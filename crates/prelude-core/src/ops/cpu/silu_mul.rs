@@ -6,9 +6,6 @@
 //! Output: `[num_tokens, dim]`.
 
 use candle_core::{DType, Result, Tensor};
-use super::bf16_utils::{bf16_to_f32, f32_to_bf16};
-#[cfg(target_arch = "x86_64")]
-use super::bf16_utils::{bf16x16_load_as_f32, f32x16_store_as_bf16};
 use super::cpu_float::CpuFloat;
 
 // ── Tensor-level API ────────────────────────────────────────────────────
@@ -270,15 +267,24 @@ fn silu_and_mul_impl(output: &mut [u16], input: &[u16], num_tokens: usize, dim: 
             }
         }
     }
-    silu_and_mul_bf16_scalar_via_generic(output, input, num_tokens, dim);
+    silu_and_mul_bf16_scalar(output, input, num_tokens, dim);
 }
 
-// ── Scalar fallback (delegates to generic kernel via CpuFloat) ──────────
+// ── Scalar fallback ─────────────────────────────────────────────────────
 
-fn silu_and_mul_bf16_scalar_via_generic(output: &mut [u16], input: &[u16], num_tokens: usize, dim: usize) {
-    let out = unsafe { &mut *(output as *mut [u16] as *mut [half::bf16]) };
-    let inp = unsafe { &*(input as *const [u16] as *const [half::bf16]) };
-    silu_and_mul_generic(out, inp, num_tokens, dim);
+fn silu_and_mul_bf16_scalar(output: &mut [u16], input: &[u16], num_tokens: usize, dim: usize) {
+    for t in 0..num_tokens {
+        let gate_off = t * 2 * dim;
+        let up_off = gate_off + dim;
+        let out_off = t * dim;
+
+        for j in 0..dim {
+            let g = bf16_to_f32(input[gate_off + j]);
+            let u = bf16_to_f32(input[up_off + j]);
+            let silu_g = g / (1.0 + (-g).exp());
+            output[out_off + j] = f32_to_bf16(silu_g * u);
+        }
+    }
 }
 
 // ── Generic scalar kernel (any CpuFloat dtype) ─────────────────────────
@@ -300,49 +306,6 @@ pub(crate) fn silu_and_mul_generic<T: CpuFloat>(
             output[out_off + j] = T::from_f32(silu_g * u);
         }
     }
-}
-
-// ── AVX-512 exp approximation ───────────────────────────────────────────
-
-/// Fast vectorized exp(x) for 16 packed floats using Cody-Waite range reduction
-/// + 5th-order Taylor polynomial. ~20 ULP accuracy (more than enough for BF16).
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-#[inline]
-fn exp_ps_avx512(x: core::arch::x86_64::__m512) -> core::arch::x86_64::__m512 {
-    use core::arch::x86_64::*;
-
-    let log2e = _mm512_set1_ps(std::f32::consts::LOG2_E);
-    let ln2_hi = _mm512_set1_ps(0.693145752);
-    let ln2_lo = _mm512_set1_ps(1.42860677e-6);
-    let half = _mm512_set1_ps(0.5);
-
-    let x = _mm512_max_ps(x, _mm512_set1_ps(-87.33654));
-    let x = _mm512_min_ps(x, _mm512_set1_ps(88.72284));
-
-    let fx = _mm512_fmadd_ps(x, log2e, half);
-    let n = _mm512_roundscale_ps(fx, _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC);
-
-    let r = _mm512_sub_ps(x, _mm512_mul_ps(n, ln2_hi));
-    let r = _mm512_sub_ps(r, _mm512_mul_ps(n, ln2_lo));
-
-    let c1 = _mm512_set1_ps(1.0);
-    let c2 = _mm512_set1_ps(0.5);
-    let c3 = _mm512_set1_ps(0.16666666);
-    let c4 = _mm512_set1_ps(0.04166666);
-    let c5 = _mm512_set1_ps(0.00833333);
-
-    let mut p = _mm512_fmadd_ps(c5, r, c4);
-    p = _mm512_fmadd_ps(p, r, c3);
-    p = _mm512_fmadd_ps(p, r, c2);
-    p = _mm512_fmadd_ps(p, r, c1);
-    p = _mm512_fmadd_ps(p, r, c1);
-
-    let n_i = _mm512_cvtps_epi32(n);
-    let bias = _mm512_set1_epi32(127);
-    let pow2n = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_add_epi32(n_i, bias), 23));
-
-    _mm512_mul_ps(p, pow2n)
 }
 
 // ── AVX-512 implementation ──────────────────────────────────────────────
@@ -389,18 +352,128 @@ fn silu_and_mul_bf16_avx512(
     }
 }
 
+// ── AVX-512 exp approximation ───────────────────────────────────────────
+
+/// Fast vectorized exp(x) for 16 packed floats using Cody-Waite range reduction
+/// + 5th-order Taylor polynomial. ~20 ULP accuracy (more than enough for BF16).
+///
+/// Algorithm:
+///   1. n = round(x * log2(e))
+///   2. r = x - n * ln(2)   (Cody-Waite: split ln2 into high + low parts)
+///   3. exp(r) ≈ 1 + r + r²/2! + r³/3! + r⁴/4! + r⁵/5!  (Horner's method)
+///   4. result = exp(r) * 2^n  (bit manipulation on float exponent)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[inline]
+fn exp_ps_avx512(x: core::arch::x86_64::__m512) -> core::arch::x86_64::__m512 {
+    use core::arch::x86_64::*;
+
+    // Constants
+    let log2e = _mm512_set1_ps(std::f32::consts::LOG2_E); // 1.44269504
+    let ln2_hi = _mm512_set1_ps(0.693145752); // high part of ln(2)
+    let ln2_lo = _mm512_set1_ps(1.42860677e-6); // low part of ln(2)
+    let half = _mm512_set1_ps(0.5);
+
+    // Clamp to prevent overflow/underflow (exp range for f32: ~[-87.3, 88.7])
+    let x = _mm512_max_ps(x, _mm512_set1_ps(-87.33654));
+    let x = _mm512_min_ps(x, _mm512_set1_ps(88.72284));
+
+    // Step 1: n = round(x * log2(e))
+    let fx = _mm512_fmadd_ps(x, log2e, half);
+    let n = _mm512_roundscale_ps(fx, _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC);
+
+    // Step 2: r = x - n * ln(2) using Cody-Waite for precision
+    let r = _mm512_sub_ps(x, _mm512_mul_ps(n, ln2_hi));
+    let r = _mm512_sub_ps(r, _mm512_mul_ps(n, ln2_lo));
+
+    // Step 3: exp(r) via Horner's method (5th order)
+    // p = 1/5! + r*(1/4! + r*(1/3! + r*(1/2! + r*(1/1! + r*1))))
+    // Simplified: evaluate from inside out
+    let c1 = _mm512_set1_ps(1.0);
+    let c2 = _mm512_set1_ps(0.5); // 1/2!
+    let c3 = _mm512_set1_ps(0.16666666); // 1/3!
+    let c4 = _mm512_set1_ps(0.04166666); // 1/4!
+    let c5 = _mm512_set1_ps(0.00833333); // 1/5!
+
+    let mut p = _mm512_fmadd_ps(c5, r, c4);
+    p = _mm512_fmadd_ps(p, r, c3);
+    p = _mm512_fmadd_ps(p, r, c2);
+    p = _mm512_fmadd_ps(p, r, c1);
+    p = _mm512_fmadd_ps(p, r, c1);
+
+    // Step 4: result = p * 2^n via float exponent manipulation
+    // 2^n = reinterpret((n + 127) << 23)
+    let n_i = _mm512_cvtps_epi32(n);
+    let bias = _mm512_set1_epi32(127);
+    let pow2n = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_add_epi32(n_i, bias), 23));
+
+    _mm512_mul_ps(p, pow2n)
+}
+
+// ── BF16 <-> F32 helpers (reused from rmsnorm) ─────────────────────────
+
+#[inline(always)]
+fn bf16_to_f32(v: u16) -> f32 {
+    f32::from_bits((v as u32) << 16)
+}
+
+#[inline(always)]
+fn f32_to_bf16(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let lsb = (bits >> 16) & 1;
+    let rounded = bits.wrapping_add(0x7FFF + lsb);
+    (rounded >> 16) as u16
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[inline]
+fn bf16x16_load_as_f32(ptr: *const u16) -> core::arch::x86_64::__m512 {
+    use core::arch::x86_64::*;
+    unsafe {
+        let bf16_vals = _mm256_loadu_si256(ptr as *const __m256i);
+        let extended = _mm512_cvtepu16_epi32(bf16_vals);
+        let shifted = _mm512_slli_epi32(extended, 16);
+        _mm512_castsi512_ps(shifted)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[inline]
+fn f32x16_store_as_bf16(ptr: *mut u16, vals: core::arch::x86_64::__m512) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let bits = _mm512_castps_si512(vals);
+        let lsb = _mm512_srli_epi32::<16>(bits);
+        let lsb_masked = _mm512_and_si512(lsb, _mm512_set1_epi32(1));
+        let rounding_bias = _mm512_add_epi32(lsb_masked, _mm512_set1_epi32(0x7FFF));
+        let rounded = _mm512_add_epi32(bits, rounding_bias);
+        let shifted = _mm512_srli_epi32::<16>(rounded);
+        let packed = _mm512_cvtepi32_epi16(shifted);
+        _mm256_storeu_si256(ptr as *mut __m256i, packed);
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use super::super::bf16_utils::{make_bf16_vec, to_f32_vec, bf16_to_f32};
-    use super::super::max_sglang_violation;
+    fn make_bf16_vec(vals: &[f32]) -> Vec<u16> {
+        vals.iter().map(|&v| f32_to_bf16(v)).collect()
+    }
+
+    fn to_f32_vec(vals: &[u16]) -> Vec<f32> {
+        vals.iter().map(|&v| bf16_to_f32(v)).collect()
+    }
 
     fn silu_f32(x: f32) -> f32 {
         x / (1.0 + (-x).exp())
     }
+
+    use super::super::max_sglang_violation;
 
     #[test]
     fn test_silu_and_mul_scalar_basic() {
@@ -415,7 +488,7 @@ mod tests {
         let input = make_bf16_vec(&input_f32);
         let mut output = vec![0u16; dim];
 
-        silu_and_mul_bf16_scalar_via_generic(&mut output, &input, 1, dim);
+        silu_and_mul_bf16_scalar(&mut output, &input, 1, dim);
 
         let actual = to_f32_vec(&output);
         let expected: Vec<f32> = (0..dim)
@@ -444,7 +517,7 @@ mod tests {
         let input = make_bf16_vec(&input_f32);
 
         let mut out_scalar = vec![0u16; num_tokens * dim];
-        silu_and_mul_bf16_scalar_via_generic(&mut out_scalar, &input, num_tokens, dim);
+        silu_and_mul_bf16_scalar(&mut out_scalar, &input, num_tokens, dim);
 
         let mut out_dispatch = vec![0u16; num_tokens * dim];
         silu_and_mul_bf16(&mut out_dispatch, &input, num_tokens, dim);
