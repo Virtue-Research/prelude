@@ -15,10 +15,13 @@
 
 **GPU (H200, Qwen3-4B)**
 
-<p align="center">
-  <img src="assets/perf-throughput.svg" width="460" alt="Prefill throughput vs concurrency">
-  <img src="assets/perf-latency.svg" width="340" alt="Latency P50/P95 at c=1">
-</p>
+<picture>
+  <img src="assets/perf-throughput.svg" width="100%" alt="Prefill throughput vs concurrency">
+</picture>
+
+<picture>
+  <img src="assets/perf-latency.svg" width="100%" alt="Latency P50/P95 at c=1">
+</picture>
 
 - **Peak throughput**: 186.7 req/s × 512 tokens = **95,590 tok/s** — **1.39× vs vLLM**, **1.23× vs SGLang** (at c=96)
 - **Latency (c=1)**: P50 **15.4ms** · P95 **21.1ms** — vs vLLM 18.1ms/27.9ms, SGLang 20.8ms/26.2ms
