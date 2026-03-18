@@ -1,0 +1,92 @@
+//! Raw FFI bindings for onednn-ffi shared library.
+//! Only available when the `onednn` feature is enabled.
+
+use std::ffi::c_void;
+
+unsafe extern "C" {
+    pub fn onednn_init();
+    pub fn onednn_cleanup();
+    pub fn onednn_set_num_threads(num_threads: i32);
+    pub fn onednn_bind_threads(cpu_ids: *const i32, num_threads: i32);
+
+    // ── F32 matmul (oneDNN primitive cache) ──────────────────────────
+
+    pub fn onednn_f32_linear(
+        input: *const c_void, weight: *const c_void, output: *mut c_void,
+        m: i64, k: i64, n: i64,
+    );
+
+    pub fn onednn_f32_matmul(
+        a: *const c_void, b: *const c_void, c: *mut c_void,
+        m: i64, k: i64, n: i64,
+    );
+
+    // ── BRGeMM micro-kernel ──────────────────────────────────────────
+
+    pub fn brgemm_available() -> i32;
+
+    pub fn brgemm_bf16_pack(
+        weight: *const c_void, k: i64, n: i64,
+    ) -> *mut c_void;
+
+    pub fn brgemm_bf16_pack_destroy(pw: *mut c_void);
+
+    pub fn brgemm_bf16_linear(
+        input: *const c_void, pw: *mut c_void, output: *mut c_void,
+        m: i64, n_total: i64, n_start: i64, n_end: i64,
+    );
+
+    pub fn brgemm_bf16_linear_fused_silu_mul(
+        input: *const c_void, pw: *mut c_void, output: *mut c_void,
+        m: i64, dim: i64, n_start: i64, n_end: i64,
+    );
+
+    /// Release AMX/brgemm HW context after attention N-block loop.
+    pub fn brgemm_attn_release();
+
+    /// QK^T GEMM for attention: scores = Q @ K^T * sm_scale
+    pub fn brgemm_qk_gemm(
+        q_bf16: *const u16,
+        k_bf16: *const u16,
+        scores_f32: *mut f32,
+        m: i64, n: i64, head_dim: i64,
+        q_stride: i64, k_stride: i64, ldc: i64, sm_scale: f32,
+    );
+
+    /// Score @ V accumulation for attention: C_f32 += scores_bf16 @ V_vnni
+    pub fn brgemm_score_v_accum(
+        scores_f32: *const f32,
+        v_bf16: *const u16,
+        c_f32: *mut f32,
+        m: i64, k: i64, n: i64, lda: i64, v_stride: i64,
+    );
+}
+
+// ── Rayon callback exports ──────────────────────────────────────────────
+// Called by oneDNN's RayonThreadPool adapter (C++ side) to dispatch
+// parallel work to Rust's rayon thread pool.
+
+/// C-compatible callback type: fn(chunk_id, total_chunks, context)
+type ParallelForBody = unsafe extern "C" fn(i32, i32, *mut c_void);
+
+/// Dispatch `n` parallel tasks to rayon. Called from C++ RayonThreadPool::parallel_for().
+#[unsafe(no_mangle)]
+pub extern "C" fn rayon_parallel_for(n: i32, body: ParallelForBody, context: *mut c_void) {
+    use rayon::prelude::*;
+    let ctx = context as usize; // usize is Send
+    (0..n).into_par_iter().for_each(|i| {
+        unsafe { body(i, n, ctx as *mut c_void) };
+    });
+}
+
+/// Return the number of rayon worker threads.
+#[unsafe(no_mangle)]
+pub extern "C" fn rayon_get_num_threads() -> i32 {
+    rayon::current_num_threads() as i32
+}
+
+/// Return 1 if the calling thread is inside a rayon parallel region, 0 otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn rayon_get_in_parallel() -> i32 {
+    if rayon::current_thread_index().is_some() { 1 } else { 0 }
+}

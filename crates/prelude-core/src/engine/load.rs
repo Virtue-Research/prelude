@@ -1,0 +1,1131 @@
+//! Model loading: local path, HF Hub, safetensors, GGUF.
+//!
+//! All factory functions return a fully assembled `Engine`.
+//! Runtime accessors (tokenize, model_id, etc.) live in engine_struct.rs.
+
+use std::path::PathBuf;
+
+use super::*;
+use crate::cache::manager::CacheManager;
+use crate::config::EngineConfig;
+use crate::engine::{
+    EmbeddingActivation, EmbeddingDenseLayerSpec, EmbeddingNormalization, EmbeddingPooling,
+    EmbeddingSemantics,
+};
+use crate::models::architectures::gemma3::meta::{
+    Gemma3ModelBuildContext, build_gemma3_model_with_context,
+};
+use crate::models::architectures::meta::AuxiliaryVarBuilder;
+use crate::models::architectures::qwen3_gguf::Qwen3GgufModel;
+
+#[derive(Debug, serde::Deserialize)]
+struct SentenceTransformerModuleEntry {
+    idx: usize,
+    path: String,
+    #[serde(rename = "type")]
+    module_type: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SentenceTransformerPoolingConfig {
+    #[serde(default)]
+    pooling_mode_cls_token: bool,
+    #[serde(default)]
+    pooling_mode_mean_tokens: bool,
+    #[serde(default)]
+    pooling_mode_lasttoken: bool,
+    #[serde(default)]
+    pooling_mode_max_tokens: bool,
+    #[serde(default)]
+    pooling_mode_mean_sqrt_len_tokens: bool,
+    #[serde(default)]
+    pooling_mode_weightedmean_tokens: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SentenceTransformerDenseConfig {
+    in_features: usize,
+    out_features: usize,
+    #[serde(default)]
+    bias: Option<bool>,
+    #[serde(default)]
+    activation_function: Option<String>,
+    #[serde(default)]
+    activation: Option<String>,
+}
+
+struct LoadedEmbeddingModules {
+    spec: EmbeddingSemantics,
+    auxiliary: Vec<AuxiliaryVarBuilder>,
+}
+
+impl Engine {
+    // Cleaned -- Reviewed by Minzhou
+    pub fn from_local_path_with_task(
+        model_path: impl AsRef<Path>,
+        model_id: impl Into<String>,
+        task_override: TaskOverride,
+        engine_config: EngineConfig,
+    ) -> Result<Self, EngineError> {
+        let model_path = model_path.as_ref();
+        let model_id = model_id.into();
+
+        // Detect GGUF file by extension
+        if model_path.extension().is_some_and(|ext| ext == "gguf") {
+            return load_gguf(model_path, model_id, task_override, engine_config);
+        }
+
+        tracing::info!(path = %model_path.display(), "loading model");
+        let load_start = Instant::now();
+
+        let (device, dtype) = select_device(&engine_config.runtime)?;
+        init_cpu_runtime_if_needed(&device, &engine_config.runtime);
+
+        let resolved = load_model_config(model_path, task_override)?;
+        let embedding_modules =
+            load_embedding_modules_from_dir(
+                model_path,
+                resolved.spec.name(),
+                resolved.task,
+                DType::F32,
+                &device,
+            )?;
+        let vb = load_weights(model_path, dtype, &device)?;
+        let tokenizer = load_tokenizer(model_path)?;
+        load_safetensor_parts(
+            model_id,
+            resolved,
+            embedding_modules,
+            vb,
+            tokenizer,
+            device,
+            dtype,
+            load_start,
+            engine_config,
+        )
+    }
+
+    // Cleaned -- Reviewed by Minzhou
+    pub fn from_hf_hub_with_task(
+        repo_id: &str,
+        task_override: TaskOverride,
+        engine_config: EngineConfig,
+    ) -> Result<Self, EngineError> {
+        let api = hf_hub::api::sync::Api::new()
+            .map_err(|e| EngineError::Internal(format!("failed to init hf-hub api: {e}")))?;
+        let repo = api.model(repo_id.to_string());
+
+        tracing::info!(repo = repo_id, "downloading model from HuggingFace Hub");
+
+        let config_path = repo
+            .get("config.json")
+            .map_err(|e| EngineError::Internal(format!("failed to download config.json: {e}")))?;
+        let tokenizer_path = repo.get("tokenizer.json").map_err(|e| {
+            EngineError::Internal(format!("failed to download tokenizer.json: {e}"))
+        })?;
+
+        let weight_files = load_safetensor_filenames(&repo)?;
+
+        let (device, dtype) = select_device(&engine_config.runtime)?;
+        init_cpu_runtime_if_needed(&device, &engine_config.runtime);
+        let load_start = Instant::now();
+
+        let resolved = {
+            let content = std::fs::read_to_string(&config_path)
+                .map_err(|e| EngineError::Internal(format!("failed to read config.json: {e}")))?;
+            parse_model_config_for_source(
+                &content,
+                task_override,
+                has_remote_file(&repo, "config_sentence_transformers.json"),
+            )?
+        };
+        let embedding_modules =
+            load_embedding_modules_from_repo(
+                &repo,
+                resolved.spec.name(),
+                resolved.task,
+                DType::F32,
+                &device,
+            )?;
+
+        let vb = load_var_builder_from_filenames(&weight_files, dtype, &device)?;
+        let tokenizer = load_tokenizer_file(&tokenizer_path)?;
+        load_safetensor_parts(
+            repo_id.to_string(),
+            resolved,
+            embedding_modules,
+            vb,
+            tokenizer,
+            device,
+            dtype,
+            load_start,
+            engine_config,
+        )
+    }
+}
+
+// ── Free functions ────────────────────────────────────────────────────────
+
+fn load_safetensor_parts(
+    model_id: String,
+    resolved: ResolvedModelConfig,
+    embedding_modules: Option<LoadedEmbeddingModules>,
+    vb: VarBuilder<'static>,
+    tokenizer: Tokenizer,
+    device: Device,
+    dtype: DType,
+    load_start: Instant,
+    engine_config: EngineConfig,
+) -> Result<Engine, EngineError> {
+    // Initialize global config before building the model, so that model
+    // constructors can read cache/runtime settings via global accessors.
+    crate::config::init_global_config(&engine_config);
+
+    let built = build_model_variant(
+        &resolved,
+        vb,
+        embedding_modules.as_ref(),
+        &device,
+        WeightsBackend::Safetensors,
+    )?;
+    let eos_token_ids = resolved.eos_token_ids;
+    let common_config = resolved.parsed.common;
+    let deltanet_config = resolved.parsed.deltanet;
+
+    let executor = ModelExecutor {
+        model: Mutex::new(built.model),
+        device,
+        dtype,
+        config: common_config,
+        runtime_caps: built.runtime_caps,
+    };
+
+    let cache = CacheManager::new(
+        &executor.config,
+        deltanet_config.as_ref(),
+        executor.dtype,
+        &executor.device,
+        &executor.runtime_caps,
+        &engine_config.cache,
+    )?;
+
+    tracing::info!(
+        elapsed_ms = load_start.elapsed().as_millis() as u64,
+        task = ?built.descriptor.task,
+        arch = built.descriptor.arch_name,
+        backend = ?built.descriptor.backend,
+        runtime_caps = ?executor.runtime_caps,
+        is_cuda = executor.device.is_cuda(),
+        dtype = ?executor.dtype,
+        layers = executor.config.num_hidden_layers,
+        vocab = executor.config.vocab_size,
+        "model loaded"
+    );
+
+    Ok(Engine {
+        executor,
+        cache,
+        tokenizer,
+        model_id,
+        embedding_semantics: embedding_modules
+            .as_ref()
+            .map(|modules| modules.spec.clone())
+            .unwrap_or_default(),
+        eos_token_ids,
+        descriptor: built.descriptor,
+        engine_config,
+    })
+}
+
+/// Load a quantized model from a GGUF file.
+fn load_gguf(
+    gguf_path: &Path,
+    model_id: String,
+    task_override: TaskOverride,
+    engine_config: EngineConfig,
+) -> Result<Engine, EngineError> {
+    tracing::info!(path = %gguf_path.display(), "loading GGUF model");
+    let load_start = Instant::now();
+
+    if !matches!(task_override, TaskOverride::Auto | TaskOverride::Generate) {
+        return Err(EngineError::InvalidRequest(
+            "GGUF models currently support generation only".into(),
+        ));
+    }
+
+    let device = Device::Cpu; // GGUF quantized is CPU-only for now
+    let dtype = DType::F32; // working dtype for embeddings/norms
+
+    let mut file = std::fs::File::open(gguf_path)
+        .map_err(|e| EngineError::Internal(format!("failed to open GGUF: {e}")))?;
+    let ct = candle_core::quantized::gguf_file::Content::read(&mut file).map_err(candle_err)?;
+
+    let (model, gguf_config) =
+        Qwen3GgufModel::from_gguf(ct, &mut file, &device).map_err(candle_err)?;
+
+    let eos_token_ids = if gguf_config.eos_token_ids.is_empty() {
+        return Err(EngineError::InvalidRequest(
+            "generation GGUF metadata is missing required field `tokenizer.ggml.eos_token_id`"
+                .into(),
+        ));
+    } else {
+        gguf_config.eos_token_ids.clone()
+    };
+
+    let common_config = CommonModelConfig {
+        vocab_size: gguf_config.vocab_size,
+        num_hidden_layers: gguf_config.num_hidden_layers,
+        max_position_embeddings: gguf_config.max_position_embeddings,
+        num_key_value_heads: gguf_config.num_key_value_heads,
+        head_dim: gguf_config.head_dim,
+    };
+
+    let descriptor = ModelDescriptor {
+        task: TaskKind::Generate,
+        arch_name: "qwen3_gguf",
+        backend: WeightsBackend::Gguf,
+    };
+    let runtime_caps = RuntimeCaps::default();
+
+    // Resolve tokenizer: look next to GGUF file, else download from HF Hub
+    let tokenizer = if let Some(parent) = gguf_path.parent()
+        && parent.join("tokenizer.json").exists()
+    {
+        load_tokenizer(parent)?
+    } else {
+        download_tokenizer(&model_id)?
+    };
+
+    let executor = ModelExecutor {
+        model: Mutex::new(Box::new(model)),
+        device,
+        dtype,
+        config: common_config,
+        runtime_caps,
+    };
+
+    tracing::info!(
+        elapsed_ms = load_start.elapsed().as_millis() as u64,
+        task = ?descriptor.task,
+        arch = descriptor.arch_name,
+        backend = ?descriptor.backend,
+        runtime_caps = ?executor.runtime_caps,
+        layers = executor.config.num_hidden_layers,
+        vocab = executor.config.vocab_size,
+        "GGUF model loaded"
+    );
+
+    Ok(Engine {
+        executor,
+        cache: CacheManager::none(),
+        tokenizer,
+        model_id,
+        embedding_semantics: EmbeddingSemantics::default(),
+        eos_token_ids,
+        descriptor,
+        engine_config,
+    })
+}
+
+fn load_embedding_modules_from_dir(
+    model_path: &Path,
+    arch_name: &str,
+    task: TaskKind,
+    dtype: DType,
+    device: &Device,
+) -> Result<Option<LoadedEmbeddingModules>, EngineError> {
+    if task != TaskKind::Embed {
+        return Ok(None);
+    }
+
+    let modules_path = model_path.join("modules.json");
+    if !modules_path.exists() {
+        tracing::warn!(
+            path = %modules_path.display(),
+            "embedding modules.json not found; using default last-token semantics"
+        );
+        return Ok(None);
+    }
+
+    load_embedding_modules_from_file(
+        &modules_path,
+        |relative| Ok(model_path.join(relative)),
+        dtype,
+        device,
+        arch_name == "gemma3",
+    )
+}
+
+fn load_embedding_modules_from_repo(
+    repo: &hf_hub::api::sync::ApiRepo,
+    arch_name: &str,
+    task: TaskKind,
+    dtype: DType,
+    device: &Device,
+) -> Result<Option<LoadedEmbeddingModules>, EngineError> {
+    if task != TaskKind::Embed {
+        return Ok(None);
+    }
+
+    let modules_path = match repo.get("modules.json") {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to resolve embedding modules.json");
+            return Ok(None);
+        }
+    };
+
+    load_embedding_modules_from_file(
+        &modules_path,
+        |relative| {
+            repo.get(relative).map_err(|err| {
+                EngineError::Internal(format!("failed to download {relative}: {err}"))
+            })
+        },
+        dtype,
+        device,
+        arch_name == "gemma3",
+    )
+}
+
+fn load_embedding_modules_from_file<F>(
+    modules_path: &Path,
+    mut resolve_path: F,
+    dtype: DType,
+    device: &Device,
+    load_dense_auxiliary: bool,
+) -> Result<Option<LoadedEmbeddingModules>, EngineError>
+where
+    F: FnMut(&str) -> Result<PathBuf, EngineError>,
+{
+    let content = std::fs::read_to_string(modules_path).map_err(|err| {
+        EngineError::Internal(format!(
+            "failed to read embedding modules.json {}: {err}",
+            modules_path.display()
+        ))
+    })?;
+
+    let mut modules: Vec<SentenceTransformerModuleEntry> =
+        serde_json::from_str(&content).map_err(|err| {
+            EngineError::Internal(format!(
+                "failed to parse embedding modules.json {}: {err}",
+                modules_path.display()
+            ))
+        })?;
+    modules.sort_by_key(|entry| entry.idx);
+
+    let mut spec = EmbeddingSemantics::default();
+    let mut auxiliary = Vec::new();
+
+    for entry in modules {
+        let is_normalize = entry.module_type.ends_with(".Normalize");
+        if spec.normalization == EmbeddingNormalization::L2 && !is_normalize {
+            return Err(EngineError::InvalidRequest(format!(
+                "unsupported sentence-transformers module order in {}: Normalize must be the final module",
+                modules_path.display()
+            )));
+        }
+
+        if entry.module_type.ends_with(".Transformer") {
+            continue;
+        }
+
+        if entry.module_type.ends_with(".Pooling") {
+            let config_path = resolve_path(&module_relative_path(&entry.path, "config.json"))?;
+            let pooling_cfg: SentenceTransformerPoolingConfig =
+                read_json_file(&config_path, "sentence-transformers pooling config")?;
+            spec.pooling = pooling_from_config(&pooling_cfg, &config_path)?;
+            continue;
+        }
+
+        if entry.module_type.ends_with(".Dense") {
+            let config_path = resolve_path(&module_relative_path(&entry.path, "config.json"))?;
+            let dense_cfg: SentenceTransformerDenseConfig =
+                read_json_file(&config_path, "sentence-transformers dense config")?;
+            let activation = resolve_dense_activation(&dense_cfg)?;
+            let bias = if load_dense_auxiliary {
+                let weight_path =
+                    resolve_path(&module_relative_path(&entry.path, "model.safetensors"))?;
+                let vb = load_var_builder_from_filenames(&[weight_path.clone()], dtype, device)?;
+                auxiliary.push(AuxiliaryVarBuilder {
+                    module_path: entry.path.clone(),
+                    vb,
+                });
+                dense_bias_from_config_or_weights(dense_cfg.bias, &weight_path)?
+            } else {
+                dense_cfg.bias.unwrap_or(false)
+            };
+
+            spec.dense_layers.push(EmbeddingDenseLayerSpec {
+                module_path: entry.path.clone(),
+                in_features: dense_cfg.in_features,
+                out_features: dense_cfg.out_features,
+                bias,
+                activation,
+            });
+            continue;
+        }
+
+        if entry.module_type.ends_with(".Normalize") {
+            if spec.normalization == EmbeddingNormalization::L2 {
+                return Err(EngineError::InvalidRequest(format!(
+                    "unsupported sentence-transformers module order in {}: multiple Normalize modules are not supported",
+                    modules_path.display()
+                )));
+            }
+            spec.normalization = EmbeddingNormalization::L2;
+            continue;
+        }
+
+        return Err(EngineError::InvalidRequest(format!(
+            "unsupported sentence-transformers module type for embeddings: {}",
+            entry.module_type
+        )));
+    }
+
+    Ok(Some(LoadedEmbeddingModules { spec, auxiliary }))
+}
+
+fn module_relative_path(module_path: &str, filename: &str) -> String {
+    if module_path.is_empty() {
+        filename.to_string()
+    } else {
+        format!("{module_path}/{filename}")
+    }
+}
+
+fn dense_bias_from_config_or_weights(
+    config_bias: Option<bool>,
+    weight_path: &Path,
+) -> Result<bool, EngineError> {
+    if let Some(bias) = config_bias {
+        return Ok(bias);
+    }
+
+    // Some sentence-transformers dense configs omit `bias`; use the safetensor
+    // payload as the source of truth so we don't silently drop a present bias.
+    let weights = unsafe { candle_core::safetensors::MmapedSafetensors::new(weight_path) }
+        .map_err(candle_err)?;
+    Ok(weights
+        .tensors()
+        .into_iter()
+        .any(|(name, _)| name == "linear.bias"))
+}
+
+fn pooling_from_config(
+    cfg: &SentenceTransformerPoolingConfig,
+    path: &Path,
+) -> Result<EmbeddingPooling, EngineError> {
+    let supported = [
+        (cfg.pooling_mode_lasttoken, EmbeddingPooling::LastToken),
+        (cfg.pooling_mode_mean_tokens, EmbeddingPooling::Mean),
+        (cfg.pooling_mode_cls_token, EmbeddingPooling::Cls),
+    ];
+    let enabled: Vec<_> = supported
+        .into_iter()
+        .filter_map(|(enabled, pooling): (bool, EmbeddingPooling)| enabled.then_some(pooling))
+        .collect();
+
+    if enabled.len() == 1
+        && !cfg.pooling_mode_max_tokens
+        && !cfg.pooling_mode_mean_sqrt_len_tokens
+        && !cfg.pooling_mode_weightedmean_tokens
+    {
+        return Ok(enabled[0]);
+    }
+
+    Err(EngineError::InvalidRequest(format!(
+        "unsupported sentence-transformers pooling config {}",
+        path.display()
+    )))
+}
+
+fn parse_dense_activation(value: Option<&str>) -> Result<EmbeddingActivation, EngineError> {
+    let normalized = value.unwrap_or("").trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "" | "torch.nn.modules.linear.identity" | "torch.nn.identity" | "identity" => {
+            Ok(EmbeddingActivation::Identity)
+        }
+        _ => Err(EngineError::InvalidRequest(format!(
+            "unsupported sentence-transformers dense activation: {}",
+            value.unwrap_or("")
+        ))),
+    }
+}
+
+fn resolve_dense_activation(
+    cfg: &SentenceTransformerDenseConfig,
+) -> Result<EmbeddingActivation, EngineError> {
+    let activation_function = cfg.activation_function.as_deref();
+    let activation = cfg.activation.as_deref();
+
+    if let (Some(lhs), Some(rhs)) = (activation_function, activation) {
+        if !lhs.trim().eq_ignore_ascii_case(rhs.trim()) {
+            return Err(EngineError::InvalidRequest(format!(
+                "conflicting sentence-transformers dense activation values: activation_function={lhs}, activation={rhs}"
+            )));
+        }
+    }
+
+    parse_dense_activation(activation_function.or(activation))
+}
+
+fn read_json_file<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    description: &str,
+) -> Result<T, EngineError> {
+    let content = std::fs::read_to_string(path).map_err(|err| {
+        EngineError::Internal(format!(
+            "failed to read {description} {}: {err}",
+            path.display()
+        ))
+    })?;
+    serde_json::from_str(&content).map_err(|err| {
+        EngineError::Internal(format!(
+            "failed to parse {description} {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+fn load_tokenizer(model_path: &Path) -> Result<Tokenizer, EngineError> {
+    let tokenizer_path = model_path.join("tokenizer.json");
+    load_tokenizer_file(&tokenizer_path)
+}
+
+fn load_tokenizer_file(tokenizer_path: &Path) -> Result<Tokenizer, EngineError> {
+    Tokenizer::from_file(tokenizer_path).map_err(|e| {
+        EngineError::Internal(format!("failed to load {}: {e}", tokenizer_path.display()))
+    })
+}
+
+/// Download tokenizer.json from HuggingFace Hub.
+fn download_tokenizer(model_id: &str) -> Result<Tokenizer, EngineError> {
+    tracing::info!(
+        repo = model_id,
+        "downloading tokenizer from HuggingFace Hub"
+    );
+    let api = hf_hub::api::sync::Api::new()
+        .map_err(|e| EngineError::Internal(format!("hf-hub api init: {e}")))?;
+    let repo = api.model(model_id.to_string());
+    let tokenizer_path = repo
+        .get("tokenizer.json")
+        .map_err(|e| EngineError::Internal(format!("failed to download tokenizer.json: {e}")))?;
+    Tokenizer::from_file(tokenizer_path.as_path())
+        .map_err(|e| EngineError::Internal(format!("failed to load tokenizer: {e}")))
+}
+
+pub(crate) struct BuiltModel {
+    pub model: ModelVariant,
+    pub descriptor: ModelDescriptor,
+    pub runtime_caps: RuntimeCaps,
+}
+
+pub(crate) fn build_model_variant(
+    resolved: &ResolvedModelConfig,
+    vb: VarBuilder<'_>,
+    embedding_modules: Option<&LoadedEmbeddingModules>,
+    device: &Device,
+    backend: WeightsBackend,
+) -> Result<BuiltModel, EngineError> {
+    let model = if resolved.spec.name() == "gemma3" && resolved.task == TaskKind::Embed {
+        let build_ctx = Gemma3ModelBuildContext {
+            main_vb: vb,
+            embedding: embedding_modules.map(|modules| &modules.spec),
+            auxiliary: embedding_modules
+                .map(|modules| modules.auxiliary.as_slice())
+                .unwrap_or(&[]),
+        };
+        build_gemma3_model_with_context(resolved.parsed.arch_config.as_ref(), &build_ctx)?
+    } else {
+        resolved
+            .spec
+            .build_model(resolved.parsed.arch_config.as_ref(), vb)?
+    };
+
+    Ok(BuiltModel {
+        model,
+        descriptor: ModelDescriptor {
+            task: resolved.task,
+            arch_name: resolved.spec.name(),
+            backend,
+        },
+        runtime_caps: resolved.spec.runtime_caps(resolved.task, backend, device),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::safetensors::save as save_safetensors;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const TEST_SENTENCE_TRANSFORMER_MODEL_DIM: usize = 768;
+    const TEST_SENTENCE_TRANSFORMER_EXPANDED_DIM: usize = 3072;
+    const TEST_SENTENCE_TRANSFORMER_DENSE_ACTIVATION: &str = "torch.nn.Identity";
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let id = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "prelude-{name}-{}-{}",
+                std::process::id(),
+                id
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_json(path: &Path, value: &serde_json::Value) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
+    }
+
+    fn write_dense_weights_with_bias(
+        path: &Path,
+        in_features: usize,
+        out_features: usize,
+        include_bias: bool,
+    ) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let weight = Tensor::from_vec(
+            vec![0f32; in_features * out_features],
+            (out_features, in_features),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let mut tensors = HashMap::new();
+        tensors.insert("linear.weight".to_string(), weight);
+        if include_bias {
+            let bias =
+                Tensor::from_vec(vec![0f32; out_features], out_features, &Device::Cpu).unwrap();
+            tensors.insert("linear.bias".to_string(), bias);
+        }
+        save_safetensors(&tensors, path).unwrap();
+    }
+
+    fn write_dense_weights(path: &Path, in_features: usize, out_features: usize) {
+        write_dense_weights_with_bias(path, in_features, out_features, false);
+    }
+
+    fn sentence_transformers_pooling_config() -> serde_json::Value {
+        json!({
+            "pooling_mode_cls_token": false,
+            "pooling_mode_mean_tokens": true,
+            "pooling_mode_lasttoken": false,
+            "pooling_mode_max_tokens": false,
+            "pooling_mode_mean_sqrt_len_tokens": false,
+            "pooling_mode_weightedmean_tokens": false
+        })
+    }
+
+    fn sentence_transformers_dense_config(
+        in_features: usize,
+        out_features: usize,
+        bias: Option<bool>,
+        activation: Option<&str>,
+    ) -> serde_json::Value {
+        let mut config = json!({
+            "in_features": in_features,
+            "out_features": out_features
+        });
+        if let Some(bias) = bias {
+            config["bias"] = json!(bias);
+        }
+        if let Some(activation) = activation {
+            config["activation_function"] = json!(activation);
+        }
+        config
+    }
+
+    fn sentence_transformers_dense_config_with_activation_alias(
+        in_features: usize,
+        out_features: usize,
+        activation: &str,
+    ) -> serde_json::Value {
+        json!({
+            "in_features": in_features,
+            "out_features": out_features,
+            "activation": activation
+        })
+    }
+
+    #[test]
+    fn parses_sentence_transformers_embedding_modules() {
+        let dir = TestDir::new("sentence-transformers-modules");
+        let modules_path = dir.path.join("modules.json");
+
+        write_json(
+            &modules_path,
+            &json!([
+                {
+                    "idx": 0,
+                    "name": "0",
+                    "path": "",
+                    "type": "sentence_transformers.models.Transformer"
+                },
+                {
+                    "idx": 1,
+                    "name": "1",
+                    "path": "1_Pooling",
+                    "type": "sentence_transformers.models.Pooling"
+                },
+                {
+                    "idx": 2,
+                    "name": "2",
+                    "path": "2_Dense",
+                    "type": "sentence_transformers.models.Dense"
+                },
+                {
+                    "idx": 3,
+                    "name": "3",
+                    "path": "3_Dense",
+                    "type": "sentence_transformers.models.Dense"
+                },
+                {
+                    "idx": 4,
+                    "name": "4",
+                    "path": "4_Normalize",
+                    "type": "sentence_transformers.models.Normalize"
+                }
+            ]),
+        );
+
+        write_json(
+            &dir.path.join("1_Pooling/config.json"),
+            &sentence_transformers_pooling_config(),
+        );
+        write_json(
+            &dir.path.join("2_Dense/config.json"),
+            &sentence_transformers_dense_config(
+                TEST_SENTENCE_TRANSFORMER_MODEL_DIM,
+                TEST_SENTENCE_TRANSFORMER_EXPANDED_DIM,
+                Some(false),
+                Some(TEST_SENTENCE_TRANSFORMER_DENSE_ACTIVATION),
+            ),
+        );
+        write_json(
+            &dir.path.join("3_Dense/config.json"),
+            &sentence_transformers_dense_config(
+                TEST_SENTENCE_TRANSFORMER_EXPANDED_DIM,
+                TEST_SENTENCE_TRANSFORMER_MODEL_DIM,
+                Some(false),
+                None,
+            ),
+        );
+        write_dense_weights(
+            &dir.path.join("2_Dense/model.safetensors"),
+            TEST_SENTENCE_TRANSFORMER_MODEL_DIM,
+            TEST_SENTENCE_TRANSFORMER_EXPANDED_DIM,
+        );
+        write_dense_weights(
+            &dir.path.join("3_Dense/model.safetensors"),
+            TEST_SENTENCE_TRANSFORMER_EXPANDED_DIM,
+            TEST_SENTENCE_TRANSFORMER_MODEL_DIM,
+        );
+
+        let loaded = load_embedding_modules_from_file(
+            &modules_path,
+            |relative| Ok(dir.path.join(relative)),
+            DType::F32,
+            &Device::Cpu,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(loaded.spec.pooling, EmbeddingPooling::Mean);
+        assert_eq!(loaded.spec.normalization, EmbeddingNormalization::L2);
+        assert_eq!(loaded.spec.dense_layers.len(), 2);
+        assert_eq!(loaded.spec.dense_layers[0].module_path, "2_Dense");
+        assert_eq!(
+            loaded.spec.dense_layers[0].in_features,
+            TEST_SENTENCE_TRANSFORMER_MODEL_DIM
+        );
+        assert_eq!(
+            loaded.spec.dense_layers[0].out_features,
+            TEST_SENTENCE_TRANSFORMER_EXPANDED_DIM
+        );
+        assert_eq!(
+            loaded.spec.dense_layers[0].activation,
+            EmbeddingActivation::Identity
+        );
+        assert_eq!(loaded.spec.dense_layers[1].module_path, "3_Dense");
+        assert_eq!(
+            loaded.spec.dense_layers[1].in_features,
+            TEST_SENTENCE_TRANSFORMER_EXPANDED_DIM
+        );
+        assert_eq!(
+            loaded.spec.dense_layers[1].out_features,
+            TEST_SENTENCE_TRANSFORMER_MODEL_DIM
+        );
+        assert_eq!(loaded.auxiliary.len(), 2);
+        assert_eq!(loaded.auxiliary[0].module_path, "2_Dense");
+        assert_eq!(loaded.auxiliary[1].module_path, "3_Dense");
+    }
+
+    #[test]
+    fn infers_embedding_dense_bias_from_weights_when_config_omits_flag() {
+        let dir = TestDir::new("sentence-transformers-dense-bias-inference");
+        let modules_path = dir.path.join("modules.json");
+
+        write_json(
+            &modules_path,
+            &json!([
+                {
+                    "idx": 0,
+                    "name": "0",
+                    "path": "",
+                    "type": "sentence_transformers.models.Transformer"
+                },
+                {
+                    "idx": 1,
+                    "name": "1",
+                    "path": "1_Dense",
+                    "type": "sentence_transformers.models.Dense"
+                }
+            ]),
+        );
+        write_json(
+            &dir.path.join("1_Dense/config.json"),
+            &sentence_transformers_dense_config(
+                TEST_SENTENCE_TRANSFORMER_MODEL_DIM,
+                TEST_SENTENCE_TRANSFORMER_EXPANDED_DIM,
+                None,
+                None,
+            ),
+        );
+        write_dense_weights_with_bias(
+            &dir.path.join("1_Dense/model.safetensors"),
+            TEST_SENTENCE_TRANSFORMER_MODEL_DIM,
+            TEST_SENTENCE_TRANSFORMER_EXPANDED_DIM,
+            true,
+        );
+
+        let loaded = load_embedding_modules_from_file(
+            &modules_path,
+            |relative| Ok(dir.path.join(relative)),
+            DType::F32,
+            &Device::Cpu,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(loaded.spec.dense_layers.len(), 1);
+        assert!(loaded.spec.dense_layers[0].bias);
+    }
+
+    #[test]
+    fn parses_embedding_dense_activation_alias_key() {
+        let dir = TestDir::new("sentence-transformers-dense-activation-alias");
+        let modules_path = dir.path.join("modules.json");
+
+        write_json(
+            &modules_path,
+            &json!([
+                {
+                    "idx": 0,
+                    "name": "0",
+                    "path": "",
+                    "type": "sentence_transformers.models.Transformer"
+                },
+                {
+                    "idx": 1,
+                    "name": "1",
+                    "path": "1_Dense",
+                    "type": "sentence_transformers.models.Dense"
+                }
+            ]),
+        );
+        write_json(
+            &dir.path.join("1_Dense/config.json"),
+            &sentence_transformers_dense_config_with_activation_alias(
+                TEST_SENTENCE_TRANSFORMER_MODEL_DIM,
+                TEST_SENTENCE_TRANSFORMER_EXPANDED_DIM,
+                TEST_SENTENCE_TRANSFORMER_DENSE_ACTIVATION,
+            ),
+        );
+        write_dense_weights(
+            &dir.path.join("1_Dense/model.safetensors"),
+            TEST_SENTENCE_TRANSFORMER_MODEL_DIM,
+            TEST_SENTENCE_TRANSFORMER_EXPANDED_DIM,
+        );
+
+        let loaded = load_embedding_modules_from_file(
+            &modules_path,
+            |relative| Ok(dir.path.join(relative)),
+            DType::F32,
+            &Device::Cpu,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(loaded.spec.dense_layers.len(), 1);
+        assert_eq!(
+            loaded.spec.dense_layers[0].activation,
+            EmbeddingActivation::Identity
+        );
+    }
+
+    #[test]
+    fn rejects_non_terminal_sentence_transformers_normalize_module() {
+        let dir = TestDir::new("sentence-transformers-normalize-non-terminal");
+        let modules_path = dir.path.join("modules.json");
+
+        write_json(
+            &modules_path,
+            &json!([
+                {
+                    "idx": 0,
+                    "name": "0",
+                    "path": "",
+                    "type": "sentence_transformers.models.Transformer"
+                },
+                {
+                    "idx": 1,
+                    "name": "1",
+                    "path": "1_Normalize",
+                    "type": "sentence_transformers.models.Normalize"
+                },
+                {
+                    "idx": 2,
+                    "name": "2",
+                    "path": "2_Dense",
+                    "type": "sentence_transformers.models.Dense"
+                }
+            ]),
+        );
+
+        let err = match load_embedding_modules_from_file(
+            &modules_path,
+            |relative| Ok(dir.path.join(relative)),
+            DType::F32,
+            &Device::Cpu,
+            true,
+        ) {
+            Ok(_) => panic!("expected non-terminal Normalize module order to be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("Normalize must be the final module"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_multiple_sentence_transformers_normalize_modules() {
+        let dir = TestDir::new("sentence-transformers-normalize-duplicate");
+        let modules_path = dir.path.join("modules.json");
+
+        write_json(
+            &modules_path,
+            &json!([
+                {
+                    "idx": 0,
+                    "name": "0",
+                    "path": "",
+                    "type": "sentence_transformers.models.Transformer"
+                },
+                {
+                    "idx": 1,
+                    "name": "1",
+                    "path": "1_Normalize",
+                    "type": "sentence_transformers.models.Normalize"
+                },
+                {
+                    "idx": 2,
+                    "name": "2",
+                    "path": "2_Normalize",
+                    "type": "sentence_transformers.models.Normalize"
+                }
+            ]),
+        );
+
+        let err = match load_embedding_modules_from_file(
+            &modules_path,
+            |relative| Ok(dir.path.join(relative)),
+            DType::F32,
+            &Device::Cpu,
+            true,
+        ) {
+            Ok(_) => panic!("expected duplicate Normalize modules to be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("multiple Normalize modules are not supported"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn skips_dense_weight_loading_for_non_gemma_embeddings() {
+        let dir = TestDir::new("sentence-transformers-dense-metadata-only");
+        let modules_path = dir.path.join("modules.json");
+
+        write_json(
+            &modules_path,
+            &json!([
+                {
+                    "idx": 0,
+                    "name": "0",
+                    "path": "",
+                    "type": "sentence_transformers.models.Transformer"
+                },
+                {
+                    "idx": 1,
+                    "name": "1",
+                    "path": "1_Dense",
+                    "type": "sentence_transformers.models.Dense"
+                }
+            ]),
+        );
+        write_json(
+            &dir.path.join("1_Dense/config.json"),
+            &sentence_transformers_dense_config(
+                TEST_SENTENCE_TRANSFORMER_MODEL_DIM,
+                TEST_SENTENCE_TRANSFORMER_EXPANDED_DIM,
+                Some(true),
+                Some(TEST_SENTENCE_TRANSFORMER_DENSE_ACTIVATION),
+            ),
+        );
+
+        let loaded = load_embedding_modules_from_file(
+            &modules_path,
+            |relative| Ok(dir.path.join(relative)),
+            DType::F32,
+            &Device::Cpu,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(loaded.spec.dense_layers.len(), 1);
+        assert!(loaded.spec.dense_layers[0].bias);
+        assert!(loaded.auxiliary.is_empty());
+    }
+}
