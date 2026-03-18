@@ -11,26 +11,77 @@
 
 ---
 
-## Performance
+## Quick Start
 
-**GPU (H200, Qwen3-0.6B, BF16)**
+### Prerequisites
 
-| Task           | Concurrency |  Throughput   | Latency P95 |
-|----------------|:-----------:|:-------------:|:-----------:|
-| Generation     |      8      |  1,768 tok/s  |    138ms    |
-| Generation     |     16      |  1,822 tok/s  |    285ms    |
-| Classification |     16      | 2,060 items/s |    166ms    |
-| Embedding      |     16      | 1,983 items/s |    168ms    |
+- **Rust** (stable, 1.85+)
+- **CUDA Toolkit** (for GPU)
+- **CMake** >= 3.18 (for oneDNN CPU backend)
 
-TPOT (time per output token): **3.2ms** at c=1, **3.8ms** at c=16.
+### Build
 
-**CPU (Xeon 8480+, Qwen3-0.6B, BF16 via oneDNN)**
+```bash
+# GPU with Flash Attention v4 + v3 (Hopper, recommended)
+cargo build -p prelude-server --release --features flash-attn-v4,flash-attn-v3,onednn
 
-| Benchmark              |   Prelude   |   SGLang   |  Speedup  |
-|------------------------|:-----------:|:----------:|:---------:|
-| Prefill (128 tok, c=1) |  3,629 t/s  | 2,298 t/s  | **1.58x** |
-| Prefill (128 tok, c=4) |  5,710 t/s  | 3,970 t/s  | **1.44x** |
-| Decode (32 in, 32 out) | 109.6 out/s | 57.1 out/s | **1.92x** |
+# GPU with Flash Attention v2 (Ampere/Ada)
+cargo build -p prelude-server --release --features flash-attn
+
+# CPU only with oneDNN BF16 GEMM
+cargo build -p prelude-server --release --features onednn
+```
+
+### Run
+
+```bash
+# GPU
+CUDA_VISIBLE_DEVICES=0 ./target/release/prelude-server \
+  --model Qwen/Qwen3-4B --port 8000
+
+# CPU
+PRELUDE_DEVICE=cpu ./target/release/prelude-server \
+  --model Qwen/Qwen3-0.6B --port 8000
+```
+
+### Query
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-4B",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 64
+  }'
+```
+
+## Supported Models
+
+| Architecture   | Models                            | GPU Backend | Continuous Batching |
+|----------------|-----------------------------------|-------------|---------------------|
+| Dense          | Qwen3 (0.6B–32B)                 | FA4 / FA3 / FA2 | Yes             |
+| MoE            | Qwen3-MoE (30B-A3B)              | FA3 / FA2   | Yes                 |
+| Hybrid         | Qwen3.5 (0.8B–27B, dense + MoE)  | FA3         | Yes                 |
+| Hybrid         | Qwen3-Next (80B-A3B)             | FA3         | Yes                 |
+| Classification | Qwen3-Reranker, Gemma3           | FA3 / FA2   | Yes                 |
+| Embedding      | Qwen3-Embedding                  | FA3 / FA2   | Yes                 |
+| Quantized      | GGUF (Qwen3, LLaMA, Gemma, Phi3) | CPU only    | No                  |
+
+## API
+
+OpenAI-compatible endpoints:
+
+| Endpoint                    | Description          |
+|-----------------------------|----------------------|
+| `POST /v1/chat/completions` | Chat completion      |
+| `POST /v1/completions`      | Text completion      |
+| `POST /v1/embeddings`       | Text embeddings      |
+| `POST /classify`            | Classification       |
+| `GET  /v1/models`           | List models          |
+| `GET  /health`              | Health check         |
+
+Compatible with OpenAI SDK, vLLM, and SGLang clients. Supports streaming, logprobs, and stop sequences.
 
 ## License
 
