@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/Prelude_logo.svg" alt="Prelude" height="80">
+  <img src="assets/Prelude_logo.svg" alt="Prelude" height="120">
 </p>
 
 <p align="center">
@@ -12,8 +12,9 @@
 
 **GPU (H200, Qwen3-4B)**
 
+<img src="assets/perf-throughput.svg" width="100%" alt="Prefill throughput vs concurrency">
 
-
+<img src="assets/perf-latency.svg" width="100%" alt="Latency P50/P95 at c=1">
 
 
 - **Peak throughput**: 186.7 req/s × 512 tokens = **95,590 tok/s** — **1.39× vs vLLM**, **1.23× vs SGLang** (at c=96)
