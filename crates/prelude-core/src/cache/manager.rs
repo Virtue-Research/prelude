@@ -79,35 +79,6 @@ impl CacheManager {
         }
     }
 
-    // ── Accessors ────────────────────────────────────────────────────────
-
-    #[allow(dead_code)]
-    pub(crate) fn prefix_cache(&self) -> Option<&Mutex<PrefixKvCache>> {
-        self.prefix_cache.as_ref()
-    }
-
-    #[cfg(feature = "cuda")]
-    #[allow(dead_code)]
-    pub(crate) fn paged_pool(&self) -> Option<&PagedKvPool> {
-        self.paged_pool.as_ref()
-    }
-
-    #[cfg(feature = "cuda")]
-    #[allow(dead_code)]
-    pub(crate) fn block_manager(&self) -> Option<&Mutex<crate::cache::block_manager::BlockManager>> {
-        self.block_manager.as_ref()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn deltanet_pool(&self) -> Option<&Mutex<DeltaNetPool>> {
-        self.deltanet_pool.as_ref()
-    }
-
-    #[cfg(feature = "cuda")]
-    #[allow(dead_code)]
-    pub(crate) fn has_paged_attn(&self) -> bool {
-        self.paged_pool.is_some() && self.block_manager.is_some()
-    }
 
     // ── Init helpers (read from CacheConfig, not env vars) ───────────────
 

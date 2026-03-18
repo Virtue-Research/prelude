@@ -19,10 +19,6 @@ pub(crate) const PTX_QKNORM_ROPE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/qknorm_rope.ptx"));
 pub(crate) const PTX_MOE_ROUTING: &str =
     include_str!(concat!(env!("OUT_DIR"), "/moe_routing.ptx"));
-pub(crate) const PTX_MOE_GATEUP: &str =
-    include_str!(concat!(env!("OUT_DIR"), "/moe_gateup.ptx"));
-pub(crate) const PTX_MOE_DOWN: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_down.ptx"));
-pub(crate) const PTX_KV_APPEND: &str = include_str!(concat!(env!("OUT_DIR"), "/kv_append.ptx"));
 pub(crate) const PTX_KNORM_ROPE_KV_WRITE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/knorm_rope_kv_write.ptx"));
 
@@ -33,9 +29,6 @@ pub(crate) const MOD_RMSNORM: &str = "normalization_rmsnorm";
 pub(crate) const MOD_ADD_RMSNORM: &str = "normalization_add_rmsnorm";
 pub(crate) const MOD_QKNORM_ROPE: &str = "rope_qknorm";
 pub(crate) const MOD_MOE_ROUTING: &str = "moe_routing";
-pub(crate) const MOD_MOE_GATEUP: &str = "moe_gateup";
-pub(crate) const MOD_MOE_DOWN: &str = "moe_down";
-pub(crate) const MOD_KV_APPEND: &str = "kvcache_append";
 pub(crate) const MOD_KNORM_ROPE_KV_WRITE: &str = "kvcache_knorm_rope_kv_write";
 
 pub mod elementwise;

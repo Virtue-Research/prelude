@@ -16,11 +16,6 @@ unsafe extern "C" {
         m: i64, k: i64, n: i64,
     );
 
-    pub fn onednn_f32_matmul(
-        a: *const c_void, b: *const c_void, c: *mut c_void,
-        m: i64, k: i64, n: i64,
-    );
-
     // ── BRGeMM micro-kernel ──────────────────────────────────────────
 
     pub fn brgemm_available() -> i32;

@@ -87,10 +87,7 @@ impl ArchSpec for Qwen3MoeArchSpec {
                 && is_safetensors,
             supports_varlen: cfg!(feature = "flash-attn-v3") && device.is_cuda() && is_safetensors,
             supports_deltanet: false,
-            supports_cuda_graph: cfg!(all(feature = "cuda", feature = "flash-attn-v3"))
-                && device.is_cuda()
-                && is_safetensors
-                && is_generate,
+            supports_cuda_graph: false,
         }
     }
 }

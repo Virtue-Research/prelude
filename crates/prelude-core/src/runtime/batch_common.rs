@@ -17,13 +17,6 @@ use super::request_state::{
 // Error cloning
 // ---------------------------------------------------------------------------
 
-pub(crate) fn clone_engine_error(err: &EngineError) -> EngineError {
-    match err {
-        EngineError::Unavailable(msg) => EngineError::Unavailable(msg.clone()),
-        EngineError::InvalidRequest(msg) => EngineError::InvalidRequest(msg.clone()),
-        EngineError::Internal(msg) => EngineError::Internal(msg.clone()),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tokenize generation batch
@@ -226,7 +219,7 @@ pub(crate) fn dispatch_generate_results(
         }
         Err(e) => {
             for req in inflight {
-                req.fail(clone_engine_error(&e));
+                req.fail(e.clone());
             }
         }
     }
@@ -255,7 +248,7 @@ pub(crate) fn dispatch_classify_results(
         }
         Err(e) => {
             for req in inflight {
-                let _ = req.response.send(Err(clone_engine_error(&e)));
+                let _ = req.response.send(Err(e.clone()));
             }
         }
     }
@@ -284,7 +277,7 @@ pub(crate) fn dispatch_embed_results(
         }
         Err(e) => {
             for req in inflight {
-                let _ = req.response.send(Err(clone_engine_error(&e)));
+                let _ = req.response.send(Err(e.clone()));
             }
         }
     }

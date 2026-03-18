@@ -123,15 +123,10 @@ impl GenerationRequestState {
                 }
                 GenerationResponseChannel::Stream(tx) => {
                     let _ = tx.send(StreamEvent::Started);
-                    // TODO: restore is_empty check after fixing model inference precision
-                    // issue where argmax produces <|im_start|> (151644) for some prompts,
-                    // causing empty output_text with skip_special_tokens=true.
-                    // if !result.output_text.is_empty() {
                     let _ = tx.send(StreamEvent::Token {
                         text: result.output_text,
                         logprobs: None,
                     });
-                    // }
                     let _ = tx.send(StreamEvent::Finished {
                         finish_reason: result.finish_reason,
                         usage: result.usage,
