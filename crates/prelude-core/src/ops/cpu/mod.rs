@@ -4,6 +4,7 @@
 //! Public Tensor functions are re-exported here for convenience.
 
 pub mod attention;
+pub mod bf16_utils;
 pub mod buf_tensor;
 pub mod cpu_float;
 pub mod gemm;

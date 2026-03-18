@@ -273,6 +273,8 @@ struct TaskPipeline<T: BatchTask> {
     gpu_task: Option<PendingSlot<T, T::RawGpuResult>>,
     /// Background tokenization job.
     tokenize_task: Option<JoinHandle<Option<ReadyBatch<T>>>>,
+    /// Number of items currently in the tokenize task (for adaptive wait visibility).
+    tokenize_count: usize,
     /// Adaptive batch sizing state.
     adaptive: AdaptiveSchedulerState,
 }
@@ -284,6 +286,7 @@ impl<T: BatchTask> TaskPipeline<T> {
             ready_batches: VecDeque::new(),
             gpu_task: None,
             tokenize_task: None,
+            tokenize_count: 0,
             adaptive,
         }
     }
@@ -297,6 +300,9 @@ impl<T: BatchTask> TaskPipeline<T> {
 
     fn gpu_busy(&self) -> bool { self.gpu_task.is_some() }
     fn tokenize_busy(&self) -> bool { self.tokenize_task.is_some() }
+
+    /// Total pending items: queued + currently being tokenized.
+    fn pending_count(&self) -> usize { self.queued.len() + self.tokenize_count }
 
     /// Drain items from queued (up to `max_batch_size` sequences) and start
     /// background tokenization via `spawn_blocking`.
@@ -313,6 +319,7 @@ impl<T: BatchTask> TaskPipeline<T> {
             items.push(self.queued.pop_front().unwrap());
         }
         if items.is_empty() { return; }
+        self.tokenize_count = items.len();
         let e = Arc::clone(engine);
         self.tokenize_task = Some(tokio::task::spawn_blocking(move || {
             tokenize_batch_sync(items, |item, idx| T::tokenize_one(&e, item, idx), T::fail)
@@ -323,6 +330,7 @@ impl<T: BatchTask> TaskPipeline<T> {
     async fn collect_tokenized(&mut self) {
         if self.tokenize_task.as_ref().is_some_and(|h| h.is_finished()) {
             if let Some(h) = self.tokenize_task.take() {
+                self.tokenize_count = 0;
                 match h.await {
                     Ok(Some(batch)) => self.ready_batches.push_back(batch),
                     Ok(None) => {}
@@ -332,13 +340,49 @@ impl<T: BatchTask> TaskPipeline<T> {
         }
     }
 
-    /// Submit a ready batch to the GPU queue. Returns batch size if submitted.
-    fn submit_ready(&mut self, gpu_tx: &GpuQueueTx) -> Option<usize> {
+    /// Submit ready batches to the GPU queue, merging multiple tokenized
+    /// batches into one GPU call (up to `max_batch_size`). Returns batch size
+    /// if submitted.
+    ///
+    /// Defers submission when more items are pending (queued + in-flight
+    /// tokenize) than are currently ready.  Rationale:
+    ///
+    ///   Submit now  → T_gpu(r) + T_gpu(p)      = 2C + (r+p)α
+    ///   Defer+merge → T_tok(p) + T_gpu(r+p)    =  C + (r+p)α + T_tok
+    ///
+    /// Because GPU kernel launch overhead C ≈ 3–5 ms >> T_tok ≈ 1–2 ms,
+    /// deferring saves one C per merge.  The loop naturally retries within
+    /// microseconds, so the extra latency is negligible.
+    fn submit_ready(&mut self, gpu_tx: &GpuQueueTx, max_batch_size: usize) -> Option<usize> {
         if self.gpu_task.is_some() { return None; }
-        let batch = self.ready_batches.pop_front()?;
-        let batch_sz = batch.requests.len();
-        let handle = T::submit(gpu_tx, batch.tokenized);
-        self.gpu_task = Some(PendingSlot::new(batch.requests, handle));
+        if self.ready_batches.is_empty() { return None; }
+
+        // Defer: pending items (queued + tokenizing) outnumber ready items.
+        let pending = self.pending_count();
+        if pending > 0 {
+            let ready_total: usize = self.ready_batches.iter().map(|b| b.requests.len()).sum();
+            if pending > ready_total {
+                return None;
+            }
+        }
+
+        let first = self.ready_batches.pop_front().unwrap();
+        let mut requests = first.requests;
+        let mut tokenized = first.tokenized;
+
+        // Merge subsequent ready batches up to max_batch_size.
+        while let Some(next) = self.ready_batches.front() {
+            if requests.len() + next.requests.len() > max_batch_size {
+                break;
+            }
+            let next = self.ready_batches.pop_front().unwrap();
+            requests.extend(next.requests);
+            tokenized.extend(next.tokenized);
+        }
+
+        let batch_sz = requests.len();
+        let handle = T::submit(gpu_tx, tokenized);
+        self.gpu_task = Some(PendingSlot::new(requests, handle));
         Some(batch_sz)
     }
 
@@ -366,7 +410,7 @@ impl<T: BatchTask> TaskPipeline<T> {
 
     /// Shutdown: finish in-flight work, then fail all remaining requests.
     async fn shutdown(&mut self, engine: &Engine) {
-        if let Some(h) = self.tokenize_task.take() { let _ = h.await; }
+        if let Some(h) = self.tokenize_task.take() { self.tokenize_count = 0; let _ = h.await; }
         if let Some(slot) = self.gpu_task.take() {
             let c = PendingSlot::collect(slot).await;
             let result = c.result.and_then(|raw| T::postprocess(raw, engine));
@@ -439,14 +483,14 @@ impl BatchRuntimeQueues {
 
         // Find the max recommended wait across pipelines with queued work
         let mut wait_budget = Duration::ZERO;
-        for (len, adaptive, busy) in [
-            (self.generate.queued.len(), &self.generate.adaptive, self.generate.tokenize_busy()),
-            (self.classify.queued.len(), &self.classify.adaptive, self.classify.tokenize_busy()),
-            (self.embed.queued.len(), &self.embed.adaptive, self.embed.tokenize_busy()),
+        for (pending, adaptive) in [
+            (self.generate.pending_count(), &self.generate.adaptive),
+            (self.classify.pending_count(), &self.classify.adaptive),
+            (self.embed.pending_count(), &self.embed.adaptive),
         ] {
-            if len > 0 && !busy {
-                let (target, budget) = adaptive.compute_optimal_batch_and_wait(len);
-                if len < target && budget > wait_budget {
+            if pending > 0 {
+                let (target, budget) = adaptive.compute_optimal_batch_and_wait(pending);
+                if pending < target && budget > wait_budget {
                     wait_budget = budget;
                 }
             }
@@ -491,14 +535,14 @@ impl BatchRuntimeQueues {
         self.embed.collect_gpu(engine).await;
     }
 
-    fn submit_all(&mut self, gpu_tx: &GpuQueueTx) {
-        if let Some(sz) = self.generate.submit_ready(gpu_tx) {
+    fn submit_all(&mut self, gpu_tx: &GpuQueueTx, max_batch_size: usize) {
+        if let Some(sz) = self.generate.submit_ready(gpu_tx, max_batch_size) {
             tracing::info!(batch_size = sz, queue_remaining = self.generate.queued.len(), "gen batch submitted");
         }
-        if let Some(sz) = self.classify.submit_ready(gpu_tx) {
+        if let Some(sz) = self.classify.submit_ready(gpu_tx, max_batch_size) {
             tracing::debug!(batch_size = sz, queue_remaining = self.classify.queued.len(), "classify batch submitted");
         }
-        if let Some(sz) = self.embed.submit_ready(gpu_tx) {
+        if let Some(sz) = self.embed.submit_ready(gpu_tx, max_batch_size) {
             tracing::debug!(batch_size = sz, queue_remaining = self.embed.queued.len(), "embed batch submitted");
         }
     }
@@ -577,7 +621,7 @@ pub(crate) async fn batch_runtime_loop(
 
         // ── Phase D: Collect GPU results + submit ready batches ──
         q.collect_gpu_all(&engine).await;
-        q.submit_all(&gpu_tx);
+        q.submit_all(&gpu_tx, max_batch_size);
 
         // ── Phase G: Brief yield if GPU is busy to allow more requests to arrive ──
         if q.any_gpu_busy() && rx_open {

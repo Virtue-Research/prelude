@@ -124,20 +124,29 @@ impl AdaptiveSchedulerState {
 
         match (below, above) {
             (Some((bi, bv)), Some((ai, av))) => {
-                // Linear interpolation
-                let t = (b - bi) as f64 / (ai - bi) as f64;
-                bv + t * (av - bv)
+                // Fit the GPU cost model  s(b) = C/b + α  to both points:
+                //   bv = C/bi + α,  av = C/ai + α
+                //   → C = (bv - av) · bi · ai / (ai - bi)
+                //   → α = bv - C/bi
+                // This captures the sublinear GPU cost structure where fixed
+                // kernel launch overhead C is amortized over the batch.
+                // Linear interpolation would severely underestimate marginal
+                // savings at small batch sizes (e.g. batch 1→2).
+                let bi_f = bi as f64;
+                let ai_f = ai as f64;
+                let c = (bv - av) * bi_f * ai_f / (ai_f - bi_f);
+                let alpha = bv - c / bi_f;
+                (c / b as f64 + alpha).max(0.0)
             }
             (Some((bi, bv)), None) => {
-                // Only have data below — extrapolate using a 1/b model.
-                // Assume total GPU time = C (constant overhead) that is amortized,
-                // so per_req(b) = (bi * bv) / b.  This gives diminishing per-req
-                // time as batch size grows, which matches GPU kernel behavior.
+                // Only have data below — extrapolate using C/b model.
+                // Assume total GPU time = C that is amortized, so
+                // per_req(b) = (bi * bv) / b.
                 let total = bi as f64 * bv;
                 total / b as f64
             }
             (None, Some((ai, av))) => {
-                // Only have data above — extrapolate using same 1/b model.
+                // Only have data above — extrapolate using same C/b model.
                 let total = ai as f64 * av;
                 total / b as f64
             }
@@ -164,22 +173,13 @@ impl AdaptiveSchedulerState {
             return (self.b_max, Duration::ZERO);
         }
 
-        // Need at least some observed GPU data to make marginal decisions.
-        // Cold start: if no GPU data yet, estimate how many requests can arrive
-        // within w_cap and try to fill up to that amount. This avoids locking in
-        // tiny batches before the scheduler has a chance to observe large-batch
-        // throughput.
+        // Cold start: no GPU data yet — dispatch immediately.  At c=1 this
+        // avoids any wait penalty.  At high concurrency, the defer logic in
+        // submit_ready() merges subsequent arrivals into large batches that
+        // seed the EWMA with accurate data.  The C/b+α interpolation model
+        // correctly handles batch(1) observations without pollution.
         if !self.has_gpu_data() {
-            // Expected arrivals within w_cap: lambda_hat * w_cap / 1000
-            let expected = (self.lambda_hat * self.w_cap / 1000.0).ceil() as usize;
-            let target = q.max(expected).min(self.b_max);
-            let wait_ms = if target > q {
-                let computed = (target - q) as f64 / self.lambda_hat.max(eps) * 1000.0;
-                self.w_cap.min(computed)
-            } else {
-                0.0
-            };
-            return (target, Duration::from_secs_f64(wait_ms / 1000.0));
+            return (q.max(1).min(self.b_max), Duration::ZERO);
         }
 
         // Find b* by marginal rule: keep increasing batch size as long as

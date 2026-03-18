@@ -8,8 +8,10 @@
 //! - `CpuRmsNorm` — Module wrapper
 
 use candle_core::{DType, Module, Result, Tensor};
-use rayon::prelude::*;
 
+use super::bf16_utils::{bf16_to_f32, f32_to_bf16};
+#[cfg(target_arch = "x86_64")]
+use super::bf16_utils::{bf16x16_load_as_f32, f32x16_store_as_bf16};
 use super::cpu_float::CpuFloat;
 
 // ── Tensor-level API ────────────────────────────────────────────────────
@@ -263,7 +265,7 @@ pub(crate) fn rmsnorm_impl(
             }
         }
     }
-    rmsnorm_bf16_scalar(output, input, weight, batch_size, hidden_size, eps);
+    rmsnorm_bf16_scalar_via_generic(output, input, weight, batch_size, hidden_size, eps);
 }
 
 fn fused_add_rmsnorm_impl(
@@ -289,12 +291,12 @@ fn fused_add_rmsnorm_impl(
             }
         }
     }
-    fused_add_rmsnorm_bf16_scalar(input, residual, weight, batch_size, hidden_size, eps);
+    fused_add_rmsnorm_bf16_scalar_via_generic(input, residual, weight, batch_size, hidden_size, eps);
 }
 
-// ── Scalar fallback ─────────────────────────────────────────────────────
+// ── Scalar fallback (delegates to generic kernels via CpuFloat) ─────────
 
-fn rmsnorm_bf16_scalar(
+fn rmsnorm_bf16_scalar_via_generic(
     output: &mut [u16],
     input: &[u16],
     weight: &[u16],
@@ -302,25 +304,13 @@ fn rmsnorm_bf16_scalar(
     hidden_size: usize,
     eps: f32,
 ) {
-    let inv_n = 1.0f32 / hidden_size as f32;
-    for b in 0..batch_size {
-        let off = b * hidden_size;
-        let row = &input[off..off + hidden_size];
-        let out = &mut output[off..off + hidden_size];
-
-        let mut sum_sq = 0.0f32;
-        for j in 0..hidden_size {
-            let v = bf16_to_f32(row[j]);
-            sum_sq += v * v;
-        }
-        let scale = 1.0 / (sum_sq * inv_n + eps).sqrt();
-        for j in 0..hidden_size {
-            out[j] = f32_to_bf16(bf16_to_f32(row[j]) * bf16_to_f32(weight[j]) * scale);
-        }
-    }
+    let out = unsafe { &mut *(output as *mut [u16] as *mut [half::bf16]) };
+    let inp = unsafe { &*(input as *const [u16] as *const [half::bf16]) };
+    let w = unsafe { &*(weight as *const [u16] as *const [half::bf16]) };
+    rmsnorm_generic(out, inp, w, batch_size, hidden_size, eps);
 }
 
-fn fused_add_rmsnorm_bf16_scalar(
+fn fused_add_rmsnorm_bf16_scalar_via_generic(
     input: &mut [u16],
     residual: &mut [u16],
     weight: &[u16],
@@ -328,24 +318,10 @@ fn fused_add_rmsnorm_bf16_scalar(
     hidden_size: usize,
     eps: f32,
 ) {
-    let inv_n = 1.0f32 / hidden_size as f32;
-    for b in 0..batch_size {
-        let off = b * hidden_size;
-
-        // Pass 1: compute sum_sq only (don't write anything yet)
-        let mut sum_sq = 0.0f32;
-        for j in 0..hidden_size {
-            let added = bf16_to_f32(input[off + j]) + bf16_to_f32(residual[off + j]);
-            sum_sq += added * added;
-        }
-        let scale = 1.0 / (sum_sq * inv_n + eps).sqrt();
-        // Pass 2: recompute added (cheap), write both outputs
-        for j in 0..hidden_size {
-            let added = bf16_to_f32(input[off + j]) + bf16_to_f32(residual[off + j]);
-            residual[off + j] = f32_to_bf16(added);
-            input[off + j] = f32_to_bf16(added * bf16_to_f32(weight[j]) * scale);
-        }
-    }
+    let inp = unsafe { &mut *(input as *mut [u16] as *mut [half::bf16]) };
+    let res = unsafe { &mut *(residual as *mut [u16] as *mut [half::bf16]) };
+    let w = unsafe { &*(weight as *const [u16] as *const [half::bf16]) };
+    fused_add_rmsnorm_generic(inp, res, w, batch_size, hidden_size, eps);
 }
 
 // ── Generic scalar kernels (any CpuFloat dtype) ────────────────────────
@@ -400,22 +376,6 @@ pub(crate) fn fused_add_rmsnorm_generic<T: CpuFloat>(
             input[off + j] = T::from_f32(added * weight[j].to_f32() * scale);
         }
     }
-}
-
-// ── Scalar BF16 <-> F32 helpers ─────────────────────────────────────────
-
-#[inline(always)]
-fn bf16_to_f32(v: u16) -> f32 {
-    f32::from_bits((v as u32) << 16)
-}
-
-#[inline(always)]
-fn f32_to_bf16(v: f32) -> u16 {
-    let bits = v.to_bits();
-    // Round to nearest even
-    let lsb = (bits >> 16) & 1;
-    let rounded = bits.wrapping_add(0x7FFF + lsb);
-    (rounded >> 16) as u16
 }
 
 // ── AVX-512 implementation ──────────────────────────────────────────────
@@ -526,54 +486,13 @@ fn fused_add_rmsnorm_bf16_avx512(
     }
 }
 
-// ── AVX-512 BF16 <-> F32 vector helpers ─────────────────────────────────
-
-/// Load 16 BF16 values (256 bits) and convert to 16 F32 values (512 bits).
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-#[inline]
-fn bf16x16_load_as_f32(ptr: *const u16) -> core::arch::x86_64::__m512 {
-    use core::arch::x86_64::*;
-    unsafe {
-        let bf16_vals = _mm256_loadu_si256(ptr as *const __m256i);
-        let extended = _mm512_cvtepu16_epi32(bf16_vals);
-        let shifted = _mm512_slli_epi32(extended, 16);
-        _mm512_castsi512_ps(shifted)
-    }
-}
-
-/// Convert 16 F32 values to 16 BF16 values with round-to-nearest-even, and store.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-#[inline]
-fn f32x16_store_as_bf16(ptr: *mut u16, vals: core::arch::x86_64::__m512) {
-    use core::arch::x86_64::*;
-    unsafe {
-        let bits = _mm512_castps_si512(vals);
-        let lsb = _mm512_srli_epi32::<16>(bits);
-        let lsb_masked = _mm512_and_si512(lsb, _mm512_set1_epi32(1));
-        let rounding_bias = _mm512_add_epi32(lsb_masked, _mm512_set1_epi32(0x7FFF));
-        let rounded = _mm512_add_epi32(bits, rounding_bias);
-        let shifted = _mm512_srli_epi32::<16>(rounded);
-        let packed = _mm512_cvtepi32_epi16(shifted);
-        _mm256_storeu_si256(ptr as *mut __m256i, packed);
-    }
-}
-
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_bf16_vec(vals: &[f32]) -> Vec<u16> {
-        vals.iter().map(|&v| f32_to_bf16(v)).collect()
-    }
-
-    fn to_f32_vec(vals: &[u16]) -> Vec<f32> {
-        vals.iter().map(|&v| bf16_to_f32(v)).collect()
-    }
-
+    use super::super::bf16_utils::{make_bf16_vec, to_f32_vec, bf16_to_f32, f32_to_bf16};
     use super::super::max_sglang_violation;
 
     /// Reference RMSNorm in f64 for accuracy comparison.
@@ -599,7 +518,7 @@ mod tests {
         let weight = make_bf16_vec(&weight_f32);
         let mut output = vec![0u16; hidden];
 
-        rmsnorm_bf16_scalar(&mut output, &input, &weight, 1, hidden, eps as f32);
+        rmsnorm_bf16_scalar_via_generic(&mut output, &input, &weight, 1, hidden, eps as f32);
 
         let input_rebf16: Vec<f32> = to_f32_vec(&input);
         let weight_rebf16: Vec<f32> = to_f32_vec(&weight);
@@ -627,7 +546,7 @@ mod tests {
 
         // Scalar
         let mut out_scalar = vec![0u16; batch * hidden];
-        rmsnorm_bf16_scalar(&mut out_scalar, &input, &weight, batch, hidden, 1e-6);
+        rmsnorm_bf16_scalar_via_generic(&mut out_scalar, &input, &weight, batch, hidden, 1e-6);
 
         // Dispatched
         let mut out_dispatch = vec![0u16; batch * hidden];
@@ -671,7 +590,7 @@ mod tests {
         let mut residual = make_bf16_vec(&res_f32);
         let weight = make_bf16_vec(&weight_f32);
 
-        fused_add_rmsnorm_bf16_scalar(&mut input, &mut residual, &weight, 1, hidden, eps);
+        fused_add_rmsnorm_bf16_scalar_via_generic(&mut input, &mut residual, &weight, 1, hidden, eps);
 
         let actual: Vec<f32> = (0..hidden).map(|j| bf16_to_f32(residual[j])).collect();
         let expected: Vec<f32> = (0..hidden).map(|j| h_f32[j] + res_f32[j]).collect();
@@ -696,7 +615,7 @@ mod tests {
         // Scalar
         let mut in_s = make_bf16_vec(&h_f32);
         let mut res_s = make_bf16_vec(&res_f32);
-        fused_add_rmsnorm_bf16_scalar(&mut in_s, &mut res_s, &weight, batch, hidden, 1e-6);
+        fused_add_rmsnorm_bf16_scalar_via_generic(&mut in_s, &mut res_s, &weight, batch, hidden, 1e-6);
 
         // Dispatched
         let mut in_d = make_bf16_vec(&h_f32);

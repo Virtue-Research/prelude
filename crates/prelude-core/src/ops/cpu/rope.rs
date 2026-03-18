@@ -7,7 +7,9 @@
 //! cos_sin_cache layout: `[max_seq_len, rotary_dim]` where first half is cos,
 //! second half is sin: `[cos[0..embed_dim] | sin[0..embed_dim]]`.
 
-use rayon::prelude::*;
+use super::bf16_utils::{bf16_to_f32, f32_to_bf16};
+#[cfg(target_arch = "x86_64")]
+use super::bf16_utils::{bf16x16_load_as_f32, f32x16_store_as_bf16};
 
 /// Minimum elements per thread to justify parallelization overhead.
 /// RoPE per-element work is very light (~0.26ns/elem AVX-512). On 64+ core
@@ -191,65 +193,17 @@ fn rope_neox_row_avx512(row: &mut [u16], cache: &[u16], cache_off: usize, embed_
     }
 }
 
-// ── BF16 <-> F32 helpers ────────────────────────────────────────────────
-
-#[inline(always)]
-fn bf16_to_f32(v: u16) -> f32 {
-    f32::from_bits((v as u32) << 16)
-}
-
-#[inline(always)]
-fn f32_to_bf16(v: f32) -> u16 {
-    let bits = v.to_bits();
-    let lsb = (bits >> 16) & 1;
-    let rounded = bits.wrapping_add(0x7FFF + lsb);
-    (rounded >> 16) as u16
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-#[inline]
-fn bf16x16_load_as_f32(ptr: *const u16) -> core::arch::x86_64::__m512 {
-    use core::arch::x86_64::*;
-    unsafe {
-        let bf16_vals = _mm256_loadu_si256(ptr as *const __m256i);
-        let extended = _mm512_cvtepu16_epi32(bf16_vals);
-        let shifted = _mm512_slli_epi32(extended, 16);
-        _mm512_castsi512_ps(shifted)
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-#[inline]
-fn f32x16_store_as_bf16(ptr: *mut u16, vals: core::arch::x86_64::__m512) {
-    use core::arch::x86_64::*;
-    unsafe {
-        let bits = _mm512_castps_si512(vals);
-        let lsb = _mm512_srli_epi32::<16>(bits);
-        let lsb_masked = _mm512_and_si512(lsb, _mm512_set1_epi32(1));
-        let rounding_bias = _mm512_add_epi32(lsb_masked, _mm512_set1_epi32(0x7FFF));
-        let rounded = _mm512_add_epi32(bits, rounding_bias);
-        let shifted = _mm512_srli_epi32::<16>(rounded);
-        let packed = _mm512_cvtepi32_epi16(shifted);
-        _mm256_storeu_si256(ptr as *mut __m256i, packed);
-    }
-}
-
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use super::super::bf16_utils::{make_bf16_vec, bf16_to_f32, f32_to_bf16};
     use super::super::max_sglang_violation;
 
     fn make_bf16(v: f32) -> u16 {
         f32_to_bf16(v)
-    }
-
-    fn make_bf16_vec(vals: &[f32]) -> Vec<u16> {
-        vals.iter().map(|&v| f32_to_bf16(v)).collect()
     }
 
     /// Build a cos_sin_cache: cache[pos, 0..embed_dim] = cos, cache[pos, embed_dim..rotary_dim] = sin
