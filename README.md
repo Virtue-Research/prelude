@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/Prelude_logo.svg" alt="Prelude" height="120">
+  <img src="assets/Prelude_logo.svg" alt="Prelude" height="240">
 </p>
 
 <p align="center">

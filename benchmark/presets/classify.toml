@@ -1,0 +1,13 @@
+task = "classify"
+
+concurrency = [1, 4, 8, 16, 32, 64, 128]
+requests    = [50, 100, 100, 200, 200, 400, 400]
+warmup      = 5
+batch_size  = 20             # texts per HTTP request
+seed        = 42
+
+# output = "results/classify.json"
+
+[data]
+type          = "synthetic"  # pure random text; each request is unique (no KV reuse)
+prompt_tokens = "256-768"    # uniform [256, 768] → avg 512 tokens/seq (needs tokenizer)
