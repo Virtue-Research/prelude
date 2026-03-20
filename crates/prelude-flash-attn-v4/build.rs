@@ -328,7 +328,6 @@ fn ensure_fa4_source(out_dir: &Path) -> Result<PathBuf> {
     }
 
     // Upstream bug: create_softcap_scoremod missing seqlen_info param.
-    // Tracked in https://github.com/Dao-AILab/flash-attention/pull/2366
     let utils_py = fa4_src.join("flash_attn/cute/utils.py");
     if utils_py.exists() {
         let content = std::fs::read_to_string(&utils_py)?;
