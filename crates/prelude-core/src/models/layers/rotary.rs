@@ -30,7 +30,7 @@ impl Qwen3RotaryEmbedding {
         let sin = freqs.sin()?.to_dtype(dtype)?;
         let cos = freqs.cos()?.to_dtype(dtype)?;
 
-        let cos_sin_cache = if dev.is_cpu() && dtype == DType::BF16 {
+        let cos_sin_cache = if dev.is_cpu() && (dtype == DType::BF16 || dtype == DType::F32) {
             Some(Tensor::cat(&[&cos, &sin], 1)?)
         } else {
             None
@@ -51,17 +51,23 @@ impl Qwen3RotaryEmbedding {
         k: &Tensor,
         position_ids: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        // Fast path: cpu_ops AVX-512 RoPE (in-place, no Tensor allocs)
-        if q.device().is_cpu() && q.dtype() == DType::BF16 {
+        // Fast path: cpu_ops RoPE (in-place, no Tensor allocs)
+        if q.device().is_cpu() {
             if let Some(ref cache) = self.cos_sin_cache {
                 let (total, h_q, d) = q.dims3()?;
                 let h_k = k.dim(1)?;
                 let q4 = q.reshape((1, total, h_q, d))?;
                 let k4 = k.reshape((1, total, h_k, d))?;
                 let positions: Vec<i64> = position_ids.to_dtype(DType::I64)?.to_vec1::<i64>()?;
-                let (q_out, k_out) = crate::ops::cpu::cpu_rotary_embedding_with_positions(
-                    &q4, &k4, cache, &positions, h_q, h_k,
-                )?;
+                let (q_out, k_out) = if q.dtype() == DType::F32 {
+                    crate::ops::cpu::cpu_rotary_embedding_f32_with_positions(
+                        &q4, &k4, cache, &positions, h_q, h_k,
+                    )?
+                } else {
+                    crate::ops::cpu::cpu_rotary_embedding_with_positions(
+                        &q4, &k4, cache, &positions, h_q, h_k,
+                    )?
+                };
                 return Ok((
                     q_out.reshape((total, h_q, d))?,
                     k_out.reshape((total, h_k, d))?,
@@ -69,7 +75,7 @@ impl Qwen3RotaryEmbedding {
             }
         }
 
-        // Fallback: candle rope_thd (GPU or F32)
+        // Fallback: candle rope_thd (GPU)
         // q: (total_tokens, num_heads, head_dim), position_ids: (total_tokens,)
         let cos = self.cos.index_select(position_ids, 0)?;
         let sin = self.sin.index_select(position_ids, 0)?;

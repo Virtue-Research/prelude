@@ -16,6 +16,23 @@ unsafe extern "C" {
         m: i64, k: i64, n: i64,
     );
 
+    pub fn onednn_f32_matmul(
+        a: *const c_void, b: *const c_void, c: *mut c_void,
+        m: i64, k: i64, n: i64,
+    );
+
+    // ── F32 packed weights (oneDNN blocked format) ────────────────────
+
+    pub fn onednn_f32_pack_weights(
+        weight: *const c_void, k: i64, n: i64, ref_m: i64,
+    ) -> *mut c_void;
+
+    pub fn onednn_f32_linear_packed(
+        input: *const c_void, packed_weight: *mut c_void,
+        output: *mut c_void, m: i64,
+    );
+
+    pub fn onednn_packed_weights_destroy(pw: *mut c_void);
     // ── BRGeMM micro-kernel ──────────────────────────────────────────
 
     pub fn brgemm_available() -> i32;

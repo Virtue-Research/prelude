@@ -109,6 +109,7 @@ pub struct CommonModelConfig {
     pub vocab_size: usize,
     pub num_hidden_layers: usize,
     pub max_position_embeddings: usize,
+    pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub head_dim: usize,
 }
@@ -253,6 +254,8 @@ pub struct BatchPrefillResult {
     pub deltanet_slot: Option<u32>,
     /// Logprobs for the first token (populated when request.logprobs is Some).
     pub first_token_logprobs: Option<TokenLogprobInfo>,
+    /// Per-prompt-token logprobs (populated when request.prompt_logprobs is Some).
+    pub prompt_token_logprobs: Option<Vec<TokenLogprobInfo>>,
 }
 
 /// One sequence in a batched decode step (Q=1 per sequence).
@@ -266,7 +269,7 @@ pub struct BatchDecodeSeq<'a> {
 }
 
 /// Owned version of [`BatchDecodeSeq`] for sending through the GPU queue.
-#[cfg(feature = "flash-attn-v3")]
+#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
 pub struct OwnedBatchDecodeSeq {
     pub token: u32,
     pub position: usize,
@@ -275,7 +278,7 @@ pub struct OwnedBatchDecodeSeq {
     pub deltanet_slot: Option<u32>,
 }
 
-#[cfg(feature = "flash-attn-v3")]
+#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
 impl OwnedBatchDecodeSeq {
     pub fn as_borrowed(&self) -> BatchDecodeSeq<'_> {
         BatchDecodeSeq {
@@ -295,9 +298,9 @@ impl OwnedBatchDecodeSeq {
 pub(crate) struct PagedKvPool {
     pub(crate) key_caches: Vec<Tensor>,
     pub(crate) value_caches: Vec<Tensor>,
-    #[cfg(feature = "flash-attn-v3")]
+    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
     pub(crate) key_caches_flash: Vec<Tensor>,
-    #[cfg(feature = "flash-attn-v3")]
+    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
     pub(crate) value_caches_flash: Vec<Tensor>,
     pub(crate) block_size: usize,
 }
@@ -308,17 +311,17 @@ impl PagedKvPool {
     /// FA3: flash layout `[blocks, block_sz, heads, dim]`.
     /// FA2/others: v1 layout `[blocks, heads, dim/x, block_sz, x]`.
     pub(crate) fn active_key_caches(&self) -> &[Tensor] {
-        #[cfg(feature = "flash-attn-v3")]
+        #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
         return &self.key_caches_flash;
-        #[cfg(not(feature = "flash-attn-v3"))]
+        #[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
         return &self.key_caches;
     }
 
     /// Returns the active value caches for the compiled attention backend.
     pub(crate) fn active_value_caches(&self) -> &[Tensor] {
-        #[cfg(feature = "flash-attn-v3")]
+        #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
         return &self.value_caches_flash;
-        #[cfg(not(feature = "flash-attn-v3"))]
+        #[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
         return &self.value_caches;
     }
 }

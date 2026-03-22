@@ -90,6 +90,8 @@ fn completions_stream(
                     index: 0,
                     finish_reason: String::new(),
                     logprobs,
+                    prompt_logprobs: None,
+                    prompt_token_ids: None,
                 }],
                 usage: Usage {
                     prompt_tokens: 0,
@@ -124,6 +126,8 @@ fn completions_stream(
                     index: 0,
                     finish_reason,
                     logprobs: None,
+                    prompt_logprobs: None,
+                    prompt_token_ids: None,
                 }],
                 usage: if include_usage {
                     usage.clone()
@@ -152,6 +156,10 @@ fn completions_stream(
             events.push(sse_done_event());
             events
         }
+        StreamEvent::Error { message } => {
+            tracing::error!(error = %message, "stream generation error");
+            vec![sse_done_event()]
+        }
     }))
 }
 
@@ -176,11 +184,15 @@ async fn completions_batch(
                 .token_logprobs
                 .as_ref()
                 .map(|infos| to_completion_logprobs(infos, &result.output_text));
+            let (prompt_logprobs, prompt_token_ids) =
+                crate::logprobs::to_prompt_logprobs_response(&result);
             CompletionChoice {
                 text: result.output_text,
                 index: idx as u32,
                 finish_reason: result.finish_reason.as_openai_str().to_string(),
                 logprobs,
+                prompt_logprobs,
+                prompt_token_ids,
             }
         })
         .collect();
@@ -240,6 +252,7 @@ fn parse_completion_requests(
             request.stop.clone(),
             request.seed,
             request.logprobs,
+            request.prompt_logprobs,
         ));
     }
 

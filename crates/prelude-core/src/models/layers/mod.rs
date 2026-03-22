@@ -80,6 +80,11 @@ pub(crate) use attn::{
     reshape_and_cache, varlen_attention, varlen_attention_bidirectional, varlen_attention_paged,
     varlen_attention_windowed,
 };
+#[cfg(feature = "flashinfer")]
+pub(crate) use attn::{
+    allocate_fi_graph_meta, fi_begin_forward, fi_end_forward, fi_precompute_paged_plan,
+    fi_precompute_paged_plan_graphed,
+};
 pub(crate) use ops::{
     debug_disable_fused_add_rmsnorm, debug_disable_fused_qknorm_rope, fast_add, fast_rms_norm,
     fast_silu_mul, first_token_select, fused_add_rmsnorm, last_token_select, qknorm_rope_varlen,

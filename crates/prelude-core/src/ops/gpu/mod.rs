@@ -21,6 +21,8 @@ pub(crate) const PTX_MOE_ROUTING: &str =
     include_str!(concat!(env!("OUT_DIR"), "/moe_routing.ptx"));
 pub(crate) const PTX_KNORM_ROPE_KV_WRITE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/knorm_rope_kv_write.ptx"));
+pub(crate) const PTX_SCATTER_KV_CACHE: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/scatter_kv_cache.ptx"));
 
 // Module names for cudarc caching
 pub(crate) const MOD_ADD: &str = "elementwise_add";
@@ -30,6 +32,7 @@ pub(crate) const MOD_ADD_RMSNORM: &str = "normalization_add_rmsnorm";
 pub(crate) const MOD_QKNORM_ROPE: &str = "rope_qknorm";
 pub(crate) const MOD_MOE_ROUTING: &str = "moe_routing";
 pub(crate) const MOD_KNORM_ROPE_KV_WRITE: &str = "kvcache_knorm_rope_kv_write";
+pub(crate) const MOD_SCATTER_KV_CACHE: &str = "kvcache_scatter_kv_cache";
 
 pub mod elementwise;
 pub mod rmsnorm;

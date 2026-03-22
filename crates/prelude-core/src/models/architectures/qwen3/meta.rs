@@ -28,6 +28,7 @@ fn common_from_qwen3(cfg: &Qwen3Config) -> CommonModelConfig {
         vocab_size: cfg.vocab_size,
         num_hidden_layers: cfg.num_hidden_layers,
         max_position_embeddings: cfg.max_position_embeddings,
+        num_attention_heads: cfg.num_attention_heads,
         num_key_value_heads: cfg.num_key_value_heads,
         head_dim: cfg.head_dim,
     }
@@ -120,8 +121,11 @@ impl ArchSpec for Qwen3ArchSpec {
         device: &candle_core::Device,
     ) -> RuntimeCaps {
         let is_safetensors = backend == WeightsBackend::Safetensors;
-        let supports_cuda_varlen =
-            cfg!(feature = "flash-attn-v3") && device.is_cuda() && is_safetensors;
+        let supports_cuda_varlen = (cfg!(feature = "cuda")
+            || cfg!(feature = "flash-attn-v4")
+            || cfg!(feature = "flashinfer"))
+            && device.is_cuda()
+            && is_safetensors;
         RuntimeCaps {
             supports_kv_cache: is_safetensors && task == TaskKind::Generate,
             supports_prefix_cache: is_safetensors
@@ -130,7 +134,7 @@ impl ArchSpec for Qwen3ArchSpec {
             supports_paged_attn: cfg!(feature = "cuda") && device.is_cuda() && is_safetensors,
             supports_varlen: supports_cuda_varlen,
             supports_deltanet: false,
-            supports_cuda_graph: false,
+            supports_cuda_graph: supports_cuda_varlen && task == TaskKind::Generate,
         }
     }
 }

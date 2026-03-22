@@ -1,0 +1,58 @@
+{
+  "model": "Qwen/Qwen3-Next-80B-A3B-Instruct",
+  "version": 1,
+  "prompts": [
+    {
+      "id": "factual_completion",
+      "description": "Short English factual completion",
+      "type": "completion",
+      "prompt": "The capital of France is",
+      "max_tokens": 16,
+      "temperature": 0.0
+    },
+    {
+      "id": "math_completion",
+      "description": "Simple math completion",
+      "type": "completion",
+      "prompt": "1 + 1 =",
+      "max_tokens": 8,
+      "temperature": 0.0
+    },
+    {
+      "id": "chat_factual",
+      "description": "Chat factual question",
+      "messages": [
+        {"role": "user", "content": "What is the capital of Japan? Answer in one word."}
+      ],
+      "max_tokens": 16,
+      "temperature": 0.0
+    },
+    {
+      "id": "chat_math",
+      "description": "Chat math question",
+      "messages": [
+        {"role": "user", "content": "What is 2+2? Answer with just the number."}
+      ],
+      "max_tokens": 8,
+      "temperature": 0.0
+    },
+    {
+      "id": "chat_code",
+      "description": "Code generation",
+      "messages": [
+        {"role": "user", "content": "Write a Python function that returns the sum of two numbers."}
+      ],
+      "max_tokens": 64,
+      "temperature": 0.0
+    },
+    {
+      "id": "chat_chinese",
+      "description": "Chinese language question",
+      "messages": [
+        {"role": "user", "content": "法国的首都是哪里？请简短回答。"}
+      ],
+      "max_tokens": 16,
+      "temperature": 0.0
+    }
+  ]
+}

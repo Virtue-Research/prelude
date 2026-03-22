@@ -8,7 +8,7 @@ use crate::engine::{Engine, EngineError, InferenceEngine, PreparedGenerateReques
 use crate::runtime::gpu_queue::spawn_gpu_worker;
 use crate::runtime::{
     SchedulerConfig, batch_runtime_loop, continuous_generation_loop,
-    cpu_batch_runtime_loop, cpu_continuous_generation_loop,
+    cpu_batch_runtime_loop, spawn_cpu_continuous_worker,
 };
 use crate::types::{
     ClassifyRequest, ClassifyResult, EmbedRequest, EmbedResult, GenerateRequest, GenerateResult,
@@ -39,6 +39,7 @@ pub struct ScheduledEngine {
     engine: Arc<Engine>,
     _batch_loop_handle: tokio::task::JoinHandle<()>,
     _continuous_loop_handle: Option<tokio::task::JoinHandle<()>>,
+    _cpu_continuous_handle: Option<std::thread::JoinHandle<()>>,
     _gpu_worker_handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -96,6 +97,7 @@ impl ScheduledEngine {
             engine,
             _batch_loop_handle: batch_handle,
             _continuous_loop_handle: Some(continuous_handle),
+            _cpu_continuous_handle: None,
             _gpu_worker_handle: Some(gpu_worker_handle),
         }
     }
@@ -118,11 +120,13 @@ impl ScheduledEngine {
         ));
 
         let (continuous_tx, continuous_rx) = mpsc::unbounded_channel();
-        let continuous_handle = if supports_kv_cache {
-            Some(tokio::spawn(cpu_continuous_generation_loop(
+        let cpu_continuous_handle = if supports_kv_cache {
+            // Run on dedicated OS thread to avoid tokio worker pool expansion
+            // from block_in_place, which causes thread contention with OpenMP.
+            Some(spawn_cpu_continuous_worker(
                 Arc::clone(&engine),
                 continuous_rx,
-            )))
+            ))
         } else {
             None
         };
@@ -133,7 +137,8 @@ impl ScheduledEngine {
             model_info,
             engine,
             _batch_loop_handle: batch_handle,
-            _continuous_loop_handle: continuous_handle,
+            _continuous_loop_handle: None,
+            _cpu_continuous_handle: cpu_continuous_handle,
             _gpu_worker_handle: None,
         }
     }
@@ -405,6 +410,7 @@ mod tests {
             seed: Some(42),
             deadline_ms: None,
             logprobs: None,
+            prompt_logprobs: None,
         }
     }
 

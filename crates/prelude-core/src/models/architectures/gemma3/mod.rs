@@ -613,6 +613,30 @@ impl crate::models::ModelForward for Gemma3ForCausalLM {
         self.forward(packed_input, ctx)
     }
 
+    fn forward_hidden_states(
+        &mut self,
+        packed_input: &Tensor,
+        ctx: &mut crate::models::layers::BatchAttnContext,
+    ) -> candle_core::Result<Tensor> {
+        self.base.forward(
+            packed_input,
+            ctx.cu_seqlens_q,
+            ctx.max_seqlen_q,
+            ctx.position_ids,
+        )
+    }
+
+    fn compute_logits(&self, hidden: &Tensor) -> candle_core::Result<Tensor> {
+        let logits = hidden.apply(&self.lm_head)?;
+        if let Some(cap) = self.final_logit_softcapping {
+            let scaled = (&logits / cap)?;
+            let tanh = scaled.tanh()?;
+            tanh * cap
+        } else {
+            Ok(logits)
+        }
+    }
+
     fn clear_kv_cache(&mut self) {
         self.clear_kv_cache();
     }

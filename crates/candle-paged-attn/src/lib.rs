@@ -13,7 +13,7 @@ use core::ffi::{c_int, c_long, c_void};
 // FFI declarations
 // ---------------------------------------------------------------------------
 
-extern "C" {
+unsafe extern "C" {
     fn paged_attention_v1(
         out: *const c_void,
         query: *const c_void,
