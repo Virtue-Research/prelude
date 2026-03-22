@@ -75,15 +75,15 @@ curl http://localhost:8000/v1/chat/completions \
 ## Supported Models
 
 
-| Architecture | Models | GPU Backend | Continuous Batching |
-|---|---|---|---|
-| Dense | Qwen3 (0.6B–32B) | FlashInfer / FA4 | Yes |
-| MoE | Qwen3-MoE (30B-A3B) | FlashInfer / FA4 | Yes |
-| Hybrid | Qwen3.5 (0.8B–27B, dense + MoE) | FlashInfer / FA4 | Yes |
-| Hybrid | Qwen3-Next (80B-A3B) | FlashInfer / FA4 | Yes |
-| Classification | Qwen3-Reranker, Gemma3 | FlashInfer / FA4 | Yes |
-| Embedding | Qwen3-Embedding | FlashInfer / FA4 | Yes |
-| Quantized | GGUF (Qwen3, Qwen3.5, LLaMA, Gemma, Phi3) | CUDA / CPU | No |
+| Name | Structure | Completion | Classify | Embed | GPU Backend |
+|---|---|---|---|---|---|
+| Qwen3 (0.6B–32B) | Dense | ✔ | ✔ | ✔ | FlashInfer / FA4 |
+| Qwen3-MoE (30B-A3B) | MoE | ✔ | — | — | FlashInfer / FA4 |
+| Qwen3-Next (80B-A3B) | Hybrid (DeltaNet + MoE) | ✔ | — | — | FlashInfer / FA4 |
+| Qwen3.5 (0.8B–27B) | Hybrid (DeltaNet) | ✔ | — | — | FlashInfer / FA4 |
+| Qwen3.5-MoE (35B-A3B) | Hybrid (DeltaNet + MoE) | ✔ | — | — | FlashInfer / FA4 |
+| Gemma3 | Dense | ✔ | ✔ | ✔ | FlashInfer / FA4 |
+| GGUF (Qwen3, Qwen3.5, LLaMA, Gemma, Phi3) | Quantized | ✔ | — | — | CUDA / CPU |
 
 GGUF models are auto-detected from HuggingFace Hub or local `.gguf` files.
 
