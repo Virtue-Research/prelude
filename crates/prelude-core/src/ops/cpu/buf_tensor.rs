@@ -192,6 +192,85 @@ impl<'a> CpuTensor<'a> {
     }
 }
 
+// ── F32 variant ──────────────────────────────────────────────────────────
+
+/// Zero-overhead CPU F32 tensor. Same design as `CpuTensor` (BF16) but
+/// for `f32` data. Will be unified with `CpuTensor` via generics later.
+#[derive(Clone, Copy)]
+pub struct CpuTensorF32<'a> {
+    data: *const f32,
+    len: usize,
+    shape: [usize; 4],
+    ndim: u8,
+    _phantom: PhantomData<&'a [f32]>,
+}
+
+unsafe impl<'a> Send for CpuTensorF32<'a> {}
+unsafe impl<'a> Sync for CpuTensorF32<'a> {}
+
+impl<'a> CpuTensorF32<'a> {
+    #[inline]
+    pub fn from_slice(data: &'a [f32], shape: &[usize]) -> Self {
+        let ndim = shape.len();
+        assert!(ndim <= 4, "CpuTensorF32: max 4 dims, got {ndim}");
+        let product: usize = shape.iter().product();
+        assert_eq!(product, data.len(), "CpuTensorF32: shape product {product} != data len {}", data.len());
+        let mut s = [0usize; 4];
+        s[..ndim].copy_from_slice(shape);
+        Self { data: data.as_ptr(), len: data.len(), shape: s, ndim: ndim as u8, _phantom: PhantomData }
+    }
+
+    #[inline]
+    pub unsafe fn from_raw(data: *const f32, len: usize, shape: &[usize]) -> Self {
+        let ndim = shape.len();
+        debug_assert!(ndim <= 4);
+        debug_assert_eq!(shape.iter().product::<usize>(), len);
+        let mut s = [0usize; 4];
+        s[..ndim].copy_from_slice(shape);
+        Self { data, len, shape: s, ndim: ndim as u8, _phantom: PhantomData }
+    }
+
+    pub fn from_candle(tensor: &'a Tensor) -> Result<Self> {
+        let slice = super::tensor_as_f32_slice(tensor)?;
+        Ok(unsafe { Self::from_raw(slice.as_ptr(), slice.len(), tensor.dims()) })
+    }
+
+    pub fn to_candle(&self, device: &Device) -> Result<Tensor> {
+        let data = self.as_slice().to_vec();
+        Tensor::from_vec(data, self.dims(), device)
+    }
+
+    #[inline]
+    pub fn reshape(&self, shape: &[usize]) -> Self {
+        let ndim = shape.len();
+        assert!(ndim <= 4, "CpuTensorF32::reshape: max 4 dims, got {ndim}");
+        let product: usize = shape.iter().product();
+        assert_eq!(product, self.len, "CpuTensorF32::reshape: product {product} != len {}", self.len);
+        let mut s = [0usize; 4];
+        s[..ndim].copy_from_slice(shape);
+        Self { data: self.data, len: self.len, shape: s, ndim: ndim as u8, _phantom: PhantomData }
+    }
+
+    #[inline]
+    pub fn narrow(&self, dim: usize, start: usize, count: usize) -> Self {
+        assert_eq!(dim, 0, "CpuTensorF32::narrow: only dim 0 supported");
+        assert!(start + count <= self.shape[0], "CpuTensorF32::narrow: {start}+{count} > {}", self.shape[0]);
+        let stride0: usize = self.shape[1..self.ndim as usize].iter().product();
+        let offset = start * stride0;
+        let new_len = count * stride0;
+        let mut s = self.shape;
+        s[0] = count;
+        Self { data: unsafe { self.data.add(offset) }, len: new_len, shape: s, ndim: self.ndim, _phantom: PhantomData }
+    }
+
+    #[inline] pub fn dim(&self, d: usize) -> usize { self.shape[d] }
+    #[inline] pub fn ndim(&self) -> usize { self.ndim as usize }
+    #[inline] pub fn dims(&self) -> &[usize] { &self.shape[..self.ndim as usize] }
+    #[inline] pub fn len(&self) -> usize { self.len }
+    #[inline] pub fn as_ptr(&self) -> *const f32 { self.data }
+    #[inline] pub fn as_slice(&self) -> &'a [f32] { unsafe { std::slice::from_raw_parts(self.data, self.len) } }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

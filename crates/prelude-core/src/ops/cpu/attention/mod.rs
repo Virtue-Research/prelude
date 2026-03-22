@@ -757,6 +757,146 @@ fn decode_attention_one_head(
     }
 }
 
+// ── F32 Decode Attention ─────────────────────────────────────────────────
+
+/// Decode attention for F32 tensors: single Q token against KV cache.
+///
+/// Layout: q `[num_seqs, num_heads, head_dim]`, k/v_cache `[total_slots, num_kv_heads, head_dim]`.
+/// `req_to_token[req * max_context_len + i]` maps to the cache slot for position i.
+/// `seq_lens[req]` is the KV length for request `req`.
+/// Output: `[num_seqs, num_heads, head_dim]` F32.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_attention_f32(
+    output: &mut [f32],
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    req_to_token: &[i32],
+    seq_lens: &[i64],
+    num_seqs: usize,
+    max_context_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sm_scale: f32,
+) {
+    use rayon::prelude::*;
+
+    let gqa_ratio = num_heads / num_kv_heads;
+    let total_work = num_seqs * num_heads;
+
+    let out_ptr = output.as_mut_ptr() as usize;
+    let out_len = output.len();
+
+    (0..total_work).into_par_iter().for_each(|work_id| {
+        let req_idx = work_id / num_heads;
+        let head_idx = work_id % num_heads;
+        let output = unsafe { std::slice::from_raw_parts_mut(out_ptr as *mut f32, out_len) };
+        decode_attention_one_head_f32(
+            output, q, k_cache, v_cache, req_to_token, seq_lens,
+            req_idx, head_idx, max_context_len,
+            num_heads, num_kv_heads, head_dim, gqa_ratio, sm_scale,
+        );
+    });
+}
+
+/// Decode attention for one (request, head) pair — F32 variant.
+/// Uses online softmax with block-based processing and AVX-512 vectorized dot/FMA.
+#[allow(clippy::too_many_arguments)]
+fn decode_attention_one_head_f32(
+    output: &mut [f32],
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    req_to_token: &[i32],
+    seq_lens: &[i64],
+    req_idx: usize,
+    head_idx: usize,
+    max_context_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    gqa_ratio: usize,
+    sm_scale: f32,
+) {
+    let use_avx512 = CAPS.avx512;
+
+    let kv_head = head_idx / gqa_ratio;
+    let slen = seq_lens[req_idx] as usize;
+    if slen == 0 {
+        return;
+    }
+
+    let q_off = req_idx * num_heads * head_dim + head_idx * head_dim;
+    let q_row = &q[q_off..q_off + head_dim];
+
+    let block_n: usize = if slen <= 1024 { slen } else { 512 };
+
+    let mut k_block = vec![0.0f32; block_n * head_dim];
+    let mut v_block = vec![0.0f32; block_n * head_dim];
+    let mut scores = vec![0.0f32; block_n];
+
+    let mut out_f32 = vec![0.0f32; head_dim];
+    let mut m_prime = f32::NEG_INFINITY;
+    let mut s_prime = 0.0f32;
+
+    let req_token_base = req_idx * max_context_len;
+
+    let mut n = 0;
+    while n < slen {
+        let n_size = (slen - n).min(block_n);
+
+        for j in 0..n_size {
+            let slot = req_to_token[req_token_base + n + j] as usize;
+            let kv_off = slot * num_kv_heads * head_dim + kv_head * head_dim;
+            k_block[j * head_dim..(j + 1) * head_dim]
+                .copy_from_slice(&k_cache[kv_off..kv_off + head_dim]);
+            v_block[j * head_dim..(j + 1) * head_dim]
+                .copy_from_slice(&v_cache[kv_off..kv_off + head_dim]);
+        }
+
+        // QK scores — already F32, use dot_f32_f32 directly
+        for j in 0..n_size {
+            let k_row = &k_block[j * head_dim..(j + 1) * head_dim];
+            scores[j] = dot_f32_f32(q_row, k_row, head_dim, use_avx512) * sm_scale;
+        }
+
+        // Online softmax
+        let (m_i, block_sum, rescale) = if use_avx512 {
+            #[cfg(target_arch = "x86_64")]
+            unsafe { online_softmax_avx512(scores.as_mut_ptr(), n_size, m_prime, 1.0) }
+            #[cfg(not(target_arch = "x86_64"))]
+            unreachable!()
+        } else {
+            softmax_scalar(&mut scores, n_size, m_prime, 1.0)
+        };
+
+        if rescale != 1.0 {
+            s_prime *= rescale;
+            scale_f32(&mut out_f32, rescale, use_avx512);
+        }
+        s_prime += block_sum;
+        m_prime = m_i;
+
+        // V accumulation — F32 FMA
+        for j in 0..n_size {
+            let w = scores[j];
+            if w > 0.0 {
+                let v_row = &v_block[j * head_dim..(j + 1) * head_dim];
+                fma_f32_f32(&mut out_f32, v_row, w, use_avx512);
+            }
+        }
+
+        n += block_n;
+    }
+
+    let inv_sum = if s_prime > 0.0 { 1.0 / s_prime } else { 0.0 };
+    let o_off = req_idx * num_heads * head_dim + head_idx * head_dim;
+    for d in 0..head_dim {
+        output[o_off + d] = out_f32[d] * inv_sum;
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]

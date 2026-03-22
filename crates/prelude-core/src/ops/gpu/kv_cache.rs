@@ -1,5 +1,6 @@
 use candle_core::backend::BackendStorage;
 use super::{MOD_KNORM_ROPE_KV_WRITE, PTX_KNORM_ROPE_KV_WRITE};
+use super::{MOD_SCATTER_KV_CACHE, PTX_SCATTER_KV_CACHE};
 use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
 use candle_core::cuda_backend::WrapErr;
 use candle_core::{DType, Result, Tensor};
@@ -180,7 +181,7 @@ pub fn fused_knorm_rope_kv_cache_write_thd(
 /// - `key_cache`: `[num_blocks, block_size, num_kv_heads, head_dim]` BF16
 /// - `value_cache`: `[num_blocks, block_size, num_kv_heads, head_dim]` BF16
 /// - `slot_mapping`: `[total_tokens]` I64
-#[cfg(feature = "flash-attn-v3")]
+#[cfg(feature = "cuda")]
 pub fn fused_knorm_rope_kv_cache_write_varlen(
     k: &Tensor,             // [total_tokens, num_kv_heads, head_dim]
     v: &Tensor,             // [total_tokens, num_kv_heads, head_dim]
@@ -322,6 +323,113 @@ pub fn fused_knorm_rope_kv_cache_write_varlen(
     drop(cos_storage);
     drop(sin_storage);
     drop(pos_storage);
+    drop(kc_storage);
+    drop(vc_storage);
+    drop(sm_storage);
+
+    Ok(())
+}
+
+// ── Scatter KV cache write (flash layout) ────────────────────────────
+
+/// Scatter-write K/V tokens into a flash-layout paged KV cache.
+///
+/// Drop-in replacement for `candle_paged_attn::reshape_and_cache_flash`.
+/// Uses vectorized 128-bit copies (8 BF16/thread).
+///
+/// - `key`: `[num_tokens, num_heads, head_size]` BF16
+/// - `value`: `[num_tokens, num_heads, head_size]` BF16
+/// - `key_cache`: `[num_blocks, block_size, num_heads, head_size]` BF16
+/// - `value_cache`: `[num_blocks, block_size, num_heads, head_size]` BF16
+/// - `slot_mapping`: `[num_tokens]` I64
+#[cfg(feature = "cuda")]
+pub fn scatter_kv_cache_flash(
+    key: &Tensor,
+    value: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    slot_mapping: &Tensor,
+) -> Result<()> {
+    let (k_storage, k_layout) = key.storage_and_layout();
+    let (v_storage, v_layout) = value.storage_and_layout();
+    let (kc_storage, kc_layout) = key_cache.storage_and_layout();
+    let (vc_storage, vc_layout) = value_cache.storage_and_layout();
+    let (sm_storage, sm_layout) = slot_mapping.storage_and_layout();
+
+    let k_cuda = match &*k_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("scatter_kv_cache_flash: key requires CUDA"),
+    };
+    let v_cuda = match &*v_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("scatter_kv_cache_flash: value requires CUDA"),
+    };
+    let kc_cuda = match &*kc_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("scatter_kv_cache_flash: key_cache requires CUDA"),
+    };
+    let vc_cuda = match &*vc_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("scatter_kv_cache_flash: value_cache requires CUDA"),
+    };
+    let sm_cuda = match &*sm_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("scatter_kv_cache_flash: slot_mapping requires CUDA"),
+    };
+
+    if k_cuda.dtype() != DType::BF16 {
+        candle_core::bail!("scatter_kv_cache_flash: requires BF16 (got {:?})", k_cuda.dtype());
+    }
+
+    let dev = k_cuda.device().clone();
+
+    let (num_tokens, num_heads, head_size) = k_layout.shape().dims3()?;
+    let (_num_blocks, block_size, _num_heads_c, _head_size_c) = kc_layout.shape().dims4()?;
+
+    let k_slice = k_cuda.as_cuda_slice::<half::bf16>()?.slice(k_layout.start_offset()..);
+    let v_slice = v_cuda.as_cuda_slice::<half::bf16>()?.slice(v_layout.start_offset()..);
+    let kc_slice = kc_cuda.as_cuda_slice::<half::bf16>()?.slice(kc_layout.start_offset()..);
+    let vc_slice = vc_cuda.as_cuda_slice::<half::bf16>()?.slice(vc_layout.start_offset()..);
+    let sm_slice = sm_cuda.as_cuda_slice::<i64>()?.slice(sm_layout.start_offset()..);
+
+    let n = num_heads * head_size;
+    // Each thread handles 8 BF16 elements (128-bit vectorized).
+    // For 32h×128d (n=4096): 512 threads, each copies 8 elements = done in 1 pass.
+    let threads_needed = (n + 7) / 8;
+    let block_dim = threads_needed.min(512) as u32;
+
+    let func = dev.get_or_load_custom_func(
+        "scatter_kv_cache_flash_bf16",
+        MOD_SCATTER_KV_CACHE,
+        PTX_SCATTER_KV_CACHE,
+    )?;
+    let cfg = LaunchConfig {
+        grid_dim: (num_tokens as u32, 1, 1),
+        block_dim: (block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let key_stride = k_layout.stride()[0] as u32;
+    let value_stride = v_layout.stride()[0] as u32;
+    let num_heads_val = num_heads as u32;
+    let head_size_val = head_size as u32;
+    let block_size_val = block_size as u32;
+
+    let mut builder = func.builder();
+    builder.arg(&k_slice);
+    builder.arg(&v_slice);
+    builder.arg(&kc_slice);
+    builder.arg(&vc_slice);
+    builder.arg(&sm_slice);
+    builder.arg(&num_heads_val);
+    builder.arg(&head_size_val);
+    builder.arg(&block_size_val);
+    builder.arg(&key_stride);
+    builder.arg(&value_stride);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(k_storage);
+    drop(v_storage);
     drop(kc_storage);
     drop(vc_storage);
     drop(sm_storage);

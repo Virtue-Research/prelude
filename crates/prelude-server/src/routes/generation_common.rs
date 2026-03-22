@@ -34,6 +34,7 @@ pub(crate) fn build_generate_request(
     stop: Option<Vec<String>>,
     seed: Option<u64>,
     logprobs: Option<u32>,
+    prompt_logprobs: Option<u32>,
 ) -> GenerateRequest {
     GenerateRequest {
         request_id: format!("req-{}", Uuid::new_v4().simple()),
@@ -52,6 +53,7 @@ pub(crate) fn build_generate_request(
         seed,
         deadline_ms: None,
         logprobs,
+        prompt_logprobs,
     }
 }
 

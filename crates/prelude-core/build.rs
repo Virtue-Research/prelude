@@ -60,6 +60,7 @@ fn main() {
             ("moe", "down.cu", "moe_down"),
             ("kvcache", "append.cu", "kv_append"),
             ("kvcache", "knorm_rope_kv_write.cu", "knorm_rope_kv_write"),
+            ("kvcache", "scatter_kv_cache.cu", "scatter_kv_cache"),
         ];
 
         // Track all source files for rerun-if-changed

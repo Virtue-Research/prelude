@@ -16,6 +16,7 @@ use crate::models::architectures::gemma3::meta::{
     Gemma3ModelBuildContext, build_gemma3_model_with_context,
 };
 use crate::models::architectures::meta::AuxiliaryVarBuilder;
+use crate::models::architectures::qwen3_5_gguf::Qwen3_5GgufModel;
 use crate::models::architectures::qwen3_gguf::Qwen3GgufModel;
 
 #[derive(Debug, serde::Deserialize)]
@@ -117,9 +118,14 @@ impl Engine {
 
         tracing::info!(repo = repo_id, "downloading model from HuggingFace Hub");
 
-        let config_path = repo
-            .get("config.json")
-            .map_err(|e| EngineError::Internal(format!("failed to download config.json: {e}")))?;
+        // Try config.json — if missing, this might be a GGUF-only repo
+        let config_path = match repo.get("config.json") {
+            Ok(path) => path,
+            Err(_) => {
+                tracing::info!("config.json not found, checking for GGUF files");
+                return Self::from_hf_hub_gguf(repo_id, &repo, task_override, engine_config);
+            }
+        };
         let tokenizer_path = repo.get("tokenizer.json").map_err(|e| {
             EngineError::Internal(format!("failed to download tokenizer.json: {e}"))
         })?;
@@ -162,6 +168,92 @@ impl Engine {
             engine_config,
         )
     }
+
+    /// Load a GGUF model from an HF Hub repo that contains .gguf files but no config.json.
+    /// Auto-selects the best GGUF file (prefers Q8_0 > Q4_K_M > largest).
+    fn from_hf_hub_gguf(
+        repo_id: &str,
+        repo: &hf_hub::api::sync::ApiRepo,
+        task_override: TaskOverride,
+        engine_config: EngineConfig,
+    ) -> Result<Self, EngineError> {
+        let info = repo
+            .info()
+            .map_err(|e| EngineError::Internal(format!("failed to get repo info: {e}")))?;
+
+        let gguf_files: Vec<&str> = info
+            .siblings
+            .iter()
+            .map(|s| s.rfilename.as_str())
+            .filter(|f| f.ends_with(".gguf"))
+            .collect();
+
+        if gguf_files.is_empty() {
+            return Err(EngineError::InvalidRequest(format!(
+                "repo {repo_id} has no config.json or .gguf files"
+            )));
+        }
+
+        // Select best GGUF: prefer Q8_0 > Q4_K_M > first available
+        let selected = gguf_files
+            .iter()
+            .find(|f| f.contains("Q8_0"))
+            .or_else(|| gguf_files.iter().find(|f| f.contains("Q4_K_M")))
+            .or_else(|| gguf_files.first())
+            .unwrap();
+
+        tracing::info!(file = %selected, "auto-selected GGUF file from {repo_id}");
+
+        let gguf_path = repo
+            .get(selected)
+            .map_err(|e| EngineError::Internal(format!("failed to download {selected}: {e}")))?;
+
+        // Resolve tokenizer: try this repo first, then infer base model from GGUF metadata
+        let tokenizer_model_id = resolve_gguf_tokenizer_repo(repo_id, repo, &gguf_path);
+
+        load_gguf(&gguf_path, tokenizer_model_id, task_override, engine_config)
+    }
+}
+
+/// Try to resolve the tokenizer source for a GGUF repo.
+/// 1. If this repo has tokenizer.json, use it directly.
+/// 2. Otherwise, read GGUF metadata for `general.base_model.0.repo_url` to find the base model.
+/// 3. Fall back to stripping `-GGUF` suffix from repo_id.
+fn resolve_gguf_tokenizer_repo(
+    repo_id: &str,
+    repo: &hf_hub::api::sync::ApiRepo,
+    gguf_path: &Path,
+) -> String {
+    // Check if tokenizer.json exists next to GGUF or in repo
+    if let Some(parent) = gguf_path.parent() {
+        if parent.join("tokenizer.json").exists() {
+            return repo_id.to_string();
+        }
+    }
+
+    // Try reading base_model from GGUF metadata
+    if let Ok(mut file) = std::fs::File::open(gguf_path) {
+        if let Ok(ct) = candle_core::quantized::gguf_file::Content::read(&mut file) {
+            if let Some(val) = ct.metadata.get("general.base_model.0.repo_url") {
+                if let Ok(url) = val.to_string() {
+                    // Extract "org/model" from "https://huggingface.co/org/model"
+                    if let Some(repo) = url.strip_prefix("https://huggingface.co/") {
+                        tracing::info!(base_model = %repo, "resolved tokenizer from GGUF metadata");
+                        return repo.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: strip -GGUF suffix (e.g. "unsloth/Qwen3.5-0.8B-GGUF" → "unsloth/Qwen3.5-0.8B")
+    let fallback = repo_id
+        .strip_suffix("-GGUF")
+        .or_else(|| repo_id.strip_suffix("-gguf"))
+        .unwrap_or(repo_id)
+        .to_string();
+    tracing::info!(fallback = %fallback, "using fallback tokenizer repo (stripped -GGUF suffix)");
+    fallback
 }
 
 // ── Free functions ────────────────────────────────────────────────────────
@@ -237,6 +329,14 @@ fn load_safetensor_parts(
     })
 }
 
+/// Detect GGUF architecture from metadata.
+fn detect_gguf_arch(ct: &candle_core::quantized::gguf_file::Content) -> String {
+    ct.metadata
+        .get("general.architecture")
+        .and_then(|v| v.to_string().ok().map(|s| s.to_string()))
+        .unwrap_or_else(|| "qwen3".to_string())
+}
+
 /// Load a quantized model from a GGUF file.
 fn load_gguf(
     gguf_path: &Path,
@@ -253,15 +353,187 @@ fn load_gguf(
         ));
     }
 
-    let device = Device::Cpu; // GGUF quantized is CPU-only for now
+    let (device, _dtype) = select_device(&engine_config.runtime)?;
     let dtype = DType::F32; // working dtype for embeddings/norms
 
     let mut file = std::fs::File::open(gguf_path)
         .map_err(|e| EngineError::Internal(format!("failed to open GGUF: {e}")))?;
     let ct = candle_core::quantized::gguf_file::Content::read(&mut file).map_err(candle_err)?;
 
+    let arch = detect_gguf_arch(&ct);
+    tracing::info!(arch = %arch, "detected GGUF architecture");
+
+    // Resolve tokenizer: look next to GGUF file, else download from HF Hub
+    let tokenizer = if let Some(parent) = gguf_path.parent()
+        && parent.join("tokenizer.json").exists()
+    {
+        load_tokenizer(parent)?
+    } else {
+        download_tokenizer(&model_id)?
+    };
+
+    // When ggml-quants is enabled, use llama.cpp FFI for ALL architectures
+    #[cfg(feature = "ggml-quants")]
+    {
+        let n_gpu_layers = if device.is_cuda() { -1 } else { 0 };
+        return load_gguf_llama_cpp(gguf_path, model_id, engine_config, load_start, tokenizer, n_gpu_layers);
+    }
+
+    #[cfg(not(feature = "ggml-quants"))]
+    match arch.as_str() {
+        "qwen35" | "qwen35moe" => load_gguf_qwen35(ct, &mut file, &device, model_id, engine_config, load_start, tokenizer),
+        _ => load_gguf_qwen3(ct, &mut file, &device, model_id, engine_config, load_start, tokenizer),
+    }
+}
+
+/// Load ANY GGUF model via llama.cpp FFI (requires `ggml-quants` feature).
+#[cfg(feature = "ggml-quants")]
+fn load_gguf_llama_cpp(
+    gguf_path: &Path,
+    model_id: String,
+    engine_config: EngineConfig,
+    load_start: Instant,
+    tokenizer: Tokenizer,
+    n_gpu_layers: i32,
+) -> Result<Engine, EngineError> {
+    use crate::models::architectures::qwen3_5_gguf::LlamaGgufModel;
+
+    let model = LlamaGgufModel::load(gguf_path, n_gpu_layers, 4096)
+        .map_err(|e| EngineError::Internal(e))?;
+
+    let cfg = model.config();
+    let eos_token_ids = vec![cfg.eos_token as u32];
+
+    let common_config = CommonModelConfig {
+        vocab_size: cfg.vocab_size,
+        num_hidden_layers: cfg.num_hidden_layers,
+        max_position_embeddings: cfg.max_position_embeddings,
+        num_attention_heads: cfg.num_attention_heads,
+        num_key_value_heads: cfg.num_key_value_heads,
+        head_dim: cfg.head_dim,
+    };
+
+    let descriptor = ModelDescriptor {
+        task: TaskKind::Generate,
+        arch_name: "llama_cpp_gguf",
+        backend: WeightsBackend::Gguf,
+    };
+
+    let runtime_caps = RuntimeCaps {
+        supports_kv_cache: true,
+        ..RuntimeCaps::default()
+    };
+
+    let device = Device::Cpu; // llama.cpp manages its own device
+    let executor = ModelExecutor {
+        model: Mutex::new(Box::new(model)),
+        device,
+        dtype: DType::F32,
+        config: common_config,
+        runtime_caps,
+    };
+
+    tracing::info!(
+        elapsed_ms = load_start.elapsed().as_millis() as u64,
+        arch = descriptor.arch_name,
+        gpu_layers = n_gpu_layers,
+        layers = executor.config.num_hidden_layers,
+        vocab = executor.config.vocab_size,
+        "llama.cpp GGUF model loaded"
+    );
+
+    Ok(Engine {
+        executor,
+        cache: CacheManager::none(),
+        tokenizer,
+        model_id,
+        embedding_semantics: EmbeddingSemantics::default(),
+        eos_token_ids,
+        descriptor,
+        engine_config,
+    })
+}
+
+/// Load Qwen3.5 (hybrid DeltaNet) from GGUF.
+fn load_gguf_qwen35(
+    ct: candle_core::quantized::gguf_file::Content,
+    file: &mut std::fs::File,
+    device: &Device,
+    model_id: String,
+    engine_config: EngineConfig,
+    load_start: Instant,
+    tokenizer: Tokenizer,
+) -> Result<Engine, EngineError> {
     let (model, gguf_config) =
-        Qwen3GgufModel::from_gguf(ct, &mut file, &device).map_err(candle_err)?;
+        Qwen3_5GgufModel::from_gguf(ct, file, device).map_err(candle_err)?;
+
+    let eos_token_ids = if gguf_config.eos_token_ids.is_empty() {
+        return Err(EngineError::InvalidRequest(
+            "GGUF metadata missing `tokenizer.ggml.eos_token_id`".into(),
+        ));
+    } else {
+        gguf_config.eos_token_ids.clone()
+    };
+
+    let common_config = CommonModelConfig {
+        vocab_size: gguf_config.vocab_size,
+        num_hidden_layers: gguf_config.num_hidden_layers,
+        max_position_embeddings: gguf_config.max_position_embeddings,
+        num_attention_heads: gguf_config.num_attention_heads,
+        num_key_value_heads: gguf_config.num_key_value_heads,
+        head_dim: gguf_config.head_dim,
+    };
+
+    let descriptor = ModelDescriptor {
+        task: TaskKind::Generate,
+        arch_name: "qwen3_5_gguf",
+        backend: WeightsBackend::Gguf,
+    };
+    let runtime_caps = RuntimeCaps {
+        supports_kv_cache: true,
+        ..RuntimeCaps::default()
+    };
+
+    let executor = ModelExecutor {
+        model: Mutex::new(Box::new(model)),
+        device: device.clone(),
+        dtype: DType::F32,
+        config: common_config,
+        runtime_caps,
+    };
+
+    tracing::info!(
+        elapsed_ms = load_start.elapsed().as_millis() as u64,
+        arch = descriptor.arch_name,
+        layers = executor.config.num_hidden_layers,
+        vocab = executor.config.vocab_size,
+        "Qwen3.5 GGUF model loaded"
+    );
+
+    Ok(Engine {
+        executor,
+        cache: CacheManager::none(),
+        tokenizer,
+        model_id,
+        embedding_semantics: EmbeddingSemantics::default(),
+        eos_token_ids,
+        descriptor,
+        engine_config,
+    })
+}
+
+/// Load standard Qwen3 (and other dense architectures) from GGUF.
+fn load_gguf_qwen3(
+    ct: candle_core::quantized::gguf_file::Content,
+    file: &mut std::fs::File,
+    device: &Device,
+    model_id: String,
+    engine_config: EngineConfig,
+    load_start: Instant,
+    tokenizer: Tokenizer,
+) -> Result<Engine, EngineError> {
+    let (model, gguf_config) =
+        Qwen3GgufModel::from_gguf(ct, file, device).map_err(candle_err)?;
 
     let eos_token_ids = if gguf_config.eos_token_ids.is_empty() {
         return Err(EngineError::InvalidRequest(
@@ -276,6 +548,7 @@ fn load_gguf(
         vocab_size: gguf_config.vocab_size,
         num_hidden_layers: gguf_config.num_hidden_layers,
         max_position_embeddings: gguf_config.max_position_embeddings,
+        num_attention_heads: gguf_config.num_attention_heads,
         num_key_value_heads: gguf_config.num_key_value_heads,
         head_dim: gguf_config.head_dim,
     };
@@ -285,21 +558,15 @@ fn load_gguf(
         arch_name: "qwen3_gguf",
         backend: WeightsBackend::Gguf,
     };
-    let runtime_caps = RuntimeCaps::default();
-
-    // Resolve tokenizer: look next to GGUF file, else download from HF Hub
-    let tokenizer = if let Some(parent) = gguf_path.parent()
-        && parent.join("tokenizer.json").exists()
-    {
-        load_tokenizer(parent)?
-    } else {
-        download_tokenizer(&model_id)?
+    let runtime_caps = RuntimeCaps {
+        supports_kv_cache: true,
+        ..RuntimeCaps::default()
     };
 
     let executor = ModelExecutor {
         model: Mutex::new(Box::new(model)),
-        device,
-        dtype,
+        device: device.clone(),
+        dtype: DType::F32,
         config: common_config,
         runtime_caps,
     };

@@ -34,9 +34,36 @@ pub trait ModelForward: Send {
         candle_core::bail!("forward_with_cache not supported for this model")
     }
 
+    /// Forward pass returning hidden states BEFORE lm_head.
+    /// Returns `(total_tokens, hidden_dim)` — used for prompt logprobs extraction
+    /// where lm_head is applied in chunks to limit peak GPU memory.
+    fn forward_hidden_states(
+        &mut self,
+        _packed_input: &Tensor,
+        _ctx: &mut BatchAttnContext,
+    ) -> candle_core::Result<Tensor> {
+        candle_core::bail!("forward_hidden_states not supported for this model")
+    }
+
+    /// Apply lm_head (and any post-processing like softcapping) to hidden states.
+    /// Can be called on chunks: `compute_logits(chunk)` → `(chunk_size, vocab_size)`.
+    fn compute_logits(&self, _hidden: &Tensor) -> candle_core::Result<Tensor> {
+        candle_core::bail!("compute_logits not supported for this model")
+    }
+
     /// Whether this model supports `forward_with_cache` for CPU KV-cached decode.
     fn supports_kv_cache(&self) -> bool {
         false
+    }
+
+    /// Direct generation: prefill + decode loop handled internally (e.g. by llama.cpp FFI).
+    /// Returns (generated_token_ids, last_logits_f32). Default: not supported.
+    fn generate_direct(
+        &mut self,
+        _prompt_tokens: &[u32],
+        _max_new: usize,
+    ) -> candle_core::Result<Option<(Vec<u32>, Vec<f32>)>> {
+        Ok(None)
     }
 
     // ── Task-specific queries ──────────────────────────────────────────

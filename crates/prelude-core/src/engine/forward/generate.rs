@@ -1,14 +1,18 @@
 use super::super::*;
-#[cfg(feature = "flash-attn-v3")]
+#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
 use super::prefill::PrefillForwardResult;
 
 /// Raw GPU output for generation batches (before CPU post-processing).
-#[cfg(feature = "flash-attn-v3")]
+#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
 pub(crate) struct RawGenerateOutput {
     pub items: Vec<PreparedGenerateRequest>,
     pub forward_result: PrefillForwardResult,
     pub batch_start: Instant,
     pub prefill_ms: f32,
+    /// Pre-extracted prompt logprobs (CPU-side Vec<f32>).
+    /// Extracted on the GPU worker thread so that the large all-token logits tensor
+    /// is freed before the next request allocates, avoiding cross-thread memory leak.
+    pub prompt_logprobs_cpu: Option<Vec<f32>>,
 }
 
 impl Engine {
@@ -201,7 +205,11 @@ impl Engine {
 
     /// GPU-only: runs prefill_pipeline and returns raw logits tensor.
     /// Does NOT do argmax/to_vec1/logprob extraction — those are CPU work.
-    #[cfg(feature = "flash-attn-v3")]
+    ///
+    /// When prompt_logprobs is requested, extracts logprobs HERE on the GPU thread
+    /// so the large (total_tokens, vocab_size) tensor is freed before the next request.
+    /// This prevents cross-thread GPU memory accumulation.
+    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
     pub(crate) fn prefill_forward_only(
         &self,
         items: Vec<PreparedGenerateRequest>,
@@ -213,21 +221,46 @@ impl Engine {
             .map(|item| std::slice::from_ref(&item.prompt_tokens))
             .collect();
 
+        let needs_prompt_logprobs = items.iter().any(|item| item.request.prompt_logprobs.is_some());
+
         let prefill_start = Instant::now();
-        let forward_result = self
-            .prefill_pipeline(&token_groups)?
-            .ok_or_else(|| EngineError::Internal("empty prefill batch".into()))?;
+        let mut forward_result = if needs_prompt_logprobs {
+            self.prefill_pipeline_with_hidden_states(&token_groups)?
+        } else {
+            self.prefill_pipeline(&token_groups)?
+        }
+        .ok_or_else(|| EngineError::Internal("empty prefill batch".into()))?;
         let prefill_ms = prefill_start.elapsed().as_secs_f32() * 1000.0;
+
+        // Extract prompt logprobs on the GPU thread by applying compute_logits
+        // to hidden states in chunks. This avoids materializing the full
+        // (total_tokens, vocab_size) tensor and keeps GPU memory bounded.
+        let prompt_logprobs_cpu = if let Some(hidden_states) = forward_result.hidden_states.take() {
+            let model = self.executor.model.lock()
+                .map_err(|e| EngineError::Internal(format!("model lock: {e}")))?;
+            let cpu = extract_prompt_logprobs_from_hidden(
+                &hidden_states,
+                &**model,
+                &items,
+                &forward_result.seq_lens,
+            )?;
+            drop(model);
+            drop(hidden_states);
+            Some(cpu)
+        } else {
+            None
+        };
 
         Ok(RawGenerateOutput {
             items,
             forward_result,
             batch_start,
             prefill_ms,
+            prompt_logprobs_cpu,
         })
     }
 
-    #[cfg(feature = "flash-attn-v3")]
+    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
     fn execute_cuda_prefill_only_batch(
         &self,
         items: Vec<PreparedGenerateRequest>,
@@ -237,14 +270,14 @@ impl Engine {
         generate_postprocess(raw, &self.tokenizer, &self.eos_token_ids)
     }
 
-    #[cfg(not(feature = "flash-attn-v3"))]
+    #[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
     fn ensure_multi_token_decode_ready(&self) -> Result<(), EngineError> {
         Err(EngineError::Unavailable(
             "multi-token decode requires flash-attn-v3 (cuda + paged attention)".into(),
         ))
     }
 
-    #[cfg(not(feature = "flash-attn-v3"))]
+    #[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
     fn execute_multi_token_batch(
         &self,
         _items: Vec<PreparedGenerateRequest>,
@@ -255,7 +288,7 @@ impl Engine {
         ))
     }
 
-    #[cfg(not(feature = "flash-attn-v3"))]
+    #[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
     fn generate_stream_paged(
         &self,
         _request: &GenerateRequest,
@@ -267,7 +300,7 @@ impl Engine {
         ))
     }
 
-    #[cfg(feature = "flash-attn-v3")]
+    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
     fn ensure_multi_token_decode_ready(&self) -> Result<(), EngineError> {
         if self.cache.paged_pool.is_none() || self.cache.block_manager.is_none() {
             return Err(EngineError::Unavailable(
@@ -278,7 +311,7 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(feature = "flash-attn-v3")]
+    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
     fn execute_multi_token_batch(
         &self,
         items: Vec<PreparedGenerateRequest>,
@@ -325,7 +358,7 @@ impl Engine {
         .collect()
     }
 
-    #[cfg(feature = "flash-attn-v3")]
+    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
     pub(crate) fn generate_stream_paged(
         &self,
         request: &GenerateRequest,
@@ -398,17 +431,64 @@ impl Engine {
                 deltanet_slots: None,
             };
 
-            let logits = model
-                .forward(&input, &mut ctx)
-                .map_err(|e| EngineError::Internal(e.to_string()))?;
+            let needs_prompt_logprobs = item.request.prompt_logprobs.is_some();
+
+            // When prompt logprobs requested: get hidden states, apply lm_head separately.
+            let (logits_flat, prompt_token_logprobs) = if needs_prompt_logprobs {
+                let hidden = model.forward_hidden_states(&input, &mut ctx)
+                    .map_err(|e| EngineError::Internal(e.to_string()))?;
+                let last_hidden = hidden.get(seq_len - 1)
+                    .map_err(|e| EngineError::Internal(e.to_string()))?;
+                let last_logits = model.compute_logits(&last_hidden)
+                    .and_then(|t| t.to_dtype(DType::F32))
+                    .map_err(|e| EngineError::Internal(e.to_string()))?;
+
+                // Reuse shared chunked extraction
+                let items_slice = std::slice::from_ref(item);
+                let seq_lens_slice = [seq_len];
+                let logprobs_cpu = extract_prompt_logprobs_from_hidden(
+                    &hidden, &**model, items_slice, &seq_lens_slice,
+                )?;
+
+                let prompt_tokens = &item.prompt_tokens;
+                let plps: Vec<TokenLogprobInfo> = (0..seq_len.saturating_sub(1))
+                    .filter_map(|pos| {
+                        if pos + 1 < prompt_tokens.len() {
+                            let next_token = prompt_tokens[pos + 1];
+                            Some(TokenLogprobInfo {
+                                token: self.tokenizer.decode(&[next_token], false).unwrap_or_default(),
+                                token_id: next_token,
+                                logprob: logprobs_cpu[pos],
+                                top_logprobs: Vec::new(),
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                (last_logits, if plps.is_empty() { None } else { Some(plps) })
+            } else if model.supports_kv_cache() {
+                // GGUF and other models with internal KV cache
+                let logits = model.forward_with_cache(&input, 0)
+                    .map_err(|e| EngineError::Internal(e.to_string()))?;
+                // forward_with_cache returns [L, vocab]; take last token
+                let last_logits = logits.get(seq_len - 1)
+                    .and_then(|t| t.to_dtype(DType::F32))
+                    .map_err(|e| EngineError::Internal(e.to_string()))?;
+                (last_logits, None)
+            } else {
+                let logits = model.forward(&input, &mut ctx)
+                    .map_err(|e| EngineError::Internal(e.to_string()))?;
+                let flat = logits.flatten_all()
+                    .and_then(|t| t.to_dtype(DType::F32))
+                    .map_err(|e| EngineError::Internal(e.to_string()))?;
+                (flat, None)
+            };
             model.clear_kv_cache();
 
             let prefill_ms = gen_start.elapsed().as_secs_f32() * 1000.0;
 
-            let logits_flat = logits
-                .flatten_all()
-                .and_then(|t| t.to_dtype(DType::F32))
-                .map_err(|e| EngineError::Internal(e.to_string()))?;
             let _ = self.sample_and_check(
                 &logits_flat, logprobs_k, item,
                 &mut output_token_ids, &mut output_logprobs, &mut finish_reason,
@@ -434,6 +514,7 @@ impl Engine {
                     total_ms, prefill_ms, decode_ms, ttft_ms: prefill_ms,
                 },
                 token_logprobs: if output_logprobs.is_empty() { None } else { Some(output_logprobs) },
+                prompt_token_logprobs,
             });
         }
 
@@ -627,7 +708,11 @@ impl Engine {
 
 /// CPU post-processing for generation: argmax → logprob extraction → tokenizer decode → result.
 /// Standalone function — no &Engine needed, can run on any thread.
-#[cfg(feature = "flash-attn-v3")]
+///
+/// Prompt logprobs arrive as pre-extracted CPU data (`raw.prompt_logprobs_cpu`),
+/// computed on the GPU thread in `prefill_forward_only`. No large GPU tensors cross
+/// the thread boundary.
+#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
 pub(crate) fn generate_postprocess(
     raw: RawGenerateOutput,
     tokenizer: &Tokenizer,
@@ -638,10 +723,12 @@ pub(crate) fn generate_postprocess(
         forward_result,
         batch_start,
         prefill_ms,
+        prompt_logprobs_cpu,
     } = raw;
     let batch_size = items.len();
 
     let logits = forward_result.output;
+    let fwd_seq_lens = forward_result.seq_lens;
     let argmax_start = Instant::now();
     let logits_2d = logits.squeeze(1).map_err(candle_err)?;
     let all_tokens = logits_2d
@@ -650,6 +737,37 @@ pub(crate) fn generate_postprocess(
         .to_vec1::<u32>()
         .map_err(candle_err)?;
     let argmax_ms = argmax_start.elapsed().as_secs_f32() * 1000.0;
+
+    // Build prompt logprobs per item from pre-extracted CPU data.
+    let prompt_logprobs_per_item: Vec<Option<Vec<TokenLogprobInfo>>> = if let Some(ref logprobs_cpu) = prompt_logprobs_cpu {
+        let mut per_item = Vec::with_capacity(batch_size);
+        let mut offset = 0usize;
+        for (i, item) in items.iter().enumerate() {
+            let q_len = fwd_seq_lens[i];
+            if item.request.prompt_logprobs.is_some() {
+                let mut plps = Vec::with_capacity(q_len.saturating_sub(1));
+                let prompt_tokens = &item.prompt_tokens;
+                for pos in 0..q_len.saturating_sub(1) {
+                    let next_token = prompt_tokens[pos + 1];
+                    let lp = logprobs_cpu[offset + pos];
+                    let token_str = tokenizer.decode(&[next_token], false).unwrap_or_default();
+                    plps.push(TokenLogprobInfo {
+                        token: token_str,
+                        token_id: next_token,
+                        logprob: lp,
+                        top_logprobs: Vec::new(),
+                    });
+                }
+                per_item.push(Some(plps));
+            } else {
+                per_item.push(None);
+            }
+            offset += q_len;
+        }
+        per_item
+    } else {
+        vec![None; batch_size]
+    };
 
     let pack_start = Instant::now();
     let mut results: Vec<GenerateResult> = Vec::with_capacity(batch_size);
@@ -692,6 +810,7 @@ pub(crate) fn generate_postprocess(
                 total_ms,
             },
             token_logprobs,
+            prompt_token_logprobs: prompt_logprobs_per_item[i].clone(),
         });
     }
     let pack_ms = pack_start.elapsed().as_secs_f32() * 1000.0;
@@ -707,4 +826,79 @@ pub(crate) fn generate_postprocess(
     );
 
     Ok(results)
+}
+
+/// Extract prompt logprobs from hidden states using chunked compute_logits + log_softmax + gather.
+///
+/// Applies lm_head in chunks (like vLLM) so the full (total_tokens, vocab_size) logits
+/// tensor is never materialized. Peak GPU memory: chunk_size × vocab_size × ~6 bytes.
+/// Chunk size for prompt logprobs extraction (tokens processed at a time).
+/// Controls peak GPU memory: chunk_size × vocab_size × ~6 bytes.
+const PROMPT_LOGPROBS_CHUNK_SIZE: usize = 512;
+
+/// Extract prompt logprobs from hidden states using chunked compute_logits.
+///
+/// `token_offset`: offset into `item.prompt_tokens` for the start of hidden states
+/// (non-zero when prefix caching skips a prefix).
+pub(crate) fn extract_prompt_logprobs_from_hidden(
+    hidden_states: &Tensor,
+    model: &dyn crate::models::ModelForward,
+    items: &[PreparedGenerateRequest],
+    seq_lens: &[usize],
+) -> Result<Vec<f32>, EngineError> {
+    extract_prompt_logprobs_from_hidden_offset(hidden_states, model, items, seq_lens, 0)
+}
+
+pub(crate) fn extract_prompt_logprobs_from_hidden_offset(
+    hidden_states: &Tensor,
+    model: &dyn crate::models::ModelForward,
+    items: &[PreparedGenerateRequest],
+    seq_lens: &[usize],
+    token_offset: usize,
+) -> Result<Vec<f32>, EngineError> {
+    let total_tokens = hidden_states.dim(0).map_err(candle_err)?;
+    let device = hidden_states.device().clone();
+
+    // Build flat token_ids: for each position, the next token being predicted.
+    let mut flat_next_tokens: Vec<u32> = Vec::with_capacity(total_tokens);
+    for (i, item) in items.iter().enumerate() {
+        let q_len = seq_lens[i];
+        let prompt_tokens = &item.prompt_tokens[token_offset..];
+        for pos in 0..q_len {
+            if pos + 1 < prompt_tokens.len() {
+                flat_next_tokens.push(prompt_tokens[pos + 1]);
+            } else {
+                flat_next_tokens.push(0);
+            }
+        }
+    }
+
+    // Chunked: compute_logits → log_softmax → gather per chunk.
+    // Only chunk_size × vocab_size logits exist at any time.
+    let mut logprobs_cpu: Vec<f32> = Vec::with_capacity(total_tokens);
+    for start in (0..total_tokens).step_by(PROMPT_LOGPROBS_CHUNK_SIZE) {
+        let end = (start + PROMPT_LOGPROBS_CHUNK_SIZE).min(total_tokens);
+        let chunk_len = end - start;
+
+        let chunk_hidden = hidden_states.narrow(0, start, chunk_len).map_err(candle_err)?;
+        let chunk_logits = model.compute_logits(&chunk_hidden).map_err(candle_err)?;
+        let chunk_log_probs = candle_nn::ops::log_softmax(&chunk_logits, 1).map_err(candle_err)?;
+        drop(chunk_logits); // free (chunk, vocab_size) before gather allocates
+
+        let chunk_token_ids = Tensor::from_vec(
+            flat_next_tokens[start..end].to_vec(), (chunk_len, 1), &device,
+        )
+        .map_err(candle_err)?
+        .to_dtype(candle_core::DType::U32)
+        .map_err(candle_err)?;
+
+        let chunk_gathered = chunk_log_probs
+            .gather(&chunk_token_ids, 1).map_err(candle_err)?
+            .squeeze(1).map_err(candle_err)?
+            .to_dtype(candle_core::DType::F32).map_err(candle_err)?;
+        logprobs_cpu.extend(chunk_gathered.to_vec1::<f32>().map_err(candle_err)?);
+        // chunk_log_probs freed here
+    }
+
+    Ok(logprobs_cpu)
 }

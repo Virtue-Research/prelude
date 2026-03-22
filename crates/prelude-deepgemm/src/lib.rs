@@ -7,7 +7,7 @@
 
 use std::ffi::c_void;
 
-extern "C" {
+unsafe extern "C" {
     fn deepgemm_bf16_gemm(
         A: *mut c_void,
         B: *mut c_void,

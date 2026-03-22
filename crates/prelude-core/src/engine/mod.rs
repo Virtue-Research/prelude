@@ -33,7 +33,7 @@ mod weights;
 // ── Re-exports: plan types + engine struct ──
 pub use self::engine_struct::Engine;
 pub(crate) use self::engine_struct::{ModelExecutor, ModelVariant};
-#[cfg(feature = "flash-attn-v3")]
+#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
 pub(crate) use self::types::OwnedBatchDecodeSeq;
 #[cfg(feature = "cuda")]
 pub(crate) use self::types::PagedKvPool;
@@ -53,7 +53,7 @@ pub(crate) use self::forward::{
     RawClassifyOutput, classify_postprocess,
     RawEmbedOutput, embed_postprocess,
 };
-#[cfg(feature = "flash-attn-v3")]
+#[cfg(feature = "cuda")]
 pub(crate) use self::forward::{RawGenerateOutput, generate_postprocess};
 
 // ── Re-exports: helpers (config, device, weights, tokenizer) ──

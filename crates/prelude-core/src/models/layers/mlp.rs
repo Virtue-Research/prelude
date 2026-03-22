@@ -195,4 +195,41 @@ impl Qwen3Mlp {
             }
         });
     }
+
+    #[cfg(feature = "onednn")]
+    pub(crate) fn gate_up_f32_packed_weight(&self) -> Option<&crate::ops::onednn::OnednnF32PackedWeight> {
+        self.gate_up_proj.as_ref()?.f32_packed_weight()
+    }
+
+    /// Raw F32 MLP forward: gate_up GEMM → SiLU×Mul → down GEMM on raw f32 buffers.
+    #[cfg(feature = "onednn")]
+    pub(crate) unsafe fn forward_raw_f32(
+        &self,
+        input: *const f32,
+        total: usize,
+        hidden_size: usize,
+        output: *mut f32,
+    ) {
+        let gup = match self.gate_up_proj {
+            Some(ref gup) => gup,
+            None => return,
+        };
+        let gate_up_pw = match gup.f32_packed_weight() {
+            Some(b) => b,
+            None => return,
+        };
+        let down_pw = match self.down_proj.f32_packed_weight() {
+            Some(b) => b,
+            None => return,
+        };
+
+        super::raw_cpu::with_scratch_f32(|scratch| {
+            unsafe {
+                super::raw_cpu::raw_mlp_forward_f32(
+                    scratch, input, total, hidden_size,
+                    gate_up_pw, down_pw, output,
+                );
+            }
+        });
+    }
 }
