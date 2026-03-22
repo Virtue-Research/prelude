@@ -94,15 +94,16 @@ Modular dispatch lives exclusively in `models/layers/attn/mod.rs`. Model code
 has zero `#[cfg]` gates for attention -- adding a backend means one file in
 `attn/` and one dispatch branch in `mod.rs`.
 
-| Backend | Feature flag       | GPU requirement | Key capabilities                        |
-|---------|--------------------|-----------------|----------------------------------------|
-| FA4     | `flash-attn-v4`    | SM80+ (Ampere)  | Prefill only, AOT CuTeDSL, no paged KV |
-| FA3     | `flash-attn-v3`    | SM90 (Hopper)   | Prefill + paged decode, prefix cache    |
-| FA2     | `flash-attn`       | SM80+ (Ampere)  | Prefill + paged decode (v1 layout)      |
-| CPU     | (always available) | None            | Matmul SDPA, tiled BF16 attention       |
+| Backend | Feature flag | GPU requirement | Key capabilities |
+|---|---|---|---|
+| FA4 | `flash-attn-v4` | SM80+ | Prefill + paged decode, AOT CuTeDSL |
+| FlashInfer | `flashinfer` | SM80+ (FA2) / SM90+ (FA3) | All attention paths, CUDA graph (32 graphs), plan caching |
+| FA3 | `flash-attn-v3` | SM90 (Hopper) | Legacy, replaced by FlashInfer |
+| FA2 | `flash-attn` | SM80+ | Legacy, replaced by FlashInfer |
+| CPU | (always available) | None | Tiled BF16 (AVX-512) + F32 matmul SDPA |
 
-**Dispatch priority:** FA4 (prefill) > FA3 > FA2 > CPU.
-Recommended GPU build: `flash-attn-v4,flash-attn-v3` (FA4 prefill + FA3 decode).
+**Dispatch priority:** FA4 -> FlashInfer -> FA3 -> FA2 -> CPU.
+Recommended GPU build: `flashinfer-v4,onednn,deepgemm` (~98MB binary).
 
 ## 6. GEMM Backends
 
@@ -116,14 +117,20 @@ Recommended GPU build: `flash-attn-v4,flash-attn-v3` (FA4 prefill + FA3 decode).
 ## 7. KV Cache
 
 **Paged KV cache** with `BlockManager` (vLLM-style). Block size is auto-tuned
-for the active attention backend (128 with FA3, 16 otherwise) and overridable
-via `PRELUDE_PAGED_BLOCK_SIZE`.
+for the active attention backend (128 with FlashInfer/FA3, 16 otherwise) and
+overridable via `PRELUDE_PAGED_BLOCK_SIZE`.
+
+**KV cache write**: custom vectorized PTX kernel (`scatter_kv_cache_flash` in
+`ops/gpu/kv_cache.rs`), 128-bit float4 loads/stores. Independent of candle-paged-attn.
 
 **Prefix cache** (`prefix_cache.rs`): hash-trie structure that matches incoming
 prompts against cached token blocks using hash chains. LRU eviction of leaf
 blocks. Ref-counted integration with `BlockManager` so cached blocks survive
-across requests. `AssembledKvCache` avoids repeated `Tensor::cat` for the same
-prefix chain. Prefix cache requires FA3 (needs `flash_attn_varlen_paged`).
+across requests.
+
+**CUDA graph decode** (`cuda_graph.rs`): Optional graph capture for decode steps.
+FlashInfer mode: 32 graphs (no seqlen bucketing), ~750ms warmup. Pre-allocated
+metadata buffers for address stability across capture/replay.
 
 ## 8. CPU Optimization
 

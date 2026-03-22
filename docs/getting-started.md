@@ -22,30 +22,28 @@ This directory must exist (symlink or copy of candle-core source).
 Three main configurations:
 
 ```bash
-# GPU full -- Hopper/Blackwell (FA4 prefill + FA3 paged decode + CPU fallback)
-# First build is slow due to FA4 AOT kernel compilation (~120 variants per arch)
-cargo build -p prelude-server --release --features flash-attn-v4,flash-attn-v3,onednn
+# GPU — full stack (recommended): FlashInfer + FA4 + DeepGEMM + oneDNN
+cargo build -p prelude-server --release --features flashinfer-v4,onednn,deepgemm
 
-# GPU Ampere/Ada -- Flash Attention v2
-cargo build -p prelude-server --release --features flash-attn
+# GPU — FlashInfer only (no FA4)
+cargo build -p prelude-server --release --features flashinfer,onednn
 
-# CPU only -- oneDNN BF16 GEMM
+# CPU only — oneDNN BF16 GEMM
 cargo build -p prelude-server --release --features onednn
 ```
 
-Feature flags cascade: `flash-attn`, `flash-attn-v3`, and `flash-attn-v4` each imply `cuda`.
-`cuda` auto-enables `paged-attn`.
+Feature flags cascade: `flashinfer`, `flash-attn-v4`, and `flash-attn` each imply `cuda`.
 
-Additional features you can combine:
+| Feature | What it does | GPU requirement |
+|---|---|---|
+| `flashinfer-v4` | FlashInfer + FA4 combined (recommended) | SM80+ |
+| `flashinfer` | FlashInfer AOT attention (FA2 SM80+ / FA3 SM90+) | SM80+ |
+| `flash-attn-v4` | FA4 CuTeDSL AOT attention | SM80+ |
+| `deepgemm` | DeepGEMM BF16 GEMM, replaces cuBLAS. 17-2x faster decode | SM90+ |
+| `onednn` | CPU BF16 GEMM via oneDNN | None (CPU) |
+| `cuda` | GPU fused ops + paged KV (implied by above) | Any CUDA |
 
-| Feature        | What it does                                       | GPU requirement |
-|----------------|----------------------------------------------------|-----------------|
-| `flash-attn-v4`| CuTeDSL AOT prefill kernels, statically linked     | SM80+ (Ampere+) |
-| `flash-attn-v3`| Hopper flash attention (varlen + paged + GQA)       | SM90+ (Hopper)  |
-| `flash-attn`   | Flash Attention v2 (varlen + paged decode)          | SM80+ (Ampere+) |
-| `deepgemm`     | DeepGEMM BF16 GEMM, replaces cuBLAS. 17-2x faster decode | SM90+ (Hopper) |
-| `onednn`       | CPU BF16 GEMM via oneDNN                           | None (CPU)      |
-| `cuda`         | GPU fused ops + paged KV (implied by flash-attn*)  | Any CUDA        |
+Attention dispatch priority: FA4 -> FlashInfer -> FA3 -> FA2 -> CPU.
 
 ## Run
 

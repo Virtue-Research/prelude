@@ -1,193 +1,450 @@
-# Server Configuration Reference
+# Prelude Server
 
-## CLI Flags
+## Configuration
 
-### Server
-
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--host` | string | `0.0.0.0` | Bind address |
-| `--port` | u16 | `8000` | Bind port |
-| `--model` | string | `Qwen/Qwen3-0.6B` | HF Hub repo ID or model name |
-| `--model-path` | string | none | Local path to model directory or `.gguf` file (bypasses HF Hub) |
-| `--task` | enum | `auto` | Force model task detection: `auto`, `classify`, `embedding`, `generation` |
-| `--dtype` | string | none | Override dtype: `f32` or `bf16`. Default: bf16 for CPU, auto for GPU |
-| `--cors-allow-origin` | string | none | Allowed CORS origin (repeatable). No CORS headers emitted unless set |
-
-### Batching / Scheduler
-
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--max-batch-size` | usize | `32` | Max requests per batched model call |
-| `--max-batch-wait-ms` | u64 | `5` | Max wait time (ms) before dispatching a batch |
-| `--max-running-requests` | usize | `8` | Max concurrent running requests in the scheduler |
-| `--max-prefill-tokens` | usize | `4096` | Max prefill tokens per scheduling step |
-| `--max-total-tokens` | usize | `32768` | Max total tokens across all running requests |
-| `--decode-reservation-cap` | usize | `4096` | Per-request cap for reserving future decode tokens |
-
-### Memory / Cache
-
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--gpu-memory-utilization` | f32 | `0.4` | Fraction of free GPU memory for KV cache (0.0--1.0). Ignored when `PRELUDE_PAGED_ATTN_BLOCKS` is set |
-
-### Authentication
-
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--api-key` | string | none | API key for authentication (repeatable). Merged with `PRELUDE_API_KEY` env var. When set, `/v1/*` routes require `Authorization: Bearer <key>`; `/health` is always open |
-
-### Mock / Debug
-
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--pseudo` | bool | `false` | Use mock engine (no model loaded) |
-| `--pseudo-latency-ms` | u64 | `25` | Simulated per-token latency in mock mode |
-
----
-
-## Environment Variables
-
-### Device
-
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| `PRELUDE_DEVICE` | string | `auto` | Device selection: `auto`, `cpu`, `cuda`, `cuda:N` |
-| `SGLANG_CPU_OMP_THREADS_BIND` | string | none | CPU IDs for NUMA-aware thread binding |
-
-### Cache
-
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| `PRELUDE_PAGED_BLOCK_SIZE` | usize | `128` (flash-attn-v3) / `16` (other) | Tokens per paged KV cache block |
-| `PRELUDE_PAGED_ATTN_BLOCKS` | usize | `0` (auto) | Explicit paged attention block count. 0 = derive from `--gpu-memory-utilization` |
-| `PRELUDE_PREFIX_CACHE_BLOCKS` | usize | `0` (disabled) | Max cached prefix blocks. 0 = prefix cache disabled |
-| `PRELUDE_PREFIX_BLOCK_SIZE` | usize | `64` | Tokens per prefix cache block |
-| `PRELUDE_DELTANET_POOL_SLOTS` | u32 | `8` | Max concurrent DeltaNet recurrent state slots (hybrid models) |
-
-### Sampling Defaults
-
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| `PRELUDE_DEFAULT_TEMPERATURE` | f32 | `0.7` | Default sampling temperature when not specified by request |
-| `PRELUDE_DEFAULT_TOP_P` | f32 | `1.0` | Default top-p when not specified by request |
-| `PRELUDE_DEFAULT_MAX_TOKENS` | u32 | `4096` | Default max new tokens when not specified by request |
-
-### Performance
-
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| `PRELUDE_FUSED_KV_CACHE_WRITE` | bool (`1`) | off | Enable fused K-Norm + RoPE + KV paged cache write kernel (saves 1 kernel launch per layer) |
-| `PRELUDE_FORCE_VARLEN_PREFILL` | bool | off | Force variable-length prefill path even when all sequences are same length |
-| `PRELUDE_ADAPTIVE_ARRIVAL_ALPHA` | f64 | `0.5` | EWMA smoothing factor for arrival rate (higher = more responsive) |
-| `PRELUDE_ADAPTIVE_GPU_ALPHA` | f64 | `0.4` | EWMA smoothing factor for GPU time (lower = more stable) |
-| `PRELUDE_ADAPTIVE_INITIAL_LAMBDA` | f64 | `1000.0` | Initial arrival rate assumption (req/s) for adaptive batch cold start |
-| `PRELUDE_ADAPTIVE_MAX_RATE` | f64 | `10000.0` | Maximum instantaneous rate before clamping |
-
-### Debug
-
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| `RUST_LOG` | string | `prelude_server=info,prelude_core=info,tower_http=info` | Logging verbosity filter (tracing-subscriber `EnvFilter` syntax) |
-| `PRELUDE_SYNC_TIMING` | bool | off | Enable CUDA device sync for timing measurements |
-| `PRELUDE_PROFILE` | bool | off | Enable profiling output |
-| `PRELUDE_ATTN_PROFILE` | bool | off | Enable attention sub-section profiling |
-| `PRELUDE_NO_SCHEDULER` | bool (`1`) | off | Bypass ScheduledEngine, use base Engine directly. Disables streaming. Debug only |
-
-### Authentication
-
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| `PRELUDE_API_KEY` | string | none | API key, merged with `--api-key` CLI args |
-
-### Build-time
-
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| `PRELUDE_FA4_ARCHS` | string | local GPU arch | Comma-separated SM architectures for FA4 AOT compilation (e.g., `sm_90,sm_120`) |
-| `ONEDNN_FFI_DIR` | string | auto | Override oneDNN FFI build directory |
-
----
-
-## Feature Flags
-
-Build-time Cargo features defined in `prelude-core`. Pass via `--features` when building `prelude-server`.
-
-| Feature | Implies | Description |
-|---------|---------|-------------|
-| `cuda` | `paged-attn` | GPU support via CUDA. Enables paged attention KV cache and fused CUDA kernels |
-| `flash-attn` | `cuda` | Flash Attention V2 (Ampere+, SM80). GQA native, no varlen-paged (no prefix cache) |
-| `flash-attn-v3` | `cuda` | Flash Attention V3 (Hopper, SM90). Full varlen-paged support including prefix cache |
-| `flash-attn-v4` | `cuda` | Flash Attention V4 (CuTeDSL AOT, SM80+). Prefill only, no paged KV. Statically linked |
-| `deepgemm` | `cuda` | DeepGEMM BF16 GEMM kernels replacing cuBLAS. SM90+, statically linked. Decode 17%--2x faster on H200 |
-| `onednn` | none | oneDNN BF16 GEMM for CPU. Auto-built from source via CMake. Adds ~33MB to binary |
-
-### Recommended combinations
-
-| Target | Features |
-|--------|----------|
-| CPU (F32) | none |
-| CPU (BF16) | `onednn` |
-| GPU (Ampere) | `flash-attn` |
-| GPU (Hopper) | `flash-attn-v4,flash-attn-v3` |
-| GPU (Hopper, full) | `flash-attn-v4,flash-attn-v3,onednn` |
-| GPU (Hopper, DeepGEMM) | `flash-attn-v4,flash-attn-v3,deepgemm` |
-
----
-
-## Deployment Recipes
-
-### Development (mock mode, fast iteration)
+### Command Line Arguments
 
 ```bash
-cargo run -p prelude-server -- --pseudo --pseudo-latency-ms 10 --port 8000
+prelude-server [OPTIONS]
 ```
 
-### Single-GPU Hopper (production)
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--host <HOST>` | `127.0.0.1` | Server bind address |
+| `--port <PORT>` | `8000` | Server port |
+| `--model <MODEL>` | `Qwen/Qwen3-0.6B` | HuggingFace repo ID or local path to model dir / `.gguf` file |
+| `--max-batch-size <N>` | `32` | Max requests per batch |
+| `--max-batch-wait-ms <MS>` | `5` | Max wait time before batch dispatch |
+| `--max-running-requests <N>` | `8` | Max concurrent running requests |
+| `--max-prefill-tokens <N>` | `4096` | Max prefill tokens per step |
+| `--max-total-tokens <N>` | `32768` | Max total tokens across requests |
+| `--api-key <KEY>` | - | API key for authentication (repeatable). `/v1/*` routes require `Authorization: Bearer <key>` |
 
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PRELUDE_DEVICE` | `auto` | Device selection: `auto`, `cpu`, `cuda`, `cuda:N` |
+| `PRELUDE_PAGED_BLOCK_SIZE` | `128`* | Block size for paged KV cache (128 with FA3, 16 otherwise) |
+| `CUDA_VISIBLE_DEVICES` | all | GPU device selection |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | - | OpenTelemetry collector endpoint (e.g. `http://localhost:4317`) |
+| `OTEL_SERVICE_NAME` | `prelude` | Service name reported to OTel collector |
+| `RUST_LOG` | `info` | Log level: `debug`, `info`, `warn`, `error` |
+| `PRELUDE_MOCK` | - | Enable mock engine (no model needed, dev only) |
+| `PRELUDE_MOCK_LATENCY_MS` | `25` | Simulated latency in mock mode (ms) |
+| `PRELUDE_NO_SCHEDULER` | - | Disable scheduler, run engine directly (dev only) |
+| `PRELUDE_API_KEY` | - | API key (merged with `--api-key` CLI args) |
+
+### Example Startup Commands
+
+**Text Generation (Qwen3-4B)**:
 ```bash
-cargo build -p prelude-server --release --features flash-attn-v4,flash-attn-v3
-
 CUDA_VISIBLE_DEVICES=0 ./target/release/prelude-server \
   --model Qwen/Qwen3-4B \
-  --port 8000 \
-  --gpu-memory-utilization 0.8 \
+  --max-batch-size 32 \
+  --port 8000
+```
+
+**Classification**:
+```bash
+CUDA_VISIBLE_DEVICES=0 ./target/release/prelude-server \
+  --model tomaarsen/Qwen3-Reranker-0.6B-seq-cls \
   --max-batch-size 64 \
-  --max-running-requests 32 \
-  --api-key sk-prod-key
+  --port 8000
 ```
 
-### Single-GPU Ampere (production)
-
-```bash
-cargo build -p prelude-server --release --features flash-attn
-
-CUDA_VISIBLE_DEVICES=0 ./target/release/prelude-server \
-  --model Qwen/Qwen3-4B \
-  --port 8000 \
-  --gpu-memory-utilization 0.8 \
-  --max-batch-size 64
-```
-
-### CPU-only (BF16)
-
-```bash
-cargo build -p prelude-server --release --features onednn
-
-PRELUDE_DEVICE=cpu ./target/release/prelude-server \
-  --model Qwen/Qwen3-0.6B \
-  --port 8000 \
-  --max-batch-size 16
-```
-
-### High-throughput classification / embedding
-
+**Embeddings**:
 ```bash
 CUDA_VISIBLE_DEVICES=0 ./target/release/prelude-server \
-  --model Qwen/Qwen3-Reranker \
-  --task classify \
-  --port 8000 \
-  --max-batch-size 128 \
-  --max-batch-wait-ms 10 \
-  --gpu-memory-utilization 0.8
+  --model Qwen/Qwen3-Embedding-0.6B \
+  --max-batch-size 64 \
+  --port 8000
 ```
+
+---
+
+## REST API Endpoints
+
+### Health Check
+
+```
+GET /health
+```
+
+**Response**:
+```json
+{
+  "status": "ready",
+  "model": "Qwen/Qwen3-4B",
+  "uptime_s": 123.45
+}
+```
+
+---
+
+### List Models
+
+```
+GET /v1/models
+```
+
+**Response**:
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "Qwen/Qwen3-4B",
+      "object": "model",
+      "created": 1234567890,
+      "owned_by": "prelude"
+    }
+  ]
+}
+```
+
+---
+
+### Text Completion
+
+```
+POST /v1/completions
+```
+
+**Request Body**:
+```json
+{
+  "model": "Qwen/Qwen3-4B",
+  "prompt": "The capital of France is",
+  "max_tokens": 32,
+  "temperature": 0.7,
+  "top_p": 1.0,
+  "stop": ["\n"],
+  "stream": false
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `model` | string | Yes | - | Model identifier |
+| `prompt` | string | Yes | - | Input text |
+| `max_tokens` | int | No | 256 | Max tokens to generate |
+| `temperature` | float | No | 1.0 | Sampling temperature |
+| `top_p` | float | No | 1.0 | Nucleus sampling threshold |
+| `top_k` | int | No | -1 | Top-k sampling (-1 = disabled) |
+| `stop` | string[] | No | [] | Stop sequences |
+| `stream` | bool | No | false | Enable SSE streaming |
+
+**Response**:
+```json
+{
+  "id": "cmpl-xxx",
+  "object": "text_completion",
+  "created": 1234567890,
+  "model": "Qwen/Qwen3-4B",
+  "choices": [
+    {
+      "text": " Paris, which is also the largest city.",
+      "index": 0,
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 6,
+    "completion_tokens": 10,
+    "total_tokens": 16
+  }
+}
+```
+
+---
+
+### Chat Completion
+
+```
+POST /v1/chat/completions
+```
+
+**Request Body**:
+```json
+{
+  "model": "Qwen/Qwen3-4B",
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Hello!"}
+  ],
+  "max_tokens": 64,
+  "temperature": 0.7,
+  "stream": false
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `model` | string | Yes | - | Model identifier |
+| `messages` | array | Yes | - | Chat messages array |
+| `max_tokens` | int | No | 256 | Max tokens to generate |
+| `temperature` | float | No | 1.0 | Sampling temperature |
+| `top_p` | float | No | 1.0 | Nucleus sampling threshold |
+| `stop` | string[] | No | [] | Stop sequences |
+| `stream` | bool | No | false | Enable SSE streaming |
+
+**Message Format**:
+```json
+{
+  "role": "user|assistant|system",
+  "content": "message text"
+}
+```
+
+**Response**:
+```json
+{
+  "id": "chatcmpl-xxx",
+  "object": "chat.completion",
+  "created": 1234567890,
+  "model": "Qwen/Qwen3-4B",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Hello! How can I help you today?"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 20,
+    "completion_tokens": 10,
+    "total_tokens": 30
+  }
+}
+```
+
+**Streaming Response** (SSE):
+```
+data: {"id":"chatcmpl-xxx","choices":[{"delta":{"content":"Hello"}}]}
+
+data: {"id":"chatcmpl-xxx","choices":[{"delta":{"content":"!"}}]}
+
+data: [DONE]
+```
+
+---
+
+### Classification
+
+```
+POST /v1/classify
+```
+
+**Request Body**:
+```json
+{
+  "model": "test",
+  "input": ["This is great!", "This is terrible."]
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `model` | string | Yes | Model identifier |
+| `input` | string or string[] | Yes | Text(s) to classify |
+
+**Response**:
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "object": "classification",
+      "index": 0,
+      "label": "positive",
+      "probs": [0.95, 0.05],
+      "num_classes": 2
+    },
+    {
+      "object": "classification",
+      "index": 1,
+      "label": "negative",
+      "probs": [0.1, 0.9],
+      "num_classes": 2
+    }
+  ],
+  "model": "test",
+  "usage": {
+    "prompt_tokens": 12,
+    "total_tokens": 12
+  }
+}
+```
+
+---
+
+### Embeddings
+
+```
+POST /v1/embeddings
+```
+
+**Request Body**:
+```json
+{
+  "model": "test",
+  "input": ["Hello world", "How are you?"]
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `model` | string | Yes | Model identifier |
+| `input` | string or string[] | Yes | Text(s) to embed |
+
+**Response**:
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "object": "embedding",
+      "index": 0,
+      "embedding": [0.123, -0.456, ...]
+    },
+    {
+      "object": "embedding",
+      "index": 1,
+      "embedding": [0.789, -0.012, ...]
+    }
+  ],
+  "model": "test",
+  "usage": {
+    "prompt_tokens": 8,
+    "total_tokens": 8
+  }
+}
+```
+
+---
+
+## Error Responses
+
+All endpoints return errors in this format:
+
+```json
+{
+  "error": {
+    "message": "Error description",
+    "type": "invalid_request_error"
+  }
+}
+```
+
+| HTTP Status | Type | Description |
+|-------------|------|-------------|
+| 400 | `invalid_request_error` | Malformed request |
+| 401 | `authentication_error` | Missing or invalid API key |
+| 404 | `not_found` | Model or endpoint not found |
+| 500 | `internal_error` | Server error |
+| 501 | `not_implemented` | Endpoint not yet implemented |
+| 503 | `unavailable` | Model not ready |
+
+---
+
+## Python Client Examples
+
+### Using requests
+
+```python
+import requests
+
+BASE_URL = "http://localhost:8000"
+
+# Completion
+resp = requests.post(f"{BASE_URL}/v1/completions", json={
+    "model": "Qwen/Qwen3-4B",
+    "prompt": "Hello",
+    "max_tokens": 32
+})
+print(resp.json())
+
+# Chat
+resp = requests.post(f"{BASE_URL}/v1/chat/completions", json={
+    "model": "Qwen/Qwen3-4B",
+    "messages": [{"role": "user", "content": "Hi!"}]
+})
+print(resp.json())
+
+# Classification
+resp = requests.post(f"{BASE_URL}/v1/classify", json={
+    "model": "test",
+    "input": ["Good product!", "Bad service."]
+})
+print(resp.json())
+
+# Embeddings
+resp = requests.post(f"{BASE_URL}/v1/embeddings", json={
+    "model": "test",
+    "input": ["Hello world"]
+})
+print(resp.json())
+```
+
+### Using OpenAI SDK
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="not-needed"
+)
+
+# Completion
+response = client.completions.create(
+    model="Qwen/Qwen3-4B",
+    prompt="The capital of France is",
+    max_tokens=32
+)
+print(response.choices[0].text)
+
+# Chat
+response = client.chat.completions.create(
+    model="Qwen/Qwen3-4B",
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+print(response.choices[0].message.content)
+
+# Embeddings
+response = client.embeddings.create(
+    model="test",
+    input=["Hello world"]
+)
+print(response.data[0].embedding[:5])
+```
+
+---
+
+## Benchmarking
+
+Use the included benchmark script:
+
+```bash
+# Text generation
+python benchmark/benchmark_simple.py --mode generate --model Qwen/Qwen3-4B --workers 32
+
+# Classification
+python benchmark/benchmark_simple.py --mode classify --workers 32 --requests 200
+
+# Embeddings
+python benchmark/benchmark_simple.py --mode embed --workers 32 --requests 200
+```
+
+Options:
+- `--mode`: `generate`, `classify`, or `embed`
+- `--model`: Model name (default: `test`)
+- `--url`: Server URL (default: `http://localhost:8000`)
+- `--workers`: Concurrent workers (default: 32)
+- `--requests`: Total requests (default: 200)
+- `--batch-size`: Batch size for classify/embed (default: 20)
+- `--max-tokens`: Max tokens for generation (default: 32)

@@ -3,15 +3,15 @@
 ## Model Support Matrix
 
 | Architecture | Models | GPU Backend | CPU | Continuous Batching | Quantization |
-|--------------|--------|-------------|-----|---------------------|--------------|
-| Qwen3 (Dense) | 0.6B, 1.7B, 4B, 8B, 14B, 32B | FA4 / FA3 / FA2 | Yes | Yes | GGUF |
-| Qwen3-MoE | 30B-A3B | FA4 / FA3 / FA2 | No | Yes | -- |
-| Qwen3.5 (Hybrid) | 0.8B-27B dense, 35B-A3B MoE | FA3 | No | Yes (DeltaNet pool) | -- |
-| Qwen3-Next (Hybrid) | 80B-A3B | FA3 | No | Yes (DeltaNet pool) | -- |
-| Gemma3 | All sizes | FA4 / FA3 / FA2 | Yes | Yes | -- |
-| GGUF | Qwen3, LLaMA, Gemma, Phi3, Qwen2 | CPU only | Yes | No | All GGUF formats |
+|---|---|---|---|---|---|
+| Qwen3 (Dense) | 0.6B, 1.7B, 4B, 8B, 14B, 32B | FlashInfer / FA4 | Yes | Yes | GGUF |
+| Qwen3-MoE | 30B-A3B | FlashInfer / FA4 | No | Yes | -- |
+| Qwen3.5 (Hybrid) | 0.8B-27B dense, 35B-A3B MoE | FlashInfer / FA4 | No | Yes (DeltaNet pool) | GGUF |
+| Qwen3-Next (Hybrid) | 80B-A3B | FlashInfer / FA4 | No | Yes (DeltaNet pool) | -- |
+| Gemma3 | All sizes | FlashInfer / FA4 | Yes | Yes | -- |
+| GGUF | Qwen3, Qwen3.5, LLaMA, Gemma, Phi3, Qwen2 | CUDA / CPU | Yes | No | All GGUF formats |
 
-**Backend key:** FA4 = Flash Attention v4 (SM80+ prefill only), FA3 = v3 (Hopper SM90+), FA2 = v2 (Ampere SM80+).
+**Backend key:** FlashInfer = AOT attention (FA2 SM80+ / FA3 SM90+), FA4 = CuTeDSL AOT (SM80+). GGUF uses llama.cpp FFI backend.
 
 ## Task Support
 
@@ -77,7 +77,7 @@ The directory must contain `config.json`, safetensor weight files, and `tokenize
 PRELUDE_DEVICE=cpu ./target/release/prelude-server --model /path/to/model.gguf --port 8000
 ```
 
-GGUF files are auto-detected by the `.gguf` extension. The architecture is read from GGUF metadata (`general.architecture`). Supported GGUF architectures: qwen3, qwen3moe, llama, gemma3, gemma2, gemma, phi3, qwen2.
+GGUF files are auto-detected by the `.gguf` extension or from HuggingFace Hub repos (e.g., `--model unsloth/Qwen3.5-0.8B-GGUF`). The architecture is read from GGUF metadata (`general.architecture`). When `ggml-quants` feature is enabled, all architectures use the llama.cpp FFI backend. Supported architectures: qwen3, qwen35, qwen3moe, llama, gemma3, gemma2, gemma, phi3, qwen2.
 
 ## Hybrid Models
 
@@ -94,7 +94,7 @@ PRELUDE_DELTANET_POOL_SLOTS=16  # default 8
 Increase this if you expect more concurrent generation requests on a hybrid model.
 
 **Limitations:**
-- GPU only (FA3 required)
+- GPU only (FlashInfer or FA3 required for native weights)
 - Decode throughput depends on `PRELUDE_DELTANET_POOL_SLOTS`
 
 ## Known Limitations
@@ -103,5 +103,5 @@ Increase this if you expect more concurrent generation requests on a hybrid mode
 - No tool calling / function calling
 - No LoRA adapter serving
 - No tensor parallelism (single-GPU only)
-- GGUF models are CPU-only (except `qwen3moe` which needs CUDA for fused MoE GEMM)
+- GGUF models support both CPU and GPU (via llama.cpp with `ggml-quants` feature)
 - No FP8 or INT8 quantization for native models (only GGUF quantization)

@@ -35,13 +35,16 @@
 ### Build
 
 ```bash
-# GPU with Flash Attention v4 + v3 (Hopper, recommended)
-cargo build -p prelude-server --release --features flash-attn-v4,flash-attn-v3,onednn
+# GPU — full stack (recommended): FlashInfer + FA4 + DeepGEMM + oneDNN
+cargo build -p prelude-server --release --features flashinfer-v4,onednn,deepgemm
 
-# GPU with Flash Attention v2 (Ampere/Ada)
-cargo build -p prelude-server --release --features flash-attn
+# GPU — FlashInfer only (no FA4)
+cargo build -p prelude-server --release --features flashinfer,onednn
 
 # CPU only with oneDNN BF16 GEMM
+cargo build -p prelude-server --release --features onednn
+
+# GGUF models (auto-detected, no extra flags needed)
 cargo build -p prelude-server --release --features onednn
 ```
 
@@ -72,15 +75,17 @@ curl http://localhost:8000/v1/chat/completions \
 ## Supported Models
 
 
-| Name                             | Structure            | Completion | Classify | Embed | GPU Backend     |
-| -------------------------------- | -------------------- | ---------- | -------- | ----- | --------------- |
-| Qwen3 (0.6B–32B)                 | Dense                | ✔          | ✔        | ✔     | FA4 / FA3 / FA2 |
-| Qwen3-MoE (30B-A3B)              | MoE                  | ✔          | —        | —     | FA3 / FA2       |
-| Qwen3-Next (80B-A3B)             | Hybrid (DeltaNet + MoE) | ✔          | —        | —     | FA3             |
-| Qwen3.5 (0.8B–27B)               | Hybrid (DeltaNet) | ✔          | —        | —     | FA3             |
-| Qwen3.5-MoE (35B-A3B)            | Hybrid (DeltaNet + MoE) | ✔          | —        | —     | FA3             |
-| Gemma3                           | Dense                | ✔          | ✔        | ✔     | FA3 / FA2       |
-| GGUF (Qwen3, LLaMA, Gemma, Phi3) | Quantized            | ✔          | —        | —     | CPU only        |
+| Architecture | Models | GPU Backend | Continuous Batching |
+|---|---|---|---|
+| Dense | Qwen3 (0.6B–32B) | FlashInfer / FA4 | Yes |
+| MoE | Qwen3-MoE (30B-A3B) | FlashInfer / FA4 | Yes |
+| Hybrid | Qwen3.5 (0.8B–27B, dense + MoE) | FlashInfer / FA4 | Yes |
+| Hybrid | Qwen3-Next (80B-A3B) | FlashInfer / FA4 | Yes |
+| Classification | Qwen3-Reranker, Gemma3 | FlashInfer / FA4 | Yes |
+| Embedding | Qwen3-Embedding | FlashInfer / FA4 | Yes |
+| Quantized | GGUF (Qwen3, Qwen3.5, LLaMA, Gemma, Phi3) | CUDA / CPU | No |
+
+GGUF models are auto-detected from HuggingFace Hub or local `.gguf` files.
 
 
 ## API
@@ -98,7 +103,19 @@ OpenAI-compatible endpoints:
 | `GET /health`               | Health check    |
 
 
-Compatible with OpenAI SDK, vLLM, and SGLang clients. Supports streaming, logprobs, and stop sequences.
+Supports `logprobs`, `top_logprobs`, `prompt_logprobs`, `stop` sequences, and `stream` mode. Compatible with OpenAI SDK, vLLM, and SGLang clients.
+
+## Architecture
+
+```
+Request -> Continuous Batching Scheduler -> GPU Queue -> GPU Worker -> Response
+```
+
+**Attention**: FA4 (prefill) -> FlashInfer (decode + CUDA graph) -> CPU fallback. One file per backend, zero `#[cfg]` in model code.
+
+**GEMM**: DeepGEMM (SM90+, 2x cuBLAS) / cuBLAS / oneDNN (CPU BF16).
+
+**Runtime**: Paged KV cache, prefix caching, fused CUDA kernels (QKNorm+RoPE, SiLU*Mul, Add+RMSNorm), pure Rust AVX-512 CPU kernels.
 
 ## License
 
