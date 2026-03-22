@@ -27,27 +27,6 @@ use super::request_state::{
     ContinuousGenerationRequestState, ContinuousSchedulerMsg, GenerationResponseChannel,
 };
 
-/// Spawn the CPU continuous generation loop on a dedicated OS thread.
-///
-/// Runs on its own thread (like the GPU worker) to avoid tokio worker pool
-/// expansion from `block_in_place`. This prevents thread contention between
-/// tokio's replacement workers and llama.cpp's OpenMP pool.
-pub(crate) fn spawn_cpu_continuous_worker(
-    engine: Arc<Engine>,
-    rx: mpsc::UnboundedReceiver<ContinuousSchedulerMsg>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("cpu-continuous".into())
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("cpu continuous worker runtime");
-            rt.block_on(cpu_continuous_generation_loop(engine, rx));
-        })
-        .expect("spawn cpu continuous worker thread")
-}
-
 /// CPU continuous generation loop with per-token streaming.
 ///
 /// Receives `ContinuousSchedulerMsg` from the scheduler, processes one request
@@ -80,7 +59,10 @@ pub(crate) async fn cpu_continuous_generation_loop(
                 continue;
             }
 
-            process_request(&engine, state);
+            let engine = Arc::clone(&engine);
+            tokio::task::block_in_place(|| {
+                process_request(&engine, state);
+            });
         }
     }
 }
@@ -112,47 +94,13 @@ fn process_request(engine: &Engine, state: ContinuousGenerationRequestState) {
     let max_new = prepared.max_new.max(1);
     let logprobs_k = prepared.request.logprobs;
     let model_id = prepared.request.model.clone();
-    let stop_strings = prepared.request.stop.strings.clone();
 
     // Send Started event for streaming
     if let GenerationResponseChannel::Stream(tx) = &response {
         let _ = tx.send(StreamEvent::Started);
     }
 
-    // ── Fast path: C-side decode loop (llama.cpp FFI) ──
-    {
-        let mut model = engine.executor.model.lock().unwrap();
-        if let Ok(Some((tokens, _logits))) =
-            model.generate_direct(&prepared.prompt_tokens, max_new)
-        {
-            model.clear_kv_cache();
-            drop(model);
-
-            let prefill_ms = gen_start.elapsed().as_secs_f32() * 1000.0;
-            let mut finish_reason = FinishReason::Length;
-            let mut output_tokens: Vec<u32> = Vec::new();
-            let output_logprobs = Vec::new();
-
-            for &tok in &tokens {
-                output_tokens.push(tok);
-                emit_token(engine, &response, &output_tokens, logprobs_k, &output_logprobs);
-                if check_stop(
-                    engine, tok, &prepared.request.stop, &output_tokens, &mut finish_reason,
-                ) {
-                    break;
-                }
-            }
-
-            finish_response(
-                response, model_id, output_tokens, output_logprobs,
-                finish_reason, prompt_len, gen_start, prefill_ms, engine, &stop_strings,
-            );
-            return;
-        }
-        drop(model);
-    }
-
-    // ── Standard path: per-token Rust loop ──
+    // ── Prefill ──
     let logits = match engine.cpu_prefill_with_cache(&prepared.prompt_tokens) {
         Ok(l) => l,
         Err(e) => {
@@ -191,7 +139,7 @@ fn process_request(engine: &Engine, state: ContinuousGenerationRequestState) {
         engine.cpu_clear_kv_cache();
         finish_response(
             response, model_id, output_tokens, output_logprobs,
-            finish_reason, prompt_len, gen_start, prefill_ms, engine, &stop_strings,
+            finish_reason, prompt_len, gen_start, prefill_ms, engine,
         );
         return;
     }
@@ -233,7 +181,7 @@ fn process_request(engine: &Engine, state: ContinuousGenerationRequestState) {
     engine.cpu_clear_kv_cache();
     finish_response(
         response, model_id, output_tokens, output_logprobs,
-        finish_reason, prompt_len, gen_start, prefill_ms, engine, &stop_strings,
+        finish_reason, prompt_len, gen_start, prefill_ms, engine,
     );
 }
 
@@ -299,10 +247,8 @@ fn fail_response(response: GenerationResponseChannel, error: EngineError) {
         GenerationResponseChannel::Complete(tx) => {
             let _ = tx.send(Err(error));
         }
-        GenerationResponseChannel::Stream(tx) => {
-            let _ = tx.send(StreamEvent::Error {
-                message: error.to_string(),
-            });
+        GenerationResponseChannel::Stream(_tx) => {
+            // Dropping closes the stream
         }
     }
 }
@@ -318,7 +264,6 @@ fn finish_response(
     gen_start: Instant,
     prefill_ms: f32,
     engine: &Engine,
-    stop_strings: &[String],
 ) {
     let total_ms = gen_start.elapsed().as_secs_f32() * 1000.0;
     let decode_ms = total_ms - prefill_ms;
@@ -326,7 +271,7 @@ fn finish_response(
         .tokenizer
         .decode(&output_tokens, true)
         .unwrap_or_default();
-    let output_text = Engine::trim_stop_strings(&output_text, stop_strings);
+    let output_text = Engine::trim_stop_strings(&output_text, &[]);
     let completion_tokens = output_tokens.len() as u32;
 
     let result = GenerateResult {
@@ -350,7 +295,6 @@ fn finish_response(
         } else {
             Some(output_logprobs)
         },
-        prompt_token_logprobs: None,
     };
 
     match response {

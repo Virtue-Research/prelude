@@ -121,7 +121,7 @@ fn generate_dispatch_code(
     writeln!(code)?;
 
     // Extern declarations for each kernel variant
-    writeln!(code, "unsafe extern \"C\" {{")?;
+    writeln!(code, "extern \"C\" {{")?;
     for variant in variants {
         let symbol = variant["symbol"]
             .as_str()
@@ -141,14 +141,11 @@ fn generate_dispatch_code(
     )?;
     writeln!(
         code,
-        "    match (key.head_dim, key.head_dim_v, key.gqa_ratio, key.causal, key.window, key.pack_gqa, key.softcap_bits, key.paged, key.paged_non_tma, key.dtype as u8, key.has_seqused_q, arch) {{"
+        "    match (key.head_dim, key.gqa_ratio, key.causal, key.window, key.pack_gqa, key.softcap_bits, arch) {{"
     )?;
     for variant in variants {
         let symbol = variant["symbol"].as_str().unwrap();
         let head_dim = variant["head_dim"].as_u64().unwrap();
-        let head_dim_v = variant.get("head_dim_v")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(head_dim);
         let gqa_ratio = variant["gqa_ratio"].as_u64().unwrap();
         let causal = variant["causal"].as_bool().unwrap();
         let window = variant["window"].as_bool().unwrap();
@@ -164,25 +161,9 @@ fn generate_dispatch_code(
             }
             _ => 0u32,
         };
-        let paged = variant
-            .get("paged")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let dtype_val: u8 = match variant.get("dtype").and_then(|v| v.as_str()) {
-            Some("fp16") => 1,
-            _ => 0,  // bf16
-        };
-        let paged_non_tma = variant
-            .get("paged_non_tma")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let has_seqused_q = variant
-            .get("has_seqused_q")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
         writeln!(
             code,
-            "        ({head_dim}, {head_dim_v}, {gqa_ratio}, {causal}, {window}, {pack_gqa}, {softcap_bits}_u32, {paged}, {paged_non_tma}, {dtype_val}_u8, {has_seqused_q}, {arch}) => Some({symbol}),"
+            "        ({head_dim}, {gqa_ratio}, {causal}, {window}, {pack_gqa}, {softcap_bits}_u32, {arch}) => Some({symbol}),"
         )?;
     }
     writeln!(code, "        _ => None,")?;
@@ -362,19 +343,8 @@ fn ensure_fa4_source(out_dir: &Path) -> Result<PathBuf> {
     Ok(fa4_src)
 }
 
-/// Compute SHA-256 hash (first 16 hex chars) of a file. Matches compile_kernels.py.
-fn file_hash(path: &Path) -> Option<String> {
-    use sha2::Digest;
-    let content = std::fs::read(path).ok()?;
-    let hash = sha2::Sha256::digest(&content);
-    Some(hex::encode(hash)[..16].to_string())
-}
-
 fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_dir: &Path) -> Result<()> {
-    let script = manifest_dir.join("scripts/compile_kernels.py");
-    let current_hash = file_hash(&script).unwrap_or_default();
-
-    // Check if we already have compiled kernels that match the current script
+    // Check if we already have compiled kernels (manifest with non-empty variants + .o files)
     if kernels_dir.join("manifest.json").exists() {
         let has_objs = std::fs::read_dir(kernels_dir)
             .ok()
@@ -382,34 +352,10 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_d
             .flatten()
             .any(|e| e.ok().map(|e| e.path().extension().is_some_and(|x| x == "o")).unwrap_or(false));
         if has_objs {
-            // Check if compile_kernels.py has changed since last compilation
-            let manifest_str = std::fs::read_to_string(kernels_dir.join("manifest.json")).unwrap_or_default();
-            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&manifest_str) {
-                let stored_hash = manifest.get("script_hash")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if stored_hash == current_hash {
-                    return Ok(());
-                }
-                println!(
-                    "cargo:warning=compile_kernels.py changed (hash {stored_hash:.8} → {current_hash:.8}), \
-                     clearing old kernels and recompiling..."
-                );
-                // Clear all old .o files
-                for entry in std::fs::read_dir(kernels_dir).into_iter().flatten().flatten() {
-                    let p = entry.path();
-                    if p.extension().is_some_and(|x| x == "o") {
-                        let _ = std::fs::remove_file(&p);
-                    }
-                }
-                let _ = std::fs::remove_file(kernels_dir.join("manifest.json"));
-            } else {
-                return Ok(());
-            }
-        } else {
-            // manifest exists but no .o files — need to recompile
-            let _ = std::fs::remove_file(kernels_dir.join("manifest.json"));
+            return Ok(());
         }
+        // manifest exists but no .o files — need to recompile
+        let _ = std::fs::remove_file(kernels_dir.join("manifest.json"));
     }
 
     println!("cargo:warning=No pre-compiled FA4 kernels, attempting AOT compilation...");
@@ -445,18 +391,10 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_d
     for arch in &archs {
         println!("cargo:warning=FA4 AOT compiling for {arch}...");
 
-        let workers = std::env::var("PRELUDE_FA4_WORKERS").unwrap_or_else(|_| {
-            let num_cpus = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1);
-            num_cpus.min(8).to_string()
-        });
-
         let status = Command::new(&python)
             .arg(&script)
             .arg("--output-dir")
             .arg(kernels_dir)
-            .args(["-j", &workers])
             .env("PYTHONPATH", fa4_src)
             .env("FLASH_ATTENTION_FAKE_TENSOR", "1")
             .env("FLASH_ATTENTION_ARCH", arch)
@@ -544,7 +482,7 @@ fn ensure_python_env(out_dir: &Path) -> Result<String> {
     } else {
         let pip_path = venv_dir.join("bin/pip");
         Command::new(&pip_path)
-            .args(["install", "nvidia-cutlass-dsl", "quack-kernels>=0.3.4", "torch", "einops"])
+            .args(["install", "nvidia-cutlass-dsl", "torch"])
             .status()
             .context("pip install failed")?
     };

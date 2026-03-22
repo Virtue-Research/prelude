@@ -80,9 +80,6 @@ pub struct CompletionRequest {
     /// Number of top log probabilities to return per token (null = don't return).
     #[serde(default)]
     pub logprobs: Option<u32>,
-    /// Number of top log probabilities to return per prompt token (vLLM extension).
-    #[serde(default)]
-    pub prompt_logprobs: Option<u32>,
     #[serde(default)]
     pub seed: Option<u64>,
     // TODO: implement n > 1 (multiple choices)
@@ -124,22 +121,6 @@ pub struct CompletionChoice {
     pub finish_reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<CompletionLogprobs>,
-    /// Per-prompt-token logprobs (vLLM extension). First element is always None.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_logprobs: Option<Vec<Option<HashMap<u32, PromptLogprobEntry>>>>,
-    /// Prompt token IDs (returned when prompt_logprobs is requested).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_token_ids: Option<Vec<u32>>,
-}
-
-/// A single logprob entry in the prompt_logprobs response (vLLM-compatible).
-#[derive(Debug, Clone, Serialize)]
-pub struct PromptLogprobEntry {
-    pub logprob: f32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rank: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoded_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,8 +350,6 @@ pub struct GenerateRequest {
     pub deadline_ms: Option<u64>,
     /// If Some(k), return top-k log probabilities per generated token.
     pub logprobs: Option<u32>,
-    /// If Some(k), return top-k log probabilities per prompt token (vLLM extension).
-    pub prompt_logprobs: Option<u32>,
 }
 
 
@@ -392,8 +371,6 @@ pub struct GenerateResult {
     pub metrics: DecodeMetrics,
     /// Per-token logprob info (populated when logprobs was requested).
     pub token_logprobs: Option<Vec<TokenLogprobInfo>>,
-    /// Per-prompt-token logprob info (populated when prompt_logprobs was requested).
-    pub prompt_token_logprobs: Option<Vec<TokenLogprobInfo>>,
 }
 
 /// Events emitted during streaming generation.
@@ -411,10 +388,6 @@ pub enum StreamEvent {
         finish_reason: FinishReason,
         usage: Usage,
         metrics: DecodeMetrics,
-    },
-    /// Generation failed with an error.
-    Error {
-        message: String,
     },
 }
 

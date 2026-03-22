@@ -13,17 +13,13 @@ keywords = ["llm", "inference", "serving", "scheduler", "rust"]
 
 [features]
 default = ["onednn"]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-flash-attn = ["cuda", "paged-attn", "candle-flash-attn"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda", "paged-attn"]
+flash-attn = ["cuda", "candle-flash-attn"]
 flash-attn-v3 = ["cuda", "candle-flash-attn-v3"]
 flash-attn-v4 = ["cuda", "prelude-flash-attn-v4"]
 deepgemm = ["cuda", "prelude-deepgemm"]
-flashinfer = ["cuda", "prelude-flashinfer"]
-## FlashInfer + FA4 combined: FlashInfer skips tvm_ffi compilation (FA4 provides it).
-flashinfer-v4 = ["flashinfer", "flash-attn-v4", "prelude-flashinfer/skip-tvm-ffi"]
 paged-attn = ["dep:candle-paged-attn"]
 onednn = []
-ggml-quants = ["dep:prelude-ggml-quants"]
 hf_tokenizer = ["dep:tokenizers"]
 
 [dependencies]
@@ -40,14 +36,13 @@ candle-nn.workspace = true
 candle-transformers.workspace = true
 fastokens.workspace = true
 hf-hub.workspace = true
-half = "2.7.1"
+rand.workspace = true
+half = "2"
 candle-flash-attn = { workspace = true, optional = true }
 candle-flash-attn-v3 = { workspace = true, optional = true }
 candle-paged-attn = { workspace = true, optional = true }
 prelude-flash-attn-v4 = { workspace = true, optional = true }
 prelude-deepgemm = { workspace = true, optional = true }
-prelude-flashinfer = { workspace = true, optional = true }
-prelude-ggml-quants = { path = "../prelude-ggml-quants", optional = true }
-rayon = "1.11.0"
-libc = "1.0.0-alpha.3"
+rayon = "1.11"
+libc = "0.2"
 tokenizers = { workspace = true, optional = true }

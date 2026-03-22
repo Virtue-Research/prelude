@@ -112,13 +112,6 @@ struct Cli {
                 Ignored when PRELUDE_PAGED_ATTN_BLOCKS is set explicitly."
     )]
     gpu_memory_utilization: f32,
-
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Enable CUDA graph capture for decode steps (reduces kernel launch overhead)"
-    )]
-    cuda_graph: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -196,9 +189,6 @@ fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
         engine_config.runtime.dtype = Some(dtype.clone());
     }
     engine_config.cache.gpu_memory_utilization = cli.gpu_memory_utilization;
-    if cli.cuda_graph {
-        engine_config.runtime.cuda_graph = true;
-    }
     info!(?engine_config, "engine config loaded");
 
     let base_engine = if let Some(ref path) = cli.model_path {
@@ -238,44 +228,15 @@ fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
     Ok(Arc::new(scheduled))
 }
 
-/// Try loading chat template from HF Hub, with fallback for GGUF repos.
-/// If the repo has no tokenizer_config.json, try stripping -GGUF suffix to find the base model.
-fn load_chat_template_with_gguf_fallback(
-    model: &str,
-) -> anyhow::Result<Option<ModelChatTemplate>> {
-    match ModelChatTemplate::from_hf_hub(model) {
-        Ok(Some(t)) => return Ok(Some(t)),
-        Ok(None) | Err(_) => {}
-    }
-    // Fallback: strip -GGUF suffix
-    if let Some(base) = model
-        .strip_suffix("-GGUF")
-        .or_else(|| model.strip_suffix("-gguf"))
-    {
-        info!(base_model = %base, "trying base model for chat template");
-        if let Ok(Some(t)) = ModelChatTemplate::from_hf_hub(base) {
-            return Ok(Some(t));
-        }
-    }
-    Ok(None)
-}
-
 fn build_chat_template(cli: &Cli) -> anyhow::Result<Option<ModelChatTemplate>> {
     if cli.pseudo {
         return Ok(None);
     }
 
-    // Try local path first, then HF Hub. For GGUF repos (no tokenizer_config.json),
-    // fall back to base model repo by stripping -GGUF suffix.
     let template = if let Some(ref path) = cli.model_path {
-        let local = ModelChatTemplate::from_local_path(path)?;
-        if local.is_some() {
-            local
-        } else {
-            load_chat_template_with_gguf_fallback(&cli.model)?
-        }
+        ModelChatTemplate::from_local_path(path)?
     } else {
-        load_chat_template_with_gguf_fallback(&cli.model)?
+        ModelChatTemplate::from_hf_hub(&cli.model)?
     };
 
     if template.is_some() {

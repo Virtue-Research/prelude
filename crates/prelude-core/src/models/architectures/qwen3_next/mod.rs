@@ -1349,18 +1349,6 @@ impl crate::models::ModelForward for Qwen3NextForCausalLM {
         self.forward(packed_input, ctx)
     }
 
-    fn forward_hidden_states(
-        &mut self,
-        packed_input: &Tensor,
-        ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
-        self.model.forward(packed_input, ctx)
-    }
-
-    fn compute_logits(&self, hidden: &Tensor) -> candle_core::Result<Tensor> {
-        hidden.apply(&self.lm_head)
-    }
-
     fn clear_kv_cache(&mut self) {
         self.clear_kv_cache();
     }

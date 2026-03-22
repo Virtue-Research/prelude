@@ -22,23 +22,10 @@ use std::ffi::c_void;
 pub type TVMSafeCallFn =
     unsafe extern "C" fn(*mut c_void, *const TVMFFIAny, i32, *mut TVMFFIAny) -> i32;
 
-/// Dtype for kernel dispatch. Maps to DLDataType codes.
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-#[repr(u8)]
-pub enum KernelDtype {
-    BF16 = 0,
-    FP16 = 1,
-}
-
 /// Key for looking up a kernel variant.
-///
-/// Mirrors the compile_key dimensions from upstream `flash_attn/cute/interface.py`.
-/// Every dimension that can produce a different compiled kernel must be here.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct KernelKey {
     pub head_dim: u32,
-    /// Value head dimension. Usually = head_dim. Different for DeepSeek MLA (192, 128).
-    pub head_dim_v: u32,
     pub gqa_ratio: u32,
     pub causal: bool,
     pub window: bool,
@@ -47,69 +34,24 @@ pub struct KernelKey {
     /// Attention logit soft-capping, stored as `f32::to_bits()`. 0 = disabled.
     /// Used by Gemma models (30.0 for Gemma2, 50.0 for Gemma3).
     pub softcap_bits: u32,
-    /// Paged KV cache: K/V read from block-indexed paged cache.
-    pub paged: bool,
-    /// If paged: true = cp.async (page_size != tile_n), false = TMA (page_size == tile_n).
-    /// Ignored when paged=false.
-    pub paged_non_tma: bool,
-    /// Data type: BF16 or FP16.
-    pub dtype: KernelDtype,
-    /// Whether seqused_q is passed (prefix cache Q trimming).
-    pub has_seqused_q: bool,
 }
 
 impl KernelKey {
-    /// Convenience: create a key with defaults (bf16, head_dim_v=head_dim,
-    /// pack_gqa auto-derived, no softcap, non-paged, no seqused_q).
+    /// Convenience: create a key with pack_gqa auto-derived and no softcap.
     pub fn new(head_dim: u32, gqa_ratio: u32, causal: bool, window: bool) -> Self {
         Self {
             head_dim,
-            head_dim_v: head_dim,
             gqa_ratio,
             causal,
             window,
             pack_gqa: gqa_ratio > 1,
             softcap_bits: 0,
-            paged: false,
-            paged_non_tma: false,
-            dtype: KernelDtype::BF16,
-            has_seqused_q: false,
         }
-    }
-
-    /// Set value head dimension (for DeepSeek MLA shape).
-    pub fn with_head_dim_v(mut self, head_dim_v: u32) -> Self {
-        self.head_dim_v = head_dim_v;
-        self
     }
 
     /// Create a key with explicit softcap value.
     pub fn with_softcap(mut self, softcap: Option<f32>) -> Self {
         self.softcap_bits = softcap.map_or(0, |v| v.to_bits());
-        self
-    }
-
-    /// Create a key for paged KV attention (TMA path, page_size == tile_n).
-    pub fn with_paged(mut self, paged: bool) -> Self {
-        self.paged = paged;
-        self
-    }
-
-    /// Set paged non-TMA (cp.async path, page_size != tile_n).
-    pub fn with_paged_non_tma(mut self, non_tma: bool) -> Self {
-        self.paged_non_tma = non_tma;
-        self
-    }
-
-    /// Set dtype.
-    pub fn with_dtype(mut self, dtype: KernelDtype) -> Self {
-        self.dtype = dtype;
-        self
-    }
-
-    /// Set whether seqused_q is passed.
-    pub fn with_seqused_q(mut self, has_seqused_q: bool) -> Self {
-        self.has_seqused_q = has_seqused_q;
         self
     }
 
@@ -128,18 +70,9 @@ include!(concat!(env!("OUT_DIR"), "/fa4_dispatch.rs"));
 
 // ── GPU arch detection via CUDA runtime API ─────────────────────────
 
-unsafe extern "C" {
+extern "C" {
     fn cudaGetDevice(device: *mut i32) -> i32;
     fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> i32;
-    fn cudaGetLastError() -> i32;
-    fn cudaGetErrorString(error: i32) -> *const std::ffi::c_char;
-    fn cudaDeviceSynchronize() -> i32;
-    /// Set the CUDA stream for TVM FFI kernel calls.
-    /// Kernels call TVMFFIEnvGetStream() internally to get the stream.
-    fn TVMFFIEnvSetStream(
-        device_type: i32, device_id: i32,
-        stream: *mut c_void, out_original: *mut *mut c_void,
-    ) -> i32;
 }
 
 const CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
@@ -192,51 +125,24 @@ impl KernelRegistry {
         lookup(key, self.arch)
     }
 
-    /// Set the CUDA stream for subsequent kernel calls.
-    /// Kernels use TVMFFIEnvGetStream() internally to retrieve it.
-    pub fn set_stream(&self, device_id: i32, stream: *mut c_void) {
-        const KDLCUDA_DEVICE: i32 = 2;
-        unsafe {
-            TVMFFIEnvSetStream(KDLCUDA_DEVICE, device_id, stream, std::ptr::null_mut());
-        }
-    }
-
     /// Call a statically linked kernel via TVM FFI packed calling convention.
     ///
     /// # Safety
     /// All TVMFFIAny args must contain valid device pointers.
-    /// Caller must call `set_stream()` before calling this.
     pub unsafe fn call_kernel(
         &self,
         func: TVMSafeCallFn,
         args: &mut [TVMFFIAny],
     ) -> Result<(), String> {
         let mut result = TVMFFIAny::none();
-        let ret = unsafe {
-            func(
-                std::ptr::null_mut(),
-                args.as_ptr(),
-                args.len() as i32,
-                &mut result,
-            )
-        };
+        let ret = func(
+            std::ptr::null_mut(),
+            args.as_ptr(),
+            args.len() as i32,
+            &mut result,
+        );
         if ret != 0 {
-            // Sync and get CUDA error for detailed diagnostics
-            let cuda_detail = unsafe {
-                cudaDeviceSynchronize();
-                let cuda_err = cudaGetLastError();
-                if cuda_err != 0 {
-                    let ptr = cudaGetErrorString(cuda_err);
-                    if !ptr.is_null() {
-                        format!("CUDA error {cuda_err}: {}", std::ffi::CStr::from_ptr(ptr).to_string_lossy())
-                    } else {
-                        format!("CUDA error {cuda_err}")
-                    }
-                } else {
-                    "no CUDA error (TVM FFI internal failure)".to_string()
-                }
-            };
-            return Err(format!("FA4 kernel call failed (code {ret}): {cuda_detail}"));
+            return Err(format!("FA4 kernel call failed (code {ret})"));
         }
         Ok(())
     }

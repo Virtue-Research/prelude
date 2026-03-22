@@ -1,13 +1,13 @@
 use crate::engine::*;
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(feature = "flash-attn-v3")]
 use crate::models::layers::BatchAttnContext;
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(feature = "flash-attn-v3")]
 use crate::models::layers::PagedKvBatchContext;
 
 impl Engine {
     /// Batched decode step: N sequences, each with Q=1 (one new token),
     /// different context lengths. Returns logits (N, vocab_size).
-    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+    #[cfg(feature = "flash-attn-v3")]
     pub fn batch_decode_paged(
         &self,
         seqs: &[BatchDecodeSeq],
@@ -108,16 +108,12 @@ impl Engine {
             max_seqlen_q: 1,
             position_ids: &position_ids_t,
             seq_lens: &q_seq_lens,
-            #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+            #[cfg(feature = "flash-attn-v3")]
             paged_kv: Some(&paged_kv),
             deltanet_pool: dn_pool_ref,
             deltanet_slots: deltanet_slots.as_deref(),
         };
-        #[cfg(feature = "flashinfer")]
-        crate::models::layers::fi_begin_forward();
         let logits = model.forward(&packed_input, &mut ctx).map_err(candle_err)?;
-        #[cfg(feature = "flashinfer")]
-        crate::models::layers::fi_end_forward();
         drop(dn_pool_guard);
         drop(model);
 
@@ -129,7 +125,7 @@ impl Engine {
     /// Uses `forward` with paged KV and Q=1 for each decode step
     /// (same flash-layout KV caches as the batch prefill).
     /// Frees the block table when done.
-    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+    #[cfg(feature = "flash-attn-v3")]
     pub fn stream_decode_with_blocks(
         &self,
         request: &GenerateRequest,
@@ -251,16 +247,12 @@ impl Engine {
                     max_seqlen_q: 1,
                     position_ids: &pos_ids,
                     seq_lens: &[1usize],
-                    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+                    #[cfg(feature = "flash-attn-v3")]
                     paged_kv: Some(&paged_kv),
                     deltanet_pool: dn_pool_ref,
                     deltanet_slots: dn_slots.as_deref(),
                 };
-                #[cfg(feature = "flashinfer")]
-                crate::models::layers::fi_begin_forward();
                 let logits = model.forward(&input_t, &mut ctx).map_err(candle_err)?;
-                #[cfg(feature = "flashinfer")]
-                crate::models::layers::fi_end_forward();
                 drop(dn_pool_guard);
                 drop(model);
 
@@ -406,13 +398,12 @@ impl Engine {
             usage,
             metrics,
             token_logprobs: token_logprobs_final,
-            prompt_token_logprobs: None,
         })
     }
 
     /// Batched streaming decode: all sequences decode together, one token per iteration.
     /// Replaces the sequential per-request `stream_decode_with_blocks`.
-    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+    #[cfg(feature = "flash-attn-v3")]
     pub fn batched_stream_decode(
         &self,
         requests: &[&GenerateRequest],
@@ -773,7 +764,6 @@ impl Engine {
                     usage,
                     metrics,
                     token_logprobs,
-                    prompt_token_logprobs: None,
                 }));
             }
         }

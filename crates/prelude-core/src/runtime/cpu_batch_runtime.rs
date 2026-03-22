@@ -29,7 +29,7 @@ use crate::types::GenerateResult;
 
 use crate::engine::{classify_postprocess, embed_postprocess};
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(feature = "flash-attn-v3")]
 use crate::engine::{RawGenerateOutput, generate_postprocess};
 
 use super::batch_common::{
@@ -167,7 +167,7 @@ fn execute_generate_batch(engine: &Arc<Engine>, batch: Vec<GenerationRequestStat
     );
 }
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(feature = "flash-attn-v3")]
 fn execute_generate_forward(
     engine: &Engine,
     prepared: Vec<PreparedGenerateRequest>,
@@ -178,7 +178,7 @@ fn execute_generate_forward(
     generate_postprocess(raw, &engine.tokenizer, &engine.eos_token_ids)
 }
 
-#[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
+#[cfg(not(feature = "flash-attn-v3"))]
 fn execute_generate_forward(
     engine: &Engine,
     prepared: Vec<PreparedGenerateRequest>,

@@ -105,7 +105,7 @@ impl CacheConfig {
         Self {
             paged_block_size: parse_env_usize(
                 "PRELUDE_PAGED_BLOCK_SIZE",
-                if cfg!(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")) { 128 } else { 16 },
+                if cfg!(feature = "flash-attn-v3") { 128 } else { 16 },
             ),
             paged_attn_blocks: parse_env_usize("PRELUDE_PAGED_ATTN_BLOCKS", 0),
             gpu_memory_utilization: 0.4,
@@ -156,10 +156,6 @@ pub struct RuntimeConfig {
     /// Override dtype selection: "f32", "bf16".
     /// When None, auto-selects based on device (GPU: BF16 if supported, CPU: BF16).
     pub dtype: Option<String>,
-    /// Enable CUDA graph capture for decode (Q=1) steps.
-    pub cuda_graph: bool,
-    /// Maximum batch size for CUDA graph capture (graphs captured for 1..=max_bs powers of 2).
-    pub cuda_graph_max_bs: usize,
 }
 
 impl RuntimeConfig {
@@ -174,8 +170,6 @@ impl RuntimeConfig {
                 .ok()
                 .filter(|s| !s.is_empty()),
             dtype: None,
-            cuda_graph: parse_env_bool("PRELUDE_CUDA_GRAPH"),
-            cuda_graph_max_bs: parse_env_usize("PRELUDE_CUDA_GRAPH_MAX_BS", 32),
         }
     }
 }

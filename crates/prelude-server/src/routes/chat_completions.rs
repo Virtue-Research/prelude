@@ -150,10 +150,6 @@ fn chat_stream(
             events.push(sse_done_event());
             events
         }
-        StreamEvent::Error { message } => {
-            tracing::error!(error = %message, "chat stream generation error");
-            vec![sse_done_event()]
-        }
     }))
 }
 
@@ -241,6 +237,5 @@ fn parse_chat_request(
         request.stop.clone(),
         request.seed,
         logprobs,
-        None, // prompt_logprobs not supported for chat completions
     ))
 }

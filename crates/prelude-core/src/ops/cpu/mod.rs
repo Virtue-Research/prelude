@@ -13,7 +13,6 @@ pub mod numa;
 pub mod rmsnorm;
 pub mod rope;
 pub mod silu_mul;
-pub mod softmax;
 
 use candle_core::{Device, Result, Tensor};
 
@@ -22,12 +21,11 @@ use candle_core::{Device, Result, Tensor};
 pub use rmsnorm::{cpu_rmsnorm, cpu_fused_add_rmsnorm, CpuRmsNorm};
 pub use silu_mul::{cpu_silu_and_mul, cpu_silu_and_mul_inplace};
 
-// Attention: tiled kernels for BF16 and F32.
-pub use self::attention_tensor::{cpu_prefill_attention, cpu_decode_attention, cpu_decode_attention_f32};
+// Attention: BF16-only tiled kernel. F32 uses matmul SDPA in layers/ops.rs.
+pub use self::attention_tensor::{cpu_prefill_attention, cpu_decode_attention};
 
 // RoPE
 pub use self::rope_tensor::{cpu_rotary_embedding, cpu_rotary_embedding_with_positions};
-pub use self::rope_tensor::{cpu_rotary_embedding_f32, cpu_rotary_embedding_f32_with_positions};
 
 // ── Thread pool helpers ─────────────────────────────────────────────────
 
@@ -115,32 +113,6 @@ pub(crate) fn tensor_as_u16_slice(tensor: &Tensor) -> Result<&[u16]> {
     }
 }
 
-/// Get a zero-copy `&[f32]` view of a CPU F32 tensor.
-/// Tensor must be contiguous.
-///
-/// # Safety
-/// Same lifetime contract as `tensor_as_u16_slice`: the returned slice is
-/// valid as long as the originating `Tensor` is alive.
-pub(crate) fn tensor_as_f32_slice(tensor: &Tensor) -> Result<&[f32]> {
-    if !tensor.is_contiguous() {
-        candle_core::bail!(
-            "tensor_as_f32_slice: tensor is not contiguous (shape={:?}, stride={:?})",
-            tensor.dims(), tensor.stride()
-        );
-    }
-    let (storage, layout) = tensor.storage_and_layout();
-    let offset = layout.start_offset();
-    let n = layout.shape().elem_count();
-    match &*storage {
-        candle_core::Storage::Cpu(cpu) => {
-            let slice = cpu.as_slice::<f32>()?;
-            let data = &slice[offset..offset + n];
-            Ok(unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) })
-        }
-        _ => candle_core::bail!("tensor_as_f32_slice: expected CPU storage"),
-    }
-}
-
 /// Get a mutable `&mut [u16]` view into a CPU BF16 tensor's storage.
 pub(crate) unsafe fn extract_bf16_mut_u16(
     storage: &mut candle_core::Storage,
@@ -153,21 +125,6 @@ pub(crate) unsafe fn extract_bf16_mut_u16(
             Ok(unsafe { std::slice::from_raw_parts_mut(ptr, n) })
         }
         _ => candle_core::bail!("cpu_ops: expected CPU BF16 storage"),
-    }
-}
-
-/// Get a mutable `&mut [f32]` view into a CPU F32 tensor's storage.
-pub(crate) unsafe fn extract_f32_mut(
-    storage: &mut candle_core::Storage,
-    offset: usize,
-    n: usize,
-) -> Result<&mut [f32]> {
-    match storage {
-        candle_core::Storage::Cpu(candle_core::CpuStorage::F32(data)) => {
-            let ptr = unsafe { data.as_mut_ptr().add(offset) };
-            Ok(unsafe { std::slice::from_raw_parts_mut(ptr, n) })
-        }
-        _ => candle_core::bail!("cpu_ops: expected CPU F32 storage"),
     }
 }
 
@@ -241,37 +198,6 @@ mod attention_tensor {
 
         super::u16_vec_to_bf16_tensor(out_buf, &[1, num_heads, head_dim], q.device())
     }
-
-    /// Decode attention: single Q token against contiguous KV cache (F32).
-    ///
-    /// q: `[1, num_heads, head_dim]`, k/v_cache: `[context_len, num_kv_heads, head_dim]`
-    /// Returns: `[1, num_heads, head_dim]`
-    pub fn cpu_decode_attention_f32(
-        q: &Tensor, k_cache: &Tensor, v_cache: &Tensor,
-        context_len: usize, num_heads: usize, num_kv_heads: usize,
-        head_dim: usize, sm_scale: f32,
-    ) -> Result<Tensor> {
-        debug_assert_eq!(q.dtype(), candle_core::DType::F32, "cpu_decode_attention_f32 requires F32");
-
-        let q_cont = q.contiguous()?;
-        let k_cont = k_cache.contiguous()?;
-        let v_cont = v_cache.contiguous()?;
-        let q_slice = super::tensor_as_f32_slice(&q_cont)?;
-        let k_slice = super::tensor_as_f32_slice(&k_cont)?;
-        let v_slice = super::tensor_as_f32_slice(&v_cont)?;
-
-        let mut out_buf = vec![0.0f32; num_heads * head_dim];
-        let req_to_token: Vec<i32> = (0..context_len as i32).collect();
-        let seq_lens = [context_len as i64];
-
-        super::attention::decode_attention_f32(
-            &mut out_buf, q_slice, k_slice, v_slice,
-            &req_to_token, &seq_lens,
-            1, context_len, num_heads, num_kv_heads, head_dim, sm_scale,
-        );
-
-        Tensor::from_vec(out_buf, &[1, num_heads, head_dim], q.device())
-    }
 }
 
 // ── RoPE Tensor wrappers ────────────────────────────────────────────────
@@ -316,51 +242,6 @@ mod rope_tensor {
             };
 
             super::rope::rope_neox_bf16(
-                q_slice, k_slice, cache_slice, positions,
-                batch_size, seq_len, num_heads, num_kv_heads, head_dim, rotary_dim,
-            );
-        }
-
-        Ok((q_2d.reshape(q.dims())?, k_2d.reshape(k.dims())?))
-    }
-
-    /// Apply NeoX-style RoPE in-place to Q and K tensors (F32).
-    pub fn cpu_rotary_embedding_f32(
-        q: &Tensor, k: &Tensor, cos_sin_cache: &Tensor,
-        offset: usize, num_heads: usize, num_kv_heads: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        let q_dims = q.dims();
-        let (batch_size, seq_len) = (q_dims[0], q_dims[1]);
-        let positions: Vec<i64> = (0..batch_size)
-            .flat_map(|_| (0..seq_len).map(|s| (offset + s) as i64))
-            .collect();
-        cpu_rotary_embedding_f32_with_positions(q, k, cos_sin_cache, &positions, num_heads, num_kv_heads)
-    }
-
-    /// Apply NeoX-style RoPE with explicit per-token positions (F32).
-    pub fn cpu_rotary_embedding_f32_with_positions(
-        q: &Tensor, k: &Tensor, cos_sin_cache: &Tensor,
-        positions: &[i64], num_heads: usize, num_kv_heads: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        let q_dims = q.dims();
-        let (batch_size, seq_len, _nh, head_dim) = (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
-        let rotary_dim = cos_sin_cache.dims()[1];
-
-        let q_2d = q.contiguous()?.reshape((batch_size * seq_len * num_heads * head_dim,))?;
-        let k_2d = k.contiguous()?.reshape((batch_size * seq_len * num_kv_heads * head_dim,))?;
-        let cache_slice = super::tensor_as_f32_slice(cos_sin_cache)?;
-
-        {
-            let (mut q_guard, q_layout) = unsafe { q_2d.storage_mut_and_layout() };
-            let (mut k_guard, k_layout) = unsafe { k_2d.storage_mut_and_layout() };
-            let q_slice = unsafe {
-                super::extract_f32_mut(&mut q_guard, q_layout.start_offset(), batch_size * seq_len * num_heads * head_dim)?
-            };
-            let k_slice = unsafe {
-                super::extract_f32_mut(&mut k_guard, k_layout.start_offset(), batch_size * seq_len * num_kv_heads * head_dim)?
-            };
-
-            super::rope::rope_neox_f32(
                 q_slice, k_slice, cache_slice, positions,
                 batch_size, seq_len, num_heads, num_kv_heads, head_dim, rotary_dim,
             );

@@ -9,7 +9,7 @@
 
 use core::ffi::{c_int, c_void};
 
-unsafe extern "C" {
+extern "C" {
     pub(crate) fn run_mha(
         q_ptr: *const c_void,
         k_ptr: *const c_void,

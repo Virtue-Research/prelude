@@ -1,14 +1,14 @@
 use crate::engine::*;
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(feature = "flash-attn-v3")]
 use crate::models::layers::BatchAttnContext;
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(feature = "flash-attn-v3")]
 use crate::models::layers::PagedKvBatchContext;
 
 impl Engine {
     /// Batch prefill multiple requests using varlen paged attention.
     /// Returns first token + block table per request. Blocks are NOT freed —
     /// the caller must either call `stream_decode_with_blocks` or free them manually.
-    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+    #[cfg(feature = "flash-attn-v3")]
     pub(crate) fn batch_prefill_paged(
         &self,
         items: &mut [PreparedGenerateRequest],
@@ -149,75 +149,21 @@ impl Engine {
             max_seqlen_q,
             position_ids: &position_ids_t,
             seq_lens: &q_seq_lens,
-            #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+            #[cfg(feature = "flash-attn-v3")]
             paged_kv: Some(&paged_kv),
             deltanet_pool: dn_pool_ref,
             deltanet_slots: deltanet_slots.as_deref(),
         };
-        let needs_prompt_logprobs = items.iter().any(|item| item.request.prompt_logprobs.is_some());
-
-        #[cfg(feature = "flashinfer")]
-        crate::models::layers::fi_begin_forward();
-
-        // When prompt logprobs needed: get hidden states, apply compute_logits in chunks.
-        // This avoids materializing the full (total_tokens, vocab_size) logits tensor.
-        let (logits, prompt_logprobs_cpu) = if needs_prompt_logprobs {
-            let hidden = model.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
-            let last_hidden = crate::models::layers::last_token_select(&hidden, &q_seq_lens)
-                .map_err(candle_err)?;
-            let last_logits = model.compute_logits(&last_hidden).map_err(candle_err)?
-                .unsqueeze(1).map_err(candle_err)?;
-
-            // Chunked prompt logprobs extraction while model lock is still held.
-            // Uses the shared extract function (avoids duplicating chunk logic).
-            let logprobs_cpu = super::generate::extract_prompt_logprobs_from_hidden_offset(
-                &hidden, &**model, items, &q_seq_lens, cached_len,
-            )?;
-            drop(hidden);
-            (last_logits, Some(logprobs_cpu))
-        } else {
-            (model.forward(&packed_input, &mut ctx).map_err(candle_err)?, None)
-        };
-        #[cfg(feature = "flashinfer")]
-        crate::models::layers::fi_end_forward();
+        let logits = model.forward(&packed_input, &mut ctx).map_err(candle_err)?;
+        // logits: (batch_size, 1, vocab_size)
         drop(dn_pool_guard);
         drop(model);
 
         let prefill_ms = prefill_start.elapsed().as_secs_f32() * 1000.0;
 
         // Sample first token per request
-        let logits_2d = logits.squeeze(1).map_err(candle_err)?;
+        let logits_2d = logits.squeeze(1).map_err(candle_err)?; // (batch_size, vocab_size)
         let mut results: Vec<BatchPrefillResult> = Vec::with_capacity(batch_size);
-
-        // Build prompt logprobs per item from pre-extracted CPU data.
-        let prompt_logprobs_per_item: Vec<Option<Vec<TokenLogprobInfo>>> = if let Some(ref logprobs_cpu) = prompt_logprobs_cpu {
-            let mut per_item = Vec::with_capacity(batch_size);
-            let mut offset = 0usize;
-            for (i, item) in items.iter().enumerate() {
-                let q_len = q_seq_lens[i];
-                if item.request.prompt_logprobs.is_some() {
-                    let prompt_tokens = &item.prompt_tokens[cached_len..];
-                    let plps: Vec<TokenLogprobInfo> = (0..q_len.saturating_sub(1))
-                        .map(|pos| {
-                            let next_token = prompt_tokens[pos + 1];
-                            TokenLogprobInfo {
-                                token: self.tokenizer.decode(&[next_token], false).unwrap_or_default(),
-                                token_id: next_token,
-                                logprob: logprobs_cpu[offset + pos],
-                                top_logprobs: Vec::new(),
-                            }
-                        })
-                        .collect();
-                    per_item.push(Some(plps));
-                } else {
-                    per_item.push(None);
-                }
-                offset += q_len;
-            }
-            per_item
-        } else {
-            vec![None; batch_size]
-        };
 
         // Fast path: all greedy → batch GPU argmax (avoids F32 conversion + CPU transfer)
         if prefill_plan.all_greedy {
@@ -240,7 +186,6 @@ impl Engine {
                     prefill_ms,
                     deltanet_slot: deltanet_slots.as_ref().map(|s| s[i]),
                     first_token_logprobs,
-                    prompt_token_logprobs: prompt_logprobs_per_item[i].clone(),
                 });
             }
         } else {
@@ -260,7 +205,6 @@ impl Engine {
                     prefill_ms,
                     deltanet_slot: deltanet_slots.as_ref().map(|s| s[i]),
                     first_token_logprobs,
-                    prompt_token_logprobs: prompt_logprobs_per_item[i].clone(),
                 });
             }
         }

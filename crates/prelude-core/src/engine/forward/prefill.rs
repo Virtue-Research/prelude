@@ -1,7 +1,7 @@
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(feature = "flash-attn-v3")]
 use super::super::*;
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(feature = "flash-attn-v3")]
 pub(crate) struct PackedSequenceBatch {
     pub flat_tokens: Vec<u32>,
     pub cu_seqlens: Vec<u32>,
@@ -14,23 +14,18 @@ pub(crate) struct PackedSequenceBatch {
 }
 
 /// Result of a batched varlen forward pass, shared by classify, embed, and generation.
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(feature = "flash-attn-v3")]
 pub(crate) struct PrefillForwardResult {
     /// Raw model output tensor (not converted to F32 — callers decide dtype).
-    /// Shape: (batch_size, vocab_size) — last token logits per sequence.
     pub output: candle_core::Tensor,
     /// Number of sequences per input item (for classify/embed grouping).
     pub item_seq_counts: Vec<usize>,
     /// Per-sequence query lengths (suffix lengths after prefix cache skip).
     pub seq_lens: Vec<usize>,
-    /// Hidden states before lm_head (total_tokens, hidden_dim).
-    /// Only populated when prompt_logprobs requested. Much smaller than
-    /// full logits (hidden_dim vs vocab_size), safe to pass across threads.
-    pub hidden_states: Option<candle_core::Tensor>,
 }
 
 /// Find the longest common prefix across all token sequences in the groups.
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(feature = "flash-attn-v3")]
 fn find_common_prefix_from_groups(token_groups: &[&[Vec<u32>]]) -> Vec<u32> {
     let all_seqs: Vec<&[u32]> = token_groups
         .iter()
@@ -57,7 +52,7 @@ fn find_common_prefix_from_groups(token_groups: &[&[Vec<u32>]]) -> Vec<u32> {
     first[..common_len].to_vec()
 }
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(feature = "flash-attn-v3")]
 impl Engine {
     /// Unified prefill pipeline for all task types (classify, embed, generate).
     ///
@@ -71,23 +66,6 @@ impl Engine {
     pub(crate) fn prefill_pipeline(
         &self,
         token_groups: &[&[Vec<u32>]],
-    ) -> Result<Option<PrefillForwardResult>, EngineError> {
-        self.prefill_pipeline_inner(token_groups, false)
-    }
-
-    /// Like `prefill_pipeline` but also returns hidden states (before lm_head)
-    /// for prompt logprobs extraction via chunked `compute_logits`.
-    pub(crate) fn prefill_pipeline_with_hidden_states(
-        &self,
-        token_groups: &[&[Vec<u32>]],
-    ) -> Result<Option<PrefillForwardResult>, EngineError> {
-        self.prefill_pipeline_inner(token_groups, true)
-    }
-
-    fn prefill_pipeline_inner(
-        &self,
-        token_groups: &[&[Vec<u32>]],
-        need_hidden_states: bool,
     ) -> Result<Option<PrefillForwardResult>, EngineError> {
         use crate::models::layers::BatchAttnContext;
 
@@ -147,7 +125,7 @@ impl Engine {
             ResolvedPrefixReuse::default()
         };
 
-        let (output, hidden_states) = {
+        let output = {
             {
                 let is_cache_hit = prefix_reuse.cached_len > 0;
                 let should_populate_prefix_cache = !is_cache_hit
@@ -163,7 +141,7 @@ impl Engine {
                     .iter()
                     .map(|&q| prefix_reuse.cached_len + q)
                     .collect();
-                let run = (|| -> Result<(candle_core::Tensor, Option<candle_core::Tensor>), EngineError> {
+                let run = (|| -> Result<candle_core::Tensor, EngineError> {
                     if use_paged_forward {
                         if let Some(pool) = &self.cache.paged_pool {
                             use crate::models::layers::PagedKvBatchContext;
@@ -255,21 +233,9 @@ impl Engine {
                                 deltanet_pool: None,
                                 deltanet_slots: None,
                             };
-                            #[cfg(feature = "flashinfer")]
-                            crate::models::layers::fi_begin_forward();
-                            let result = if need_hidden_states {
-                                let hidden = model.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
-                                let last = crate::models::layers::last_token_select(&hidden, &seq_lens)
-                                    .map_err(candle_err)?;
-                                let logits = model.compute_logits(&last).map_err(candle_err)?
-                                    .unsqueeze(1).map_err(candle_err)?;
-                                Ok((logits, Some(hidden)))
-                            } else {
-                                Ok((model.forward(&packed_input, &mut ctx).map_err(candle_err)?, None))
-                            };
-                            #[cfg(feature = "flashinfer")]
-                            crate::models::layers::fi_end_forward();
-                            return result;
+                            return Ok(model
+                                .forward(&packed_input, &mut ctx)
+                                .map_err(candle_err)?);
                         }
                     }
 
@@ -283,21 +249,7 @@ impl Engine {
                         deltanet_pool: None,
                         deltanet_slots: None,
                     };
-                    #[cfg(feature = "flashinfer")]
-                    crate::models::layers::fi_begin_forward();
-                    let result = if need_hidden_states {
-                        let hidden = model.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
-                        let last = crate::models::layers::last_token_select(&hidden, &seq_lens)
-                            .map_err(candle_err)?;
-                        let logits = model.compute_logits(&last).map_err(candle_err)?
-                            .unsqueeze(1).map_err(candle_err)?;
-                        Ok((logits, Some(hidden)))
-                    } else {
-                        Ok((model.forward(&packed_input, &mut ctx).map_err(candle_err)?, None))
-                    };
-                    #[cfg(feature = "flashinfer")]
-                    crate::models::layers::fi_end_forward();
-                    result
+                    Ok(model.forward(&packed_input, &mut ctx).map_err(candle_err)?)
                 })();
 
                 // Insert into prefix cache on cache miss (populate for future hits).
@@ -333,7 +285,6 @@ impl Engine {
             output,
             item_seq_counts,
             seq_lens,
-            hidden_states,
         }))
     }
 
@@ -385,7 +336,7 @@ impl Engine {
 /// Pack token groups into varlen format, skipping the first `offset` tokens
 /// from each sequence (used when prefix cache provides the leading tokens).
 /// Position IDs account for the offset so the model sees correct positions.
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(feature = "flash-attn-v3")]
 fn pack_varlen_tokens(
     token_groups: &[&[Vec<u32>]],
     offset: usize,

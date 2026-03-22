@@ -197,7 +197,6 @@ impl InferenceEngine for PseudoEngine {
                 total_ms,
             },
             token_logprobs: None,
-            prompt_token_logprobs: None,
         })
     }
 

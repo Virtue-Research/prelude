@@ -88,49 +88,16 @@ pub(crate) fn debug_disable_flash_attn_path() -> bool {
 
 // ── Shared utility functions ───────────────────────────────────────────
 
-/// Vectorized add: CUDA uses custom kernel, CPU F32 uses in-place add,
-/// everything else falls back to candle's default add.
+/// Vectorized BF16 add on CUDA, falls back to candle's default add.
 pub(crate) fn fast_add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     if a.device().is_cuda() && !debug_disable_vectorized_add() {
         return crate::ops::gpu::vectorized_add(a, b);
     }
-    if a.device().is_cpu() && a.dtype() == candle_core::DType::F32 {
-        return cpu_add_f32(a, b);
-    }
     a + b
 }
 
-/// Element-wise F32 add on CPU, avoiding candle tensor overhead.
-fn cpu_add_f32(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    let a_c = a.contiguous()?;
-    let b_c = b.contiguous()?;
-    let a_slice = crate::ops::cpu::tensor_as_f32_slice(&a_c)?;
-    let b_slice = crate::ops::cpu::tensor_as_f32_slice(&b_c)?;
-    let n = a_slice.len();
-    debug_assert_eq!(n, b_slice.len());
-    let mut out = vec![0.0f32; n];
-    let mut i = 0;
-    #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx512f") {
-        while i + 16 <= n {
-            unsafe {
-                use core::arch::x86_64::*;
-                let va = _mm512_loadu_ps(a_slice.as_ptr().add(i));
-                let vb = _mm512_loadu_ps(b_slice.as_ptr().add(i));
-                _mm512_storeu_ps(out.as_mut_ptr().add(i), _mm512_add_ps(va, vb));
-            }
-            i += 16;
-        }
-    }
-    while i < n {
-        out[i] = a_slice[i] + b_slice[i];
-        i += 1;
-    }
-    Tensor::from_vec(out, a.dims(), a.device())
-}
-
-/// Custom fast RMSNorm: CUDA fused kernel, CPU custom kernel, fallback candle.
+/// Custom fast RMSNorm on CUDA, falls back to candle's default RmsNorm.
 pub(crate) fn fast_rms_norm(
     x: &Tensor,
     norm: &QwenRmsNorm,
@@ -141,9 +108,6 @@ pub(crate) fn fast_rms_norm(
     if x.device().is_cuda() && !debug_disable_fast_rmsnorm() {
         return crate::ops::gpu::fast_rmsnorm(x, weight, eps);
     }
-    if x.device().is_cpu() {
-        return crate::ops::cpu::cpu_rmsnorm(x, weight, eps);
-    }
     norm.forward(x)
 }
 
@@ -151,12 +115,6 @@ pub(crate) fn fast_rms_norm(
 ///
 /// Given `seq_lens = [3, 5, 2]`, returns rows at indices `[2, 7, 9]`.
 pub(crate) fn last_token_select(hidden: &Tensor, seq_lens: &[usize]) -> Result<Tensor> {
-    // Fast path: all seq_lens == 1 (decode Q=1).
-    // Hidden is already [batch_size, hidden_dim] — no index_select needed.
-    // Also required for CUDA graph safety (avoids Tensor::from_vec during replay).
-    if seq_lens.iter().all(|&l| l == 1) {
-        return Ok(hidden.clone());
-    }
     let batch_size = seq_lens.len();
     let mut last_indices = Vec::with_capacity(batch_size);
     let mut off = 0usize;
@@ -244,8 +202,8 @@ pub(crate) fn qknorm_rope_varlen(
         return Ok((q, k));
     }
 
-    // ── CPU: cpu_ops rmsnorm + rotary_embedding (BF16 and F32) ──
-    if q.device().is_cpu() && (q.dtype() == DType::BF16 || q.dtype() == DType::F32) {
+    // ── CPU BF16: cpu_ops rmsnorm + rotary_embedding ──
+    if q.device().is_cpu() && q.dtype() == DType::BF16 {
         if let Some(ref cache) = rotary_emb.cos_sin_cache {
             let q = crate::ops::cpu::cpu_rmsnorm(&q.flatten(0, 1)?, q_norm_weight, rms_norm_eps)?
                 .reshape((total, num_heads, head_dim))?;
@@ -255,17 +213,14 @@ pub(crate) fn qknorm_rope_varlen(
             let positions: Vec<i64> = position_ids
                 .to_dtype(DType::I64)?
                 .to_vec1::<i64>()?;
-            let q4 = q.reshape((1, total, num_heads, head_dim))?;
-            let k4 = k.reshape((1, total, num_kv_heads, head_dim))?;
-            let (q_out, k_out) = if q.dtype() == DType::F32 {
-                crate::ops::cpu::cpu_rotary_embedding_f32_with_positions(
-                    &q4, &k4, cache, &positions, num_heads, num_kv_heads,
-                )?
-            } else {
-                crate::ops::cpu::cpu_rotary_embedding_with_positions(
-                    &q4, &k4, cache, &positions, num_heads, num_kv_heads,
-                )?
-            };
+            let (q_out, k_out) = crate::ops::cpu::cpu_rotary_embedding_with_positions(
+                &q.reshape((1, total, num_heads, head_dim))?,
+                &k.reshape((1, total, num_kv_heads, head_dim))?,
+                cache,
+                &positions,
+                num_heads,
+                num_kv_heads,
+            )?;
 
             return Ok((
                 q_out.reshape((total, num_heads, head_dim))?,

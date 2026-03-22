@@ -28,7 +28,7 @@ use crate::engine::{
 };
 use crate::types::{ClassificationInputs, ClassifyResult, EmbedResult, GenerateResult};
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(feature = "flash-attn-v3")]
 use crate::engine::{RawGenerateOutput, generate_postprocess};
 
 use crate::scheduler::scheduled_engine::{
@@ -144,9 +144,9 @@ fn dispatch_results<I, R>(
 // BatchTask trait — defines per-task-type behavior
 // ---------------------------------------------------------------------------
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(feature = "flash-attn-v3")]
 type GenGpuResult = RawGenerateOutput;
-#[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
+#[cfg(not(feature = "flash-attn-v3"))]
 type GenGpuResult = Vec<GenerateResult>;
 
 /// Trait that captures all per-task-type differences. `TaskPipeline<T>` drives
@@ -196,9 +196,9 @@ impl BatchTask for GenerationRequestState {
         submit_generate_batch(gpu_tx, batch)
     }
     fn postprocess(raw: GenGpuResult, engine: &Engine) -> Result<Vec<GenerateResult>, EngineError> {
-        #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+        #[cfg(feature = "flash-attn-v3")]
         return generate_postprocess(raw, &engine.tokenizer, &engine.eos_token_ids);
-        #[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
+        #[cfg(not(feature = "flash-attn-v3"))]
         { let _ = engine; Ok(raw) }
     }
     fn send_ok(item: Self, result: GenerateResult) { item.finish(Ok(result)); }

@@ -90,105 +90,7 @@ impl Drop for BrgemmPackedWeight {
     }
 }
 
-// ── F32 packed weight API (oneDNN blocked format) ─────────────────────
-
-/// Pre-packed F32 weight in oneDNN's optimal blocked format.
-/// Reorders weight from user layout to oneDNN's internal layout once at model load;
-/// subsequent matmuls skip the on-the-fly reorder, improving cache utilization.
-pub struct OnednnF32PackedWeight {
-    ptr: *mut std::ffi::c_void,
-    pub k: usize,
-    pub n: usize,
-}
-
-impl std::fmt::Debug for OnednnF32PackedWeight {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OnednnF32PackedWeight")
-            .field("k", &self.k)
-            .field("n", &self.n)
-            .finish()
-    }
-}
-
-unsafe impl Send for OnednnF32PackedWeight {}
-unsafe impl Sync for OnednnF32PackedWeight {}
-
-impl OnednnF32PackedWeight {
-    /// Pack an F32 weight tensor `[N, K]` into oneDNN's optimal blocked format.
-    /// `ref_m` is a representative M dimension for the matmul (affects blocking choice).
-    pub fn pack(weight: &Tensor, ref_m: usize) -> Result<Option<Self>> {
-        let weight = weight.contiguous()?;
-        if weight.dtype() != DType::F32 || !weight.device().is_cpu() {
-            return Ok(None);
-        }
-        let (n, k) = weight.dims2()?;
-
-        let (w_storage, w_layout) = weight.storage_and_layout();
-        let w_data = match &*w_storage {
-            candle_core::Storage::Cpu(s) => s.as_slice::<f32>()?,
-            _ => return Ok(None),
-        };
-        let w_ptr = w_data[w_layout.start_offset()..].as_ptr() as *const std::ffi::c_void;
-
-        let ptr = unsafe {
-            super::ffi::onednn_f32_pack_weights(w_ptr, k as i64, n as i64, ref_m as i64)
-        };
-        drop(w_storage);
-
-        if ptr.is_null() {
-            return Ok(None);
-        }
-        Ok(Some(Self { ptr, k, n }))
-    }
-
-    /// Raw F32 GEMM: output[M, N] = input[M, K] × packed^T, on pre-allocated buffers.
-    ///
-    /// # Safety
-    /// `input` must point to `[m * self.k]` f32 elements,
-    /// `output` must point to `[m * self.n]` f32 elements.
-    pub unsafe fn forward_raw(&self, input: *const f32, output: *mut f32, m: usize) {
-        unsafe {
-            super::ffi::onednn_f32_linear_packed(
-                input as *const std::ffi::c_void,
-                self.ptr,
-                output as *mut std::ffi::c_void,
-                m as i64,
-            );
-        }
-    }
-
-    /// Execute F32 linear with packed weights: output[M, N] = input[M, K] × packed^T
-    pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        let dims = input.dims();
-        let m: usize = dims[..dims.len() - 1].iter().product();
-        let input = input.contiguous()?;
-
-        let (in_storage, in_layout) = input.storage_and_layout();
-        let in_data = match &*in_storage {
-            candle_core::Storage::Cpu(s) => s.as_slice::<f32>()?,
-            _ => candle_core::bail!("OnednnF32PackedWeight::forward: CPU tensor required"),
-        };
-        let in_ptr = in_data[in_layout.start_offset()..].as_ptr() as *const std::ffi::c_void;
-
-        let mut out_buf = vec![0.0f32; m * self.n];
-        unsafe {
-            super::ffi::onednn_f32_linear_packed(
-                in_ptr, self.ptr, out_buf.as_mut_ptr() as *mut std::ffi::c_void, m as i64,
-            );
-        }
-
-        drop(in_storage);
-        let mut shape = dims.to_vec();
-        *shape.last_mut().unwrap() = self.n;
-        Tensor::from_vec(out_buf, shape.as_slice(), &Device::Cpu)
-    }
-}
-
-impl Drop for OnednnF32PackedWeight {
-    fn drop(&mut self) {
-        unsafe { super::ffi::onednn_packed_weights_destroy(self.ptr) }
-    }
-}
+// ── AMX packed weight API ─────────────────────────────────────────────
 
 // ── OnednnLinear: drop-in replacement for candle_nn::Linear ──────────
 
@@ -198,7 +100,6 @@ impl Drop for OnednnF32PackedWeight {
 pub struct OnednnLinear {
     candle_linear: candle_nn::Linear,
     brgemm_packed: Option<Arc<BrgemmPackedWeight>>,
-    f32_packed: Option<Arc<OnednnF32PackedWeight>>,
 }
 
 impl OnednnLinear {
@@ -232,34 +133,9 @@ impl OnednnLinear {
             None
         };
 
-        // Pack F32 weights into oneDNN's optimal blocked format (done once at model load)
-        let f32_packed = if w.device().is_cpu() && w.dtype() == DType::F32 {
-            match OnednnF32PackedWeight::pack(w, 1) {
-                Ok(Some(pw)) => {
-                    use std::sync::atomic::{AtomicBool, Ordering};
-                    static F32_LOGGED: AtomicBool = AtomicBool::new(false);
-                    if !F32_LOGGED.swap(true, Ordering::Relaxed) {
-                        let (n, k) = w.dims2().unwrap_or((0, 0));
-                        tracing::info!(
-                            "oneDNN F32: packing weights (K={k}, N={n})"
-                        );
-                    }
-                    Some(Arc::new(pw))
-                }
-                Ok(None) => None,
-                Err(e) => {
-                    tracing::debug!("F32 weight packing failed: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         Ok(Self {
             candle_linear: linear,
             brgemm_packed,
-            f32_packed,
         })
     }
 
@@ -271,11 +147,6 @@ impl OnednnLinear {
     /// Access the brgemm packed weight (if available) for fused operations.
     pub fn brgemm_weight(&self) -> Option<&BrgemmPackedWeight> {
         self.brgemm_packed.as_deref()
-    }
-
-    /// Access the F32 packed weight (if available) for raw forward path.
-    pub fn f32_packed_weight(&self) -> Option<&OnednnF32PackedWeight> {
-        self.f32_packed.as_deref()
     }
 }
 
@@ -306,12 +177,8 @@ impl Module for OnednnLinear {
             }
             return Ok(out);
         }
-        // F32 CPU: use packed weights if available, otherwise unpacked oneDNN matmul
+        // F32 CPU: use oneDNN F32 matmul (primitive-cached, much faster than candle)
         if x.device().is_cpu() && x.dtype() == DType::F32 {
-            if let Some(ref pw) = self.f32_packed {
-                return pw.forward(x);
-            }
-
             let dims = x.dims();
             let (flat, m) = if dims.len() == 3 {
                 let (b, s, h) = x.dims3()?;

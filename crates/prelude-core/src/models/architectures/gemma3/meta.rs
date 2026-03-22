@@ -41,7 +41,6 @@ fn common_from_gemma3(cfg: &Gemma3Config) -> CommonModelConfig {
         vocab_size: cfg.vocab_size,
         num_hidden_layers: cfg.num_hidden_layers,
         max_position_embeddings: cfg.max_position_embeddings,
-        num_attention_heads: cfg.num_attention_heads,
         num_key_value_heads: cfg.num_key_value_heads,
         head_dim: cfg.head_dim,
     }
@@ -241,7 +240,7 @@ impl ArchSpec for Gemma3ArchSpec {
             supports_kv_cache: is_safetensors && is_generate,
             supports_prefix_cache: false,
             supports_paged_attn: false,
-            supports_varlen: cfg!(feature = "cuda") && device.is_cuda() && is_safetensors,
+            supports_varlen: cfg!(feature = "flash-attn-v3") && device.is_cuda() && is_safetensors,
             supports_deltanet: false,
             supports_cuda_graph: false,
         }

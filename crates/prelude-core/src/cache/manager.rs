@@ -79,6 +79,7 @@ impl CacheManager {
         }
     }
 
+
     // ── Init helpers (read from CacheConfig, not env vars) ───────────────
 
     /// Create a prefix cache if enabled by config.
@@ -94,7 +95,7 @@ impl CacheManager {
         let block_size = cache_config.prefix_block_size;
         // flash layout: [B, L, H, D] → concat dim 1; standard: [B, H, L, D] → concat dim 2
         let is_flash =
-            device.is_cuda() && (cfg!(feature = "flash-attn") || cfg!(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")));
+            device.is_cuda() && (cfg!(feature = "flash-attn") || cfg!(feature = "flash-attn-v3"));
         let concat_dim = if is_flash { 1 } else { 2 };
         info!(
             max_blocks = max_blocks,
@@ -132,29 +133,9 @@ impl CacheManager {
         let num_kv_heads = config.num_key_value_heads;
         let head_dim = config.head_dim;
 
-        // FA4 TMA requires page_size == tile_n for optimal paged attention.
-        // tile_n depends on head_dim (SM90 _tile_size_fwd_sm90).
-        // FA3 requires page_block_size % kBlockN == 0.
-        // Auto-adjust if user didn't explicitly set PRELUDE_PAGED_BLOCK_SIZE.
-        #[cfg(feature = "flash-attn-v4")]
-        if std::env::var("PRELUDE_PAGED_BLOCK_SIZE").is_err() {
-            // Use shared tile_n calculation. head_dim_v defaults to head_dim
-            // (correct for all current models; DeepSeek MLA would need head_dim_v
-            // added to CommonModelConfig for the 192/128 case).
-            let tile_n = crate::models::layers::attn::fa4_tile_n(head_dim, head_dim);
-            if paged_block_size != tile_n {
-                let old = paged_block_size;
-                paged_block_size = tile_n;
-                info!(
-                    old_block_size = old,
-                    new_block_size = paged_block_size,
-                    head_dim,
-                    tile_n,
-                    "auto-adjusted paged_block_size to match FA4 tile_n for TMA"
-                );
-            }
-        }
-        #[cfg(all(any(feature = "flash-attn-v3", feature = "flashinfer"), not(feature = "flash-attn-v4")))]
+        // flash-attn-v3 requires page_block_size % kBlockN == 0
+        // kBlockN = 64 for head_dim=256, 128 otherwise
+        #[cfg(feature = "flash-attn-v3")]
         {
             let min_block = if head_dim == 256 { 64 } else { 128 };
             if paged_block_size % min_block != 0 {
@@ -178,9 +159,9 @@ impl CacheManager {
         } else {
             let bytes_per_block_per_layer = {
                 let v1 = 2 * num_kv_heads * head_dim * paged_block_size * dtype.size_in_bytes();
-                #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+                #[cfg(feature = "flash-attn-v3")]
                 let flash = 2 * num_kv_heads * head_dim * paged_block_size * dtype.size_in_bytes();
-                #[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
+                #[cfg(not(feature = "flash-attn-v3"))]
                 let flash = 0;
                 v1 + flash
             };
@@ -206,9 +187,9 @@ impl CacheManager {
 
         let mut key_caches = Vec::with_capacity(num_layers);
         let mut value_caches = Vec::with_capacity(num_layers);
-        #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+        #[cfg(feature = "flash-attn-v3")]
         let mut key_caches_flash = Vec::with_capacity(num_layers);
-        #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+        #[cfg(feature = "flash-attn-v3")]
         let mut value_caches_flash = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
             // key_cache: [num_blocks, num_kv_heads, head_dim/x, block_size, x]
@@ -236,7 +217,7 @@ impl CacheManager {
                 .map_err(candle_err)?,
             );
 
-            #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+            #[cfg(feature = "flash-attn-v3")]
             {
                 // flash-friendly paged layout: [num_blocks, block_size, num_kv_heads, head_dim]
                 key_caches_flash.push(
@@ -270,9 +251,9 @@ impl CacheManager {
         let pool = PagedKvPool {
             key_caches,
             value_caches,
-            #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+            #[cfg(feature = "flash-attn-v3")]
             key_caches_flash,
-            #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+            #[cfg(feature = "flash-attn-v3")]
             value_caches_flash,
             block_size: paged_block_size,
         };
