@@ -93,7 +93,9 @@ fn main() {
     if cuda_targets_stubs.exists() {
         println!("cargo:rustc-link-search=native={}", cuda_targets_stubs.display());
     }
-    println!("cargo:rustc-link-lib=dylib=cudart");
+    println!("cargo:rustc-link-lib=static=cudart_static");
+    println!("cargo:rustc-link-lib=dylib=rt");   // required by cudart_static
+    println!("cargo:rustc-link-lib=dylib=dl");   // required by cudart_static
     println!("cargo:rustc-link-lib=dylib=cuda"); // CUDA driver API (cuTensorMapEncodeTiled)
     println!("cargo:rustc-link-lib=dylib=stdc++");
 }

@@ -48,7 +48,7 @@ pub unsafe fn bf16_gemm(
     match ret {
         0 => Ok(()),
         -1 => Err(format!("DeepGEMM: no kernel variant for M={m} N={n} K={k}")),
-        code => Err(format!("DeepGEMM GEMM failed (code {code})")),
+        code => Err(format!("DeepGEMM: launch failed (code {code}) for M={m} N={n} K={k}")),
     }
 }
 
