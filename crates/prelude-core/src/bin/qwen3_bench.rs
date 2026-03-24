@@ -30,14 +30,9 @@ fn main() -> Result<()> {
     let config = load_config(&args.model_path)?;
     let (device, dtype, device_name) = select_device(&args.device)?;
 
-    // Enable BF16 reduced precision GEMM for tensor core acceleration
-    #[cfg(feature = "cuda")]
-    {
-        candle_core::cuda_backend::set_gemm_reduced_precision_bf16(true);
-        candle_core::cuda_backend::set_gemm_reduced_precision_f16(true);
-        candle_core::cuda_backend::set_gemm_reduced_precision_f32(true);
-        println!("BF16/F16/F32 reduced precision GEMM: enabled");
-    }
+    // Register CUTLASS/DeepGEMM GEMM dispatch (replaces cuBLAS)
+    #[cfg(any(feature = "cutlass-gemm", feature = "deepgemm"))]
+    crate::ops::gpu::gemm::register_gpu_gemm();
     let weight_files = find_safetensor_files(&args.model_path)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, &device)? };
 

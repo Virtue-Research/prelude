@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/prelude-core", "crates/prelude-server"]
-exclude = ["crates/candle-paged-attn", "crates/candle-flash-attn-v3", "crates/prelude-flash-attn-v4", "crates/prelude-flashinfer", "crates/prelude-deepgemm", "crates/prelude-ggml-quants"]
+exclude = ["crates/candle-paged-attn", "crates/candle-flash-attn-v3", "crates/prelude-flash-attn-v4", "crates/prelude-flashinfer", "crates/prelude-deepgemm", "crates/prelude-cutlass-gemm", "crates/prelude-ggml-quants"]
 # NOTE: prelude-ggml-quants is excluded but referenced via path dep from prelude-core (optional).
 # It compiles standalone with its own edition/version settings.
 resolver = "2"
@@ -46,6 +46,7 @@ candle-flash-attn-v3 = { path = "crates/candle-flash-attn-v3" }
 candle-paged-attn = { path = "crates/candle-paged-attn" }
 prelude-flash-attn-v4 = { path = "crates/prelude-flash-attn-v4" }
 prelude-deepgemm = { path = "crates/prelude-deepgemm" }
+prelude-cutlass-gemm = { path = "crates/prelude-cutlass-gemm" }
 prelude-flashinfer = { path = "crates/prelude-flashinfer" }
 
 # Tokenization & model loading

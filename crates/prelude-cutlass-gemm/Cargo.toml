@@ -1,0 +1,8 @@
+[package]
+name = "prelude-cutlass-gemm"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "CUTLASS 3.x BF16/F32 GEMM fallback (SM80+), no cuBLAS dependency"
+
+[build-dependencies]

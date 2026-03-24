@@ -35,6 +35,8 @@ pub(crate) const MOD_KNORM_ROPE_KV_WRITE: &str = "kvcache_knorm_rope_kv_write";
 pub(crate) const MOD_SCATTER_KV_CACHE: &str = "kvcache_scatter_kv_cache";
 
 pub mod elementwise;
+#[cfg(any(feature = "cutlass-gemm", feature = "deepgemm"))]
+pub mod gemm;
 pub mod rmsnorm;
 pub mod rope;
 pub mod moe;

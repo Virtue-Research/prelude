@@ -484,12 +484,7 @@ pub struct Qwen3MoeModelForCausalLM {
 
 impl Qwen3MoeModelForCausalLM {
     pub fn new(cfg: &Qwen3MoeConfig, vb: VarBuilder) -> Result<Self> {
-        #[cfg(feature = "cuda")]
-        {
-            candle_core::cuda_backend::set_gemm_reduced_precision_bf16(true);
-            candle_core::cuda_backend::set_gemm_reduced_precision_f16(true);
-            candle_core::cuda_backend::set_gemm_reduced_precision_f32(true);
-        }
+        // GEMM dispatch (CUTLASS/DeepGEMM) is registered at startup, not per-model.
 
         let base = MoeModel::new(cfg, vb.clone())?;
         let lm_head = if cfg.tie_word_embeddings {

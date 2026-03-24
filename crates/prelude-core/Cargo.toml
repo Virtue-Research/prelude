@@ -18,6 +18,7 @@ flash-attn = ["cuda", "paged-attn", "candle-flash-attn"]
 flash-attn-v3 = ["cuda", "candle-flash-attn-v3"]
 flash-attn-v4 = ["cuda", "prelude-flash-attn-v4"]
 deepgemm = ["cuda", "prelude-deepgemm"]
+cutlass-gemm = ["cuda", "prelude-cutlass-gemm"]
 flashinfer = ["cuda", "prelude-flashinfer"]
 ## FlashInfer + FA4 combined: FlashInfer skips tvm_ffi compilation (FA4 provides it).
 flashinfer-v4 = ["flashinfer", "flash-attn-v4", "prelude-flashinfer/skip-tvm-ffi"]
@@ -46,6 +47,7 @@ candle-flash-attn-v3 = { workspace = true, optional = true }
 candle-paged-attn = { workspace = true, optional = true }
 prelude-flash-attn-v4 = { workspace = true, optional = true }
 prelude-deepgemm = { workspace = true, optional = true }
+prelude-cutlass-gemm = { workspace = true, optional = true }
 prelude-flashinfer = { workspace = true, optional = true }
 prelude-ggml-quants = { path = "../prelude-ggml-quants", optional = true }
 rayon = "1.11.0"
