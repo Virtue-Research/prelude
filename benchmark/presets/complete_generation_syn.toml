@@ -1,0 +1,14 @@
+task = "complete"
+
+concurrency = [1, 4, 16, 32]
+requests    = [50, 100, 200, 200]
+warmup      = 5
+max_tokens  = 128
+streaming   = true           # collect TTFT and TPOT
+seed        = 42
+
+# output = "results/complete_generation_syn.json"
+
+[data]
+type          = "synthetic"
+prompt_tokens = "256-768"    # uniform [256, 768] → avg 512 tokens/seq (needs tokenizer)

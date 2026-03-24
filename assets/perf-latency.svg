@@ -1,0 +1,65 @@
+<svg viewBox="0 0 560 310" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+
+  <!-- Background -->
+  <rect width="560" height="310" fill="#FAFAFA" rx="12" stroke="#E5E7EB" stroke-width="1"/>
+
+  <!-- Title -->
+  <text x="280" y="27" text-anchor="middle" font-size="15" font-weight="700" fill="#111827" letter-spacing="-0.3">Latency at c=1 — Single Request</text>
+  <text x="280" y="43" text-anchor="middle" font-size="11" fill="#9CA3AF">Qwen3-4B · H200 · lower is better</text>
+
+  <!-- Grid lines (y_bottom=268, scale=6.7: 0→268, 10→201, 20→134, 30→67) -->
+  <line x1="70" y1="268" x2="530" y2="268" stroke="#D1D5DB" stroke-width="1"/>
+  <line x1="70" y1="201" x2="530" y2="201" stroke="#E5E7EB" stroke-width="1" stroke-dasharray="4,3"/>
+  <line x1="70" y1="134" x2="530" y2="134" stroke="#E5E7EB" stroke-width="1" stroke-dasharray="4,3"/>
+  <line x1="70" y1="67"  x2="530" y2="67"  stroke="#E5E7EB" stroke-width="1" stroke-dasharray="4,3"/>
+  <line x1="70" y1="55"  x2="70"  y2="268" stroke="#D1D5DB" stroke-width="1"/>
+
+  <!-- Y-axis labels -->
+  <text x="62" y="271" text-anchor="end" font-size="12" fill="#9CA3AF">0</text>
+  <text x="62" y="204" text-anchor="end" font-size="12" fill="#9CA3AF">10</text>
+  <text x="62" y="137" text-anchor="end" font-size="12" fill="#9CA3AF">20</text>
+  <text x="62" y="70"  text-anchor="end" font-size="12" fill="#9CA3AF">30</text>
+  <text x="15" y="168" text-anchor="middle" font-size="12" fill="#9CA3AF" transform="rotate(-90,15,168)">latency (ms)</text>
+
+  <!-- Divider between P50 and P95 sections -->
+  <line x1="300" y1="55" x2="300" y2="268" stroke="#E5E7EB" stroke-width="1" stroke-dasharray="4,3"/>
+
+  <!-- Section headers -->
+  <text x="185" y="60" text-anchor="middle" font-size="12" font-weight="600" fill="#6B7280">P50</text>
+  <text x="415" y="60" text-anchor="middle" font-size="12" font-weight="600" fill="#6B7280">P95</text>
+
+  <!-- ══ P50 section ══ -->
+  <!-- Prelude P50: 15.4ms → h=103 -->
+  <rect x="105" y="165" width="40" height="103" fill="#4F46E5" rx="3"/>
+  <text x="125" y="160" text-anchor="middle" font-size="11" font-weight="700" fill="#3730A3">15.4ms</text>
+
+  <!-- vLLM P50: 18.1ms → h=121 -->
+  <rect x="165" y="147" width="40" height="121" fill="#94A3B8" rx="3"/>
+  <text x="185" y="142" text-anchor="middle" font-size="10" fill="#475569">18.1ms</text>
+
+  <!-- SGLang P50: 20.8ms → h=139 -->
+  <rect x="225" y="129" width="40" height="139" fill="#CBD5E1" rx="3" stroke="#94A3B8" stroke-width="0.5"/>
+  <text x="245" y="124" text-anchor="middle" font-size="10" fill="#475569">20.8ms</text>
+
+  <!-- ══ P95 section ══ -->
+  <!-- Prelude P95: 21.1ms → h=141 -->
+  <rect x="335" y="127" width="40" height="141" fill="#4F46E5" rx="3"/>
+  <text x="355" y="122" text-anchor="middle" font-size="11" font-weight="700" fill="#3730A3">21.1ms</text>
+
+  <!-- vLLM P95: 27.9ms → h=187 -->
+  <rect x="395" y="81" width="40" height="187" fill="#94A3B8" rx="3"/>
+  <text x="415" y="76" text-anchor="middle" font-size="10" fill="#475569">27.9ms</text>
+
+  <!-- SGLang P95: 26.2ms → h=176 -->
+  <rect x="455" y="92" width="40" height="176" fill="#CBD5E1" rx="3" stroke="#94A3B8" stroke-width="0.5"/>
+  <text x="475" y="87" text-anchor="middle" font-size="10" fill="#475569">26.2ms</text>
+
+  <!-- X-axis labels -->
+  <text x="125" y="286" text-anchor="middle" font-size="11" fill="#4F46E5" font-weight="600">Prelude</text>
+  <text x="185" y="286" text-anchor="middle" font-size="11" fill="#374151" font-weight="600">vLLM</text>
+  <text x="245" y="286" text-anchor="middle" font-size="11" fill="#374151" font-weight="600">SGLang</text>
+  <text x="355" y="286" text-anchor="middle" font-size="11" fill="#4F46E5" font-weight="600">Prelude</text>
+  <text x="415" y="286" text-anchor="middle" font-size="11" fill="#374151" font-weight="600">vLLM</text>
+  <text x="475" y="286" text-anchor="middle" font-size="11" fill="#374151" font-weight="600">SGLang</text>
+
+</svg>

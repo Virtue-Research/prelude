@@ -1,0 +1,19 @@
+task = "complete"
+
+concurrency = [1, 4, 8, 16, 32, 64, 128]
+requests    = [50, 100, 100, 200, 200, 400, 400]
+warmup      = 5
+max_tokens  = 1              # prefill-only; measures prefix cache hit benefit
+seed        = 42
+
+# output = "results/prefix_cache.json"
+
+[data]
+type = "synthetic"           # suffix per request (unique, no KV reuse on suffix)
+prompt_tokens = "256-768"    # uniform [256, 768] → avg 512 tokens/seq (needs tokenizer)
+
+[prefix]
+enabled      = true
+prefix_tokens = 3072          # shared system prompt length; needs tokenizer
+num_unique   = 1             # all requests share exactly one system prompt
+                             # set > 1 to test with multiple rotating prefixes

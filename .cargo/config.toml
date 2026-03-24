@@ -1,0 +1,4 @@
+[env]
+PYTHON_EXECUTABLE = { value = ".venv/bin/python3", relative = true }
+# Force pcre2-sys to build from source (static link), no runtime libpcre2-8.so dependency
+PCRE2_SYS_STATIC = "1"

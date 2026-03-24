@@ -1,0 +1,15 @@
+task = "mix"
+
+concurrency    = [1, 4, 16, 32]
+requests       = [50, 100, 200, 200]
+warmup         = 5
+prefill_weight = 0.7         # ~70% of requests are prefill-only (max_tokens=1)
+gen_weight     = 0.3         # ~30% are generation (max_tokens below)
+max_tokens     = 64          # decode length for generation requests
+streaming      = true        # SSE for generation; collects TTFT/TPOT
+seed           = 42
+
+# output = "results/mix.json"
+
+[data]
+type = "synthetic"           # shared between prefill and generation requests
