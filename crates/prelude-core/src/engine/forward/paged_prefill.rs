@@ -1,8 +1,8 @@
 use crate::engine::*;
 #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
-use crate::models::layers::BatchAttnContext;
+use crate::models::common::BatchAttnContext;
 #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
-use crate::models::layers::PagedKvBatchContext;
+use crate::models::common::PagedKvBatchContext;
 
 impl Engine {
     /// Batch prefill multiple requests using varlen paged attention.
@@ -157,13 +157,13 @@ impl Engine {
         let needs_prompt_logprobs = items.iter().any(|item| item.request.prompt_logprobs.is_some());
 
         #[cfg(feature = "flashinfer")]
-        crate::models::layers::fi_begin_forward();
+        crate::models::common::fi_begin_forward();
 
         // When prompt logprobs needed: get hidden states, apply compute_logits in chunks.
         // This avoids materializing the full (total_tokens, vocab_size) logits tensor.
         let (logits, prompt_logprobs_cpu) = if needs_prompt_logprobs {
             let hidden = model.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
-            let last_hidden = crate::models::layers::last_token_select(&hidden, &q_seq_lens)
+            let last_hidden = crate::models::common::last_token_select(&hidden, &q_seq_lens)
                 .map_err(candle_err)?;
             let last_logits = model.compute_logits(&last_hidden).map_err(candle_err)?
                 .unsqueeze(1).map_err(candle_err)?;
@@ -179,7 +179,7 @@ impl Engine {
             (model.forward(&packed_input, &mut ctx).map_err(candle_err)?, None)
         };
         #[cfg(feature = "flashinfer")]
-        crate::models::layers::fi_end_forward();
+        crate::models::common::fi_end_forward();
         drop(dn_pool_guard);
         drop(model);
 

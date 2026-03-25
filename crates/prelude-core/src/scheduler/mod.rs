@@ -9,7 +9,6 @@ mod admission;
 mod preemption;
 mod state;
 pub(crate) mod adaptive;
-pub mod scheduled_engine;
 
 #[cfg(test)]
 mod tests;
@@ -20,4 +19,3 @@ pub use state::{
     FinishReason, ForwardMode, SamplingParams, SchedulePolicy, Scheduler, SchedulerConfig,
     SchedulerOutput, SchedulerStep, SeqFinishReason, Sequence, SequenceStatus,
 };
-pub use scheduled_engine::ScheduledEngine;

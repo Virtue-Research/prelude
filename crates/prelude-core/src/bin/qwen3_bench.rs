@@ -6,7 +6,7 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::qwen3::{
     Config as Qwen3Config, ModelForCausalLM as BaselineQwen3,
 };
-use prelude_core::models::architectures::qwen3::Qwen3ModelForCausalLM;
+use prelude_core::models::qwen3::Qwen3ModelForCausalLM;
 
 #[derive(Debug, Clone)]
 struct Args {

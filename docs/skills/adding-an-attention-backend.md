@@ -17,7 +17,7 @@ No model code, no engine code, no scheduler code needs to change. Attention disp
 All attention dispatch lives in one directory:
 
 ```
-crates/prelude-core/src/models/layers/attn/
+crates/prelude-core/src/models/common/attn/
   mod.rs       -- dispatch functions (the ONLY file with #[cfg] gates)
   flash_v4.rs  -- FA4 CuTeDSL wrappers
   flash_v3.rs  -- FA3 Hopper wrappers (varlen + paged)

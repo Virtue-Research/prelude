@@ -1,5 +1,5 @@
 use super::*;
-use crate::models::architectures::meta::{
+use crate::models::registry::{
     find_arch_spec_by_model_type, resolve_architecture_name, unsupported_task_error, ArchSpec,
     ParsedModelConfig,
 };

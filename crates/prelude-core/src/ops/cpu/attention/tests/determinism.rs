@@ -118,12 +118,12 @@ fn test_fused_add_rmsnorm_determinism() {
     }
 }
 
-/// QwenLinear forward (candle Linear → brgemm dispatch): run twice, assert bit-exact.
+/// Linear forward (candle Linear → brgemm dispatch): run twice, assert bit-exact.
 /// Tests the full Linear layer path including Tensor allocation/dispatch.
 #[cfg(feature = "onednn")]
 #[test]
 fn test_qwen_linear_determinism() {
-    use crate::models::layers::linear::wrap_linear;
+    use crate::models::common::linear::Linear;
     use candle_core::{DType, Device, Tensor};
 
     if !crate::ops::onednn::brgemm_available() { return; }
@@ -137,7 +137,7 @@ fn test_qwen_linear_determinism() {
         .map(|i| half::bf16::from_f32(((i as f32 * 0.0003) - 0.15).sin()))
         .collect();
     let w = Tensor::from_vec(w_vals, &[out_dim, in_dim], &Device::Cpu).unwrap();
-    let linear = wrap_linear(candle_nn::Linear::new(w, None)).unwrap();
+    let linear = Linear::from_weight(w, None).unwrap();
 
     let make_input = || -> Tensor {
         let vals: Vec<half::bf16> = (0..batch * in_dim)
@@ -152,7 +152,7 @@ fn test_qwen_linear_determinism() {
     let v1: Vec<f32> = out1.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
     let v2: Vec<f32> = out2.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
     for (i, (&a, &b)) in v1.iter().zip(v2.iter()).enumerate() {
-        assert_eq!(a.to_bits(), b.to_bits(), "QwenLinear determinism mismatch at {i}: {a} vs {b}");
+        assert_eq!(a.to_bits(), b.to_bits(), "Linear determinism mismatch at {i}: {a} vs {b}");
     }
 }
 
@@ -251,18 +251,18 @@ fn test_layer_chain_determinism() {
     assert_eq!(diffs_23, 0, "step4: f2 vs f3 differ by {diffs_23} elements");
 }
 
-/// Model-like chain: rmsnorm → OnednnLinear → fused_add_rmsnorm → OnednnLinear.
+/// Model-like chain: rmsnorm → Linear → fused_add_rmsnorm → Linear.
 /// Run twice, assert bit-exact. Passes alone but FAILS after test_prefill_amx_precision:
 ///   cargo test -p prelude-core --lib -- "test_extend_amx" "test_linear_chain" --test-threads=1
 /// Root cause: 1 ULP non-determinism in brgemm_bf16_linear (C++ oneDNN FFI) when
 /// the test harness runs verify_prefill_precision (brgemm attention + naive comparison)
 /// in a prior #[test]. Cannot be reproduced within a single test function.
-/// The non-determinism is in OnednnLinear::forward's second call vs first call.
+/// The non-determinism is in Linear::forward's second call vs first call.
 #[cfg(feature = "onednn")]
 #[test]
 fn test_linear_chain_determinism() {
     use crate::ops::cpu::{cpu_rmsnorm, cpu_fused_add_rmsnorm};
-    use crate::models::layers::linear::wrap_linear;
+    use crate::models::common::linear::Linear;
     use candle_core::{DType, Device, Module, Tensor};
 
     if !crate::ops::onednn::brgemm_available() { return; }
@@ -282,10 +282,10 @@ fn test_linear_chain_determinism() {
     };
 
     let norm_w = make_bf16_tensor(1, hidden, 0.001).reshape(&[hidden]).unwrap();
-    let proj = wrap_linear(candle_nn::Linear::new(make_bf16_tensor(inter, hidden, 0.0003), None)).unwrap();
+    let proj = Linear::from_weight(make_bf16_tensor(inter, hidden, 0.0003), None).unwrap();
     // down: [hidden, hidden] — input from fused_add_rmsnorm is [seq_len, hidden]
     // (Previously [hidden, inter] caused K=inter mismatch: brgemm read past buffer)
-    let down = wrap_linear(candle_nn::Linear::new(make_bf16_tensor(hidden, hidden, 0.0004), None)).unwrap();
+    let down = Linear::from_weight(make_bf16_tensor(hidden, hidden, 0.0004), None).unwrap();
 
     // Step-by-step: find first diverging operation
     let x1 = make_bf16_tensor(seq_len, hidden, 0.002);

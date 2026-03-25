@@ -8,6 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 description = "Core inference engine, scheduler, and model runtime for Prelude"
+autobins = false
 readme = "../../README.md"
 keywords = ["llm", "inference", "serving", "scheduler", "rust"]
 
@@ -53,3 +54,32 @@ prelude-ggml-quants = { path = "../prelude-ggml-quants", optional = true }
 rayon = "1.11.0"
 libc = "1.0.0-alpha.3"
 tokenizers = { workspace = true, optional = true }
+
+[[bin]]
+name = "cpu_ops_bench"
+path = "src/bin/cpu_ops_bench/main.rs"
+
+[[bin]]
+name = "gpu_ops_bench"
+path = "src/bin/gpu_ops_bench/main.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "tokenizer_bench"
+path = "src/bin/tokenizer_bench.rs"
+required-features = ["hf_tokenizer"]
+
+[[bin]]
+name = "qwen3_bench"
+path = "src/bin/qwen3_bench.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "fused_ops_test"
+path = "src/bin/fused_ops_test.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "gemma3_test"
+path = "src/bin/gemma3_test.rs"
+required-features = ["cuda"]

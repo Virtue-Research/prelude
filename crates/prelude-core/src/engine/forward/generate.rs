@@ -421,7 +421,7 @@ impl Engine {
             ).map_err(|e| EngineError::Internal(e.to_string()))?;
             let seq_lens_vec = vec![seq_len];
 
-            let mut ctx = crate::models::layers::BatchAttnContext {
+            let mut ctx = crate::models::common::BatchAttnContext {
                 cu_seqlens_q: &cu_seqlens,
                 max_seqlen_q: seq_len,
                 position_ids: &position_ids,
