@@ -241,7 +241,7 @@ fn process_request(engine: &Engine, state: ContinuousGenerationRequestState) {
 
 fn sample_token(
     logits: &candle_core::Tensor,
-    logits_processor: &mut candle_transformers::generation::LogitsProcessor,
+    logits_processor: &mut crate::nn_ops::generation::LogitsProcessor,
     logprobs_k: Option<u32>,
     engine: &Engine,
     output_logprobs: &mut Vec<crate::types::TokenLogprobInfo>,

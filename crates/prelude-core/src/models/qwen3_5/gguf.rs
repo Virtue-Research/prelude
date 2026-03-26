@@ -134,7 +134,7 @@ impl RmsNormGated {
         let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
         let normed = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
         let normed = normed.to_dtype(x.dtype())?.broadcast_mul(&self.weight)?;
-        let gate = candle_nn::Activation::Silu.forward(&z)?;
+        let gate = crate::nn_ops::Activation::Silu.forward(&z)?;
         let result = normed.broadcast_mul(&gate)?;
         result.reshape(orig_shape)
     }
@@ -243,7 +243,7 @@ impl GatedDeltaNetLayer {
         };
 
         // SiLU activation
-        let qkv_conv = candle_nn::Activation::Silu.forward(&qkv_conv)?;
+        let qkv_conv = crate::nn_ops::Activation::Silu.forward(&qkv_conv)?;
 
         // Split
         let q = qkv_conv.narrow(D::Minus1, 0, self.key_dim)?;
@@ -299,7 +299,7 @@ impl GatedDeltaNetLayer {
         let a_plus_dt = (a_f32 + dt_bias)?;
         let softplus_val = softplus(&a_plus_dt)?;
         let g = (softplus_val * ssm_a)?;
-        let beta = candle_nn::ops::sigmoid(&b_f32)?;
+        let beta = crate::nn_ops::ops::sigmoid(&b_f32)?;
         let decay = g.exp()?;
 
         // Initialize state
@@ -552,7 +552,7 @@ impl GatedAttentionLayer {
             attn_weights.to_dtype(DType::F32)?
         };
 
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_weights = crate::nn_ops::ops::softmax_last_dim(&attn_weights)?;
         let attn_weights = attn_weights.to_dtype(v.dtype())?;
         let attn_output = attn_weights.matmul(&v)?; // [H, L, D]
         let attn_output = attn_output
@@ -561,7 +561,7 @@ impl GatedAttentionLayer {
 
         // Gate
         let gated = if let Some(gate) = gate {
-            (attn_output * candle_nn::ops::sigmoid(&gate)?)?
+            (attn_output * crate::nn_ops::ops::sigmoid(&gate)?)?
         } else {
             attn_output
         };
@@ -581,7 +581,7 @@ impl Mlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        let act = candle_nn::Activation::Silu.forward(&gate)?;
+        let act = crate::nn_ops::Activation::Silu.forward(&gate)?;
         let hidden = (act * up)?;
         self.down_proj.forward(&hidden)
     }
@@ -625,7 +625,7 @@ impl DecoderLayer {
 // ── Model ───────────────────────────────────────────────────────────────
 
 pub struct Qwen3_5GgufModel {
-    embed_tokens: candle_nn::Embedding,
+    embed_tokens: crate::nn_ops::Embedding,
     layers: Vec<DecoderLayer>,
     norm: ResidualRmsNorm,
     lm_head: QuantLinear,
@@ -662,7 +662,7 @@ impl Qwen3_5GgufModel {
         // Embedding
         let embed_weight = Self::load_tensor(&ct, reader, "token_embd.weight", device)?;
         let embed_tokens =
-            candle_nn::Embedding::new(embed_weight, config.hidden_size);
+            crate::nn_ops::Embedding::new(embed_weight, config.hidden_size);
 
         // Build layers
         let mut layers = Vec::with_capacity(config.num_hidden_layers);

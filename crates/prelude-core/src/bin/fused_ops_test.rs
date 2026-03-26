@@ -29,7 +29,7 @@ fn fused_ops_test() -> candle_core::Result<()> {
     let up = Tensor::randn(0f32, 1.0, n, &dev)?.to_dtype(DType::BF16)?;
 
     // Reference: silu(gate) * up
-    let silu_gate = candle_nn::Activation::Silu.forward(&gate)?;
+    let silu_gate = prelude_core::nn_ops::Activation::Silu.forward(&gate)?;
     let ref_result = (&silu_gate * &up)?;
 
     // Fused
@@ -96,7 +96,7 @@ fn fused_ops_test() -> candle_core::Result<()> {
     // Reference silu*mul perf
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
-        let s = candle_nn::Activation::Silu.forward(&gate)?;
+        let s = prelude_core::nn_ops::Activation::Silu.forward(&gate)?;
         let _ = (&s * &up)?;
     }
     dev.synchronize()?;

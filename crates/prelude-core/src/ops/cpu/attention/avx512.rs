@@ -26,40 +26,38 @@ pub(super) fn weight_v_accum_bf16_avx512(
     let chunks = dim / 16;
     debug_assert!(chunks <= 16, "head_dim > 256 not supported by fixed-size accumulator array");
 
-    unsafe {
-        // Load all accumulators into zmm registers (up to 16 × __m512 = head_dim ≤ 256)
-        let mut accs = [_mm512_setzero_ps(); 16];
-        for c in 0..chunks {
-            accs[c] = _mm512_loadu_ps(acc.add(c * 16));
-        }
+    // Load all accumulators into zmm registers (up to 16 × __m512 = head_dim ≤ 256)
+    let mut accs = [_mm512_setzero_ps(); 16];
+    for c in 0..chunks {
+        accs[c] = unsafe { _mm512_loadu_ps(acc.add(c * 16)) };
+    }
 
+    for j in 0..n_size {
+        let w = unsafe { *weights.add(j) };
+        if w > 0.0 {
+            let vw = _mm512_set1_ps(w);
+            let base = unsafe { v_bf16.add(j * v_stride) };
+            for c in 0..chunks {
+                let v_src = bf16x16_load_as_f32(unsafe { base.add(c * 16) });
+                accs[c] = _mm512_fmadd_ps(vw, v_src, accs[c]);
+            }
+        }
+    }
+
+    // Store back
+    for c in 0..chunks {
+        unsafe { _mm512_storeu_ps(acc.add(c * 16), accs[c]) };
+    }
+
+    // Handle remainder (head_dim not multiple of 16 — rare for transformers)
+    for d in (chunks * 16)..dim {
+        let mut sum = unsafe { *acc.add(d) };
         for j in 0..n_size {
-            let w = *weights.add(j);
+            let w = unsafe { *weights.add(j) };
             if w > 0.0 {
-                let vw = _mm512_set1_ps(w);
-                let base = v_bf16.add(j * v_stride);
-                for c in 0..chunks {
-                    let v_src = bf16x16_load_as_f32(base.add(c * 16));
-                    accs[c] = _mm512_fmadd_ps(vw, v_src, accs[c]);
-                }
+                sum += w * bf16_to_f32(unsafe { *v_bf16.add(j * v_stride + d) });
             }
         }
-
-        // Store back
-        for c in 0..chunks {
-            _mm512_storeu_ps(acc.add(c * 16), accs[c]);
-        }
-
-        // Handle remainder (head_dim not multiple of 16 — rare for transformers)
-        for d in (chunks * 16)..dim {
-            let mut sum = *acc.add(d);
-            for j in 0..n_size {
-                let w = *weights.add(j);
-                if w > 0.0 {
-                    sum += w * bf16_to_f32(*v_bf16.add(j * v_stride + d));
-                }
-            }
-            *acc.add(d) = sum;
-        }
+        unsafe { *acc.add(d) = sum };
     }
 }

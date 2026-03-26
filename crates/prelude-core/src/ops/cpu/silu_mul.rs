@@ -27,8 +27,7 @@ pub fn cpu_silu_and_mul(input: &Tensor) -> Result<Tensor> {
         DType::BF16 => {
             let input_2d = input.contiguous()?;
             let in_slice = super::tensor_as_u16_slice(&input_2d)?;
-            let mut out_buf: Vec<u16> = Vec::with_capacity(n * dim);
-            unsafe { out_buf.set_len(n * dim) };
+            let mut out_buf: Vec<u16> = vec![0u16; n * dim];
             silu_and_mul_bf16(&mut out_buf, in_slice, n, dim);
             super::u16_vec_to_bf16_tensor(out_buf, &[n, dim], input.device())
         }

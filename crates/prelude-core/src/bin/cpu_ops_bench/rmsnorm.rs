@@ -29,7 +29,7 @@ pub fn bench(hidden: usize, batch: usize, warmup: usize, repeats: usize) -> Resu
     // candle F32
     let input_f32 = input.to_dtype(DType::F32)?;
     let weight_f32 = weight.to_dtype(DType::F32)?;
-    let candle_norm = candle_nn::RmsNorm::new(weight_f32, 1e-6);
+    let candle_norm = prelude_core::nn_ops::CandleRmsNorm::new(weight_f32, 1e-6);
     for _ in 0..warmup {
         let _ = candle_norm.forward(&input_f32)?;
     }
@@ -70,7 +70,7 @@ pub fn bench_fused(hidden: usize, batch: usize, warmup: usize, repeats: usize) -
 
     // candle F32 (separate add + norm)
     let weight_f32 = weight.to_dtype(DType::F32)?;
-    let candle_norm = candle_nn::RmsNorm::new(weight_f32, 1e-6);
+    let candle_norm = prelude_core::nn_ops::CandleRmsNorm::new(weight_f32, 1e-6);
     let h_f32: Vec<f32> = h_data.iter().map(|v| v.to_f32()).collect();
     let r_f32: Vec<f32> = res_data.iter().map(|v| v.to_f32()).collect();
     for _ in 0..warmup {

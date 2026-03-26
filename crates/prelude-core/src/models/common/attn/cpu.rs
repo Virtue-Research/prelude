@@ -128,20 +128,15 @@ fn matmul_sdpa_onednn(
         let mut scores_buf = vec![0.0f32; num_heads * slen * slen];
         let mut head_out = vec![0.0f32; num_heads * head_block];
 
-        let scores_ptr = scores_buf.as_mut_ptr() as usize;
-        let head_out_ptr = head_out.as_mut_ptr() as usize;
         let head_scores = slen * slen;
 
-        (0..num_heads).into_par_iter().for_each(|h| {
+        scores_buf.par_chunks_mut(head_scores)
+            .zip(head_out.par_chunks_mut(head_block))
+            .enumerate()
+            .for_each(|(h, (s_h, o_h))| {
             let q_h = &q_heads[h * head_block..(h + 1) * head_block];
             let k_h = &k_heads[h * head_block..(h + 1) * head_block];
             let v_h = &v_heads[h * head_block..(h + 1) * head_block];
-            let s_h = unsafe {
-                std::slice::from_raw_parts_mut((scores_ptr as *mut f32).add(h * head_scores), head_scores)
-            };
-            let o_h = unsafe {
-                std::slice::from_raw_parts_mut((head_out_ptr as *mut f32).add(h * head_block), head_block)
-            };
 
             // QK^T: [slen, head_dim] @ [slen, head_dim]^T → [slen, slen]
             unsafe {
@@ -257,19 +252,13 @@ pub fn cross_attention_f32_onednn(
     let mut scores_buf = vec![0.0f32; num_heads * head_scores];
     let mut head_out = vec![0.0f32; num_heads * head_q_block];
 
-    let scores_ptr = scores_buf.as_mut_ptr() as usize;
-    let head_out_ptr = head_out.as_mut_ptr() as usize;
-
-    (0..num_heads).into_par_iter().for_each(|h| {
+    scores_buf.par_chunks_mut(head_scores)
+        .zip(head_out.par_chunks_mut(head_q_block))
+        .enumerate()
+        .for_each(|(h, (s_h, o_h))| {
         let q_h = &q_heads[h * head_q_block..(h + 1) * head_q_block];
         let k_h = &k_heads[h * head_kv_block..(h + 1) * head_kv_block];
         let v_h = &v_heads[h * head_kv_block..(h + 1) * head_kv_block];
-        let s_h = unsafe {
-            std::slice::from_raw_parts_mut((scores_ptr as *mut f32).add(h * head_scores), head_scores)
-        };
-        let o_h = unsafe {
-            std::slice::from_raw_parts_mut((head_out_ptr as *mut f32).add(h * head_q_block), head_q_block)
-        };
 
         unsafe {
             crate::ops::onednn::ffi::onednn_f32_linear(
@@ -371,7 +360,7 @@ fn matmul_sdpa_candle(
             scores
         };
 
-        let attn_weights = candle_nn::ops::softmax_last_dim(&scores)?;
+        let attn_weights = crate::nn_ops::ops::softmax_last_dim(&scores)?;
         let out = attn_weights.matmul(&v_t)?;
         outputs.push(out.transpose(0, 1)?);
         offset += slen;

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{Activation, Embedding};
+use crate::nn_ops::{Activation, Embedding};
 use crate::loading::var_builder::VarBuilder;
 use serde::Deserialize;
 
@@ -150,8 +150,8 @@ impl Gemma3RotaryEmbedding {
         let h_k = k.dim(1)?;
         let q4 = q.reshape((1, total, h_q, d))?;
         let k4 = k.reshape((1, total, h_k, d))?;
-        let q_embed = candle_nn::rotary_emb::rope_thd(&q4, &cos, &sin)?;
-        let k_embed = candle_nn::rotary_emb::rope_thd(&k4, &cos, &sin)?;
+        let q_embed = crate::nn_ops::rotary_emb::rope_thd(&q4, &cos, &sin)?;
+        let k_embed = crate::nn_ops::rotary_emb::rope_thd(&k4, &cos, &sin)?;
         Ok((
             q_embed.reshape((total, h_q, d))?,
             k_embed.reshape((total, h_k, d))?,
@@ -405,7 +405,7 @@ impl Gemma3Model {
         let embed_tokens = {
             let emb_vb = vb.pp("embed_tokens");
             let weight = emb_vb.get((cfg.vocab_size, cfg.hidden_size), "weight")?;
-            candle_nn::Embedding::new(weight, cfg.hidden_size)
+            Embedding::new(weight, cfg.hidden_size)
         };
 
         // Create global rotary embedding (full context)

@@ -1,7 +1,7 @@
 use crate::types::{ClassifyRequest, EmbedRequest, GenerateRequest, TokenLogprobInfo};
 #[cfg(feature = "cuda")]
 use candle_core::Tensor;
-use candle_transformers::generation::LogitsProcessor;
+use crate::nn_ops::generation::LogitsProcessor;
 
 // ── Model dispatch ──────────────────────────────────────────────────────
 

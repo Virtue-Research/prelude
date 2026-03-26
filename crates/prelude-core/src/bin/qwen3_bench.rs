@@ -3,10 +3,11 @@ use std::time::Instant;
 
 use candle_core::{DType, Device, Result, Tensor, D};
 use prelude_core::loading::var_builder::VarBuilder;
-use candle_transformers::models::qwen3::{
-    Config as Qwen3Config, ModelForCausalLM as BaselineQwen3,
-};
+use prelude_core::nn_ops::Qwen3Config;
 use prelude_core::models::qwen3::Qwen3ModelForCausalLM;
+
+#[cfg(feature = "candle-baseline")]
+use candle_transformers::models::qwen3::ModelForCausalLM as BaselineQwen3;
 
 #[derive(Debug, Clone)]
 struct Args {
@@ -36,11 +37,21 @@ fn main() -> Result<()> {
     let weight_files = find_safetensor_files(&args.model_path)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, &device)? };
 
+    #[cfg(feature = "candle-baseline")]
     let mut baseline = if args.ours_only {
         None
     } else {
-        Some(BaselineQwen3::new(&config, vb.clone())?)
+        let baseline_config: candle_transformers::models::qwen3::Config =
+            serde_json::from_str(&std::fs::read_to_string(args.model_path.join("config.json"))
+                .map_err(candle_core::Error::msg)?)
+                .map_err(candle_core::Error::msg)?;
+        Some(BaselineQwen3::new(&baseline_config, vb.clone())?)
     };
+    #[cfg(not(feature = "candle-baseline"))]
+    let ours_only_forced = true;
+    #[cfg(feature = "candle-baseline")]
+    let ours_only_forced = args.ours_only;
+
     let mut custom = Qwen3ModelForCausalLM::new(&config, vb)?;
 
     println!("Model path: {}", args.model_path.display());
@@ -49,7 +60,7 @@ fn main() -> Result<()> {
     println!("Batch size: {}", args.batch_size);
     println!(
         "Mode: {}",
-        if args.ours_only {
+        if ours_only_forced {
             "ours-only"
         } else {
             "compare"
@@ -60,7 +71,7 @@ fn main() -> Result<()> {
         args.decode_tokens, args.repeats
     );
     println!();
-    if args.ours_only {
+    if ours_only_forced {
         println!("ctx\tours_prefill\tours_tok/s");
     } else {
         println!("ctx\tbase_prefill\tours_prefill\tprefill_x\tbase_tok/s\tours_tok/s\tdecode_x");
@@ -77,7 +88,7 @@ fn main() -> Result<()> {
             args.repeats,
             &device,
         )?;
-        if args.ours_only {
+        if ours_only_forced {
             let decode_token_count = (args.batch_size * args.decode_tokens) as f64;
             let custom_tps = decode_token_count / (custom_res.decode_ms / 1000.0);
             println!(
@@ -87,32 +98,35 @@ fn main() -> Result<()> {
             continue;
         }
 
-        let Some(base_model) = baseline.as_mut() else {
-            candle_core::bail!("internal error: baseline model missing in compare mode");
-        };
-        let base_res = run_bench(
-            base_model,
-            &prompt,
-            args.batch_size,
-            ctx,
-            args.decode_tokens,
-            args.repeats,
-            &device,
-        )?;
+        #[cfg(feature = "candle-baseline")]
+        {
+            let Some(base_model) = baseline.as_mut() else {
+                candle_core::bail!("internal error: baseline model missing in compare mode");
+            };
+            let base_res = run_bench(
+                base_model,
+                &prompt,
+                args.batch_size,
+                ctx,
+                args.decode_tokens,
+                args.repeats,
+                &device,
+            )?;
 
-        let decode_token_count = (args.batch_size * args.decode_tokens) as f64;
-        let base_tps = decode_token_count / (base_res.decode_ms / 1000.0);
-        let custom_tps = decode_token_count / (custom_res.decode_ms / 1000.0);
-        println!(
-            "{}\t{:.2} ms\t{:.2} ms\t{:.2}x\t{:.2}\t\t{:.2}\t\t{:.2}x",
-            ctx,
-            base_res.prefill_ms,
-            custom_res.prefill_ms,
-            base_res.prefill_ms / custom_res.prefill_ms.max(1e-9),
-            base_tps,
-            custom_tps,
-            custom_tps / base_tps.max(1e-9),
-        );
+            let decode_token_count = (args.batch_size * args.decode_tokens) as f64;
+            let base_tps = decode_token_count / (base_res.decode_ms / 1000.0);
+            let custom_tps = decode_token_count / (custom_res.decode_ms / 1000.0);
+            println!(
+                "{}\t{:.2} ms\t{:.2} ms\t{:.2}x\t{:.2}\t\t{:.2}\t\t{:.2}x",
+                ctx,
+                base_res.prefill_ms,
+                custom_res.prefill_ms,
+                base_res.prefill_ms / custom_res.prefill_ms.max(1e-9),
+                base_tps,
+                custom_tps,
+                custom_tps / base_tps.max(1e-9),
+            );
+        }
     }
 
     Ok(())
@@ -184,6 +198,7 @@ trait ForwardModel {
     fn clear_kv_cache(&mut self);
 }
 
+#[cfg(feature = "candle-baseline")]
 impl ForwardModel for BaselineQwen3 {
     fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         self.forward(input, offset)

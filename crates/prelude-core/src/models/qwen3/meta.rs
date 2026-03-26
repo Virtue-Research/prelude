@@ -1,5 +1,5 @@
 use crate::loading::var_builder::VarBuilder;
-use candle_transformers::models::qwen3::Config as Qwen3Config;
+use crate::nn_ops::Qwen3Config;
 
 use super::{
     Qwen3ClassifierConfig, Qwen3ForEmbedding, Qwen3ForSequenceClassification, Qwen3ModelForCausalLM,

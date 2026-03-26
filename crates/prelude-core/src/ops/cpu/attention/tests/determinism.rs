@@ -220,10 +220,10 @@ fn test_layer_chain_determinism() {
 
     // Step 3: fused_add_rmsnorm with narrow (non-contiguous input)
     let pt1 = Tensor::from_vec(
-        unsafe { std::mem::transmute::<Vec<u16>, Vec<half::bf16>>(p1) },
+        bytemuck::cast_vec::<u16, half::bf16>(p1),
         &[seq_len, inter], &Device::Cpu).unwrap();
     let pt2 = Tensor::from_vec(
-        unsafe { std::mem::transmute::<Vec<u16>, Vec<half::bf16>>(p2) },
+        bytemuck::cast_vec::<u16, half::bf16>(p2),
         &[seq_len, inter], &Device::Cpu).unwrap();
     let n1 = pt1.narrow(1, 0, hidden).unwrap();
     let n2 = pt2.narrow(1, 0, hidden).unwrap();
@@ -529,7 +529,7 @@ fn test_multi_layer_determinism() {
 
             // Step 6: fused_add_rmsnorm(residual=h, attn_out=proj_out)
             let proj_tensor = {
-                let vals: Vec<half::bf16> = unsafe { std::mem::transmute::<Vec<u16>, Vec<half::bf16>>(proj_out) };
+                let vals: Vec<half::bf16> = bytemuck::cast_vec::<u16, half::bf16>(proj_out);
                 Tensor::from_vec(vals, &[seq_len, hidden], &Device::Cpu).unwrap()
             };
             let (x_res, h2) = cpu_fused_add_rmsnorm(&h, &proj_tensor, &lw.norm2_w, eps).unwrap();
@@ -544,7 +544,7 @@ fn test_multi_layer_determinism() {
 
             // Step 8: SiLU×Mul → [seq_len, inter]
             let gu_tensor = {
-                let vals: Vec<half::bf16> = unsafe { std::mem::transmute::<Vec<u16>, Vec<half::bf16>>(gate_up) };
+                let vals: Vec<half::bf16> = bytemuck::cast_vec::<u16, half::bf16>(gate_up);
                 Tensor::from_vec(vals, &[seq_len, 2 * inter], &Device::Cpu).unwrap()
             };
             let silu_out = cpu_silu_and_mul(&gu_tensor).unwrap();
@@ -559,7 +559,7 @@ fn test_multi_layer_determinism() {
 
             // Step 10: residual add: h = x_res + mlp_out
             let mlp_tensor = {
-                let vals: Vec<half::bf16> = unsafe { std::mem::transmute::<Vec<u16>, Vec<half::bf16>>(mlp_out) };
+                let vals: Vec<half::bf16> = bytemuck::cast_vec::<u16, half::bf16>(mlp_out);
                 Tensor::from_vec(vals, &[seq_len, hidden], &Device::Cpu).unwrap()
             };
             h = (x_res + mlp_tensor).unwrap();

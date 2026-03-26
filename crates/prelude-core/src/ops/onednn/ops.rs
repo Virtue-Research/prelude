@@ -190,21 +190,21 @@ impl Drop for OnednnF32PackedWeight {
     }
 }
 
-// ── OnednnLinear: drop-in replacement for candle_nn::Linear ──────────
+// ── OnednnLinear: drop-in replacement for crate::nn_ops::CandleLinear ──────────
 
 /// Drop-in Linear layer that dispatches BF16/F32 CPU to oneDNN packed GEMM,
 /// falling back to candle for other dtypes/devices.
 #[derive(Clone, Debug)]
 pub struct OnednnLinear {
-    candle_linear: candle_nn::Linear,
+    candle_linear: crate::nn_ops::CandleLinear,
     brgemm_packed: Option<Arc<BrgemmPackedWeight>>,
     f32_packed: Option<Arc<OnednnF32PackedWeight>>,
 }
 
 impl OnednnLinear {
-    /// Wrap a `candle_nn::Linear`. If BF16 or F32 CPU, pre-packs weights for oneDNN.
+    /// Wrap a `crate::nn_ops::CandleLinear`. If BF16 or F32 CPU, pre-packs weights for oneDNN.
     /// Also packs brgemm VNNI weights and AMX VNNI weights if available.
-    pub fn new(linear: candle_nn::Linear) -> Result<Self> {
+    pub fn new(linear: crate::nn_ops::CandleLinear) -> Result<Self> {
         init(); // ensure oneDNN engine/stream exist
         let w = linear.weight();
 
@@ -581,10 +581,7 @@ pub fn brgemm_gemm_forward_pub(input: &Tensor, brg: &BrgemmPackedWeight, m: usiz
     let mut out_buf = BRGEMM_OUT_BUF.with_borrow_mut(|buf| {
         let mut taken = std::mem::take(buf);
         let needed = m * n;
-        if taken.capacity() < needed {
-            taken.reserve(needed - taken.len());
-        }
-        unsafe { taken.set_len(needed) };
+        taken.resize(needed, 0u16);
         taken
     });
 
@@ -649,7 +646,7 @@ pub fn brgemm_gemm_forward_pub(input: &Tensor, brg: &BrgemmPackedWeight, m: usiz
     drop(in_storage);
 
     let bf16_vec: Vec<half::bf16> =
-        unsafe { std::mem::transmute::<Vec<u16>, Vec<half::bf16>>(out_buf) };
+        bytemuck::cast_vec(out_buf);
     let result = Tensor::from_vec(bf16_vec, &[m, n], &Device::Cpu);
 
     if let (Some(t0v), Some(t1v), Some(t2v), Some(t3v)) = (t0, t1, t2, t3) {
@@ -733,10 +730,7 @@ pub fn brgemm_fused_silu_mul(
     let mut out_buf = BRGEMM_OUT_BUF.with_borrow_mut(|buf| {
         let mut taken = std::mem::take(buf);
         let needed = m * dim;
-        if taken.capacity() < needed {
-            taken.reserve(needed - taken.len());
-        }
-        unsafe { taken.set_len(needed) };
+        taken.resize(needed, 0u16);
         taken
     });
 
@@ -796,7 +790,7 @@ pub fn brgemm_fused_silu_mul(
 
     drop(in_storage);
     let bf16_vec: Vec<half::bf16> =
-        unsafe { std::mem::transmute::<Vec<u16>, Vec<half::bf16>>(out_buf) };
+        bytemuck::cast_vec(out_buf);
     Tensor::from_vec(bf16_vec, &[m, dim], &candle_core::Device::Cpu)
 }
 
@@ -959,8 +953,7 @@ fn cpu_gemm_forward(input: &Tensor, weight: &Tensor, m: usize, k: usize, n: usiz
         std::slice::from_raw_parts(w_data[w_offset..].as_ptr() as *const u16, n * k)
     };
 
-    let mut out_buf: Vec<u16> = Vec::with_capacity(m * n);
-    unsafe { out_buf.set_len(m * n) };
+    let mut out_buf: Vec<u16> = vec![0u16; m * n];
 
     crate::ops::cpu::gemm::bf16_gemm_small_m(&mut out_buf, in_slice, w_slice, m, k, n);
 
@@ -968,7 +961,7 @@ fn cpu_gemm_forward(input: &Tensor, weight: &Tensor, m: usize, k: usize, n: usiz
     drop(w_storage);
 
     let bf16_vec: Vec<half::bf16> =
-        unsafe { std::mem::transmute::<Vec<u16>, Vec<half::bf16>>(out_buf) };
+        bytemuck::cast_vec(out_buf);
     Tensor::from_vec(bf16_vec, &[m, n], &Device::Cpu)
 }
 

@@ -3,9 +3,8 @@ pub(crate) mod meta;
 use std::sync::Arc;
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::{Activation, Embedding};
 use crate::loading::var_builder::VarBuilder;
-use candle_transformers::models::qwen3::Config as Qwen3Config;
+use crate::nn_ops::{Activation, CandleLinear, Embedding, Qwen3Config};
 
 // Shared layer primitives (extracted from qwen3 into reusable modules)
 use crate::models::common::{
@@ -105,7 +104,7 @@ impl Qwen3MoeExpert {
 
 #[derive(Debug, Clone)]
 struct Qwen3SparseMoeBlock {
-    gate: candle_nn::Linear,
+    gate: CandleLinear,
     experts: Vec<Qwen3MoeExpert>,
     // Stacked expert weights for fused GEMM [num_experts, N, K]
     #[cfg(feature = "cuda")]
@@ -123,7 +122,7 @@ impl Qwen3SparseMoeBlock {
         let gate = {
             let gvb = vb.pp("gate");
             let w = gvb.get((cfg.num_experts, cfg.hidden_size), "weight")?;
-            candle_nn::Linear::new(w, None)
+            CandleLinear::new(w, None)
         };
         let mut experts = Vec::with_capacity(cfg.num_experts);
         let vb_e = vb.pp("experts");
@@ -169,7 +168,7 @@ impl Qwen3SparseMoeBlock {
     fn compute_routing_2d(&self, xs: &Tensor) -> Result<(Tensor, Tensor, usize)> {
         let (_total_tokens, hidden_dim) = xs.dims2()?;
         let router_logits = xs.apply(&self.gate)?;
-        let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
+        let routing_weights = crate::nn_ops::ops::softmax_last_dim(&router_logits)?;
 
         let experts_per_tok = routing_weights
             .arg_sort_last_dim(false)?
@@ -231,7 +230,7 @@ impl Qwen3SparseMoeBlock {
 
         let is_prefill = total_tokens > 1;
 
-        let gate = candle_nn::moe::moe_gemm(
+        let gate = crate::nn_ops::moe::moe_gemm(
             xs,
             &self.gate_w,
             &None,
@@ -241,7 +240,7 @@ impl Qwen3SparseMoeBlock {
             is_prefill,
         )?;
 
-        let up = candle_nn::moe::moe_gemm(
+        let up = crate::nn_ops::moe::moe_gemm(
             xs,
             &self.up_w,
             &None,
@@ -253,7 +252,7 @@ impl Qwen3SparseMoeBlock {
 
         let down_input = crate::models::common::fast_silu_mul(&gate, &up)?;
 
-        let ys = candle_nn::moe::moe_gemm(
+        let ys = crate::nn_ops::moe::moe_gemm(
             &down_input,
             &self.down_w,
             &Some(topk_weights.clone()),
@@ -419,7 +418,7 @@ impl MoeModel {
         let embed_tokens = {
             let emb_vb = vb.pp("model.embed_tokens");
             let weight = emb_vb.get((cfg.vocab_size, cfg.hidden_size), "weight")?;
-            candle_nn::Embedding::new(weight, cfg.hidden_size)
+            Embedding::new(weight, cfg.hidden_size)
         };
         let rotary = Arc::new(RotaryEmbedding::new(
             vb.dtype(),

@@ -1,3 +1,4 @@
+#[cfg(feature = "candle-baseline")]
 pub mod gguf;
 pub(crate) mod meta;
 
@@ -5,9 +6,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use candle_core::{DType, Module, Result, Tensor};
-use candle_nn::Embedding;
 use crate::loading::var_builder::VarBuilder;
-use candle_transformers::models::qwen3::Config as Qwen3Config;
+use crate::nn_ops::{Embedding, Qwen3Config};
 use serde::Deserialize;
 
 use crate::models::common::varlen_attention;
@@ -673,7 +673,7 @@ impl Qwen3Attention {
             scores
         };
 
-        let attn = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?;
+        let attn = crate::nn_ops::ops::softmax_last_dim(&scores)?.matmul(&v)?;
         attn.transpose(1, 2)?
             .contiguous()?
             .reshape((seq_len, self.num_heads, self.head_dim))
@@ -772,22 +772,7 @@ impl DecoderLayer {
             }
 
             // In-place add: x_res += mlp_out
-            let (mut x_storage, x_layout) = unsafe { x_res.storage_mut_and_layout() };
-            let x_data = unsafe {
-                crate::ops::cpu::extract_bf16_mut_u16(
-                    &mut x_storage,
-                    x_layout.start_offset(),
-                    needed,
-                )
-                .unwrap()
-            };
-            unsafe {
-                raw_cpu::raw_residual_add_bf16(
-                    x_data.as_mut_ptr(),
-                    scratch.mlp_out.as_ptr(),
-                    needed,
-                );
-            }
+            crate::ops::cpu::inplace_add_bf16(x_res, &scratch.mlp_out[..needed]).unwrap();
         });
 
         Ok(x_res.clone())
@@ -814,18 +799,7 @@ impl DecoderLayer {
                 );
             }
 
-            let (mut x_storage, x_layout) = unsafe { x_res.storage_mut_and_layout() };
-            let x_data = unsafe {
-                crate::ops::cpu::extract_f32_mut(&mut x_storage, x_layout.start_offset(), needed)
-                    .unwrap()
-            };
-            unsafe {
-                raw_cpu::raw_residual_add_f32(
-                    x_data.as_mut_ptr(),
-                    scratch.mlp_out.as_ptr(),
-                    needed,
-                );
-            }
+            crate::ops::cpu::inplace_add_f32(x_res, &scratch.mlp_out[..needed]).unwrap();
         });
 
         Ok(x_res.clone())
@@ -933,7 +907,7 @@ impl Model {
         };
         let embed_tokens = {
             let weight = embed_vb.get((cfg.vocab_size, cfg.hidden_size), "weight")?;
-            candle_nn::Embedding::new(weight, cfg.hidden_size)
+            Embedding::new(weight, cfg.hidden_size)
         };
         let rotary = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb.device())?);
 
@@ -1250,8 +1224,7 @@ mod tests {
 
     fn build_model(cfg: &Qwen3Config) -> Qwen3ModelForCausalLM {
         let device = Device::Cpu;
-        let varmap = candle_nn::VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let vb = VarBuilder::zeros(DType::F32, &device);
         Qwen3ModelForCausalLM::new(cfg, vb).expect("model construction failed")
     }
 
@@ -1431,15 +1404,13 @@ mod tests {
         // Reference: re-forward full sequence at each step
         let mut ref_generated = Vec::new();
         let mut full_seq = prompt.clone();
-        for step in 0..3 {
+        for _step in 0..3 {
             let ref_logits = forward_standard(&mut model, &full_seq, &device);
-            let ref_flat: Vec<f32> = ref_logits.flatten_all().unwrap().to_vec1().unwrap();
-            let next = ref_flat
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .unwrap()
-                .0 as u32;
+            // forward_standard returns [1, 1, vocab] — flatten and use Tensor argmax
+            let next = ref_logits
+                .flatten_all().unwrap()
+                .argmax(0).unwrap()
+                .to_vec0::<u32>().unwrap();
             ref_generated.push(next);
             full_seq.push(next);
         }
@@ -1456,7 +1427,7 @@ mod tests {
     #[ignore]
     fn bench_decode_stages() {
         use std::time::Instant;
-        use candle_nn::Module;
+        use candle_core::Module;
 
         let hidden = 1024usize;
         let intermediate = 3072usize;
@@ -1472,7 +1443,7 @@ mod tests {
         // 1. RMSNorm
         let rmsnorm_us = {
             let x = Tensor::randn(0.0f32, 1.0, (1, hidden), &device).unwrap();
-            let norm = candle_nn::RmsNorm::new(
+            let norm = crate::nn_ops::CandleRmsNorm::new(
                 Tensor::ones((hidden,), DType::F32, &device).unwrap(), 1e-6,
             );
             for _ in 0..warmup { let _ = norm.forward(&x); }
@@ -1488,7 +1459,7 @@ mod tests {
             let x = Tensor::randn(0.0f32, 1.0, (1, hidden), &device).unwrap();
             let w = Tensor::randn(0.0f32, 1.0, (qkv_dim, hidden), &device).unwrap();
             let linear = crate::ops::onednn::OnednnLinear::new(
-                candle_nn::Linear::new(w, None),
+                crate::nn_ops::CandleLinear::new(w, None),
             ).unwrap();
             for _ in 0..warmup { let _ = linear.forward(&x); }
             let t = Instant::now();
@@ -1507,13 +1478,13 @@ mod tests {
             let v = k.clone();
             for _ in 0..warmup {
                 let s = q.matmul(&k.transpose(2, 3).unwrap()).unwrap();
-                let s = candle_nn::ops::softmax_last_dim(&s).unwrap();
+                let s = crate::nn_ops::ops::softmax_last_dim(&s).unwrap();
                 let _ = s.matmul(&v).unwrap();
             }
             let t = Instant::now();
             for _ in 0..iters {
                 let s = q.matmul(&k.transpose(2, 3).unwrap()).unwrap();
-                let s = candle_nn::ops::softmax_last_dim(&s).unwrap();
+                let s = crate::nn_ops::ops::softmax_last_dim(&s).unwrap();
                 let _ = s.matmul(&v).unwrap();
             }
             t.elapsed().as_micros() as f64 / iters as f64
@@ -1572,7 +1543,7 @@ mod tests {
             let x = Tensor::randn(0.0f32, 1.0, (1, proj_in), &device).unwrap();
             let w = Tensor::randn(0.0f32, 1.0, (hidden, proj_in), &device).unwrap();
             let linear = crate::ops::onednn::OnednnLinear::new(
-                candle_nn::Linear::new(w, None),
+                crate::nn_ops::CandleLinear::new(w, None),
             ).unwrap();
             for _ in 0..warmup { let _ = linear.forward(&x); }
             let t = Instant::now();
@@ -1587,16 +1558,16 @@ mod tests {
             let w_gu = Tensor::randn(0.0f32, 1.0, (2 * intermediate, hidden), &device).unwrap();
             let w_down = Tensor::randn(0.0f32, 1.0, (hidden, intermediate), &device).unwrap();
             let lin_gu = crate::ops::onednn::OnednnLinear::new(
-                candle_nn::Linear::new(w_gu, None),
+                crate::nn_ops::CandleLinear::new(w_gu, None),
             ).unwrap();
             let lin_down = crate::ops::onednn::OnednnLinear::new(
-                candle_nn::Linear::new(w_down, None),
+                crate::nn_ops::CandleLinear::new(w_down, None),
             ).unwrap();
             for _ in 0..warmup {
                 let h = lin_gu.forward(&x).unwrap();
                 let chunks: Vec<_> = h.chunk(2, 1).unwrap();
                 let _ = lin_down.forward(
-                    &(candle_nn::ops::silu(&chunks[0]).unwrap() * &chunks[1]).unwrap()
+                    &(crate::nn_ops::ops::silu(&chunks[0]).unwrap() * &chunks[1]).unwrap()
                 );
             }
             let t = Instant::now();
@@ -1604,7 +1575,7 @@ mod tests {
                 let h = lin_gu.forward(&x).unwrap();
                 let chunks: Vec<_> = h.chunk(2, 1).unwrap();
                 let _ = lin_down.forward(
-                    &(candle_nn::ops::silu(&chunks[0]).unwrap() * &chunks[1]).unwrap()
+                    &(crate::nn_ops::ops::silu(&chunks[0]).unwrap() * &chunks[1]).unwrap()
                 );
             }
             t.elapsed().as_micros() as f64 / iters as f64

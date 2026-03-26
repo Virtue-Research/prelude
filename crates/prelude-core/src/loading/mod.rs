@@ -28,6 +28,7 @@ use crate::models::gemma3::meta::{
 };
 use crate::models::registry::AuxiliaryVarBuilder;
 use crate::models::qwen3_5::gguf::Qwen3_5GgufModel;
+#[cfg(feature = "candle-baseline")]
 use crate::models::qwen3::gguf::Qwen3GgufModel;
 
 #[derive(Debug, serde::Deserialize)]
@@ -393,7 +394,12 @@ fn load_gguf(
     #[cfg(not(feature = "ggml-quants"))]
     match arch.as_str() {
         "qwen35" | "qwen35moe" => load_gguf_qwen35(ct, &mut file, &device, model_id, engine_config, load_start, tokenizer),
+        #[cfg(feature = "candle-baseline")]
         _ => load_gguf_qwen3(ct, &mut file, &device, model_id, engine_config, load_start, tokenizer),
+        #[cfg(not(feature = "candle-baseline"))]
+        _ => Err(EngineError::InvalidRequest(
+            format!("GGUF architecture '{arch}' requires the 'candle-baseline' feature (or use 'ggml-quants' for llama.cpp backend)").into(),
+        )),
     }
 }
 
@@ -533,6 +539,7 @@ fn load_gguf_qwen35(
     })
 }
 
+#[cfg(feature = "candle-baseline")]
 /// Load standard Qwen3 (and other dense architectures) from GGUF.
 fn load_gguf_qwen3(
     ct: candle_core::quantized::gguf_file::Content,

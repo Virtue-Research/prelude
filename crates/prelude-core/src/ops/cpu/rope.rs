@@ -314,35 +314,33 @@ fn rope_neox_row_f32_scalar(row: &mut [f32], cache: &[f32], cache_off: usize, em
 unsafe fn rope_neox_row_f32_avx512(row: &mut [f32], cache: &[f32], cache_off: usize, embed_dim: usize) {
     use core::arch::x86_64::*;
 
-    unsafe {
-        let cos_ptr = cache.as_ptr().add(cache_off);
-        let sin_ptr = cache.as_ptr().add(cache_off + embed_dim);
-        let row_ptr = row.as_mut_ptr();
+    let cos_ptr = unsafe { cache.as_ptr().add(cache_off) };
+    let sin_ptr = unsafe { cache.as_ptr().add(cache_off + embed_dim) };
+    let row_ptr = row.as_mut_ptr();
 
-        let chunks = embed_dim / 16;
+    let chunks = embed_dim / 16;
 
-        for i in 0..chunks {
-            let off = i * 16;
-            let x = _mm512_loadu_ps(row_ptr.add(off));
-            let y = _mm512_loadu_ps(row_ptr.add(embed_dim + off));
-            let cos = _mm512_loadu_ps(cos_ptr.add(off));
-            let sin = _mm512_loadu_ps(sin_ptr.add(off));
+    for i in 0..chunks {
+        let off = i * 16;
+        let x = unsafe { _mm512_loadu_ps(row_ptr.add(off)) };
+        let y = unsafe { _mm512_loadu_ps(row_ptr.add(embed_dim + off)) };
+        let cos = unsafe { _mm512_loadu_ps(cos_ptr.add(off)) };
+        let sin = unsafe { _mm512_loadu_ps(sin_ptr.add(off)) };
 
-            let out_x = _mm512_sub_ps(_mm512_mul_ps(x, cos), _mm512_mul_ps(y, sin));
-            let out_y = _mm512_fmadd_ps(x, sin, _mm512_mul_ps(y, cos));
+        let out_x = _mm512_sub_ps(_mm512_mul_ps(x, cos), _mm512_mul_ps(y, sin));
+        let out_y = _mm512_fmadd_ps(x, sin, _mm512_mul_ps(y, cos));
 
-            _mm512_storeu_ps(row_ptr.add(off), out_x);
-            _mm512_storeu_ps(row_ptr.add(embed_dim + off), out_y);
-        }
+        unsafe { _mm512_storeu_ps(row_ptr.add(off), out_x) };
+        unsafe { _mm512_storeu_ps(row_ptr.add(embed_dim + off), out_y) };
+    }
 
-        for i in (chunks * 16)..embed_dim {
-            let cos = cache[cache_off + i];
-            let sin = cache[cache_off + embed_dim + i];
-            let x = row[i];
-            let y = row[embed_dim + i];
-            row[i] = x * cos - y * sin;
-            row[embed_dim + i] = y * cos + x * sin;
-        }
+    for i in (chunks * 16)..embed_dim {
+        let cos = cache[cache_off + i];
+        let sin = cache[cache_off + embed_dim + i];
+        let x = row[i];
+        let y = row[embed_dim + i];
+        row[i] = x * cos - y * sin;
+        row[embed_dim + i] = y * cos + x * sin;
     }
 }
 

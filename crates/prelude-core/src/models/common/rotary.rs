@@ -3,7 +3,7 @@
 // Supports standard [B, H, L, D], THD [B, L, H, D], and varlen [total, H, D] layouts.
 
 use candle_core::{DType, Device, Result, Tensor};
-use candle_transformers::models::qwen3::Config as Qwen3Config;
+use crate::nn_ops::Qwen3Config;
 
 #[derive(Debug, Clone)]
 pub(crate) struct RotaryEmbedding {
@@ -84,8 +84,8 @@ impl RotaryEmbedding {
         let h_k = k.dim(1)?;
         let q4 = q.reshape((1, total, h_q, d))?;
         let k4 = k.reshape((1, total, h_k, d))?;
-        let q_embed = candle_nn::rotary_emb::rope_thd(&q4, &cos, &sin)?;
-        let k_embed = candle_nn::rotary_emb::rope_thd(&k4, &cos, &sin)?;
+        let q_embed = crate::nn_ops::rotary_emb::rope_thd(&q4, &cos, &sin)?;
+        let k_embed = crate::nn_ops::rotary_emb::rope_thd(&k4, &cos, &sin)?;
         Ok((
             q_embed.reshape((total, h_q, d))?,
             k_embed.reshape((total, h_k, d))?,

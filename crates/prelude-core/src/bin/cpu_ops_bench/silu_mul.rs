@@ -28,11 +28,11 @@ pub fn bench(dim: usize, batch: usize, warmup: usize, repeats: usize) -> Result<
     let gate = input_f32.narrow(1, 0, dim)?;
     let up = input_f32.narrow(1, dim, dim)?;
     for _ in 0..warmup {
-        let _ = (candle_nn::ops::silu(&gate)? * &up)?;
+        let _ = (prelude_core::nn_ops::ops::silu(&gate)? * &up)?;
     }
     let start = Instant::now();
     for _ in 0..repeats {
-        let _ = (candle_nn::ops::silu(&gate)? * &up)?;
+        let _ = (prelude_core::nn_ops::ops::silu(&gate)? * &up)?;
     }
     let candle_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 

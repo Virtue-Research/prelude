@@ -189,22 +189,7 @@ impl TransformerBlock {
             }
 
             // In-place add: x_res += mlp_out
-            let (mut x_storage, x_layout) = unsafe { x_res.storage_mut_and_layout() };
-            let x_data = unsafe {
-                crate::ops::cpu::extract_bf16_mut_u16(
-                    &mut x_storage,
-                    x_layout.start_offset(),
-                    needed,
-                )
-                .unwrap()
-            };
-            unsafe {
-                raw_cpu::raw_residual_add_bf16(
-                    x_data.as_mut_ptr(),
-                    scratch.mlp_out.as_ptr(),
-                    needed,
-                );
-            }
+            crate::ops::cpu::inplace_add_bf16(x_res, &scratch.mlp_out[..needed]).unwrap();
         });
 
         Ok(x_res.clone())
@@ -231,22 +216,7 @@ impl TransformerBlock {
                 );
             }
 
-            let (mut x_storage, x_layout) = unsafe { x_res.storage_mut_and_layout() };
-            let x_data = unsafe {
-                crate::ops::cpu::extract_f32_mut(
-                    &mut x_storage,
-                    x_layout.start_offset(),
-                    needed,
-                )
-                .unwrap()
-            };
-            unsafe {
-                raw_cpu::raw_residual_add_f32(
-                    x_data.as_mut_ptr(),
-                    scratch.mlp_out.as_ptr(),
-                    needed,
-                );
-            }
+            crate::ops::cpu::inplace_add_f32(x_res, &scratch.mlp_out[..needed]).unwrap();
         });
 
         Ok(x_res.clone())

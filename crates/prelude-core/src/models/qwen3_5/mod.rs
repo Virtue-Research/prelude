@@ -16,7 +16,7 @@ pub mod gguf;
 pub(crate) mod meta;
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::Embedding;
+use crate::nn_ops::{CandleLinear, Embedding};
 use crate::loading::var_builder::VarBuilder;
 
 use crate::models::common::varlen_attention;
@@ -337,7 +337,7 @@ impl RmsNormGated {
         let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
         let normed = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
         let normed = normed.to_dtype(x.dtype())?.broadcast_mul(&self.weight)?;
-        let gate = candle_nn::Activation::Silu.forward(&z)?;
+        let gate = crate::nn_ops::Activation::Silu.forward(&z)?;
         let result = normed.broadcast_mul(&gate)?;
 
         // Reshape back to [..., num_heads * head_dim]
@@ -481,7 +481,7 @@ impl Qwen3_5GatedDeltaNet {
         };
 
         // Apply SiLU activation after conv
-        let qkv_conv = candle_nn::Activation::Silu.forward(&qkv_conv)?;
+        let qkv_conv = crate::nn_ops::Activation::Silu.forward(&qkv_conv)?;
 
         // Split into q, k, v
         let q = qkv_conv.narrow(D::Minus1, 0, self.key_dim)?;
@@ -555,7 +555,7 @@ impl Qwen3_5GatedDeltaNet {
         let g = (neg_a_exp * softplus_val)?; // [num_v_heads]
 
         // beta = sigmoid(b) per head
-        let beta = candle_nn::ops::sigmoid(&b_f32)?; // [num_v_heads]
+        let beta = crate::nn_ops::ops::sigmoid(&b_f32)?; // [num_v_heads]
 
         // decay = exp(g)
         let decay = g.exp()?; // [num_v_heads]
@@ -853,7 +853,7 @@ impl Qwen3_5Attention {
         )?;
         let attn_output = attn_output.reshape((total_tokens, self.num_heads * self.head_dim))?;
         let gated = if let Some(gate) = gate {
-            (attn_output * candle_nn::ops::sigmoid(&gate)?)?
+            (attn_output * crate::nn_ops::ops::sigmoid(&gate)?)?
         } else {
             attn_output
         };
@@ -888,13 +888,13 @@ impl Qwen3_5Mlp {
 // ── Sparse MoE Block ────────────────────────────────────────────────────
 
 struct Qwen3_5SparseMoeBlock {
-    gate: candle_nn::Linear, // [num_experts, hidden_size]
+    gate: CandleLinear, // [num_experts, hidden_size]
     // Fused expert weights: gate_up [E, 2*inter, hidden], down [E, hidden, inter]
     experts_gate_up: Tensor,
     experts_down: Tensor,
     moe_intermediate_size: usize,
     shared_expert: Option<Qwen3_5Mlp>,
-    shared_expert_gate: Option<candle_nn::Linear>, // [1, hidden_size]
+    shared_expert_gate: Option<CandleLinear>, // [1, hidden_size]
     num_experts_per_tok: usize,
     norm_topk_prob: bool,
 }
@@ -908,7 +908,7 @@ impl Qwen3_5SparseMoeBlock {
         let gate = {
             let gvb = vb.pp("gate");
             let w = gvb.get((num_experts, cfg.hidden_size), "weight")?;
-            candle_nn::Linear::new(w, None)
+            CandleLinear::new(w, None)
         };
 
         // Load fused expert weights: [num_experts, 2*inter, hidden] and [num_experts, hidden, inter]
@@ -940,7 +940,7 @@ impl Qwen3_5SparseMoeBlock {
             Some({
                 let gvb = vb.pp("shared_expert_gate");
                 let w = gvb.get((1, cfg.hidden_size), "weight")?;
-                candle_nn::Linear::new(w, None)
+                CandleLinear::new(w, None)
             })
         } else {
             None
@@ -982,7 +982,7 @@ impl Qwen3_5SparseMoeBlock {
         let gate_up = x.matmul(&gate_up_w.t()?)?;
         let gate = gate_up.narrow(D::Minus1, 0, inter)?;
         let up = gate_up.narrow(D::Minus1, inter, inter)?;
-        let act = candle_nn::Activation::Silu.forward(&gate)?;
+        let act = crate::nn_ops::Activation::Silu.forward(&gate)?;
         let hidden = (act * up)?;
         hidden.matmul(&down_w.t()?)
     }
@@ -1053,7 +1053,7 @@ impl Qwen3_5SparseMoeBlock {
 
         // Router: softmax → topk → gather weights
         let router_logits = xs.apply(&self.gate)?;
-        let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
+        let routing_weights = crate::nn_ops::ops::softmax_last_dim(&router_logits)?;
 
         let experts_per_tok = routing_weights
             .arg_sort_last_dim(false)?
@@ -1093,7 +1093,7 @@ impl Qwen3_5SparseMoeBlock {
         if let Some(ref shared) = self.shared_expert {
             let shared_out = shared.forward(xs)?;
             let shared_out = if let Some(ref gate) = self.shared_expert_gate {
-                let gate_val = candle_nn::ops::sigmoid(&xs.apply(gate)?)?; // [n, 1]
+                let gate_val = crate::nn_ops::ops::sigmoid(&xs.apply(gate)?)?; // [n, 1]
                 shared_out.broadcast_mul(&gate_val)?
             } else {
                 shared_out
@@ -1335,7 +1335,7 @@ impl Qwen3_5Model {
         let embed_tokens = {
             let emb_vb = vb_m.pp("embed_tokens");
             let weight = emb_vb.get((cfg.vocab_size, cfg.hidden_size), "weight")?;
-            candle_nn::Embedding::new(weight, cfg.hidden_size)
+            Embedding::new(weight, cfg.hidden_size)
         };
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);

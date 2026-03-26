@@ -4,7 +4,7 @@
 //! Thread-local scratch buffers are pre-allocated and reused across layers.
 //! The only Tensor operations happen at the boundary: extract input, wrap output.
 
-use std::cell::UnsafeCell;
+use std::cell::RefCell;
 
 use candle_core::{Device, Result, Tensor};
 
@@ -50,7 +50,7 @@ impl RawScratch {
 }
 
 thread_local! {
-    static SCRATCH: UnsafeCell<RawScratch> = UnsafeCell::new(RawScratch::new());
+    static SCRATCH: RefCell<RawScratch> = RefCell::new(RawScratch::new());
 }
 
 /// Access the thread-local scratch buffers.
@@ -58,7 +58,7 @@ pub(crate) fn with_scratch<F, R>(f: F) -> R
 where
     F: FnOnce(&mut RawScratch) -> R,
 {
-    SCRATCH.with(|c| f(unsafe { &mut *c.get() }))
+    SCRATCH.with_borrow_mut(f)
 }
 
 /// Ensure a buffer has at least `needed` elements (grow-only).
@@ -95,17 +95,7 @@ pub(crate) fn extract_seq_lens(cu_seqlens: &Tensor) -> Result<Vec<usize>> {
 
 /// Wrap raw `&[u16]` data into a new BF16 Tensor (copies data).
 pub(crate) fn wrap_output(data: &[u16], shape: &[usize], device: &Device) -> Result<Tensor> {
-    let len = data.len();
-    let result_vec: Vec<half::bf16> = unsafe {
-        let mut v = Vec::with_capacity(len);
-        std::ptr::copy_nonoverlapping(
-            data.as_ptr() as *const half::bf16,
-            v.as_mut_ptr(),
-            len,
-        );
-        v.set_len(len);
-        v
-    };
+    let result_vec: Vec<half::bf16> = bytemuck::cast_slice::<u16, half::bf16>(data).to_vec();
     Tensor::from_vec(result_vec, shape, device)
 }
 
@@ -578,14 +568,14 @@ impl RawScratchF32 {
 }
 
 thread_local! {
-    static SCRATCH_F32: UnsafeCell<RawScratchF32> = UnsafeCell::new(RawScratchF32::new());
+    static SCRATCH_F32: RefCell<RawScratchF32> = RefCell::new(RawScratchF32::new());
 }
 
 pub(crate) fn with_scratch_f32<F, R>(f: F) -> R
 where
     F: FnOnce(&mut RawScratchF32) -> R,
 {
-    SCRATCH_F32.with(|c| f(unsafe { &mut *c.get() }))
+    SCRATCH_F32.with_borrow_mut(f)
 }
 
 #[inline]

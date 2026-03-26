@@ -5,13 +5,14 @@
 
 use candle_core::{Module, Result, Tensor};
 use crate::loading::var_builder::VarBuilder;
+use crate::nn_ops::{CandleLinear, CandleRmsNorm};
 
 // ── Linear ──────────────────────────────────────────────────────────────
 
 /// Unified linear layer. Loads weights from VarBuilder and automatically
 /// selects the best GEMM backend at construction time.
 ///
-/// Models should always use this instead of `candle_nn::Linear`.
+/// Models should always use this instead of `CandleLinear`.
 #[derive(Debug, Clone)]
 pub struct Linear {
     inner: LinearInner,
@@ -19,7 +20,7 @@ pub struct Linear {
 
 #[derive(Debug, Clone)]
 enum LinearInner {
-    Candle(candle_nn::Linear),
+    Candle(CandleLinear),
     #[cfg(feature = "onednn")]
     Onednn(crate::ops::onednn::OnednnLinear),
 }
@@ -33,16 +34,16 @@ impl Linear {
         } else {
             None
         };
-        Self::from_candle(candle_nn::Linear::new(weight, bias))
+        Self::from_candle(CandleLinear::new(weight, bias))
     }
 
     /// Construct from a raw weight tensor (e.g., for tied embeddings / lm_head).
     pub fn from_weight(weight: Tensor, bias: Option<Tensor>) -> Result<Self> {
-        Self::from_candle(candle_nn::Linear::new(weight, bias))
+        Self::from_candle(CandleLinear::new(weight, bias))
     }
 
-    /// Wrap an existing `candle_nn::Linear`, packing weights for acceleration.
-    pub fn from_candle(linear: candle_nn::Linear) -> Result<Self> {
+    /// Wrap an existing `CandleLinear`, packing weights for acceleration.
+    pub fn from_candle(linear: CandleLinear) -> Result<Self> {
         #[cfg(feature = "onednn")]
         {
             let w = linear.weight();
@@ -100,7 +101,7 @@ impl Module for Linear {
 /// Unified RMS normalization layer. AVX-512 on CPU, CUDA kernel on GPU,
 /// candle fallback elsewhere.
 ///
-/// Models should always use this instead of `candle_nn::RmsNorm`.
+/// Models should always use this instead of `CandleRmsNorm`.
 #[derive(Debug, Clone)]
 pub struct RmsNorm {
     weight: Tensor,
@@ -136,7 +137,7 @@ impl Module for RmsNorm {
             crate::ops::cpu::cpu_rmsnorm(x, &self.weight, self.eps)
         } else {
             // GPU: use candle's built-in RmsNorm which dispatches to CUDA kernel
-            let norm = candle_nn::RmsNorm::new(self.weight.clone(), self.eps);
+            let norm = CandleRmsNorm::new(self.weight.clone(), self.eps);
             norm.forward(x)
         }
     }
