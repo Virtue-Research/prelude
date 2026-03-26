@@ -4,6 +4,7 @@
 // RmsNorm: AVX-512 on CPU, candle on GPU.
 
 use candle_core::{Module, Result, Tensor};
+use candle_core::quantized::QMatMul;
 use crate::loading::var_builder::VarBuilder;
 use crate::nn_ops::{CandleLinear, CandleRmsNorm};
 
@@ -12,7 +13,8 @@ use crate::nn_ops::{CandleLinear, CandleRmsNorm};
 /// Unified linear layer. Loads weights from VarBuilder and automatically
 /// selects the best GEMM backend at construction time.
 ///
-/// Models should always use this instead of `CandleLinear`.
+/// Supports both standard (FP16/BF16/F32) and quantized (GGUF Q4/Q8) weights.
+/// Models call `linear.forward(x)` without knowing which backend is active.
 #[derive(Debug, Clone)]
 pub struct Linear {
     inner: LinearInner,
@@ -23,6 +25,8 @@ enum LinearInner {
     Candle(CandleLinear),
     #[cfg(feature = "onednn")]
     Onednn(crate::ops::onednn::OnednnLinear),
+    /// GGUF quantized weights (Q4_0, Q4_K_M, Q8_0, etc.)
+    Quantized(QMatMul),
 }
 
 impl Linear {
@@ -58,12 +62,29 @@ impl Linear {
         })
     }
 
+    /// Construct from a quantized QMatMul (GGUF).
+    pub fn from_qmatmul(qmm: QMatMul) -> Self {
+        Self { inner: LinearInner::Quantized(qmm) }
+    }
+
+    /// Construct from a quantized QTensor (GGUF).
+    pub fn from_qtensor(qtensor: std::sync::Arc<candle_core::quantized::QTensor>) -> Result<Self> {
+        Ok(Self::from_qmatmul(QMatMul::from_arc(qtensor)?))
+    }
+
+    /// Whether this linear uses quantized weights.
+    pub fn is_quantized(&self) -> bool {
+        matches!(&self.inner, LinearInner::Quantized(_))
+    }
+
     /// Access the underlying weight tensor.
+    /// Panics on quantized variant — use `is_quantized()` to check first.
     pub fn weight(&self) -> &Tensor {
         match &self.inner {
             LinearInner::Candle(l) => l.weight(),
             #[cfg(feature = "onednn")]
             LinearInner::Onednn(l) => l.weight(),
+            LinearInner::Quantized(_) => panic!("weight() not available on quantized Linear"),
         }
     }
 
@@ -92,6 +113,7 @@ impl Module for Linear {
             LinearInner::Candle(l) => l.forward(x),
             #[cfg(feature = "onednn")]
             LinearInner::Onednn(l) => l.forward(x),
+            LinearInner::Quantized(q) => q.forward(x),
         }
     }
 }
