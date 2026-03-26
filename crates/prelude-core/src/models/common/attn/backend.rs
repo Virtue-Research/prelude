@@ -437,24 +437,45 @@ impl AttentionBackend for CpuBackend {
 /// Select the best available attention backend based on compiled features
 /// and the device type.
 ///
-/// Priority: FA4 → FlashInfer → FA3 → FA2 → CPU.
+/// Returns the cached attention backend for the given device class.
 ///
-/// GPU backends are only returned when `is_cuda` is true. When running on
-/// CPU (or when no GPU backend is compiled), the CPU fallback is returned.
-pub(crate) fn select_backend(is_cuda: bool) -> Box<dyn AttentionBackend> {
+/// Priority: FA4 → FlashInfer → FA3 → FA2 → CPU.
+/// The backend is resolved once on first call and cached for the lifetime of
+/// the process — no allocation on subsequent calls.
+pub(crate) fn select_backend(is_cuda: bool) -> &'static dyn AttentionBackend {
+    use std::sync::OnceLock;
+
+    static GPU_BACKEND: OnceLock<Box<dyn AttentionBackend>> = OnceLock::new();
+    static CPU_BACKEND: CpuBackend = CpuBackend;
+
     if is_cuda {
-        #[cfg(feature = "flash-attn-v4")]
-        return Box::new(FlashAttnV4Backend);
-
-        #[cfg(feature = "flashinfer")]
-        return Box::new(FlashInferBackend);
-
-        #[cfg(feature = "flash-attn-v3")]
-        return Box::new(FlashAttnV3Backend);
-
-        #[cfg(feature = "flash-attn")]
-        return Box::new(FlashAttnV2Backend);
+        GPU_BACKEND.get_or_init(|| {
+            let backend: Box<dyn AttentionBackend> = select_gpu_backend();
+            tracing::info!(backend = backend.name(), "attention backend selected");
+            backend
+        }).as_ref()
+    } else {
+        &CPU_BACKEND
     }
+}
 
-    Box::new(CpuBackend)
+/// Select the highest-priority GPU backend among those compiled in.
+fn select_gpu_backend() -> Box<dyn AttentionBackend> {
+    #[cfg(feature = "flash-attn-v4")]
+    return Box::new(FlashAttnV4Backend);
+
+    #[cfg(feature = "flashinfer")]
+    return Box::new(FlashInferBackend);
+
+    #[cfg(feature = "flash-attn-v3")]
+    return Box::new(FlashAttnV3Backend);
+
+    #[cfg(feature = "flash-attn")]
+    return Box::new(FlashAttnV2Backend);
+
+    #[allow(unreachable_code)]
+    {
+        tracing::warn!("no GPU attention backend compiled, falling back to CPU");
+        Box::new(CpuBackend)
+    }
 }

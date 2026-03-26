@@ -10,8 +10,8 @@
 //! 1. **Free functions** (backward-compatible): `varlen_attention()`, `reshape_and_cache()`, etc.
 //!    These contain `#[cfg]` dispatch internally.
 //!
-//! 2. **Trait interface**: call `select_backend()` to get a `Box<dyn AttentionBackend>`,
-//!    then call methods on it. The `#[cfg]` gates are concentrated in `select_backend()`.
+//! 2. **Trait interface**: call `select_backend()` to get a `&'static dyn AttentionBackend`,
+//!    then call methods on it. The backend is resolved once and cached for the process lifetime.
 
 mod backend;
 pub(crate) use backend::{AttentionBackend, select_backend};
