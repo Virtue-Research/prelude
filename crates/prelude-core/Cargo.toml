@@ -53,6 +53,7 @@ prelude-deepgemm = { workspace = true, optional = true }
 prelude-cutlass-gemm = { workspace = true, optional = true }
 prelude-flashinfer = { workspace = true, optional = true }
 prelude-ggml-quants = { path = "../prelude-ggml-quants", optional = true }
+inventory = "0.3"
 rayon = "1.11.0"
 nix = { version = "0.31", features = ["sched"] }
 tokenizers = { workspace = true, optional = true }

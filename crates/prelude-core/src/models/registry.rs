@@ -109,16 +109,26 @@ pub(crate) fn candle_model_err(e: candle_core::Error) -> EngineError {
     EngineError::Internal(format!("candle error: {e}"))
 }
 
-static ALL_ARCH_SPECS: &[&dyn ArchSpec] = &[
-    &super::qwen3::meta::QWEN3_ARCH_SPEC,
-    &super::qwen3_moe::meta::QWEN3_MOE_ARCH_SPEC,
-    &super::gemma3::meta::GEMMA3_ARCH_SPEC,
-    &super::qwen3_next::meta::QWEN3_NEXT_ARCH_SPEC,
-    &super::qwen3_5::meta::QWEN3_5_ARCH_SPEC,
-];
+/// Wrapper for `inventory` auto-registration.
+///
+/// Each model's `meta.rs` calls `inventory::submit!(ArchSpecEntry::new(&MY_ARCH_SPEC))`
+/// to register itself. No need to edit this file when adding a new model.
+pub(crate) struct ArchSpecEntry {
+    pub spec: &'static dyn ArchSpec,
+}
 
-fn all_arch_specs() -> &'static [&'static dyn ArchSpec] {
-    ALL_ARCH_SPECS
+impl ArchSpecEntry {
+    pub const fn new(spec: &'static dyn ArchSpec) -> Self {
+        Self { spec }
+    }
+}
+
+inventory::collect!(ArchSpecEntry);
+
+fn all_arch_specs() -> Vec<&'static dyn ArchSpec> {
+    inventory::iter::<ArchSpecEntry>()
+        .map(|entry| entry.spec)
+        .collect()
 }
 
 fn task_from_architecture_suffix(suffix: &str) -> Option<TaskKind> {

@@ -30,6 +30,7 @@ fn deltanet_config_from(cfg: &Qwen3NextConfig) -> DeltaNetPoolConfig {
 pub(crate) struct Qwen3NextArchSpec;
 
 pub(crate) static QWEN3_NEXT_ARCH_SPEC: Qwen3NextArchSpec = Qwen3NextArchSpec;
+inventory::submit!(crate::models::registry::ArchSpecEntry::new(&QWEN3_NEXT_ARCH_SPEC));
 
 impl ArchSpec for Qwen3NextArchSpec {
     fn name(&self) -> &'static str {

@@ -140,6 +140,7 @@ pub(crate) fn build_gemma3_model_with_context(
 pub(crate) struct Gemma3ArchSpec;
 
 pub(crate) static GEMMA3_ARCH_SPEC: Gemma3ArchSpec = Gemma3ArchSpec;
+inventory::submit!(crate::models::registry::ArchSpecEntry::new(&GEMMA3_ARCH_SPEC));
 
 impl ArchSpec for Gemma3ArchSpec {
     fn name(&self) -> &'static str {

@@ -37,6 +37,7 @@ fn common_from_qwen3(cfg: &Qwen3Config) -> CommonModelConfig {
 pub(crate) struct Qwen3ArchSpec;
 
 pub(crate) static QWEN3_ARCH_SPEC: Qwen3ArchSpec = Qwen3ArchSpec;
+inventory::submit!(crate::models::registry::ArchSpecEntry::new(&QWEN3_ARCH_SPEC));
 
 impl ArchSpec for Qwen3ArchSpec {
     fn name(&self) -> &'static str {

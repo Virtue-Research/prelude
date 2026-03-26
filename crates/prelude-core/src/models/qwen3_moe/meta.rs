@@ -14,6 +14,7 @@ const SUPPORTED_TASKS: &[TaskKind] = &[TaskKind::Generate];
 pub(crate) struct Qwen3MoeArchSpec;
 
 pub(crate) static QWEN3_MOE_ARCH_SPEC: Qwen3MoeArchSpec = Qwen3MoeArchSpec;
+inventory::submit!(crate::models::registry::ArchSpecEntry::new(&QWEN3_MOE_ARCH_SPEC));
 
 impl ArchSpec for Qwen3MoeArchSpec {
     fn name(&self) -> &'static str {
