@@ -2,12 +2,64 @@ use candle_core::Tensor;
 
 use crate::models::common::BatchAttnContext;
 
+// ── Sub-traits ──────────────────────────────────────────────────────────
+
+/// Models that can split forward into hidden-states + lm_head for
+/// chunked prompt-logprobs extraction.
+pub trait LogitsSplitModel: Send {
+    /// Forward pass returning hidden states BEFORE lm_head.
+    /// Returns `(total_tokens, hidden_dim)`.
+    fn forward_hidden_states(
+        &mut self,
+        packed_input: &Tensor,
+        ctx: &mut BatchAttnContext,
+    ) -> candle_core::Result<Tensor>;
+
+    /// Apply lm_head (and any post-processing like softcapping) to hidden states.
+    /// Can be called on chunks: `compute_logits(chunk)` → `(chunk_size, vocab_size)`.
+    fn compute_logits(&self, hidden: &Tensor) -> candle_core::Result<Tensor>;
+}
+
+/// Models with internal KV cache for CPU sequential decode.
+pub trait KvCacheModel: Send {
+    /// Forward with internal KV cache.
+    /// `input_ids` is `[L]` flat token IDs, `position_offset` is the starting
+    /// position (0 for prefill, prompt_len+step for decode).
+    /// Returns logits `[L, vocab_size]`.
+    fn forward_with_cache(
+        &mut self,
+        input_ids: &Tensor,
+        position_offset: usize,
+    ) -> candle_core::Result<Tensor>;
+}
+
+/// Classifier model metadata.
+pub trait ClassifierModel {
+    fn num_labels(&self) -> usize;
+    fn get_label(&self, class_idx: usize) -> Option<String>;
+
+    /// Convenience: returns (num_labels, sample_label_for_class_0).
+    fn classifier_info(&self) -> (usize, Option<String>) {
+        (self.num_labels(), self.get_label(0))
+    }
+}
+
+/// Embedding model metadata.
+pub trait EmbeddingModel {
+    fn embedding_dim(&self) -> usize;
+}
+
+// ── Core trait ──────────────────────────────────────────────────────────
+
 /// Trait implemented by all model architectures for uniform dispatch.
 ///
 /// Required methods:
 /// - `forward()` — the main forward pass
 /// - `clear_kv_cache()` — reset KV cache between requests
-#[allow(dead_code)]
+///
+/// Optional capabilities are accessed via `as_xxx()` accessors, which return
+/// `None` by default. Models that support a capability implement the
+/// corresponding sub-trait and override the accessor.
 pub trait ModelForward: Send {
     /// Run the model forward pass.
     fn forward(
@@ -19,42 +71,21 @@ pub trait ModelForward: Send {
     /// Clear all KV caches.
     fn clear_kv_cache(&mut self);
 
-    /// Forward pass with internal KV cache for CPU decode.
-    ///
-    /// `input_ids` is `[L]` (flat token IDs). `position_offset` is the starting
-    /// position index for the tokens (0 for prefill, prompt_len+step for decode).
-    /// Returns logits `[L, vocab_size]`.
-    ///
-    /// Default: not supported (GPU models use paged KV).
-    fn forward_with_cache(
-        &mut self,
-        _input_ids: &Tensor,
-        _position_offset: usize,
-    ) -> candle_core::Result<Tensor> {
-        candle_core::bail!("forward_with_cache not supported for this model")
-    }
+    // ── Capability accessors ────────────────────────────────────────
 
-    /// Forward pass returning hidden states BEFORE lm_head.
-    /// Returns `(total_tokens, hidden_dim)` — used for prompt logprobs extraction
-    /// where lm_head is applied in chunks to limit peak GPU memory.
-    fn forward_hidden_states(
-        &mut self,
-        _packed_input: &Tensor,
-        _ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
-        candle_core::bail!("forward_hidden_states not supported for this model")
-    }
+    /// Access hidden-states / logits splitting (for prompt logprobs).
+    fn as_logits_model(&self) -> Option<&dyn LogitsSplitModel> { None }
+    /// Mutable access for `forward_hidden_states` which takes `&mut self`.
+    fn as_logits_model_mut(&mut self) -> Option<&mut dyn LogitsSplitModel> { None }
 
-    /// Apply lm_head (and any post-processing like softcapping) to hidden states.
-    /// Can be called on chunks: `compute_logits(chunk)` → `(chunk_size, vocab_size)`.
-    fn compute_logits(&self, _hidden: &Tensor) -> candle_core::Result<Tensor> {
-        candle_core::bail!("compute_logits not supported for this model")
-    }
+    /// Access CPU KV-cache decode capability.
+    fn as_kv_cache_model(&mut self) -> Option<&mut dyn KvCacheModel> { None }
 
-    /// Whether this model supports `forward_with_cache` for CPU KV-cached decode.
-    fn supports_kv_cache(&self) -> bool {
-        false
-    }
+    /// Access classifier-specific metadata.
+    fn as_classifier(&self) -> Option<&dyn ClassifierModel> { None }
+
+    /// Access embedding-specific metadata.
+    fn as_embedding(&self) -> Option<&dyn EmbeddingModel> { None }
 
     /// Direct generation: prefill + decode loop handled internally (e.g. by llama.cpp FFI).
     /// Returns (generated_token_ids, last_logits_f32). Default: not supported.
@@ -64,37 +95,5 @@ pub trait ModelForward: Send {
         _max_new: usize,
     ) -> candle_core::Result<Option<(Vec<u32>, Vec<f32>)>> {
         Ok(None)
-    }
-
-    // ── Task-specific queries ──────────────────────────────────────────
-
-    /// Whether this is a classifier model.
-    fn is_classifier(&self) -> bool {
-        false
-    }
-
-    /// Whether this is an embedding model.
-    fn is_embedding(&self) -> bool {
-        false
-    }
-
-    /// Embedding hidden size (embedding models only).
-    fn embedding_dim(&self) -> Option<usize> {
-        None
-    }
-
-    /// Returns (num_labels, sample_label) for classifier models.
-    fn classifier_info(&self) -> Option<(usize, Option<String>)> {
-        None
-    }
-
-    /// Get the label string for a class index (classifier models only).
-    fn get_label(&self, _class_idx: usize) -> Option<String> {
-        None
-    }
-
-    /// Get the number of labels (classifier models only).
-    fn num_labels(&self) -> Option<usize> {
-        None
     }
 }

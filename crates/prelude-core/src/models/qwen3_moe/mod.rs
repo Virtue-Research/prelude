@@ -489,15 +489,7 @@ impl Qwen3MoeModelForCausalLM {
     }
 }
 
-impl crate::models::ModelForward for Qwen3MoeModelForCausalLM {
-    fn forward(
-        &mut self,
-        packed_input: &Tensor,
-        ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
-        self.forward(packed_input, ctx)
-    }
-
+impl crate::models::LogitsSplitModel for Qwen3MoeModelForCausalLM {
     fn forward_hidden_states(
         &mut self,
         packed_input: &Tensor,
@@ -509,8 +501,26 @@ impl crate::models::ModelForward for Qwen3MoeModelForCausalLM {
     fn compute_logits(&self, hidden: &Tensor) -> candle_core::Result<Tensor> {
         hidden.apply(&self.lm_head)
     }
+}
+
+impl crate::models::ModelForward for Qwen3MoeModelForCausalLM {
+    fn forward(
+        &mut self,
+        packed_input: &Tensor,
+        ctx: &mut BatchAttnContext,
+    ) -> candle_core::Result<Tensor> {
+        self.forward(packed_input, ctx)
+    }
 
     fn clear_kv_cache(&mut self) {
         self.clear_kv_cache();
+    }
+
+    fn as_logits_model(&self) -> Option<&dyn crate::models::LogitsSplitModel> {
+        Some(self)
+    }
+
+    fn as_logits_model_mut(&mut self) -> Option<&mut dyn crate::models::LogitsSplitModel> {
+        Some(self)
     }
 }

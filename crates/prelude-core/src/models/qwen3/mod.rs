@@ -26,6 +26,7 @@ pub use crate::models::common::{
     set_debug_disable_fused_silu_mul, set_debug_disable_vectorized_add,
 };
 
+use crate::models::{ClassifierModel, EmbeddingModel, KvCacheModel, LogitsSplitModel, ModelForward};
 use crate::cache::kv_buf::KvBuf;
 
 // ============================================================================
@@ -1008,7 +1009,31 @@ impl Qwen3ForEmbedding {
 
 // ── ModelForward implementations ─────────────────────────────────────────
 
-impl crate::models::ModelForward for Qwen3ModelForCausalLM {
+impl LogitsSplitModel for Qwen3ModelForCausalLM {
+    fn forward_hidden_states(
+        &mut self,
+        packed_input: &Tensor,
+        ctx: &mut BatchAttnContext,
+    ) -> candle_core::Result<Tensor> {
+        self.base.forward(packed_input, ctx)
+    }
+
+    fn compute_logits(&self, hidden: &Tensor) -> candle_core::Result<Tensor> {
+        hidden.apply(&self.lm_head)
+    }
+}
+
+impl KvCacheModel for Qwen3ModelForCausalLM {
+    fn forward_with_cache(
+        &mut self,
+        input_ids: &Tensor,
+        position_offset: usize,
+    ) -> candle_core::Result<Tensor> {
+        Qwen3ModelForCausalLM::forward_with_cache(self, input_ids, position_offset)
+    }
+}
+
+impl ModelForward for Qwen3ModelForCausalLM {
     fn forward(
         &mut self,
         packed_input: &Tensor,
@@ -1021,32 +1046,30 @@ impl crate::models::ModelForward for Qwen3ModelForCausalLM {
         self.clear_kv_cache();
     }
 
-    fn forward_with_cache(
-        &mut self,
-        input_ids: &Tensor,
-        position_offset: usize,
-    ) -> candle_core::Result<Tensor> {
-        Qwen3ModelForCausalLM::forward_with_cache(self, input_ids, position_offset)
+    fn as_logits_model(&self) -> Option<&dyn LogitsSplitModel> {
+        Some(self)
     }
 
-    fn forward_hidden_states(
-        &mut self,
-        packed_input: &Tensor,
-        ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
-        self.base.forward(packed_input, ctx)
+    fn as_logits_model_mut(&mut self) -> Option<&mut dyn LogitsSplitModel> {
+        Some(self)
     }
 
-    fn compute_logits(&self, hidden: &Tensor) -> candle_core::Result<Tensor> {
-        hidden.apply(&self.lm_head)
-    }
-
-    fn supports_kv_cache(&self) -> bool {
-        true
+    fn as_kv_cache_model(&mut self) -> Option<&mut dyn KvCacheModel> {
+        Some(self)
     }
 }
 
-impl crate::models::ModelForward for Qwen3ForSequenceClassification {
+impl ClassifierModel for Qwen3ForSequenceClassification {
+    fn num_labels(&self) -> usize {
+        Qwen3ForSequenceClassification::num_labels(self)
+    }
+
+    fn get_label(&self, class_idx: usize) -> Option<String> {
+        Qwen3ForSequenceClassification::get_label(self, class_idx)
+    }
+}
+
+impl ModelForward for Qwen3ForSequenceClassification {
     fn forward(
         &mut self,
         packed_input: &Tensor,
@@ -1059,25 +1082,18 @@ impl crate::models::ModelForward for Qwen3ForSequenceClassification {
         Qwen3ForSequenceClassification::clear_kv_cache(self);
     }
 
-    fn is_classifier(&self) -> bool {
-        true
-    }
-
-    fn classifier_info(&self) -> Option<(usize, Option<String>)> {
-        let label = Qwen3ForSequenceClassification::get_label(self, 0);
-        Some((Qwen3ForSequenceClassification::num_labels(self), label))
-    }
-
-    fn get_label(&self, class_idx: usize) -> Option<String> {
-        Qwen3ForSequenceClassification::get_label(self, class_idx)
-    }
-
-    fn num_labels(&self) -> Option<usize> {
-        Some(Qwen3ForSequenceClassification::num_labels(self))
+    fn as_classifier(&self) -> Option<&dyn ClassifierModel> {
+        Some(self)
     }
 }
 
-impl crate::models::ModelForward for Qwen3ForEmbedding {
+impl EmbeddingModel for Qwen3ForEmbedding {
+    fn embedding_dim(&self) -> usize {
+        self.hidden_size()
+    }
+}
+
+impl ModelForward for Qwen3ForEmbedding {
     fn forward(
         &mut self,
         packed_input: &Tensor,
@@ -1089,11 +1105,9 @@ impl crate::models::ModelForward for Qwen3ForEmbedding {
     fn clear_kv_cache(&mut self) {
         Qwen3ForEmbedding::clear_kv_cache(self);
     }
-    fn is_embedding(&self) -> bool {
-        true
-    }
-    fn embedding_dim(&self) -> Option<usize> {
-        Some(self.hidden_size())
+
+    fn as_embedding(&self) -> Option<&dyn EmbeddingModel> {
+        Some(self)
     }
 }
 

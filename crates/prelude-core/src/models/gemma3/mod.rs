@@ -559,15 +559,7 @@ impl Gemma3ForCausalLM {
     }
 }
 
-impl crate::models::ModelForward for Gemma3ForCausalLM {
-    fn forward(
-        &mut self,
-        packed_input: &Tensor,
-        ctx: &mut crate::models::common::BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
-        self.forward(packed_input, ctx)
-    }
-
+impl crate::models::LogitsSplitModel for Gemma3ForCausalLM {
     fn forward_hidden_states(
         &mut self,
         packed_input: &Tensor,
@@ -591,9 +583,27 @@ impl crate::models::ModelForward for Gemma3ForCausalLM {
             Ok(logits)
         }
     }
+}
+
+impl crate::models::ModelForward for Gemma3ForCausalLM {
+    fn forward(
+        &mut self,
+        packed_input: &Tensor,
+        ctx: &mut crate::models::common::BatchAttnContext,
+    ) -> candle_core::Result<Tensor> {
+        self.forward(packed_input, ctx)
+    }
 
     fn clear_kv_cache(&mut self) {
         self.clear_kv_cache();
+    }
+
+    fn as_logits_model(&self) -> Option<&dyn crate::models::LogitsSplitModel> {
+        Some(self)
+    }
+
+    fn as_logits_model_mut(&mut self) -> Option<&mut dyn crate::models::LogitsSplitModel> {
+        Some(self)
     }
 }
 
@@ -753,6 +763,16 @@ impl Gemma3ForEmbedding {
     }
 }
 
+impl crate::models::ClassifierModel for Gemma3ForSequenceClassification {
+    fn num_labels(&self) -> usize {
+        Gemma3ForSequenceClassification::num_labels(self)
+    }
+
+    fn get_label(&self, class_idx: usize) -> Option<String> {
+        Gemma3ForSequenceClassification::get_label(self, class_idx)
+    }
+}
+
 impl crate::models::ModelForward for Gemma3ForSequenceClassification {
     fn forward(
         &mut self,
@@ -766,21 +786,14 @@ impl crate::models::ModelForward for Gemma3ForSequenceClassification {
         Gemma3ForSequenceClassification::clear_kv_cache(self);
     }
 
-    fn is_classifier(&self) -> bool {
-        true
+    fn as_classifier(&self) -> Option<&dyn crate::models::ClassifierModel> {
+        Some(self)
     }
+}
 
-    fn classifier_info(&self) -> Option<(usize, Option<String>)> {
-        let label = Gemma3ForSequenceClassification::get_label(self, 0);
-        Some((Gemma3ForSequenceClassification::num_labels(self), label))
-    }
-
-    fn get_label(&self, class_idx: usize) -> Option<String> {
-        Gemma3ForSequenceClassification::get_label(self, class_idx)
-    }
-
-    fn num_labels(&self) -> Option<usize> {
-        Some(Gemma3ForSequenceClassification::num_labels(self))
+impl crate::models::EmbeddingModel for Gemma3ForEmbedding {
+    fn embedding_dim(&self) -> usize {
+        self.hidden_size()
     }
 }
 
@@ -797,11 +810,7 @@ impl crate::models::ModelForward for Gemma3ForEmbedding {
         Gemma3ForEmbedding::clear_kv_cache(self);
     }
 
-    fn is_embedding(&self) -> bool {
-        true
-    }
-
-    fn embedding_dim(&self) -> Option<usize> {
-        Some(self.hidden_size())
+    fn as_embedding(&self) -> Option<&dyn crate::models::EmbeddingModel> {
+        Some(self)
     }
 }

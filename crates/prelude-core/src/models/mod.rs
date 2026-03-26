@@ -9,7 +9,9 @@ pub(crate) mod registry;
 
 
 
-pub(crate) use forward::ModelForward;
+pub(crate) use forward::{
+    ClassifierModel, EmbeddingModel, KvCacheModel, LogitsSplitModel, ModelForward,
+};
 
 /// Resolve an optional config field, warning if falling back to a default value.
 ///

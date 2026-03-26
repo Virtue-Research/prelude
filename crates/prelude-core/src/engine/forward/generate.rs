@@ -435,11 +435,13 @@ impl Engine {
 
             // When prompt logprobs requested: get hidden states, apply lm_head separately.
             let (logits_flat, prompt_token_logprobs) = if needs_prompt_logprobs {
-                let hidden = model.forward_hidden_states(&input, &mut ctx)
+                let logits_model = model.as_logits_model_mut()
+                    .expect("prompt logprobs requested but model doesn't support LogitsSplitModel");
+                let hidden = logits_model.forward_hidden_states(&input, &mut ctx)
                     .map_err(|e| EngineError::Internal(e.to_string()))?;
                 let last_hidden = hidden.get(seq_len - 1)
                     .map_err(|e| EngineError::Internal(e.to_string()))?;
-                let last_logits = model.compute_logits(&last_hidden)
+                let last_logits = logits_model.compute_logits(&last_hidden)
                     .and_then(|t| t.to_dtype(DType::F32))
                     .map_err(|e| EngineError::Internal(e.to_string()))?;
 
@@ -447,7 +449,7 @@ impl Engine {
                 let items_slice = std::slice::from_ref(item);
                 let seq_lens_slice = [seq_len];
                 let logprobs_cpu = extract_prompt_logprobs_from_hidden(
-                    &hidden, &**model, items_slice, &seq_lens_slice,
+                    &hidden, logits_model, items_slice, &seq_lens_slice,
                 )?;
 
                 let prompt_tokens = &item.prompt_tokens;
@@ -468,9 +470,9 @@ impl Engine {
                     .collect();
 
                 (last_logits, if plps.is_empty() { None } else { Some(plps) })
-            } else if model.supports_kv_cache() {
+            } else if let Some(kv) = model.as_kv_cache_model() {
                 // GGUF and other models with internal KV cache
-                let logits = model.forward_with_cache(&input, 0)
+                let logits = kv.forward_with_cache(&input, 0)
                     .map_err(|e| EngineError::Internal(e.to_string()))?;
                 // forward_with_cache returns [L, vocab]; take last token
                 let last_logits = logits.get(seq_len - 1)
@@ -659,7 +661,7 @@ impl Engine {
 
     // ── CPU continuous decode helpers ─────────────────────────────────
 
-    /// CPU prefill: full prompt through forward_with_cache, returns last-token logits (F32).
+    /// CPU prefill: full prompt through KvCacheModel, returns last-token logits (F32).
     pub(crate) fn cpu_prefill_with_cache(
         &self,
         prompt_tokens: &[u32],
@@ -670,7 +672,9 @@ impl Engine {
             .map_err(|e| EngineError::Internal(e.to_string()))?;
         let mut model = self.executor.model.lock().unwrap();
         model.clear_kv_cache();
-        let logits = model
+        let kv = model.as_kv_cache_model()
+            .expect("cpu_prefill_with_cache called on model without KvCacheModel");
+        let logits = kv
             .forward_with_cache(&input, 0)
             .map_err(|e| EngineError::Internal(e.to_string()))?;
         drop(model);
@@ -680,7 +684,7 @@ impl Engine {
             .map_err(|e| EngineError::Internal(e.to_string()))
     }
 
-    /// CPU decode step: single token through forward_with_cache, returns logits (F32).
+    /// CPU decode step: single token through KvCacheModel, returns logits (F32).
     pub(crate) fn cpu_decode_step(
         &self,
         token: u32,
@@ -690,7 +694,9 @@ impl Engine {
         let input = Tensor::from_vec(vec![token], (1,), device)
             .map_err(|e| EngineError::Internal(e.to_string()))?;
         let mut model = self.executor.model.lock().unwrap();
-        let logits = model
+        let kv = model.as_kv_cache_model()
+            .expect("cpu_decode_step called on model without KvCacheModel");
+        let logits = kv
             .forward_with_cache(&input, position_offset)
             .map_err(|e| EngineError::Internal(e.to_string()))?;
         drop(model);
@@ -842,7 +848,7 @@ const PROMPT_LOGPROBS_CHUNK_SIZE: usize = 512;
 /// (non-zero when prefix caching skips a prefix).
 pub(crate) fn extract_prompt_logprobs_from_hidden(
     hidden_states: &Tensor,
-    model: &dyn crate::models::ModelForward,
+    model: &dyn crate::models::LogitsSplitModel,
     items: &[PreparedGenerateRequest],
     seq_lens: &[usize],
 ) -> Result<Vec<f32>, EngineError> {
@@ -851,7 +857,7 @@ pub(crate) fn extract_prompt_logprobs_from_hidden(
 
 pub(crate) fn extract_prompt_logprobs_from_hidden_offset(
     hidden_states: &Tensor,
-    model: &dyn crate::models::ModelForward,
+    model: &dyn crate::models::LogitsSplitModel,
     items: &[PreparedGenerateRequest],
     seq_lens: &[usize],
     token_offset: usize,

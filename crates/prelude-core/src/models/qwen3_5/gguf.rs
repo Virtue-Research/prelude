@@ -839,6 +839,16 @@ impl Qwen3_5GgufModel {
     }
 }
 
+impl crate::models::KvCacheModel for Qwen3_5GgufModel {
+    fn forward_with_cache(
+        &mut self,
+        input_ids: &Tensor,
+        position_offset: usize,
+    ) -> Result<Tensor> {
+        Qwen3_5GgufModel::forward_with_cache(self, input_ids, position_offset)
+    }
+}
+
 impl crate::models::ModelForward for Qwen3_5GgufModel {
     fn forward(
         &mut self,
@@ -848,20 +858,12 @@ impl crate::models::ModelForward for Qwen3_5GgufModel {
         candle_core::bail!("GGUF model does not support varlen forward")
     }
 
-    fn forward_with_cache(
-        &mut self,
-        input_ids: &Tensor,
-        position_offset: usize,
-    ) -> Result<Tensor> {
-        Qwen3_5GgufModel::forward_with_cache(self, input_ids, position_offset)
-    }
-
-    fn supports_kv_cache(&self) -> bool {
-        true
-    }
-
     fn clear_kv_cache(&mut self) {
         self.clear_kv_cache();
+    }
+
+    fn as_kv_cache_model(&mut self) -> Option<&mut dyn crate::models::KvCacheModel> {
+        Some(self)
     }
 }
 
@@ -1071,15 +1073,7 @@ pub struct LlamaGgufConfig {
 }
 
 #[cfg(feature = "ggml-quants")]
-impl crate::models::ModelForward for LlamaGgufModel {
-    fn forward(
-        &mut self,
-        _packed_input: &Tensor,
-        _ctx: &mut crate::models::common::BatchAttnContext,
-    ) -> Result<Tensor> {
-        candle_core::bail!("llama.cpp GGUF model does not support varlen forward")
-    }
-
+impl crate::models::KvCacheModel for LlamaGgufModel {
     fn forward_with_cache(
         &mut self,
         input_ids: &Tensor,
@@ -1106,9 +1100,16 @@ impl crate::models::ModelForward for LlamaGgufModel {
             Tensor::from_vec(data, (seq_len, self.n_vocab), &candle_core::Device::Cpu)
         }
     }
+}
 
-    fn supports_kv_cache(&self) -> bool {
-        true
+#[cfg(feature = "ggml-quants")]
+impl crate::models::ModelForward for LlamaGgufModel {
+    fn forward(
+        &mut self,
+        _packed_input: &Tensor,
+        _ctx: &mut crate::models::common::BatchAttnContext,
+    ) -> Result<Tensor> {
+        candle_core::bail!("llama.cpp GGUF model does not support varlen forward")
     }
 
     fn generate_direct(
@@ -1123,5 +1124,9 @@ impl crate::models::ModelForward for LlamaGgufModel {
 
     fn clear_kv_cache(&mut self) {
         self.ctx.clear_kv_cache();
+    }
+
+    fn as_kv_cache_model(&mut self) -> Option<&mut dyn crate::models::KvCacheModel> {
+        Some(self)
     }
 }

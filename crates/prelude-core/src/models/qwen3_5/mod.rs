@@ -22,8 +22,8 @@ use crate::loading::var_builder::VarBuilder;
 use crate::models::common::varlen_attention;
 
 use crate::models::common::{
-    fast_rms_norm, last_token_select, BatchAttnContext,
-    LayerAttnContext, Linear, RmsNorm,
+    fast_add, fast_rms_norm, last_token_select, BatchAttnContext,
+    LayerAttnContext, Linear, RmsNorm, TransformerBlock,
 };
 use crate::models::resolve_or_warn;
 
@@ -1127,13 +1127,9 @@ enum TokenMixer {
 }
 
 struct Qwen3_5DecoderLayer {
-    input_layernorm: RmsNorm,
     token_mixer: TokenMixer,
-    post_attention_layernorm: RmsNorm,
     mlp: MlpVariant,
-    input_ln_weight: Tensor,
-    post_attn_ln_weight: Tensor,
-    rms_norm_eps: f64,
+    block: TransformerBlock,
 }
 
 /// Free function to run DeltaNet on packed varlen input (avoids borrow conflicts).
@@ -1200,14 +1196,13 @@ impl Qwen3_5DecoderLayer {
         vb: VarBuilder,
     ) -> Result<Self> {
         // Qwen3.5 uses residual RMSNorm: output = norm(x) * (1 + weight)
-        let input_ln_weight = (vb.pp("input_layernorm").get(cfg.hidden_size, "weight")? + 1.0)?;
-        let input_layernorm = RmsNorm::from_weight(input_ln_weight.clone(), cfg.rms_norm_eps);
-        let post_attn_ln_weight = (vb
+        let ln1_weight = (vb.pp("input_layernorm").get(cfg.hidden_size, "weight")? + 1.0)?;
+        let ln1 = RmsNorm::from_weight(ln1_weight.clone(), cfg.rms_norm_eps);
+        let ln2_weight = (vb
             .pp("post_attention_layernorm")
             .get(cfg.hidden_size, "weight")?
             + 1.0)?;
-        let post_attention_layernorm =
-            RmsNorm::from_weight(post_attn_ln_weight.clone(), cfg.rms_norm_eps);
+        let ln2 = RmsNorm::from_weight(ln2_weight.clone(), cfg.rms_norm_eps);
 
         let token_mixer = match cfg.layer_type(layer_idx) {
             LayerType::LinearAttention => {
@@ -1229,13 +1224,9 @@ impl Qwen3_5DecoderLayer {
         };
 
         Ok(Self {
-            input_layernorm,
             token_mixer,
-            post_attention_layernorm,
             mlp,
-            input_ln_weight,
-            post_attn_ln_weight,
-            rms_norm_eps: cfg.rms_norm_eps,
+            block: TransformerBlock::new(ln1, ln1_weight, ln2, ln2_weight, cfg.rms_norm_eps, layer_idx),
         })
     }
 
@@ -1246,25 +1237,14 @@ impl Qwen3_5DecoderLayer {
         ctx: &LayerAttnContext,
         seq_lens: &[usize],
     ) -> Result<Tensor> {
-        let h = fast_rms_norm(
-            x,
-            &self.input_layernorm,
-            &self.input_ln_weight,
-            self.rms_norm_eps,
-        )?;
-        let h = match &mut self.token_mixer {
-            TokenMixer::FullAttention(attn) => attn.forward(&h, ctx)?,
-            TokenMixer::LinearAttention(gdn) => deltanet_varlen(gdn, &h, seq_lens)?,
-        };
-        let x = (x + h)?;
-        let h2 = fast_rms_norm(
-            &x,
-            &self.post_attention_layernorm,
-            &self.post_attn_ln_weight,
-            self.rms_norm_eps,
-        )?;
-        let h2 = self.mlp.forward(&h2)?;
-        (x + h2).map(|t| t)
+        let Self { block, token_mixer, mlp, .. } = self;
+        block.forward(x,
+            |h| match token_mixer {
+                TokenMixer::FullAttention(attn) => attn.forward(h, ctx),
+                TokenMixer::LinearAttention(gdn) => deltanet_varlen(gdn, h, seq_lens),
+            },
+            |x_res, h2| fast_add(x_res, &mlp.forward(h2)?),
+        )
     }
 
     /// Varlen prefill for DeltaNet layers using pool — scatters state per-sequence.
@@ -1281,29 +1261,18 @@ impl Qwen3_5DecoderLayer {
         slot_ids: &[u32],
         dn_layer_idx: usize,
     ) -> Result<Tensor> {
-        let h = fast_rms_norm(
-            x,
-            &self.input_layernorm,
-            &self.input_ln_weight,
-            self.rms_norm_eps,
-        )?;
-        let h = match &mut self.token_mixer {
-            TokenMixer::LinearAttention(gdn) => {
-                deltanet_varlen_pooled(gdn, &h, seq_lens, pool, slot_ids, dn_layer_idx)?
-            }
-            TokenMixer::FullAttention(_) => {
-                candle_core::bail!("forward_with_paged_prefix_pooled called on FullAttention layer")
-            }
-        };
-        let x = (x + h)?;
-        let h2 = fast_rms_norm(
-            &x,
-            &self.post_attention_layernorm,
-            &self.post_attn_ln_weight,
-            self.rms_norm_eps,
-        )?;
-        let h2 = self.mlp.forward(&h2)?;
-        (x + h2).map(|t| t)
+        let Self { block, token_mixer, mlp, .. } = self;
+        block.forward(x,
+            |h| match token_mixer {
+                TokenMixer::LinearAttention(gdn) => {
+                    deltanet_varlen_pooled(gdn, h, seq_lens, pool, slot_ids, dn_layer_idx)
+                }
+                TokenMixer::FullAttention(_) => {
+                    candle_core::bail!("forward_with_paged_prefix_pooled called on FullAttention layer")
+                }
+            },
+            |x_res, h2| fast_add(x_res, &mlp.forward(h2)?),
+        )
     }
 
     fn clear_cache(&mut self) {
@@ -1467,15 +1436,7 @@ impl Qwen3_5ForCausalLM {
     }
 }
 
-impl crate::models::ModelForward for Qwen3_5ForCausalLM {
-    fn forward(
-        &mut self,
-        packed_input: &Tensor,
-        ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
-        self.forward(packed_input, ctx)
-    }
-
+impl crate::models::LogitsSplitModel for Qwen3_5ForCausalLM {
     fn forward_hidden_states(
         &mut self,
         packed_input: &Tensor,
@@ -1487,8 +1448,26 @@ impl crate::models::ModelForward for Qwen3_5ForCausalLM {
     fn compute_logits(&self, hidden: &Tensor) -> candle_core::Result<Tensor> {
         hidden.apply(&self.lm_head)
     }
+}
+
+impl crate::models::ModelForward for Qwen3_5ForCausalLM {
+    fn forward(
+        &mut self,
+        packed_input: &Tensor,
+        ctx: &mut BatchAttnContext,
+    ) -> candle_core::Result<Tensor> {
+        self.forward(packed_input, ctx)
+    }
 
     fn clear_kv_cache(&mut self) {
         self.clear_kv_cache();
+    }
+
+    fn as_logits_model(&self) -> Option<&dyn crate::models::LogitsSplitModel> {
+        Some(self)
+    }
+
+    fn as_logits_model_mut(&mut self) -> Option<&mut dyn crate::models::LogitsSplitModel> {
+        Some(self)
     }
 }

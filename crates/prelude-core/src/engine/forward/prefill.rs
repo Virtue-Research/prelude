@@ -258,10 +258,12 @@ impl Engine {
                             #[cfg(feature = "flashinfer")]
                             crate::models::common::fi_begin_forward();
                             let result = if need_hidden_states {
-                                let hidden = model.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
+                                let lm = model.as_logits_model_mut()
+                                    .expect("hidden states requested but model doesn't support LogitsSplitModel");
+                                let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
                                 let last = crate::models::common::last_token_select(&hidden, &seq_lens)
                                     .map_err(candle_err)?;
-                                let logits = model.compute_logits(&last).map_err(candle_err)?
+                                let logits = lm.compute_logits(&last).map_err(candle_err)?
                                     .unsqueeze(1).map_err(candle_err)?;
                                 Ok((logits, Some(hidden)))
                             } else {
@@ -286,10 +288,12 @@ impl Engine {
                     #[cfg(feature = "flashinfer")]
                     crate::models::common::fi_begin_forward();
                     let result = if need_hidden_states {
-                        let hidden = model.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
+                        let lm = model.as_logits_model_mut()
+                            .expect("hidden states requested but model doesn't support LogitsSplitModel");
+                        let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
                         let last = crate::models::common::last_token_select(&hidden, &seq_lens)
                             .map_err(candle_err)?;
-                        let logits = model.compute_logits(&last).map_err(candle_err)?
+                        let logits = lm.compute_logits(&last).map_err(candle_err)?
                             .unsqueeze(1).map_err(candle_err)?;
                         Ok((logits, Some(hidden)))
                     } else {

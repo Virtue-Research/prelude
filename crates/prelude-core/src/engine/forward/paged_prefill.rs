@@ -162,16 +162,18 @@ impl Engine {
         // When prompt logprobs needed: get hidden states, apply compute_logits in chunks.
         // This avoids materializing the full (total_tokens, vocab_size) logits tensor.
         let (logits, prompt_logprobs_cpu) = if needs_prompt_logprobs {
-            let hidden = model.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
+            let lm = model.as_logits_model_mut()
+                .expect("prompt logprobs requested but model doesn't support LogitsSplitModel");
+            let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
             let last_hidden = crate::models::common::last_token_select(&hidden, &q_seq_lens)
                 .map_err(candle_err)?;
-            let last_logits = model.compute_logits(&last_hidden).map_err(candle_err)?
+            let last_logits = lm.compute_logits(&last_hidden).map_err(candle_err)?
                 .unsqueeze(1).map_err(candle_err)?;
 
             // Chunked prompt logprobs extraction while model lock is still held.
             // Uses the shared extract function (avoids duplicating chunk logic).
             let logprobs_cpu = super::generate::extract_prompt_logprobs_from_hidden_offset(
-                &hidden, &**model, items, &q_seq_lens, cached_len,
+                &hidden, lm, items, &q_seq_lens, cached_len,
             )?;
             drop(hidden);
             (last_logits, Some(logprobs_cpu))
