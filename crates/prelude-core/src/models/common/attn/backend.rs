@@ -62,6 +62,10 @@ pub(crate) trait AttentionBackend: Send + Sync {
         key_cache: &Tensor, value_cache: &Tensor,
         slot_mapping: &Tensor,
     ) -> Result<()>;
+
+    /// Whether this backend supports paged attention for prefill (Q > 1).
+    /// FA2 only supports paged decode (Q=1); all other backends support both.
+    fn supports_paged_prefill(&self) -> bool { true }
 }
 
 // ── FA4 backend ──────────────────────────────────────────────────────
@@ -364,6 +368,8 @@ impl AttentionBackend for FlashAttnV2Backend {
     ) -> Result<()> {
         super::paged::reshape_and_cache_v1(key, value, key_cache, value_cache, slot_mapping)
     }
+
+    fn supports_paged_prefill(&self) -> bool { false }
 }
 
 // ── CPU backend ──────────────────────────────────────────────────────

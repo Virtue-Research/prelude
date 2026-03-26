@@ -10,6 +10,7 @@ use crate::nn_ops::{Activation, CandleLinear, Embedding, Qwen3Config};
 use crate::models::common::{
     fast_add, fast_rms_norm, fused_add_rmsnorm, last_token_select,
     BatchAttnContext, LayerAttnContext, GatedMlp, RotaryEmbedding, Linear, RmsNorm,
+    TransformerBlock,
 };
 
 // Model-specific attention (still lives in qwen3)
@@ -347,11 +348,7 @@ impl MoeFeedForward {
 struct MoeDecoderLayer {
     self_attn: Qwen3Attention,
     feed_forward: MoeFeedForward,
-    ln1: RmsNorm,
-    ln1_weight: Tensor,
-    ln2: RmsNorm,
-    ln2_weight: Tensor,
-    rms_norm_eps: f64,
+    block: TransformerBlock,
 }
 
 impl MoeDecoderLayer {
@@ -380,24 +377,21 @@ impl MoeDecoderLayer {
 
         let ln1_weight = vb.pp("input_layernorm").get(cfg.hidden_size, "weight")?;
         let ln2_weight = vb.pp("post_attention_layernorm").get(cfg.hidden_size, "weight")?;
+        let ln1 = RmsNorm::from_weight(ln1_weight.clone(), cfg.rms_norm_eps);
+        let ln2 = RmsNorm::from_weight(ln2_weight.clone(), cfg.rms_norm_eps);
 
         Ok(Self {
             self_attn,
             feed_forward,
-            ln1: RmsNorm::from_weight(ln1_weight.clone(), cfg.rms_norm_eps),
-            ln1_weight,
-            ln2: RmsNorm::from_weight(ln2_weight.clone(), cfg.rms_norm_eps),
-            ln2_weight,
-            rms_norm_eps: cfg.rms_norm_eps,
+            block: TransformerBlock::new(ln1, ln1_weight, ln2, ln2_weight, cfg.rms_norm_eps, layer_idx),
         })
     }
 
     fn forward(&self, x: &Tensor, ctx: &LayerAttnContext) -> Result<Tensor> {
-        let h = fast_rms_norm(x, &self.ln1, &self.ln1_weight, self.rms_norm_eps)?;
-        let h = self.self_attn.forward(&h, ctx)?;
-        let (x, h2) = fused_add_rmsnorm(x, &h, &self.ln2, &self.ln2_weight, self.rms_norm_eps)?;
-        let h2 = self.feed_forward.forward_2d(&h2)?;
-        fast_add(&x, &h2)
+        self.block.forward(x,
+            |h| self.self_attn.forward(h, ctx),
+            |x_res, h2| fast_add(x_res, &self.feed_forward.forward_2d(h2)?),
+        )
     }
 }
 

@@ -13,8 +13,8 @@ use serde::Deserialize;
 use crate::models::common::varlen_attention;
 use crate::models::common::{BatchAttnContext, LayerAttnContext};
 use crate::models::common::{
-    GatedMlp, Linear, RmsNorm, RotaryEmbedding, fast_add, fast_rms_norm,
-    fused_add_rmsnorm, last_token_select, qknorm_rope_varlen,
+    GatedMlp, Linear, RmsNorm, RotaryEmbedding, TransformerBlock,
+    fast_add, fast_rms_norm, fused_add_rmsnorm, last_token_select, qknorm_rope_varlen,
 };
 #[cfg(feature = "cuda")]
 use crate::models::common::debug_disable_fused_qknorm_rope;
@@ -693,12 +693,7 @@ impl Qwen3Attention {
 struct DecoderLayer {
     self_attn: Qwen3Attention,
     mlp: GatedMlp,
-    ln1: RmsNorm,
-    ln1_weight: Tensor,
-    ln2: RmsNorm,
-    ln2_weight: Tensor,
-    rms_norm_eps: f64,
-    layer_idx: usize,
+    block: TransformerBlock,
 }
 
 impl DecoderLayer {
@@ -721,94 +716,60 @@ impl DecoderLayer {
         Ok(Self {
             self_attn,
             mlp,
-            ln1,
-            ln1_weight,
-            ln2,
-            ln2_weight,
-            rms_norm_eps: cfg.rms_norm_eps,
-            layer_idx,
+            block: TransformerBlock::new(ln1, ln1_weight, ln2, ln2_weight, cfg.rms_norm_eps, layer_idx),
         })
     }
 
     #[inline]
-    fn residual_mlp(&self, x: &Tensor, h: &Tensor) -> Result<Tensor> {
-        let (x_res, h2) = fused_add_rmsnorm(x, h, &self.ln2, &self.ln2_weight, self.rms_norm_eps)?;
-
-        // Raw MLP path: eliminate Tensor allocations in MLP forward
+    fn residual_mlp(&self, x_res: &Tensor, h2: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "onednn")]
         if h2.device().is_cpu() && h2.dtype() == candle_core::DType::BF16 {
-            if let Some(_) = self.mlp.gate_up_brgemm_weight() {
-                return self.residual_mlp_raw(&x_res, &h2);
+            if self.mlp.gate_up_brgemm_weight().is_some() {
+                return self.residual_mlp_raw(x_res, h2);
             }
         }
-
         #[cfg(feature = "onednn")]
         if h2.device().is_cpu() && h2.dtype() == candle_core::DType::F32 {
-            if let Some(_) = self.mlp.gate_up_f32_packed_weight() {
-                return self.residual_mlp_raw_f32(&x_res, &h2);
+            if self.mlp.gate_up_f32_packed_weight().is_some() {
+                return self.residual_mlp_raw_f32(x_res, h2);
             }
         }
-
-        fast_add(&x_res, &self.mlp.forward(&h2)?)
+        fast_add(x_res, &self.mlp.forward(h2)?)
     }
 
-    /// Raw MLP: forward_raw + in-place residual add. Zero Tensor allocations.
     #[cfg(feature = "onednn")]
     fn residual_mlp_raw(&self, x_res: &Tensor, h2: &Tensor) -> Result<Tensor> {
         use crate::models::common::raw_cpu;
         use crate::ops::cpu::buf_tensor::CpuTensor;
-
         let h2_buf = CpuTensor::from_candle(h2)?;
         let needed = h2_buf.len();
-
-        // MLP forward + residual add via shared raw infrastructure
         raw_cpu::with_scratch(|scratch| {
             raw_cpu::ensure_len(&mut scratch.mlp_out, needed);
-            unsafe {
-                self.mlp.forward_raw(
-                    &h2_buf,
-                    scratch.mlp_out.as_mut_ptr(),
-                );
-            }
-
-            // In-place add: x_res += mlp_out
+            unsafe { self.mlp.forward_raw(&h2_buf, scratch.mlp_out.as_mut_ptr()) }
             crate::ops::cpu::inplace_add_bf16(x_res, &scratch.mlp_out[..needed]).unwrap();
         });
-
         Ok(x_res.clone())
     }
 
-    /// Raw F32 MLP: forward_raw_f32 + in-place residual add. Zero Tensor allocations.
     #[cfg(feature = "onednn")]
     fn residual_mlp_raw_f32(&self, x_res: &Tensor, h2: &Tensor) -> Result<Tensor> {
         use crate::models::common::raw_cpu;
-
         let h2_slice = crate::ops::cpu::tensor_as_f32_slice(h2)?;
-        let total = h2.dim(0)?;
-        let hidden_size = h2.dim(1)?;
+        let (total, hidden_size) = (h2.dim(0)?, h2.dim(1)?);
         let needed = total * hidden_size;
-
         raw_cpu::with_scratch_f32(|scratch| {
             raw_cpu::ensure_len_f32(&mut scratch.mlp_out, needed);
-            unsafe {
-                self.mlp.forward_raw_f32(
-                    h2_slice.as_ptr(),
-                    total,
-                    hidden_size,
-                    scratch.mlp_out.as_mut_ptr(),
-                );
-            }
-
+            unsafe { self.mlp.forward_raw_f32(h2_slice.as_ptr(), total, hidden_size, scratch.mlp_out.as_mut_ptr()) }
             crate::ops::cpu::inplace_add_f32(x_res, &scratch.mlp_out[..needed]).unwrap();
         });
-
         Ok(x_res.clone())
     }
 
     fn forward_with_cache(&mut self, x: &Tensor, position_offset: usize) -> Result<Tensor> {
-        let h = fast_rms_norm(x, &self.ln1, &self.ln1_weight, self.rms_norm_eps)?;
+        let h = fast_rms_norm(x, &self.block.ln1, &self.block.ln1_weight, self.block.rms_norm_eps)?;
         let h = self.self_attn.forward_with_cache(&h, position_offset)?;
-        self.residual_mlp(x, &h)
+        let (x_res, h2) = fused_add_rmsnorm(x, &h, &self.block.ln2, &self.block.ln2_weight, self.block.rms_norm_eps)?;
+        self.residual_mlp(&x_res, &h2)
     }
 
     fn reset_kv_cache(&mut self) {
@@ -816,64 +777,10 @@ impl DecoderLayer {
     }
 
     fn forward(&self, x: &Tensor, ctx: &LayerAttnContext) -> Result<Tensor> {
-        let profile = crate::config::global_runtime()
-            .map(|r| r.profile)
-            .unwrap_or(false);
-        if !profile {
-            let h = fast_rms_norm(x, &self.ln1, &self.ln1_weight, self.rms_norm_eps)?;
-            let h = self.self_attn.forward(&h, ctx)?;
-            return self.residual_mlp(x, &h);
-        }
-
-        // Profiled path: time each component separately (matches SGLang's breakdown)
-        let t = std::time::Instant::now();
-        let h = fast_rms_norm(x, &self.ln1, &self.ln1_weight, self.rms_norm_eps)?;
-        let norm1_ms = t.elapsed().as_secs_f32() * 1000.0;
-
-        let t = std::time::Instant::now();
-        let h = self.self_attn.forward(&h, ctx)?;
-        let attn_ms = t.elapsed().as_secs_f32() * 1000.0;
-
-        // Inline residual_mlp to split norm2 and mlp timing
-        let t = std::time::Instant::now();
-        let (x_res, h2) = fused_add_rmsnorm(
-            x,
-            &h,
-            &self.ln2,
-            &self.ln2_weight,
-            self.rms_norm_eps,
-        )?;
-        let norm2_ms = t.elapsed().as_secs_f32() * 1000.0;
-
-        let t = std::time::Instant::now();
-        #[cfg(feature = "onednn")]
-        let result = if h2.device().is_cpu() && h2.dtype() == candle_core::DType::BF16
-            && self.mlp.gate_up_brgemm_weight().is_some()
-        {
-            self.residual_mlp_raw(&x_res, &h2)?
-        } else if h2.device().is_cpu() && h2.dtype() == candle_core::DType::F32
-            && self.mlp.gate_up_f32_packed_weight().is_some()
-        {
-            self.residual_mlp_raw_f32(&x_res, &h2)?
-        } else {
-            fast_add(&x_res, &self.mlp.forward(&h2)?)?
-        };
-        #[cfg(not(feature = "onednn"))]
-        let result = fast_add(&x_res, &self.mlp.forward(&h2)?)?;
-        let mlp_ms = t.elapsed().as_secs_f32() * 1000.0;
-
-        let total = norm1_ms + attn_ms + norm2_ms + mlp_ms;
-        tracing::info!(
-            layer = self.layer_idx,
-            norm1 = format!("{norm1_ms:.2}"),
-            attn = format!("{attn_ms:.2}"),
-            norm2 = format!("{norm2_ms:.2}"),
-            mlp = format!("{mlp_ms:.2}"),
-            total = format!("{total:.2}"),
-            "layer_profile"
-        );
-
-        Ok(result)
+        self.block.forward(x,
+            |h| self.self_attn.forward(h, ctx),
+            |x_res, h2| self.residual_mlp(x_res, h2),
+        )
     }
 }
 
