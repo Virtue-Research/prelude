@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use candle_core::{DType, Device, Result, Tensor, D};
-use candle_nn::VarBuilder;
+use prelude_core::loading::var_builder::VarBuilder;
 use candle_transformers::models::qwen3::{
     Config as Qwen3Config, ModelForCausalLM as BaselineQwen3,
 };

@@ -4,7 +4,7 @@
 // RmsNorm: AVX-512 on CPU, candle on GPU.
 
 use candle_core::{Module, Result, Tensor};
-use candle_nn::VarBuilder;
+use crate::loading::var_builder::VarBuilder;
 
 // ── Linear ──────────────────────────────────────────────────────────────
 
@@ -27,12 +27,13 @@ enum LinearInner {
 impl Linear {
     /// Load from VarBuilder (reads "weight" and optionally "bias" tensors).
     pub fn load(vb: VarBuilder, in_dim: usize, out_dim: usize, bias: bool) -> Result<Self> {
-        let raw = if bias {
-            candle_nn::linear(in_dim, out_dim, vb)?
+        let weight = vb.get((out_dim, in_dim), "weight")?;
+        let bias = if bias {
+            Some(vb.get(out_dim, "bias")?)
         } else {
-            candle_nn::linear_no_bias(in_dim, out_dim, vb)?
+            None
         };
-        Self::from_candle(raw)
+        Self::from_candle(candle_nn::Linear::new(weight, bias))
     }
 
     /// Construct from a raw weight tensor (e.g., for tied embeddings / lm_head).

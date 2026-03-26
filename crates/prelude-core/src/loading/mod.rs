@@ -2,14 +2,15 @@
 //!
 //! All factory functions return a fully assembled `Engine`.
 
+pub mod var_builder;
 pub(crate) mod weights;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use candle_core::{DType, Device};
-use candle_nn::VarBuilder;
+use candle_core::{DType, Device, Tensor};
+use crate::loading::var_builder::VarBuilder;
 use fastokens::Tokenizer;
 
 use crate::cache::manager::CacheManager;

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device};
-use candle_nn::VarBuilder;
+use crate::loading::var_builder::VarBuilder;
 
 use crate::engine::{candle_err, EngineError};
 

@@ -1,4 +1,4 @@
-use candle_nn::VarBuilder;
+use crate::loading::var_builder::VarBuilder;
 use candle_transformers::models::qwen3::Config as Qwen3Config;
 
 use super::{

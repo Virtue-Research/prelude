@@ -1,5 +1,5 @@
 use candle_core::Device;
-use candle_nn::VarBuilder;
+use crate::loading::var_builder::VarBuilder;
 use serde::de::DeserializeOwned;
 
 use crate::cache::deltanet_pool::DeltaNetPoolConfig;

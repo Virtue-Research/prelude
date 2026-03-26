@@ -3,7 +3,7 @@
 // Used by Qwen3, Qwen3-MoE (dense layers), and other architectures.
 
 use candle_core::{DType, Module, Result, Tensor};
-use candle_nn::VarBuilder;
+use crate::loading::var_builder::VarBuilder;
 use candle_transformers::models::qwen3::Config as Qwen3Config;
 
 use super::linear::Linear;

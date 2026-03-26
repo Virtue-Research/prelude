@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use candle_core::{DType, Module, Result, Tensor};
-use candle_nn::{Embedding, VarBuilder};
+use candle_nn::Embedding;
+use crate::loading::var_builder::VarBuilder;
 use candle_transformers::models::qwen3::Config as Qwen3Config;
 use serde::Deserialize;
 
@@ -930,7 +931,10 @@ impl Model {
                 vb.pp(format!("{}.norm", prefix)),
             )
         };
-        let embed_tokens = candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, embed_vb)?;
+        let embed_tokens = {
+            let weight = embed_vb.get((cfg.vocab_size, cfg.hidden_size), "weight")?;
+            candle_nn::Embedding::new(weight, cfg.hidden_size)
+        };
         let rotary = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb.device())?);
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -1220,7 +1224,7 @@ impl crate::models::ModelForward for Qwen3ForEmbedding {
 mod tests {
     use super::*;
     use candle_core::Device;
-    use candle_nn::VarBuilder;
+    use crate::loading::var_builder::VarBuilder;
     use crate::models::common::BatchAttnContext;
 
     fn tiny_config() -> Qwen3Config {

@@ -2,7 +2,7 @@ use super::{
     Gemma3ClassifierConfig, Gemma3Config, Gemma3EmbeddingDenseLayer, Gemma3ForCausalLM,
     Gemma3ForEmbedding, Gemma3ForSequenceClassification,
 };
-use candle_nn::VarBuilder;
+use crate::loading::var_builder::VarBuilder;
 use crate::engine::EngineError;
 use crate::engine::{CommonModelConfig, EmbeddingSemantics, RuntimeCaps, TaskKind, WeightsBackend};
 use crate::models::registry::{
@@ -255,7 +255,7 @@ mod tests {
         EmbeddingDenseLayerSpec, EmbeddingNormalization, EmbeddingPooling, EmbeddingSemantics,
     };
     use crate::models::gemma3::meta::Gemma3ModelBuildContext;
-    use candle_nn::VarBuilder;
+    use crate::loading::var_builder::VarBuilder;
 
     #[test]
     fn gemma3_embedding_defaults_to_last_token_without_modules_metadata() {

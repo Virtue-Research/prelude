@@ -14,7 +14,8 @@
 pub(crate) mod meta;
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::{Embedding, VarBuilder};
+use candle_nn::Embedding;
+use crate::loading::var_builder::VarBuilder;
 
 use crate::models::common::varlen_attention;
 
@@ -751,7 +752,11 @@ struct Qwen3NextSparseMoeBlock {
 
 impl Qwen3NextSparseMoeBlock {
     fn new(cfg: &Qwen3NextConfig, vb: VarBuilder) -> Result<Self> {
-        let gate = candle_nn::linear_no_bias(cfg.hidden_size, cfg.num_experts, vb.pp("gate"))?;
+        let gate = {
+            let gvb = vb.pp("gate");
+            let w = gvb.get((cfg.num_experts, cfg.hidden_size), "weight")?;
+            candle_nn::Linear::new(w, None)
+        };
 
         let mut experts = Vec::with_capacity(cfg.num_experts);
         let vb_e = vb.pp("experts");
@@ -768,7 +773,11 @@ impl Qwen3NextSparseMoeBlock {
             cfg.shared_expert_intermediate_size,
             vb.pp("shared_expert"),
         )?;
-        let shared_expert_gate = candle_nn::linear_no_bias(cfg.hidden_size, 1, vb.pp("shared_expert_gate"))?;
+        let shared_expert_gate = {
+            let gvb = vb.pp("shared_expert_gate");
+            let w = gvb.get((1, cfg.hidden_size), "weight")?;
+            candle_nn::Linear::new(w, None)
+        };
 
         // Stack expert weights for fused GEMM
         #[cfg(feature = "cuda")]
@@ -1168,8 +1177,11 @@ struct Qwen3NextModel {
 impl Qwen3NextModel {
     fn new(cfg: &Qwen3NextConfig, vb: VarBuilder) -> Result<Self> {
         let vb_m = vb.pp("model");
-        let embed_tokens =
-            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+        let embed_tokens = {
+            let emb_vb = vb_m.pp("embed_tokens");
+            let weight = emb_vb.get((cfg.vocab_size, cfg.hidden_size), "weight")?;
+            candle_nn::Embedding::new(weight, cfg.hidden_size)
+        };
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");

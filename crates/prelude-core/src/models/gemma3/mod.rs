@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{Activation, Embedding, VarBuilder};
+use candle_nn::{Activation, Embedding};
+use crate::loading::var_builder::VarBuilder;
 use serde::Deserialize;
 
 use crate::models::common::{
@@ -401,8 +402,11 @@ struct Gemma3Model {
 
 impl Gemma3Model {
     fn new(cfg: &Gemma3Config, vb: VarBuilder) -> Result<Self> {
-        let embed_tokens =
-            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
+        let embed_tokens = {
+            let emb_vb = vb.pp("embed_tokens");
+            let weight = emb_vb.get((cfg.vocab_size, cfg.hidden_size), "weight")?;
+            candle_nn::Embedding::new(weight, cfg.hidden_size)
+        };
 
         // Create global rotary embedding (full context)
         let global_rotary = Arc::new(Gemma3RotaryEmbedding::new(

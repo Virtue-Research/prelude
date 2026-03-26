@@ -3,7 +3,8 @@ pub(crate) mod meta;
 use std::sync::Arc;
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::{Activation, Embedding, VarBuilder};
+use candle_nn::{Activation, Embedding};
+use crate::loading::var_builder::VarBuilder;
 use candle_transformers::models::qwen3::Config as Qwen3Config;
 
 // Shared layer primitives (extracted from qwen3 into reusable modules)
@@ -119,7 +120,11 @@ struct Qwen3SparseMoeBlock {
 
 impl Qwen3SparseMoeBlock {
     fn new(cfg: &Qwen3MoeConfig, vb: VarBuilder) -> Result<Self> {
-        let gate = candle_nn::linear_no_bias(cfg.hidden_size, cfg.num_experts, vb.pp("gate"))?;
+        let gate = {
+            let gvb = vb.pp("gate");
+            let w = gvb.get((cfg.num_experts, cfg.hidden_size), "weight")?;
+            candle_nn::Linear::new(w, None)
+        };
         let mut experts = Vec::with_capacity(cfg.num_experts);
         let vb_e = vb.pp("experts");
         for idx in 0..cfg.num_experts {
@@ -411,8 +416,11 @@ struct MoeModel {
 impl MoeModel {
     fn new(cfg: &Qwen3MoeConfig, vb: VarBuilder) -> Result<Self> {
         let dense_cfg = cfg.to_dense_config();
-        let embed_tokens =
-            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
+        let embed_tokens = {
+            let emb_vb = vb.pp("model.embed_tokens");
+            let weight = emb_vb.get((cfg.vocab_size, cfg.hidden_size), "weight")?;
+            candle_nn::Embedding::new(weight, cfg.hidden_size)
+        };
         let rotary = Arc::new(RotaryEmbedding::new(
             vb.dtype(),
             &dense_cfg,

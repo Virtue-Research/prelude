@@ -12,7 +12,7 @@ pub(crate) use std::sync::Mutex;
 pub(crate) use std::time::Instant;
 
 pub(crate) use candle_core::{DType, Device, Tensor};
-pub(crate) use candle_nn::VarBuilder;
+pub(crate) use crate::loading::var_builder::VarBuilder;
 pub(crate) use candle_transformers::generation::{LogitsProcessor, Sampling};
 pub(crate) use fastokens::Tokenizer;
 pub(crate) use tracing::info;

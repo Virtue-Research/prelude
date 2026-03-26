@@ -1,4 +1,4 @@
-use candle_nn::VarBuilder;
+use crate::loading::var_builder::VarBuilder;
 
 use super::{Qwen3NextConfig, Qwen3NextForCausalLM};
 use crate::cache::deltanet_pool::DeltaNetPoolConfig;

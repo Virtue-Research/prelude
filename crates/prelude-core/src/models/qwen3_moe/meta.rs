@@ -1,4 +1,4 @@
-use candle_nn::VarBuilder;
+use crate::loading::var_builder::VarBuilder;
 
 use super::{Qwen3MoeConfig, Qwen3MoeModelForCausalLM};
 use crate::engine::EngineError;

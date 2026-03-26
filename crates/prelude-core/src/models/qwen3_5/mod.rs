@@ -16,7 +16,8 @@ pub mod gguf;
 pub(crate) mod meta;
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::{Embedding, VarBuilder};
+use candle_nn::Embedding;
+use crate::loading::var_builder::VarBuilder;
 
 use crate::models::common::varlen_attention;
 
@@ -904,7 +905,11 @@ impl Qwen3_5SparseMoeBlock {
         let num_experts_per_tok = cfg.num_experts_per_tok.unwrap();
         let moe_intermediate_size = cfg.moe_intermediate_size.unwrap();
 
-        let gate = candle_nn::linear_no_bias(cfg.hidden_size, num_experts, vb.pp("gate"))?;
+        let gate = {
+            let gvb = vb.pp("gate");
+            let w = gvb.get((num_experts, cfg.hidden_size), "weight")?;
+            candle_nn::Linear::new(w, None)
+        };
 
         // Load fused expert weights: [num_experts, 2*inter, hidden] and [num_experts, hidden, inter]
         let vb_experts = vb.pp("experts");
@@ -932,11 +937,11 @@ impl Qwen3_5SparseMoeBlock {
         };
 
         let shared_expert_gate = if shared_expert.is_some() {
-            Some(candle_nn::linear_no_bias(
-                cfg.hidden_size,
-                1,
-                vb.pp("shared_expert_gate"),
-            )?)
+            Some({
+                let gvb = vb.pp("shared_expert_gate");
+                let w = gvb.get((1, cfg.hidden_size), "weight")?;
+                candle_nn::Linear::new(w, None)
+            })
         } else {
             None
         };
@@ -1327,8 +1332,11 @@ impl Qwen3_5Model {
         } else {
             vb.pp("model")
         };
-        let embed_tokens =
-            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+        let embed_tokens = {
+            let emb_vb = vb_m.pp("embed_tokens");
+            let weight = emb_vb.get((cfg.vocab_size, cfg.hidden_size), "weight")?;
+            candle_nn::Embedding::new(weight, cfg.hidden_size)
+        };
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
