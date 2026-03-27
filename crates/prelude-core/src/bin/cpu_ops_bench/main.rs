@@ -8,12 +8,12 @@
 
 mod attention;
 mod gemm;
+mod quant;
 mod rmsnorm;
 mod rope;
 mod silu_mul;
 
 use candle_core::Result;
-#[cfg(feature = "onednn")]
 use candle_core::{DType, Tensor};
 
 fn main() -> Result<()> {
@@ -34,7 +34,6 @@ fn main() -> Result<()> {
     // Initialize NUMA-pinned rayon pool (must be before any rayon work)
     let numa_report = prelude_core::ops::cpu::numa::init_numa_rayon_pool();
 
-    #[cfg(feature = "onednn")]
     {
         prelude_core::ops::onednn::init();
         // oneDNN uses THREADPOOL runtime (rayon-backed), no OpenMP binding needed
@@ -199,9 +198,37 @@ fn main() -> Result<()> {
         }
     }
 
+    // -- Quantized kernels --
+    if run("quant") {
+        // Precision (llama.cpp style: dot product error vs F32)
+        quant::verify_dot_precision()?;
+
+        // Dot product throughput
+        println!("\n=== Quantized dot product throughput ===");
+        for &k in &[256, 512, 1024, 2048, 4096] {
+            quant::bench_dot(k, 100, 10000)?;
+        }
+
+        // Matmul throughput
+        println!("\n=== Quantized matmul: Q4_0 / Q4_K vs F32 ===");
+        let quant_repeats = 50;
+        let quant_configs: &[(usize, usize, usize)] = &[
+            (1, 1024, 1024),
+            (1, 2048, 2048),
+            (1, 4096, 4096),
+            (4, 2048, 2048),
+            (4, 4096, 4096),
+            (16, 4096, 4096),
+            (1, 1024, 4096),
+            (1, 4096, 1024),
+        ];
+        for &(m, k, n) in quant_configs {
+            quant::bench_matmul(m, k, n, 5, quant_repeats)?;
+        }
+    }
+
     // -- Numerical accuracy --
     if run("accuracy") {
-        #[cfg(feature = "onednn")]
         {
             println!("\n=== Numerical accuracy: GEMM backends vs candle F32 ===");
             println!("  Pass criteria: |a-b| <= atol + rtol*max(|a|,|b|) (atol=5e-2, rtol=5e-2)");
@@ -238,7 +265,6 @@ pub(crate) fn print_result(label: &str, hidden: usize, batch: usize, r: &BenchRe
 // -- Shared accuracy helpers --
 
 /// Accuracy comparison result following SGLang's atol+rtol convention.
-#[cfg(feature = "onednn")]
 pub(crate) struct AccuracyResult {
     pub max_abs_err: f32,
     pub max_rel_err: f32,
@@ -247,7 +273,6 @@ pub(crate) struct AccuracyResult {
 }
 
 /// Compare two tensors using SGLang-style tolerance: |a - b| <= atol + rtol * max(|a|, |b|).
-#[cfg(feature = "onednn")]
 pub(crate) fn compare_tensors(a: &Tensor, b: &Tensor, atol: f32, rtol: f32) -> Result<AccuracyResult> {
     let a_f32 = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
     let b_f32 = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
@@ -268,7 +293,6 @@ pub(crate) fn compare_tensors(a: &Tensor, b: &Tensor, atol: f32, rtol: f32) -> R
     Ok(AccuracyResult { max_abs_err, max_rel_err, fail_count, total: a_f32.len() })
 }
 
-#[cfg(feature = "onednn")]
 pub(crate) fn print_accuracy(label: &str, hidden: usize, batch: usize, r: &AccuracyResult, atol: f32, rtol: f32) {
     let status = if r.fail_count == 0 { "PASS" } else { "FAIL" };
     println!(
