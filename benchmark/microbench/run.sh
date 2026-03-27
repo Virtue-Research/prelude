@@ -21,7 +21,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESULTS_DIR="${SCRIPT_DIR}/results"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-IMAGE="prelude-microbench-dev"
+IMAGE="prelude-dev"
 
 mkdir -p "${RESULTS_DIR}"
 
@@ -59,7 +59,7 @@ if [ "$RUN_OURS" = true ]; then
         # Docker mode
         if ! docker image inspect "${IMAGE}" &>/dev/null; then
             echo ">>> Building ${IMAGE}..."
-            docker build -f "${SCRIPT_DIR}/Dockerfile" -t "${IMAGE}" "${PROJECT_ROOT}"
+            docker build -f "${PROJECT_ROOT}/Dockerfile" -t "${IMAGE}" "${PROJECT_ROOT}"
         fi
 
         DOCKER_ARGS=()
@@ -80,7 +80,7 @@ if [ "$RUN_OURS" = true ]; then
             -v "${RESULTS_DIR}:/results" \
             "${DOCKER_ARGS[@]}" \
             "${IMAGE}" \
-            ${FILTER_ARGS} --json "/results/prelude_${TIMESTAMP}.json"
+            bash -c "cd /workspace && cargo run -p prelude-microbench --release -- ${FILTER_ARGS} --json /results/prelude_${TIMESTAMP}.json"
         echo ">>> Results: ${RESULTS_DIR}/prelude_${TIMESTAMP}.json"
     else
         # Local mode (native performance with target-cpu=native)

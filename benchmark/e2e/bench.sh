@@ -25,9 +25,11 @@
 # Prerequisites:
 #   pip install "genai-bench @ git+https://github.com/rucnyz/genai-bench.git"
 #
-# CPU images (build once if needed):
+# CPU images for vLLM/SGLang (build once if needed):
 #   vLLM:   cd vllm && docker build -f docker/Dockerfile.cpu -t vllm-cpu --target vllm-openai .
 #   SGLang: cd sglang && docker build -f docker/xeon.Dockerfile -t sglang-cpu .
+#
+# Prelude uses the root Dockerfile (prelude-dev image) for both microbench and e2e.
 
 set -euo pipefail
 
@@ -121,10 +123,10 @@ run_benchmark() {
 # ── Engine launchers ──────────────────────────────────────────────────────
 
 start_prelude() {
-    local image="prelude-e2e"
+    local image="prelude-dev"
     if ! docker image inspect "${image}" &>/dev/null; then
         echo ">>> Building ${image} ..."
-        docker build -f "${SCRIPT_DIR}/Dockerfile.prelude" -t "${image}" "${PROJECT_ROOT}"
+        docker build -f "${PROJECT_ROOT}/Dockerfile" -t "${image}" "${PROJECT_ROOT}"
     fi
 
     local extra="${EXTRA_ARGS:-}"
@@ -133,14 +135,16 @@ start_prelude() {
     local gpu_flag=""
     [[ "${CPU_MODE}" == false ]] && gpu_flag="--gpus device=${GPU}"
 
+    # Mount source + HF cache, build and run server
     # shellcheck disable=SC2086
     docker run -d --name "${CONTAINER_NAME}" \
         ${gpu_flag} \
         -p "${PORT}:8000" \
+        -v "${PROJECT_ROOT}:/workspace" \
+        -v prelude-e2e-target:/workspace/target \
         -v "${HF_CACHE}:/root/.cache/huggingface:ro" \
-        -e MODEL="${MODEL}" \
-        -e EXTRA_ARGS="${extra}" \
-        "${image}"
+        "${image}" \
+        bash -c "cd /workspace && cargo build -p prelude-server --release && exec ./target/release/prelude-server --model ${MODEL} --host 0.0.0.0 --port 8000 ${extra}"
 }
 
 start_vllm() {
