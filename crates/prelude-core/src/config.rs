@@ -171,7 +171,7 @@ impl RuntimeConfig {
                 .ok()
                 .filter(|s| !s.is_empty()),
             dtype: None,
-            cuda_graph: parse_env_bool("PRELUDE_CUDA_GRAPH"),
+            cuda_graph: true,
             cuda_graph_max_bs: parse_env_usize("PRELUDE_CUDA_GRAPH_MAX_BS", 32),
         }
     }
