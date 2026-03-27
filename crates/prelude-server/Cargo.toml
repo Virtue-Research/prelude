@@ -43,7 +43,7 @@ reqwest = { version = "0.13.2", default-features = false, features = ["blocking"
 tower = { version = "0.5.3", features = ["util"] }
 
 [features]
-default = ["onednn"]
+default = []
 cuda = ["prelude-core/cuda"]
 flash-attn = ["prelude-core/flash-attn"]
 flash-attn-v3 = ["prelude-core/flash-attn-v3"]
@@ -52,6 +52,4 @@ flashinfer = ["prelude-core/flashinfer"]
 flashinfer-v4 = ["prelude-core/flashinfer-v4"]
 deepgemm = ["prelude-core/deepgemm"]
 paged-attn = ["prelude-core/paged-attn"]
-onednn = ["prelude-core/onednn"]
-ggml-quants = ["prelude-core/ggml-quants"]
 hf_tokenizer = ["prelude-core/hf_tokenizer"]

@@ -2635,7 +2635,6 @@ dependencies = [
  "prelude-deepgemm",
  "prelude-flash-attn-v4",
  "prelude-flashinfer",
- "prelude-ggml-quants",
  "rand 0.10.0",
  "rayon",
  "serde",
@@ -2676,13 +2675,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tracing",
-]
-
-[[package]]
-name = "prelude-ggml-quants"
-version = "0.1.0"
-dependencies = [
- "cc",
 ]
 
 [[package]]

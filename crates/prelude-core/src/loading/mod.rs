@@ -9,27 +9,25 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use candle_core::{DType, Device, Tensor};
 use crate::loading::var_builder::VarBuilder;
+use candle_core::{DType, Device, Tensor};
 use fastokens::Tokenizer;
 
 use crate::cache::manager::CacheManager;
 use crate::config::EngineConfig;
 use crate::engine::{
-    candle_err, init_cpu_runtime_if_needed, load_model_config, load_safetensor_filenames,
-    load_var_builder_from_filenames, load_weights, parse_model_config_for_source,
-    has_remote_file, select_device,
     CommonModelConfig, EmbeddingActivation, EmbeddingDenseLayerSpec, EmbeddingNormalization,
     EmbeddingPooling, EmbeddingSemantics, Engine, EngineError, ModelDescriptor, ModelExecutor,
     ModelVariant, ResolvedModelConfig, RuntimeCaps, TaskKind, TaskOverride, WeightsBackend,
+    candle_err, has_remote_file, init_cpu_runtime_if_needed, load_model_config,
+    load_safetensor_filenames, load_var_builder_from_filenames, load_weights,
+    parse_model_config_for_source, select_device,
 };
-use crate::models::gemma3::meta::{
-    Gemma3ModelBuildContext, build_gemma3_model_with_context,
-};
-use crate::models::registry::AuxiliaryVarBuilder;
-use crate::models::qwen3_5::gguf::Qwen3_5GgufModel;
+use crate::models::gemma3::meta::{Gemma3ModelBuildContext, build_gemma3_model_with_context};
 #[cfg(feature = "candle-baseline")]
 use crate::models::qwen3::gguf::Qwen3GgufModel;
+use crate::models::qwen3_5::gguf::Qwen3_5GgufModel;
+use crate::models::registry::AuxiliaryVarBuilder;
 
 #[derive(Debug, serde::Deserialize)]
 struct SentenceTransformerModuleEntry {
@@ -95,14 +93,13 @@ impl Engine {
         init_cpu_runtime_if_needed(&device, &engine_config.runtime);
 
         let resolved = load_model_config(model_path, task_override)?;
-        let embedding_modules =
-            load_embedding_modules_from_dir(
-                model_path,
-                resolved.spec.name(),
-                resolved.task,
-                DType::F32,
-                &device,
-            )?;
+        let embedding_modules = load_embedding_modules_from_dir(
+            model_path,
+            resolved.spec.name(),
+            resolved.task,
+            DType::F32,
+            &device,
+        )?;
         let vb = load_weights(model_path, dtype, &device)?;
         let tokenizer = load_tokenizer(model_path)?;
         load_safetensor_parts(
@@ -157,14 +154,13 @@ impl Engine {
                 has_remote_file(&repo, "config_sentence_transformers.json"),
             )?
         };
-        let embedding_modules =
-            load_embedding_modules_from_repo(
-                &repo,
-                resolved.spec.name(),
-                resolved.task,
-                DType::F32,
-                &device,
-            )?;
+        let embedding_modules = load_embedding_modules_from_repo(
+            &repo,
+            resolved.spec.name(),
+            resolved.task,
+            DType::F32,
+            &device,
+        )?;
 
         let vb = load_var_builder_from_filenames(&weight_files, dtype, &device)?;
         let tokenizer = load_tokenizer_file(&tokenizer_path)?;
@@ -384,91 +380,31 @@ fn load_gguf(
         download_tokenizer(&model_id)?
     };
 
-    // When ggml-quants is enabled, use llama.cpp FFI for ALL architectures
-    #[cfg(feature = "ggml-quants")]
-    {
-        let n_gpu_layers = if device.is_cuda() { -1 } else { 0 };
-        return load_gguf_llama_cpp(gguf_path, model_id, engine_config, load_start, tokenizer, n_gpu_layers);
-    }
-
-    #[cfg(not(feature = "ggml-quants"))]
     match arch.as_str() {
-        "qwen35" | "qwen35moe" => load_gguf_qwen35(ct, &mut file, &device, model_id, engine_config, load_start, tokenizer),
+        "qwen35" | "qwen35moe" => load_gguf_qwen35(
+            ct,
+            &mut file,
+            &device,
+            model_id,
+            engine_config,
+            load_start,
+            tokenizer,
+        ),
         #[cfg(feature = "candle-baseline")]
-        _ => load_gguf_qwen3(ct, &mut file, &device, model_id, engine_config, load_start, tokenizer),
+        _ => load_gguf_qwen3(
+            ct,
+            &mut file,
+            &device,
+            model_id,
+            engine_config,
+            load_start,
+            tokenizer,
+        ),
         #[cfg(not(feature = "candle-baseline"))]
         _ => Err(EngineError::InvalidRequest(
-            format!("GGUF architecture '{arch}' requires the 'candle-baseline' feature (or use 'ggml-quants' for llama.cpp backend)").into(),
+            format!("GGUF architecture '{arch}' requires the 'candle-baseline' feature").into(),
         )),
     }
-}
-
-/// Load ANY GGUF model via llama.cpp FFI (requires `ggml-quants` feature).
-#[cfg(feature = "ggml-quants")]
-fn load_gguf_llama_cpp(
-    gguf_path: &Path,
-    model_id: String,
-    engine_config: EngineConfig,
-    load_start: Instant,
-    tokenizer: Tokenizer,
-    n_gpu_layers: i32,
-) -> Result<Engine, EngineError> {
-    use crate::models::qwen3_5::gguf::LlamaGgufModel;
-
-    let model = LlamaGgufModel::load(gguf_path, n_gpu_layers, 4096)
-        .map_err(|e| EngineError::Internal(e))?;
-
-    let cfg = model.config();
-    let eos_token_ids = vec![cfg.eos_token as u32];
-
-    let common_config = CommonModelConfig {
-        vocab_size: cfg.vocab_size,
-        num_hidden_layers: cfg.num_hidden_layers,
-        max_position_embeddings: cfg.max_position_embeddings,
-        num_attention_heads: cfg.num_attention_heads,
-        num_key_value_heads: cfg.num_key_value_heads,
-        head_dim: cfg.head_dim,
-    };
-
-    let descriptor = ModelDescriptor {
-        task: TaskKind::Generate,
-        arch_name: "llama_cpp_gguf",
-        backend: WeightsBackend::Gguf,
-    };
-
-    let runtime_caps = RuntimeCaps {
-        supports_kv_cache: true,
-        ..RuntimeCaps::default()
-    };
-
-    let device = Device::Cpu; // llama.cpp manages its own device
-    let executor = ModelExecutor {
-        model: Mutex::new(Box::new(model)),
-        device,
-        dtype: DType::F32,
-        config: common_config,
-        runtime_caps,
-    };
-
-    tracing::info!(
-        elapsed_ms = load_start.elapsed().as_millis() as u64,
-        arch = descriptor.arch_name,
-        gpu_layers = n_gpu_layers,
-        layers = executor.config.num_hidden_layers,
-        vocab = executor.config.vocab_size,
-        "llama.cpp GGUF model loaded"
-    );
-
-    Ok(Engine {
-        executor,
-        cache: CacheManager::none(),
-        tokenizer,
-        model_id,
-        embedding_semantics: EmbeddingSemantics::default(),
-        eos_token_ids,
-        descriptor,
-        engine_config,
-    })
 }
 
 /// Load Qwen3.5 (hybrid DeltaNet) from GGUF.
@@ -481,8 +417,7 @@ fn load_gguf_qwen35(
     load_start: Instant,
     tokenizer: Tokenizer,
 ) -> Result<Engine, EngineError> {
-    let (model, gguf_config) =
-        Qwen3_5GgufModel::from_gguf(ct, file, device).map_err(candle_err)?;
+    let (model, gguf_config) = Qwen3_5GgufModel::from_gguf(ct, file, device).map_err(candle_err)?;
 
     let eos_token_ids = if gguf_config.eos_token_ids.is_empty() {
         return Err(EngineError::InvalidRequest(
@@ -550,8 +485,7 @@ fn load_gguf_qwen3(
     load_start: Instant,
     tokenizer: Tokenizer,
 ) -> Result<Engine, EngineError> {
-    let (model, gguf_config) =
-        Qwen3GgufModel::from_gguf(ct, file, device).map_err(candle_err)?;
+    let (model, gguf_config) = Qwen3GgufModel::from_gguf(ct, file, device).map_err(candle_err)?;
 
     let eos_token_ids = if gguf_config.eos_token_ids.is_empty() {
         return Err(EngineError::InvalidRequest(
@@ -961,11 +895,8 @@ mod tests {
     impl TestDir {
         fn new(name: &str) -> Self {
             let id = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "prelude-{name}-{}-{}",
-                std::process::id(),
-                id
-            ));
+            let path =
+                std::env::temp_dir().join(format!("prelude-{name}-{}-{}", std::process::id(), id));
             fs::create_dir_all(&path).unwrap();
             Self { path }
         }
@@ -1315,7 +1246,8 @@ mod tests {
         };
 
         assert!(
-            err.to_string().contains("Normalize must be the final module"),
+            err.to_string()
+                .contains("Normalize must be the final module"),
             "{err}"
         );
     }
