@@ -52,10 +52,12 @@ CPU_MODE=false
 HF_CACHE="${HOME}/.cache/huggingface"
 GGUF_CACHE="${HOME}/.cache/prelude/gguf"
 
+DEVICE_FILTER=""  # "", "cpu", or "gpu"
 ENGINES=()
 for arg in "$@"; do
     case "$arg" in
-        --cpu)  CPU_MODE=true ;;
+        --cpu)  DEVICE_FILTER=cpu ;;
+        --gpu)  DEVICE_FILTER=gpu ;;
         *)      ENGINES+=("$arg") ;;
     esac
 done
@@ -377,12 +379,23 @@ start_llama_cpp() {
         -ngl "${ngl}"
 }
 
-# ── Run one engine ────────────────────────────────────────────────────────
+# ── Run one engine in one mode ─────────────────────────────────────────────
 
-bench_engine() {
-    local engine="$1"
-    local mode="GPU"
-    [[ "${CPU_MODE}" == true ]] && mode="CPU"
+# GPU-only engines (skip CPU mode)
+is_gpu_only() {
+    [[ "$1" == "vllm.rs" ]]
+}
+
+bench_engine_mode() {
+    local engine="$1" mode="$2"  # mode = GPU or CPU
+    CPU_MODE=false
+    [[ "${mode}" == "CPU" ]] && CPU_MODE=true
+
+    if is_gpu_only "${engine}" && [[ "${CPU_MODE}" == true ]]; then
+        echo "  SKIP: ${engine} does not support CPU mode"
+        return 0
+    fi
+
     echo ""
     echo "=== ${engine} (${mode}) ==="
     cleanup
@@ -407,25 +420,40 @@ bench_engine() {
     cleanup
 }
 
+# Run an engine in the appropriate mode(s) based on --cpu/--gpu filter
+bench_engine() {
+    local engine="$1"
+    if [[ "${DEVICE_FILTER}" == "cpu" ]]; then
+        bench_engine_mode "${engine}" CPU
+    elif [[ "${DEVICE_FILTER}" == "gpu" ]]; then
+        bench_engine_mode "${engine}" GPU
+    else
+        # No filter: run both GPU and CPU
+        bench_engine_mode "${engine}" GPU || true
+        bench_engine_mode "${engine}" CPU || true
+    fi
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────
 
 echo "engine,device,startup_s,ttft_s,tpot_s,e2e_latency_s,input_tps,output_tps,rpm" > "${CSV_FILE}"
 
 if [[ ${#ENGINES[@]} -eq 0 ]]; then
-    echo "Usage: $0 <engine|all> [engine2 ...] [--cpu]"
+    echo "Usage: $0 <engine|all> [engine2 ...] [--cpu] [--gpu]"
     echo ""
     echo "Engines: prelude, vllm, vllm.rs, sglang, llama.cpp"
     echo "  all = all engines"
     echo ""
     echo "Flags:"
-    echo "  --cpu    CPU mode (no GPU, auto-selects CPU images where needed)"
+    echo "  --cpu    CPU only"
+    echo "  --gpu    GPU only"
+    echo "  (none)   Both GPU and CPU"
     echo ""
     echo "Examples:"
-    echo "  $0 prelude                             # Prelude GPU"
-    echo "  $0 prelude --cpu                       # Prelude CPU"
-    echo "  $0 all --cpu                           # All engines CPU"
-    echo "  INPUT_TOKENS=512 $0 prelude vllm       # Compare prelude vs vllm
-  $0 llama.cpp                                 # Auto-converts HF model to GGUF"
+    echo "  $0 all                                  # All engines, GPU + CPU"
+    echo "  $0 all --gpu                            # All engines, GPU only"
+    echo "  $0 prelude --cpu                        # Prelude CPU only"
+    echo "  INPUT_TOKENS=512 $0 prelude vllm        # Compare prelude vs vllm"
     echo ""
     echo "Environment:"
     echo "  MODEL=${MODEL}  GPU=${GPU}  PORT=${PORT}"

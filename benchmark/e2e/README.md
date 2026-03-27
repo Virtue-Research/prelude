@@ -1,66 +1,63 @@
 # E2E Benchmark
 
-Docker 化的端到端推理性能对比，每个引擎跑在自己的容器里。
+Dockerized end-to-end inference benchmark. Each engine runs in its own container.
 
-## 前置
+## Prerequisites
 
 ```bash
 pip install "genai-bench @ git+https://github.com/rucnyz/genai-bench.git"
 ```
 
-## 用法
+## Usage
 
 ```bash
-# 所有引擎 (GPU)
+# All engines, both GPU and CPU
 ./benchmark/e2e/bench.sh all
 
-# 所有引擎 (CPU)
-./benchmark/e2e/bench.sh all --cpu
-
-# 单个引擎
+# Single engine (runs both GPU and CPU)
 ./benchmark/e2e/bench.sh prelude
 ./benchmark/e2e/bench.sh vllm
 ./benchmark/e2e/bench.sh sglang
+./benchmark/e2e/bench.sh llama.cpp        # auto-converts HF model to GGUF
 ./benchmark/e2e/bench.sh vllm.rs
-./benchmark/e2e/bench.sh llama.cpp        # 自动从 HF 模型转换 GGUF
 
-# 多个引擎对比
+# GPU or CPU only
+./benchmark/e2e/bench.sh prelude --cpu
+./benchmark/e2e/bench.sh prelude --gpu
+
+# Multiple engines
 ./benchmark/e2e/bench.sh prelude vllm sglang
 
-# CPU 模式
-./benchmark/e2e/bench.sh prelude --cpu
-./benchmark/e2e/bench.sh llama.cpp --cpu
-
-# 自定义参数
+# Custom parameters
 INPUT_TOKENS=512 OUTPUT_TOKENS=32 MAX_REQUESTS=100 CONCURRENCY=4 \
   ./benchmark/e2e/bench.sh prelude vllm
 ```
 
-## 引擎和 Docker Image
+## Engines and Docker Images
 
-| 引擎 | Image | GPU | CPU |
-|------|-------|-----|-----|
-| prelude | `prelude-dev` (根 Dockerfile) | Y | Y (`--device cpu`) |
-| vllm | `vllm/vllm-openai:latest` | Y | Y (需自建 `vllm-cpu`) |
-| sglang | `lmsysorg/sglang:latest` | Y | Y (需自建 `sglang-cpu`) |
-| llama.cpp | `prelude-others` (Dockerfile.others) | Y (`-ngl 99`) | Y (`-ngl 0`) |
-| vllm.rs | `prelude-others` (Dockerfile.others) | Y | N |
+| Engine    | Image                              | GPU            | CPU                     |
+|-----------|-------------------------------------|----------------|-------------------------|
+| prelude   | `prelude-dev` (root Dockerfile)     | Y              | Y (`--device cpu`)      |
+| vllm      | `vllm/vllm-openai:latest`          | Y              | Y (needs `vllm-cpu`)    |
+| sglang    | `lmsysorg/sglang:latest`           | Y              | Y (needs `sglang-cpu`)  |
+| llama.cpp | `prelude-others` (Dockerfile.others)| Y (`-ngl 99`)  | Y (`-ngl 0`)            |
+| vllm.rs   | `prelude-others` (Dockerfile.others)| Y              | N                       |
 
-首次运行自动 build image，之后复用。
+Images are auto-built on first run and reused afterwards.
 
-## GGUF 自动转换
+## GGUF Auto-Conversion
 
-llama.cpp 需要 GGUF 格式模型。bench.sh 自动处理：
+llama.cpp requires GGUF format. bench.sh handles this automatically:
 
-1. 检查 `~/.cache/prelude/gguf/<model>/model-BF16.gguf` 是否已存在
-2. 不存在则从 HF cache 中的 safetensors 自动转换（需要 `convert_hf_to_gguf.py`）
-3. 转换结果缓存，下次直接复用
+1. Checks `~/.cache/prelude/gguf/<model>/model-BF16.gguf`
+2. If missing, converts from HF cache safetensors via `convert_hf_to_gguf.py`
+3. Cached for future runs
 
-需要 llama.cpp 的转换脚本，自动搜索常见路径，或通过 `LLAMA_CPP_CONVERT` 指定。
+Requires llama.cpp's convert script. Auto-searched at common paths, or set `LLAMA_CPP_CONVERT`.
 
-## CPU Image 构建 (一次性)
+## CPU Image Build (one-time)
 
-vLLM 和 SGLang 的 CPU 版需要从上游源码构建：
+vLLM and SGLang CPU images need to be built from upstream source:
 
 ```bash
 # vLLM CPU
@@ -72,28 +69,31 @@ cd /path/to/sglang
 docker build -f docker/xeon.Dockerfile -t sglang-cpu .
 ```
 
-## 环境变量
+## Environment Variables
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `MODEL` | `Qwen/Qwen3-0.6B` | HuggingFace 模型 |
-| `INPUT_TOKENS` | `128` | 输入 token 数 |
-| `OUTPUT_TOKENS` | `1` | 输出 token 数 (1 = prefill-only) |
-| `MAX_REQUESTS` | `200` | 总请求数 |
-| `CONCURRENCY` | `1` | 并发数 |
-| `GPU` | `0` | GPU 编号 |
-| `PORT` | `8000` | 服务端口 |
-| `HF_TOKEN` | - | HuggingFace token (gated 模型) |
-| `VLLM_RS_DIR` | `../vllm.rs` | vllm.rs 源码路径 |
+| Variable       | Default            | Description                    |
+|----------------|--------------------|---------------------------------|
+| `MODEL`        | `Qwen/Qwen3-0.6B` | HuggingFace model              |
+| `INPUT_TOKENS` | `128`              | Input token count              |
+| `OUTPUT_TOKENS`| `1`                | Output token count (1=prefill) |
+| `MAX_REQUESTS` | `200`              | Total requests                 |
+| `CONCURRENCY`  | `1`                | Concurrent requests            |
+| `GPU`          | `0`                | GPU device id                  |
+| `PORT`         | `8000`             | Server port                    |
+| `HF_TOKEN`     | -                  | HuggingFace token (gated models)|
+| `VLLM_RS_DIR`  | `../vllm.rs`       | vllm.rs source path            |
 
-## 结果
+## Results
 
-输出到 `benchmark/e2e/results/`，JSON 格式，文件名包含引擎和时间戳：
+Output to `benchmark/e2e/results/`, with a summary table printed after all runs:
 
 ```
-results/
-├── prelude_20260327_120000.json
-├── prelude-cpu_20260327_120500.json
-├── vllm_20260327_121000.json
-└── sglang_20260327_121500.json
+┌────────────────┬─────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬────────┐
+│ Engine         │ Device  │ Start(s) │ TTFT(s)  │ TPOT(s)  │ E2E(s)   │ In t/s   │ Out t/s  │ RPM    │
+├────────────────┼─────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────┼────────┤
+│ prelude        │ GPU     │ 12       │ 0.0234   │ 0.0156   │ 0.5123   │ 1234.5   │ 567.8    │ 45.6   │
+│ prelude        │ CPU     │ 5        │ 0.1234   │ 0.0856   │ 2.8123   │ 234.5    │ 67.8     │ 8.2    │
+│ vllm           │ GPU     │ 45       │ 0.0345   │ 0.0178   │ 0.6012   │ 1100.2   │ 489.3    │ 38.2   │
+│ ...            │         │          │          │          │          │          │          │        │
+└────────────────┴─────────┴──────────┴──────────┴──────────┴──────────┴──────────┴──────────┴────────┘
 ```
