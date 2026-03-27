@@ -63,6 +63,16 @@ done
 
 mkdir -p "${RESULTS_DIR}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+CSV_FILE="${RESULTS_DIR}/summary_${TIMESTAMP}.csv"
+TRAFFIC="D(${INPUT_TOKENS},${OUTPUT_TOKENS})"
+
+# Hardware info
+CPU_NAME=$(lscpu 2>/dev/null | awk -F: '/Model name/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')
+GPU_NAME=""; GPU_COUNT=0
+if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | xargs)
+    GPU_COUNT=$(nvidia-smi --query-gpu=count --format=csv,noheader 2>/dev/null | head -1)
+fi
 
 # Result file suffix includes device mode
 result_tag() {
@@ -76,17 +86,21 @@ result_tag() {
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
+STARTUP_ELAPSED=0
+
 wait_healthy() {
     local url="$1"
     local timeout="${2:-$HEALTH_TIMEOUT}"
     echo "  Waiting for ${url} ..."
     for ((i=0; i<timeout; i++)); do
         if curl -sf "${url}" >/dev/null 2>&1; then
+            STARTUP_ELAPSED=$i
             echo "  Ready (${i}s)"
             return 0
         fi
         sleep 1
     done
+    STARTUP_ELAPSED=$timeout
     echo "  ERROR: not healthy after ${timeout}s"
     docker logs "${CONTAINER_NAME}" 2>&1 | tail -20
     return 1
@@ -99,25 +113,38 @@ cleanup() {
 run_benchmark() {
     local engine="$1"
     local url="http://localhost:${PORT}"
-    local out="${RESULTS_DIR}/$(result_tag "${engine}").json"
+    local tag
+    tag="$(result_tag "${engine}")"
 
     local mode="GPU"
     [[ "${CPU_MODE}" == true ]] && mode="CPU"
-    echo "  genai-bench [${mode}]: D(${INPUT_TOKENS},${OUTPUT_TOKENS}) × ${MAX_REQUESTS} @ C=${CONCURRENCY}"
+    echo "  genai-bench [${mode}]: ${TRAFFIC} × ${MAX_REQUESTS} @ C=${CONCURRENCY}"
     genai-bench benchmark \
-        --backend openai \
-        --base-url "${url}" \
-        --model "${MODEL}" \
-        --tokenizer "${MODEL}" \
-        --dataset-name random \
-        --random-input-len "${INPUT_TOKENS}" \
-        --random-output-len "${OUTPUT_TOKENS}" \
-        --num-requests "${MAX_REQUESTS}" \
-        --max-concurrency "${CONCURRENCY}" \
-        --output-file "${out}" \
-        2>&1 | tail -30
+        --api-backend openai \
+        --api-base "${url}" \
+        --api-key "dummy" \
+        --api-model-name "${MODEL}" \
+        --model-tokenizer "${MODEL}" \
+        --task text-to-text \
+        --traffic-scenario "${TRAFFIC}" \
+        --num-concurrency "${CONCURRENCY}" \
+        --max-requests-per-run "${MAX_REQUESTS}" \
+        --max-time-per-run 10 \
+        --experiment-base-dir "${RESULTS_DIR}" \
+        --experiment-folder-name "${tag}" \
+        2>&1 | tee "${RESULTS_DIR}/${tag}.log" | tail -30
 
-    echo "  Results: ${out}"
+    # Extract metrics from genai-bench JSON into CSV
+    local json_file
+    json_file=$(find "${RESULTS_DIR}/${tag}" -name '*.json' -not -name 'experiment_metadata.json' 2>/dev/null | head -1)
+    if [[ -n "${json_file}" ]] && [[ -f "${json_file}" ]]; then
+        python3 "${SCRIPT_DIR}/bench_utils.py" extract-metrics \
+            --json-file "${json_file}" --engine "${engine}" --device "${mode}" \
+            --startup-s "${STARTUP_ELAPSED:-0}" --csv-file "${CSV_FILE}"
+    else
+        echo "  WARNING: no result JSON found"
+        echo "${engine},${mode},${STARTUP_ELAPSED:-0},N/A,N/A,N/A,N/A,N/A,N/A" >> "${CSV_FILE}"
+    fi
 }
 
 # ── Engine launchers ──────────────────────────────────────────────────────
@@ -320,6 +347,8 @@ bench_engine() {
 
 # ── Main ──────────────────────────────────────────────────────────────────
 
+echo "engine,device,startup_s,ttft_s,tpot_s,e2e_latency_s,input_tps,output_tps,rpm" > "${CSV_FILE}"
+
 if [[ ${#ENGINES[@]} -eq 0 ]]; then
     echo "Usage: $0 <engine|all> [engine2 ...] [--cpu]"
     echo ""
@@ -354,6 +383,10 @@ for engine in "${ENGINES[@]}"; do
     fi
 done
 
-echo ""
-echo "=== Results ==="
-ls -t "${RESULTS_DIR}"/*.json 2>/dev/null | head -10 || echo "  (no results)"
+# ── Summary table ─────────────────────────────────────────────────────────
+
+python3 "${SCRIPT_DIR}/bench_utils.py" print-summary \
+    --csv-file "${CSV_FILE}" --model "${MODEL}" --traffic "${TRAFFIC}" \
+    --input-tokens "${INPUT_TOKENS}" --output-tokens "${OUTPUT_TOKENS}" \
+    --concurrency "${CONCURRENCY}" --max-requests "${MAX_REQUESTS}" \
+    --cpu-name "${CPU_NAME:-}" --gpu-name "${GPU_NAME:-}" --gpu-count "${GPU_COUNT}"
