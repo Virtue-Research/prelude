@@ -1,7 +1,9 @@
-//! Activation quantization: FP32 → Q8_0.
+//! Activation quantization: FP32 → Q8_0 / Q8_K.
 //!
-//! During inference, weights are stored in Q4_0; activations arrive as FP32/BF16.
-//! We quantize activations to Q8_0 on-the-fly, then compute Q4_0 × Q8_0 dot products.
+//! During inference, weights are stored quantized; activations arrive as FP32/BF16.
+//! We quantize activations on-the-fly:
+//! - Q8_0 (32-element blocks) paired with Q4_0 weights
+//! - Q8_K (256-element blocks with bsums) paired with Q4_K weights
 //!
 //! Scalar reference + AVX2 implementations.
 
@@ -140,6 +142,61 @@ pub fn quantize_row_q8_0(x: &[f32]) -> Vec<BlockQ8_0> {
         }
     }
     quantize_row_q8_0_scalar(x)
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Q8_K quantization (256-element blocks, paired with Q4_K weights)
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Quantize a row of FP32 values into Q8_K blocks (scalar).
+///
+/// `x.len()` must be a multiple of 256. Output length = `x.len() / 256`.
+/// Q8_K uses f32 scale and pre-computes 16-element sub-block sums (`bsums`).
+pub fn quantize_row_q8k_scalar(x: &[f32]) -> Vec<BlockQ8K> {
+    assert!(x.len() % QK_K == 0, "input length must be multiple of {QK_K}");
+    let nb = x.len() / QK_K;
+    let mut output = Vec::with_capacity(nb);
+
+    for i in 0..nb {
+        let block = &x[i * QK_K..(i + 1) * QK_K];
+
+        // Find max absolute value
+        let mut amax: f32 = 0.0;
+        for &v in block {
+            let av = v.abs();
+            if av > amax {
+                amax = av;
+            }
+        }
+
+        let d = amax / 127.0;
+        let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
+
+        let mut qs = [0i8; QK_K];
+        for (j, &v) in block.iter().enumerate() {
+            qs[j] = (v * id).round().clamp(-128.0, 127.0) as i8;
+        }
+
+        // Compute sub-block sums (16 sums, each covering 16 elements)
+        let mut bsums = [0i16; QK_K / 16];
+        for (s, sum) in bsums.iter_mut().enumerate() {
+            let mut acc: i16 = 0;
+            for j in 0..16 {
+                acc += qs[s * 16 + j] as i16;
+            }
+            *sum = acc;
+        }
+
+        output.push(BlockQ8K { d, qs, bsums });
+    }
+
+    output
+}
+
+/// Quantize FP32 activations to Q8_K, selecting the best kernel at runtime.
+pub fn quantize_row_q8k(x: &[f32]) -> Vec<BlockQ8K> {
+    // TODO: AVX2 implementation for Q8_K
+    quantize_row_q8k_scalar(x)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
