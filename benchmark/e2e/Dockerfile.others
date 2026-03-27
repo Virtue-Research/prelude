@@ -1,0 +1,84 @@
+# llama.cpp + vllm.rs — both in one image, GPU and CPU
+#
+# Build (needs vllm.rs source as VLLM_RS_DIR):
+#   VLLM_RS_DIR=../vllm.rs docker build \
+#     -f benchmark/e2e/Dockerfile.others \
+#     --build-arg VLLM_RS_DIR=vllm.rs \
+#     -t prelude-others .
+#
+# Run llama.cpp:
+#   docker run --gpus all -p 8000:8000 \
+#     -v /path/to/models:/models \
+#     prelude-others \
+#     llama-server -m /models/Qwen3-0.6B-BF16.gguf --host 0.0.0.0 --port 8000 -ngl 99
+#
+# Run llama.cpp CPU:
+#   docker run -p 8000:8000 -v /path/to/models:/models prelude-others \
+#     llama-server -m /models/Qwen3-0.6B-BF16.gguf --host 0.0.0.0 --port 8000 -ngl 0
+#
+# Run vllm.rs:
+#   docker run --gpus all -p 8000:8000 \
+#     -v ~/.cache/huggingface:/data \
+#     prelude-others \
+#     vllm-rs-server --model Qwen/Qwen3-0.6B --host 0.0.0.0 --port 8000
+
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── System deps (union of llama.cpp + vllm.rs) ───────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
+    build-essential cmake ninja-build \
+    libnccl-dev libnccl2 \
+    curl git ca-certificates \
+    libssl-dev pkg-config \
+    clang libclang-dev \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Python build tools (for vllm.rs maturin wheel)
+RUN pip3 install --no-cache-dir maturin patchelf cffi
+
+# CUDA env
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+
+# ── llama.cpp ─────────────────────────────────────────────────────────────
+RUN git clone --depth 1 https://github.com/ggerganov/llama.cpp /opt/llama.cpp \
+    && cd /opt/llama.cpp \
+    && cmake -B build -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_CUDA=ON -DGGML_AVX512=ON \
+    && cmake --build build -j$(nproc) --target llama-server \
+    && cp build/bin/llama-server /usr/local/bin/ \
+    && rm -rf /opt/llama.cpp
+
+# ── vllm.rs ───────────────────────────────────────────────────────────────
+ARG CUDA_COMPUTE_CAP=80
+ENV CUDA_COMPUTE_CAP="${CUDA_COMPUTE_CAP}"
+
+# Copy vllm.rs source (bench.sh mounts or copies it)
+COPY vllm.rs /tmp/vllm.rs
+RUN cd /tmp/vllm.rs \
+    && ./build.sh --release --features "cuda,nccl,graph,python,flash-attn,flash-context" \
+    && cargo build --release --features "cuda,nccl,graph,flash-attn,flash-context" \
+    && pip3 install --no-cache-dir target/wheels/* \
+    && install -Dm755 target/release/vllm-rs /usr/local/bin/vllm-rs \
+    && printf '%s\n' '#!/bin/sh' 'exec python3 -m vllm_rs.server "$@"' > /usr/local/bin/vllm-rs-server \
+    && chmod +x /usr/local/bin/vllm-rs-server \
+    && rm -rf /tmp/vllm.rs
+
+# Fix nccl symlink
+RUN arch="$(uname -m)" \
+    && libdir="/usr/lib/${arch}-linux-gnu" \
+    && if [ ! -e "${libdir}/libnccl.so" ] && [ -e "${libdir}/libnccl.so.2" ]; then \
+         ln -s libnccl.so.2 "${libdir}/libnccl.so"; \
+       fi
+
+ENV HUGGINGFACE_HUB_CACHE=/data
+EXPOSE 8000
+CMD ["bash"]

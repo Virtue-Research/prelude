@@ -212,18 +212,29 @@ start_sglang() {
     fi
 }
 
-start_vllm_rs() {
-    local image="vllm-rs-e2e"
-    local vllm_rs_dir="${VLLM_RS_DIR:-${PROJECT_ROOT}/../vllm.rs}"
-    if ! docker image inspect "${image}" &>/dev/null; then
-        if [[ ! -d "${vllm_rs_dir}" ]]; then
-            echo "ERROR: vllm.rs source not found at ${vllm_rs_dir}"
-            echo "  Set VLLM_RS_DIR or clone: git clone https://github.com/yuzhounie/vllm.rs ../vllm.rs"
-            return 1
-        fi
-        echo ">>> Building ${image} (this takes a while) ..."
-        docker build -f "${SCRIPT_DIR}/Dockerfile.vllm-rs" -t "${image}" "${vllm_rs_dir}"
+## Build the shared "others" image (llama.cpp + vllm.rs)
+ensure_others_image() {
+    local image="prelude-others"
+    if docker image inspect "${image}" &>/dev/null; then
+        return 0
     fi
+    local vllm_rs_dir="${VLLM_RS_DIR:-${PROJECT_ROOT}/../vllm.rs}"
+    if [[ ! -d "${vllm_rs_dir}" ]]; then
+        echo "ERROR: vllm.rs source not found at ${vllm_rs_dir}"
+        echo "  Set VLLM_RS_DIR or clone: git clone https://github.com/yuzhounie/vllm.rs ../vllm.rs"
+        return 1
+    fi
+    # Build context needs vllm.rs source as a subdirectory
+    local build_ctx
+    build_ctx="$(mktemp -d)"
+    ln -s "$(cd "${vllm_rs_dir}" && pwd)" "${build_ctx}/vllm.rs"
+    echo ">>> Building ${image} (llama.cpp + vllm.rs, this takes a while) ..."
+    docker build -f "${SCRIPT_DIR}/Dockerfile.others" -t "${image}" "${build_ctx}"
+    rm -rf "${build_ctx}"
+}
+
+start_vllm_rs() {
+    ensure_others_image || return 1
 
     # vllm.rs is GPU-only
     if [[ "${CPU_MODE}" == true ]]; then
@@ -237,18 +248,16 @@ start_vllm_rs() {
         --ipc=host \
         -v "${HF_CACHE}:/data:ro" \
         -e HF_TOKEN="${HF_TOKEN}" \
-        "${image}" \
+        prelude-others \
+        vllm-rs-server \
         --model "${MODEL}" \
         --host 0.0.0.0 \
         --port 8000
 }
 
 start_llama_cpp() {
-    local image="llama-cpp-e2e"
-    if ! docker image inspect "${image}" &>/dev/null; then
-        echo ">>> Building ${image} ..."
-        docker build -f "${SCRIPT_DIR}/Dockerfile.llama-cpp" -t "${image}" "${SCRIPT_DIR}"
-    fi
+    ensure_others_image || return 1
+
     if [[ -z "${GGUF_MODEL}" ]]; then
         echo "ERROR: GGUF_MODEL not set. Example:"
         echo "  GGUF_MODEL=/path/to/Qwen3-0.6B-BF16.gguf ./benchmark/e2e/bench.sh llama.cpp"
@@ -271,9 +280,12 @@ start_llama_cpp() {
         ${gpu_flag} \
         -p "${PORT}:8000" \
         -v "${model_dir}:/models:ro" \
-        -e MODEL="/models/${model_file}" \
-        -e N_GPU_LAYERS="${ngl}" \
-        "${image}"
+        prelude-others \
+        llama-server \
+        -m "/models/${model_file}" \
+        --host 0.0.0.0 \
+        --port 8000 \
+        -ngl "${ngl}"
 }
 
 # ── Run one engine ────────────────────────────────────────────────────────
