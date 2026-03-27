@@ -5,7 +5,6 @@ pub(crate) mod attention;
 pub(crate) mod linear;
 pub(crate) mod mlp;
 pub(crate) mod ops;
-#[cfg(feature = "onednn")]
 pub(crate) mod raw_cpu;
 pub(crate) mod rotary;
 pub(crate) mod transformer_block;

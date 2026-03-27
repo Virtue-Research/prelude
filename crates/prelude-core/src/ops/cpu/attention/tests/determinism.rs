@@ -120,7 +120,6 @@ fn test_fused_add_rmsnorm_determinism() {
 
 /// Linear forward (candle Linear → brgemm dispatch): run twice, assert bit-exact.
 /// Tests the full Linear layer path including Tensor allocation/dispatch.
-#[cfg(feature = "onednn")]
 #[test]
 fn test_qwen_linear_determinism() {
     use crate::models::common::linear::Linear;
@@ -158,7 +157,6 @@ fn test_qwen_linear_determinism() {
 
 /// Chain: rmsnorm → brgemm GEMM → fused_add_rmsnorm → brgemm GEMM.
 /// Simulates DecoderLayer forward data flow. Run twice, assert bit-exact.
-#[cfg(feature = "onednn")]
 #[test]
 fn test_layer_chain_determinism() {
     use crate::ops::cpu::{cpu_rmsnorm, cpu_fused_add_rmsnorm};
@@ -258,7 +256,6 @@ fn test_layer_chain_determinism() {
 /// the test harness runs verify_prefill_precision (brgemm attention + naive comparison)
 /// in a prior #[test]. Cannot be reproduced within a single test function.
 /// The non-determinism is in Linear::forward's second call vs first call.
-#[cfg(feature = "onednn")]
 #[test]
 fn test_linear_chain_determinism() {
     use crate::ops::cpu::{cpu_rmsnorm, cpu_fused_add_rmsnorm};
@@ -325,7 +322,6 @@ fn test_linear_chain_determinism() {
 /// brgemm GEMM with different shapes interleaved: tests if JIT cache / scratchpad
 /// residuals cause non-determinism. Simulates what happens when different layers
 /// (with different M) use the same GemmPool thread.
-#[cfg(feature = "onednn")]
 #[test]
 fn test_brgemm_interleaved_shapes_determinism() {
     use crate::ops::onednn;
@@ -365,7 +361,6 @@ fn test_brgemm_interleaved_shapes_determinism() {
 
 /// brgemm GEMM (GemmPool 2D M×N dispatch): run twice, assert bit-exact.
 /// This is the Linear layer's hot path — the most likely source of non-determinism.
-#[cfg(feature = "onednn")]
 #[test]
 fn test_brgemm_gemm_determinism() {
     use crate::ops::onednn;
@@ -408,7 +403,6 @@ fn test_brgemm_gemm_determinism() {
 /// Each layer: rmsnorm → attn(prefill) → fused_add_rmsnorm → gate_up GEMM → SiLU → down GEMM → residual_add.
 /// Uses Qwen3-0.6B dimensions: hidden=1024, inter=3072, heads=16, kv_heads=8, head_dim=64.
 /// Run full chain twice with same input, assert bit-exact output.
-#[cfg(feature = "onednn")]
 #[test]
 fn test_multi_layer_determinism() {
     use crate::ops::cpu::{cpu_rmsnorm, cpu_fused_add_rmsnorm, cpu_silu_and_mul};

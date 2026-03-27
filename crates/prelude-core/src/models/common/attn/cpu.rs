@@ -51,21 +51,13 @@ fn matmul_sdpa(
     num_heads: usize, num_kv_heads: usize, head_dim: usize,
     softmax_scale: f32, causal: bool,
 ) -> Result<Tensor> {
-    #[cfg(feature = "onednn")]
-    {
-        return matmul_sdpa_onednn(q, k, v, seq_lens, num_heads, num_kv_heads, head_dim, softmax_scale, causal);
-    }
-    #[cfg(not(feature = "onednn"))]
-    {
-        matmul_sdpa_candle(q, k, v, seq_lens, num_heads, num_kv_heads, head_dim, softmax_scale, causal)
-    }
+    matmul_sdpa_onednn(q, k, v, seq_lens, num_heads, num_kv_heads, head_dim, softmax_scale, causal)
 }
 
 // ── oneDNN F32 SDPA ──────────────────────────────────────────────────────
 
 /// F32 SDPA using raw `CpuTensorF32` + per-head oneDNN matmul + custom softmax,
 /// parallelized across heads with rayon. No candle compute in the hot path.
-#[cfg(feature = "onednn")]
 #[allow(clippy::too_many_arguments)]
 fn matmul_sdpa_onednn(
     q: &Tensor, k: &Tensor, v: &Tensor,
@@ -197,7 +189,6 @@ fn matmul_sdpa_onednn(
 /// V: [seq_kv, num_kv_heads, head_dim].
 /// `position_offset` is the KV position of Q's first token (for causal mask).
 /// Returns: [seq_q, num_heads, head_dim]
-#[cfg(feature = "onednn")]
 #[allow(clippy::too_many_arguments)]
 pub fn cross_attention_f32_onednn(
     q: &Tensor, k: &Tensor, v: &Tensor,
@@ -402,7 +393,6 @@ mod tests {
             &q, &k, &v, &[seq_len], num_heads, num_kv_heads, head_dim, scale, true,
         ).unwrap();
 
-        #[cfg(feature = "onednn")]
         {
             let onednn_out = matmul_sdpa_onednn(
                 &q, &k, &v, &[seq_len], num_heads, num_kv_heads, head_dim, scale, true,
@@ -437,7 +427,6 @@ mod tests {
             &q, &k, &v, &seq_lens, num_heads, num_kv_heads, head_dim, scale, true,
         ).unwrap();
 
-        #[cfg(feature = "onednn")]
         {
             let onednn_out = matmul_sdpa_onednn(
                 &q, &k, &v, &seq_lens, num_heads, num_kv_heads, head_dim, scale, true,
@@ -480,7 +469,6 @@ mod tests {
         }
         let candle_us = t0.elapsed().as_micros() / iters as u128;
 
-        #[cfg(feature = "onednn")]
         {
             for _ in 0..warmup {
                 let _ = matmul_sdpa_onednn(
@@ -505,9 +493,5 @@ mod tests {
             }
         }
 
-        #[cfg(not(feature = "onednn"))]
-        {
-            eprintln!("candle-only: {candle_us} us/iter (onednn feature disabled)");
-        }
     }
 }

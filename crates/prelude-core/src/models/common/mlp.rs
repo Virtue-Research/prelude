@@ -51,8 +51,7 @@ impl GatedMlp {
     }
 
     /// Check if gate_up brgemm weight is available (for raw path dispatch).
-    #[cfg(feature = "onednn")]
-    pub(crate) fn gate_up_brgemm_weight(&self) -> Option<&crate::ops::onednn::BrgemmPackedWeight> {
+        pub(crate) fn gate_up_brgemm_weight(&self) -> Option<&crate::ops::onednn::BrgemmPackedWeight> {
         self.gate_up_proj.as_ref()?.brgemm_weight()
     }
 
@@ -70,8 +69,7 @@ impl GatedMlp {
                 // is ~1000x slower than AVX-512 cpu_ops silu_mul. At M>128 the
                 // scalar expf cost overwhelms the L2 cache savings from fusion.
                 // The unfused path still benefits from 2D M×N tiling at large M.
-                #[cfg(feature = "onednn")]
-                if let Some(brg) = gup.brgemm_weight() {
+                                if let Some(brg) = gup.brgemm_weight() {
                     let n = brg.n;
                     let dims = x.dims();
                     let m: usize = dims.iter().product::<usize>() / dims[dims.len() - 1];
@@ -156,8 +154,7 @@ impl GatedMlp {
     ///
     /// # Safety
     /// - `output` must point to `[total * hidden_size]` pre-allocated u16 elements.
-    #[cfg(feature = "onednn")]
-    pub(crate) unsafe fn forward_raw(
+        pub(crate) unsafe fn forward_raw(
         &self,
         input: &crate::ops::cpu::buf_tensor::CpuTensor,
         output: *mut u16,
@@ -184,14 +181,12 @@ impl GatedMlp {
         });
     }
 
-    #[cfg(feature = "onednn")]
-    pub(crate) fn gate_up_f32_packed_weight(&self) -> Option<&crate::ops::onednn::OnednnF32PackedWeight> {
+        pub(crate) fn gate_up_f32_packed_weight(&self) -> Option<&crate::ops::onednn::OnednnF32PackedWeight> {
         self.gate_up_proj.as_ref()?.f32_packed_weight()
     }
 
     /// Raw F32 MLP forward: gate_up GEMM → SiLU×Mul → down GEMM on raw f32 buffers.
-    #[cfg(feature = "onednn")]
-    pub(crate) unsafe fn forward_raw_f32(
+        pub(crate) unsafe fn forward_raw_f32(
         &self,
         input: *const f32,
         total: usize,

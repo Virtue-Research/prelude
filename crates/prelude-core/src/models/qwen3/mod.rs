@@ -183,7 +183,6 @@ impl Qwen3Attention {
             let total_q = x.dim(0)?;
 
             // ── Raw CPU BF16 fast path: bypass Tensor intermediates ──────
-            #[cfg(feature = "onednn")]
             if !self.is_cuda && x.dtype() == candle_core::DType::BF16 && ctx.paged_kv.is_none() {
                 if let Some(ref qkv_proj) = self.qkv_proj {
                     if let (Some(qkv_brg), Some(oproj_brg)) =
@@ -201,7 +200,6 @@ impl Qwen3Attention {
             }
 
             // ── Raw CPU F32 fast path: bypass Tensor intermediates ──────
-            #[cfg(feature = "onednn")]
             if !self.is_cuda && x.dtype() == candle_core::DType::F32 && ctx.paged_kv.is_none() {
                 if let Some(ref qkv_proj) = self.qkv_proj {
                     if let (Some(qkv_pw), Some(oproj_pw)) =
@@ -367,7 +365,6 @@ impl Qwen3Attention {
     ///
     /// Flow: input Tensor → CpuTensor → QKV GEMM → split → QK norm → RoPE
     ///       → attention → O_proj GEMM → CpuTensor → output Tensor
-    #[cfg(feature = "onednn")]
     fn forward_raw_cpu_bf16(
         &self,
         x: &Tensor,
@@ -412,7 +409,6 @@ impl Qwen3Attention {
 
     /// Raw CPU F32 attention forward: mirrors forward_raw_cpu_bf16 but for F32.
     /// All intermediate operations use raw &[f32] slices via OnednnF32PackedWeight.
-    #[cfg(feature = "onednn")]
     fn forward_raw_cpu_f32(
         &self,
         x: &Tensor,
@@ -470,7 +466,6 @@ impl Qwen3Attention {
         let seq_len = x.dim(0)?;
 
         // ── BF16 + oneDNN raw prefill: fused QKV+norm+RoPE+attn+O_proj, save K,V ──
-        #[cfg(feature = "onednn")]
         if position_offset == 0 && !self.is_cuda && x.dtype() == DType::BF16 {
             // Clone Arc refs to avoid borrowing self immutably while calling &mut self
             let qkv_proj = self.qkv_proj.clone();
@@ -537,7 +532,6 @@ impl Qwen3Attention {
 
     /// Raw BF16 prefill: runs the fully fused raw path (zero Tensor allocs)
     /// and saves K,V to KvBuf as a side effect.
-    #[cfg(feature = "onednn")]
     fn forward_raw_prefill_and_cache(
         &mut self,
         x: &Tensor,
@@ -607,7 +601,6 @@ impl Qwen3Attention {
         let k_f32 = k_full.to_dtype(DType::F32)?;
         let v_f32 = v_full.to_dtype(DType::F32)?;
 
-        #[cfg(feature = "onednn")]
         {
             let out = crate::models::common::attn::cpu::cross_attention_f32_onednn(
                 &q_f32, &k_f32, &v_f32,
@@ -618,66 +611,6 @@ impl Qwen3Attention {
             return out.to_dtype(v_full.dtype());
         }
 
-        #[cfg(not(feature = "onednn"))]
-        {
-            self.matmul_cross_attention_candle(
-                &q_f32, &k_f32, &v_f32,
-                seq_len, total_kv_len, position_offset,
-            )?.to_dtype(v_full.dtype())
-        }
-    }
-
-    #[cfg(not(feature = "onednn"))]
-    fn matmul_cross_attention_candle(
-        &self,
-        q: &Tensor, k_full: &Tensor, v_full: &Tensor,
-        seq_len: usize, total_kv_len: usize, position_offset: usize,
-    ) -> Result<Tensor> {
-        let gqa_ratio = self.num_heads / self.num_kv_heads;
-
-        let q = q.reshape((1, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?.contiguous()?;
-        let k = k_full.reshape((1, total_kv_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?.contiguous()?;
-        let v = v_full.reshape((1, total_kv_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?.contiguous()?;
-
-        let (k, v) = if gqa_ratio > 1 {
-            (
-                k.reshape((1, self.num_kv_heads, 1, total_kv_len, self.head_dim))?
-                    .expand((1, self.num_kv_heads, gqa_ratio, total_kv_len, self.head_dim))?
-                    .reshape((1, self.num_heads, total_kv_len, self.head_dim))?
-                    .contiguous()?,
-                v.reshape((1, self.num_kv_heads, 1, total_kv_len, self.head_dim))?
-                    .expand((1, self.num_kv_heads, gqa_ratio, total_kv_len, self.head_dim))?
-                    .reshape((1, self.num_heads, total_kv_len, self.head_dim))?
-                    .contiguous()?,
-            )
-        } else {
-            (k, v)
-        };
-
-        let scores =
-            (q.matmul(&k.transpose(2, 3)?)? * (self.softmax_scale as f64))?;
-
-        let scores = if seq_len > 1 {
-            let mut mask_data = vec![0.0f32; seq_len * total_kv_len];
-            for i in 0..seq_len {
-                for j in (position_offset + i + 1)..total_kv_len {
-                    mask_data[i * total_kv_len + j] = f32::NEG_INFINITY;
-                }
-            }
-            let mask =
-                Tensor::from_vec(mask_data, (1, 1, seq_len, total_kv_len), q.device())?;
-            scores.broadcast_add(&mask)?
-        } else {
-            scores
-        };
-
-        let attn = crate::nn_ops::ops::softmax_last_dim(&scores)?.matmul(&v)?;
-        attn.transpose(1, 2)?
-            .contiguous()?
-            .reshape((seq_len, self.num_heads, self.head_dim))
     }
 
     fn reset_kv_cache(&mut self) {
@@ -723,13 +656,11 @@ impl DecoderLayer {
 
     #[inline]
     fn residual_mlp(&self, x_res: &Tensor, h2: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "onednn")]
         if h2.device().is_cpu() && h2.dtype() == candle_core::DType::BF16 {
             if self.mlp.gate_up_brgemm_weight().is_some() {
                 return self.residual_mlp_raw(x_res, h2);
             }
         }
-        #[cfg(feature = "onednn")]
         if h2.device().is_cpu() && h2.dtype() == candle_core::DType::F32 {
             if self.mlp.gate_up_f32_packed_weight().is_some() {
                 return self.residual_mlp_raw_f32(x_res, h2);
@@ -738,7 +669,6 @@ impl DecoderLayer {
         fast_add(x_res, &self.mlp.forward(h2)?)
     }
 
-    #[cfg(feature = "onednn")]
     fn residual_mlp_raw(&self, x_res: &Tensor, h2: &Tensor) -> Result<Tensor> {
         use crate::models::common::raw_cpu;
         use crate::ops::cpu::buf_tensor::CpuTensor;
@@ -752,7 +682,6 @@ impl DecoderLayer {
         Ok(x_res.clone())
     }
 
-    #[cfg(feature = "onednn")]
     fn residual_mlp_raw_f32(&self, x_res: &Tensor, h2: &Tensor) -> Result<Tensor> {
         use crate::models::common::raw_cpu;
         let h2_slice = crate::ops::cpu::tensor_as_f32_slice(h2)?;
@@ -1413,7 +1342,6 @@ mod tests {
         eprintln!("[3] Attn candle      (1q×{context_len}kv, {num_heads}H):     {attn_candle_us:.1} µs");
 
         // 4. Attention oneDNN cross_attention
-        #[cfg(feature = "onednn")]
         let attn_onednn_us = {
             let q = Tensor::randn(0.0f32, 1.0, (1, num_heads, head_dim), &device).unwrap();
             let k = Tensor::randn(0.0f32, 1.0, (context_len, num_kv_heads, head_dim), &device).unwrap();
@@ -1433,7 +1361,6 @@ mod tests {
             }
             t.elapsed().as_micros() as f64 / iters as f64
         };
-        #[cfg(feature = "onednn")]
         eprintln!("[4] Attn oneDNN      (1q×{context_len}kv, {num_heads}H):     {attn_onednn_us:.1} µs");
 
         // 4b. Attention native F32 decode kernel

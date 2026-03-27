@@ -47,7 +47,6 @@ static CAPS: LazyLock<Caps> = LazyLock::new(|| {
             && is_x86_feature_detected!("avx512bw");
         caps.avx512_bf16 = is_x86_feature_detected!("avx512bf16");
     }
-    #[cfg(feature = "onednn")]
     {
         caps.amx = crate::ops::onednn::brgemm_available();
     }
@@ -331,7 +330,6 @@ fn prefill_attention_one_head(
         let t_qk = std::time::Instant::now();
         if use_amx {
             // AMX: strided Q/K access, oneDNN brgemm GEMM
-            #[cfg(feature = "onednn")]
             {
                 unsafe {
                     crate::ops::onednn::ffi::brgemm_qk_gemm(
@@ -420,7 +418,6 @@ fn prefill_attention_one_head(
         // ── V accumulation ───────────────────────────────────────────────
         let t_sv = std::time::Instant::now();
         if use_amx {
-            #[cfg(feature = "onednn")]
             unsafe {
                 crate::ops::onednn::ffi::brgemm_score_v_accum(
                     bufs.s_i.as_ptr(),
@@ -462,7 +459,6 @@ fn prefill_attention_one_head(
     }
 
     // ── Post-loop cleanup (brgemm only) ─────────────────────────────────
-    #[cfg(feature = "onednn")]
     if use_amx {
         unsafe { crate::ops::onednn::ffi::brgemm_attn_release(); }
     }

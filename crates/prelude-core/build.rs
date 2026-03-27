@@ -1,4 +1,3 @@
-#[cfg(feature = "onednn")]
 fn configured_parallel_jobs() -> Option<usize> {
     for key in ["NUM_JOBS", "CARGO_BUILD_JOBS"] {
         if let Ok(value) = std::env::var(key)
@@ -14,7 +13,6 @@ fn configured_parallel_jobs() -> Option<usize> {
         .map(std::num::NonZeroUsize::get)
 }
 
-#[cfg(feature = "onednn")]
 fn run_cmake_build(build_dir: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {
     let mut cmd = std::process::Command::new("cmake");
     cmd.arg("--build").arg(build_dir);
@@ -97,7 +95,6 @@ fn main() {
     }
 
     // ── oneDNN FFI (static linking — no .so needed at runtime) ──
-    #[cfg(feature = "onednn")]
     {
         use std::path::{Path, PathBuf};
         use std::process::Command;

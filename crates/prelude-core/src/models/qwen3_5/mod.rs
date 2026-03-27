@@ -1091,7 +1091,6 @@ impl Qwen3_5SparseMoeBlock {
         let down_w = self.experts_down.get(expert_idx)?; // [hidden, inter]
         let inter = self.moe_intermediate_size;
 
-        #[cfg(feature = "onednn")]
         if x.device().is_cpu() && x.dtype() == DType::F32 {
             return self.expert_forward_onednn(x, &gate_up_w, &down_w, inter);
         }
@@ -1104,7 +1103,6 @@ impl Qwen3_5SparseMoeBlock {
         hidden.matmul(&down_w.t()?)
     }
 
-    #[cfg(feature = "onednn")]
     fn expert_forward_onednn(
         &self, x: &Tensor, gate_up_w: &Tensor, down_w: &Tensor, inter: usize,
     ) -> Result<Tensor> {

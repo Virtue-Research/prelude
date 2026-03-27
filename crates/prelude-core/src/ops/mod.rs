@@ -7,5 +7,4 @@
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod gpu;
-#[cfg(feature = "onednn")]
 pub mod onednn;

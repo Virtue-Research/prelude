@@ -308,7 +308,6 @@ pub(super) fn softmax_scalar(scores: &mut [f32], n_size: usize, m_prime: f32, sm
 /// Select adaptive block sizes based on sequence length (matches SGLang).
 /// Both QK^T and V accumulation now use brgemm (AMX), so larger blocks are efficient.
 pub(super) fn select_blocks(slen: usize) -> (usize, usize) {
-    #[cfg(feature = "onednn")]
     if crate::ops::onednn::brgemm_available() {
         return match slen {
             0..=256 => (32, 64),

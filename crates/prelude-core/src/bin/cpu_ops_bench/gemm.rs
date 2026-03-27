@@ -34,7 +34,6 @@ pub fn bench(m: usize, k: usize, n: usize, warmup: usize, repeats: usize) -> Res
     let onednn_packed_us: Option<f64> = None; // removed: PackedWeight no longer exists
 
     // -- brgemm BF16 GEMM (oneDNN micro-kernel, multi-threaded) --
-    #[cfg(feature = "onednn")]
     let brgemm_us = {
         use prelude_core::ops::onednn::{brgemm_available, BrgemmPackedWeight};
         if brgemm_available() {
@@ -56,8 +55,6 @@ pub fn bench(m: usize, k: usize, n: usize, warmup: usize, repeats: usize) -> Res
             None
         }
     };
-    #[cfg(not(feature = "onednn"))]
-    let brgemm_us: Option<f64> = None;
 
     let amx_us: Option<f64> = None; // removed: AMX GEMM replaced by brgemm
 
@@ -117,7 +114,6 @@ pub fn bench(m: usize, k: usize, n: usize, warmup: usize, repeats: usize) -> Res
 }
 
 /// Accuracy: compare GEMM backends against candle F32 reference
-#[cfg(feature = "onednn")]
 pub fn verify_accuracy(m: usize, k: usize, n: usize) -> Result<()> {
     let device = Device::Cpu;
 
