@@ -45,73 +45,94 @@ mod avx2 {
     use super::*;
     use core::arch::x86_64::*;
 
-    /// Unpack 16 bytes of nibble pairs → 32 bytes in `[0..15]`.
-    ///
-    /// Input: 16 bytes where byte `j` = `(hi_nibble << 4) | lo_nibble`.
-    /// Output: 32 bytes — low lane = raw nibbles, high lane = shifted nibbles,
-    /// both masked to 4 bits.
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    fn bytes_from_nibbles_32(ptr: *const u8) -> __m256i {
-        // SAFETY: ptr must point to 16 readable bytes (guaranteed by BlockQ4_0.qs layout)
-        let raw = unsafe { _mm_loadu_si128(ptr as *const __m128i) };
-        let hi = _mm_srli_epi16(raw, 4);
-        let combined = _mm256_set_m128i(hi, raw);
-        let mask = _mm256_set1_epi8(0x0F);
-        _mm256_and_si256(combined, mask)
+    // Helpers: NO #[target_feature] → CAN be #[inline(always)].
+    // Only called from #[target_feature] functions, LLVM inlines with correct ISA.
+
+    /// Hardware FP16→F32 using F16C (vcvtph2ps). All AVX2 CPUs have F16C.
+    #[inline(always)]
+    unsafe fn fp16_to_f32_hw(h: u16) -> f32 {
+        let v = _mm_cvtsi32_si128(h as i32);
+        _mm_cvtss_f32(_mm_cvtph_ps(v))
     }
 
-    /// 32 × (i8 × i8) → 8 × f32, using the sign-trick for maddubs.
-    ///
-    /// `_mm256_maddubs_epi16` requires unsigned × signed operands.
-    /// We use `_mm256_sign_epi8` to make `x` positive and flip `y`'s sign
-    /// accordingly, so the product is correct for signed × signed inputs.
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    fn mul_sum_i8_pairs_float(x: __m256i, y: __m256i) -> __m256 {
+    #[inline(always)]
+    unsafe fn bytes_from_nibbles_32(ptr: *const u8) -> __m256i {
+        let raw = _mm_loadu_si128(ptr as *const __m128i);
+        let hi = _mm_srli_epi16(raw, 4);
+        let combined = _mm256_set_m128i(hi, raw);
+        _mm256_and_si256(combined, _mm256_set1_epi8(0x0F))
+    }
+
+    #[inline(always)]
+    unsafe fn mul_sum_i8_pairs_float(x: __m256i, y: __m256i) -> __m256 {
         let ax = _mm256_sign_epi8(x, x);
         let sy = _mm256_sign_epi8(y, x);
         let dot = _mm256_maddubs_epi16(ax, sy);
-        let ones = _mm256_set1_epi16(1);
-        let sum32 = _mm256_madd_epi16(dot, ones);
+        let sum32 = _mm256_madd_epi16(dot, _mm256_set1_epi16(1));
         _mm256_cvtepi32_ps(sum32)
     }
 
-    /// Horizontal sum of 8 floats in a __m256.
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    fn hsum_float_8(x: __m256) -> f32 {
+    #[inline(always)]
+    unsafe fn mul_sum_us8_pairs_float_vnni(ax: __m256i, sy: __m256i) -> __m256 {
+        let sum32 = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), ax, sy);
+        _mm256_cvtepi32_ps(sum32)
+    }
+
+    #[inline(always)]
+    unsafe fn hsum_float_8(x: __m256) -> f32 {
         let hi128 = _mm256_extractf128_ps(x, 1);
         let lo128 = _mm256_castps256_ps128(x);
         let sum128 = _mm_add_ps(hi128, lo128);
         let hi64 = _mm_movehl_ps(sum128, sum128);
         let sum64 = _mm_add_ps(sum128, hi64);
         let hi32 = _mm_movehdup_ps(sum64);
-        let sum32 = _mm_add_ss(sum64, hi32);
-        _mm_cvtss_f32(sum32)
+        _mm_cvtss_f32(_mm_add_ss(sum64, hi32))
     }
 
     /// AVX2 Q4_0 · Q8_0 dot product.
-    #[target_feature(enable = "avx2,fma")]
-    pub(super) fn vec_dot_q4_0_q8_0_avx2(
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub(super) unsafe fn vec_dot_q4_0_q8_0_avx2(
         x: &[BlockQ4_0],
         y: &[BlockQ8_0],
     ) -> f32 {
         let nb = x.len();
         let mut acc = _mm256_setzero_ps();
+        let off = _mm256_set1_epi8(8);
 
         for ib in 0..nb {
-            let xb = &x[ib];
-            let yb = &y[ib];
+            let xb = x.get_unchecked(ib);
+            let yb = y.get_unchecked(ib);
 
-            let d = _mm256_set1_ps(fp16_to_f32(xb.d) * fp16_to_f32(yb.d));
-            let qx = bytes_from_nibbles_32(xb.qs.as_ptr());
-            let off = _mm256_set1_epi8(8);
-            let qx = _mm256_sub_epi8(qx, off);
-            // SAFETY: yb.qs is a [i8; 32], 32 bytes readable
-            let qy = unsafe { _mm256_loadu_si256(yb.qs.as_ptr() as *const __m256i) };
-            let dot = mul_sum_i8_pairs_float(qx, qy);
-            acc = _mm256_fmadd_ps(d, dot, acc);
+            let d = _mm256_set1_ps(fp16_to_f32_hw(xb.d) * fp16_to_f32_hw(yb.d));
+            let qx = _mm256_sub_epi8(bytes_from_nibbles_32(xb.qs.as_ptr()), off);
+            let qy = _mm256_loadu_si256(yb.qs.as_ptr() as *const __m256i);
+            acc = _mm256_fmadd_ps(d, mul_sum_i8_pairs_float(qx, qy), acc);
+        }
+
+        hsum_float_8(acc)
+    }
+
+    /// AVX-VNNI Q4_0 · Q8_0 dot product — dpbusd replaces maddubs+madd.
+    #[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+    pub(super) unsafe fn vec_dot_q4_0_q8_0_vnni(
+        x: &[BlockQ4_0],
+        y: &[BlockQ8_0],
+    ) -> f32 {
+        let nb = x.len();
+        let mut acc = _mm256_setzero_ps();
+        let off = _mm256_set1_epi8(8);
+
+        for ib in 0..nb {
+            let xb = x.get_unchecked(ib);
+            let yb = y.get_unchecked(ib);
+
+            let d = _mm256_set1_ps(fp16_to_f32_hw(xb.d) * fp16_to_f32_hw(yb.d));
+            let qx = _mm256_sub_epi8(bytes_from_nibbles_32(xb.qs.as_ptr()), off);
+            let qy = _mm256_loadu_si256(yb.qs.as_ptr() as *const __m256i);
+
+            let ax = _mm256_sign_epi8(qx, qx);
+            let sy = _mm256_sign_epi8(qy, qx);
+            acc = _mm256_fmadd_ps(d, mul_sum_us8_pairs_float_vnni(ax, sy), acc);
         }
 
         hsum_float_8(acc)
@@ -121,14 +142,14 @@ mod avx2 {
 // ── Auto-dispatch ────────────────────────────────────────────────────────
 
 /// Compute Q4_0 · Q8_0 dot product, automatically selecting the best kernel.
-///
-/// `x` and `y` must have equal length (number of 32-element blocks).
-/// The result is the dot product of the dequantized vectors.
+#[inline]
 pub fn vec_dot_q4_0_q8_0(x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            // SAFETY: feature detection above guarantees AVX2+FMA are available
+            if is_x86_feature_detected!("avxvnni") {
+                return unsafe { avx2::vec_dot_q4_0_q8_0_vnni(x, y) };
+            }
             return unsafe { avx2::vec_dot_q4_0_q8_0_avx2(x, y) };
         }
     }

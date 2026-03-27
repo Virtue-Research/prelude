@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/prelude-core", "crates/prelude-server"]
+members = ["crates/prelude-core", "crates/prelude-server", "crates/prelude-microbench"]
 exclude = ["crates/candle-core", "crates/candle-paged-attn", "crates/candle-flash-attn-v3", "crates/prelude-flash-attn-v4", "crates/prelude-flashinfer", "crates/prelude-deepgemm", "crates/prelude-cutlass-gemm"]
 resolver = "2"
 

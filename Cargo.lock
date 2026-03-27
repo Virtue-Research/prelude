@@ -2678,6 +2678,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "prelude-microbench"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "candle-core",
+ "cc",
+ "chrono",
+ "clap",
+ "half",
+ "nix",
+ "prelude-core",
+ "rayon",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "prelude-server"
 version = "0.1.0"
 dependencies = [

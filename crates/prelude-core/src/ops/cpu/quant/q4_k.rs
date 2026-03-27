@@ -95,14 +95,43 @@ mod avx2 {
     use super::*;
     use core::arch::x86_64::*;
 
-    /// AVX2 Q4_K × Q8_K dot product.
+    // Scale shuffle lookup table: broadcasts scale pairs across 16-byte lanes.
+    // Entry i broadcasts bytes (2*i, 2*i+1) to all positions.
+    static SCALE_SHUFFLE_K4: [[u8; 32]; 8] = [
+        [ 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1],
+        [ 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3],
+        [ 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5],
+        [ 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7],
+        [ 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9],
+        [10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11],
+        [12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13],
+        [14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15],
+    ];
+
+    #[inline(always)]
+    unsafe fn get_scale_shuffle_k4(i: usize) -> __m256i {
+        _mm256_loadu_si256(SCALE_SHUFFLE_K4.get_unchecked(i).as_ptr() as *const __m256i)
+    }
+
+    #[inline(always)]
+    unsafe fn hsum_float_8(x: __m256) -> f32 {
+        let hi128 = _mm256_extractf128_ps(x, 1);
+        let lo128 = _mm256_castps256_ps128(x);
+        let sum128 = _mm_add_ps(hi128, lo128);
+        let hi64 = _mm_movehl_ps(sum128, sum128);
+        let sum64 = _mm_add_ps(sum128, hi64);
+        let hi32 = _mm_movehdup_ps(sum64);
+        _mm_cvtss_f32(_mm_add_ss(sum64, hi32))
+    }
+
+    /// AVX2 Q4_K × Q8_K dot product — optimized to match ggml.
     ///
-    /// Follows llama.cpp / candle-core avx.rs `vec_dot_q4k_q8k` logic:
-    /// - Unpack scales with KMASK bit manipulation
-    /// - Process 4 groups of 64 elements (2 sub-blocks each)
-    /// - maddubs for u8×i8 multiply, madd for scale application
-    #[target_feature(enable = "avx2")]
-    pub(super) fn vec_dot_q4k_q8k_avx2(x: &[BlockQ4K], y: &[BlockQ8K]) -> f32 {
+    /// Key optimizations vs previous version:
+    /// - SIMD mins computation (hadd + madd instead of scalar loop)
+    /// - Cross-block float accumulation (one hsum at the end)
+    /// - Shuffle-based scale broadcasting (lookup table instead of set1)
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn vec_dot_q4k_q8k_avx2(x: &[BlockQ4K], y: &[BlockQ8K]) -> f32 {
         assert_eq!(x.len(), y.len());
 
         const KMASK1: u32 = 0x3f3f3f3f;
@@ -110,14 +139,16 @@ mod avx2 {
         const KMASK3: u32 = 0x03030303;
 
         let m4 = _mm256_set1_epi8(0x0F);
-        let mut sumf = 0.0f32;
+        let mut acc = _mm256_setzero_ps();
+        let mut acc_m = _mm_setzero_ps();
+
+        let mut utmp = [0u32; 4];
 
         for (xb, yb) in x.iter().zip(y.iter()) {
-            let d = fp16_to_f32(xb.d) * yb.d;
-            let dmin = fp16_to_f32(xb.dmin) * yb.d;
+            let d = yb.d * fp16_to_f32(xb.d);
+            let dmin = -yb.d * fp16_to_f32(xb.dmin);
 
             // Unpack scales/mins from 12-byte packed format
-            let mut utmp = [0u32; 4];
             utmp[0] = u32::from_le_bytes([xb.scales[0], xb.scales[1], xb.scales[2], xb.scales[3]]);
             utmp[1] = u32::from_le_bytes([xb.scales[4], xb.scales[5], xb.scales[6], xb.scales[7]]);
             utmp[2] = u32::from_le_bytes([xb.scales[8], xb.scales[9], xb.scales[10], xb.scales[11]]);
@@ -128,69 +159,66 @@ mod avx2 {
             utmp[2] = uaux;
             utmp[0] &= KMASK1;
 
-            // scales in utmp[0..2] (8 bytes), mins in utmp[2..4] (8 bytes)
-            let scales = bytemuck::cast::<[u32; 2], [u8; 8]>([utmp[0], utmp[1]]);
-            let mins = bytemuck::cast::<[u32; 2], [u8; 8]>([utmp[2], utmp[3]]);
+            // Load scales+mins as 16-bit: lower 128 = scales, upper 128 = mins
+            let mins_and_scales = unsafe {
+                _mm256_cvtepu8_epi16(_mm_set_epi32(
+                    utmp[3] as i32, utmp[2] as i32, utmp[1] as i32, utmp[0] as i32,
+                ))
+            };
 
-            // Min contribution via bsums
-            let mut sum_mins: i32 = 0;
-            for j in 0..QK_K / 16 {
-                sum_mins += yb.bsums[j] as i32 * mins[j / 2] as i32;
-            }
+            // SIMD mins contribution: hadd bsums pairs, madd with mins, FMA accumulate
+            let q8sums = unsafe { _mm256_loadu_si256(yb.bsums.as_ptr() as *const __m256i) };
+            let q8s = _mm_hadd_epi16(
+                _mm256_extracti128_si256(q8sums, 0),
+                _mm256_extracti128_si256(q8sums, 1),
+            );
+            let prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
+            acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m);
 
-            // Main dot product: 4 iterations, each processes 64 elements (2 sub-blocks)
+            // Extract scales for shuffle-based broadcasting
+            let sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
+            let scales = _mm256_set_m128i(sc128, sc128);
+
             let mut sumi = _mm256_setzero_si256();
+            let q4 = xb.qs.as_ptr();
+            let q8 = yb.qs.as_ptr();
 
-            for i in 0..(QK_K / 64) {
-                // Load 32 bytes of Q4 nibble pairs
-                let q4bits = unsafe {
-                    _mm256_loadu_si256(xb.qs.as_ptr().add(i * 32) as *const __m256i)
-                };
-                // Low nibbles → sub-block 2i, high nibbles → sub-block 2i+1
+            for j in 0..(QK_K / 64) {
+                // Broadcast scales via shuffle table
+                let scale_l = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j));
+                let scale_h = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j + 1));
+
+                let q4bits = unsafe { _mm256_loadu_si256(q4.add(j * 32) as *const __m256i) };
                 let q4l = _mm256_and_si256(q4bits, m4);
                 let q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
 
-                // Load 64 bytes of Q8 values (32 for each sub-block)
-                let q8l = unsafe {
-                    _mm256_loadu_si256(yb.qs.as_ptr().add(i * 64) as *const __m256i)
-                };
-                let q8h = unsafe {
-                    _mm256_loadu_si256(yb.qs.as_ptr().add(i * 64 + 32) as *const __m256i)
-                };
+                let q8l = unsafe { _mm256_loadu_si256(q8.add(j * 64) as *const __m256i) };
+                let mut p16l = _mm256_maddubs_epi16(q4l, q8l);
+                p16l = _mm256_madd_epi16(scale_l, p16l);
 
-                // u8 × i8 → i16 pairs
-                let p16l = _mm256_maddubs_epi16(q4l, q8l);
-                let p16h = _mm256_maddubs_epi16(q4h, q8h);
+                let q8h = unsafe { _mm256_loadu_si256(q8.add(j * 64 + 32) as *const __m256i) };
+                let mut p16h = _mm256_maddubs_epi16(q4h, q8h);
+                p16h = _mm256_madd_epi16(scale_h, p16h);
 
-                // Scale and accumulate: madd with scale broadcast as i16
-                let sc0 = scales[2 * i] as i16;
-                let sc1 = scales[2 * i + 1] as i16;
-                let p32l = _mm256_madd_epi16(p16l, _mm256_set1_epi16(sc0));
-                let p32h = _mm256_madd_epi16(p16h, _mm256_set1_epi16(sc1));
-
-                sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p32l, p32h));
+                sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16l, p16h));
             }
 
-            // Horizontal sum of sumi (i32 × 8)
-            let hi128 = _mm256_extracti128_si256(sumi, 1);
-            let lo128 = _mm256_castsi256_si128(sumi);
-            let sum128 = _mm_add_epi32(hi128, lo128);
-            let hi64 = _mm_unpackhi_epi64(sum128, sum128);
-            let sum64 = _mm_add_epi32(sum128, hi64);
-            let hi32 = _mm_shuffle_epi32(sum64, 0b_01_01_01_01);
-            let sum32 = _mm_add_epi32(sum64, hi32);
-            let sumi_scalar = _mm_cvtsi128_si32(sum32);
-
-            sumf += d * sumi_scalar as f32 - dmin * sum_mins as f32;
+            // Accumulate across blocks in float (no per-block hsum)
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
         }
 
-        sumf
+        // Final horizontal sum
+        acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
+        acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
+
+        hsum_float_8(acc) + _mm_cvtss_f32(acc_m)
     }
 }
 
 // ── Auto-dispatch ────────────────────────────────────────────────────────
 
 /// Q4_K × Q8_K dot product, auto-dispatching to the best available kernel.
+#[inline]
 pub fn vec_dot_q4k_q8k(x: &[BlockQ4K], y: &[BlockQ8K]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {

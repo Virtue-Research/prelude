@@ -108,7 +108,7 @@ fn main() {
             workspace_root.join("crates/onednn-ffi")
         };
 
-        let build_dir = ffi_dir.join("build");
+        let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("onednn-build");
         let ffi_lib = build_dir.join("libonednn_ffi.a");
         let dnnl_lib_dir = build_dir.join("_deps/onednn-build/src");
 
