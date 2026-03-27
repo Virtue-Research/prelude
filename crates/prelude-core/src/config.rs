@@ -163,7 +163,7 @@ pub struct RuntimeConfig {
 impl RuntimeConfig {
     fn from_env() -> Self {
         Self {
-            device: std::env::var("PRELUDE_DEVICE").unwrap_or_else(|_| "auto".to_string()),
+            device: "auto".to_string(),
             sync_timing: parse_env_bool("PRELUDE_SYNC_TIMING"),
             force_varlen_prefill: parse_env_bool("PRELUDE_FORCE_VARLEN_PREFILL"),
             fused_kv_cache_write: parse_env_bool_eq1("PRELUDE_FUSED_KV_CACHE_WRITE"),
