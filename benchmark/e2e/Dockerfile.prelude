@@ -1,0 +1,38 @@
+# Prelude server — GPU or CPU inference
+#
+#   docker build -f benchmark/e2e/Dockerfile.prelude -t prelude-e2e .
+#   docker run --gpus all -p 8000:8000 -e MODEL=Qwen/Qwen3-0.6B prelude-e2e
+
+FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build pkg-config \
+    git curl ca-certificates libssl-dev libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+
+# CUDA env
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+
+WORKDIR /workspace
+COPY . /workspace
+
+# Build with GPU support + oneDNN (CPU)
+RUN cargo build -p prelude-server --release --features flashinfer-v4,onednn
+
+ENV MODEL=Qwen/Qwen3-0.6B
+ENV HOST=0.0.0.0
+ENV PORT=8000
+
+EXPOSE 8000
+
+ENTRYPOINT ["/bin/bash", "-c", \
+    "exec ./target/release/prelude-server --model $MODEL --host $HOST --port $PORT $EXTRA_ARGS"]

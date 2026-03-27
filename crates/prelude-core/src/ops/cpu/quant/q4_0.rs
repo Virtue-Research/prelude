@@ -51,42 +51,52 @@ mod avx2 {
     /// Hardware FP16→F32 using F16C (vcvtph2ps). All AVX2 CPUs have F16C.
     #[inline(always)]
     unsafe fn fp16_to_f32_hw(h: u16) -> f32 {
-        let v = _mm_cvtsi32_si128(h as i32);
-        _mm_cvtss_f32(_mm_cvtph_ps(v))
+        unsafe {
+            let v = _mm_cvtsi32_si128(h as i32);
+            _mm_cvtss_f32(_mm_cvtph_ps(v))
+        }
     }
 
     #[inline(always)]
     unsafe fn bytes_from_nibbles_32(ptr: *const u8) -> __m256i {
-        let raw = _mm_loadu_si128(ptr as *const __m128i);
-        let hi = _mm_srli_epi16(raw, 4);
-        let combined = _mm256_set_m128i(hi, raw);
-        _mm256_and_si256(combined, _mm256_set1_epi8(0x0F))
+        unsafe {
+            let raw = _mm_loadu_si128(ptr as *const __m128i);
+            let hi = _mm_srli_epi16(raw, 4);
+            let combined = _mm256_set_m128i(hi, raw);
+            _mm256_and_si256(combined, _mm256_set1_epi8(0x0F))
+        }
     }
 
     #[inline(always)]
     unsafe fn mul_sum_i8_pairs_float(x: __m256i, y: __m256i) -> __m256 {
-        let ax = _mm256_sign_epi8(x, x);
-        let sy = _mm256_sign_epi8(y, x);
-        let dot = _mm256_maddubs_epi16(ax, sy);
-        let sum32 = _mm256_madd_epi16(dot, _mm256_set1_epi16(1));
-        _mm256_cvtepi32_ps(sum32)
+        unsafe {
+            let ax = _mm256_sign_epi8(x, x);
+            let sy = _mm256_sign_epi8(y, x);
+            let dot = _mm256_maddubs_epi16(ax, sy);
+            let sum32 = _mm256_madd_epi16(dot, _mm256_set1_epi16(1));
+            _mm256_cvtepi32_ps(sum32)
+        }
     }
 
     #[inline(always)]
     unsafe fn mul_sum_us8_pairs_float_vnni(ax: __m256i, sy: __m256i) -> __m256 {
-        let sum32 = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), ax, sy);
-        _mm256_cvtepi32_ps(sum32)
+        unsafe {
+            let sum32 = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), ax, sy);
+            _mm256_cvtepi32_ps(sum32)
+        }
     }
 
     #[inline(always)]
     unsafe fn hsum_float_8(x: __m256) -> f32 {
-        let hi128 = _mm256_extractf128_ps(x, 1);
-        let lo128 = _mm256_castps256_ps128(x);
-        let sum128 = _mm_add_ps(hi128, lo128);
-        let hi64 = _mm_movehl_ps(sum128, sum128);
-        let sum64 = _mm_add_ps(sum128, hi64);
-        let hi32 = _mm_movehdup_ps(sum64);
-        _mm_cvtss_f32(_mm_add_ss(sum64, hi32))
+        unsafe {
+            let hi128 = _mm256_extractf128_ps(x, 1);
+            let lo128 = _mm256_castps256_ps128(x);
+            let sum128 = _mm_add_ps(hi128, lo128);
+            let hi64 = _mm_movehl_ps(sum128, sum128);
+            let sum64 = _mm_add_ps(sum128, hi64);
+            let hi32 = _mm_movehdup_ps(sum64);
+            _mm_cvtss_f32(_mm_add_ss(sum64, hi32))
+        }
     }
 
     /// AVX2 Q4_0 · Q8_0 dot product.
@@ -95,21 +105,23 @@ mod avx2 {
         x: &[BlockQ4_0],
         y: &[BlockQ8_0],
     ) -> f32 {
-        let nb = x.len();
-        let mut acc = _mm256_setzero_ps();
-        let off = _mm256_set1_epi8(8);
+        unsafe {
+            let nb = x.len();
+            let mut acc = _mm256_setzero_ps();
+            let off = _mm256_set1_epi8(8);
 
-        for ib in 0..nb {
-            let xb = x.get_unchecked(ib);
-            let yb = y.get_unchecked(ib);
+            for ib in 0..nb {
+                let xb = x.get_unchecked(ib);
+                let yb = y.get_unchecked(ib);
 
-            let d = _mm256_set1_ps(fp16_to_f32_hw(xb.d) * fp16_to_f32_hw(yb.d));
-            let qx = _mm256_sub_epi8(bytes_from_nibbles_32(xb.qs.as_ptr()), off);
-            let qy = _mm256_loadu_si256(yb.qs.as_ptr() as *const __m256i);
-            acc = _mm256_fmadd_ps(d, mul_sum_i8_pairs_float(qx, qy), acc);
+                let d = _mm256_set1_ps(fp16_to_f32_hw(xb.d) * fp16_to_f32_hw(yb.d));
+                let qx = _mm256_sub_epi8(bytes_from_nibbles_32(xb.qs.as_ptr()), off);
+                let qy = _mm256_loadu_si256(yb.qs.as_ptr() as *const __m256i);
+                acc = _mm256_fmadd_ps(d, mul_sum_i8_pairs_float(qx, qy), acc);
+            }
+
+            hsum_float_8(acc)
         }
-
-        hsum_float_8(acc)
     }
 
     /// AVX-VNNI Q4_0 · Q8_0 dot product — dpbusd replaces maddubs+madd.
@@ -118,24 +130,26 @@ mod avx2 {
         x: &[BlockQ4_0],
         y: &[BlockQ8_0],
     ) -> f32 {
-        let nb = x.len();
-        let mut acc = _mm256_setzero_ps();
-        let off = _mm256_set1_epi8(8);
+        unsafe {
+            let nb = x.len();
+            let mut acc = _mm256_setzero_ps();
+            let off = _mm256_set1_epi8(8);
 
-        for ib in 0..nb {
-            let xb = x.get_unchecked(ib);
-            let yb = y.get_unchecked(ib);
+            for ib in 0..nb {
+                let xb = x.get_unchecked(ib);
+                let yb = y.get_unchecked(ib);
 
-            let d = _mm256_set1_ps(fp16_to_f32_hw(xb.d) * fp16_to_f32_hw(yb.d));
-            let qx = _mm256_sub_epi8(bytes_from_nibbles_32(xb.qs.as_ptr()), off);
-            let qy = _mm256_loadu_si256(yb.qs.as_ptr() as *const __m256i);
+                let d = _mm256_set1_ps(fp16_to_f32_hw(xb.d) * fp16_to_f32_hw(yb.d));
+                let qx = _mm256_sub_epi8(bytes_from_nibbles_32(xb.qs.as_ptr()), off);
+                let qy = _mm256_loadu_si256(yb.qs.as_ptr() as *const __m256i);
 
-            let ax = _mm256_sign_epi8(qx, qx);
-            let sy = _mm256_sign_epi8(qy, qx);
-            acc = _mm256_fmadd_ps(d, mul_sum_us8_pairs_float_vnni(ax, sy), acc);
+                let ax = _mm256_sign_epi8(qx, qx);
+                let sy = _mm256_sign_epi8(qy, qx);
+                acc = _mm256_fmadd_ps(d, mul_sum_us8_pairs_float_vnni(ax, sy), acc);
+            }
+
+            hsum_float_8(acc)
         }
-
-        hsum_float_8(acc)
     }
 }
 

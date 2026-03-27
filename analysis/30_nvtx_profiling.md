@@ -37,8 +37,17 @@ cargo build -p prelude-microbench --release --features prelude-core/nvtx
 # 运行 profiling
 nsys profile -o forward_profile ./target/release/prelude-microbench forward
 
-# 查看结果
+# 查看结果（GUI）
 nsys-ui forward_profile.nsys-rep
+
+# 命令行统计（按 NVTX range name 聚合）
+nsys stats --report nvtx_pushpop_trace forward_profile.nsys-rep
+
+# 导出 CSV
+nsys stats --report nvtx_pushpop_trace --format csv -o forward_stats forward_profile.nsys-rep
+
+# 导出 SQLite（可自定义 SQL 查询）
+nsys export --type sqlite -o forward.sqlite forward_profile.nsys-rep
 ```
 
 ## 实现

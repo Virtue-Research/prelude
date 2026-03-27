@@ -110,18 +110,20 @@ mod avx2 {
 
     #[inline(always)]
     unsafe fn get_scale_shuffle_k4(i: usize) -> __m256i {
-        _mm256_loadu_si256(SCALE_SHUFFLE_K4.get_unchecked(i).as_ptr() as *const __m256i)
+        unsafe { _mm256_loadu_si256(SCALE_SHUFFLE_K4.get_unchecked(i).as_ptr() as *const __m256i) }
     }
 
     #[inline(always)]
     unsafe fn hsum_float_8(x: __m256) -> f32 {
-        let hi128 = _mm256_extractf128_ps(x, 1);
-        let lo128 = _mm256_castps256_ps128(x);
-        let sum128 = _mm_add_ps(hi128, lo128);
-        let hi64 = _mm_movehl_ps(sum128, sum128);
-        let sum64 = _mm_add_ps(sum128, hi64);
-        let hi32 = _mm_movehdup_ps(sum64);
-        _mm_cvtss_f32(_mm_add_ss(sum64, hi32))
+        unsafe {
+            let hi128 = _mm256_extractf128_ps(x, 1);
+            let lo128 = _mm256_castps256_ps128(x);
+            let sum128 = _mm_add_ps(hi128, lo128);
+            let hi64 = _mm_movehl_ps(sum128, sum128);
+            let sum64 = _mm_add_ps(sum128, hi64);
+            let hi32 = _mm_movehdup_ps(sum64);
+            _mm_cvtss_f32(_mm_add_ss(sum64, hi32))
+        }
     }
 
     /// AVX2 Q4_K × Q8_K dot product — optimized to match ggml.
@@ -138,80 +140,80 @@ mod avx2 {
         const KMASK2: u32 = 0x0f0f0f0f;
         const KMASK3: u32 = 0x03030303;
 
-        let m4 = _mm256_set1_epi8(0x0F);
-        let mut acc = _mm256_setzero_ps();
-        let mut acc_m = _mm_setzero_ps();
+        unsafe {
+            let m4 = _mm256_set1_epi8(0x0F);
+            let mut acc = _mm256_setzero_ps();
+            let mut acc_m = _mm_setzero_ps();
 
-        let mut utmp = [0u32; 4];
+            let mut utmp = [0u32; 4];
 
-        for (xb, yb) in x.iter().zip(y.iter()) {
-            let d = yb.d * fp16_to_f32(xb.d);
-            let dmin = -yb.d * fp16_to_f32(xb.dmin);
+            for (xb, yb) in x.iter().zip(y.iter()) {
+                let d = yb.d * fp16_to_f32(xb.d);
+                let dmin = -yb.d * fp16_to_f32(xb.dmin);
 
-            // Unpack scales/mins from 12-byte packed format
-            utmp[0] = u32::from_le_bytes([xb.scales[0], xb.scales[1], xb.scales[2], xb.scales[3]]);
-            utmp[1] = u32::from_le_bytes([xb.scales[4], xb.scales[5], xb.scales[6], xb.scales[7]]);
-            utmp[2] = u32::from_le_bytes([xb.scales[8], xb.scales[9], xb.scales[10], xb.scales[11]]);
+                // Unpack scales/mins from 12-byte packed format
+                utmp[0] = u32::from_le_bytes([xb.scales[0], xb.scales[1], xb.scales[2], xb.scales[3]]);
+                utmp[1] = u32::from_le_bytes([xb.scales[4], xb.scales[5], xb.scales[6], xb.scales[7]]);
+                utmp[2] = u32::from_le_bytes([xb.scales[8], xb.scales[9], xb.scales[10], xb.scales[11]]);
 
-            utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
-            let uaux = utmp[1] & KMASK1;
-            utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
-            utmp[2] = uaux;
-            utmp[0] &= KMASK1;
+                utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
+                let uaux = utmp[1] & KMASK1;
+                utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
+                utmp[2] = uaux;
+                utmp[0] &= KMASK1;
 
-            // Load scales+mins as 16-bit: lower 128 = scales, upper 128 = mins
-            let mins_and_scales = unsafe {
-                _mm256_cvtepu8_epi16(_mm_set_epi32(
+                // Load scales+mins as 16-bit: lower 128 = scales, upper 128 = mins
+                let mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(
                     utmp[3] as i32, utmp[2] as i32, utmp[1] as i32, utmp[0] as i32,
-                ))
-            };
+                ));
 
-            // SIMD mins contribution: hadd bsums pairs, madd with mins, FMA accumulate
-            let q8sums = unsafe { _mm256_loadu_si256(yb.bsums.as_ptr() as *const __m256i) };
-            let q8s = _mm_hadd_epi16(
-                _mm256_extracti128_si256(q8sums, 0),
-                _mm256_extracti128_si256(q8sums, 1),
-            );
-            let prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
-            acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m);
+                // SIMD mins contribution: hadd bsums pairs, madd with mins, FMA accumulate
+                let q8sums = _mm256_loadu_si256(yb.bsums.as_ptr() as *const __m256i);
+                let q8s = _mm_hadd_epi16(
+                    _mm256_extracti128_si256(q8sums, 0),
+                    _mm256_extracti128_si256(q8sums, 1),
+                );
+                let prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
+                acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m);
 
-            // Extract scales for shuffle-based broadcasting
-            let sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
-            let scales = _mm256_set_m128i(sc128, sc128);
+                // Extract scales for shuffle-based broadcasting
+                let sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
+                let scales = _mm256_set_m128i(sc128, sc128);
 
-            let mut sumi = _mm256_setzero_si256();
-            let q4 = xb.qs.as_ptr();
-            let q8 = yb.qs.as_ptr();
+                let mut sumi = _mm256_setzero_si256();
+                let q4 = xb.qs.as_ptr();
+                let q8 = yb.qs.as_ptr();
 
-            for j in 0..(QK_K / 64) {
-                // Broadcast scales via shuffle table
-                let scale_l = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j));
-                let scale_h = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j + 1));
+                for j in 0..(QK_K / 64) {
+                    // Broadcast scales via shuffle table
+                    let scale_l = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j));
+                    let scale_h = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j + 1));
 
-                let q4bits = unsafe { _mm256_loadu_si256(q4.add(j * 32) as *const __m256i) };
-                let q4l = _mm256_and_si256(q4bits, m4);
-                let q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
+                    let q4bits = _mm256_loadu_si256(q4.add(j * 32) as *const __m256i);
+                    let q4l = _mm256_and_si256(q4bits, m4);
+                    let q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
 
-                let q8l = unsafe { _mm256_loadu_si256(q8.add(j * 64) as *const __m256i) };
-                let mut p16l = _mm256_maddubs_epi16(q4l, q8l);
-                p16l = _mm256_madd_epi16(scale_l, p16l);
+                    let q8l = _mm256_loadu_si256(q8.add(j * 64) as *const __m256i);
+                    let mut p16l = _mm256_maddubs_epi16(q4l, q8l);
+                    p16l = _mm256_madd_epi16(scale_l, p16l);
 
-                let q8h = unsafe { _mm256_loadu_si256(q8.add(j * 64 + 32) as *const __m256i) };
-                let mut p16h = _mm256_maddubs_epi16(q4h, q8h);
-                p16h = _mm256_madd_epi16(scale_h, p16h);
+                    let q8h = _mm256_loadu_si256(q8.add(j * 64 + 32) as *const __m256i);
+                    let mut p16h = _mm256_maddubs_epi16(q4h, q8h);
+                    p16h = _mm256_madd_epi16(scale_h, p16h);
 
-                sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16l, p16h));
+                    sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16l, p16h));
+                }
+
+                // Accumulate across blocks in float (no per-block hsum)
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
             }
 
-            // Accumulate across blocks in float (no per-block hsum)
-            acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+            // Final horizontal sum
+            acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
+            acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
+
+            hsum_float_8(acc) + _mm_cvtss_f32(acc_m)
         }
-
-        // Final horizontal sum
-        acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
-        acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
-
-        hsum_float_8(acc) + _mm_cvtss_f32(acc_m)
     }
 }
 

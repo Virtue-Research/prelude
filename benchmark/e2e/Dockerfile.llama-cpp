@@ -1,0 +1,30 @@
+# llama.cpp server — GPU or CPU inference
+#
+#   docker build -f benchmark/e2e/Dockerfile.llama-cpp -t llama-cpp-e2e .
+#   docker run --gpus all -p 8000:8000 \
+#     -v /path/to/models:/models \
+#     -e MODEL=/models/Qwen3-0.6B-BF16.gguf llama-cpp-e2e
+
+FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 https://github.com/ggerganov/llama.cpp /opt/llama.cpp \
+    && cd /opt/llama.cpp \
+    && cmake -B build -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_CUDA=ON -DGGML_AVX512=ON \
+    && cmake --build build -j$(nproc) --target llama-server \
+    && cp build/bin/llama-server /usr/local/bin/
+
+ENV MODEL=/models/model.gguf
+ENV HOST=0.0.0.0
+ENV PORT=8000
+ENV N_GPU_LAYERS=99
+
+EXPOSE 8000
+
+ENTRYPOINT ["/bin/bash", "-c", \
+    "exec llama-server -m $MODEL --host $HOST --port $PORT -ngl $N_GPU_LAYERS $EXTRA_ARGS"]
