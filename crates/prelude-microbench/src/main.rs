@@ -10,7 +10,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "prelude-microbench", about = "Prelude kernel micro-benchmarks")]
 struct Cli {
-    /// Benchmark filters (e.g. "quant", "gemm", "attention")
+    /// Benchmark filters (e.g. "quant", "gemm", "attention", "forward")
     filters: Vec<String>,
 
     /// Save results as JSON
@@ -28,6 +28,16 @@ struct Cli {
     /// Repeat iterations
     #[arg(long, default_value = "2000")]
     repeats: usize,
+
+    /// HuggingFace model directory (for forward benchmark).
+    /// Auto-detects ~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B if not set.
+    #[arg(long)]
+    model_dir: Option<PathBuf>,
+
+    /// GGUF model file for llama-bench comparison (for forward benchmark).
+    /// Also reads GGUF_MODEL env var.
+    #[arg(long)]
+    gguf_model: Option<PathBuf>,
 }
 
 fn should_run(filters: &[String], name: &str) -> bool {
@@ -91,7 +101,9 @@ fn main() -> candle_core::Result<()> {
 
     // ── CPU / Forward (model E2E) ──
     if should_run(&cli.filters, "forward") {
-        cpu::forward::bench_forward(&mut report)?;
+        let gguf_model = cli.gguf_model.clone()
+            .or_else(|| std::env::var("GGUF_MODEL").ok().map(PathBuf::from));
+        cpu::forward::bench_forward(&mut report, cli.model_dir.as_deref(), gguf_model.as_deref())?;
     }
 
     // Save JSON

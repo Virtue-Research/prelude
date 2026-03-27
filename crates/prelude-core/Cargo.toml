@@ -26,6 +26,7 @@ flashinfer = ["cuda", "prelude-flashinfer"]
 flashinfer-v4 = ["flashinfer", "flash-attn-v4", "prelude-flashinfer/skip-tvm-ffi"]
 paged-attn = ["dep:candle-paged-attn"]
 hf_tokenizer = ["dep:tokenizers"]
+nvtx = []
 
 [dependencies]
 async-trait.workspace = true

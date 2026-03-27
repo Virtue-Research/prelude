@@ -10,6 +10,7 @@ use candle_core::{Device, Result, Tensor};
 
 use crate::ops::cpu::buf_tensor::CpuTensor;
 use crate::ops::onednn::BrgemmPackedWeight;
+use crate::profiling::{nvtx_push, nvtx_pop};
 
 // ── Unified thread-local scratch buffers ───────────────────────────────
 
@@ -175,6 +176,7 @@ pub(crate) unsafe fn raw_mlp_forward(
         ensure_len(&mut scratch.silu, silu_len);
 
         // Fused path (M ≤ 128): gate_up GEMM + SiLU in one pass
+        nvtx_push!("gate_up+silu");
         if total <= 128 && gate_up_brg.n % 2 == 0 {
             crate::ops::onednn::brgemm_fused_silu_mul_raw(
                 input.as_ptr(),
@@ -199,8 +201,10 @@ pub(crate) unsafe fn raw_mlp_forward(
                 dim,
             );
         }
+        nvtx_pop!();
 
         // down GEMM: [total, intermediate] → [total, hidden]
+        nvtx_push!("down_gemm");
         crate::ops::onednn::brgemm_gemm_raw(
             scratch.silu.as_ptr(),
             down_brg,
@@ -208,6 +212,7 @@ pub(crate) unsafe fn raw_mlp_forward(
             total,
             hidden_size,
         );
+        nvtx_pop!();
     }
 }
 
@@ -463,6 +468,7 @@ pub(crate) unsafe fn raw_attention_forward<'a>(
         ensure_len(&mut scratch.proj_out, total * input_dim);
 
         // 1. QKV GEMM
+        nvtx_push!("qkv_gemm");
         crate::ops::onednn::brgemm_gemm_raw(
             x.as_ptr(),
             qkv_brg,
@@ -470,9 +476,10 @@ pub(crate) unsafe fn raw_attention_forward<'a>(
             total,
             qkv_n,
         );
+        nvtx_pop!();
 
         // 2-4. Fused deinterleave + QK-norm + RoPE
-        // Note: k_normed gets its own buffer to avoid data race with q_scratch (both were q_buf).
+        nvtx_push!("norm_rope");
         raw_fused_deinterleave_norm_rope(
             scratch.qkv.as_mut_ptr(),
             scratch.q.as_mut_ptr(),
@@ -494,9 +501,10 @@ pub(crate) unsafe fn raw_attention_forward<'a>(
             rotary_dim,
             eps,
         );
+        nvtx_pop!();
 
         // 5. Attention
-        // After fused dispatch: q_normed in q_normed[..], k_normed in k_normed[..], v in v[..]
+        nvtx_push!("attn_compute");
         let q_normed = &scratch.q_normed[..total * q_size];
         let k_normed = &scratch.k_normed[..total * kv_size];
         let v_final = &scratch.v[..total * kv_size];
@@ -511,8 +519,10 @@ pub(crate) unsafe fn raw_attention_forward<'a>(
             head_dim,
             softmax_scale,
         );
+        nvtx_pop!();
 
         // 6. O_proj GEMM
+        nvtx_push!("o_proj");
         crate::ops::onednn::brgemm_gemm_raw(
             scratch.attn_out.as_ptr(),
             oproj_brg,
@@ -520,6 +530,7 @@ pub(crate) unsafe fn raw_attention_forward<'a>(
             total,
             input_dim,
         );
+        nvtx_pop!();
 
         CpuTensor::from_slice(&scratch.proj_out[..total * input_dim], &[total, input_dim])
     }

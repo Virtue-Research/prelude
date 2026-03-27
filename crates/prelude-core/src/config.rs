@@ -149,8 +149,6 @@ pub struct RuntimeConfig {
     pub force_varlen_prefill: bool,
     /// Enable fused K-Norm + RoPE + KV cache write kernel.
     pub fused_kv_cache_write: bool,
-    /// Enable profiling output.
-    pub profile: bool,
     /// CPU IDs for NUMA-aware thread binding.
     pub cpu_thread_bind: Option<String>,
     /// Override dtype selection: "f32", "bf16".
@@ -169,7 +167,6 @@ impl RuntimeConfig {
             sync_timing: parse_env_bool("PRELUDE_SYNC_TIMING"),
             force_varlen_prefill: parse_env_bool("PRELUDE_FORCE_VARLEN_PREFILL"),
             fused_kv_cache_write: parse_env_bool_eq1("PRELUDE_FUSED_KV_CACHE_WRITE"),
-            profile: std::env::var("PRELUDE_PROFILE").is_ok(),
             cpu_thread_bind: std::env::var("SGLANG_CPU_OMP_THREADS_BIND")
                 .ok()
                 .filter(|s| !s.is_empty()),

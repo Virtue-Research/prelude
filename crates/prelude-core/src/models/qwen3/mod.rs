@@ -18,6 +18,7 @@ use crate::models::common::{
 };
 #[cfg(feature = "cuda")]
 use crate::models::common::debug_disable_fused_qknorm_rope;
+use crate::profiling::{nvtx_push, nvtx_pop};
 
 // Re-export public debug setters so existing callers (`use qwen3::set_debug_*`) still compile.
 pub use crate::models::common::{
@@ -216,9 +217,7 @@ impl Qwen3Attention {
                 }
             }
 
-            let t_qkv = std::time::Instant::now();
             let (q, k, v) = self.fused_qkv_projection(x, total_q)?;
-            let qkv_ms = t_qkv.elapsed().as_secs_f32() * 1000.0;
 
             // Fused CUDA path: norm + rope + optional fused KV cache write
             #[cfg(feature = "cuda")]
@@ -313,15 +312,8 @@ impl Qwen3Attention {
             }
 
             // Non-fused path: norm + rope then varlen attention (GPU flash-attn or CPU matmul)
-            let profile = crate::config::global_runtime()
-                .map(|r| r.profile)
-                .unwrap_or(false);
-
-            let t0 = std::time::Instant::now();
             let (q, k) = self.norm_rope_varlen(&q, &k, total_q, ctx.position_ids)?;
-            let norm_rope_ms = t0.elapsed().as_secs_f32() * 1000.0;
 
-            let t0 = std::time::Instant::now();
             let (cu_seqlens_k, max_seqlen_k) = match ctx.paged_kv {
                 Some(kv) => (kv.cu_seqlens_k, kv.max_seqlen_k),
                 None => (ctx.cu_seqlens_q, ctx.max_seqlen_q),
@@ -337,26 +329,10 @@ impl Qwen3Attention {
                 self.softmax_scale,
                 ctx.paged_kv,
             )?;
-            let attn_ms = t0.elapsed().as_secs_f32() * 1000.0;
 
-            let t0 = std::time::Instant::now();
-            let result = attn_out
+            attn_out
                 .reshape((total_q, self.hidden_size))?
-                .apply(&self.o_proj);
-            let oproj_ms = t0.elapsed().as_secs_f32() * 1000.0;
-
-            if profile {
-                tracing::info!(
-                    qkv = format!("{qkv_ms:.3}"),
-                    norm = format!("{norm_rope_ms:.3}"),
-                    rope = format!("0.000"),
-                    attn = format!("{attn_ms:.3}"),
-                    o_proj = format!("{oproj_ms:.3}"),
-                    "attn_profile"
-                );
-            }
-
-            result
+                .apply(&self.o_proj)
         }
     }
 
@@ -676,7 +652,8 @@ impl DecoderLayer {
         let needed = h2_buf.len();
         raw_cpu::with_scratch(|scratch| {
             raw_cpu::ensure_len(&mut scratch.mlp_out, needed);
-            unsafe { self.mlp.forward_raw(&h2_buf, scratch.mlp_out.as_mut_ptr()) }
+            let mlp_out_ptr = scratch.mlp_out.as_mut_ptr();
+            unsafe { self.mlp.forward_raw(scratch, &h2_buf, mlp_out_ptr) }
             crate::ops::cpu::inplace_add_bf16(x_res, &scratch.mlp_out[..needed]).unwrap();
         });
         Ok(x_res.clone())
@@ -689,7 +666,8 @@ impl DecoderLayer {
         let needed = total * hidden_size;
         raw_cpu::with_scratch_f32(|scratch| {
             raw_cpu::ensure_len_f32(&mut scratch.mlp_out, needed);
-            unsafe { self.mlp.forward_raw_f32(h2_slice.as_ptr(), total, hidden_size, scratch.mlp_out.as_mut_ptr()) }
+            let mlp_out_ptr = scratch.mlp_out.as_mut_ptr();
+            unsafe { self.mlp.forward_raw_f32(scratch, h2_slice.as_ptr(), total, hidden_size, mlp_out_ptr) }
             crate::ops::cpu::inplace_add_f32(x_res, &scratch.mlp_out[..needed]).unwrap();
         });
         Ok(x_res.clone())
@@ -780,8 +758,10 @@ impl Model {
         position_offset: usize,
     ) -> Result<Tensor> {
         let mut h = self.embed_tokens.forward(input_ids)?;
-        for layer in self.layers.iter_mut() {
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            nvtx_push!("layer[{}]", i);
             h = layer.forward_with_cache(&h, position_offset)?;
+            nvtx_pop!();
         }
         fast_rms_norm(&h, &self.norm, &self.norm_weight, self.rms_norm_eps)
     }
@@ -789,6 +769,7 @@ impl Model {
     fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> Result<Tensor> {
         let mut h = self.embed_tokens.forward(packed_input)?;
         for (i, layer) in self.layers.iter_mut().enumerate() {
+            nvtx_push!("layer[{}]", i);
             let layer_kv = ctx.paged_kv.map(|kv| kv.layer(i));
             let layer_ctx = LayerAttnContext {
                 cu_seqlens_q: ctx.cu_seqlens_q,
@@ -797,6 +778,7 @@ impl Model {
                 paged_kv: layer_kv.as_ref(),
             };
             h = layer.forward(&h, &layer_ctx)?;
+            nvtx_pop!();
         }
         fast_rms_norm(&h, &self.norm, &self.norm_weight, self.rms_norm_eps)
     }

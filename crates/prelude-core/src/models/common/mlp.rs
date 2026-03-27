@@ -7,7 +7,6 @@ use crate::loading::var_builder::VarBuilder;
 use crate::nn_ops::Qwen3Config;
 
 use super::linear::Linear;
-use super::ops::debug_disable_fused_silu_mul;
 
 #[derive(Debug, Clone)]
 pub(crate) struct GatedMlp {
@@ -58,86 +57,47 @@ impl GatedMlp {
     pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // Fused gate_up GEMM path (CPU BF16)
         if let Some(ref gup) = self.gate_up_proj {
-            {
-                let profile = crate::config::global_runtime()
-                    .map(|r| r.profile)
-                    .unwrap_or(false);
-
-                // Fused GEMM+SiLU path: gate_up GEMM + SiLU×Mul in one pass,
-                // keeping F32 accumulators hot in L2 cache.
-                // Only for small M: the C++ fused kernel uses scalar expf which
-                // is ~1000x slower than AVX-512 cpu_ops silu_mul. At M>128 the
-                // scalar expf cost overwhelms the L2 cache savings from fusion.
-                // The unfused path still benefits from 2D M×N tiling at large M.
-                                if let Some(brg) = gup.brgemm_weight() {
-                    let n = brg.n;
-                    let dims = x.dims();
-                    let m: usize = dims.iter().product::<usize>() / dims[dims.len() - 1];
-                    if n % 2 == 0 && m <= 128 {
-                        let dim = n / 2;
-                        let k = dims[dims.len() - 1];
-
-                        let t0 = std::time::Instant::now();
-                        let activated = crate::ops::onednn::brgemm_fused_silu_mul(
-                            x, brg, m, k, dim,
-                        )?;
-                        let fused_ms = t0.elapsed().as_secs_f32() * 1000.0;
-
-                        let t0 = std::time::Instant::now();
-                        let result = activated.apply(&self.down_proj);
-                        let down_ms = t0.elapsed().as_secs_f32() * 1000.0;
-
-                        if profile {
-                            tracing::info!(
-                                gate_up = format!("{fused_ms:.3}"),
-                                silu_mul = format!("0.000"),
-                                down = format!("{down_ms:.3}"),
-                                "mlp_profile"
-                            );
-                        }
-                        return result;
-                    }
+            // Fused GEMM+SiLU path: gate_up GEMM + SiLU×Mul in one pass,
+            // keeping F32 accumulators hot in L2 cache.
+            // Only for small M: the C++ fused kernel uses scalar expf which
+            // is ~1000x slower than AVX-512 cpu_ops silu_mul. At M>128 the
+            // scalar expf cost overwhelms the L2 cache savings from fusion.
+            // The unfused path still benefits from 2D M×N tiling at large M.
+            if let Some(brg) = gup.brgemm_weight() {
+                let n = brg.n;
+                let dims = x.dims();
+                let m: usize = dims.iter().product::<usize>() / dims[dims.len() - 1];
+                if n % 2 == 0 && m <= 128 {
+                    let dim = n / 2;
+                    let k = dims[dims.len() - 1];
+                    let activated = crate::ops::onednn::brgemm_fused_silu_mul(
+                        x, brg, m, k, dim,
+                    )?;
+                    return activated.apply(&self.down_proj);
                 }
-
-                let t0 = std::time::Instant::now();
-                let gate_up = gup.forward(x)?;
-                let gate_up_ms = t0.elapsed().as_secs_f32() * 1000.0;
-
-                let dims = gate_up.dims();
-                let is_3d = dims.len() == 3;
-                let flat = if is_3d {
-                    let (b, s, d) = gate_up.dims3()?;
-                    gate_up.reshape((b * s, d))?
-                } else {
-                    gate_up
-                };
-
-                let t0 = std::time::Instant::now();
-                let activated = crate::ops::cpu::cpu_silu_and_mul(&flat)?;
-                let silu_ms = t0.elapsed().as_secs_f32() * 1000.0;
-
-                let activated = if is_3d {
-                    let (b, s, _) = x.dims3()?;
-                    activated.reshape((b, s, activated.dim(1)?))?
-                } else {
-                    activated
-                };
-
-                let t0 = std::time::Instant::now();
-                let result = activated.apply(&self.down_proj);
-                let down_ms = t0.elapsed().as_secs_f32() * 1000.0;
-
-                if profile {
-                    tracing::info!(
-                        gate_up = format!("{gate_up_ms:.3}"),
-                        silu_mul = format!("{silu_ms:.3}"),
-                        down = format!("{down_ms:.3}"),
-                        "mlp_profile"
-                    );
-                }
-
-                return result;
             }
+
+            let gate_up = gup.forward(x)?;
+
+            let dims = gate_up.dims();
+            let is_3d = dims.len() == 3;
+            let flat = if is_3d {
+                let (b, s, d) = gate_up.dims3()?;
+                gate_up.reshape((b * s, d))?
+            } else {
+                gate_up
+            };
+
+            let activated = crate::ops::cpu::cpu_silu_and_mul(&flat)?;
+
+            let activated = if is_3d {
+                let (b, s, _) = x.dims3()?;
+                activated.reshape((b, s, activated.dim(1)?))?
+            } else {
+                activated
+            };
+
+            return activated.apply(&self.down_proj);
         }
 
         // gate_up_proj is always Some on CPU BF16 — this path is for CUDA only
@@ -146,9 +106,10 @@ impl GatedMlp {
         super::ops::fast_silu_mul(&gate, &up)?.apply(&self.down_proj)
     }
 
-    /// Raw MLP forward: operates on CpuTensor with thread-local scratch buffers.
+    /// Raw MLP forward: operates on CpuTensor with caller-provided scratch buffers.
     /// Eliminates all intermediate `Tensor::from_vec` allocations (~0.37ms/layer saved).
     ///
+    /// - `scratch`: caller's already-borrowed thread-local scratch (avoids nested RefCell borrow)
     /// - `input`: `[total, hidden_size]` BF16 via CpuTensor
     /// - `output`: pre-allocated `[total * hidden_size]` u16 buffer
     ///
@@ -156,6 +117,7 @@ impl GatedMlp {
     /// - `output` must point to `[total * hidden_size]` pre-allocated u16 elements.
         pub(crate) unsafe fn forward_raw(
         &self,
+        scratch: &mut super::raw_cpu::RawScratch,
         input: &crate::ops::cpu::buf_tensor::CpuTensor,
         output: *mut u16,
     ) {
@@ -172,13 +134,11 @@ impl GatedMlp {
             None => return,
         };
 
-        super::raw_cpu::with_scratch(|scratch| {
-            unsafe {
-                super::raw_cpu::raw_mlp_forward(
-                    scratch, input, gate_up_brg, down_brg, output,
-                );
-            }
-        });
+        unsafe {
+            super::raw_cpu::raw_mlp_forward(
+                scratch, input, gate_up_brg, down_brg, output,
+            );
+        }
     }
 
         pub(crate) fn gate_up_f32_packed_weight(&self) -> Option<&crate::ops::onednn::OnednnF32PackedWeight> {
@@ -188,6 +148,7 @@ impl GatedMlp {
     /// Raw F32 MLP forward: gate_up GEMM → SiLU×Mul → down GEMM on raw f32 buffers.
         pub(crate) unsafe fn forward_raw_f32(
         &self,
+        scratch: &mut super::raw_cpu::RawScratchF32,
         input: *const f32,
         total: usize,
         hidden_size: usize,
@@ -206,13 +167,11 @@ impl GatedMlp {
             None => return,
         };
 
-        super::raw_cpu::with_scratch_f32(|scratch| {
-            unsafe {
-                super::raw_cpu::raw_mlp_forward_f32(
-                    scratch, input, total, hidden_size,
-                    gate_up_pw, down_pw, output,
-                );
-            }
-        });
+        unsafe {
+            super::raw_cpu::raw_mlp_forward_f32(
+                scratch, input, total, hidden_size,
+                gate_up_pw, down_pw, output,
+            );
+        }
     }
 }

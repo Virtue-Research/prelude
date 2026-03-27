@@ -13,6 +13,7 @@ use candle_core::{Result, Tensor};
 
 use super::linear::RmsNorm;
 use super::ops::{fast_rms_norm, fused_add_rmsnorm};
+use crate::profiling::{nvtx_push, nvtx_pop};
 
 /// A generic pre-norm transformer decoder block.
 ///
@@ -38,7 +39,7 @@ pub(crate) struct TransformerBlock {
     pub(crate) ln2_weight: Tensor,
     /// RMS norm epsilon (shared by both norms; models always use the same eps).
     pub(crate) rms_norm_eps: f64,
-    /// Layer index (used for profiling output).
+    /// Layer index.
     pub(crate) layer_idx: usize,
 }
 
@@ -82,49 +83,16 @@ impl TransformerBlock {
         A: FnOnce(&Tensor) -> Result<Tensor>,
         M: FnOnce(&Tensor, &Tensor) -> Result<Tensor>,
     {
-        let profile = crate::config::global_runtime()
-            .map(|r| r.profile)
-            .unwrap_or(false);
-
-        if !profile {
-            let h = fast_rms_norm(x, &self.ln1, &self.ln1_weight, self.rms_norm_eps)?;
-            let h = attn_fn(&h)?;
-            let (x_res, h2) = fused_add_rmsnorm(
-                x, &h, &self.ln2, &self.ln2_weight, self.rms_norm_eps,
-            )?;
-            return residual_mlp_fn(&x_res, &h2);
-        }
-
-        // Profiled path: time each component separately.
-        let t = std::time::Instant::now();
         let h = fast_rms_norm(x, &self.ln1, &self.ln1_weight, self.rms_norm_eps)?;
-        let norm1_ms = t.elapsed().as_secs_f32() * 1000.0;
-
-        let t = std::time::Instant::now();
+        nvtx_push!("attention");
         let h = attn_fn(&h)?;
-        let attn_ms = t.elapsed().as_secs_f32() * 1000.0;
-
-        let t = std::time::Instant::now();
+        nvtx_pop!();
         let (x_res, h2) = fused_add_rmsnorm(
             x, &h, &self.ln2, &self.ln2_weight, self.rms_norm_eps,
         )?;
-        let norm2_ms = t.elapsed().as_secs_f32() * 1000.0;
-
-        let t = std::time::Instant::now();
-        let result = residual_mlp_fn(&x_res, &h2)?;
-        let mlp_ms = t.elapsed().as_secs_f32() * 1000.0;
-
-        let total = norm1_ms + attn_ms + norm2_ms + mlp_ms;
-        tracing::info!(
-            layer = self.layer_idx,
-            norm1 = format!("{norm1_ms:.2}"),
-            attn = format!("{attn_ms:.2}"),
-            norm2 = format!("{norm2_ms:.2}"),
-            mlp = format!("{mlp_ms:.2}"),
-            total = format!("{total:.2}"),
-            "layer_profile"
-        );
-
-        Ok(result)
+        nvtx_push!("mlp");
+        let result = residual_mlp_fn(&x_res, &h2);
+        nvtx_pop!();
+        result
     }
 }
