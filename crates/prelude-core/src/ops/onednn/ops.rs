@@ -335,6 +335,13 @@ impl Module for OnednnLinear {
     }
 }
 
+impl crate::models::common::linear::LinearBackend for OnednnLinear {
+    fn name(&self) -> &str { "cpu/onednn" }
+    fn weight(&self) -> Option<&Tensor> { Some(self.candle_linear.weight()) }
+    fn clone_box(&self) -> Box<dyn crate::models::common::linear::LinearBackend> { Box::new(self.clone()) }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
 /// Run oneDNN F32 linear: input [M, K] × weight [N, K]^T → output [M, N]
 fn f32_linear_forward(input: &Tensor, weight: &Tensor, m: usize, k: usize, n: usize) -> Result<Tensor> {
     let input = input.contiguous()?;

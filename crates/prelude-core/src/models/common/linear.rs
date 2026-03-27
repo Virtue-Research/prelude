@@ -1,44 +1,97 @@
-// Shared Linear & RmsNorm — model code uses these, never touches candle_nn types directly.
+// Shared Linear & RmsNorm — model code uses these, never touches backend types directly.
 //
-// Linear: auto-dispatches to oneDNN BRGeMM (BF16 CPU), oneDNN F32, or candle matmul.
+// Linear: auto-dispatches to GpuLinear (CUDA), OnednnLinear (CPU), or registered
+//         quantization backends (Q4_0, future Q4_K_M / FP8 / INT4).
 // RmsNorm: AVX-512 on CPU, candle on GPU.
 
-use candle_core::{DType, Device, Module, Result, Tensor};
 use crate::loading::var_builder::VarBuilder;
 use crate::nn_ops::{CandleLinear, CandleRmsNorm};
-use crate::ops::cpu::quant::BlockQ4_0;
+use candle_core::{Module, Result, Tensor};
+use std::any::Any;
+use std::sync::Arc;
+
+// ── LinearBackend trait ───────────────────────────────────────────────────
+
+/// Trait for all Linear layer backends.
+///
+/// Models call `Linear::forward(x)` which delegates to the active backend.
+/// Each backend handles its own weight storage and GEMM dispatch.
+///
+/// Implemented by: `GpuLinear`, `OnednnLinear`, `QuantizedWeight`, and
+/// future backends (FP8, INT4 GEMM, ...).
+pub trait LinearBackend: Module + Send + Sync + std::fmt::Debug {
+    /// Backend name for logging (e.g., "gpu/cutlass", "cpu/onednn", "quant/q4_0").
+    fn name(&self) -> &str;
+
+    /// Access the underlying weight tensor.
+    /// Returns `None` for quantized backends where raw weights aren't available.
+    fn weight(&self) -> Option<&Tensor> {
+        None
+    }
+
+    /// Whether this backend uses quantized weights.
+    fn is_quantized(&self) -> bool {
+        false
+    }
+
+    /// Clone into a boxed trait object.
+    fn clone_box(&self) -> Box<dyn LinearBackend>;
+
+    /// Downcast for backend-specific operations (e.g., brgemm_weight on OnednnLinear).
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl Clone for Box<dyn LinearBackend> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
+}
+
+// ── QuantFormat registry ──────────────────────────────────────────────────
+
+/// Registry entry for a quantization format.
+///
+/// Each format (Q4_0, Q4_K_M, FP8, ...) implements this trait and registers
+/// via `inventory::submit!`. `Linear::from_qtensor()` iterates the registry
+/// to find a handler for the given GGML dtype.
+pub trait QuantFormat: Send + Sync {
+    fn name(&self) -> &str;
+    fn can_handle(&self, dtype: candle_core::quantized::GgmlDType) -> bool;
+    fn load(&self, qtensor: Arc<candle_core::quantized::QTensor>) -> Result<Box<dyn LinearBackend>>;
+}
+
+/// Wrapper for `inventory` auto-registration.
+pub struct QuantFormatEntry {
+    pub format: &'static dyn QuantFormat,
+}
+
+impl QuantFormatEntry {
+    pub const fn new(format: &'static dyn QuantFormat) -> Self {
+        Self { format }
+    }
+}
+
+inventory::collect!(QuantFormatEntry);
+
+/// Find a registered QuantFormat that can handle the given dtype.
+fn find_quant_format(
+    dtype: candle_core::quantized::GgmlDType,
+) -> Option<&'static dyn QuantFormat> {
+    inventory::iter::<QuantFormatEntry>()
+        .find(|entry| entry.format.can_handle(dtype))
+        .map(|entry| entry.format)
+}
 
 // ── Linear ──────────────────────────────────────────────────────────────
 
 /// Unified linear layer. Loads weights from VarBuilder and automatically
-/// selects the best GEMM backend at construction time.
+/// selects the best backend at construction time.
 ///
-/// Supports both standard (FP16/BF16/F32) and quantized (GGUF Q4/Q8) weights.
+/// Supports both standard (FP16/BF16/F32) and quantized (GGUF) weights.
 /// Models call `linear.forward(x)` without knowing which backend is active.
 #[derive(Debug, Clone)]
 pub struct Linear {
-    inner: LinearInner,
-}
-
-#[derive(Debug, Clone)]
-enum LinearInner {
-    Candle(CandleLinear),
-    #[cfg(feature = "onednn")]
-    Onednn(crate::ops::onednn::OnednnLinear),
-    /// Quantized weights with native SIMD kernel (no candle QMatMul dependency).
-    Quantized(QuantizedWeight),
-}
-
-/// Owned quantized weight storage. Raw block data extracted from QTensor at
-/// construction time — forward uses our native SIMD kernels directly.
-#[derive(Debug, Clone)]
-struct QuantizedWeight {
-    /// Q4_0 block data, row-major: `[n, k/32]` blocks.
-    blocks: Vec<BlockQ4_0>,
-    /// Number of output features (rows).
-    n: usize,
-    /// Number of input features (columns), must be multiple of 32.
-    k: usize,
+    inner: Box<dyn LinearBackend>,
 }
 
 impl Linear {
@@ -58,109 +111,105 @@ impl Linear {
         Self::from_candle(CandleLinear::new(weight, bias))
     }
 
-    /// Wrap an existing `CandleLinear`, packing weights for acceleration.
+    /// Wrap an existing `CandleLinear`, selecting the best backend by device.
     pub fn from_candle(linear: CandleLinear) -> Result<Self> {
-        #[cfg(feature = "onednn")]
+        #[cfg(feature = "cuda")]
         {
-            let w = linear.weight();
-            if w.device().is_cpu() {
+            if linear.weight().device().is_cuda() {
                 return Ok(Self {
-                    inner: LinearInner::Onednn(crate::ops::onednn::OnednnLinear::new(linear)?),
+                    inner: Box::new(crate::ops::gpu::gemm::GpuLinear::new(
+                        linear.weight().clone(),
+                        linear.bias().cloned(),
+                    )?),
                 });
             }
         }
+
         Ok(Self {
-            inner: LinearInner::Candle(linear),
+            inner: Box::new(crate::ops::onednn::OnednnLinear::new(linear)?),
         })
     }
 
     /// Construct from a quantized QTensor (GGUF).
     ///
-    /// Extracts raw block data at construction time. Currently supports Q4_0;
-    /// unsupported formats return an error.
-    pub fn from_qtensor(qtensor: std::sync::Arc<candle_core::quantized::QTensor>) -> Result<Self> {
-        use candle_core::quantized::GgmlDType;
-
+    /// Looks up registered `QuantFormat` backends to find one that handles
+    /// the given quantization type. Returns error if no backend supports it.
+    pub fn from_qtensor(qtensor: Arc<candle_core::quantized::QTensor>) -> Result<Self> {
         let dtype = qtensor.dtype();
-        if dtype != GgmlDType::Q4_0 {
-            candle_core::bail!(
-                "Linear::from_qtensor: unsupported quantization format {:?} (only Q4_0 supported)",
+        match find_quant_format(dtype) {
+            Some(fmt) => Ok(Self {
+                inner: fmt.load(qtensor)?,
+            }),
+            None => candle_core::bail!(
+                "Linear::from_qtensor: no registered backend for {:?}",
                 dtype
-            );
+            ),
         }
-
-        let shape = qtensor.shape();
-        let dims = shape.dims();
-        let n = dims[0];
-        let k = dims[1];
-
-        let raw = qtensor.data()?;
-        let blocks: Vec<BlockQ4_0> = bytemuck::cast_slice(&raw).to_vec();
-
-        Ok(Self {
-            inner: LinearInner::Quantized(QuantizedWeight { blocks, n, k }),
-        })
     }
 
     /// Whether this linear uses quantized weights.
     pub fn is_quantized(&self) -> bool {
-        matches!(&self.inner, LinearInner::Quantized(_))
+        self.inner.is_quantized()
     }
 
     /// Access the underlying weight tensor.
     /// Panics on quantized variant — use `is_quantized()` to check first.
     pub fn weight(&self) -> &Tensor {
-        match &self.inner {
-            LinearInner::Candle(l) => l.weight(),
-            #[cfg(feature = "onednn")]
-            LinearInner::Onednn(l) => l.weight(),
-            LinearInner::Quantized(_) => panic!("weight() not available on quantized Linear"),
-        }
+        self.inner
+            .weight()
+            .expect("weight() not available on quantized Linear")
     }
 
     /// Access brgemm packed weight (BF16 CPU acceleration), if available.
-    #[cfg(feature = "onednn")]
     pub fn brgemm_weight(&self) -> Option<&crate::ops::onednn::BrgemmPackedWeight> {
-        match &self.inner {
-            LinearInner::Onednn(l) => l.brgemm_weight(),
-            _ => None,
-        }
+        self.inner
+            .as_any()
+            .downcast_ref::<crate::ops::onednn::OnednnLinear>()
+            .and_then(|l| l.brgemm_weight())
     }
 
     /// Access F32 packed weight (F32 CPU acceleration), if available.
-    #[cfg(feature = "onednn")]
     pub fn f32_packed_weight(&self) -> Option<&crate::ops::onednn::OnednnF32PackedWeight> {
-        match &self.inner {
-            LinearInner::Onednn(l) => l.f32_packed_weight(),
-            _ => None,
-        }
+        self.inner
+            .as_any()
+            .downcast_ref::<crate::ops::onednn::OnednnLinear>()
+            .and_then(|l| l.f32_packed_weight())
     }
 }
 
 impl Module for Linear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        match &self.inner {
-            LinearInner::Candle(l) => l.forward(x),
-            #[cfg(feature = "onednn")]
-            LinearInner::Onednn(l) => l.forward(x),
-            LinearInner::Quantized(qw) => qw.forward(x),
-        }
+        self.inner.forward(x)
     }
 }
 
-impl QuantizedWeight {
+// ── Q4_0 quantized backend ───────────────────────────────────────────────
+
+/// Owned quantized weight storage (Q4_0). Raw block data extracted from QTensor
+/// at construction time — forward uses our native SIMD kernels directly.
+#[derive(Debug, Clone)]
+struct QuantizedWeight {
+    blocks: Vec<crate::ops::cpu::quant::BlockQ4_0>,
+    n: usize,
+    k: usize,
+}
+
+impl Module for QuantizedWeight {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         use crate::ops::cpu::quant::quantized_matmul_f32;
+        use candle_core::{DType, Device};
 
         let x = x.to_dtype(DType::F32)?;
         let x_dims = x.shape().dims();
         let m: usize = x_dims[..x_dims.len() - 1].iter().product();
         let x_k = *x_dims.last().unwrap();
         if x_k != self.k {
-            candle_core::bail!("quantized matmul: x inner dim {x_k} != weight dim {}", self.k);
+            candle_core::bail!(
+                "quantized matmul: x inner dim {x_k} != weight dim {}",
+                self.k
+            );
         }
 
-        // Get x as contiguous F32 slice
         let x_cont = x.flatten_all()?;
         let x_storage = x_cont.storage_and_layout().0;
         let x_slice = match &*x_storage {
@@ -177,14 +226,124 @@ impl QuantizedWeight {
     }
 }
 
+impl LinearBackend for QuantizedWeight {
+    fn name(&self) -> &str {
+        "quant/q4_0"
+    }
+    fn is_quantized(&self) -> bool {
+        true
+    }
+    fn clone_box(&self) -> Box<dyn LinearBackend> {
+        Box::new(self.clone())
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Q4_0 format handler — registered via `inventory`.
+struct Q4_0Format;
+
+impl QuantFormat for Q4_0Format {
+    fn name(&self) -> &str {
+        "Q4_0"
+    }
+    fn can_handle(&self, dtype: candle_core::quantized::GgmlDType) -> bool {
+        dtype == candle_core::quantized::GgmlDType::Q4_0
+    }
+    fn load(&self, qtensor: Arc<candle_core::quantized::QTensor>) -> Result<Box<dyn LinearBackend>> {
+        let shape = qtensor.shape();
+        let dims = shape.dims();
+        let n = dims[0];
+        let k = dims[1];
+        let raw = qtensor.data()?;
+        let blocks: Vec<crate::ops::cpu::quant::BlockQ4_0> =
+            bytemuck::cast_slice(&raw).to_vec();
+        Ok(Box::new(QuantizedWeight { blocks, n, k }))
+    }
+}
+
+inventory::submit!(QuantFormatEntry::new(&Q4_0Format));
+
+// ── Q4_K quantized backend ──────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct QuantizedWeightQ4K {
+    blocks: Vec<crate::ops::cpu::quant::BlockQ4K>,
+    n: usize,
+    k: usize,
+}
+
+impl Module for QuantizedWeightQ4K {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        use crate::ops::cpu::quant::q4_k::quantized_matmul_q4k;
+        use candle_core::{DType, Device};
+
+        let x = x.to_dtype(DType::F32)?;
+        let x_dims = x.shape().dims();
+        let m: usize = x_dims[..x_dims.len() - 1].iter().product();
+        let x_k = *x_dims.last().unwrap();
+        if x_k != self.k {
+            candle_core::bail!(
+                "Q4_K matmul: x inner dim {x_k} != weight dim {}",
+                self.k
+            );
+        }
+
+        let x_cont = x.flatten_all()?;
+        let x_storage = x_cont.storage_and_layout().0;
+        let x_slice = match &*x_storage {
+            candle_core::Storage::Cpu(cpu) => cpu.as_slice::<f32>()?,
+            _ => candle_core::bail!("Q4_K matmul: expected CPU tensor"),
+        };
+
+        let mut out = vec![0.0f32; m * self.n];
+        quantized_matmul_q4k(x_slice, &self.blocks, &mut out, m, self.n, self.k);
+
+        let mut out_dims = x_dims[..x_dims.len() - 1].to_vec();
+        out_dims.push(self.n);
+        Tensor::from_vec(out, out_dims.as_slice(), &Device::Cpu)
+    }
+}
+
+impl LinearBackend for QuantizedWeightQ4K {
+    fn name(&self) -> &str { "quant/q4_k" }
+    fn is_quantized(&self) -> bool { true }
+    fn clone_box(&self) -> Box<dyn LinearBackend> { Box::new(self.clone()) }
+    fn as_any(&self) -> &dyn Any { self }
+}
+
+struct Q4KFormat;
+
+impl QuantFormat for Q4KFormat {
+    fn name(&self) -> &str { "Q4_K" }
+    fn can_handle(&self, dtype: candle_core::quantized::GgmlDType) -> bool {
+        dtype == candle_core::quantized::GgmlDType::Q4K
+    }
+    fn load(&self, qtensor: Arc<candle_core::quantized::QTensor>) -> Result<Box<dyn LinearBackend>> {
+        let shape = qtensor.shape();
+        let dims = shape.dims();
+        let n = dims[0];
+        let k = dims[1];
+        let raw = qtensor.data()?;
+        let blocks: Vec<crate::ops::cpu::quant::BlockQ4K> =
+            bytemuck::cast_slice(&raw).to_vec();
+        Ok(Box::new(QuantizedWeightQ4K { blocks, n, k }))
+    }
+}
+
+inventory::submit!(QuantFormatEntry::new(&Q4KFormat));
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::quantized::{QTensor, GgmlDType};
+    use candle_core::quantized::{GgmlDType, QTensor};
+    use candle_core::{DType, Device};
 
     #[test]
     fn q4_0_linear_forward_matches_candle() {
-        // Create F32 weight [N=4, K=64], quantize to Q4_0
         let k = 64;
         let n = 4;
         let w_data: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.01).sin()).collect();
@@ -192,30 +351,27 @@ mod tests {
         let qt = QTensor::quantize_onto(&w_tensor, GgmlDType::Q4_0, &Device::Cpu).unwrap();
         let qt = std::sync::Arc::new(qt);
 
-        // Create input x [M=2, K=64]
         let m = 2;
         let x_data: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.03).cos()).collect();
         let x = Tensor::from_vec(x_data, (m, k), &Device::Cpu).unwrap();
 
-        // Our path: Linear with native Q4_0 kernel
         let our_linear = Linear::from_qtensor(qt.clone()).unwrap();
         let our_out = our_linear.forward(&x).unwrap();
 
-        // Reference path: candle's QMatMul dequant→F32→matmul
         let w_deq = qt.dequantize(&Device::Cpu).unwrap();
         let ref_out = x.matmul(&w_deq.t().unwrap()).unwrap();
 
-        // Compare: both start from same Q4_0 weights, but our path also
-        // quantizes activations to Q8_0. Normalized error should be small.
         let our_flat = our_out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let ref_flat = ref_out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
 
         let n_elems = our_flat.len();
-        let mean_abs_err: f32 = our_flat.iter().zip(ref_flat.iter())
+        let mean_abs_err: f32 = our_flat
+            .iter()
+            .zip(ref_flat.iter())
             .map(|(a, b)| (a - b).abs())
-            .sum::<f32>() / n_elems as f32;
+            .sum::<f32>()
+            / n_elems as f32;
 
-        // Activation quantization adds some noise, but should be small
         assert!(
             mean_abs_err < 0.05,
             "Q4_0 Linear forward: mean abs error {mean_abs_err} too high"
@@ -224,7 +380,6 @@ mod tests {
 
     #[test]
     fn q4_0_linear_output_shape() {
-        // Verify output shape is correct for batched input
         let k = 32;
         let n = 8;
         let w_data: Vec<f32> = (0..n * k).map(|i| (i as f32) * 0.01).collect();
@@ -232,12 +387,10 @@ mod tests {
         let qt = QTensor::quantize_onto(&w_tensor, GgmlDType::Q4_0, &Device::Cpu).unwrap();
         let linear = Linear::from_qtensor(std::sync::Arc::new(qt)).unwrap();
 
-        // [3, 32] → [3, 8]
         let x = Tensor::zeros((3, k), DType::F32, &Device::Cpu).unwrap();
         let out = linear.forward(&x).unwrap();
         assert_eq!(out.dims(), &[3, 8]);
 
-        // [2, 5, 32] → [2, 5, 8]
         let x = Tensor::zeros((2, 5, k), DType::F32, &Device::Cpu).unwrap();
         let out = linear.forward(&x).unwrap();
         assert_eq!(out.dims(), &[2, 5, 8]);
@@ -284,10 +437,8 @@ impl Module for RmsNorm {
         if x.device().is_cpu() {
             crate::ops::cpu::cpu_rmsnorm(x, &self.weight, self.eps)
         } else {
-            // GPU: use candle's built-in RmsNorm which dispatches to CUDA kernel
             let norm = CandleRmsNorm::new(self.weight.clone(), self.eps);
             norm.forward(x)
         }
     }
 }
-

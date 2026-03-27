@@ -13,8 +13,8 @@ readme = "../../README.md"
 keywords = ["llm", "inference", "serving", "scheduler", "rust"]
 
 [features]
-default = ["onednn"]
-cuda = ["candle-core/cuda", "candle-transformers?/cuda"]
+default = []
+cuda = ["candle-core/cuda", "candle-transformers?/cuda", "cutlass-gemm"]
 candle-baseline = ["dep:candle-transformers"]
 flash-attn = ["cuda", "paged-attn", "candle-flash-attn"]
 flash-attn-v3 = ["cuda", "candle-flash-attn-v3"]
@@ -25,8 +25,6 @@ flashinfer = ["cuda", "prelude-flashinfer"]
 ## FlashInfer + FA4 combined: FlashInfer skips tvm_ffi compilation (FA4 provides it).
 flashinfer-v4 = ["flashinfer", "flash-attn-v4", "prelude-flashinfer/skip-tvm-ffi"]
 paged-attn = ["dep:candle-paged-attn"]
-onednn = []
-ggml-quants = ["dep:prelude-ggml-quants"]
 hf_tokenizer = ["dep:tokenizers"]
 
 [dependencies]
@@ -52,7 +50,6 @@ prelude-flash-attn-v4 = { workspace = true, optional = true }
 prelude-deepgemm = { workspace = true, optional = true }
 prelude-cutlass-gemm = { workspace = true, optional = true }
 prelude-flashinfer = { workspace = true, optional = true }
-prelude-ggml-quants = { path = "../prelude-ggml-quants", optional = true }
 inventory = "0.3"
 rayon = "1.11.0"
 nix = { version = "0.31", features = ["sched"] }

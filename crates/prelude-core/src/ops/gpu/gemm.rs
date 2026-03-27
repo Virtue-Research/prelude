@@ -1,8 +1,12 @@
-//! GPU GEMM dispatch registration.
+//! GPU GEMM — direct CUTLASS/DeepGEMM dispatch for Linear layers.
 //!
-//! Registers CUTLASS (and optionally DeepGEMM) as the GEMM backend for
-//! candle-core's `Tensor::matmul()`, replacing cuBLAS entirely.
+//! `GpuLinear` calls CUTLASS/DeepGEMM FFI directly, without going through
+//! candle's `Tensor::matmul()` monkey-patch.
+//!
+//! `register_gpu_gemm()` is still provided for other `Tensor::matmul()` callers
+//! (attention, RoPE, etc.) that haven't been converted yet.
 
+use candle_core::{DType, Module, Result, Tensor};
 use std::ffi::c_void;
 
 /// Register our GEMM dispatch with candle-core. Must be called before any GPU matmul.
@@ -80,4 +84,165 @@ unsafe fn gemm_dispatch_impl(
 
     #[allow(unreachable_code)]
     -99 // No GEMM backend available
+}
+
+// ── GpuLinear ─────────────────────────────────────────────────────────────
+
+/// GPU Linear layer — calls CUTLASS/DeepGEMM directly.
+///
+/// Unlike `CandleLinear` which goes through `Tensor::matmul()` → registered dispatch,
+/// this extracts CUDA pointers and calls the GEMM kernels via FFI. No global
+/// registration needed for this path.
+#[derive(Debug, Clone)]
+pub struct GpuLinear {
+    weight: Tensor,
+    bias: Option<Tensor>,
+}
+
+impl GpuLinear {
+    /// Create from weight `[N, K]` and optional bias `[N]` on CUDA.
+    pub fn new(weight: Tensor, bias: Option<Tensor>) -> Result<Self> {
+        if !weight.device().is_cuda() {
+            candle_core::bail!("GpuLinear: weight must be on CUDA device");
+        }
+        Ok(Self { weight, bias })
+    }
+}
+
+impl crate::models::common::linear::LinearBackend for GpuLinear {
+    fn name(&self) -> &str { "gpu/cutlass" }
+    fn weight(&self) -> Option<&Tensor> { Some(&self.weight) }
+    fn clone_box(&self) -> Box<dyn crate::models::common::linear::LinearBackend> { Box::new(self.clone()) }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
+impl Module for GpuLinear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x_dims = x.dims().to_vec();
+        let k = *x_dims.last().unwrap();
+        let (n, wk) = self.weight.dims2()?;
+        if k != wk {
+            candle_core::bail!("GpuLinear: input dim {k} != weight dim {wk}");
+        }
+        let m: usize = x_dims[..x_dims.len() - 1].iter().product();
+
+        // Flatten batch dims and ensure contiguous
+        let x_flat = if x_dims.len() == 2 && x.is_contiguous() {
+            x.clone()
+        } else {
+            x.reshape((m, k))?.contiguous()?
+        };
+
+        // y[M,N] = x[M,K] @ W[N,K]^T
+        let y_flat = gpu_matmul_nt(&x_flat, &self.weight, m, n, k)?;
+
+        // Reshape back to original batch dims
+        let y = if x_dims.len() > 2 {
+            let mut out_dims = x_dims[..x_dims.len() - 1].to_vec();
+            out_dims.push(n);
+            y_flat.reshape(out_dims.as_slice())?
+        } else {
+            y_flat
+        };
+
+        match &self.bias {
+            None => Ok(y),
+            Some(bias) => y.broadcast_add(bias),
+        }
+    }
+}
+
+/// Compute y[M,N] = x[M,K] @ W[N,K]^T via CUTLASS/DeepGEMM.
+///
+/// Both tensors must be contiguous and on the same CUDA device.
+fn gpu_matmul_nt(x: &Tensor, w: &Tensor, m: usize, n: usize, k: usize) -> Result<Tensor> {
+    let dtype_code = match x.dtype() {
+        DType::BF16 => 0u32,
+        DType::F16 => 1u32,
+        DType::F32 => 2u32,
+        dt => candle_core::bail!("gpu_matmul_nt: unsupported dtype {dt:?}"),
+    };
+    match x.dtype() {
+        DType::BF16 => gpu_matmul_nt_typed::<half::bf16>(x, w, m, n, k, dtype_code),
+        DType::F16 => gpu_matmul_nt_typed::<half::f16>(x, w, m, n, k, dtype_code),
+        DType::F32 => gpu_matmul_nt_typed::<f32>(x, w, m, n, k, dtype_code),
+        dt => candle_core::bail!("gpu_matmul_nt: unsupported dtype {dt:?}"),
+    }
+}
+
+/// Typed inner function — extracts CUDA pointers and calls GEMM dispatch.
+fn gpu_matmul_nt_typed<T>(
+    x: &Tensor,
+    w: &Tensor,
+    m: usize,
+    n: usize,
+    k: usize,
+    dtype_code: u32,
+) -> Result<Tensor>
+where
+    T: candle_core::cuda_backend::CudaDType
+        + candle_core::cuda_backend::cudarc::driver::DeviceRepr,
+{
+    use candle_core::op::BackpropOp;
+
+    let dev = x.device().as_cuda_device()?;
+
+    // Extract CUDA slices
+    let (x_storage, _x_layout) = x.storage_and_layout();
+    let x_slice = match &*x_storage {
+        candle_core::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+        _ => candle_core::bail!("gpu_matmul_nt: expected CUDA tensor for x"),
+    };
+
+    let (w_storage, _w_layout) = w.storage_and_layout();
+    let w_slice = match &*w_storage {
+        candle_core::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+        _ => candle_core::bail!("gpu_matmul_nt: expected CUDA tensor for w"),
+    };
+
+    // Allocate output
+    let out = unsafe { dev.alloc::<T>(m * n)? };
+
+    // Get raw device pointers
+    let x_ptr = x_slice.device_ptr(x_slice.stream()).0 as *const c_void;
+    let w_ptr = w_slice.device_ptr(w_slice.stream()).0 as *const c_void;
+    let out_ptr = out.device_ptr(out.stream()).0 as *mut c_void;
+    let stream = dev.cuda_stream();
+    let raw_stream = unsafe { stream.cu_stream() } as *const c_void;
+
+    // cuBLAS convention: A=weight, B=input, m=N_features, n=M_tokens
+    // transa=true because weight [N,K] row-major needs transpose in cuBLAS col-major
+    let ret = unsafe {
+        gemm_dispatch_impl(
+            w_ptr,       // A = weight
+            x_ptr,       // B = input
+            out_ptr,     // D = output
+            n as i32,    // m_cublas = N (features)
+            m as i32,    // n_cublas = M (tokens)
+            k as i32,
+            1,           // batch
+            k as i32,    // lda (weight [N,K] row-major)
+            k as i32,    // ldb (input [M,K] row-major)
+            n as i32,    // ldd
+            0, 0, 0,     // batch strides (non-batched)
+            true, false, // transa, transb
+            dtype_code,
+            raw_stream,
+        )
+    };
+    if ret != 0 {
+        candle_core::bail!("GPU GEMM failed (code {ret}) M={m} N={n} K={k}");
+    }
+
+    // Release storage guards before wrapping output
+    drop(x_storage);
+    drop(w_storage);
+
+    let out_storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev.clone());
+    Tensor::from_storage(
+        candle_core::Storage::Cuda(out_storage),
+        (m, n),
+        BackpropOp::none(),
+        false,
+    )
 }
