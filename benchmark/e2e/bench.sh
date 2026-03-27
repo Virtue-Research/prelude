@@ -20,6 +20,7 @@
 #   PORT            Server port (default: 8000)
 #   RESULTS_DIR     Output directory (default: benchmark/e2e/results)
 #   HF_TOKEN        HuggingFace token for gated models
+#   LLAMA_CPP_CONVERT  Path to convert_hf_to_gguf.py (auto-detected)
 #
 # Prerequisites:
 #   pip install "genai-bench @ git+https://github.com/rucnyz/genai-bench.git"
@@ -172,7 +173,7 @@ start_prelude() {
         -v prelude-e2e-target:/workspace/target \
         -v "${HF_CACHE}:/root/.cache/huggingface:ro" \
         "${image}" \
-        bash -c "cd /workspace && cargo build -p prelude-server --release && exec ./target/release/prelude-server --model ${MODEL} --host 0.0.0.0 --port 8000 ${extra}"
+        bash -c "cd /workspace && cargo build -p prelude-server --release --features flashinfer-v4,onednn,deepgemm && exec ./target/release/prelude-server --model ${MODEL} --host 0.0.0.0 --port 8000 ${extra}"
 }
 
 start_vllm() {
@@ -240,25 +241,14 @@ start_sglang() {
     fi
 }
 
-## Build the shared "others" image (llama.cpp + vllm.rs)
+## Build the shared "others" image (llama.cpp + vllm.rs, both git cloned inside)
 ensure_others_image() {
     local image="prelude-others"
     if docker image inspect "${image}" &>/dev/null; then
         return 0
     fi
-    local vllm_rs_dir="${VLLM_RS_DIR:-${PROJECT_ROOT}/../vllm.rs}"
-    if [[ ! -d "${vllm_rs_dir}" ]]; then
-        echo "ERROR: vllm.rs source not found at ${vllm_rs_dir}"
-        echo "  Set VLLM_RS_DIR or clone: git clone https://github.com/yuzhounie/vllm.rs ../vllm.rs"
-        return 1
-    fi
-    # Build context needs vllm.rs source as a subdirectory
-    local build_ctx
-    build_ctx="$(mktemp -d)"
-    ln -s "$(cd "${vllm_rs_dir}" && pwd)" "${build_ctx}/vllm.rs"
     echo ">>> Building ${image} (llama.cpp + vllm.rs, this takes a while) ..."
-    docker build -f "${SCRIPT_DIR}/Dockerfile.others" -t "${image}" "${build_ctx}"
-    rm -rf "${build_ctx}"
+    docker build -f "${SCRIPT_DIR}/Dockerfile.others" -t "${image}" "${SCRIPT_DIR}"
 }
 
 start_vllm_rs() {

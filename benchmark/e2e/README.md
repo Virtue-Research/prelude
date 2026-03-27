@@ -81,7 +81,7 @@ docker build -f docker/xeon.Dockerfile -t sglang-cpu .
 | `GPU`          | `0`                | GPU device id                  |
 | `PORT`         | `8000`             | Server port                    |
 | `HF_TOKEN`     | -                  | HuggingFace token (gated models)|
-| `VLLM_RS_DIR`  | `../vllm.rs`       | vllm.rs source path            |
+| `LLAMA_CPP_CONVERT` | (auto-detected) | Path to convert_hf_to_gguf.py |
 
 ## Results
 
