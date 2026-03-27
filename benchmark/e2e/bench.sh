@@ -12,7 +12,6 @@
 #
 # Environment variables:
 #   MODEL           HuggingFace model (default: Qwen/Qwen3-0.6B)
-#   GGUF_MODEL      GGUF file path for llama.cpp (required for llama.cpp)
 #   INPUT_TOKENS    Prompt length (default: 128)
 #   OUTPUT_TOKENS   Generation length (default: 1, i.e. prefill-only)
 #   MAX_REQUESTS    Total requests (default: 200)
@@ -39,7 +38,6 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # ── Config ────────────────────────────────────────────────────────────────
 
 MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
-GGUF_MODEL="${GGUF_MODEL:-}"
 INPUT_TOKENS="${INPUT_TOKENS:-128}"
 OUTPUT_TOKENS="${OUTPUT_TOKENS:-1}"
 MAX_REQUESTS="${MAX_REQUESTS:-200}"
@@ -52,6 +50,7 @@ CONTAINER_NAME="prelude-e2e-bench"
 HEALTH_TIMEOUT=180
 CPU_MODE=false
 HF_CACHE="${HOME}/.cache/huggingface"
+GGUF_CACHE="${HOME}/.cache/prelude/gguf"
 
 ENGINES=()
 for arg in "$@"; do
@@ -282,18 +281,79 @@ start_vllm_rs() {
         --port 8000
 }
 
+## Resolve GGUF model: auto-convert from HF safetensors if not cached.
+## Result path: ~/.cache/prelude/gguf/<org>--<name>/model-BF16.gguf
+resolve_gguf() {
+    local model_safe="${MODEL//\//__}"  # Qwen/Qwen3-0.6B → Qwen__Qwen3-0.6B
+    local gguf_dir="${GGUF_CACHE}/${model_safe}"
+    local gguf_file="${gguf_dir}/model-BF16.gguf"
+
+    if [[ -f "${gguf_file}" ]]; then
+        echo "${gguf_file}"
+        return 0
+    fi
+
+    # Find HF model directory
+    local hf_model_dir=""
+    local hf_safe="${MODEL//\//--}"  # Qwen/Qwen3-0.6B → Qwen--Qwen3-0.6B
+    local hf_base="${HF_CACHE}/hub/models--${hf_safe}/snapshots"
+    if [[ -d "${hf_base}" ]]; then
+        for snap in "${hf_base}"/*/; do
+            if [[ -f "${snap}/config.json" ]]; then
+                hf_model_dir="${snap}"
+                break
+            fi
+        done
+    fi
+
+    if [[ -z "${hf_model_dir}" ]]; then
+        echo "  Downloading ${MODEL} ..." >&2
+        huggingface-cli download "${MODEL}" --local-dir "${gguf_dir}/hf_tmp" >&2
+        hf_model_dir="${gguf_dir}/hf_tmp"
+    fi
+
+    # Convert using llama.cpp's convert script
+    local convert_script="${LLAMA_CPP_CONVERT:-}"
+    if [[ -z "${convert_script}" ]]; then
+        # Common locations
+        for p in \
+            /opt/llama.cpp/convert_hf_to_gguf.py \
+            ../llama.cpp/convert_hf_to_gguf.py \
+            /home/yuzhounie/src/llama.cpp/convert_hf_to_gguf.py; do
+            if [[ -f "${p}" ]]; then
+                convert_script="${p}"
+                break
+            fi
+        done
+    fi
+
+    if [[ -z "${convert_script}" ]]; then
+        echo "ERROR: convert_hf_to_gguf.py not found. Set LLAMA_CPP_CONVERT=/path/to/convert_hf_to_gguf.py" >&2
+        return 1
+    fi
+
+    mkdir -p "${gguf_dir}"
+    echo "  Converting ${MODEL} → GGUF (BF16) ..." >&2
+    python3 "${convert_script}" "${hf_model_dir}" \
+        --outfile "${gguf_file}" \
+        --outtype bf16 >&2 || { echo "ERROR: GGUF conversion failed" >&2; return 1; }
+
+    # Clean up temp download if we did one
+    [[ -d "${gguf_dir}/hf_tmp" ]] && rm -rf "${gguf_dir}/hf_tmp"
+
+    echo "${gguf_file}"
+}
+
 start_llama_cpp() {
     ensure_others_image || return 1
 
-    if [[ -z "${GGUF_MODEL}" ]]; then
-        echo "ERROR: GGUF_MODEL not set. Example:"
-        echo "  GGUF_MODEL=/path/to/Qwen3-0.6B-BF16.gguf ./benchmark/e2e/bench.sh llama.cpp"
-        return 1
-    fi
+    local gguf_file
+    gguf_file="$(resolve_gguf)" || return 1
+
     local model_dir
-    model_dir="$(cd "$(dirname "${GGUF_MODEL}")" && pwd)"
+    model_dir="$(dirname "${gguf_file}")"
     local model_file
-    model_file="$(basename "${GGUF_MODEL}")"
+    model_file="$(basename "${gguf_file}")"
 
     local ngl=99
     local gpu_flag="--gpus device=${GPU}"
@@ -301,6 +361,8 @@ start_llama_cpp() {
         ngl=0
         gpu_flag=""
     fi
+
+    echo "  GGUF: ${gguf_file}"
 
     # shellcheck disable=SC2086
     docker run -d --name "${CONTAINER_NAME}" \
@@ -362,7 +424,8 @@ if [[ ${#ENGINES[@]} -eq 0 ]]; then
     echo "  $0 prelude                             # Prelude GPU"
     echo "  $0 prelude --cpu                       # Prelude CPU"
     echo "  $0 all --cpu                           # All engines CPU"
-    echo "  INPUT_TOKENS=512 $0 prelude vllm       # Compare prelude vs vllm"
+    echo "  INPUT_TOKENS=512 $0 prelude vllm       # Compare prelude vs vllm
+  $0 llama.cpp                                 # Auto-converts HF model to GGUF"
     echo ""
     echo "Environment:"
     echo "  MODEL=${MODEL}  GPU=${GPU}  PORT=${PORT}"

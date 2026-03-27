@@ -22,7 +22,7 @@ pip install "genai-bench @ git+https://github.com/rucnyz/genai-bench.git"
 ./benchmark/e2e/bench.sh vllm
 ./benchmark/e2e/bench.sh sglang
 ./benchmark/e2e/bench.sh vllm.rs
-GGUF_MODEL=/path/to/model.gguf ./benchmark/e2e/bench.sh llama.cpp
+./benchmark/e2e/bench.sh llama.cpp        # 自动从 HF 模型转换 GGUF
 
 # 多个引擎对比
 ./benchmark/e2e/bench.sh prelude vllm sglang
@@ -48,6 +48,16 @@ INPUT_TOKENS=512 OUTPUT_TOKENS=32 MAX_REQUESTS=100 CONCURRENCY=4 \
 
 首次运行自动 build image，之后复用。
 
+## GGUF 自动转换
+
+llama.cpp 需要 GGUF 格式模型。bench.sh 自动处理：
+
+1. 检查 `~/.cache/prelude/gguf/<model>/model-BF16.gguf` 是否已存在
+2. 不存在则从 HF cache 中的 safetensors 自动转换（需要 `convert_hf_to_gguf.py`）
+3. 转换结果缓存，下次直接复用
+
+需要 llama.cpp 的转换脚本，自动搜索常见路径，或通过 `LLAMA_CPP_CONVERT` 指定。
+
 ## CPU Image 构建 (一次性)
 
 vLLM 和 SGLang 的 CPU 版需要从上游源码构建：
@@ -67,7 +77,6 @@ docker build -f docker/xeon.Dockerfile -t sglang-cpu .
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `MODEL` | `Qwen/Qwen3-0.6B` | HuggingFace 模型 |
-| `GGUF_MODEL` | - | GGUF 文件路径 (llama.cpp 必需) |
 | `INPUT_TOKENS` | `128` | 输入 token 数 |
 | `OUTPUT_TOKENS` | `1` | 输出 token 数 (1 = prefill-only) |
 | `MAX_REQUESTS` | `200` | 总请求数 |
