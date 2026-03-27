@@ -44,7 +44,7 @@ rand.workspace = true
 fastokens.workspace = true
 hf-hub.workspace = true
 half = { version = "2.7.1", features = ["bytemuck"] }
-bytemuck = { version = "1", features = ["extern_crate_alloc"] }
+bytemuck = { version = "1", features = ["extern_crate_alloc", "derive"] }
 candle-flash-attn = { workspace = true, optional = true }
 candle-flash-attn-v3 = { workspace = true, optional = true }
 candle-paged-attn = { workspace = true, optional = true }

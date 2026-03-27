@@ -10,6 +10,7 @@ pub mod cpu_float;
 pub mod gemm;
 pub mod gemm_pool;
 pub mod numa;
+pub mod quant;
 pub mod rmsnorm;
 pub mod rope;
 pub mod silu_mul;
