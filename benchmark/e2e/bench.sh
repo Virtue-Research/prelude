@@ -173,7 +173,7 @@ start_prelude() {
         -v prelude-e2e-target:/workspace/target \
         -v "${HF_CACHE}:/root/.cache/huggingface:ro" \
         "${image}" \
-        bash -c "cd /workspace && cargo build -p prelude-server --release --features flashinfer-v4,onednn,deepgemm && exec ./target/release/prelude-server --model ${MODEL} --host 0.0.0.0 --port 8000 ${extra}"
+        bash -c "cd /workspace && cargo build -p prelude-server --release --features full && exec ./target/release/prelude-server --model ${MODEL} --host 0.0.0.0 --port 8000 ${extra}"
 }
 
 start_vllm() {
