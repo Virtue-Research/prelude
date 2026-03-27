@@ -212,6 +212,37 @@ start_sglang() {
     fi
 }
 
+start_vllm_rs() {
+    local image="vllm-rs-e2e"
+    local vllm_rs_dir="${VLLM_RS_DIR:-${PROJECT_ROOT}/../vllm.rs}"
+    if ! docker image inspect "${image}" &>/dev/null; then
+        if [[ ! -d "${vllm_rs_dir}" ]]; then
+            echo "ERROR: vllm.rs source not found at ${vllm_rs_dir}"
+            echo "  Set VLLM_RS_DIR or clone: git clone https://github.com/yuzhounie/vllm.rs ../vllm.rs"
+            return 1
+        fi
+        echo ">>> Building ${image} (this takes a while) ..."
+        docker build -f "${SCRIPT_DIR}/Dockerfile.vllm-rs" -t "${image}" "${vllm_rs_dir}"
+    fi
+
+    # vllm.rs is GPU-only
+    if [[ "${CPU_MODE}" == true ]]; then
+        echo "  SKIP: vllm.rs does not support CPU mode"
+        return 1
+    fi
+
+    docker run -d --name "${CONTAINER_NAME}" \
+        --gpus "device=${GPU}" \
+        -p "${PORT}:8000" \
+        --ipc=host \
+        -v "${HF_CACHE}:/data:ro" \
+        -e HF_TOKEN="${HF_TOKEN}" \
+        "${image}" \
+        --model "${MODEL}" \
+        --host 0.0.0.0 \
+        --port 8000
+}
+
 start_llama_cpp() {
     local image="llama-cpp-e2e"
     if ! docker image inspect "${image}" &>/dev/null; then
@@ -258,11 +289,12 @@ bench_engine() {
     case "${engine}" in
         prelude)    start_prelude ;;
         vllm)       start_vllm ;;
+        vllm.rs)    start_vllm_rs ;;
         sglang)     start_sglang ;;
         llama.cpp)  start_llama_cpp ;;
         *)
             echo "Unknown engine: ${engine}"
-            echo "Available: prelude, vllm, sglang, llama.cpp"
+            echo "Available: prelude, vllm, vllm.rs, sglang, llama.cpp"
             return 1
             ;;
     esac
@@ -279,7 +311,7 @@ bench_engine() {
 if [[ ${#ENGINES[@]} -eq 0 ]]; then
     echo "Usage: $0 <engine|all> [engine2 ...] [--cpu]"
     echo ""
-    echo "Engines: prelude, vllm, sglang, llama.cpp"
+    echo "Engines: prelude, vllm, vllm.rs, sglang, llama.cpp"
     echo "  all = all engines"
     echo ""
     echo "Flags:"
@@ -302,7 +334,7 @@ trap cleanup EXIT
 
 for engine in "${ENGINES[@]}"; do
     if [[ "${engine}" == "all" ]]; then
-        for e in prelude vllm sglang llama.cpp; do
+        for e in prelude vllm vllm.rs sglang llama.cpp; do
             bench_engine "${e}" || true
         done
     else
