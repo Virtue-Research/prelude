@@ -198,10 +198,10 @@ start_prelude() {
         return 0
     fi
 
-    # ── Docker mode ──
-    local image="prelude-dev"
+    # ── Docker mode: pre-built image with binary baked in ──
+    local image="prelude"
     if ! docker image inspect "${image}" &>/dev/null; then
-        echo ">>> Building ${image} ..."
+        echo ">>> Building ${image} (this takes ~20min on first build) ..."
         docker build -f "${PROJECT_ROOT}/Dockerfile" -t "${image}" "${PROJECT_ROOT}"
     fi
 
@@ -212,11 +212,9 @@ start_prelude() {
     docker run -d --name "${CONTAINER_NAME}" \
         ${gpu_flag} \
         -p "${PORT}:8000" \
-        -v "${PROJECT_ROOT}:/workspace" \
-        -v prelude-e2e-target:/workspace/target \
         -v "${HF_CACHE}:/root/.cache/huggingface:ro" \
         "${image}" \
-        bash -c "cd /workspace && cargo build -p prelude-server --release --features full && exec ./target/release/prelude-server --model ${MODEL} --host 0.0.0.0 --port 8000 ${extra}"
+        --model "${MODEL}" ${extra}
 }
 
 start_vllm() {
