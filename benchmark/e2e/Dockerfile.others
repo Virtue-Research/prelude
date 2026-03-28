@@ -42,13 +42,20 @@ ENV PATH=${CUDA_HOME}/bin:${PATH}
 ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
 
 # ── llama.cpp ─────────────────────────────────────────────────────────────
+# CUDA driver stub for build-time linking
+RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so.1
+
 RUN git clone --depth 1 https://github.com/ggerganov/llama.cpp /opt/llama.cpp \
     && cd /opt/llama.cpp \
+    && pip3 install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip3 install --no-cache-dir -e gguf-py transformers sentencepiece \
     && cmake -B build -DCMAKE_BUILD_TYPE=Release \
         -DGGML_CUDA=ON -DGGML_AVX512=ON \
     && cmake --build build -j$(nproc) --target llama-server \
-    && cp build/bin/llama-server /usr/local/bin/ \
-    && rm -rf /opt/llama.cpp
+    && ln -s /opt/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
+
+# Remove build-time stub (real driver from nvidia-docker at runtime)
+RUN rm -f /usr/lib/x86_64-linux-gnu/libcuda.so.1
 
 # ── vllm.rs ───────────────────────────────────────────────────────────────
 ARG CUDA_COMPUTE_CAP=80
@@ -62,7 +69,8 @@ RUN git clone --depth 1 https://github.com/yuzhounie/vllm.rs /tmp/vllm.rs \
     && install -Dm755 target/release/vllm-rs /usr/local/bin/vllm-rs \
     && printf '%s\n' '#!/bin/sh' 'exec python3 -m vllm_rs.server "$@"' > /usr/local/bin/vllm-rs-server \
     && chmod +x /usr/local/bin/vllm-rs-server \
-    && rm -rf /tmp/vllm.rs
+    && rm -rf /tmp/vllm.rs \
+    || echo "WARNING: vllm.rs build failed — skipping"
 
 # Fix nccl symlink
 RUN arch="$(uname -m)" \

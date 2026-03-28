@@ -348,11 +348,10 @@ resolve_gguf() {
     # Convert using llama.cpp's convert script
     local convert_script="${LLAMA_CPP_CONVERT:-}"
     if [[ -z "${convert_script}" ]]; then
-        # Common locations
+        local llama_cache="${HOME}/.cache/prelude/llama.cpp"
         for p in \
             /opt/llama.cpp/convert_hf_to_gguf.py \
-            ../llama.cpp/convert_hf_to_gguf.py \
-            /home/yuzhounie/src/llama.cpp/convert_hf_to_gguf.py; do
+            "${llama_cache}/convert_hf_to_gguf.py"; do
             if [[ -f "${p}" ]]; then
                 convert_script="${p}"
                 break
@@ -360,9 +359,19 @@ resolve_gguf() {
         done
     fi
 
+    # Auto-fetch convert script if not found
     if [[ -z "${convert_script}" ]]; then
-        echo "ERROR: convert_hf_to_gguf.py not found. Set LLAMA_CPP_CONVERT=/path/to/convert_hf_to_gguf.py" >&2
-        return 1
+        local llama_cache="${HOME}/.cache/prelude/llama.cpp"
+        echo "  Fetching llama.cpp convert tools ..." >&2
+        git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/ggerganov/llama.cpp "${llama_cache}" 2>&2 || true
+        (cd "${llama_cache}" && git sparse-checkout set gguf-py convert_hf_to_gguf.py) 2>&2 || true
+        pip install -q "${llama_cache}/gguf-py" 2>&2 || true
+        convert_script="${llama_cache}/convert_hf_to_gguf.py"
+        if [[ ! -f "${convert_script}" ]]; then
+            echo "ERROR: failed to fetch convert_hf_to_gguf.py" >&2
+            return 1
+        fi
     fi
 
     mkdir -p "${gguf_dir}"
@@ -380,13 +389,25 @@ resolve_gguf() {
 start_llama_cpp() {
     ensure_others_image || return 1
 
-    local gguf_file
-    gguf_file="$(resolve_gguf)" || return 1
+    local model_safe="${MODEL//\//__}"
+    local gguf_dir="${GGUF_CACHE}/${model_safe}"
+    local gguf_file="${gguf_dir}/model-BF16.gguf"
 
-    local model_dir
-    model_dir="$(dirname "${gguf_file}")"
-    local model_file
-    model_file="$(basename "${gguf_file}")"
+    # Convert HF → GGUF inside the prelude-others container (has convert script + gguf-py)
+    if [[ ! -f "${gguf_file}" ]]; then
+        mkdir -p "${gguf_dir}"
+        echo "  Converting ${MODEL} → GGUF (BF16) via prelude-others container ..."
+        docker run --rm \
+            -v "${HF_CACHE}:/root/.cache/huggingface:ro" \
+            -v "${gguf_dir}:/out" \
+            prelude-others \
+            python3 /opt/llama.cpp/convert_hf_to_gguf.py \
+                "/root/.cache/huggingface/hub/models--${MODEL//\//--}/snapshots/$(ls "${HF_CACHE}/hub/models--${MODEL//\//--}/snapshots" | head -1)" \
+                --outfile /out/model-BF16.gguf --outtype bf16 \
+            || { echo "  ERROR: GGUF conversion failed"; return 1; }
+    fi
+
+    echo "  GGUF: ${gguf_file}"
 
     local ngl=99
     local gpu_flag="--gpus device=${GPU}"
@@ -395,16 +416,14 @@ start_llama_cpp() {
         gpu_flag=""
     fi
 
-    echo "  GGUF: ${gguf_file}"
-
     # shellcheck disable=SC2086
     docker run -d --name "${CONTAINER_NAME}" \
         ${gpu_flag} \
         -p "${PORT}:8000" \
-        -v "${model_dir}:/models:ro" \
+        -v "${gguf_dir}:/models:ro" \
         prelude-others \
         llama-server \
-        -m "/models/${model_file}" \
+        -m "/models/model-BF16.gguf" \
         --host 0.0.0.0 \
         --port 8000 \
         -ngl "${ngl}"
