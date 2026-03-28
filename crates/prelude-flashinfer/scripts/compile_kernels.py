@@ -100,9 +100,16 @@ def generate_batch_decode_sources(
     kernel_src = kernel_templ.render(**kwargs)
     (out / "batch_decode_kernel.cu").write_text(kernel_src)
 
-    # NOTE: batch_decode.cu is intentionally NOT compiled — it contains JIT
-    # entry points with fixed names that cause duplicate symbols in AOT mode.
     sources = [out / "batch_decode_kernel.cu"]
+
+    # batch_decode.cu defines BatchDecodeWithPagedKVCacheRun — rename per variant
+    # to avoid duplicate symbols across AOT variants.
+    renames = {
+        "BatchDecodeWithPagedKVCacheRun": f"{vid}_BatchDecodeWithPagedKVCacheRun",
+        "BatchDecodeWithPagedKVCachePlan": f"{vid}_BatchDecodeWithPagedKVCachePlan",
+    }
+    _copy_with_renames(csrc / "batch_decode.cu", out / "batch_decode.cu", renames)
+    sources.append(out / "batch_decode.cu")
 
     # Generate modified binding with variant-specific symbol names
     binding_src = _generate_renamed_binding(
@@ -113,6 +120,9 @@ def generate_batch_decode_sources(
             "run": f"__tvm_ffi_{vid}_run",
         },
     )
+    # Also rename the internal function calls in the binding
+    for old, new in renames.items():
+        binding_src = binding_src.replace(old, new)
     binding_path = out / "batch_decode_binding.cu"
     binding_path.write_text(binding_src)
     sources.append(binding_path)
@@ -171,8 +181,14 @@ def generate_batch_prefill_fa2_sources(
             (out / fname).write_text(src)
             sources.append(out / fname)
 
-    # NOTE: batch_prefill.cu is intentionally NOT compiled — it contains JIT
-    # entry points with fixed names that cause duplicate symbols in AOT mode.
+    # batch_prefill.cu defines BatchPrefillWith{Ragged,Paged}KVCacheRun — rename per variant
+    renames = {
+        "BatchPrefillWithKVCachePlan": f"{vid}_BatchPrefillWithKVCachePlan",
+        "BatchPrefillWithRaggedKVCacheRun": f"{vid}_BatchPrefillWithRaggedKVCacheRun",
+        "BatchPrefillWithPagedKVCacheRun": f"{vid}_BatchPrefillWithPagedKVCacheRun",
+    }
+    _copy_with_renames(csrc / "batch_prefill.cu", out / "batch_prefill.cu", renames)
+    sources.append(out / "batch_prefill.cu")
 
     # Generate modified binding
     binding_src = _generate_renamed_binding(
@@ -184,6 +200,8 @@ def generate_batch_prefill_fa2_sources(
             "paged_run": f"__tvm_ffi_{vid}_paged_run",
         },
     )
+    for old, new in renames.items():
+        binding_src = binding_src.replace(old, new)
     (out / "batch_prefill_binding.cu").write_text(binding_src)
     sources.append(out / "batch_prefill_binding.cu")
 
@@ -238,10 +256,14 @@ def generate_batch_prefill_fa3_sources(
             (out / fname).write_text(src)
             sources.append(out / fname)
 
-    # NOTE: batch_prefill_sm90.cu is intentionally NOT compiled here.
-    # It contains JIT entry points (BatchPrefillWith{Ragged,Paged}KVCacheSM90Run)
-    # with fixed names that would cause duplicate symbols when AOT-compiling
-    # multiple variants. The renamed binding above provides our entry points.
+    # batch_prefill_sm90.cu defines BatchPrefillWith{Ragged,Paged}KVCacheSM90Run — rename per variant
+    renames = {
+        "BatchPrefillWithKVCacheSM90Plan": f"{vid}_BatchPrefillWithKVCacheSM90Plan",
+        "BatchPrefillWithRaggedKVCacheSM90Run": f"{vid}_BatchPrefillWithRaggedKVCacheSM90Run",
+        "BatchPrefillWithPagedKVCacheSM90Run": f"{vid}_BatchPrefillWithPagedKVCacheSM90Run",
+    }
+    _copy_with_renames(csrc / "batch_prefill_sm90.cu", out / "batch_prefill_sm90.cu", renames)
+    sources.append(out / "batch_prefill_sm90.cu")
 
     # Generate modified binding
     binding_src = _generate_renamed_binding(
@@ -253,6 +275,8 @@ def generate_batch_prefill_fa3_sources(
             "paged_run": f"__tvm_ffi_{vid}_paged_run",
         },
     )
+    for old, new in renames.items():
+        binding_src = binding_src.replace(old, new)
     (out / "batch_prefill_sm90_binding.cu").write_text(binding_src)
     sources.append(out / "batch_prefill_sm90_binding.cu")
 
@@ -283,6 +307,13 @@ def generate_page_sources(
 
 
 # ── Symbol renaming ────────────────────────────────────────────────────
+
+def _copy_with_renames(src: Path, dst: Path, renames: Dict[str, str]) -> None:
+    """Copy a .cu file, prepending #define macros to rename symbols."""
+    defines = "\n".join(f"#define {old} {new}" for old, new in renames.items())
+    original = src.read_text()
+    dst.write_text(f"// AOT variant rename\n{defines}\n\n{original}")
+
 
 def _generate_renamed_binding(
     original_path: Path, config_inc: str,

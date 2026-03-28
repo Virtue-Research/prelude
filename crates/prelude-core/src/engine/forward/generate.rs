@@ -238,9 +238,11 @@ impl Engine {
         let prompt_logprobs_cpu = if let Some(hidden_states) = forward_result.hidden_states.take() {
             let model = self.executor.model.lock()
                 .map_err(|e| EngineError::Internal(format!("model lock: {e}")))?;
+            let logits_model = model.as_logits_model()
+                .ok_or_else(|| EngineError::Internal("model does not support LogitsSplitModel".into()))?;
             let cpu = extract_prompt_logprobs_from_hidden(
                 &hidden_states,
-                &**model,
+                logits_model,
                 &items,
                 &forward_result.seq_lens,
             )?;

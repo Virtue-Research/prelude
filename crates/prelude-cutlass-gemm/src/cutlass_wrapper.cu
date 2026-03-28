@@ -334,6 +334,80 @@ static Sm80Fn sm80_bf16_fns[] = { sm80_bf16_c0, sm80_bf16_c1, sm80_bf16_c2, sm80
 static Sm80Fn sm80_fp16_fns[] = { sm80_fp16_c0, sm80_fp16_c1, sm80_fp16_c2, sm80_fp16_c3, sm80_fp16_c4, sm80_fp16_c5 };
 
 // ============================================================================
+// F32 SIMT GEMM via CUTLASS 3.x — uses UniversalFMA (no TensorOp needed)
+// ============================================================================
+
+// F32 SIMT runner: UniversalFMA atom, 32-bit gmem loads (safe for any alignment)
+template <class DispatchPolicy_, class TileShape_ = Shape<_64, _64, _8>>
+struct Sm80RunnerF32 {
+    using Element = float;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::ColumnMajor;
+    using LayoutD = cutlass::layout::ColumnMajor;
+
+    using ElementAccumulator = float;
+    using ElementCompute = float;
+
+    using TileShape = TileShape_;
+    static constexpr int TileK = size<2>(TileShape{});
+    using DispatchPolicy = DispatchPolicy_;
+
+    // SIMT FMA atom — scalar float multiply-add, no TensorOp
+    using MmaAtom = MMA_Atom<UniversalFMA<float, float, float, float>>;
+    using TiledMma = TiledMMA<
+        MmaAtom,
+        Layout<Shape<_16, _8, _1>>>;
+
+    // ── Gmem → Smem: 32-bit cp.async (1 float per copy, always aligned) ──
+    static constexpr int kAlignmentA = 1;  // single float, no alignment requirement
+    using SmemLayoutAtomA = Layout<Shape<_64, Int<TileK>>, Stride<Int<TileK>, _1>>;
+    using SmemCopyAtomA = Copy_Atom<DefaultCopy, Element>;
+    using GmemTiledCopyA = decltype(
+        make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<float>, Element>{},
+                        Layout<Shape <_128, _1>,
+                               Stride<  _1, _1>>{},
+                        Layout<Shape<_1, _1>>{}));
+
+    static constexpr int kAlignmentB = 1;
+    using SmemLayoutAtomB = SmemLayoutAtomA;
+    using SmemCopyAtomB = SmemCopyAtomA;
+    using GmemTiledCopyB = GmemTiledCopyA;
+
+    using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+        DispatchPolicy, TileShape,
+        Element, cutlass::gemm::TagToStrideA_t<LayoutA>,
+        Element, cutlass::gemm::TagToStrideB_t<LayoutB>,
+        TiledMma,
+        GmemTiledCopyA, SmemLayoutAtomA, SmemCopyAtomA, cute::identity,
+        GmemTiledCopyB, SmemLayoutAtomB, SmemCopyAtomB, cute::identity>;
+
+    static constexpr int kEpilogueVectorWidth = 1;
+    using CollectiveEpilogue = cutlass::epilogue::collective::DefaultEpilogue<
+        Element,
+        cutlass::gemm::TagToStrideC_t<LayoutC>,
+        cutlass::gemm::TagToStrideC_t<LayoutD>,
+        cutlass::epilogue::thread::LinearCombination<Element, kEpilogueVectorWidth, ElementAccumulator, ElementCompute>,
+        cutlass::gemm::EpilogueDefault>;
+
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        Shape<int, int, int, int>,
+        CollectiveMainloop,
+        CollectiveEpilogue>;
+
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+};
+
+static int sm80_f32_gemm(const void* A, const void* B, void* D,
+                         int m, int n, int k, cudaStream_t s) {
+    return launch<Sm80RunnerF32<cutlass::gemm::MainloopSm80CpAsync<4>>>(A, B, D, m, n, k, s);
+}
+
+// ============================================================================
 // C FFI dispatch
 // ============================================================================
 
@@ -347,8 +421,26 @@ extern "C" int cutlass_gemm_dispatch(
     uint32_t dtype,
     const void* stream)
 {
-    if (transa != 1 || transb != 0) return -10;
     if (batch > 1) return -30;
+
+    // CUTLASS kernels only support TN (transa=1, transb=0).
+    // For other combos, use the identity: D = op(A)*op(B) in col-major
+    // can be rewritten as TN on swapped operands.
+    //
+    // NN (transa=0, transb=0): D[m,n] = A*B
+    //   = (B^T * A^T)^T   →  call TN with swap(A,B), swap(m,n), swap(lda,ldb)
+    //   Output is naturally transposed, but since D is col-major with ldd=m
+    //   and we produce col-major with ldd=n, we need to swap ldd too.
+    if (transa == 0 && transb == 0) {
+        std::swap(A, B);
+        std::swap(m, n);
+        std::swap(lda, ldb);
+        std::swap(stride_a, stride_b);
+        ldd = m;  // output is now m-rows after swap
+        // Fall through to TN path below
+    } else if (transa != 1 || transb != 0) {
+        return -10;  // NT and TT not yet supported
+    }
 
     auto s = static_cast<cudaStream_t>(const_cast<void*>(stream));
     cudaGetLastError();
@@ -383,6 +475,9 @@ extern "C" int cutlass_gemm_dispatch(
             if (ret == 0) return 0;
         }
         return sm80_fp16_c1(A, B, D, m, n, k, s);
+    }
+    if (dtype == 2) {
+        return sm80_f32_gemm(A, B, D, m, n, k, s);
     }
     return -20;
 }

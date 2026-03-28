@@ -7,6 +7,7 @@
 //! (attention, RoPE, etc.) that haven't been converted yet.
 
 use candle_core::{DType, Module, Result, Tensor};
+use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use std::ffi::c_void;
 
 /// Register our GEMM dispatch with candle-core. Must be called before any GPU matmul.
@@ -65,7 +66,7 @@ unsafe fn gemm_dispatch_impl(
         }
     }
 
-    // CUTLASS fallback (SM80+, handles BF16/F16/F32, batched, all transpose combos)
+    // CUTLASS fallback (SM80+, handles BF16/FP16/F32)
     #[cfg(feature = "cutlass-gemm")]
     {
         let ret = prelude_cutlass_gemm::gemm_dispatch(
@@ -76,7 +77,7 @@ unsafe fn gemm_dispatch_impl(
         return match ret {
             Ok(()) => 0,
             Err(e) => {
-                eprintln!("CUTLASS GEMM error: {e} (m={m} n={n} k={k} batch={batch} lda={lda} ldb={ldb} transa={transa} transb={transb} dtype={dtype})");
+                eprintln!("CUTLASS GEMM error: {e}");
                 -1
             }
         };
@@ -239,10 +240,10 @@ where
     drop(w_storage);
 
     let out_storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev.clone());
-    Tensor::from_storage(
+    Ok(Tensor::from_storage(
         candle_core::Storage::Cuda(out_storage),
         (m, n),
         BackpropOp::none(),
         false,
-    )
+    ))
 }

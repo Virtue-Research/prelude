@@ -3,11 +3,11 @@
 # E2E inference benchmark — each engine runs in its own Docker container.
 #
 # Usage:
-#   ./benchmark/e2e/bench.sh prelude              # GPU
-#   ./benchmark/e2e/bench.sh prelude --cpu         # CPU
+#   ./benchmark/e2e/bench.sh prelude --local       # GPU, local binary (no Docker)
+#   ./benchmark/e2e/bench.sh prelude --local --cpu # CPU, local binary
+#   ./benchmark/e2e/bench.sh prelude               # GPU, Docker
 #   ./benchmark/e2e/bench.sh vllm                  # vLLM GPU
-#   ./benchmark/e2e/bench.sh vllm --cpu            # vLLM CPU (needs vllm-cpu image)
-#   ./benchmark/e2e/bench.sh all                   # all engines, GPU
+#   ./benchmark/e2e/bench.sh all --gpu             # all engines, GPU
 #   ./benchmark/e2e/bench.sh all --cpu             # all engines, CPU
 #
 # Environment variables:
@@ -54,12 +54,14 @@ HF_CACHE="${HOME}/.cache/huggingface"
 GGUF_CACHE="${HOME}/.cache/prelude/gguf"
 
 DEVICE_FILTER=""  # "", "cpu", or "gpu"
+LOCAL_PRELUDE=false
 ENGINES=()
 for arg in "$@"; do
     case "$arg" in
-        --cpu)  DEVICE_FILTER=cpu ;;
-        --gpu)  DEVICE_FILTER=gpu ;;
-        *)      ENGINES+=("$arg") ;;
+        --cpu)    DEVICE_FILTER=cpu ;;
+        --gpu)    DEVICE_FILTER=gpu ;;
+        --local)  LOCAL_PRELUDE=true ;;
+        *)        ENGINES+=("$arg") ;;
     esac
 done
 
@@ -89,6 +91,7 @@ result_tag() {
 # ── Helpers ───────────────────────────────────────────────────────────────
 
 STARTUP_ELAPSED=0
+LOCAL_PID=""
 
 wait_healthy() {
     local url="$1"
@@ -100,16 +103,35 @@ wait_healthy() {
             echo "  Ready (${i}s)"
             return 0
         fi
+        # Check if the process/container died
+        if [[ -n "${LOCAL_PID}" ]]; then
+            if ! kill -0 "${LOCAL_PID}" 2>/dev/null; then
+                echo "  ERROR: local process ${LOCAL_PID} died"
+                return 1
+            fi
+        fi
         sleep 1
     done
     STARTUP_ELAPSED=$timeout
     echo "  ERROR: not healthy after ${timeout}s"
-    docker logs "${CONTAINER_NAME}" 2>&1 | tail -20
+    if [[ -n "${LOCAL_PID}" ]]; then
+        echo "  (local process ${LOCAL_PID})"
+    else
+        docker logs "${CONTAINER_NAME}" 2>&1 | tail -20
+    fi
     return 1
 }
 
 cleanup() {
+    if [[ -n "${LOCAL_PID}" ]]; then
+        kill "${LOCAL_PID}" 2>/dev/null || true
+        wait "${LOCAL_PID}" 2>/dev/null || true
+        LOCAL_PID=""
+    fi
     docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    # Kill anything still listening on our port (stale processes from prior runs)
+    local pid
+    pid=$(lsof -ti tcp:"${PORT}" 2>/dev/null) && kill "$pid" 2>/dev/null && sleep 1 || true
 }
 
 run_benchmark() {
@@ -152,19 +174,40 @@ run_benchmark() {
 # ── Engine launchers ──────────────────────────────────────────────────────
 
 start_prelude() {
+    local extra="${EXTRA_ARGS:-}"
+    [[ "${CPU_MODE}" == true ]] && extra="--device cpu ${extra}"
+
+    if [[ "${LOCAL_PRELUDE}" == true ]]; then
+        # ── Local mode: use pre-built binary directly ──
+        local bin="${PROJECT_ROOT}/target/release/prelude-server"
+        if [[ ! -x "${bin}" ]]; then
+            echo "  Building prelude-server ..."
+            (cd "${PROJECT_ROOT}" && cargo build -p prelude-server --release --features full) \
+                || { echo "  ERROR: cargo build failed"; return 1; }
+        fi
+
+        local cuda_env=""
+        [[ "${CPU_MODE}" == false ]] && cuda_env="CUDA_VISIBLE_DEVICES=${GPU}"
+
+        # shellcheck disable=SC2086
+        env ${cuda_env} "${bin}" \
+            --model "${MODEL}" --host 0.0.0.0 --port "${PORT}" \
+            ${extra} &
+        LOCAL_PID=$!
+        echo "  Local PID: ${LOCAL_PID}"
+        return 0
+    fi
+
+    # ── Docker mode ──
     local image="prelude-dev"
     if ! docker image inspect "${image}" &>/dev/null; then
         echo ">>> Building ${image} ..."
         docker build -f "${PROJECT_ROOT}/Dockerfile" -t "${image}" "${PROJECT_ROOT}"
     fi
 
-    local extra="${EXTRA_ARGS:-}"
-    [[ "${CPU_MODE}" == true ]] && extra="--device cpu ${extra}"
-
     local gpu_flag=""
     [[ "${CPU_MODE}" == false ]] && gpu_flag="--gpus device=${GPU}"
 
-    # Mount source + HF cache, build and run server
     # shellcheck disable=SC2086
     docker run -d --name "${CONTAINER_NAME}" \
         ${gpu_flag} \
@@ -437,10 +480,11 @@ if [[ ${#ENGINES[@]} -eq 0 ]]; then
     echo "Flags:"
     echo "  --cpu    CPU only"
     echo "  --gpu    GPU only"
+    echo "  --local  Run prelude locally (no Docker)"
     echo "  (none)   Both GPU and CPU"
     echo ""
     echo "Examples:"
-    echo "  $0 all                                  # All engines, GPU + CPU"
+    echo "  $0 prelude --local --gpu                # Prelude local, GPU"
     echo "  $0 all --gpu                            # All engines, GPU only"
     echo "  $0 prelude --cpu                        # Prelude CPU only"
     echo "  INPUT_TOKENS=512 $0 prelude vllm        # Compare prelude vs vllm"
