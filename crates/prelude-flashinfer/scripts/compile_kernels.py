@@ -100,11 +100,9 @@ def generate_batch_decode_sources(
     kernel_src = kernel_templ.render(**kwargs)
     (out / "batch_decode_kernel.cu").write_text(kernel_src)
 
-    # Copy fixed source files
+    # NOTE: batch_decode.cu is intentionally NOT compiled — it contains JIT
+    # entry points with fixed names that cause duplicate symbols in AOT mode.
     sources = [out / "batch_decode_kernel.cu"]
-    for fname in ["batch_decode.cu"]:
-        shutil.copy2(csrc / fname, out / fname)
-        sources.append(out / fname)
 
     # Generate modified binding with variant-specific symbol names
     binding_src = _generate_renamed_binding(
@@ -173,10 +171,8 @@ def generate_batch_prefill_fa2_sources(
             (out / fname).write_text(src)
             sources.append(out / fname)
 
-    # Copy fixed source files
-    for fname in ["batch_prefill.cu"]:
-        shutil.copy2(csrc / fname, out / fname)
-        sources.append(out / fname)
+    # NOTE: batch_prefill.cu is intentionally NOT compiled — it contains JIT
+    # entry points with fixed names that cause duplicate symbols in AOT mode.
 
     # Generate modified binding
     binding_src = _generate_renamed_binding(
@@ -242,10 +238,10 @@ def generate_batch_prefill_fa3_sources(
             (out / fname).write_text(src)
             sources.append(out / fname)
 
-    # Copy fixed source files
-    for fname in ["batch_prefill_sm90.cu"]:
-        shutil.copy2(csrc / fname, out / fname)
-        sources.append(out / fname)
+    # NOTE: batch_prefill_sm90.cu is intentionally NOT compiled here.
+    # It contains JIT entry points (BatchPrefillWith{Ragged,Paged}KVCacheSM90Run)
+    # with fixed names that would cause duplicate symbols when AOT-compiling
+    # multiple variants. The renamed binding above provides our entry points.
 
     # Generate modified binding
     binding_src = _generate_renamed_binding(
@@ -458,6 +454,11 @@ def _find_tvm_ffi_include(fi_src: Path) -> Optional[Path]:
     p = fi_src / "3rdparty" / "tvm_ffi" / "include"
     if p.exists():
         return p
+    # Check FA4's vendored copy (same workspace)
+    script_dir = Path(__file__).resolve().parent.parent  # prelude-flashinfer crate
+    fa4_vendor = script_dir.parent / "prelude-flash-attn-v4" / "vendor" / "tvm_ffi" / "include"
+    if fa4_vendor.exists():
+        return fa4_vendor
     # Check installed tvm_ffi package
     try:
         import tvm_ffi
@@ -520,8 +521,8 @@ def build_variant_matrix(
                     "arch_flags": sm80_flags,
                 })
 
-            # Batch prefill FA3 (SM90+ only)
-            if has_sm90:
+            # Batch prefill FA3 (SM90+ only, HEAD_DIM_VO must be 64/128/256)
+            if has_sm90 and hdim in (64, 128, 256):
                 for swa, softcap in swa_softcap_combos:
                     vid = variant_id("prefill", "fa3", dtype, hdim, hdim, swa=swa, softcap=softcap)
                     variants.append({
