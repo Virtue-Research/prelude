@@ -426,6 +426,7 @@ start_llama_cpp() {
         -m "/models/model-BF16.gguf" \
         --host 0.0.0.0 \
         --port 8000 \
+        --reasoning-format none \
         -ngl "${ngl}"
 }
 
