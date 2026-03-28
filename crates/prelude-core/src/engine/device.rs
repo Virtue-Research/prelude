@@ -4,21 +4,21 @@ pub(crate) fn candle_err(e: candle_core::Error) -> EngineError {
     EngineError::Internal(format!("candle error: {e}"))
 }
 
-pub(crate) fn init_cpu_runtime_if_needed(device: &Device, runtime: &crate::config::RuntimeConfig) {
-    if !device.is_cpu() {
+pub(crate) fn init_runtime(device: &Device, runtime: &crate::config::RuntimeConfig) {
+    if device.is_cpu() {
         let _ = runtime;
-        return;
-    }
+        // oneDNN uses THREADPOOL runtime (rayon-backed). No OpenMP, no contention.
+        crate::ops::onednn::init();
+        tracing::info!("oneDNN initialized (THREADPOOL runtime, rayon-backed)");
 
-    // Initialize oneDNN (for BF16 GEMM).
-    // oneDNN uses THREADPOOL runtime (rayon-backed). No OpenMP, no contention.
-    crate::ops::onednn::init();
-    tracing::info!("oneDNN initialized (THREADPOOL runtime, rayon-backed)");
-
-    // Initialize NUMA-aware rayon pool for cpu_ops kernels
-    {
+        // NUMA-aware rayon pool for cpu_ops kernels
         let numa_report = crate::ops::cpu::numa::init_numa_rayon_pool();
         tracing::info!(numa_report, "cpu_ops NUMA rayon pool initialized");
+    }
+
+    #[cfg(feature = "cuda")]
+    if device.is_cuda() {
+        crate::ops::gpu::gemm::register_gpu_gemm();
     }
 }
 

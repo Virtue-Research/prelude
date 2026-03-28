@@ -19,7 +19,7 @@ use crate::engine::{
     CommonModelConfig, EmbeddingActivation, EmbeddingDenseLayerSpec, EmbeddingNormalization,
     EmbeddingPooling, EmbeddingSemantics, Engine, EngineError, ModelDescriptor, ModelExecutor,
     ModelVariant, ResolvedModelConfig, RuntimeCaps, TaskKind, TaskOverride, WeightsBackend,
-    candle_err, has_remote_file, init_cpu_runtime_if_needed, load_model_config,
+    candle_err, has_remote_file, init_runtime, load_model_config,
     load_safetensor_filenames, load_var_builder_from_filenames, load_weights,
     parse_model_config_for_source, select_device,
 };
@@ -90,7 +90,7 @@ impl Engine {
         let load_start = Instant::now();
 
         let (device, dtype) = select_device(&engine_config.runtime)?;
-        init_cpu_runtime_if_needed(&device, &engine_config.runtime);
+        init_runtime(&device, &engine_config.runtime);
 
         let resolved = load_model_config(model_path, task_override)?;
         let embedding_modules = load_embedding_modules_from_dir(
@@ -142,7 +142,7 @@ impl Engine {
         let weight_files = load_safetensor_filenames(&repo)?;
 
         let (device, dtype) = select_device(&engine_config.runtime)?;
-        init_cpu_runtime_if_needed(&device, &engine_config.runtime);
+        init_runtime(&device, &engine_config.runtime);
         let load_start = Instant::now();
 
         let resolved = {
