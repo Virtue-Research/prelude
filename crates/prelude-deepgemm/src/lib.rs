@@ -91,6 +91,13 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    fn deepgemm_fp8_gemm_1d1d(
+        A: *mut c_void, B: *mut c_void, D: *mut c_void,
+        scale_a: *mut c_void, scale_b: *mut c_void,
+        M: i32, N: i32, K: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
     fn deepgemm_m_grouped_masked_bf16_gemm(
         A: *mut c_void,
         B: *mut c_void,
@@ -275,6 +282,38 @@ pub fn query_config(m: i32, n: i32, k: i32) -> (i32, i32, i32, i32) {
         deepgemm_query_config(m, n, k, &mut block_m, &mut block_n, &mut stages, &mut smem);
     }
     (block_m, block_n, stages, smem)
+}
+
+/// FP8 E4M3 1D1D GEMM: D(FP32) = A(FP8) @ B(FP8) with per-block scaling.
+///
+/// Unlike `fp8_gemm()` (1D2D, BF16 output), this uses per-block scaling
+/// on BOTH A and B dimensions via TMA, and outputs FP32.
+///
+/// - A: \[M, K\] row-major FP8 E4M3
+/// - B: \[K, N\] col-major FP8 E4M3
+/// - D: \[M, N\] row-major FP32 output
+/// - scale_a: \[ceil(K/128), align(M,4)\] FP32 (per-block, loaded via TMA)
+/// - scale_b: \[ceil(K/128), align(N,4)\] FP32 (per-block, loaded via TMA)
+///
+/// # Safety
+/// All pointers must be valid CUDA device pointers. D must be FP32.
+pub unsafe fn fp8_gemm_1d1d(
+    a: *mut c_void,
+    b: *mut c_void,
+    d: *mut c_void,
+    scale_a: *mut c_void,
+    scale_b: *mut c_void,
+    m: i32,
+    n: i32,
+    k: i32,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    let ret = unsafe { deepgemm_fp8_gemm_1d1d(a, b, d, scale_a, scale_b, m, n, k, stream) };
+    match ret {
+        0 => Ok(()),
+        -1 => Err(format!("DeepGEMM FP8 1D1D: no kernel variant for M={m} N={n} K={k}")),
+        code => Err(format!("DeepGEMM FP8 1D1D: launch failed (code {code}) for M={m} N={n} K={k}")),
+    }
 }
 
 /// BF16 GEMM with FP32 accumulation: D(FP32) += A(BF16) @ B(BF16)

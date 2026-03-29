@@ -650,3 +650,192 @@ static int sm90_m_grouped_masked_fp8_gemm(
                          cfg.smem_size, cfg.num_multicast, args,
                          static_cast<cudaStream_t>(stream));
 }
+
+// ════════════════════════════════════════════════════════════════════
+// SM90 FP8 1D1D GEMM — per-block scaling on both A and B via TMA.
+// FP32 output. Different from 1D2D (per-token A via TMA, per-channel B global).
+// ════════════════════════════════════════════════════════════════════
+
+struct FP8_1D1D_Config {
+    int block_m, block_n, block_k;
+    int num_stages;
+    int num_tma_threads, num_math_threads;
+    int num_multicast;
+    bool multicast_on_a;
+    int swizzle_a, swizzle_b;
+    int smem_size;
+};
+
+static FP8_1D1D_Config select_fp8_1d1d_config(int m, int n, int k, int num_sms) {
+    const int block_k = 128;
+
+    // 1D1D: block_m = {64, 128, 256} (no small M candidates)
+    // block_m=256 is illegal for FP32 output (upstream constraint)
+    int block_ms[2] = {64, 128};
+    int n_block_ms = 2;
+
+    // block_n: standard multiples of 16, up to 128
+    // (1D1D FP32 has max bn ~152, but we stay conservative at 128)
+    int block_ns[8]; int n_block_ns = 0;
+    for (int i = 16; i <= 128; i += 16) block_ns[n_block_ns++] = i;
+
+    int best_bm = 0, best_bn = 0, best_waves = 0, best_last = 0;
+    auto ceil_div = [](int a, int b) { return (a + b - 1) / b; };
+
+    for (int i = 0; i < n_block_ms; i++) {
+        for (int j = 0; j < n_block_ns; j++) {
+            int bm = block_ms[i], bn = block_ns[j];
+            if (bm > 128 && bn > 128) continue;
+            int num_blocks = ceil_div(m, bm) * ceil_div(n, bn);
+            int waves = ceil_div(num_blocks, num_sms);
+            int last_util = num_blocks % num_sms;
+            if (last_util == 0) last_util = num_sms;
+
+            bool better = false;
+            if (best_bm == 0 || waves < best_waves) better = true;
+            else if (waves == best_waves) {
+                better = last_util > best_last;
+                if (last_util == best_last) {
+                    better |= (bm == best_bm && bn < best_bn);
+                    better |= (bn == best_bn && bm < best_bm);
+                    better |= (bm != best_bm && bn > best_bn && bn <= n && bm <= m);
+                }
+            }
+            if (better) { best_bm = bm; best_bn = bn; best_waves = waves; best_last = last_util; }
+        }
+    }
+
+    int num_tma = 128, num_math = (best_bm <= 64) ? 128 : 256;
+
+    // Multicast (same rules as normal BF16)
+    int multicast = 1; bool mc_on_a = false;
+    if (m >= 512 && num_sms % 2 == 0) {
+        bool legal_on_b = (ceil_div(n, best_bn) % 2 == 0);
+        bool legal_on_a = (ceil_div(m, best_bm) % 2 == 0);
+        bool order[2] = {false, true};
+        if (best_bm > best_bn) { order[0] = true; order[1] = false; }
+        bool legal[2] = {legal_on_a, legal_on_b};
+        for (int i = 0; i < 2; i++) {
+            if (legal[order[i] ? 1 : 0]) { multicast = 2; mc_on_a = order[i]; break; }
+        }
+    }
+
+    int sw_a = 128, sw_b = 128; // block_k=128, FP8 1-byte → 128B swizzle
+
+    // SMEM: FP32 output (no swizzle), both SFA and SFB per stage
+    const int smem_capacity = 232448;
+    int smem_cd = ((best_bm * best_bn * 4 + 1023) / 1024) * 1024; // FP32 output
+    int smem_a_per = best_bm * block_k; // FP8: 1 byte
+    int smem_b_per = best_bn * block_k;
+    int smem_sfa_per = ((best_bm * 4 + 127) / 128) * 128;
+    int smem_sfb_per = ((best_bn * 4 + 127) / 128) * 128;
+
+    int best_stages = 0, best_smem = 0;
+    for (int s = 32; s > 0; s--) {
+        int barrier = s * 16;
+        int total = smem_cd + s * (smem_a_per + smem_b_per + smem_sfa_per + smem_sfb_per) + barrier;
+        if (total <= smem_capacity) { best_stages = s; best_smem = total; break; }
+    }
+
+    return FP8_1D1D_Config{
+        .block_m = best_bm, .block_n = best_bn, .block_k = block_k,
+        .num_stages = best_stages,
+        .num_tma_threads = num_tma, .num_math_threads = num_math,
+        .num_multicast = multicast, .multicast_on_a = mc_on_a,
+        .swizzle_a = sw_a, .swizzle_b = sw_b,
+        .smem_size = best_smem,
+    };
+}
+
+// 1D1D kernel: 17 template params, cd_dtype=float, no swizzle_cd
+#define KERNEL_TYPE_FP8_1D1D(BLOCK_M, BLOCK_N, STAGES, NUM_MATH, NUM_MC, MC_ON_A) \
+    deep_gemm::sm90_fp8_gemm_1d1d_impl<                                     \
+        0, 0, 0, 1,                                                         \
+        BLOCK_M, BLOCK_N, 128,                                              \
+        128, 128,                                                           \
+        STAGES, 128, NUM_MATH,                                              \
+        NUM_MC, MC_ON_A, 132,                                               \
+        GemmType::Normal, float>
+
+// Stages computed: smem_cd=align(bm*bn*4,1024), per_stage=bm*128+bn*128+align(bm*4,128)+align(bn*4,128)+16
+__attribute__((used)) static auto* _1d1d_00 = &KERNEL_TYPE_FP8_1D1D(64, 16, 21, 128, 1, false);
+__attribute__((used)) static auto* _1d1d_01 = &KERNEL_TYPE_FP8_1D1D(64, 32, 17, 128, 1, false);
+__attribute__((used)) static auto* _1d1d_02 = &KERNEL_TYPE_FP8_1D1D(64, 48, 14, 128, 1, false);
+__attribute__((used)) static auto* _1d1d_03 = &KERNEL_TYPE_FP8_1D1D(64, 64, 12, 128, 1, false);
+__attribute__((used)) static auto* _1d1d_04 = &KERNEL_TYPE_FP8_1D1D(64, 80, 11, 128, 1, false);
+__attribute__((used)) static auto* _1d1d_05 = &KERNEL_TYPE_FP8_1D1D(64, 96, 9, 128, 1, false);
+__attribute__((used)) static auto* _1d1d_06 = &KERNEL_TYPE_FP8_1D1D(64, 112, 8, 128, 1, false);
+__attribute__((used)) static auto* _1d1d_07 = &KERNEL_TYPE_FP8_1D1D(64, 128, 7, 128, 1, false);
+__attribute__((used)) static auto* _1d1d_10 = &KERNEL_TYPE_FP8_1D1D(128, 16, 11, 256, 1, false);
+__attribute__((used)) static auto* _1d1d_11 = &KERNEL_TYPE_FP8_1D1D(128, 32, 10, 256, 1, false);
+__attribute__((used)) static auto* _1d1d_12 = &KERNEL_TYPE_FP8_1D1D(128, 48, 8, 256, 1, false);
+__attribute__((used)) static auto* _1d1d_13 = &KERNEL_TYPE_FP8_1D1D(128, 64, 7, 256, 1, false);
+__attribute__((used)) static auto* _1d1d_14 = &KERNEL_TYPE_FP8_1D1D(128, 80, 6, 256, 1, false);
+__attribute__((used)) static auto* _1d1d_15 = &KERNEL_TYPE_FP8_1D1D(128, 96, 6, 256, 1, false);
+__attribute__((used)) static auto* _1d1d_16 = &KERNEL_TYPE_FP8_1D1D(128, 112, 5, 256, 1, false);
+__attribute__((used)) static auto* _1d1d_17 = &KERNEL_TYPE_FP8_1D1D(128, 128, 4, 256, 1, false);
+
+static const void* get_fp8_1d1d_kernel(const FP8_1D1D_Config& cfg) {
+    #define MATCH_1D1D(BM, BN, ST, NM, MC, MCA) \
+        if (cfg.block_m == BM && cfg.block_n == BN && cfg.num_stages == ST && \
+            cfg.num_math_threads == NM && cfg.num_multicast == MC && cfg.multicast_on_a == MCA) \
+            return (const void*)&KERNEL_TYPE_FP8_1D1D(BM, BN, ST, NM, MC, MCA);
+
+    MATCH_1D1D(64, 16, 21, 128, 1, false) MATCH_1D1D(64, 32, 17, 128, 1, false)
+    MATCH_1D1D(64, 48, 14, 128, 1, false) MATCH_1D1D(64, 64, 12, 128, 1, false)
+    MATCH_1D1D(64, 80, 11, 128, 1, false) MATCH_1D1D(64, 96, 9, 128, 1, false)
+    MATCH_1D1D(64, 112, 8, 128, 1, false) MATCH_1D1D(64, 128, 7, 128, 1, false)
+    MATCH_1D1D(128, 16, 11, 256, 1, false) MATCH_1D1D(128, 32, 10, 256, 1, false)
+    MATCH_1D1D(128, 48, 8, 256, 1, false) MATCH_1D1D(128, 64, 7, 256, 1, false)
+    MATCH_1D1D(128, 80, 6, 256, 1, false) MATCH_1D1D(128, 96, 6, 256, 1, false)
+    MATCH_1D1D(128, 112, 5, 256, 1, false) MATCH_1D1D(128, 128, 4, 256, 1, false)
+
+    #undef MATCH_1D1D
+    return nullptr;
+}
+
+/// SM90 FP8 1D1D GEMM: D(FP32) = A(FP8) @ B(FP8) with per-block scaling on both.
+/// scale_a: [ceil(K/128), align(M, 4)] FP32, MN-major (per-block, loaded via TMA)
+/// scale_b: [ceil(K/128), align(N, 4)] FP32, MN-major (per-block, loaded via TMA)
+/// D: [M, N] FP32 output
+static int sm90_fp8_gemm_1d1d(
+    void* A, void* B, void* D,
+    void* scale_a, void* scale_b,
+    int M, int N, int K, void* stream
+) {
+    cudaGetLastError();
+    auto cfg = select_fp8_1d1d_config(M, N, K, g_num_sms);
+    auto kernel_ptr = get_fp8_1d1d_kernel(cfg);
+    if (!kernel_ptr) return -1;
+
+    auto ceil_div = [](int a, int b) { return (a + b - 1) / b; };
+    auto align4 = [](int x) { return ((x + 3) / 4) * 4; };
+
+    // TMA for A/B (FP8, K-major)
+    auto tma_a = make_2d_tma_u8(A, K, M, cfg.block_k, cfg.block_m, K, cfg.swizzle_a);
+    auto tma_b = make_2d_tma_u8(B, K, N, cfg.block_k, cfg.block_n, K, cfg.swizzle_b);
+    // TMA for D (FP32, no swizzle on SM90)
+    auto tma_d = make_2d_tma_f32(D, N, M, cfg.block_n, 64, N, 0); // cd_store_block_m=64 for 1D1D
+    // TMA for SFA: [ceil(K/128), align(M,4)] FP32, MN-major
+    int sfa_inner = align4(M);
+    int sfb_inner = align4(N);
+    int k_scales = ceil_div(K, 128);
+    auto tma_sfa = make_2d_tma_f32(scale_a, sfa_inner, k_scales, cfg.block_m, 1, sfa_inner, 0);
+    auto tma_sfb = make_2d_tma_f32(scale_b, sfb_inner, k_scales, cfg.block_n, 1, sfb_inner, 0);
+
+    // 1D1D kernel args: (gmem_a, gmem_b, grouped_layout, tensor_map_buffer, m, n, k, tma_a, tma_b, tma_sfa, tma_sfb, tma_cd)
+    // For Normal GEMM: gmem_a/b and tensor_map_buffer are nullptr
+    __nv_fp8_e4m3* null_fp8 = nullptr;
+    int* null_layout = nullptr;
+    CUtensorMap* null_tmap = nullptr;
+    uint32_t um = M, un = N, uk = K;
+    void* args[] = {
+        &null_fp8, &null_fp8, &null_layout, &null_tmap,
+        &um, &un, &uk,
+        &tma_a, &tma_b, &tma_sfa, &tma_sfb, &tma_d
+    };
+
+    return launch_kernel(kernel_ptr, cfg.num_tma_threads + cfg.num_math_threads,
+                         cfg.smem_size, cfg.num_multicast, args,
+                         static_cast<cudaStream_t>(stream));
+}

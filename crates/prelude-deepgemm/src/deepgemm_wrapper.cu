@@ -13,6 +13,7 @@
 
 #include <deep_gemm/impls/sm90_bf16_gemm.cuh>
 #include <deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh>
+#include <deep_gemm/impls/sm90_fp8_gemm_1d1d.cuh>
 #include <deep_gemm/impls/sm100_bf16_gemm.cuh>
 #include <deep_gemm/impls/sm100_fp8_gemm_1d1d.cuh>
 
@@ -142,6 +143,19 @@ int deepgemm_m_grouped_fp8_gemm(
                                          M, N, K, num_groups, stream);
     return sm90_m_grouped_fp8_gemm(A, B, D, scale_a, scale_b, grouped_layout,
                                     M, N, K, num_groups, stream);
+}
+
+/// FP8 E4M3 1D1D GEMM: D(FP32) = A(FP8) @ B(FP8) with per-block scaling on both.
+/// scale_a, scale_b: both via TMA (per 128-channel block).
+/// Output D is FP32 (not BF16).
+int deepgemm_fp8_gemm_1d1d(
+    void* A, void* B, void* D,
+    void* scale_a, void* scale_b,
+    int M, int N, int K,
+    void* stream
+) {
+    ensure_num_sms();
+    return sm90_fp8_gemm_1d1d(A, B, D, scale_a, scale_b, M, N, K, stream);
 }
 
 /// Query grouped GEMM config for a given shape.

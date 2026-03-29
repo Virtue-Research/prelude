@@ -218,6 +218,7 @@ fn ensure_deepgemm(out_dir: &Path) -> PathBuf {
     for file in [
         "deep_gemm/include/deep_gemm/impls/sm90_bf16_gemm.cuh",
         "deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh",
+        "deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d1d.cuh",
     ] {
         let path = dg_dir.join(file);
         if let Ok(content) = std::fs::read_to_string(&path) {
