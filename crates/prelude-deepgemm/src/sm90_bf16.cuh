@@ -631,24 +631,24 @@ static KernelConfig select_acc_config(int m, int n, int k, int num_sms) {
         GemmType::Normal, true, float>
 
 // FP32 output: block_m <= 128 (upstream constraint). sw_d=0 (no swizzle for FP32 on SM90).
-// Stages computed with smem_d = align(bm*bn*4, 1024).
+// Stages: smem_d=align(bm*bn*4,1024), per_stage=bm*64*2+bn*64*2+16
 __attribute__((used)) static auto* _acc_00 = &KERNEL_TYPE_ACC(16, 16, 32, 128, 0, 1, false);
 __attribute__((used)) static auto* _acc_01 = &KERNEL_TYPE_ACC(16, 32, 32, 128, 0, 1, false);
 __attribute__((used)) static auto* _acc_02 = &KERNEL_TYPE_ACC(16, 64, 22, 128, 0, 1, false);
-__attribute__((used)) static auto* _acc_03 = &KERNEL_TYPE_ACC(16, 128, 13, 128, 0, 1, false);
+__attribute__((used)) static auto* _acc_03 = &KERNEL_TYPE_ACC(16, 128, 12, 128, 0, 1, false);
 __attribute__((used)) static auto* _acc_04 = &KERNEL_TYPE_ACC(32, 16, 32, 128, 0, 1, false);
 __attribute__((used)) static auto* _acc_05 = &KERNEL_TYPE_ACC(32, 32, 27, 128, 0, 1, false);
-__attribute__((used)) static auto* _acc_06 = &KERNEL_TYPE_ACC(32, 64, 15, 128, 0, 1, false);
+__attribute__((used)) static auto* _acc_06 = &KERNEL_TYPE_ACC(32, 64, 18, 128, 0, 1, false);
 __attribute__((used)) static auto* _acc_07 = &KERNEL_TYPE_ACC(32, 128, 10, 128, 0, 1, false);
 __attribute__((used)) static auto* _acc_10 = &KERNEL_TYPE_ACC(64, 16, 22, 128, 0, 1, false);
-__attribute__((used)) static auto* _acc_11 = &KERNEL_TYPE_ACC(64, 32, 15, 128, 0, 1, false);
-__attribute__((used)) static auto* _acc_12 = &KERNEL_TYPE_ACC(64, 64, 10, 128, 0, 1, false);
-__attribute__((used)) static auto* _acc_13 = &KERNEL_TYPE_ACC(64, 128, 6, 128, 0, 1, false);
-__attribute__((used)) static auto* _acc_14 = &KERNEL_TYPE_ACC(64, 256, 3, 128, 0, 1, false);
-__attribute__((used)) static auto* _acc_20 = &KERNEL_TYPE_ACC(128, 16, 10, 256, 0, 1, false);
-__attribute__((used)) static auto* _acc_21 = &KERNEL_TYPE_ACC(128, 32, 8, 256, 0, 1, false);
-__attribute__((used)) static auto* _acc_22 = &KERNEL_TYPE_ACC(128, 64, 5, 256, 0, 1, false);
-__attribute__((used)) static auto* _acc_23 = &KERNEL_TYPE_ACC(128, 128, 3, 256, 0, 1, false);
+__attribute__((used)) static auto* _acc_11 = &KERNEL_TYPE_ACC(64, 32, 18, 128, 0, 1, false);
+__attribute__((used)) static auto* _acc_12 = &KERNEL_TYPE_ACC(64, 64, 13, 128, 0, 1, false);
+__attribute__((used)) static auto* _acc_13 = &KERNEL_TYPE_ACC(64, 128, 8, 128, 0, 1, false);
+__attribute__((used)) static auto* _acc_14 = &KERNEL_TYPE_ACC(64, 256, 4, 128, 0, 1, false);
+__attribute__((used)) static auto* _acc_20 = &KERNEL_TYPE_ACC(128, 16, 12, 256, 0, 1, false);
+__attribute__((used)) static auto* _acc_21 = &KERNEL_TYPE_ACC(128, 32, 10, 256, 0, 1, false);
+__attribute__((used)) static auto* _acc_22 = &KERNEL_TYPE_ACC(128, 64, 8, 256, 0, 1, false);
+__attribute__((used)) static auto* _acc_23 = &KERNEL_TYPE_ACC(128, 128, 5, 256, 0, 1, false);
 
 static const void* get_acc_kernel(const KernelConfig& cfg) {
     // sw_d is always 0 for FP32 accumulation
@@ -657,23 +657,15 @@ static const void* get_acc_kernel(const KernelConfig& cfg) {
             cfg.num_math_threads == NM && cfg.num_multicast == 1) \
             return (const void*)&KERNEL_TYPE_ACC(BM, BN, ST, NM, 0, 1, false);
 
-    MATCH_ACC(16, 16, 32, 128)
-    MATCH_ACC(16, 32, 32, 128)
-    MATCH_ACC(16, 64, 22, 128)
-    MATCH_ACC(16, 128, 13, 128)
-    MATCH_ACC(32, 16, 32, 128)
-    MATCH_ACC(32, 32, 27, 128)
-    MATCH_ACC(32, 64, 15, 128)
-    MATCH_ACC(32, 128, 10, 128)
-    MATCH_ACC(64, 16, 22, 128)
-    MATCH_ACC(64, 32, 15, 128)
-    MATCH_ACC(64, 64, 10, 128)
-    MATCH_ACC(64, 128, 6, 128)
-    MATCH_ACC(64, 256, 3, 128)
-    MATCH_ACC(128, 16, 10, 256)
-    MATCH_ACC(128, 32, 8, 256)
-    MATCH_ACC(128, 64, 5, 256)
-    MATCH_ACC(128, 128, 3, 256)
+    MATCH_ACC(16, 16, 32, 128) MATCH_ACC(16, 32, 32, 128)
+    MATCH_ACC(16, 64, 22, 128) MATCH_ACC(16, 128, 12, 128)
+    MATCH_ACC(32, 16, 32, 128) MATCH_ACC(32, 32, 27, 128)
+    MATCH_ACC(32, 64, 18, 128) MATCH_ACC(32, 128, 10, 128)
+    MATCH_ACC(64, 16, 22, 128) MATCH_ACC(64, 32, 18, 128)
+    MATCH_ACC(64, 64, 13, 128) MATCH_ACC(64, 128, 8, 128)
+    MATCH_ACC(64, 256, 4, 128)
+    MATCH_ACC(128, 16, 12, 256) MATCH_ACC(128, 32, 10, 256)
+    MATCH_ACC(128, 64, 8, 256) MATCH_ACC(128, 128, 5, 256)
 
     #undef MATCH_ACC
     return nullptr;
@@ -868,22 +860,40 @@ static KernelConfig select_masked_config(int expected_m, int n, int k, int num_g
 // Core configs for each num_groups. No multicast (multicast rarely triggers for masked).
 // bm=64 (math=128): bn ∈ {16,32,48,64,96,128,256}
 // bm=128 (math=256): bn ∈ {16,32,48,64,96,128,192,256}
+// Full bn coverage: all multiples of 16 from 16..256 for both bm=64 and bm=128.
 #define MASKED_CONFIGS(G, TAG) \
     __attribute__((used)) static auto* _msk_##TAG##_00 = &KERNEL_TYPE_MASKED(64, 16, 22, 128, 32, 1, false, G); \
     __attribute__((used)) static auto* _msk_##TAG##_01 = &KERNEL_TYPE_MASKED(64, 32, 18, 128, 64, 1, false, G); \
     __attribute__((used)) static auto* _msk_##TAG##_02 = &KERNEL_TYPE_MASKED(64, 48, 15, 128, 32, 1, false, G); \
     __attribute__((used)) static auto* _msk_##TAG##_03 = &KERNEL_TYPE_MASKED(64, 64, 13, 128, 128, 1, false, G); \
-    __attribute__((used)) static auto* _msk_##TAG##_04 = &KERNEL_TYPE_MASKED(64, 96, 10, 128, 64, 1, false, G); \
-    __attribute__((used)) static auto* _msk_##TAG##_05 = &KERNEL_TYPE_MASKED(64, 128, 8, 128, 128, 1, false, G); \
-    __attribute__((used)) static auto* _msk_##TAG##_06 = &KERNEL_TYPE_MASKED(64, 256, 4, 128, 128, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_04 = &KERNEL_TYPE_MASKED(64, 80, 12, 128, 32, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_05 = &KERNEL_TYPE_MASKED(64, 96, 10, 128, 64, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_06 = &KERNEL_TYPE_MASKED(64, 112, 9, 128, 32, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_07 = &KERNEL_TYPE_MASKED(64, 128, 8, 128, 128, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_08 = &KERNEL_TYPE_MASKED(64, 144, 8, 128, 32, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_09 = &KERNEL_TYPE_MASKED(64, 160, 7, 128, 64, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_0a = &KERNEL_TYPE_MASKED(64, 176, 6, 128, 32, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_0b = &KERNEL_TYPE_MASKED(64, 192, 6, 128, 128, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_0c = &KERNEL_TYPE_MASKED(64, 208, 5, 128, 32, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_0d = &KERNEL_TYPE_MASKED(64, 224, 5, 128, 64, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_0e = &KERNEL_TYPE_MASKED(64, 240, 5, 128, 32, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_0f = &KERNEL_TYPE_MASKED(64, 256, 4, 128, 128, 1, false, G); \
     __attribute__((used)) static auto* _msk_##TAG##_10 = &KERNEL_TYPE_MASKED(128, 16, 12, 256, 32, 1, false, G); \
     __attribute__((used)) static auto* _msk_##TAG##_11 = &KERNEL_TYPE_MASKED(128, 32, 10, 256, 64, 1, false, G); \
     __attribute__((used)) static auto* _msk_##TAG##_12 = &KERNEL_TYPE_MASKED(128, 48, 9, 256, 32, 1, false, G); \
     __attribute__((used)) static auto* _msk_##TAG##_13 = &KERNEL_TYPE_MASKED(128, 64, 8, 256, 128, 1, false, G); \
-    __attribute__((used)) static auto* _msk_##TAG##_14 = &KERNEL_TYPE_MASKED(128, 96, 7, 256, 64, 1, false, G); \
-    __attribute__((used)) static auto* _msk_##TAG##_15 = &KERNEL_TYPE_MASKED(128, 128, 6, 256, 128, 1, false, G); \
-    __attribute__((used)) static auto* _msk_##TAG##_16 = &KERNEL_TYPE_MASKED(128, 192, 4, 256, 128, 1, false, G); \
-    __attribute__((used)) static auto* _msk_##TAG##_17 = &KERNEL_TYPE_MASKED(128, 256, 3, 256, 128, 1, false, G);
+    __attribute__((used)) static auto* _msk_##TAG##_14 = &KERNEL_TYPE_MASKED(128, 80, 7, 256, 32, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_15 = &KERNEL_TYPE_MASKED(128, 96, 7, 256, 64, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_16 = &KERNEL_TYPE_MASKED(128, 112, 6, 256, 32, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_17 = &KERNEL_TYPE_MASKED(128, 128, 6, 256, 128, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_18 = &KERNEL_TYPE_MASKED(128, 144, 5, 256, 32, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_19 = &KERNEL_TYPE_MASKED(128, 160, 5, 256, 64, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_1a = &KERNEL_TYPE_MASKED(128, 176, 4, 256, 32, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_1b = &KERNEL_TYPE_MASKED(128, 192, 4, 256, 128, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_1c = &KERNEL_TYPE_MASKED(128, 208, 4, 256, 32, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_1d = &KERNEL_TYPE_MASKED(128, 224, 3, 256, 64, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_1e = &KERNEL_TYPE_MASKED(128, 240, 3, 256, 32, 1, false, G); \
+    __attribute__((used)) static auto* _msk_##TAG##_1f = &KERNEL_TYPE_MASKED(128, 256, 3, 256, 128, 1, false, G);
 
 // Instantiate for common MoE expert counts
 MASKED_CONFIGS(2,  g02)
@@ -912,23 +922,24 @@ static const void* get_masked_kernel(const KernelConfig& cfg, int num_groups) {
         MATCH_MSK(BM, BN, ST, NM, SD, 32) \
         MATCH_MSK(BM, BN, ST, NM, SD, 64)
 
-    // bm=64 (math=128)
-    MATCH_MSK_ALL_G(64, 16, 22, 128, 32)
-    MATCH_MSK_ALL_G(64, 32, 18, 128, 64)
-    MATCH_MSK_ALL_G(64, 48, 15, 128, 32)
-    MATCH_MSK_ALL_G(64, 64, 13, 128, 128)
-    MATCH_MSK_ALL_G(64, 96, 10, 128, 64)
-    MATCH_MSK_ALL_G(64, 128, 8, 128, 128)
-    MATCH_MSK_ALL_G(64, 256, 4, 128, 128)
-    // bm=128 (math=256)
-    MATCH_MSK_ALL_G(128, 16, 12, 256, 32)
-    MATCH_MSK_ALL_G(128, 32, 10, 256, 64)
-    MATCH_MSK_ALL_G(128, 48, 9, 256, 32)
-    MATCH_MSK_ALL_G(128, 64, 8, 256, 128)
-    MATCH_MSK_ALL_G(128, 96, 7, 256, 64)
-    MATCH_MSK_ALL_G(128, 128, 6, 256, 128)
-    MATCH_MSK_ALL_G(128, 192, 4, 256, 128)
-    MATCH_MSK_ALL_G(128, 256, 3, 256, 128)
+    // bm=64 (math=128) — all bn from 16..256 step 16
+    MATCH_MSK_ALL_G(64, 16, 22, 128, 32) MATCH_MSK_ALL_G(64, 32, 18, 128, 64)
+    MATCH_MSK_ALL_G(64, 48, 15, 128, 32) MATCH_MSK_ALL_G(64, 64, 13, 128, 128)
+    MATCH_MSK_ALL_G(64, 80, 12, 128, 32) MATCH_MSK_ALL_G(64, 96, 10, 128, 64)
+    MATCH_MSK_ALL_G(64, 112, 9, 128, 32) MATCH_MSK_ALL_G(64, 128, 8, 128, 128)
+    MATCH_MSK_ALL_G(64, 144, 8, 128, 32) MATCH_MSK_ALL_G(64, 160, 7, 128, 64)
+    MATCH_MSK_ALL_G(64, 176, 6, 128, 32) MATCH_MSK_ALL_G(64, 192, 6, 128, 128)
+    MATCH_MSK_ALL_G(64, 208, 5, 128, 32) MATCH_MSK_ALL_G(64, 224, 5, 128, 64)
+    MATCH_MSK_ALL_G(64, 240, 5, 128, 32) MATCH_MSK_ALL_G(64, 256, 4, 128, 128)
+    // bm=128 (math=256) — all bn from 16..256 step 16
+    MATCH_MSK_ALL_G(128, 16, 12, 256, 32) MATCH_MSK_ALL_G(128, 32, 10, 256, 64)
+    MATCH_MSK_ALL_G(128, 48, 9, 256, 32) MATCH_MSK_ALL_G(128, 64, 8, 256, 128)
+    MATCH_MSK_ALL_G(128, 80, 7, 256, 32) MATCH_MSK_ALL_G(128, 96, 7, 256, 64)
+    MATCH_MSK_ALL_G(128, 112, 6, 256, 32) MATCH_MSK_ALL_G(128, 128, 6, 256, 128)
+    MATCH_MSK_ALL_G(128, 144, 5, 256, 32) MATCH_MSK_ALL_G(128, 160, 5, 256, 64)
+    MATCH_MSK_ALL_G(128, 176, 4, 256, 32) MATCH_MSK_ALL_G(128, 192, 4, 256, 128)
+    MATCH_MSK_ALL_G(128, 208, 4, 256, 32) MATCH_MSK_ALL_G(128, 224, 3, 256, 64)
+    MATCH_MSK_ALL_G(128, 240, 3, 256, 32) MATCH_MSK_ALL_G(128, 256, 3, 256, 128)
 
     #undef MATCH_MSK_ALL_G
     #undef MATCH_MSK

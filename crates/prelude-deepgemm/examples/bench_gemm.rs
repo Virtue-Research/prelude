@@ -147,6 +147,8 @@ fn main() {
     bench_bf16(&gpu);
     bench_fp8(&gpu);
     bench_grouped(&gpu);
+    bench_masked(&gpu);
+    bench_acc(&gpu);
 }
 
 fn bench_bf16(gpu: &Gpu) {
@@ -536,6 +538,126 @@ fn bench_grouped(gpu: &Gpu) {
         let cfg_str = format!("{bm}x{bn}/s{stages}");
         println!("{num_groups:<6} {m_per_group:<6} {n:<5} {k:<5} {grp_us:>9.1} {sep_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T  {cfg_str:>16}",
             r, ratio_marker(r));
+    }
+    println!();
+}
+
+fn bench_masked(gpu: &Gpu) {
+    println!("\n{:=<80}", "= Masked BF16 GEMM: DeepGEMM vs G×cuBLAS ");
+    print!("{:<6} {:<6} {:<6} {:<5} {:<5} {:>9} {:>9} {:>7} {:>7}",
+        "G", "padM", "actM", "N", "K", "masked", "G×cuBLAS", "vs_cub", "TFLOPS");
+    println!();
+    println!("{}", "-".repeat(80));
+
+    // (num_groups, padded_m, actual_m, N, K)
+    let shapes: Vec<(usize, usize, usize, usize, usize)> = vec![
+        (4, 256, 128, 4096, 1024),
+        (4, 256, 192, 4096, 1024),
+        (8, 128, 128, 4096, 4096),
+        (8, 128, 64, 7168, 4096),
+        (8, 256, 128, 4096, 4096),
+    ];
+
+    for &(num_groups, padded_m, actual_m, n, k) in &shapes {
+        let a_data = rand_bf16(num_groups * padded_m * k);
+        let b_data = rand_bf16(num_groups * n * k);
+        let masked_m: Vec<i32> = vec![actual_m as i32; num_groups];
+
+        let a_gpu = gpu.upload(&a_data);
+        let b_gpu = gpu.upload(&b_data);
+        let mask_gpu = gpu.upload(&masked_m);
+        let mut out_masked = gpu.alloc_zeros::<half::bf16>(num_groups * padded_m * n);
+
+        let expected_m = actual_m;
+        let msk_us = bench_us(|| {
+            let (ap, _) = a_gpu.device_ptr(&gpu.stream);
+            let (bp, _) = b_gpu.device_ptr(&gpu.stream);
+            let (mp, _) = mask_gpu.device_ptr(&gpu.stream);
+            let (op, _) = out_masked.device_ptr_mut(&gpu.stream);
+            unsafe {
+                prelude_deepgemm::m_grouped_masked_bf16_gemm(
+                    ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
+                    mp as *mut c_void,
+                    padded_m as i32, n as i32, k as i32,
+                    num_groups as i32, expected_m as i32,
+                    gpu.stream_ptr(),
+                ).unwrap();
+            }
+        }, gpu);
+
+        // Baseline: G separate cuBLAS GEMMs (each actual_m × N × K)
+        let a_groups: Vec<CudaSlice<half::bf16>> = (0..num_groups)
+            .map(|g| {
+                let start = g * padded_m * k;
+                let end = start + actual_m * k;
+                gpu.upload(&a_data[start..end])
+            })
+            .collect();
+        let b_groups: Vec<CudaSlice<half::bf16>> = (0..num_groups)
+            .map(|g| {
+                let start = g * n * k;
+                let end = start + n * k;
+                gpu.upload(&b_data[start..end])
+            })
+            .collect();
+        let mut outs_sep: Vec<CudaSlice<half::bf16>> = (0..num_groups)
+            .map(|_| gpu.alloc_zeros::<half::bf16>(actual_m * n))
+            .collect();
+
+        let sep_us = bench_us(|| {
+            for g in 0..num_groups {
+                cublas_gemm_bf16(&b_groups[g], &a_groups[g], &mut outs_sep[g],
+                    actual_m, n, k, gpu);
+            }
+        }, gpu);
+
+        let total_flops_m = num_groups * actual_m;
+        let tf = tflops(total_flops_m, n, k, msk_us);
+        let r = msk_us / sep_us;
+        println!("{num_groups:<6} {padded_m:<6} {actual_m:<6} {n:<5} {k:<5} {msk_us:>9.1} {sep_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T",
+            r, ratio_marker(r));
+    }
+    println!();
+}
+
+fn bench_acc(gpu: &Gpu) {
+    println!("\n{:=<80}", "= BF16 GEMM + Acc: DeepGEMM D(FP32)+=A@B ");
+    print!("{:<6} {:<5} {:<5} {:>12} {:>7}",
+        "M", "N", "K", "acc_us", "TFLOPS");
+    println!();
+    println!("{}", "-".repeat(50));
+
+    let shapes = vec![
+        (1, 1024, 1024), (4, 4096, 4096), (128, 4096, 4096),
+    ];
+
+    for &(m, n, k) in &shapes {
+        let a_data = rand_bf16(m * k);
+        let b_data = rand_bf16(n * k);
+        let c_data = rand_f32(m * n);
+
+        let a_gpu = gpu.upload(&a_data);
+        let b_gpu = gpu.upload(&b_data);
+        let c_gpu = gpu.upload(&c_data);
+        let mut d_gpu = gpu.alloc_zeros::<f32>(m * n);
+
+        let acc_us = bench_us(|| {
+            let (ap, _) = a_gpu.device_ptr(&gpu.stream);
+            let (bp, _) = b_gpu.device_ptr(&gpu.stream);
+            let (cp, _) = c_gpu.device_ptr(&gpu.stream);
+            let (dp, _) = d_gpu.device_ptr_mut(&gpu.stream);
+            unsafe {
+                prelude_deepgemm::bf16_gemm_acc(
+                    ap as *mut c_void, bp as *mut c_void,
+                    cp as *mut c_void, dp as *mut c_void,
+                    m as i32, n as i32, k as i32,
+                    gpu.stream_ptr(),
+                ).unwrap();
+            }
+        }, gpu);
+
+        let tf = tflops(m, n, k, acc_us);
+        println!("{m:<6} {n:<5} {k:<5} {acc_us:>12.1} {tf:>6.1}T");
     }
     println!();
 }
