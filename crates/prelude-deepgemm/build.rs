@@ -17,6 +17,12 @@ const DEEPGEMM_BRANCH: &str = "main";
 
 fn main() {
     println!("cargo:rerun-if-changed=src/deepgemm_wrapper.cu");
+    println!("cargo:rerun-if-changed=src/common.cuh");
+    println!("cargo:rerun-if-changed=src/sm90_bf16.cuh");
+    println!("cargo:rerun-if-changed=src/sm90_fp8.cuh");
+    println!("cargo:rerun-if-changed=src/sm100_bf16.cuh");
+    println!("cargo:rerun-if-changed=src/sm100_fp8.cuh");
+    println!("cargo:rerun-if-changed=src/attention.cuh");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -40,10 +46,12 @@ fn main() {
     let common_args = [
         "-std=c++20", "-O3", "--expt-relaxed-constexpr", "-Xcompiler", "-fPIC",
     ];
+    let src_dir = manifest_dir.join("src");
     let include_args = [
         "-I", cutlass_include.to_str().unwrap(),
         "-I", deepgemm_include.to_str().unwrap(),
         "-I", &format!("{}/include", cuda_path.display()),
+        "-I", src_dir.to_str().unwrap(),
     ];
 
     // Compile for SM90a always. Add SM100a if toolkit supports it (fat binary).

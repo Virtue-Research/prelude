@@ -552,3 +552,190 @@ fn fp8_grouped_gemm_moe_shapes() {
         run_fp8_grouped_test(&ms, n, k, &gpu);
     }
 }
+
+// ── M-Grouped Masked GEMM tests ───────────────────────────────────────
+
+/// CPU reference for masked GEMM: per-group matmul, only first actual_m rows valid.
+fn cpu_masked_ref_f64(
+    a: &[f64], b: &[f64], padded_m: usize, actual_ms: &[usize], n: usize, k: usize,
+) -> Vec<f64> {
+    let num_groups = actual_ms.len();
+    let mut out = vec![0.0f64; num_groups * padded_m * n];
+    for g in 0..num_groups {
+        let am = actual_ms[g];
+        let a_group = &a[(g * padded_m * k)..(g * padded_m * k + am * k)];
+        let b_group = &b[(g * n * k)..((g + 1) * n * k)];
+        let ref_group = cpu_ref_f64(a_group, b_group, am, n, k);
+        // Copy to first am rows of group g's output
+        for mi in 0..am {
+            for ni in 0..n {
+                out[g * padded_m * n + mi * n + ni] = ref_group[mi * n + ni];
+            }
+        }
+    }
+    out
+}
+
+fn run_masked_test(actual_ms: &[usize], padded_m: usize, n: usize, k: usize, gpu: &Gpu) {
+    let num_groups = actual_ms.len();
+
+    let a_f32 = rand_f32(num_groups * padded_m * k);
+    let b_f32 = rand_f32(num_groups * n * k);
+
+    let ref64 = cpu_masked_ref_f64(
+        &a_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+        &b_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+        padded_m, actual_ms, n, k,
+    );
+
+    // masked_m[G] = actual rows per group
+    let masked_m: Vec<i32> = actual_ms.iter().map(|&x| x as i32).collect();
+
+    let a_bf16: Vec<half::bf16> = a_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
+    let b_bf16: Vec<half::bf16> = b_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
+
+    // expected_m = average actual M (for heuristic)
+    let expected_m = actual_ms.iter().sum::<usize>() / num_groups;
+
+    let result: Vec<f64> = {
+        let a_gpu = gpu.upload(&a_bf16);
+        let b_gpu = gpu.upload(&b_bf16);
+        let mask_gpu = gpu.upload(&masked_m);
+        let mut out_gpu = gpu.alloc_zeros::<half::bf16>(num_groups * padded_m * n);
+
+        {
+            let (ap, _g1) = a_gpu.device_ptr(&gpu.stream);
+            let (bp, _g2) = b_gpu.device_ptr(&gpu.stream);
+            let (mp, _g3) = mask_gpu.device_ptr(&gpu.stream);
+            let (op, _g4) = out_gpu.device_ptr_mut(&gpu.stream);
+            unsafe {
+                prelude_deepgemm::m_grouped_masked_bf16_gemm(
+                    ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
+                    mp as *mut c_void,
+                    padded_m as i32, n as i32, k as i32,
+                    num_groups as i32, expected_m as i32,
+                    gpu.stream_ptr(),
+                ).unwrap();
+            }
+        }
+        gpu.sync();
+        gpu.download(&out_gpu).iter().map(|x| x.to_f32() as f64).collect()
+    };
+
+    // Only check valid rows (first actual_ms[g] rows of each group)
+    let mut max_err = 0.0f64;
+    for g in 0..num_groups {
+        let am = actual_ms[g];
+        for mi in 0..am {
+            for ni in 0..n {
+                let idx = g * padded_m * n + mi * n + ni;
+                let e = (ref64[idx] - result[idx]).abs();
+                if e > max_err { max_err = e; }
+            }
+        }
+    }
+    assert!(max_err < 1.0,
+        "Masked GEMM G={num_groups} padM={padded_m} actual={actual_ms:?} N={n} K={k}: max_err={max_err:.6e}");
+}
+
+#[test]
+fn masked_gemm_small() {
+    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    // 2 groups, padded to 128, actual 64 and 96 rows
+    run_masked_test(&[64, 96], 128, 256, 256, &gpu);
+    // 4 groups, padded to 256, varying actual M
+    run_masked_test(&[128, 192, 64, 256], 256, 512, 512, &gpu);
+}
+
+#[test]
+fn masked_gemm_moe_shapes() {
+    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    // 4 experts, padded to 256, actual ~128 each
+    run_masked_test(&[128, 128, 128, 128], 256, 4096, 1024, &gpu);
+    // 8 experts, padded to 128, actual varies
+    run_masked_test(&[64, 128, 96, 128, 64, 128, 96, 128], 128, 4096, 4096, &gpu);
+}
+
+// ── M-Grouped Masked FP8 GEMM tests ──────────────────────────────────
+
+fn run_fp8_masked_test(actual_ms: &[usize], padded_m: usize, n: usize, k: usize, gpu: &Gpu) {
+    assert!(k % 128 == 0, "K must be multiple of 128 for FP8");
+    let num_groups = actual_ms.len();
+
+    // Generate random data for full [G, padded_m, K] / [G, N, K]
+    let a_f32 = rand_f32(num_groups * padded_m * k);
+    let b_f32 = rand_f32(num_groups * n * k);
+
+    // Quantize per-group: SFA is [G, ceil(K/128), align(padded_m, 4)]
+    // We quantize the flat [G*padded_m, K] and [G*N, K] arrays
+    let (a_fp8, scale_a) = quantize_to_fp8(&a_f32, num_groups * padded_m, k);
+    let (b_fp8, scale_b) = quantize_to_fp8(&b_f32, num_groups * n, k);
+
+    // CPU reference: dequantize, then per-group matmul (only valid rows)
+    let a_deq = dequantize_fp8_f64(&a_fp8, &scale_a, num_groups * padded_m, k);
+    let b_deq = dequantize_fp8_f64(&b_fp8, &scale_b, num_groups * n, k);
+    let ref64 = cpu_masked_ref_f64(&a_deq, &b_deq, padded_m, actual_ms, n, k);
+
+    let masked_m: Vec<i32> = actual_ms.iter().map(|&x| x as i32).collect();
+    let expected_m = actual_ms.iter().sum::<usize>() / num_groups;
+
+    let result: Vec<f64> = {
+        let a_gpu = gpu.upload(&a_fp8);
+        let b_gpu = gpu.upload(&b_fp8);
+        let sfa_gpu = gpu.upload(&scale_a);
+        let sfb_gpu = gpu.upload(&scale_b);
+        let mask_gpu = gpu.upload(&masked_m);
+        let mut out_gpu = gpu.alloc_zeros::<half::bf16>(num_groups * padded_m * n);
+
+        {
+            let (ap, _) = a_gpu.device_ptr(&gpu.stream);
+            let (bp, _) = b_gpu.device_ptr(&gpu.stream);
+            let (sfap, _) = sfa_gpu.device_ptr(&gpu.stream);
+            let (sfbp, _) = sfb_gpu.device_ptr(&gpu.stream);
+            let (mp, _) = mask_gpu.device_ptr(&gpu.stream);
+            let (op, _) = out_gpu.device_ptr_mut(&gpu.stream);
+            unsafe {
+                prelude_deepgemm::m_grouped_masked_fp8_gemm(
+                    ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
+                    sfap as *mut c_void, sfbp as *mut c_void,
+                    mp as *mut c_void,
+                    padded_m as i32, n as i32, k as i32,
+                    num_groups as i32, expected_m as i32,
+                    gpu.stream_ptr(),
+                ).unwrap();
+            }
+        }
+        gpu.sync();
+        gpu.download(&out_gpu).iter().map(|x| x.to_f32() as f64).collect()
+    };
+
+    // Only check valid rows
+    let mut max_err = 0.0f64;
+    for g in 0..num_groups {
+        let am = actual_ms[g];
+        for mi in 0..am {
+            for ni in 0..n {
+                let idx = g * padded_m * n + mi * n + ni;
+                let e = (ref64[idx] - result[idx]).abs();
+                if e > max_err { max_err = e; }
+            }
+        }
+    }
+    assert!(max_err < 1.0,
+        "Masked FP8 G={num_groups} padM={padded_m} actual={actual_ms:?} N={n} K={k}: max_err={max_err:.6e}");
+}
+
+#[test]
+fn fp8_masked_gemm_small() {
+    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    // K must be multiple of 128
+    run_fp8_masked_test(&[64, 64], 128, 256, 256, &gpu);
+    run_fp8_masked_test(&[64, 128, 64, 128], 128, 128, 128, &gpu);
+}
+
+#[test]
+fn fp8_masked_gemm_moe_shapes() {
+    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    run_fp8_masked_test(&[128, 128, 128, 128], 256, 1024, 1024, &gpu);
+    run_fp8_masked_test(&[64, 128, 64, 128, 64, 128, 64, 128], 128, 4096, 4096, &gpu);
+}
