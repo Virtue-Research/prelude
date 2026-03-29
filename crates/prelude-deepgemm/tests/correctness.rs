@@ -734,6 +734,54 @@ fn fp8_masked_gemm_small() {
 }
 
 #[test]
+#[test]
+fn bf16_gemm_acc_small() {
+    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    for (m, n, k) in [(16, 256, 256), (64, 512, 512), (128, 1024, 1024)] {
+        // Reference: D = C + A @ B (all in f64)
+        let a_f32 = rand_f32(m * k);
+        let b_f32 = rand_f32(n * k);
+        let c_f32 = rand_f32(m * n); // bias
+
+        let a_f64: Vec<f64> = a_f32.iter().map(|&x| x as f64).collect();
+        let b_f64: Vec<f64> = b_f32.iter().map(|&x| x as f64).collect();
+        let c_f64: Vec<f64> = c_f32.iter().map(|&x| x as f64).collect();
+        let matmul = cpu_ref_f64(&a_f64, &b_f64, m, n, k);
+        let ref64: Vec<f64> = c_f64.iter().zip(matmul.iter()).map(|(&c, &m)| c + m).collect();
+
+        let a_bf16: Vec<half::bf16> = a_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
+        let b_bf16: Vec<half::bf16> = b_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
+
+        let result: Vec<f64> = {
+            let a_gpu = gpu.upload(&a_bf16);
+            let b_gpu = gpu.upload(&b_bf16);
+            let c_gpu = gpu.upload(&c_f32); // C is FP32
+            let mut d_gpu = gpu.alloc_zeros::<f32>(m * n);
+
+            {
+                let (ap, _) = a_gpu.device_ptr(&gpu.stream);
+                let (bp, _) = b_gpu.device_ptr(&gpu.stream);
+                let (cp, _) = c_gpu.device_ptr(&gpu.stream);
+                let (dp, _) = d_gpu.device_ptr_mut(&gpu.stream);
+                unsafe {
+                    prelude_deepgemm::bf16_gemm_acc(
+                        ap as *mut c_void, bp as *mut c_void,
+                        cp as *mut c_void, dp as *mut c_void,
+                        m as i32, n as i32, k as i32,
+                        gpu.stream_ptr(),
+                    ).unwrap();
+                }
+            }
+            gpu.sync();
+            gpu.download(&d_gpu).iter().map(|&x| x as f64).collect()
+        };
+
+        let err = max_abs_err(&ref64, &result);
+        assert!(err < 1.0, "BF16 acc GEMM M={m} N={n} K={k}: max_err={err:.6e}");
+    }
+}
+
+#[test]
 fn fp8_masked_gemm_moe_shapes() {
     let gpu = match Gpu::new() { Some(g) => g, None => return };
     run_fp8_masked_test(&[128, 128, 128, 128], 256, 1024, 1024, &gpu);

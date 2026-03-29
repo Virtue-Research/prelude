@@ -80,6 +80,17 @@ unsafe extern "C" {
         out_smem: *mut i32,
     );
 
+    fn deepgemm_bf16_gemm_acc(
+        A: *mut c_void,
+        B: *mut c_void,
+        C: *mut c_void,
+        D: *mut c_void,
+        M: i32,
+        N: i32,
+        K: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
     fn deepgemm_m_grouped_masked_bf16_gemm(
         A: *mut c_void,
         B: *mut c_void,
@@ -264,6 +275,36 @@ pub fn query_config(m: i32, n: i32, k: i32) -> (i32, i32, i32, i32) {
         deepgemm_query_config(m, n, k, &mut block_m, &mut block_n, &mut stages, &mut smem);
     }
     (block_m, block_n, stages, smem)
+}
+
+/// BF16 GEMM with FP32 accumulation: D(FP32) += A(BF16) @ B(BF16)
+///
+/// - A: \[M, K\] row-major BF16
+/// - B: \[K, N\] col-major BF16
+/// - C: optional \[M, N\] FP32 bias (null for no bias, same as D for in-place accumulation)
+/// - D: \[M, N\] row-major FP32 output (accumulation target)
+///
+/// If C is non-null and != D, C is copied to D before the GEMM launch.
+/// The kernel then atomically adds the GEMM result to D.
+///
+/// # Safety
+/// All pointers must be valid CUDA device pointers. D must be FP32.
+pub unsafe fn bf16_gemm_acc(
+    a: *mut c_void,
+    b: *mut c_void,
+    c: *mut c_void,
+    d: *mut c_void,
+    m: i32,
+    n: i32,
+    k: i32,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    let ret = unsafe { deepgemm_bf16_gemm_acc(a, b, c, d, m, n, k, stream) };
+    match ret {
+        0 => Ok(()),
+        -1 => Err(format!("DeepGEMM acc: no kernel variant for M={m} N={n} K={k}")),
+        code => Err(format!("DeepGEMM acc: launch failed (code {code}) for M={m} N={n} K={k}")),
+    }
 }
 
 /// M-Grouped Masked BF16 GEMM (for MoE with CUDA graphs):

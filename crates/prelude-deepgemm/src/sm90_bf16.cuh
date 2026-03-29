@@ -528,6 +528,157 @@ static const void* get_grouped_kernel(const KernelConfig& cfg) {
     return nullptr;
 }
 
+// ════════════════════════════════════════════════════════════════════
+// BF16 GEMM with accumulation: D(FP32) += A @ B
+// kWithAccumulation=true, cd_dtype_t=float, uses TMA_REDUCE_ADD.
+// ════════════════════════════════════════════════════════════════════
+
+static int get_swizzle_f32(int block_n) {
+    for (int mode : {128, 64, 32, 16})
+        if ((block_n * 4) % mode == 0) return mode;
+    return 16;
+}
+
+static KernelConfig select_acc_config(int m, int n, int k, int num_sms) {
+    const int block_k = 64;
+
+    int block_ms[5] = {64, 128, 256, 0, 0};
+    int n_block_ms = 3;
+    if (m <= 16) { block_ms[n_block_ms++] = 16; }
+    if (m <= 32) { block_ms[n_block_ms++] = 32; }
+
+    int block_ns[16]; int n_block_ns = 0;
+    for (int i = 16; i <= 256; i += 16) block_ns[n_block_ns++] = i;
+
+    int best_bm = 0, best_bn = 0, best_waves = 0, best_last = 0;
+    auto ceil_div = [](int a, int b) { return (a + b - 1) / b; };
+
+    for (int i = 0; i < n_block_ms; i++) {
+        for (int j = 0; j < n_block_ns; j++) {
+            int bm = block_ms[i], bn = block_ns[j];
+            if (bm > 128 && bn > 128) continue;
+            // With FP32 output, block_m must be <= 128 (upstream constraint)
+            if (bm > 128) continue;
+            int num_blocks = ceil_div(m, bm) * ceil_div(n, bn);
+            int waves = ceil_div(num_blocks, num_sms);
+            int last_util = num_blocks % num_sms;
+            if (last_util == 0) last_util = num_sms;
+
+            bool better = false;
+            if (best_bm == 0 || waves < best_waves) better = true;
+            else if (waves == best_waves) {
+                better = last_util > best_last;
+                if (last_util == best_last) {
+                    better |= (bm == best_bm && bn < best_bn);
+                    better |= (bn == best_bn && bm < best_bm);
+                    better |= (bm != best_bm && bn > best_bn && bn <= n && bm <= m);
+                }
+            }
+            if (better) { best_bm = bm; best_bn = bn; best_waves = waves; best_last = last_util; }
+        }
+    }
+
+    int num_tma = 128;
+    int num_math = (best_bm <= 64) ? 128 : 256;
+
+    int multicast = 1; bool mc_on_a = false;
+    if (m >= 512 && num_sms % 2 == 0) {
+        bool legal_on_b = (ceil_div(n, best_bn) % 2 == 0);
+        bool legal_on_a = (ceil_div(m, best_bm) % 2 == 0);
+        bool order[2] = {false, true};
+        if (best_bm > best_bn) { order[0] = true; order[1] = false; }
+        bool legal[2] = {legal_on_a, legal_on_b};
+        for (int i = 0; i < 2; i++) {
+            if (legal[order[i] ? 1 : 0]) { multicast = 2; mc_on_a = order[i]; break; }
+        }
+    }
+
+    int sw_a = get_swizzle(block_k);
+    int sw_b = get_swizzle(block_k);
+    int sw_d = 0; // SM90 disables CD swizzle for FP32 output (enable_cd_swizzle returns false)
+
+    // FP32 output: smem_d uses 4 bytes per element
+    const int smem_capacity = 232448;
+    int smem_d = ((best_bm * best_bn * 4 + 1023) / 1024) * 1024;
+    int smem_a_per_stage = best_bm * block_k * 2;
+    int smem_b_per_stage = best_bn * block_k * 2;
+
+    int best_stages = 0, best_smem = 0;
+    for (int s = 32; s > 0; s--) {
+        int smem_barrier = s * 8 * 2;
+        int smem = smem_d + s * (smem_a_per_stage + smem_b_per_stage) + smem_barrier;
+        if (smem <= smem_capacity) { best_stages = s; best_smem = smem; break; }
+    }
+
+    return KernelConfig{
+        .block_m = best_bm, .block_n = best_bn, .block_k = block_k,
+        .num_stages = best_stages,
+        .num_tma_threads = num_tma, .num_math_threads = num_math,
+        .num_multicast = multicast, .multicast_on_a = mc_on_a,
+        .swizzle_a = sw_a, .swizzle_b = sw_b, .swizzle_d = sw_d,
+        .smem_size = best_smem,
+    };
+}
+
+#define KERNEL_TYPE_ACC(BLOCK_M, BLOCK_N, STAGES, NUM_MATH, SWIZZLE_D, NUM_MC, MC_ON_A) \
+    deep_gemm::sm90_bf16_gemm_impl<                                        \
+        cute::UMMA::Major::K, cute::UMMA::Major::K,                       \
+        0, 0, 0, 1,                                                        \
+        BLOCK_M, BLOCK_N, 64,                                              \
+        128, 128, SWIZZLE_D,                                               \
+        STAGES, 128, NUM_MATH,                                             \
+        NUM_MC, MC_ON_A, 132,                                              \
+        GemmType::Normal, true, float>
+
+// FP32 output: block_m <= 128 (upstream constraint). sw_d=0 (no swizzle for FP32 on SM90).
+// Stages computed with smem_d = align(bm*bn*4, 1024).
+__attribute__((used)) static auto* _acc_00 = &KERNEL_TYPE_ACC(16, 16, 32, 128, 0, 1, false);
+__attribute__((used)) static auto* _acc_01 = &KERNEL_TYPE_ACC(16, 32, 32, 128, 0, 1, false);
+__attribute__((used)) static auto* _acc_02 = &KERNEL_TYPE_ACC(16, 64, 22, 128, 0, 1, false);
+__attribute__((used)) static auto* _acc_03 = &KERNEL_TYPE_ACC(16, 128, 13, 128, 0, 1, false);
+__attribute__((used)) static auto* _acc_04 = &KERNEL_TYPE_ACC(32, 16, 32, 128, 0, 1, false);
+__attribute__((used)) static auto* _acc_05 = &KERNEL_TYPE_ACC(32, 32, 27, 128, 0, 1, false);
+__attribute__((used)) static auto* _acc_06 = &KERNEL_TYPE_ACC(32, 64, 15, 128, 0, 1, false);
+__attribute__((used)) static auto* _acc_07 = &KERNEL_TYPE_ACC(32, 128, 10, 128, 0, 1, false);
+__attribute__((used)) static auto* _acc_10 = &KERNEL_TYPE_ACC(64, 16, 22, 128, 0, 1, false);
+__attribute__((used)) static auto* _acc_11 = &KERNEL_TYPE_ACC(64, 32, 15, 128, 0, 1, false);
+__attribute__((used)) static auto* _acc_12 = &KERNEL_TYPE_ACC(64, 64, 10, 128, 0, 1, false);
+__attribute__((used)) static auto* _acc_13 = &KERNEL_TYPE_ACC(64, 128, 6, 128, 0, 1, false);
+__attribute__((used)) static auto* _acc_14 = &KERNEL_TYPE_ACC(64, 256, 3, 128, 0, 1, false);
+__attribute__((used)) static auto* _acc_20 = &KERNEL_TYPE_ACC(128, 16, 10, 256, 0, 1, false);
+__attribute__((used)) static auto* _acc_21 = &KERNEL_TYPE_ACC(128, 32, 8, 256, 0, 1, false);
+__attribute__((used)) static auto* _acc_22 = &KERNEL_TYPE_ACC(128, 64, 5, 256, 0, 1, false);
+__attribute__((used)) static auto* _acc_23 = &KERNEL_TYPE_ACC(128, 128, 3, 256, 0, 1, false);
+
+static const void* get_acc_kernel(const KernelConfig& cfg) {
+    // sw_d is always 0 for FP32 accumulation
+    #define MATCH_ACC(BM, BN, ST, NM) \
+        if (cfg.block_m == BM && cfg.block_n == BN && cfg.num_stages == ST && \
+            cfg.num_math_threads == NM && cfg.num_multicast == 1) \
+            return (const void*)&KERNEL_TYPE_ACC(BM, BN, ST, NM, 0, 1, false);
+
+    MATCH_ACC(16, 16, 32, 128)
+    MATCH_ACC(16, 32, 32, 128)
+    MATCH_ACC(16, 64, 22, 128)
+    MATCH_ACC(16, 128, 13, 128)
+    MATCH_ACC(32, 16, 32, 128)
+    MATCH_ACC(32, 32, 27, 128)
+    MATCH_ACC(32, 64, 15, 128)
+    MATCH_ACC(32, 128, 10, 128)
+    MATCH_ACC(64, 16, 22, 128)
+    MATCH_ACC(64, 32, 15, 128)
+    MATCH_ACC(64, 64, 10, 128)
+    MATCH_ACC(64, 128, 6, 128)
+    MATCH_ACC(64, 256, 3, 128)
+    MATCH_ACC(128, 16, 10, 256)
+    MATCH_ACC(128, 32, 8, 256)
+    MATCH_ACC(128, 64, 5, 256)
+    MATCH_ACC(128, 128, 3, 256)
+
+    #undef MATCH_ACC
+    return nullptr;
+}
+
 // ── SM90 BF16 implementation functions ─────────────────────────────
 
 static int sm90_bf16_gemm(void* A, void* B, void* D, int M, int N, int K, void* stream) {
@@ -541,6 +692,37 @@ static int sm90_bf16_gemm(void* A, void* B, void* D, int M, int N, int K, void* 
     auto tma_d = make_2d_tma(D, N, M,
                              cfg.swizzle_d > 0 ? cfg.swizzle_d / 2 : cfg.block_n,
                              cfg.block_m, N, cfg.swizzle_d);
+
+    int* grouped_layout = nullptr;
+    uint32_t um = M, un = N, uk = K;
+    void* args[] = { &grouped_layout, &um, &un, &uk, &tma_a, &tma_b, &tma_d };
+
+    return launch_kernel(kernel_ptr, cfg.num_tma_threads + cfg.num_math_threads,
+                         cfg.smem_size, cfg.num_multicast, args,
+                         static_cast<cudaStream_t>(stream));
+}
+
+/// BF16 GEMM with FP32 accumulation: D(FP32) += A(BF16) @ B(BF16)
+/// If C != D and C != nullptr, copies C to D first (upstream early_return pattern).
+/// D must be pre-allocated as FP32[M,N].
+static int sm90_bf16_gemm_acc(void* A, void* B, void* C, void* D,
+                               int M, int N, int K, void* stream) {
+    cudaGetLastError();
+
+    // If C provided and different from D, copy C to D first
+    if (C && C != D) {
+        auto s = static_cast<cudaStream_t>(stream);
+        cudaMemcpyAsync(D, C, (size_t)M * N * 4, cudaMemcpyDeviceToDevice, s);
+    }
+
+    auto cfg = select_acc_config(M, N, K, g_num_sms);
+    auto kernel_ptr = get_acc_kernel(cfg);
+    if (!kernel_ptr) return -1;
+
+    auto tma_a = make_2d_tma(A, K, M, cfg.block_k, cfg.block_m, K, cfg.swizzle_a);
+    auto tma_b = make_2d_tma(B, K, N, cfg.block_k, cfg.block_n, K, cfg.swizzle_b);
+    // D is FP32, no swizzle on SM90 for FP32 output
+    auto tma_d = make_2d_tma_f32(D, N, M, cfg.block_n, cfg.block_m, N, 0);
 
     int* grouped_layout = nullptr;
     uint32_t um = M, un = N, uk = K;

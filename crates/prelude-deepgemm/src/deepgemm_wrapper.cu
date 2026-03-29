@@ -45,6 +45,19 @@ int deepgemm_bf16_gemm(
     return sm90_bf16_gemm(A, B, D, M, N, K, stream);
 }
 
+/// BF16 GEMM with FP32 accumulation: D(FP32) += A(BF16) @ B(BF16)
+/// C: optional FP32 bias. If non-null and != D, copied to D before launch.
+/// D: [M,N] FP32 output (accumulated in-place).
+/// Returns 0 on success, -1 if no kernel variant, -2 on launch error.
+int deepgemm_bf16_gemm_acc(
+    void* A, void* B, void* C, void* D,
+    int M, int N, int K,
+    void* stream
+) {
+    ensure_num_sms();
+    return sm90_bf16_gemm_acc(A, B, C, D, M, N, K, stream);
+}
+
 /// Query BF16 kernel config for a given shape.
 /// Auto-dispatches to SM100 when detected.
 void deepgemm_query_config(int M, int N, int K,
@@ -91,6 +104,7 @@ void deepgemm_query_fp8_config(int M, int N, int K,
 
 /// M-Grouped Contiguous BF16 GEMM (MoE):
 ///   D[total_M, N] = grouped(A[total_M, K], B[G, N, K], grouped_layout[total_M])
+/// Auto-dispatches to SM100 when detected.
 /// Returns 0 on success, -1 if no kernel variant, -2 on launch error.
 int deepgemm_m_grouped_bf16_gemm(
     void* A, void* B, void* D,
@@ -100,6 +114,9 @@ int deepgemm_m_grouped_bf16_gemm(
     void* stream
 ) {
     ensure_num_sms();
+    ensure_gpu_arch();
+    if (g_gpu_arch >= 100)
+        return sm100_m_grouped_bf16_gemm(A, B, D, grouped_layout, M, N, K, num_groups, stream);
     return sm90_m_grouped_bf16_gemm(A, B, D, grouped_layout, M, N, K, num_groups, stream);
 }
 
@@ -149,6 +166,10 @@ int deepgemm_m_grouped_masked_bf16_gemm(
     void* stream
 ) {
     ensure_num_sms();
+    ensure_gpu_arch();
+    if (g_gpu_arch >= 100)
+        return sm100_m_grouped_masked_bf16_gemm(A, B, D, masked_m,
+                                                 M, N, K, num_groups, expected_m, stream);
     return sm90_m_grouped_masked_bf16_gemm(A, B, D, masked_m,
                                             M, N, K, num_groups, expected_m, stream);
 }
