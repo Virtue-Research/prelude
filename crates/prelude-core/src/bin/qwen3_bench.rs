@@ -33,7 +33,7 @@ fn main() -> Result<()> {
 
     // Register CUTLASS/DeepGEMM GEMM dispatch (replaces cuBLAS)
     #[cfg(any(feature = "cutlass-gemm", feature = "deepgemm"))]
-    crate::ops::gpu::gemm::register_gpu_gemm();
+    prelude_core::ops::gpu::gemm::register_gpu_gemm();
     let weight_files = find_safetensor_files(&args.model_path)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, &device)? };
 
