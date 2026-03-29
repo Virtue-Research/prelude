@@ -77,36 +77,21 @@ static KernelConfig select_config(int m, int n, int k, int num_sms) {
         }
     }
 
-    // Swizzle modes
-    int sw_a = get_swizzle(block_k); // A: K-major, inner=K
-    int sw_b = get_swizzle(block_k); // B: K-major, inner=K
-    int sw_d = get_swizzle(best_bn); // D: row-major, inner=N
-
-    // Select max stages that fit in shared memory (232448 bytes for SM90)
-    const int smem_capacity = 232448;
-    int smem_d = ((best_bm * best_bn * 2 + 1023) / 1024) * 1024;
-    int smem_a_per_stage = best_bm * block_k * 2; // bf16
-    int smem_b_per_stage = best_bn * block_k * 2;
-
-    int best_stages = 0;
-    int best_smem = 0;
-    for (int s = 32; s > 0; s--) {
-        int smem_barrier = s * 8 * 2;
-        int smem = smem_d + s * (smem_a_per_stage + smem_b_per_stage) + smem_barrier;
-        if (smem <= smem_capacity) {
-            best_stages = s;
-            best_smem = smem;
-            break;
-        }
-    }
+    // Stages and swizzle computed by upstream-equivalent smem formula
+    SmemConfig scfg;
+    int best_stages = select_num_stages<SM90Arch>(
+        KernelKind::NoSF, MmaKindLocal::BF16,
+        best_bm, best_bn, block_k, multicast, mc_on_a,
+        2, 2, // ab_elem=BF16(2), cd_elem=BF16(2)
+        m, n, 0, scfg);
 
     return KernelConfig{
         .block_m = best_bm, .block_n = best_bn, .block_k = block_k,
         .num_stages = best_stages,
         .num_tma_threads = num_tma, .num_math_threads = num_math,
         .num_multicast = multicast, .multicast_on_a = mc_on_a,
-        .swizzle_a = sw_a, .swizzle_b = sw_b, .swizzle_d = sw_d,
-        .smem_size = best_smem,
+        .swizzle_a = scfg.swizzle_a, .swizzle_b = scfg.swizzle_b, .swizzle_d = scfg.swizzle_cd,
+        .smem_size = scfg.smem_size,
     };
 }
 
@@ -154,29 +139,19 @@ static KernelConfig select_grouped_config(int m, int n, int k, int num_sms) {
         }
     }
 
-    int sw_a = get_swizzle(block_k);
-    int sw_b = get_swizzle(block_k);
-    int sw_d = get_swizzle(best_bn);
-
-    const int smem_capacity = 232448;
-    int smem_d = ((bm * best_bn * 2 + 1023) / 1024) * 1024;
-    int smem_a_per_stage = bm * block_k * 2;
-    int smem_b_per_stage = best_bn * block_k * 2;
-
-    int best_stages = 0, best_smem = 0;
-    for (int s = 32; s > 0; s--) {
-        int smem_barrier = s * 8 * 2;
-        int smem = smem_d + s * (smem_a_per_stage + smem_b_per_stage) + smem_barrier;
-        if (smem <= smem_capacity) { best_stages = s; best_smem = smem; break; }
-    }
+    SmemConfig scfg;
+    int best_stages = select_num_stages<SM90Arch>(
+        KernelKind::NoSF, MmaKindLocal::BF16,
+        bm, best_bn, block_k, multicast, mc_on_a,
+        2, 2, m, n, 0, scfg);
 
     return KernelConfig{
         .block_m = bm, .block_n = best_bn, .block_k = block_k,
         .num_stages = best_stages,
         .num_tma_threads = num_tma, .num_math_threads = num_math,
         .num_multicast = multicast, .multicast_on_a = mc_on_a,
-        .swizzle_a = sw_a, .swizzle_b = sw_b, .swizzle_d = sw_d,
-        .smem_size = best_smem,
+        .swizzle_a = scfg.swizzle_a, .swizzle_b = scfg.swizzle_b, .swizzle_d = scfg.swizzle_cd,
+        .smem_size = scfg.smem_size,
     };
 }
 
@@ -533,12 +508,6 @@ static const void* get_grouped_kernel(const KernelConfig& cfg) {
 // kWithAccumulation=true, cd_dtype_t=float, uses TMA_REDUCE_ADD.
 // ════════════════════════════════════════════════════════════════════
 
-static int get_swizzle_f32(int block_n) {
-    for (int mode : {128, 64, 32, 16})
-        if ((block_n * 4) % mode == 0) return mode;
-    return 16;
-}
-
 static KernelConfig select_acc_config(int m, int n, int k, int num_sms) {
     const int block_k = 64;
 
@@ -593,30 +562,20 @@ static KernelConfig select_acc_config(int m, int n, int k, int num_sms) {
         }
     }
 
-    int sw_a = get_swizzle(block_k);
-    int sw_b = get_swizzle(block_k);
-    int sw_d = 0; // SM90 disables CD swizzle for FP32 output (enable_cd_swizzle returns false)
-
-    // FP32 output: smem_d uses 4 bytes per element
-    const int smem_capacity = 232448;
-    int smem_d = ((best_bm * best_bn * 4 + 1023) / 1024) * 1024;
-    int smem_a_per_stage = best_bm * block_k * 2;
-    int smem_b_per_stage = best_bn * block_k * 2;
-
-    int best_stages = 0, best_smem = 0;
-    for (int s = 32; s > 0; s--) {
-        int smem_barrier = s * 8 * 2;
-        int smem = smem_d + s * (smem_a_per_stage + smem_b_per_stage) + smem_barrier;
-        if (smem <= smem_capacity) { best_stages = s; best_smem = smem; break; }
-    }
+    SmemConfig scfg;
+    int best_stages = select_num_stages<SM90Arch>(
+        KernelKind::NoSF, MmaKindLocal::BF16,
+        best_bm, best_bn, block_k, multicast, mc_on_a,
+        2, 4, // ab_elem=BF16(2), cd_elem=FP32(4)
+        m, n, 0, scfg);
 
     return KernelConfig{
         .block_m = best_bm, .block_n = best_bn, .block_k = block_k,
         .num_stages = best_stages,
         .num_tma_threads = num_tma, .num_math_threads = num_math,
         .num_multicast = multicast, .multicast_on_a = mc_on_a,
-        .swizzle_a = sw_a, .swizzle_b = sw_b, .swizzle_d = sw_d,
-        .smem_size = best_smem,
+        .swizzle_a = scfg.swizzle_a, .swizzle_b = scfg.swizzle_b, .swizzle_d = scfg.swizzle_cd,
+        .smem_size = scfg.smem_size,
     };
 }
 
@@ -815,29 +774,19 @@ static KernelConfig select_masked_config(int expected_m, int n, int k, int num_g
         }
     }
 
-    int sw_a = get_swizzle(block_k);
-    int sw_b = get_swizzle(block_k);
-    int sw_d = get_swizzle(best_bn);
-
-    const int smem_capacity = 232448;
-    int smem_d = ((best_bm * best_bn * 2 + 1023) / 1024) * 1024;
-    int smem_a_per_stage = best_bm * block_k * 2;
-    int smem_b_per_stage = best_bn * block_k * 2;
-
-    int best_stages = 0, best_smem = 0;
-    for (int s = 32; s > 0; s--) {
-        int smem_barrier = s * 8 * 2;
-        int smem = smem_d + s * (smem_a_per_stage + smem_b_per_stage) + smem_barrier;
-        if (smem <= smem_capacity) { best_stages = s; best_smem = smem; break; }
-    }
+    SmemConfig scfg;
+    int best_stages = select_num_stages<SM90Arch>(
+        KernelKind::NoSF, MmaKindLocal::BF16,
+        best_bm, best_bn, block_k, multicast, mc_on_a,
+        2, 2, expected_m, n, 0, scfg);
 
     return KernelConfig{
         .block_m = best_bm, .block_n = best_bn, .block_k = block_k,
         .num_stages = best_stages,
         .num_tma_threads = num_tma, .num_math_threads = num_math,
         .num_multicast = multicast, .multicast_on_a = mc_on_a,
-        .swizzle_a = sw_a, .swizzle_b = sw_b, .swizzle_d = sw_d,
-        .smem_size = best_smem,
+        .swizzle_a = scfg.swizzle_a, .swizzle_b = scfg.swizzle_b, .swizzle_d = scfg.swizzle_cd,
+        .smem_size = scfg.smem_size,
     };
 }
 

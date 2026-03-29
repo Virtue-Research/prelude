@@ -104,34 +104,18 @@ static SM100FP8Config select_sm100_fp8_config(int m, int n, int k, int num_sms) 
         if (legal) multicast = 2;
     }
 
-    // Swizzle: A/B use FP8 (1 byte), CD uses BF16 (2 bytes)
-    int sw_a = 128; // block_k * 1 = 128 bytes → 128B swizzle
-    int sw_b = 128;
-    // SM100: CD swizzle always enabled
-    int sw_cd = get_swizzle(best_bn); // BF16 output: bn * 2 bytes
-
-    // SMEM calculation for SM100 FP8
-    auto align1024 = [](int x) { return ((x + 1023) / 1024) * 1024; };
-    const int smem_capacity = 232448;
-    int smem_cd = std::min(best_bm, 128) * sw_cd * 2;
-    int smem_a_per = best_bm * block_k * 1; // FP8: 1 byte
-    int smem_b_per = best_bn * block_k * 1;
-    auto align_up2 = [](int x, int a) { return ((x + a - 1) / a) * a; };
-    int smem_sfa_per = align_up2(best_bm, 128) * 4; // UE8M0 packed: 4 bytes per 128 elements
-    int smem_sfb_per = align_up2(best_bn, 128) * 4;
-
-    int best_stages = 0, best_smem = 0;
-    for (int s = 32; s > 0; s--) {
-        int total = smem_cd + s * (smem_a_per + smem_b_per + smem_sfa_per + smem_sfb_per) + s * 24 + 44;
-        if (total <= smem_capacity) { best_stages = s; best_smem = total; break; }
-    }
+    SmemConfig scfg;
+    int best_stages = select_num_stages<SM100Arch>(
+        KernelKind::Kernel1D1D, MmaKindLocal::MXFP8FP4,
+        best_bm, best_bn, block_k, multicast, false,
+        1, 2, m, n, k, scfg);
 
     return SM100FP8Config{
         .block_m = best_bm, .block_n = best_bn, .block_k = block_k,
         .num_stages = best_stages,
         .num_multicast = multicast,
-        .swizzle_a = sw_a, .swizzle_b = sw_b, .swizzle_cd = sw_cd,
-        .smem_size = best_smem,
+        .swizzle_a = scfg.swizzle_a, .swizzle_b = scfg.swizzle_b, .swizzle_cd = scfg.swizzle_cd,
+        .smem_size = scfg.smem_size,
     };
 }
 
@@ -326,28 +310,18 @@ static SM100FP8Config select_sm100_fp8_grouped_config(int m, int n, int k, int n
         if (legal) multicast = 2;
     }
 
-    int sw_a = 128, sw_b = 128;
-    int sw_cd = get_swizzle(best_bn);
-
-    const int smem_capacity = 232448;
-    int smem_cd = std::min(bm, 128) * sw_cd * 2;
-    int smem_a_per = bm * block_k * 1;
-    int smem_b_per = best_bn * block_k * 1;
-    int smem_sfa_per = align_up(bm, 128) * 4;
-    int smem_sfb_per = align_up(best_bn, 128) * 4;
-
-    int best_stages = 0, best_smem = 0;
-    for (int s = 32; s > 0; s--) {
-        int total = smem_cd + s * (smem_a_per + smem_b_per + smem_sfa_per + smem_sfb_per) + s * 24 + 44;
-        if (total <= smem_capacity) { best_stages = s; best_smem = total; break; }
-    }
+    SmemConfig scfg;
+    int best_stages = select_num_stages<SM100Arch>(
+        KernelKind::Kernel1D1D, MmaKindLocal::MXFP8FP4,
+        bm, best_bn, block_k, multicast, false,
+        1, 2, m, n, k, scfg);
 
     return SM100FP8Config{
         .block_m = bm, .block_n = best_bn, .block_k = block_k,
         .num_stages = best_stages,
         .num_multicast = multicast,
-        .swizzle_a = sw_a, .swizzle_b = sw_b, .swizzle_cd = sw_cd,
-        .smem_size = best_smem,
+        .swizzle_a = scfg.swizzle_a, .swizzle_b = scfg.swizzle_b, .swizzle_cd = scfg.swizzle_cd,
+        .smem_size = scfg.smem_size,
     };
 }
 
@@ -498,28 +472,18 @@ static SM100FP8Config select_sm100_fp8_masked_config(int expected_m, int n, int 
         if (legal) multicast = 2;
     }
 
-    int sw_a = 128, sw_b = 128;
-    int sw_cd = get_swizzle(best_bn);
-
-    const int smem_capacity = 232448;
-    int smem_cd = std::min(best_bm, 128) * sw_cd * 2;
-    int smem_a_per = best_bm * block_k * 1;
-    int smem_b_per = best_bn * block_k * 1;
-    int smem_sfa_per = align_up(best_bm, 128) * 4;
-    int smem_sfb_per = align_up(best_bn, 128) * 4;
-
-    int best_stages = 0, best_smem = 0;
-    for (int s = 32; s > 0; s--) {
-        int total = smem_cd + s * (smem_a_per + smem_b_per + smem_sfa_per + smem_sfb_per) + s * 24 + 44;
-        if (total <= smem_capacity) { best_stages = s; best_smem = total; break; }
-    }
+    SmemConfig scfg;
+    int best_stages = select_num_stages<SM100Arch>(
+        KernelKind::Kernel1D1D, MmaKindLocal::MXFP8FP4,
+        best_bm, best_bn, block_k, multicast, false,
+        1, 2, expected_m, n, k, scfg);
 
     return SM100FP8Config{
         .block_m = best_bm, .block_n = best_bn, .block_k = block_k,
         .num_stages = best_stages,
         .num_multicast = multicast,
-        .swizzle_a = sw_a, .swizzle_b = sw_b, .swizzle_cd = sw_cd,
-        .smem_size = best_smem,
+        .swizzle_a = scfg.swizzle_a, .swizzle_b = scfg.swizzle_b, .swizzle_cd = scfg.swizzle_cd,
+        .smem_size = scfg.smem_size,
     };
 }
 

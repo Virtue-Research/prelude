@@ -58,28 +58,18 @@ static SM100Config select_sm100_config(int m, int n, int k, int num_sms) {
         if (legal) multicast = 2;
     }
 
-    int sw_a = get_swizzle(block_k);
-    int sw_b = get_swizzle(block_k);
-    int sw_d = get_swizzle(best_bn);
-
-    // SM100 SMEM: smem_cd = min(bm,128)*sw_d*2, barrier = s*24+44
-    const int smem_capacity = 232448;
-    int smem_cd = std::min(best_bm, 128) * sw_d * 2;
-    int smem_a_per = best_bm * block_k * 2;
-    int smem_b_per = best_bn * block_k * 2;
-
-    int best_stages = 0, best_smem = 0;
-    for (int s = 32; s > 0; s--) {
-        int total = smem_cd + s * (smem_a_per + smem_b_per) + s * 24 + 44;
-        if (total <= smem_capacity) { best_stages = s; best_smem = total; break; }
-    }
+    SmemConfig scfg;
+    int best_stages = select_num_stages<SM100Arch>(
+        KernelKind::NoSF, MmaKindLocal::BF16,
+        best_bm, best_bn, block_k, multicast, false,
+        2, 2, m, n, 0, scfg);
 
     return SM100Config{
         .block_m = best_bm, .block_n = best_bn, .block_k = block_k,
         .num_stages = best_stages,
         .num_multicast = multicast, .multicast_on_a = false,
-        .swizzle_a = sw_a, .swizzle_b = sw_b, .swizzle_d = sw_d,
-        .smem_size = best_smem,
+        .swizzle_a = scfg.swizzle_a, .swizzle_b = scfg.swizzle_b, .swizzle_d = scfg.swizzle_cd,
+        .smem_size = scfg.smem_size,
     };
 }
 
@@ -236,27 +226,18 @@ static SM100Config select_sm100_grouped_config(int m, int n, int k, int num_sms)
         if (legal) multicast = 2;
     }
 
-    int sw_a = get_swizzle(block_k);
-    int sw_b = get_swizzle(block_k);
-    int sw_d = get_swizzle(best_bn);
-
-    const int smem_capacity = 232448;
-    int smem_cd = std::min(bm, 128) * sw_d * 2;
-    int smem_a_per = bm * block_k * 2;
-    int smem_b_per = best_bn * block_k * 2;
-
-    int best_stages = 0, best_smem = 0;
-    for (int s = 32; s > 0; s--) {
-        int total = smem_cd + s * (smem_a_per + smem_b_per) + s * 24 + 44;
-        if (total <= smem_capacity) { best_stages = s; best_smem = total; break; }
-    }
+    SmemConfig scfg;
+    int best_stages = select_num_stages<SM100Arch>(
+        KernelKind::NoSF, MmaKindLocal::BF16,
+        bm, best_bn, block_k, multicast, false,
+        2, 2, m, n, 0, scfg);
 
     return SM100Config{
         .block_m = bm, .block_n = best_bn, .block_k = block_k,
         .num_stages = best_stages,
         .num_multicast = multicast, .multicast_on_a = false,
-        .swizzle_a = sw_a, .swizzle_b = sw_b, .swizzle_d = sw_d,
-        .smem_size = best_smem,
+        .swizzle_a = scfg.swizzle_a, .swizzle_b = scfg.swizzle_b, .swizzle_d = scfg.swizzle_cd,
+        .smem_size = scfg.smem_size,
     };
 }
 
@@ -378,27 +359,18 @@ static SM100Config select_sm100_masked_config(int expected_m, int n, int k, int 
         if (legal) multicast = 2;
     }
 
-    int sw_a = get_swizzle(block_k);
-    int sw_b = get_swizzle(block_k);
-    int sw_d = get_swizzle(best_bn);
-
-    const int smem_capacity = 232448;
-    int smem_cd = std::min(best_bm, 128) * sw_d * 2;
-    int smem_a_per = best_bm * block_k * 2;
-    int smem_b_per = best_bn * block_k * 2;
-
-    int best_stages = 0, best_smem = 0;
-    for (int s = 32; s > 0; s--) {
-        int total = smem_cd + s * (smem_a_per + smem_b_per) + s * 24 + 44;
-        if (total <= smem_capacity) { best_stages = s; best_smem = total; break; }
-    }
+    SmemConfig scfg;
+    int best_stages = select_num_stages<SM100Arch>(
+        KernelKind::NoSF, MmaKindLocal::BF16,
+        best_bm, best_bn, block_k, multicast, false,
+        2, 2, expected_m, n, 0, scfg);
 
     return SM100Config{
         .block_m = best_bm, .block_n = best_bn, .block_k = block_k,
         .num_stages = best_stages,
         .num_multicast = multicast, .multicast_on_a = false,
-        .swizzle_a = sw_a, .swizzle_b = sw_b, .swizzle_d = sw_d,
-        .smem_size = best_smem,
+        .swizzle_a = scfg.swizzle_a, .swizzle_b = scfg.swizzle_b, .swizzle_d = scfg.swizzle_cd,
+        .smem_size = scfg.smem_size,
     };
 }
 

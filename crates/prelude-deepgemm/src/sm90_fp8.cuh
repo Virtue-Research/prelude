@@ -61,42 +61,25 @@ static FP8Config select_fp8_config(int m, int n, int k, int num_sms) {
         }
     }
 
-    // Swizzle: A/B use FP8 (1 byte), D uses BF16 (2 bytes)
-    int sw_a = 128, sw_b = 128;
-    int sw_d = get_swizzle(best_bn);
-
     // kNumLastStages for 1D2D
     int nls;
     if (block_k % best_bn == 0) nls = 0;
     else if (best_bn <= block_k) nls = ceil_div(best_bn, block_k - best_bn);
     else nls = 1;
 
-    // SMEM: BF16 output, SFA per stage, SFB from global memory (one-time buffer)
-    const int smem_capacity = 232448;
-    int smem_d = ((best_bm * best_bn * 2 + 1023) / 1024) * 1024;
-    int smem_a_per = best_bm * block_k;
-    int smem_b_per = best_bn * block_k;
-    int smem_sfa_per = ((best_bm * 4 + 127) / 128) * 128;
-    int smem_per_stage = smem_a_per + smem_b_per + smem_sfa_per;
-
-    int k_scales = ceil_div(k, block_k);
-    bool must_uniform = (block_k % best_bn == 0);
-    int sfb_buf = ((k_scales * (must_uniform ? 1 : 2) * 4 + 15) / 16) * 16;
-
-    int best_stages = 0, best_smem = 0;
-    for (int s = 32; s > 0; s--) {
-        int barrier = s * 16;
-        int total = smem_d + s * smem_per_stage + barrier + sfb_buf;
-        if (total <= smem_capacity) { best_stages = s; best_smem = total; break; }
-    }
+    SmemConfig scfg;
+    int best_stages = select_num_stages<SM90Arch>(
+        KernelKind::Kernel1D2D, MmaKindLocal::MXFP8FP4,
+        best_bm, best_bn, block_k, multicast, mc_on_a,
+        1, 2, m, n, k, scfg);
 
     return FP8Config{
         .block_m = best_bm, .block_n = best_bn, .block_k = block_k,
         .num_stages = best_stages, .num_last_stages = nls,
         .num_tma_threads = num_tma, .num_math_threads = num_math,
         .num_multicast = multicast, .multicast_on_a = mc_on_a,
-        .swizzle_a = sw_a, .swizzle_b = sw_b, .swizzle_d = sw_d,
-        .smem_size = best_smem,
+        .swizzle_a = scfg.swizzle_a, .swizzle_b = scfg.swizzle_b, .swizzle_d = scfg.swizzle_cd,
+        .smem_size = scfg.smem_size,
     };
 }
 
@@ -143,39 +126,24 @@ static FP8Config select_fp8_grouped_config(int m, int n, int k, int num_sms) {
         }
     }
 
-    int sw_a = 128, sw_b = 128;
-    int sw_d = get_swizzle(best_bn);
-
     int nls;
     if (block_k % best_bn == 0) nls = 0;
     else if (best_bn <= block_k) nls = ceil_div(best_bn, block_k - best_bn);
     else nls = 1;
 
-    const int smem_capacity = 232448;
-    int smem_d = ((bm * best_bn * 2 + 1023) / 1024) * 1024;
-    int smem_a_per = bm * block_k;
-    int smem_b_per = best_bn * block_k;
-    int smem_sfa_per = ((bm * 4 + 127) / 128) * 128;
-    int smem_per_stage = smem_a_per + smem_b_per + smem_sfa_per;
-
-    int k_scales = ceil_div(k, block_k);
-    bool must_uniform = (block_k % best_bn == 0);
-    int sfb_buf = ((k_scales * (must_uniform ? 1 : 2) * 4 + 15) / 16) * 16;
-
-    int best_stages = 0, best_smem = 0;
-    for (int s = 32; s > 0; s--) {
-        int barrier = s * 16;
-        int total = smem_d + s * smem_per_stage + barrier + sfb_buf;
-        if (total <= smem_capacity) { best_stages = s; best_smem = total; break; }
-    }
+    SmemConfig scfg;
+    int best_stages = select_num_stages<SM90Arch>(
+        KernelKind::Kernel1D2D, MmaKindLocal::MXFP8FP4,
+        bm, best_bn, block_k, multicast, mc_on_a,
+        1, 2, m, n, k, scfg);
 
     return FP8Config{
         .block_m = bm, .block_n = best_bn, .block_k = block_k,
         .num_stages = best_stages, .num_last_stages = nls,
         .num_tma_threads = num_tma, .num_math_threads = num_math,
         .num_multicast = multicast, .multicast_on_a = mc_on_a,
-        .swizzle_a = sw_a, .swizzle_b = sw_b, .swizzle_d = sw_d,
-        .smem_size = best_smem,
+        .swizzle_a = scfg.swizzle_a, .swizzle_b = scfg.swizzle_b, .swizzle_d = scfg.swizzle_cd,
+        .smem_size = scfg.smem_size,
     };
 }
 
@@ -502,39 +470,24 @@ static FP8Config select_fp8_masked_config(int expected_m, int n, int k, int num_
         }
     }
 
-    int sw_a = 128, sw_b = 128;
-    int sw_d = get_swizzle(best_bn);
-
     int nls;
     if (block_k % best_bn == 0) nls = 0;
     else if (best_bn <= block_k) nls = ceil_div(best_bn, block_k - best_bn);
     else nls = 1;
 
-    const int smem_capacity = 232448;
-    int smem_d = ((best_bm * best_bn * 2 + 1023) / 1024) * 1024;
-    int smem_a_per = best_bm * block_k;
-    int smem_b_per = best_bn * block_k;
-    int smem_sfa_per = ((best_bm * 4 + 127) / 128) * 128;
-    int smem_per_stage = smem_a_per + smem_b_per + smem_sfa_per;
-
-    int k_scales = ceil_div(k, block_k);
-    bool must_uniform = (block_k % best_bn == 0);
-    int sfb_buf = ((k_scales * (must_uniform ? 1 : 2) * 4 + 15) / 16) * 16;
-
-    int best_stages = 0, best_smem = 0;
-    for (int s = 32; s > 0; s--) {
-        int barrier = s * 16;
-        int total = smem_d + s * smem_per_stage + barrier + sfb_buf;
-        if (total <= smem_capacity) { best_stages = s; best_smem = total; break; }
-    }
+    SmemConfig scfg;
+    int best_stages = select_num_stages<SM90Arch>(
+        KernelKind::Kernel1D2D, MmaKindLocal::MXFP8FP4,
+        best_bm, best_bn, block_k, multicast, mc_on_a,
+        1, 2, expected_m, n, k, scfg);
 
     return FP8Config{
         .block_m = best_bm, .block_n = best_bn, .block_k = block_k,
         .num_stages = best_stages, .num_last_stages = nls,
         .num_tma_threads = num_tma, .num_math_threads = num_math,
         .num_multicast = multicast, .multicast_on_a = mc_on_a,
-        .swizzle_a = sw_a, .swizzle_b = sw_b, .swizzle_d = sw_d,
-        .smem_size = best_smem,
+        .swizzle_a = scfg.swizzle_a, .swizzle_b = scfg.swizzle_b, .swizzle_d = scfg.swizzle_cd,
+        .smem_size = scfg.smem_size,
     };
 }
 
@@ -720,30 +673,20 @@ static FP8_1D1D_Config select_fp8_1d1d_config(int m, int n, int k, int num_sms) 
         }
     }
 
-    int sw_a = 128, sw_b = 128; // block_k=128, FP8 1-byte → 128B swizzle
-
-    // SMEM: FP32 output (no swizzle), both SFA and SFB per stage
-    const int smem_capacity = 232448;
-    int smem_cd = ((best_bm * best_bn * 4 + 1023) / 1024) * 1024; // FP32 output
-    int smem_a_per = best_bm * block_k; // FP8: 1 byte
-    int smem_b_per = best_bn * block_k;
-    int smem_sfa_per = ((best_bm * 4 + 127) / 128) * 128;
-    int smem_sfb_per = ((best_bn * 4 + 127) / 128) * 128;
-
-    int best_stages = 0, best_smem = 0;
-    for (int s = 32; s > 0; s--) {
-        int barrier = s * 16;
-        int total = smem_cd + s * (smem_a_per + smem_b_per + smem_sfa_per + smem_sfb_per) + barrier;
-        if (total <= smem_capacity) { best_stages = s; best_smem = total; break; }
-    }
+    SmemConfig scfg;
+    int best_stages = select_num_stages<SM90Arch>(
+        KernelKind::Kernel1D1D, MmaKindLocal::MXFP8FP4,
+        best_bm, best_bn, block_k, multicast, mc_on_a,
+        1, 4, // ab_elem=FP8(1), cd_elem=FP32(4)
+        m, n, k, scfg);
 
     return FP8_1D1D_Config{
         .block_m = best_bm, .block_n = best_bn, .block_k = block_k,
         .num_stages = best_stages,
         .num_tma_threads = num_tma, .num_math_threads = num_math,
         .num_multicast = multicast, .multicast_on_a = mc_on_a,
-        .swizzle_a = sw_a, .swizzle_b = sw_b,
-        .smem_size = best_smem,
+        .swizzle_a = scfg.swizzle_a, .swizzle_b = scfg.swizzle_b,
+        .smem_size = scfg.smem_size,
     };
 }
 
