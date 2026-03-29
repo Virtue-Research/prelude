@@ -9,6 +9,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/bfloat16.h"
 #include "cutlass/half.h"
+#include "cutlass/float8.h"
 #include "cute/tensor.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/atom/copy_atom.hpp"
@@ -23,6 +24,7 @@
 
 using BF16 = cutlass::bfloat16_t;
 using FP16 = cutlass::half_t;
+using FP8E4M3 = cutlass::float_e4m3_t;
 using namespace cute;
 
 static int g_sm_count = 0;
@@ -133,6 +135,25 @@ template <class E> using Sm90_Default = Sm90Runner<
     cutlass::gemm::PersistentScheduler,
     Shape<_128, _128, _64>, E>;
 
+// F32 (TF32): CollectiveBuilder auto-maps float→tfloat32_t for MMA.
+// TMA loads FP32 and converts to TF32 implicitly (see CUTLASS example 48).
+// Tile K=32 (not 64) — TF32 elements are 4B so K=32 keeps smem reasonable.
+template <class E> using Sm90_F32 = Sm90Runner<
+    cutlass::gemm::collective::KernelScheduleAuto,
+    cutlass::epilogue::collective::EpilogueScheduleAuto,
+    cutlass::gemm::collective::StageCountAuto,
+    cutlass::gemm::PersistentScheduler,
+    Shape<_128, _128, _32>, E>;
+
+// FP8 (E4M3): 1B per element so K=128 fits easily in smem (see CUTLASS example 54).
+// CollectiveBuilder selects FP8 GMMA automatically.
+template <class E> using Sm90_FP8 = Sm90Runner<
+    cutlass::gemm::collective::KernelScheduleAuto,
+    cutlass::epilogue::collective::EpilogueScheduleAuto,
+    cutlass::gemm::collective::StageCountAuto,
+    cutlass::gemm::PersistentScheduler,
+    Shape<_128, _128, _128>, E>;
+
 #endif // CUTLASS_ARCH_MMA_SM90_SUPPORTED
 
 // ============================================================================
@@ -240,17 +261,29 @@ using Sm80RunnerUnpred = Sm80RunnerBase<Element,
 
 // ── Unified launch for both SM90 and SM80 ────────────────────────────
 // Both paths use GemmUniversalAdapter with the same argument structure.
+// L = batch count (default 1).  batch_stride_* override packed strides for L>1.
 
 template <typename Runner>
 static int launch(const void* A, const void* B, void* D,
-                  int M, int N, int K, cudaStream_t stream)
+                  int M, int N, int K, cudaStream_t stream,
+                  int L = 1,
+                  int64_t batch_stride_a = 0,
+                  int64_t batch_stride_b = 0,
+                  int64_t batch_stride_d = 0)
 {
     using Gemm = typename Runner::Gemm;
 
-    auto stride_A = cutlass::make_cute_packed_stride(typename Runner::StrideA{}, make_shape(M, K, 1));
-    auto stride_B = cutlass::make_cute_packed_stride(typename Runner::StrideB{}, make_shape(N, K, 1));
-    auto stride_C = cutlass::make_cute_packed_stride(typename Runner::StrideC{}, make_shape(M, N, 1));
-    auto stride_D = cutlass::make_cute_packed_stride(typename Runner::StrideD{}, make_shape(M, N, 1));
+    auto stride_A = cutlass::make_cute_packed_stride(typename Runner::StrideA{}, make_shape(M, K, L));
+    auto stride_B = cutlass::make_cute_packed_stride(typename Runner::StrideB{}, make_shape(N, K, L));
+    auto stride_C = cutlass::make_cute_packed_stride(typename Runner::StrideC{}, make_shape(M, N, L));
+    auto stride_D = cutlass::make_cute_packed_stride(typename Runner::StrideD{}, make_shape(M, N, L));
+
+    // Override batch strides for non-contiguous batched tensors
+    if (L > 1) {
+        if (batch_stride_a > 0) get<2>(stride_A) = batch_stride_a;
+        if (batch_stride_b > 0) get<2>(stride_B) = batch_stride_b;
+        if (batch_stride_d > 0) get<2>(stride_D) = batch_stride_d;
+    }
 
     ensure_sm_count();
     cutlass::KernelHardwareInfo hw;
@@ -260,7 +293,7 @@ static int launch(const void* A, const void* B, void* D,
 
     typename Gemm::Arguments args{
         cutlass::gemm::GemmUniversalMode::kGemm,
-        {M, N, K, 1},
+        {M, N, K, L},
         {static_cast<const typename Gemm::ElementA*>(A), stride_A,
          static_cast<const typename Gemm::ElementB*>(B), stride_B},
         {{1.0f, 0.0f},
@@ -421,25 +454,10 @@ extern "C" int cutlass_gemm_dispatch(
     uint32_t dtype,
     const void* stream)
 {
-    if (batch > 1) return -30;
-
     // CUTLASS kernels only support TN (transa=1, transb=0).
-    // For other combos, use the identity: D = op(A)*op(B) in col-major
-    // can be rewritten as TN on swapped operands.
-    //
-    // NN (transa=0, transb=0): D[m,n] = A*B
-    //   = (B^T * A^T)^T   →  call TN with swap(A,B), swap(m,n), swap(lda,ldb)
-    //   Output is naturally transposed, but since D is col-major with ldd=m
-    //   and we produce col-major with ldd=n, we need to swap ldd too.
-    if (transa == 0 && transb == 0) {
-        std::swap(A, B);
-        std::swap(m, n);
-        std::swap(lda, ldb);
-        std::swap(stride_a, stride_b);
-        ldd = m;  // output is now m-rows after swap
-        // Fall through to TN path below
-    } else if (transa != 1 || transb != 0) {
-        return -10;  // NT and TT not yet supported
+    // Caller (candle) must convert NN to TN before calling dispatch.
+    if (transa != 1 || transb != 0) {
+        return -10;
     }
 
     auto s = static_cast<cudaStream_t>(const_cast<void*>(stream));
@@ -449,18 +467,23 @@ extern "C" int cutlass_gemm_dispatch(
     {
         int ret;
         switch (dtype) {
-            case 0: ret = launch<Sm90_Default<BF16>>(A, B, D, m, n, k, s); break;
-            case 1: ret = launch<Sm90_Default<FP16>>(A, B, D, m, n, k, s); break;
+            case 0: ret = launch<Sm90_Default<BF16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
+            case 1: ret = launch<Sm90_Default<FP16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
+            case 2: ret = launch<Sm90_F32<float>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
+            case 3: ret = launch<Sm90_FP8<FP8E4M3>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
             default: ret = -20; break;
         }
         if (ret == 0) return 0;
         // SM90 failed — log and fall through to SM80
-        fprintf(stderr, "CUTLASS: SM90 failed (code %d) for m=%d n=%d k=%d dtype=%u, falling back to SM80\n",
-                ret, m, n, k, dtype);
+        fprintf(stderr, "CUTLASS: SM90 failed (code %d) for m=%d n=%d k=%d batch=%d dtype=%u, falling back to SM80\n",
+                ret, m, n, k, batch, dtype);
     }
 #endif
 
-    // SM80 fallback — try unpredicated first (fastest), fall back to predicated for unaligned M.
+    // SM80 fallback — non-batched only (SM80 configs don't carry batch strides).
+    if (batch > 1) return -30;
+
+    // Try unpredicated first (fastest), fall back to predicated for unaligned M.
     // Unpredicated requires M and N aligned to tile dims (128); skip if not aligned.
     if (dtype == 0) {
         if (m % 128 == 0 && n % 128 == 0) {

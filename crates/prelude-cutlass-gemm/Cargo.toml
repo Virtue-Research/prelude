@@ -5,4 +5,10 @@ edition = "2024"
 license = "MIT"
 description = "CUTLASS 3.x BF16/F32 GEMM fallback (SM80+), no cuBLAS dependency"
 
+[dev-dependencies]
+cudarc = { version = "0.19.4", features = ["std", "cuda-version-from-build-system", "f16", "cublas", "cublaslt"] }
+half = "2.7.1"
+float8 = "0.7.0"
+rand = "0.10.0"
+
 [build-dependencies]

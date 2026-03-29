@@ -2170,6 +2170,7 @@ impl BackendStorage for CudaStorage {
             (CudaStorageSlice::BF16(_), CudaStorageSlice::BF16(_)) => 0u32,
             (CudaStorageSlice::F16(_), CudaStorageSlice::F16(_)) => 1u32,
             (CudaStorageSlice::F32(_), CudaStorageSlice::F32(_)) => 2u32,
+            (CudaStorageSlice::F8E4M3(_), CudaStorageSlice::F8E4M3(_)) => 3u32,
             (CudaStorageSlice::F64(_), CudaStorageSlice::F64(_)) => {
                 return Err(CudaError::InternalError(
                     "F64 GPU matmul not supported (cuBLAS removed). Use F32 instead."
@@ -2221,6 +2222,9 @@ impl BackendStorage for CudaStorage {
             }
             (CudaStorageSlice::F32(lhs), CudaStorageSlice::F32(rhs)) => {
                 do_gemm!(lhs, rhs, F32, f32)
+            }
+            (CudaStorageSlice::F8E4M3(lhs), CudaStorageSlice::F8E4M3(rhs)) => {
+                do_gemm!(lhs, rhs, F8E4M3, float8::F8E4M3)
             }
             _ => unreachable!(), // already checked above
         };

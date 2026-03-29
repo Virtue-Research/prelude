@@ -44,7 +44,7 @@ unsafe extern "C" {
 /// - D[m,n] = A[m,k] @ B[k,n] (column-major)
 /// - transa: 0=no transpose, 1=transpose
 /// - transb: 0=no transpose, 1=transpose
-/// - dtype: 0=BF16, 1=F16, 2=F32
+/// - dtype: 0=BF16, 1=F16, 2=F32, 3=F8E4M3
 ///
 /// # Safety
 /// All pointers must be valid CUDA device pointers.
@@ -67,12 +67,14 @@ pub unsafe fn gemm_dispatch(
     dtype: u32,
     stream: *const c_void,
 ) -> Result<(), String> {
-    let ret = cutlass_gemm_dispatch(
-        a, b, d, m, n, k, batch, lda, ldb, ldd,
-        stride_a, stride_b, stride_d,
-        transa as i32, transb as i32,
-        dtype, stream,
-    );
+    let ret = unsafe {
+        cutlass_gemm_dispatch(
+            a, b, d, m, n, k, batch, lda, ldb, ldd,
+            stride_a, stride_b, stride_d,
+            transa as i32, transb as i32,
+            dtype, stream,
+        )
+    };
     match ret {
         0 => Ok(()),
         -10 => Err(format!(
@@ -81,7 +83,7 @@ pub unsafe fn gemm_dispatch(
         )),
         -20 => Err(format!("CUTLASS: unsupported dtype {dtype}")),
         -30 => Err(format!(
-            "CUTLASS: batched GEMM not supported (batch={batch}). m={m} n={n} k={k}"
+            "CUTLASS: batched GEMM failed on SM80 fallback (batch={batch}). m={m} n={n} k={k}"
         )),
         code => Err(format!(
             "CUTLASS GEMM failed (code {code}) for m={m} n={n} k={k} batch={batch} dtype={dtype}"
@@ -105,7 +107,7 @@ pub unsafe fn gemm_sm80(
     config: i32,
     stream: *const c_void,
 ) -> Result<(), String> {
-    let ret = cutlass_gemm_sm80(a, b, d, m, n, k, dtype, config, stream);
+    let ret = unsafe { cutlass_gemm_sm80(a, b, d, m, n, k, dtype, config, stream) };
     match ret {
         0 => Ok(()),
         code => Err(format!(

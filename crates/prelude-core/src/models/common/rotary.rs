@@ -26,7 +26,7 @@ impl RotaryEmbedding {
         let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
             .to_dtype(DType::F32)?
             .reshape((max_seq_len, 1))?;
-        let freqs = t.matmul(&inv_freq)?;
+        let freqs = t.broadcast_mul(&inv_freq)?;
         let sin = freqs.sin()?.to_dtype(dtype)?;
         let cos = freqs.cos()?.to_dtype(dtype)?;
 

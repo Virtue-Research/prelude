@@ -88,7 +88,7 @@ pub fn verify(filter: &[String], device: &Device, _cublas: Option<&CublasHandle>
         println!();
     }
 
-    println!("Correctness: {passed}/{total} passed (threshold: max_abs < 1.0 vs CPU F32)");
+    println!("Correctness: {passed}/{total} passed (threshold: max_abs < 1.0 vs CPU F64)");
     if passed < total {
         println!("WARNING: {} shapes failed correctness check!", total - passed);
     }
@@ -363,4 +363,9 @@ fn bench_cublas(cb: &CublasHandle, input: &Tensor, weight: &Tensor, device: &Dev
 #[cfg(not(feature = "bench-cublas"))]
 fn bench_cublas(_cb: &CublasHandle, _input: &Tensor, _weight: &Tensor, _device: &Device) -> Result<f64> {
     Ok(0.0)
+}
+
+#[cfg(not(feature = "bench-cublas"))]
+fn run_cublas(_cb: &CublasHandle, _input: &Tensor, _weight: &Tensor, _device: &Device) -> Result<Tensor> {
+    candle_core::bail!("bench-cublas feature not enabled")
 }
