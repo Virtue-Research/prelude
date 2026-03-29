@@ -152,6 +152,8 @@ fn main() {
     bench_masked(&gpu);
     bench_masked_fp8(&gpu);
     bench_acc(&gpu);
+    bench_mqa_logits(&gpu);
+    bench_einsum(&gpu);
 }
 
 fn bench_bf16(gpu: &Gpu) {
@@ -931,6 +933,221 @@ fn bench_acc(gpu: &Gpu) {
         let r = acc_us / cub_us;
         println!("{m:<6} {n:<5} {k:<5} {acc_us:>9.1} {cub_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T",
             r, ratio_marker(r));
+    }
+    println!();
+}
+
+// ── MQA Logits Benchmark ────────────────────────────────────────────────
+
+fn rand_u8(len: usize) -> Vec<u8> {
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    (0..len).map(|_| rng.random_range(0u8..255u8)).collect()
+}
+
+fn bench_mqa_logits(gpu: &Gpu) {
+    println!("\n{:=<80}", "= FP8 MQA Logits ");
+    println!("{:<8} {:<8} {:<4} {:<4} {:>10} {:>10}",
+        "seq_len", "kv_len", "H", "D", "us", "Gflops");
+    println!("{}", "-".repeat(50));
+
+    let (num_sms, _) = prelude_deepgemm::query_device();
+
+    // DeepSeek V3 config: num_heads=32, head_dim=64
+    let configs: Vec<(usize, usize, usize, usize)> = vec![
+        // (seq_len, seq_len_kv, num_heads, head_dim)
+        (4, 256, 32, 64),
+        (4, 512, 32, 64),
+        (4, 1024, 32, 64),
+        (4, 2048, 32, 64),
+        (4, 4096, 32, 64),
+        // Larger Q batches
+        (16, 1024, 32, 64),
+        (64, 1024, 32, 64),
+        // Different head configs
+        (4, 1024, 8, 128),
+        (4, 1024, 16, 64),
+    ];
+
+    for &(seq_len, seq_len_kv, num_heads, head_dim) in &configs {
+        let q_data = rand_u8(seq_len * num_heads * head_dim);
+        let kv_data = rand_u8(seq_len_kv * head_dim);
+        let tma_slkv = prelude_deepgemm::get_tma_aligned_size(seq_len_kv as i32, 4) as usize;
+        let mut kv_scales_data = vec![1.0f32; tma_slkv];
+        for i in 0..seq_len_kv { kv_scales_data[i] = 1.0; }
+        let weights_data = rand_f32(seq_len * num_heads);
+        let cu_k_start = vec![0u32; seq_len];
+        let cu_k_end = vec![seq_len_kv as u32; seq_len];
+
+        let q_gpu = gpu.upload(&q_data);
+        let kv_gpu = gpu.upload(&kv_data);
+        let kv_scales_gpu = gpu.upload(&kv_scales_data);
+        let weights_gpu = gpu.upload(&weights_data);
+        let ks_gpu = gpu.upload(&cu_k_start);
+        let ke_gpu = gpu.upload(&cu_k_end);
+        let mut logits_gpu = gpu.alloc_zeros::<f32>(seq_len * seq_len_kv);
+
+        let us = bench_us(|| {
+            let (qp, _) = q_gpu.device_ptr(&gpu.stream);
+            let (kvp, _) = kv_gpu.device_ptr(&gpu.stream);
+            let (kvsp, _) = kv_scales_gpu.device_ptr(&gpu.stream);
+            let (wp, _) = weights_gpu.device_ptr(&gpu.stream);
+            let (ksp, _) = ks_gpu.device_ptr(&gpu.stream);
+            let (kep, _) = ke_gpu.device_ptr(&gpu.stream);
+            let (lp, _) = logits_gpu.device_ptr_mut(&gpu.stream);
+            unsafe {
+                prelude_deepgemm::fp8_mqa_logits(
+                    qp as *mut c_void, kvp as *mut c_void,
+                    kvsp as *mut c_void, wp as *mut c_void,
+                    ksp as *mut c_void, kep as *mut c_void,
+                    lp as *mut c_void,
+                    seq_len as i32, seq_len_kv as i32, 0,
+                    num_heads as i32, head_dim as i32, seq_len_kv as i32,
+                    gpu.stream_ptr(),
+                ).unwrap();
+            }
+        }, &gpu);
+
+        // FLOPs: seq_len * seq_len_kv * num_heads * (2*head_dim + 1)
+        // (Q@KV^T is 2*head_dim flops per element, plus weight multiply)
+        let flops = seq_len as f64 * seq_len_kv as f64 * num_heads as f64 * (2.0 * head_dim as f64 + 1.0);
+        let gflops = flops / (us * 1e-6) / 1e9;
+
+        println!("{seq_len:<8} {seq_len_kv:<8} {num_heads:<4} {head_dim:<4} {us:>10.1} {gflops:>10.1}");
+    }
+
+    // Also bench metadata + clean_logits
+    println!("\n  Metadata + clean_logits timings:");
+    let batch = 256;
+    let ctx_lens = vec![1024u32; batch];
+    let ctx_gpu = gpu.upload(&ctx_lens);
+    let mut meta_gpu = gpu.alloc_zeros::<u32>((num_sms as usize + 1) * 2);
+
+    let meta_us = bench_us(|| {
+        let (cp, _) = ctx_gpu.device_ptr(&gpu.stream);
+        let (mp, _) = meta_gpu.device_ptr_mut(&gpu.stream);
+        unsafe {
+            prelude_deepgemm::paged_mqa_metadata(
+                cp as *mut c_void, mp as *mut c_void,
+                batch as i32, 1, false, 256, num_sms,
+                gpu.stream_ptr(),
+            ).unwrap();
+        }
+    }, &gpu);
+    println!("  metadata (batch={batch}): {meta_us:.1} us");
+
+    let seq_kv = 1024;
+    let logits_data = vec![1.0f32; batch * seq_kv];
+    let mut logits_gpu2 = gpu.upload(&logits_data);
+    let ks = vec![0u32; batch];
+    let ke: Vec<u32> = (0..batch).map(|i| ((i + 1) * 4) as u32).collect();
+    let ks_gpu = gpu.upload(&ks);
+    let ke_gpu = gpu.upload(&ke);
+
+    let clean_us = bench_us(|| {
+        let (ksp, _) = ks_gpu.device_ptr(&gpu.stream);
+        let (kep, _) = ke_gpu.device_ptr(&gpu.stream);
+        let (lp, _) = logits_gpu2.device_ptr_mut(&gpu.stream);
+        unsafe {
+            prelude_deepgemm::clean_logits(
+                ksp as *mut c_void, kep as *mut c_void,
+                lp as *mut c_void,
+                batch as i32, seq_kv as i32, seq_kv as i32, 1,
+                gpu.stream_ptr(),
+            ).unwrap();
+        }
+    }, &gpu);
+    println!("  clean_logits (batch={batch}, kv={seq_kv}): {clean_us:.1} us");
+    println!();
+}
+
+// ── Einsum Benchmark ────────────────────────────────────────────────────
+
+/// cuBLAS baseline for einsum: S sequential GemmEx calls with beta=1 accumulation.
+/// D(FP32) += A_s(BF16) @ B_s(BF16)^T for each batch s.
+fn cublas_einsum_bf16(
+    a: &CudaSlice<half::bf16>, b: &CudaSlice<half::bf16>,
+    d: &mut CudaSlice<f32>,
+    m: usize, n: usize, k: usize, s: usize,
+    gpu: &Gpu,
+) {
+    use cudarc::cublas::sys as cub_sys;
+    let alpha: f32 = 1.0;
+    let (ap, _ga) = a.device_ptr(&gpu.stream);
+    let (bp, _gb) = b.device_ptr(&gpu.stream);
+    let (dp, _gd) = d.device_ptr_mut(&gpu.stream);
+    let a_ptr = ap as *const c_void;
+    let b_ptr = bp as *const c_void;
+    let d_ptr = dp as *mut c_void;
+    let bf16_dt = cub_sys::cudaDataType_t::CUDA_R_16BF;
+    let f32_dt = cub_sys::cudaDataType_t::CUDA_R_32F;
+
+    for si in 0..s {
+        let beta: f32 = if si == 0 { 0.0 } else { 1.0 };
+        let a_off = unsafe { a_ptr.add(si * m * k * 2) }; // BF16 = 2 bytes
+        let b_off = unsafe { b_ptr.add(si * n * k * 2) };
+        unsafe {
+            cub_sys::cublasGemmEx(
+                *gpu.blas.handle(),
+                cub_sys::cublasOperation_t::CUBLAS_OP_T,  // B transposed
+                cub_sys::cublasOperation_t::CUBLAS_OP_N,  // A not transposed
+                n as i32, m as i32, k as i32,              // cuBLAS col-major: (N, M, K)
+                &alpha as *const f32 as *const c_void,
+                b_off, bf16_dt, k as i32,                  // B: [K, N] col-major
+                a_off, bf16_dt, k as i32,                  // A: [K, M] col-major
+                &beta as *const f32 as *const c_void,
+                d_ptr, f32_dt, n as i32,                   // D: [N, M] col-major
+                cub_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cub_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            );
+        }
+    }
+}
+
+fn bench_einsum(gpu: &Gpu) {
+    println!("\n{:=<80}", "= BF16 Einsum: D[M,N] = sum_s A[s,M,K] @ B[s,N,K]^T ");
+    println!("{:<4} {:<4} {:<4} {:<6} {:>10} {:>10} {:>7} {:>7}",
+        "M", "N", "K", "S", "DeepGEMM", "cuBLAS", "vs_cub", "TFLOPS");
+    println!("{}", "-".repeat(66));
+
+    let configs: Vec<(usize, usize, usize, Vec<usize>)> = vec![
+        (128, 128, 64,  vec![16, 64, 256, 1024]),
+        (128, 128, 128, vec![16, 64, 256]),
+        (128, 64,  64,  vec![16, 64, 256, 1024]),
+        (256, 128, 64,  vec![16, 64, 256]),
+    ];
+
+    for (m, n, k, s_values) in &configs {
+        for &s in s_values {
+            let a_data = rand_bf16(s * *m * *k);
+            let b_data = rand_bf16(s * *n * *k);
+            let a_gpu = gpu.upload(&a_data);
+            let b_gpu = gpu.upload(&b_data);
+            let mut d_gpu = gpu.alloc_zeros::<f32>(*m * *n);
+            let mut d_cub = gpu.alloc_zeros::<f32>(*m * *n);
+
+            let dg_us = bench_us(|| {
+                let (ap, _) = a_gpu.device_ptr(&gpu.stream);
+                let (bp, _) = b_gpu.device_ptr(&gpu.stream);
+                let (dp, _) = d_gpu.device_ptr_mut(&gpu.stream);
+                unsafe {
+                    prelude_deepgemm::einsum(
+                        ap as *mut c_void, bp as *mut c_void, dp as *mut c_void,
+                        *m as i32, *n as i32, *k as i32, s as i32,
+                        gpu.stream_ptr(),
+                    ).unwrap();
+                }
+            }, &gpu);
+
+            let cub_us = bench_us(|| {
+                cublas_einsum_bf16(&a_gpu, &b_gpu, &mut d_cub, *m, *n, *k, s, &gpu);
+            }, &gpu);
+
+            let tf = tflops(s * *m, *n, *k, dg_us);
+            let r = dg_us / cub_us;
+            println!("{m:<4} {n:<4} {k:<4} {s:<6} {dg_us:>10.1} {cub_us:>10.1} {:>5.2}x{:<1} {tf:>6.1}T",
+                r, ratio_marker(r));
+        }
     }
     println!();
 }

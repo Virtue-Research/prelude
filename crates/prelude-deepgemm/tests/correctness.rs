@@ -919,3 +919,342 @@ fn fp8_masked_gemm_moe_shapes() {
     run_fp8_masked_test(&[128, 128, 128, 128], 256, 1024, 1024, &gpu);
     run_fp8_masked_test(&[64, 128, 64, 128, 64, 128, 64, 128], 128, 4096, 4096, &gpu);
 }
+
+// ============================================================================
+// Device query
+// ============================================================================
+
+#[test]
+fn device_query() {
+    let _gpu = match Gpu::new() { Some(g) => g, None => return };
+    let (num_sms, gpu_arch) = prelude_deepgemm::query_device();
+    assert!(num_sms > 0, "num_sms should be positive, got {num_sms}");
+    assert!(gpu_arch >= 90, "gpu_arch should be >= 90, got {gpu_arch}");
+    println!("Device: {num_sms} SMs, arch sm_{gpu_arch}");
+}
+
+// ============================================================================
+// Layout utilities — SF transpose
+// ============================================================================
+
+/// CPU reference: transpose [G, MN, SF_K] → [G, SF_K, tma_aligned_MN]
+fn cpu_transpose_sf(sf: &[f32], g: usize, mn: usize, sf_k: usize) -> Vec<f32> {
+    let tma_mn = prelude_deepgemm::get_tma_aligned_size(mn as i32, 4) as usize;
+    let mut out = vec![0.0f32; g * sf_k * tma_mn];
+    for gi in 0..g {
+        for mi in 0..mn {
+            for ki in 0..sf_k {
+                out[gi * sf_k * tma_mn + ki * tma_mn + mi] =
+                    sf[gi * mn * sf_k + mi * sf_k + ki];
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn sf_transpose_correctness() {
+    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    for (g, mn, sf_k) in [(1, 128, 8), (1, 256, 16), (2, 64, 4), (1, 1024, 56)] {
+        let sf_data = rand_f32(g * mn * sf_k);
+        let ref_out = cpu_transpose_sf(&sf_data, g, mn, sf_k);
+
+        let tma_mn = prelude_deepgemm::get_tma_aligned_size(mn as i32, 4) as usize;
+        let sf_gpu = gpu.upload(&sf_data);
+        let mut out_gpu = gpu.alloc_zeros::<f32>(g * sf_k * tma_mn);
+
+        {
+            let (sp, _) = sf_gpu.device_ptr(&gpu.stream);
+            let (op, _) = out_gpu.device_ptr_mut(&gpu.stream);
+            unsafe {
+                prelude_deepgemm::transform_sf_transpose(
+                    sp as *mut c_void, op as *mut c_void,
+                    mn as i32, sf_k as i32, g as i32,
+                    gpu.stream_ptr(),
+                ).unwrap();
+            }
+        }
+        gpu.sync();
+
+        let result = gpu.download(&out_gpu);
+        let err = ref_out.iter().zip(result.iter())
+            .map(|(r, t)| (r - t).abs())
+            .fold(0.0f32, f32::max);
+        assert!(err == 0.0, "SF transpose G={g} MN={mn} K={sf_k}: max_err={err:.6e}");
+    }
+}
+
+// ============================================================================
+// MQA logits — correctness
+// ============================================================================
+
+/// Simple FP8 E4M3 quantization for testing (no scaling).
+fn f32_to_fp8_e4m3_simple(val: f32) -> u8 {
+    if val == 0.0 { return 0; }
+    let sign = if val < 0.0 { 0x80u8 } else { 0u8 };
+    let clamped = val.abs().min(448.0);
+    let log2 = clamped.log2();
+    let exp = (log2.floor() as i32 + 7).clamp(1, 14) as u8;
+    let scale = 2.0f32.powi(exp as i32 - 7);
+    let mant = ((clamped / scale - 1.0) * 8.0).round().clamp(0.0, 7.0) as u8;
+    sign | (exp << 3) | mant
+}
+
+#[test]
+fn mqa_logits_basic() {
+    let gpu = match Gpu::new() { Some(g) => g, None => return };
+
+    // DeepSeek V3 config: num_heads=32, head_dim=64, block_q=4
+    let seq_len = 4;
+    let seq_len_kv = 256; // multiple of block_kv=256
+    let num_heads = 32;
+    let head_dim = 64;
+
+    // Generate FP8 test data
+    let q_f32 = rand_f32(seq_len * num_heads * head_dim);
+    let kv_f32 = rand_f32(seq_len_kv * head_dim);
+    let q_fp8: Vec<u8> = q_f32.iter().map(|&x| f32_to_fp8_e4m3_simple(x)).collect();
+    let kv_fp8: Vec<u8> = kv_f32.iter().map(|&x| f32_to_fp8_e4m3_simple(x)).collect();
+    let kv_scales = vec![1.0f32; seq_len_kv];
+    let weights = rand_f32(seq_len * num_heads);
+
+    let cu_k_start = vec![0u32; seq_len];
+    let cu_k_end = vec![seq_len_kv as u32; seq_len];
+
+    // GPU
+    let q_gpu = gpu.upload(&q_fp8);
+    let kv_gpu = gpu.upload(&kv_fp8);
+    let tma_slkv = prelude_deepgemm::get_tma_aligned_size(seq_len_kv as i32, 4) as usize;
+    let mut kv_scales_padded = vec![0.0f32; tma_slkv];
+    kv_scales_padded[..seq_len_kv].copy_from_slice(&kv_scales);
+    let kv_scales_gpu = gpu.upload(&kv_scales_padded);
+    let weights_gpu = gpu.upload(&weights);
+    let k_start_gpu = gpu.upload(&cu_k_start);
+    let k_end_gpu = gpu.upload(&cu_k_end);
+    let mut logits_gpu = gpu.alloc_zeros::<f32>(seq_len * seq_len_kv);
+
+    {
+        let (qp, _) = q_gpu.device_ptr(&gpu.stream);
+        let (kvp, _) = kv_gpu.device_ptr(&gpu.stream);
+        let (kvsp, _) = kv_scales_gpu.device_ptr(&gpu.stream);
+        let (wp, _) = weights_gpu.device_ptr(&gpu.stream);
+        let (ksp, _) = k_start_gpu.device_ptr(&gpu.stream);
+        let (kep, _) = k_end_gpu.device_ptr(&gpu.stream);
+        let (lp, _) = logits_gpu.device_ptr_mut(&gpu.stream);
+        unsafe {
+            prelude_deepgemm::fp8_mqa_logits(
+                qp as *mut c_void, kvp as *mut c_void,
+                kvsp as *mut c_void, wp as *mut c_void,
+                ksp as *mut c_void, kep as *mut c_void,
+                lp as *mut c_void,
+                seq_len as i32, seq_len_kv as i32,
+                0, // non-compressed
+                num_heads as i32, head_dim as i32, seq_len_kv as i32,
+                gpu.stream_ptr(),
+            ).unwrap();
+        }
+    }
+    gpu.sync();
+
+    let result = gpu.download(&logits_gpu);
+    // Verify kernel runs and produces finite results
+    assert!(result.iter().all(|x| x.is_finite()), "MQA logits produced non-finite values");
+    // Verify non-trivial output (not all zeros)
+    let max_abs = result.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+    assert!(max_abs > 0.0, "MQA logits output is all zeros");
+    println!("MQA logits: max_abs_val={max_abs:.4e}");
+}
+
+// ============================================================================
+// Clean logits
+// ============================================================================
+
+#[test]
+fn clean_logits_basic() {
+    let gpu = match Gpu::new() { Some(g) => g, None => return };
+
+    let seq_len = 4;
+    let seq_len_kv = 256;
+    let stride = seq_len_kv;
+
+    // Each query sees a different KV range
+    let cu_k_start: Vec<u32> = vec![0, 10, 20, 30];
+    let cu_k_end: Vec<u32> = vec![50, 60, 70, 80];
+
+    // Initialize logits to 1.0
+    let logits_init = vec![1.0f32; seq_len * stride];
+    let mut logits_gpu = gpu.upload(&logits_init);
+    let ks_gpu = gpu.upload(&cu_k_start);
+    let ke_gpu = gpu.upload(&cu_k_end);
+
+    {
+        let (ksp, _g1) = ks_gpu.device_ptr(&gpu.stream);
+        let (kep, _g2) = ke_gpu.device_ptr(&gpu.stream);
+        let (lp, _g3) = logits_gpu.device_ptr_mut(&gpu.stream);
+        unsafe {
+            prelude_deepgemm::clean_logits(
+                ksp as *mut c_void, kep as *mut c_void,
+                lp as *mut c_void,
+                seq_len as i32, seq_len_kv as i32, stride as i32,
+                1, // next_n
+                gpu.stream_ptr(),
+            ).unwrap();
+        }
+    }
+    gpu.sync();
+
+    let result = gpu.download(&logits_gpu);
+    // Verify: positions outside [k_start, k_end) should be -inf
+    for qi in 0..seq_len {
+        let ks = cu_k_start[qi] as usize;
+        let ke = cu_k_end[qi] as usize;
+        for kvi in 0..seq_len_kv {
+            let val = result[qi * stride + kvi];
+            if kvi >= ks && kvi < ke {
+                assert!(val == 1.0, "q={qi} kv={kvi}: expected 1.0 (in range [{ks},{ke})), got {val}");
+            } else {
+                assert!(val == f32::NEG_INFINITY,
+                        "q={qi} kv={kvi}: expected -inf (outside [{ks},{ke})), got {val}");
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Paged MQA metadata
+// ============================================================================
+
+#[test]
+fn paged_mqa_metadata_basic() {
+    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let (num_sms, _) = prelude_deepgemm::query_device();
+
+    let batch_size = 4;
+    let split_kv = 256;
+    let context_lens: Vec<u32> = vec![512, 256, 768, 128]; // varying context lengths
+    let ctx_gpu = gpu.upload(&context_lens);
+    let mut meta_gpu = gpu.alloc_zeros::<u32>((num_sms as usize + 1) * 2);
+
+    {
+        let (cp, _) = ctx_gpu.device_ptr(&gpu.stream);
+        let (mp, _) = meta_gpu.device_ptr_mut(&gpu.stream);
+        unsafe {
+            prelude_deepgemm::paged_mqa_metadata(
+                cp as *mut c_void, mp as *mut c_void,
+                batch_size as i32, 1, false,
+                split_kv as i32, num_sms,
+                gpu.stream_ptr(),
+            ).unwrap();
+        }
+    }
+    gpu.sync();
+
+    let meta = gpu.download(&meta_gpu);
+    // Verify: first entry should start at q_idx=0, last entry at q_idx=batch_size
+    assert_eq!(meta[0], 0, "First SM should start at q_idx=0");
+    let last_q = meta[num_sms as usize * 2];
+    assert!(last_q >= batch_size as u32,
+            "Last entry should cover all batches, got q_idx={last_q}");
+    println!("Metadata: first=(q={}, kv={}), last=(q={}, kv={})",
+             meta[0], meta[1], meta[num_sms as usize * 2], meta[num_sms as usize * 2 + 1]);
+}
+
+// ============================================================================
+// TMA alignment / MK alignment
+// ============================================================================
+
+// ============================================================================
+// Einsum: D[M,N] = sum_s A[s,M,K] @ B[s,N,K]^T
+// ============================================================================
+
+/// CPU reference for einsum: D[M,N] = sum over s of A[s*M..(s+1)*M, :K] @ B[s*N..(s+1)*N, :K]^T
+fn cpu_einsum_f64(a: &[f64], b: &[f64], m: usize, n: usize, k: usize, s: usize) -> Vec<f64> {
+    let mut d = vec![0.0f64; m * n];
+    for si in 0..s {
+        for mi in 0..m {
+            for ni in 0..n {
+                let mut acc = 0.0f64;
+                for ki in 0..k {
+                    acc += a[(si * m + mi) * k + ki] * b[(si * n + ni) * k + ki];
+                }
+                d[mi * n + ni] += acc;
+            }
+        }
+    }
+    d
+}
+
+fn run_einsum_test(m: usize, n: usize, k: usize, s: usize, gpu: &Gpu) {
+    let a_f32 = rand_f32(s * m * k);
+    let b_f32 = rand_f32(s * n * k);
+
+    let a_f64: Vec<f64> = a_f32.iter().map(|&x| x as f64).collect();
+    let b_f64: Vec<f64> = b_f32.iter().map(|&x| x as f64).collect();
+    let ref64 = cpu_einsum_f64(&a_f64, &b_f64, m, n, k, s);
+
+    let a_bf16: Vec<half::bf16> = a_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
+    let b_bf16: Vec<half::bf16> = b_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
+
+    let result: Vec<f64> = {
+        let a_gpu = gpu.upload(&a_bf16);
+        let b_gpu = gpu.upload(&b_bf16);
+        let mut d_gpu = gpu.alloc_zeros::<f32>(m * n);
+
+        {
+            let (ap, _) = a_gpu.device_ptr(&gpu.stream);
+            let (bp, _) = b_gpu.device_ptr(&gpu.stream);
+            let (dp, _) = d_gpu.device_ptr_mut(&gpu.stream);
+            unsafe {
+                prelude_deepgemm::einsum(
+                    ap as *mut c_void, bp as *mut c_void, dp as *mut c_void,
+                    m as i32, n as i32, k as i32, s as i32,
+                    gpu.stream_ptr(),
+                ).unwrap();
+            }
+        }
+        gpu.sync();
+        gpu.download(&d_gpu).iter().map(|&x| x as f64).collect()
+    };
+
+    let err = max_abs_err(&ref64, &result);
+    // BF16 with FP32 accumulation and atomicAdd — tolerance scales with S
+    let tol = 1.0 * s as f64;
+    assert!(err < tol, "Einsum M={m} N={n} K={k} S={s}: max_err={err:.6e} (tol={tol})");
+}
+
+#[test]
+fn einsum_128x128x64() {
+    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    run_einsum_test(128, 128, 64, 4, &gpu);
+    run_einsum_test(128, 128, 64, 16, &gpu);
+}
+
+#[test]
+fn einsum_128x64x64() {
+    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    run_einsum_test(128, 64, 64, 8, &gpu);
+}
+
+#[test]
+fn einsum_256x128x64() {
+    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    run_einsum_test(256, 128, 64, 4, &gpu);
+}
+
+#[test]
+fn einsum_128x128x128() {
+    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    run_einsum_test(128, 128, 128, 4, &gpu);
+}
+
+// ============================================================================
+// TMA alignment / MK alignment
+// ============================================================================
+
+#[test]
+fn alignment_helpers() {
+    assert_eq!(prelude_deepgemm::get_tma_aligned_size(100, 4), 100); // 100*4=400, already 16-aligned
+    assert_eq!(prelude_deepgemm::get_tma_aligned_size(3, 4), 4);     // 3*4=12 → 16 → 4 elems
+    assert_eq!(prelude_deepgemm::get_tma_aligned_size(7, 2), 8);     // 7*2=14 → 16 → 8 elems
+    assert_eq!(prelude_deepgemm::get_mk_alignment(), 128);
+}

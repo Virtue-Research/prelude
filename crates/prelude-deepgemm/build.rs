@@ -23,6 +23,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/sm100_bf16.cuh");
     println!("cargo:rerun-if-changed=src/sm100_fp8.cuh");
     println!("cargo:rerun-if-changed=src/attention.cuh");
+    println!("cargo:rerun-if-changed=src/layout.cuh");
+    println!("cargo:rerun-if-changed=src/einsum.cuh");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -219,6 +221,7 @@ fn ensure_deepgemm(out_dir: &Path) -> PathBuf {
         "deep_gemm/include/deep_gemm/impls/sm90_bf16_gemm.cuh",
         "deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh",
         "deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d1d.cuh",
+        "deep_gemm/include/deep_gemm/impls/sm90_bmk_bnk_mn.cuh",
     ] {
         let path = dg_dir.join(file);
         if let Ok(content) = std::fs::read_to_string(&path) {
@@ -233,8 +236,111 @@ fn ensure_deepgemm(out_dir: &Path) -> PathBuf {
         }
     }
 
+    // Patch SM90 MQA/paged-MQA kernels: these don't have arch guards at all in upstream
+    // (upstream JIT targets one arch at a time). For fat binary, wrap kernel bodies with
+    // __CUDA_ARCH__ >= 900 && < 1000 so SM90 wgmma instructions aren't compiled for SM100.
+    patch_kernel_arch_guard(&dg_dir.join(
+        "deep_gemm/include/deep_gemm/impls/sm90_fp8_mqa_logits.cuh"),
+        "sm90_fp8_mqa_logits",
+        "(__CUDA_ARCH__ >= 900) and (__CUDA_ARCH__ < 1000)");
+    patch_kernel_arch_guard(&dg_dir.join(
+        "deep_gemm/include/deep_gemm/impls/sm90_fp8_paged_mqa_logits.cuh"),
+        "sm90_fp8_paged_mqa_logits",
+        "(__CUDA_ARCH__ >= 900) and (__CUDA_ARCH__ < 1000)");
+
+    // Patch SM100 MQA/paged-MQA kernels: same issue, these use SM100 intrinsics
+    // (UMMA, TMEM, __ffma2_rn) that don't exist on SM90.
+    patch_kernel_arch_guard(&dg_dir.join(
+        "deep_gemm/include/deep_gemm/impls/sm100_fp8_mqa_logits.cuh"),
+        "sm100_fp8_mqa_logits",
+        "(__CUDA_ARCH__ >= 1000)");
+    patch_kernel_arch_guard(&dg_dir.join(
+        "deep_gemm/include/deep_gemm/impls/sm100_fp8_paged_mqa_logits.cuh"),
+        "sm100_fp8_paged_mqa_logits",
+        "(__CUDA_ARCH__ >= 1000)");
+
+    // Patch extern __shared__ declarations in attention headers to avoid
+    // type/alignment conflicts in AOT compilation (all kernels in one .cu).
+    // Upstream JIT compiles each kernel separately, so this isn't an issue there.
+    // We rename smem_buffer → unique names per header file.
+    patch_smem_name(&dg_dir, "deep_gemm/include/deep_gemm/impls/smxx_clean_logits.cuh",
+                    "smem_buffer", "smem_clean_");
+    patch_smem_name(&dg_dir, "deep_gemm/include/deep_gemm/impls/sm90_fp8_mqa_logits.cuh",
+                    "smem_buffer", "smem_mqa90_");
+    patch_smem_name(&dg_dir, "deep_gemm/include/deep_gemm/impls/sm100_fp8_mqa_logits.cuh",
+                    "smem_buffer", "smem_mqa100_");
+    patch_smem_name(&dg_dir, "deep_gemm/include/deep_gemm/impls/sm90_fp8_paged_mqa_logits.cuh",
+                    "smem_buffer", "smem_pmqa90_");
+    patch_smem_name(&dg_dir, "deep_gemm/include/deep_gemm/impls/sm100_fp8_paged_mqa_logits.cuh",
+                    "smem_buffer", "smem_pmqa100_");
+
     println!("cargo:warning=DeepGEMM headers ready");
     dg_dir
+}
+
+/// Rename `extern __shared__` variable in a header to avoid type/alignment conflicts.
+fn patch_smem_name(dg_dir: &Path, file: &str, old_name: &str, new_name: &str) {
+    let path = dg_dir.join(file);
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        let patched = content.replace(old_name, new_name);
+        if patched != content {
+            std::fs::write(&path, patched).expect("Failed to patch smem name");
+            let fname = path.file_name().unwrap().to_str().unwrap();
+            println!("cargo:warning=Patched {fname}: renamed {old_name} → {new_name}");
+        }
+    }
+}
+
+/// Patch attention kernel headers that lack arch guards for fat binary compilation.
+/// `kernel_name_prefix`: e.g. "sm90_fp8_mqa_logits" — matches `void <prefix>(`
+/// `arch_guard`: e.g. "(__CUDA_ARCH__ >= 900) and (__CUDA_ARCH__ < 1000)"
+fn patch_kernel_arch_guard(path: &Path, kernel_name_prefix: &str, arch_guard: &str) {
+    let Ok(content) = std::fs::read_to_string(path) else { return };
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    let file_name = path.file_name().unwrap().to_str().unwrap();
+    let pattern = format!("void {}(", kernel_name_prefix);
+    let guard_line = format!("#if (defined(__CUDA_ARCH__) and {}) or defined(__CLION_IDE__)", arch_guard);
+
+    let mut insertions: Vec<(usize, String)> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].contains(&pattern) {
+            // Find the opening brace of this function
+            let mut j = i;
+            while j < lines.len() && !lines[j].trim_end().ends_with('{') {
+                j += 1;
+            }
+            if j < lines.len() {
+                insertions.push((j + 1, guard_line.clone()));
+
+                // Find matching closing brace
+                let mut depth = 1;
+                let mut k = j + 1;
+                while k < lines.len() && depth > 0 {
+                    for ch in lines[k].chars() {
+                        if ch == '{' { depth += 1; }
+                        if ch == '}' { depth -= 1; }
+                        if depth == 0 { break; }
+                    }
+                    if depth > 0 { k += 1; }
+                }
+                if depth == 0 {
+                    insertions.push((k, "#endif".to_string()));
+                }
+            }
+            i = if !insertions.is_empty() { insertions.last().unwrap().0 + 1 } else { i + 1 };
+        } else {
+            i += 1;
+        }
+    }
+
+    if insertions.is_empty() { return; }
+    insertions.sort_by(|a, b| b.0.cmp(&a.0));
+    for (idx, text) in &insertions {
+        lines.insert(*idx, text.clone());
+    }
+    std::fs::write(path, lines.join("\n")).expect("Failed to patch kernel header");
+    println!("cargo:warning=Patched {file_name} for fat binary arch guard ({} insertions)", insertions.len());
 }
 
 fn find_cuda() -> PathBuf {

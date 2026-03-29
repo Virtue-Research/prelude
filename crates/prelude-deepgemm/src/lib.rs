@@ -125,6 +125,69 @@ unsafe extern "C" {
         expected_m: i32,
         stream: *mut c_void,
     ) -> i32;
+
+    // ── Attention kernels ───────────────────────────────────────────
+
+    fn deepgemm_fp8_mqa_logits(
+        q: *mut c_void, kv: *mut c_void,
+        kv_scales: *mut c_void, weights: *mut c_void,
+        cu_seq_len_k_start: *mut c_void, cu_seq_len_k_end: *mut c_void,
+        logits: *mut c_void,
+        seq_len: i32, seq_len_kv: i32, max_seqlen_k: i32,
+        num_heads: i32, head_dim: i32, stride_logits: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    fn deepgemm_fp8_paged_mqa_logits(
+        q: *mut c_void, kv_cache: *mut c_void,
+        kv_scales: *mut c_void, weights: *mut c_void,
+        context_lens: *mut c_void, logits: *mut c_void,
+        block_table: *mut c_void, schedule_meta: *mut c_void,
+        batch_size: i32, num_heads: i32, head_dim: i32,
+        num_kv_blocks: i32, block_kv: i32,
+        is_context_lens_2d: i32,
+        kv_cache_stride_bytes: i32, logits_stride: i32, block_table_stride: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    fn deepgemm_paged_mqa_metadata(
+        context_lens: *mut c_void, schedule_metadata: *mut c_void,
+        batch_size: i32, next_n: i32, is_context_lens_2d: i32,
+        split_kv: i32, num_sms: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    fn deepgemm_clean_logits(
+        cu_seq_len_k_start: *mut c_void, cu_seq_len_k_end: *mut c_void,
+        logits: *mut c_void,
+        seq_len: i32, seq_len_kv: i32, stride_logits: i32,
+        next_n: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    // ── Layout utilities ────────────────────────────────────────────
+
+    fn deepgemm_transform_sf_transpose(
+        sf_in: *mut c_void, sf_out: *mut c_void,
+        mn: i32, sf_k: i32, num_groups: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    fn deepgemm_transform_sf_pack_ue8m0(
+        sf_in: *mut c_void, sf_out: *mut c_void,
+        mn: i32, sf_k: i32, num_groups: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    fn deepgemm_einsum(
+        A: *mut c_void, B: *mut c_void, D: *mut c_void,
+        shape_m: i32, shape_n: i32, shape_k: i32, shape_s: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    fn deepgemm_get_tma_aligned_size(size: i32, elem_size: i32) -> i32;
+    fn deepgemm_get_mk_alignment() -> i32;
+    fn deepgemm_query_device(out_num_sms: *mut i32, out_gpu_arch: *mut i32);
 }
 
 /// BF16 GEMM: D\[M,N\] = A\[M,K\] @ B\[K,N\]
@@ -415,4 +478,253 @@ pub unsafe fn m_grouped_masked_fp8_gemm(
         -1 => Err(format!("DeepGEMM masked FP8: no kernel variant for M={m} N={n} K={k} G={num_groups}")),
         code => Err(format!("DeepGEMM masked FP8: launch failed (code {code}) for M={m} N={n} K={k}")),
     }
+}
+
+// ── Attention kernels ──────────────────────────────────────────────
+
+/// FP8 MQA Logits (prefill phase):
+///   logits = weighted_relu_sum(Q @ KV^T, weights)
+///
+/// - q: \[seq_len * num_heads, head_dim\] FP8 E4M3
+/// - kv: \[seq_len_kv, head_dim\] FP8 E4M3
+/// - kv_scales: \[tma_aligned(seq_len_kv)\] FP32 per-KV-token scaling
+/// - weights: \[seq_len, num_heads\] FP32 MQA head weights
+/// - cu_seq_len_k_start/end: \[seq_len\] uint32 cumulative KV range per query
+/// - logits: \[seq_len, stride_logits\] FP32 output
+/// - max_seqlen_k: >0 enables compressed logits format
+///
+/// Supported: num_heads ∈ {8,16,32,64}, head_dim ∈ {64,128}, num_heads * head_dim = 128 * head_dim
+///
+/// # Safety
+/// All pointers must be valid CUDA device pointers.
+pub unsafe fn fp8_mqa_logits(
+    q: *mut c_void,
+    kv: *mut c_void,
+    kv_scales: *mut c_void,
+    weights: *mut c_void,
+    cu_seq_len_k_start: *mut c_void,
+    cu_seq_len_k_end: *mut c_void,
+    logits: *mut c_void,
+    seq_len: i32,
+    seq_len_kv: i32,
+    max_seqlen_k: i32,
+    num_heads: i32,
+    head_dim: i32,
+    stride_logits: i32,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    let ret = unsafe {
+        deepgemm_fp8_mqa_logits(q, kv, kv_scales, weights,
+            cu_seq_len_k_start, cu_seq_len_k_end, logits,
+            seq_len, seq_len_kv, max_seqlen_k,
+            num_heads, head_dim, stride_logits, stream)
+    };
+    match ret {
+        0 => Ok(()),
+        -1 => Err(format!("DeepGEMM MQA: no kernel for heads={num_heads} dim={head_dim}")),
+        code => Err(format!("DeepGEMM MQA: launch failed (code {code})")),
+    }
+}
+
+/// FP8 Paged MQA Logits (decode phase):
+///   logits = paged_attention(Q, KV_cache, block_table, weights)
+///
+/// - q: \[batch_size * num_heads, head_dim\] FP8
+/// - kv_cache: paged KV cache, \[num_kv_blocks, block_kv, head_dim\] FP8
+/// - kv_scales: \[num_kv_blocks, block_kv\] FP32
+/// - weights: \[batch_size, num_heads\] FP32
+/// - context_lens: \[batch_size\] uint32
+/// - logits: \[batch_size, logits_stride\] FP32
+/// - block_table: \[batch_size, block_table_stride\] uint32
+/// - schedule_meta: \[(num_sms+1)*2\] uint32 (from paged_mqa_metadata)
+///
+/// # Safety
+/// All pointers must be valid CUDA device pointers.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn fp8_paged_mqa_logits(
+    q: *mut c_void,
+    kv_cache: *mut c_void,
+    kv_scales: *mut c_void,
+    weights: *mut c_void,
+    context_lens: *mut c_void,
+    logits: *mut c_void,
+    block_table: *mut c_void,
+    schedule_meta: *mut c_void,
+    batch_size: i32,
+    num_heads: i32,
+    head_dim: i32,
+    num_kv_blocks: i32,
+    block_kv: i32,
+    is_context_lens_2d: bool,
+    kv_cache_stride_bytes: i32,
+    logits_stride: i32,
+    block_table_stride: i32,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    let ret = unsafe {
+        deepgemm_fp8_paged_mqa_logits(q, kv_cache, kv_scales, weights,
+            context_lens, logits, block_table, schedule_meta,
+            batch_size, num_heads, head_dim, num_kv_blocks, block_kv,
+            is_context_lens_2d as i32,
+            kv_cache_stride_bytes, logits_stride, block_table_stride, stream)
+    };
+    match ret {
+        0 => Ok(()),
+        -1 => Err(format!("DeepGEMM paged MQA: no kernel for heads={num_heads} dim={head_dim}")),
+        code => Err(format!("DeepGEMM paged MQA: launch failed (code {code})")),
+    }
+}
+
+/// Compute scheduling metadata for paged MQA logits.
+///
+/// - context_lens: \[batch_size\] uint32 on GPU
+/// - schedule_metadata: \[(num_sms+1)*2\] uint32 on GPU (pre-allocated)
+/// - split_kv: SM90=256, SM100=512
+///
+/// # Safety
+/// All pointers must be valid CUDA device pointers.
+pub unsafe fn paged_mqa_metadata(
+    context_lens: *mut c_void,
+    schedule_metadata: *mut c_void,
+    batch_size: i32,
+    next_n: i32,
+    is_context_lens_2d: bool,
+    split_kv: i32,
+    num_sms: i32,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    let ret = unsafe {
+        deepgemm_paged_mqa_metadata(context_lens, schedule_metadata,
+            batch_size, next_n, is_context_lens_2d as i32,
+            split_kv, num_sms, stream)
+    };
+    match ret {
+        0 => Ok(()),
+        code => Err(format!("DeepGEMM metadata: launch failed (code {code})")),
+    }
+}
+
+/// Clean logits: fill -inf for out-of-range KV positions after MQA.
+///
+/// # Safety
+/// All pointers must be valid CUDA device pointers.
+pub unsafe fn clean_logits(
+    cu_seq_len_k_start: *mut c_void,
+    cu_seq_len_k_end: *mut c_void,
+    logits: *mut c_void,
+    seq_len: i32,
+    seq_len_kv: i32,
+    stride_logits: i32,
+    next_n: i32,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    let ret = unsafe {
+        deepgemm_clean_logits(cu_seq_len_k_start, cu_seq_len_k_end, logits,
+            seq_len, seq_len_kv, stride_logits, next_n, stream)
+    };
+    match ret {
+        0 => Ok(()),
+        -1 => Err(format!("DeepGEMM clean_logits: unsupported next_n={next_n}")),
+        code => Err(format!("DeepGEMM clean_logits: launch failed (code {code})")),
+    }
+}
+
+// ── Einsum ──────────────────────────────────────────────────────────
+
+/// BF16 Einsum: D\[M,N\] = sum_s A\[s,M,K\] @ B\[s,N,K\]^T
+///
+/// Batched matrix multiply with FP32 accumulation via atomicAdd.
+/// D must be zero-initialized before calling.
+///
+/// - A: \[shape_s * shape_m, shape_k\] BF16 (row-major, K-major for TMA)
+/// - B: \[shape_s * shape_n, shape_k\] BF16 (row-major, K-major for TMA)
+/// - D: \[shape_m, shape_n\] FP32 output (zero-init, accumulated)
+///
+/// shape_m/n/k must match a pre-compiled configuration:
+///   (128,128,64), (128,128,128), (128,64,64), (128,64,128),
+///   (256,128,64), (256,128,128)
+///
+/// # Safety
+/// All pointers must be valid CUDA device pointers.
+pub unsafe fn einsum(
+    a: *mut c_void,
+    b: *mut c_void,
+    d: *mut c_void,
+    shape_m: i32,
+    shape_n: i32,
+    shape_k: i32,
+    shape_s: i32,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    let ret = unsafe {
+        deepgemm_einsum(a, b, d, shape_m, shape_n, shape_k, shape_s, stream)
+    };
+    match ret {
+        0 => Ok(()),
+        -1 => Err(format!("DeepGEMM einsum: no kernel for M={shape_m} N={shape_n} K={shape_k}")),
+        code => Err(format!("DeepGEMM einsum: launch failed (code {code})")),
+    }
+}
+
+// ── Layout utilities ────────────────────────────────────────────────
+
+/// Transpose FP32 scaling factors from \[G, MN, K/128\] (K-major) to
+/// \[G, K/128, tma_aligned(MN)\] (MN-major, TMA-aligned).
+///
+/// # Safety
+/// sf_in and sf_out must be valid CUDA device pointers.
+pub unsafe fn transform_sf_transpose(
+    sf_in: *mut c_void,
+    sf_out: *mut c_void,
+    mn: i32,
+    sf_k: i32,
+    num_groups: i32,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    let ret = unsafe {
+        deepgemm_transform_sf_transpose(sf_in, sf_out, mn, sf_k, num_groups, stream)
+    };
+    match ret {
+        0 => Ok(()),
+        code => Err(format!("DeepGEMM SF transpose: launch failed (code {code})")),
+    }
+}
+
+/// Transform + pack FP32 scaling factors to UE8M0 format (for SM100).
+///
+/// # Safety
+/// sf_in and sf_out must be valid CUDA device pointers.
+pub unsafe fn transform_sf_pack_ue8m0(
+    sf_in: *mut c_void,
+    sf_out: *mut c_void,
+    mn: i32,
+    sf_k: i32,
+    num_groups: i32,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    let ret = unsafe {
+        deepgemm_transform_sf_pack_ue8m0(sf_in, sf_out, mn, sf_k, num_groups, stream)
+    };
+    match ret {
+        0 => Ok(()),
+        code => Err(format!("DeepGEMM SF UE8M0 pack: launch failed (code {code})")),
+    }
+}
+
+/// Get TMA-aligned element count for a given size and element size.
+pub fn get_tma_aligned_size(size: i32, elem_size: i32) -> i32 {
+    unsafe { deepgemm_get_tma_aligned_size(size, elem_size) }
+}
+
+/// Get M/K alignment for contiguous grouped layout. Always 128.
+pub fn get_mk_alignment() -> i32 {
+    unsafe { deepgemm_get_mk_alignment() }
+}
+
+/// Query device properties: number of SMs and GPU architecture.
+pub fn query_device() -> (i32, i32) {
+    let mut num_sms = 0i32;
+    let mut gpu_arch = 0i32;
+    unsafe { deepgemm_query_device(&mut num_sms, &mut gpu_arch) };
+    (num_sms, gpu_arch)
 }
