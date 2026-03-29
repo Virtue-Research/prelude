@@ -362,11 +362,11 @@ fn cublaslt_fp8(
 // ============================================================================
 
 fn bench_fp8_1d1d(gpu: &Gpu) {
-    println!("\n{:=<80}", "= FP8 1D1D GEMM (FP32 output): DeepGEMM ");
-    print!("{:<6} {:<5} {:<5} {:>12} {:>7}",
-        "M", "N", "K", "us", "TFLOPS");
+    println!("\n{:=<80}", "= FP8 1D1D GEMM (FP32 out): DeepGEMM vs cuBLASLt(FP8→BF16) ");
+    print!("{:<6} {:<5} {:<5} {:>9} {:>9} {:>7} {:>7}",
+        "M", "N", "K", "1d1d_us", "cublaslt", "vs_lt", "TFLOPS");
     println!();
-    println!("{}", "-".repeat(50));
+    println!("{}", "-".repeat(70));
 
     let ms = [64usize, 128];
     let nks: Vec<(usize, usize)> = vec![
@@ -385,14 +385,15 @@ fn bench_fp8_1d1d(gpu: &Gpu) {
             let b_gpu = gpu.upload(&b_fp8);
             let sfa_gpu = gpu.upload(&sfa);
             let sfb_gpu = gpu.upload(&sfb);
-            let mut out_gpu = gpu.alloc_zeros::<f32>(m * n);
+            let mut out_f32 = gpu.alloc_zeros::<f32>(m * n);
 
-            let us = bench_us(|| {
+            // DeepGEMM 1D1D
+            let dg_us = bench_us(|| {
                 let (ap, _) = a_gpu.device_ptr(&gpu.stream);
                 let (bp, _) = b_gpu.device_ptr(&gpu.stream);
                 let (sfap, _) = sfa_gpu.device_ptr(&gpu.stream);
                 let (sfbp, _) = sfb_gpu.device_ptr(&gpu.stream);
-                let (op, _) = out_gpu.device_ptr_mut(&gpu.stream);
+                let (op, _) = out_f32.device_ptr_mut(&gpu.stream);
                 unsafe {
                     prelude_deepgemm::fp8_gemm_1d1d(
                         ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
@@ -403,8 +404,31 @@ fn bench_fp8_1d1d(gpu: &Gpu) {
                 }
             }, gpu);
 
-            let tf = tflops(m, n, k, us);
-            println!("{m:<6} {n:<5} {k:<5} {us:>12.1} {tf:>6.1}T");
+            // cuBLASLt FP8 (per-tensor scaling, BF16 output — not identical but closest baseline)
+            let (scale_a_tensor, scale_b_tensor) = {
+                let sa = a_f32.iter().map(|x| x.abs()).fold(0.0f32, f32::max) / 448.0;
+                let sb = b_f32.iter().map(|x| x.abs()).fold(0.0f32, f32::max) / 448.0;
+                (gpu.upload(&[if sa == 0.0 { 1.0f32 } else { sa }]),
+                 gpu.upload(&[if sb == 0.0 { 1.0f32 } else { sb }]))
+            };
+            let mut out_bf16 = gpu.alloc_zeros::<half::bf16>(m * n);
+            let lt_ok = cublaslt_fp8(&b_gpu, &a_gpu, &mut out_bf16,
+                &scale_a_tensor, &scale_b_tensor, m, n, k, gpu);
+            let lt_us = if lt_ok {
+                bench_us(|| {
+                    cublaslt_fp8(&b_gpu, &a_gpu, &mut out_bf16,
+                        &scale_a_tensor, &scale_b_tensor, m, n, k, gpu);
+                }, gpu)
+            } else { f64::NAN };
+
+            let tf = tflops(m, n, k, dg_us);
+            let r = dg_us / lt_us;
+            if lt_us.is_nan() {
+                println!("{m:<6} {n:<5} {k:<5} {dg_us:>9.1} {:>9} {:>7} {tf:>6.1}T", "N/A", "N/A");
+            } else {
+                println!("{m:<6} {n:<5} {k:<5} {dg_us:>9.1} {lt_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T",
+                    r, ratio_marker(r));
+            }
         }
     }
     println!();
@@ -860,11 +884,11 @@ fn bench_masked_fp8(gpu: &Gpu) {
 }
 
 fn bench_acc(gpu: &Gpu) {
-    println!("\n{:=<80}", "= BF16 GEMM + Acc: DeepGEMM D(FP32)+=A@B ");
-    print!("{:<6} {:<5} {:<5} {:>12} {:>7}",
-        "M", "N", "K", "acc_us", "TFLOPS");
+    println!("\n{:=<80}", "= BF16 GEMM + Acc: DeepGEMM D+=A@B vs cuBLAS(BF16) ");
+    print!("{:<6} {:<5} {:<5} {:>9} {:>9} {:>7} {:>7}",
+        "M", "N", "K", "acc_us", "cuBLAS", "vs_cub", "TFLOPS");
     println!();
-    println!("{}", "-".repeat(50));
+    println!("{}", "-".repeat(65));
 
     let shapes = vec![
         (1, 1024, 1024), (4, 4096, 4096), (128, 4096, 4096),
@@ -880,6 +904,7 @@ fn bench_acc(gpu: &Gpu) {
         let c_gpu = gpu.upload(&c_data);
         let mut d_gpu = gpu.alloc_zeros::<f32>(m * n);
 
+        // DeepGEMM acc: D(FP32) = C + A@B (fused, single kernel)
         let acc_us = bench_us(|| {
             let (ap, _) = a_gpu.device_ptr(&gpu.stream);
             let (bp, _) = b_gpu.device_ptr(&gpu.stream);
@@ -895,8 +920,17 @@ fn bench_acc(gpu: &Gpu) {
             }
         }, gpu);
 
+        // Baseline: cuBLAS BF16 GEMM only (no bias add — so the acc kernel
+        // is doing strictly more work, but the point is it fuses the bias)
+        let mut out_bf16 = gpu.alloc_zeros::<half::bf16>(m * n);
+        let cub_us = bench_us(|| {
+            cublas_gemm_bf16(&b_gpu, &a_gpu, &mut out_bf16, m, n, k, gpu);
+        }, gpu);
+
         let tf = tflops(m, n, k, acc_us);
-        println!("{m:<6} {n:<5} {k:<5} {acc_us:>12.1} {tf:>6.1}T");
+        let r = acc_us / cub_us;
+        println!("{m:<6} {n:<5} {k:<5} {acc_us:>9.1} {cub_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T",
+            r, ratio_marker(r));
     }
     println!();
 }
