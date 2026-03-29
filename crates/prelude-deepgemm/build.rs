@@ -3,7 +3,7 @@
 //! Requires:
 //! - CUDA Toolkit with nvcc (sm_90a support; sm_100a for Blackwell)
 //! - CUTLASS headers (auto-cloned from GitHub)
-//! - Vendored DeepGEMM headers in vendor/deep_gemm/
+//! - DeepGEMM headers (auto-cloned from GitHub)
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -12,32 +12,37 @@ use std::process::Command;
 const CUTLASS_REPO: &str = "https://github.com/NVIDIA/cutlass.git";
 const CUTLASS_BRANCH: &str = "main";
 
+const DEEPGEMM_REPO: &str = "https://github.com/deepseek-ai/DeepGEMM.git";
+const DEEPGEMM_BRANCH: &str = "main";
+
 fn main() {
     println!("cargo:rerun-if-changed=src/deepgemm_wrapper.cu");
-    println!("cargo:rerun-if-changed=vendor/");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
-    // 1. Ensure CUTLASS headers (needed by DeepGEMM kernel)
+    // 1. Ensure CUTLASS headers
     let cutlass_dir = ensure_cutlass(&out_dir);
     let cutlass_include = cutlass_dir.join("include");
 
-    // 2. Find CUDA toolkit
+    // 2. Ensure DeepGEMM headers (cloned from upstream, patched for fat binary)
+    let deepgemm_dir = ensure_deepgemm(&out_dir);
+    let deepgemm_include = deepgemm_dir.join("deep_gemm/include");
+
+    // 3. Find CUDA toolkit
     let cuda_path = find_cuda();
     let nvcc = cuda_path.join("bin/nvcc");
     if !nvcc.exists() {
         panic!("nvcc not found at {}", nvcc.display());
     }
 
-    // 3. Compile deepgemm_wrapper.cu (SM90a)
-    let vendor_include = manifest_dir.join("vendor");
+    // 4. Compile deepgemm_wrapper.cu
     let common_args = [
         "-std=c++20", "-O3", "--expt-relaxed-constexpr", "-Xcompiler", "-fPIC",
     ];
     let include_args = [
         "-I", cutlass_include.to_str().unwrap(),
-        "-I", vendor_include.to_str().unwrap(),
+        "-I", deepgemm_include.to_str().unwrap(),
         "-I", &format!("{}/include", cuda_path.display()),
     ];
 
@@ -155,6 +160,72 @@ fn ensure_cutlass(out_dir: &Path) -> PathBuf {
 
     println!("cargo:warning=CUTLASS headers ready");
     cutlass_dir
+}
+
+fn ensure_deepgemm(out_dir: &Path) -> PathBuf {
+    let dg_dir = out_dir.join("deepgemm");
+
+    if dg_dir.join("deep_gemm/include/deep_gemm/impls/sm90_bf16_gemm.cuh").exists() {
+        return dg_dir;
+    }
+
+    println!("cargo:warning=Cloning DeepGEMM (headers only)...");
+
+    if dg_dir.exists() {
+        std::fs::remove_dir_all(&dg_dir).ok();
+    }
+
+    let status = Command::new("git")
+        .args([
+            "clone", "--depth", "1", "--branch", DEEPGEMM_BRANCH,
+            "--single-branch", "--no-checkout", DEEPGEMM_REPO,
+        ])
+        .arg(&dg_dir)
+        .status()
+        .expect("git clone failed");
+    if !status.success() {
+        panic!("Failed to clone DeepGEMM repo");
+    }
+
+    Command::new("git")
+        .args(["sparse-checkout", "init", "--cone"])
+        .current_dir(&dg_dir)
+        .status().ok();
+    Command::new("git")
+        .args(["sparse-checkout", "set", "deep_gemm/include"])
+        .current_dir(&dg_dir)
+        .status().ok();
+    Command::new("git")
+        .args(["checkout"])
+        .current_dir(&dg_dir)
+        .status().ok();
+
+    if !dg_dir.join("deep_gemm/include/deep_gemm/impls/sm90_bf16_gemm.cuh").exists() {
+        panic!("DeepGEMM headers not found after clone");
+    }
+
+    // Patch SM90 kernel arch guards for fat binary (SM90a + SM100a) compilation.
+    // Upstream uses `__CUDA_ARCH__ >= 900` which includes SM100, but SM90 wgmma
+    // instructions are invalid on SM100. Narrow to `>= 900 && < 1000`.
+    for file in [
+        "deep_gemm/include/deep_gemm/impls/sm90_bf16_gemm.cuh",
+        "deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh",
+    ] {
+        let path = dg_dir.join(file);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let patched = content.replace(
+                "(defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900))",
+                "(defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900) and (__CUDA_ARCH__ < 1000))",
+            );
+            if patched != content {
+                std::fs::write(&path, patched).expect("Failed to patch DeepGEMM header");
+                println!("cargo:warning=Patched {file} for fat binary arch guard");
+            }
+        }
+    }
+
+    println!("cargo:warning=DeepGEMM headers ready");
+    dg_dir
 }
 
 fn find_cuda() -> PathBuf {
