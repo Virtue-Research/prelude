@@ -63,12 +63,8 @@ ENV CUDA_COMPUTE_CAP="${CUDA_COMPUTE_CAP}"
 
 RUN git clone --depth 1 https://github.com/yuzhounie/vllm.rs /tmp/vllm.rs \
     && cd /tmp/vllm.rs \
-    && ./build.sh --release --features "cuda,nccl,graph,python,flash-attn,flash-context" \
-    && cargo build --release --features "cuda,nccl,graph,flash-attn,flash-context" \
-    && pip3 install --no-cache-dir target/wheels/* \
+    && cargo build --release --bin vllm-rs --features "cuda,nccl,flashinfer,graph,cutlass" \
     && install -Dm755 target/release/vllm-rs /usr/local/bin/vllm-rs \
-    && printf '%s\n' '#!/bin/sh' 'exec python3 -m vllm_rs.server "$@"' > /usr/local/bin/vllm-rs-server \
-    && chmod +x /usr/local/bin/vllm-rs-server \
     && rm -rf /tmp/vllm.rs \
     || echo "WARNING: vllm.rs build failed — skipping"
 

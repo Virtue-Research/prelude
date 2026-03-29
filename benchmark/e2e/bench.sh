@@ -218,68 +218,52 @@ start_prelude() {
 }
 
 start_vllm() {
+    local gpu_flag="" device_flag=""
     if [[ "${CPU_MODE}" == true ]]; then
-        # CPU: build from vllm/docker/Dockerfile.cpu or use pre-built vllm-cpu
-        # Build: cd vllm && docker build -f docker/Dockerfile.cpu -t vllm-cpu --target vllm-openai .
-        docker run -d --name "${CONTAINER_NAME}" \
-            -p "${PORT}:8000" \
-            --ipc=host \
-            -v "${HF_CACHE}:/root/.cache/huggingface:ro" \
-            -e HF_TOKEN="${HF_TOKEN}" \
-            vllm-cpu:latest \
-            --model "${MODEL}" \
-            --host 0.0.0.0 \
-            --port 8000 \
-            ${VLLM_EXTRA_ARGS:-}
+        device_flag="--device cpu"
     else
-        # GPU: official image, entrypoint is already `vllm serve`
-        # https://docs.vllm.ai/en/latest/deployment/docker.html
-        docker run -d --name "${CONTAINER_NAME}" \
-            --runtime nvidia --gpus "device=${GPU}" \
-            -p "${PORT}:8000" \
-            --ipc=host \
-            -v "${HF_CACHE}:/root/.cache/huggingface:ro" \
-            -e HF_TOKEN="${HF_TOKEN}" \
-            vllm/vllm-openai:latest \
-            --model "${MODEL}" \
-            --host 0.0.0.0 \
-            --port 8000 \
-            ${VLLM_EXTRA_ARGS:-}
+        gpu_flag="--runtime nvidia --gpus device=${GPU}"
     fi
+
+    # Same official image for both GPU and CPU (--device cpu for CPU mode)
+    # shellcheck disable=SC2086
+    docker run -d --name "${CONTAINER_NAME}" \
+        ${gpu_flag} \
+        -p "${PORT}:8000" \
+        --ipc=host \
+        -v "${HF_CACHE}:/root/.cache/huggingface:ro" \
+        -e HF_TOKEN="${HF_TOKEN}" \
+        vllm/vllm-openai:latest \
+        --model "${MODEL}" \
+        --host 0.0.0.0 \
+        --port 8000 \
+        ${device_flag} \
+        ${VLLM_EXTRA_ARGS:-}
 }
 
 start_sglang() {
-    # https://docs.sglang.ai/get_started/install.html
+    local gpu_flag="" device_flag=""
     if [[ "${CPU_MODE}" == true ]]; then
-        # CPU: Xeon-optimized image
-        # Build: cd sglang && docker build -f docker/xeon.Dockerfile -t sglang-cpu .
-        docker run -d --name "${CONTAINER_NAME}" \
-            -p "${PORT}:${PORT}" \
-            --ipc=host \
-            -v "${HF_CACHE}:/root/.cache/huggingface:ro" \
-            -e HF_TOKEN="${HF_TOKEN}" \
-            sglang-cpu:latest \
-            python3 -m sglang.launch_server \
-            --model-path "${MODEL}" \
-            --host 0.0.0.0 \
-            --port "${PORT}" \
-            ${SGLANG_EXTRA_ARGS:-}
+        device_flag="--device cpu --disable-overlap-schedule"
     else
-        # GPU: official image
-        docker run -d --name "${CONTAINER_NAME}" \
-            --gpus "device=${GPU}" \
-            --shm-size 32g \
-            -p "${PORT}:${PORT}" \
-            --ipc=host \
-            -v "${HF_CACHE}:/root/.cache/huggingface:ro" \
-            -e HF_TOKEN="${HF_TOKEN}" \
-            lmsysorg/sglang:latest \
-            python3 -m sglang.launch_server \
-            --model-path "${MODEL}" \
-            --host 0.0.0.0 \
-            --port "${PORT}" \
-            ${SGLANG_EXTRA_ARGS:-}
+        gpu_flag="--gpus device=${GPU} --shm-size 32g"
     fi
+
+    # Same official image for both GPU and CPU
+    # shellcheck disable=SC2086
+    docker run -d --name "${CONTAINER_NAME}" \
+        ${gpu_flag} \
+        -p "${PORT}:${PORT}" \
+        --ipc=host \
+        -v "${HF_CACHE}:/root/.cache/huggingface:ro" \
+        -e HF_TOKEN="${HF_TOKEN}" \
+        lmsysorg/sglang:latest \
+        python3 -m sglang.launch_server \
+        --model-path "${MODEL}" \
+        --host 0.0.0.0 \
+        --port "${PORT}" \
+        ${device_flag} \
+        ${SGLANG_EXTRA_ARGS:-}
 }
 
 ## Build the shared "others" image (llama.cpp + vllm.rs, both git cloned inside)
@@ -307,11 +291,9 @@ start_vllm_rs() {
         --ipc=host \
         -v "${HF_CACHE}:/data:ro" \
         -e HF_TOKEN="${HF_TOKEN}" \
+        -e CUDA_COMPUTE_CAP=90 \
         prelude-others \
-        vllm-rs-server \
-        --model "${MODEL}" \
-        --host 0.0.0.0 \
-        --port 8000
+        vllm-rs --m "${MODEL}" --server --port 8000
 }
 
 ## Resolve GGUF model: auto-convert from HF safetensors if not cached.
