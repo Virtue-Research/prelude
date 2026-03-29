@@ -14,7 +14,6 @@ const CUTLASS_BRANCH: &str = "main";
 
 fn main() {
     println!("cargo:rerun-if-changed=src/deepgemm_wrapper.cu");
-    println!("cargo:rerun-if-changed=src/deepgemm_sm100.cu");
     println!("cargo:rerun-if-changed=vendor/");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -42,51 +41,42 @@ fn main() {
         "-I", &format!("{}/include", cuda_path.display()),
     ];
 
-    // SM90 wrapper always compiles for compute_90a (H100/H200).
-    // SM100 wrapper always compiles for compute_100a (Blackwell) in a separate unit.
-    // No GPU detection needed — both are compiled unconditionally if toolkit supports them.
-    println!("cargo:warning=DeepGEMM: compiling SM90a kernels");
-
+    // Compile for SM90a always. Add SM100a if toolkit supports it (fat binary).
+    // SM90 kernel bodies are guarded by __CUDA_ARCH__ >= 900 && < 1000,
+    // SM100 kernel bodies by __CUDA_ARCH__ >= 1000, so both coexist safely.
     let cu_src = manifest_dir.join("src/deepgemm_wrapper.cu");
-    let obj_sm90 = out_dir.join("deepgemm_wrapper.o");
-    let status = Command::new(&nvcc)
-        .args(&common_args)
-        .arg("-gencode=arch=compute_90a,code=sm_90a")
+    let obj = out_dir.join("deepgemm_wrapper.o");
+
+    let sm100 = nvcc_supports_sm100(&nvcc);
+    if sm100 {
+        println!("cargo:warning=DeepGEMM: compiling for SM90a + SM100a (fat binary)");
+    } else {
+        println!("cargo:warning=DeepGEMM: compiling for SM90a only (CUDA toolkit lacks SM100 support)");
+    }
+
+    let mut nvcc_cmd = Command::new(&nvcc);
+    nvcc_cmd.args(&common_args)
+        .arg("-gencode=arch=compute_90a,code=sm_90a");
+    if sm100 {
+        nvcc_cmd.arg("-gencode=arch=compute_100a,code=sm_100a");
+    }
+    let status = nvcc_cmd
         .args(&include_args)
-        .args(["-c", cu_src.to_str().unwrap(), "-o", obj_sm90.to_str().unwrap()])
+        .args(["-c", cu_src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
         .status()
         .expect("Failed to run nvcc");
     if !status.success() {
         panic!("nvcc compilation failed for deepgemm_wrapper.cu");
     }
 
-    // 4. Compile deepgemm_sm100.cu (SM100a) — separate compilation unit
-    //    SM100 kernels use Blackwell-specific instructions incompatible with SM90.
-    let cu_sm100 = manifest_dir.join("src/deepgemm_sm100.cu");
-    let obj_sm100 = out_dir.join("deepgemm_sm100.o");
-    let sm100_ok = if nvcc_supports_sm100(&nvcc) {
-        println!("cargo:warning=DeepGEMM: compiling SM100 (Blackwell) support");
-        let status = Command::new(&nvcc)
-            .args(&common_args)
-            .arg("-gencode=arch=compute_100a,code=sm_100a")
-            .args(&include_args)
-            .args(["-c", cu_sm100.to_str().unwrap(), "-o", obj_sm100.to_str().unwrap()])
-            .status()
-            .expect("Failed to run nvcc for SM100");
-        status.success()
-    } else {
-        println!("cargo:warning=DeepGEMM: SM100 not supported by this CUDA toolkit, skipping");
-        false
-    };
-
-    // 5. Create static archive via nvcc --lib (preserves CUDA fatbin sections)
+    // 4. Create static archive via nvcc --lib (preserves CUDA fatbin sections)
     let lib = out_dir.join("libdeepgemm.a");
-    let mut lib_cmd = Command::new(&nvcc);
-    lib_cmd.arg("--lib").args(["-o", lib.to_str().unwrap()]).arg(&obj_sm90);
-    if sm100_ok {
-        lib_cmd.arg(&obj_sm100);
-    }
-    let status = lib_cmd.status().expect("Failed to run nvcc --lib");
+    let status = Command::new(&nvcc)
+        .arg("--lib")
+        .args(["-o", lib.to_str().unwrap()])
+        .arg(&obj)
+        .status()
+        .expect("Failed to run nvcc --lib");
     if !status.success() {
         panic!("nvcc --lib failed");
     }
