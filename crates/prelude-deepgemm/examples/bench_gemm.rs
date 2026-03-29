@@ -148,6 +148,7 @@ fn main() {
     bench_fp8(&gpu);
     bench_grouped(&gpu);
     bench_masked(&gpu);
+    bench_masked_fp8(&gpu);
     bench_acc(&gpu);
 }
 
@@ -604,6 +605,83 @@ fn bench_masked(gpu: &Gpu) {
             .map(|_| gpu.alloc_zeros::<half::bf16>(actual_m * n))
             .collect();
 
+        let sep_us = bench_us(|| {
+            for g in 0..num_groups {
+                cublas_gemm_bf16(&b_groups[g], &a_groups[g], &mut outs_sep[g],
+                    actual_m, n, k, gpu);
+            }
+        }, gpu);
+
+        let total_flops_m = num_groups * actual_m;
+        let tf = tflops(total_flops_m, n, k, msk_us);
+        let r = msk_us / sep_us;
+        println!("{num_groups:<6} {padded_m:<6} {actual_m:<6} {n:<5} {k:<5} {msk_us:>9.1} {sep_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T",
+            r, ratio_marker(r));
+    }
+    println!();
+}
+
+fn bench_masked_fp8(gpu: &Gpu) {
+    println!("\n{:=<80}", "= Masked FP8 GEMM: DeepGEMM vs G×cuBLAS(BF16) ");
+    print!("{:<6} {:<6} {:<6} {:<5} {:<5} {:>9} {:>9} {:>7} {:>7}",
+        "G", "padM", "actM", "N", "K", "masked", "G×cuBLAS", "vs_cub", "TFLOPS");
+    println!();
+    println!("{}", "-".repeat(80));
+
+    // K must be multiple of 128
+    let shapes: Vec<(usize, usize, usize, usize, usize)> = vec![
+        (4, 256, 128, 1024, 1024),
+        (8, 128, 128, 4096, 4096),
+        (8, 128, 64, 4096, 4096),
+    ];
+
+    for &(num_groups, padded_m, actual_m, n, k) in &shapes {
+        let a_f32 = rand_f32(num_groups * padded_m * k);
+        let b_f32 = rand_f32(num_groups * n * k);
+
+        let (a_fp8, sfa) = quantize_fp8_per_token(&a_f32, num_groups * padded_m, k);
+        let (b_fp8, sfb) = quantize_fp8_per_token(&b_f32, num_groups * n, k);
+        let masked_m: Vec<i32> = vec![actual_m as i32; num_groups];
+
+        let a_gpu = gpu.upload(&a_fp8);
+        let b_gpu = gpu.upload(&b_fp8);
+        let sfa_gpu = gpu.upload(&sfa);
+        let sfb_gpu = gpu.upload(&sfb);
+        let mask_gpu = gpu.upload(&masked_m);
+        let mut out_gpu = gpu.alloc_zeros::<half::bf16>(num_groups * padded_m * n);
+
+        let expected_m = actual_m;
+        let msk_us = bench_us(|| {
+            let (ap, _) = a_gpu.device_ptr(&gpu.stream);
+            let (bp, _) = b_gpu.device_ptr(&gpu.stream);
+            let (sfap, _) = sfa_gpu.device_ptr(&gpu.stream);
+            let (sfbp, _) = sfb_gpu.device_ptr(&gpu.stream);
+            let (mp, _) = mask_gpu.device_ptr(&gpu.stream);
+            let (op, _) = out_gpu.device_ptr_mut(&gpu.stream);
+            unsafe {
+                prelude_deepgemm::m_grouped_masked_fp8_gemm(
+                    ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
+                    sfap as *mut c_void, sfbp as *mut c_void,
+                    mp as *mut c_void,
+                    padded_m as i32, n as i32, k as i32,
+                    num_groups as i32, expected_m as i32,
+                    gpu.stream_ptr(),
+                ).unwrap();
+            }
+        }, gpu);
+
+        // Baseline: G × cuBLAS BF16 (actual_m per group)
+        let a_bf16: Vec<half::bf16> = a_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
+        let b_bf16: Vec<half::bf16> = b_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
+        let a_groups: Vec<CudaSlice<half::bf16>> = (0..num_groups)
+            .map(|g| gpu.upload(&a_bf16[g*padded_m*k..g*padded_m*k+actual_m*k]))
+            .collect();
+        let b_groups: Vec<CudaSlice<half::bf16>> = (0..num_groups)
+            .map(|g| gpu.upload(&b_bf16[g*n*k..(g+1)*n*k]))
+            .collect();
+        let mut outs_sep: Vec<CudaSlice<half::bf16>> = (0..num_groups)
+            .map(|_| gpu.alloc_zeros::<half::bf16>(actual_m * n))
+            .collect();
         let sep_us = bench_us(|| {
             for g in 0..num_groups {
                 cublas_gemm_bf16(&b_groups[g], &a_groups[g], &mut outs_sep[g],
