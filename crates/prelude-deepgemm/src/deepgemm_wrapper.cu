@@ -14,6 +14,7 @@
 #include <deep_gemm/impls/sm90_bf16_gemm.cuh>
 #include <deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh>
 #include <deep_gemm/impls/sm100_bf16_gemm.cuh>
+#include <deep_gemm/impls/sm100_fp8_gemm_1d1d.cuh>
 
 using namespace deep_gemm;
 
@@ -87,6 +88,9 @@ int deepgemm_fp8_gemm(
     void* stream
 ) {
     ensure_num_sms();
+    ensure_gpu_arch();
+    if (g_gpu_arch >= 100)
+        return sm100_fp8_gemm(A, B, D, scale_a, scale_b, M, N, K, stream);
     return sm90_fp8_gemm(A, B, D, scale_a, scale_b, M, N, K, stream);
 }
 
