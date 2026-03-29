@@ -136,6 +136,10 @@ int deepgemm_m_grouped_fp8_gemm(
     void* stream
 ) {
     ensure_num_sms();
+    ensure_gpu_arch();
+    if (g_gpu_arch >= 100)
+        return sm100_m_grouped_fp8_gemm(A, B, D, scale_a, scale_b, grouped_layout,
+                                         M, N, K, num_groups, stream);
     return sm90_m_grouped_fp8_gemm(A, B, D, scale_a, scale_b, grouped_layout,
                                     M, N, K, num_groups, stream);
 }
@@ -197,6 +201,10 @@ int deepgemm_m_grouped_masked_fp8_gemm(
     void* stream
 ) {
     ensure_num_sms();
+    ensure_gpu_arch();
+    if (g_gpu_arch >= 100)
+        return sm100_m_grouped_masked_fp8_gemm(A, B, D, scale_a, scale_b, masked_m,
+                                                M, N, K, num_groups, expected_m, stream);
     return sm90_m_grouped_masked_fp8_gemm(A, B, D, scale_a, scale_b, masked_m,
                                            M, N, K, num_groups, expected_m, stream);
 }
