@@ -610,6 +610,9 @@ def generate_utility_sources(
           "rope_quantize", "rope_quantize_append_paged_kv_cache"]),
         ("fi_cascade", ["cascade.cu"], "flashinfer_cascade_binding.cu", "cascade",
          ["merge_state", "merge_state_in_place", "merge_states"]),
+        # NOTE: MoE routing (noAuxTcKernels.cu) is excluded because it depends
+        # on TensorRT-LLM internal headers that are only partially vendored in
+        # FlashInfer (missing cudaUtils.h, cudaBf16Wrapper.h, tllmException.h, etc.)
     ]
 
     for dir_name, src_files, binding_file, kind, symbols in modules:
@@ -648,19 +651,24 @@ def generate_utility_sources(
                     (out / src_file).write_text('\n'.join(lines))
                     continue  # already handled
                 else:
-                    shutil.copy2(src_path, out / src_file)
-                sources.append(out / src_file)
-        binding_path = csrc / binding_file
-        if binding_path.exists() and not (out / binding_file).exists():
-            if kind == "norm":
-                # Remove layernorm binding export
-                src_text = binding_path.read_text()
-                lines = [l for l in src_text.split('\n')
-                         if 'layernorm' not in l]
-                (out / binding_file).write_text('\n'.join(lines))
-            else:
-                shutil.copy2(binding_path, out / binding_file)
-            sources.append(out / binding_file)
+                    # Handle subdirectory sources (e.g. fused_moe/foo.cu → foo.cu)
+                    dst_name = Path(src_file).name
+                    shutil.copy2(src_path, out / dst_name)
+                sources.append(out / Path(src_file).name)
+        if binding_file is None:
+            pass  # source file already contains TVM FFI export
+        else:
+            binding_path = csrc / binding_file
+            if binding_path.exists() and not (out / binding_file).exists():
+                if kind == "norm":
+                    # Remove layernorm binding export
+                    src_text = binding_path.read_text()
+                    lines = [l for l in src_text.split('\n')
+                             if 'layernorm' not in l]
+                    (out / binding_file).write_text('\n'.join(lines))
+                else:
+                    shutil.copy2(binding_path, out / binding_file)
+                sources.append(out / binding_file)
 
         vinfo = {
             "vid": dir_name, "kind": kind,
@@ -846,6 +854,8 @@ def compile_source(
     include_dirs = [
         str(fi_src / "include"),
         str(fi_src / "csrc"),
+        str(fi_src / "csrc" / "nv_internal"),  # vendored TRT-LLM headers
+        str(fi_src / "csrc" / "fused_moe"),    # MoE helper headers
         str(src.parent),  # for config .inc files
     ]
     # CUTLASS headers (needed for SM90/Hopper kernels)
