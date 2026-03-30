@@ -612,7 +612,8 @@ def generate_utility_sources(
          ["merge_state", "merge_state_in_place", "merge_states"]),
         ("fi_moe_routing",
          ["fused_moe/noAuxTcKernels.cu",
-          "nv_internal/cpp/common/tllmException.cpp"],
+          "nv_internal/cpp/common/tllmException.cpp",
+          "nv_internal/cpp/common/stringUtils.cpp"],
          None, "moe_routing",
          ["NoAuxTc"]),
     ]
