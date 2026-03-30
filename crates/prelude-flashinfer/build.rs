@@ -268,6 +268,7 @@ fn generate_dispatch(
     if !has_kernels {
         std::fs::write(&path, concat!(
             "pub(crate) fn lookup_prefill(_key: &crate::loader::PrefillKey) -> Option<crate::loader::PrefillVariant> { None }\n",
+            "pub(crate) fn lookup_prefill_fp8(_key: &crate::loader::FP8PrefillKey) -> Option<crate::loader::PrefillVariant> { None }\n",
             "pub(crate) fn lookup_decode(_key: &crate::loader::DecodeKey) -> Option<crate::loader::DecodeVariant> { None }\n",
             "pub(crate) fn lookup_mla_decode(_key: &crate::loader::MLADecodeKey) -> Option<crate::loader::MLADecodeVariant> { None }\n",
             "pub(crate) fn lookup_mla_paged(_key: &crate::loader::MLAPagedKey) -> Option<crate::loader::MLAPagedVariant> { None }\n",
@@ -306,7 +307,8 @@ fn generate_dispatch(
 
     for v in variants {
         let kind = v["kind"].as_str().unwrap();
-        if !kind.starts_with("prefill") { continue; }
+        // Only include prefill_fa2 and prefill_fa3, NOT prefill_fp8 (separate lookup)
+        if kind != "prefill_fa2" && kind != "prefill_fa3" { continue; }
         let symbols = v["symbols"].as_object().unwrap();
         let plan = symbols["plan"].as_str().unwrap();
         let ragged_run = symbols["ragged_run"].as_str().unwrap();
@@ -325,6 +327,31 @@ fn generate_dispatch(
 
         writeln!(code,
             "        ({dtype_val}, {hdim_qk}, {hdim_vo}, {swa}, {softcap}, {backend_val}) => Some(PrefillVariant {{ plan: {plan}, ragged_run: {ragged_run}, paged_run: {paged_run} }}),"
+        )?;
+    }
+    writeln!(code, "        _ => None,")?;
+    writeln!(code, "    }}")?;
+    writeln!(code, "}}")?;
+    writeln!(code)?;
+
+    // FP8 Prefill lookup
+    writeln!(code, "pub(crate) fn lookup_prefill_fp8(key: &crate::loader::FP8PrefillKey) -> Option<crate::loader::PrefillVariant> {{")?;
+    writeln!(code, "    use crate::loader::PrefillVariant;")?;
+    writeln!(code, "    match (key.head_dim, key.sliding_window) {{")?;
+
+    for v in variants {
+        let kind = v["kind"].as_str().unwrap();
+        if kind != "prefill_fp8" { continue; }
+        let symbols = v["symbols"].as_object().unwrap();
+        let plan = symbols["plan"].as_str().unwrap();
+        let ragged_run = symbols["ragged_run"].as_str().unwrap();
+        let paged_run = symbols["paged_run"].as_str().unwrap();
+
+        let hdim = v["hdim_qk"].as_u64().unwrap();
+        let swa = v["swa"].as_bool().unwrap();
+
+        writeln!(code,
+            "        ({hdim}, {swa}) => Some(PrefillVariant {{ plan: {plan}, ragged_run: {ragged_run}, paged_run: {paged_run} }}),"
         )?;
     }
     writeln!(code, "        _ => None,")?;
@@ -418,7 +445,7 @@ fn generate_dispatch(
 
     for v in variants {
         let kind = v["kind"].as_str().unwrap();
-        if !["page", "sampling", "norm", "rope", "cascade"].contains(&kind) { continue; }
+        if !["page", "sampling", "norm", "rope", "cascade", "activation"].contains(&kind) { continue; }
         let symbols = v["symbols"].as_object().unwrap();
         for (name, sym) in symbols {
             let s = sym.as_str().unwrap();

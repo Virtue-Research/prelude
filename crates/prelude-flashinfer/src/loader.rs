@@ -50,6 +50,14 @@ pub struct PrefillKey {
     pub backend: Backend,
 }
 
+/// Key for FP8 E4M3 prefill (SM90 only).
+/// Both Q and KV are FP8 E4M3; output is BF16. Symmetric head_dim only.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct FP8PrefillKey {
+    pub head_dim: u32,
+    pub sliding_window: bool,
+}
+
 /// Key for looking up a batch decode kernel variant.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct DecodeKey {
@@ -161,6 +169,12 @@ impl KernelRegistry {
     /// Look up a batch prefill variant.
     pub fn get_prefill(&self, key: &PrefillKey) -> Option<PrefillVariant> {
         lookup_prefill(key)
+    }
+
+    /// Look up an FP8 E4M3 prefill variant (SM90+ only).
+    /// Q and KV are both FP8 E4M3, output is BF16.
+    pub fn get_fp8_prefill(&self, key: &FP8PrefillKey) -> Option<PrefillVariant> {
+        lookup_prefill_fp8(key)
     }
 
     /// Look up a batch decode variant.

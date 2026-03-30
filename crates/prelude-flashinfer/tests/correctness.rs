@@ -224,6 +224,37 @@ fn mla_paged_variant_lookup() {
 }
 
 #[test]
+fn fp8_prefill_variant_lookup() {
+    let reg = KernelRegistry::new();
+    if reg.arch() < 90 {
+        println!("Skipping FP8 test — requires SM90+");
+        return;
+    }
+
+    let key = FP8PrefillKey {
+        head_dim: 128,
+        sliding_window: false,
+    };
+    assert!(reg.get_fp8_prefill(&key).is_some(), "FP8 E4M3 h128 prefill not found");
+
+    // With sliding window
+    let key_swa = FP8PrefillKey {
+        head_dim: 128,
+        sliding_window: true,
+    };
+    assert!(reg.get_fp8_prefill(&key_swa).is_some(), "FP8 E4M3 h128 swa prefill not found");
+}
+
+#[test]
+fn activation_kernel_lookup() {
+    let reg = KernelRegistry::new();
+
+    assert!(reg.get_utility("silu_and_mul").is_some(), "silu_and_mul not found");
+    assert!(reg.get_utility("gelu_and_mul").is_some(), "gelu_and_mul not found");
+    assert!(reg.get_utility("gelu_tanh_and_mul").is_some(), "gelu_tanh_and_mul not found");
+}
+
+#[test]
 fn utility_kernel_lookup() {
     let reg = KernelRegistry::new();
 
@@ -629,6 +660,66 @@ fn rmsnorm_utility() {
         println!("RMSNorm: PASS (max_diff={max_diff:.6})");
 
         cudaFree(input_ptr); cudaFree(weight_ptr); cudaFree(output_ptr);
+    }
+}
+
+#[test]
+fn silu_and_mul_activation() {
+    let reg = KernelRegistry::new();
+    let silu_fn = reg.get_utility("silu_and_mul").expect("silu_and_mul not found");
+
+    let tokens = 4i64;
+    let hidden = 256i64;
+    let input_dim = hidden * 2; // activation kernels take [tokens, 2*hidden]
+
+    // Generate input: first half is x, second half is y → out = silu(x) * y
+    let n = (tokens * input_dim) as usize;
+    let input_bf16: Vec<u16> = (0..n)
+        .map(|i| f32_to_bf16(0.5 * ((i as f32 % 20.0) / 10.0 - 1.0)))
+        .collect();
+
+    unsafe {
+        let input_ptr = gpu_upload(&input_bf16);
+        let output_ptr = gpu_alloc((tokens * hidden) as usize * 2);
+
+        let in_s = [tokens, input_dim];
+        let in_st = contiguous_strides(&in_s);
+        let out_s = [tokens, hidden];
+        let out_st = contiguous_strides(&out_s);
+
+        let dl_in = gpu_dl(input_ptr, BF16_DT, &in_s, &in_st);
+        let dl_out = gpu_dl(output_ptr, BF16_DT, &out_s, &out_st);
+
+        reg.set_stream(0, std::ptr::null_mut());
+
+        let args = [
+            TVMFFIAny::dltensor(&dl_out),
+            TVMFFIAny::dltensor(&dl_in),
+        ];
+        reg.call(silu_fn, &args).expect("silu_and_mul failed");
+        cudaDeviceSynchronize();
+
+        // CPU reference: silu(x) * y = x / (1 + exp(-x)) * y
+        let in_f32: Vec<f32> = input_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
+        let out_bf16 = gpu_download::<u16>(output_ptr, (tokens * hidden) as usize);
+        let out_f32: Vec<f32> = out_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
+
+        let mut max_diff: f32 = 0.0;
+        for t in 0..tokens as usize {
+            for d in 0..hidden as usize {
+                let x = in_f32[t * input_dim as usize + d];
+                let y = in_f32[t * input_dim as usize + hidden as usize + d];
+                let silu_x = x / (1.0 + (-x).exp());
+                let expected = silu_x * y;
+                let got = out_f32[t * hidden as usize + d];
+                max_diff = max_diff.max((got - expected).abs());
+            }
+        }
+        assert!(max_diff < 0.05, "silu_and_mul max_diff={max_diff} exceeds tolerance");
+        println!("silu_and_mul: PASS (max_diff={max_diff:.6})");
+
+        cudaFree(input_ptr);
+        cudaFree(output_ptr);
     }
 }
 

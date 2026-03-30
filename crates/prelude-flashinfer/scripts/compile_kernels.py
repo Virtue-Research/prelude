@@ -27,6 +27,7 @@ from typing import Dict, List, Optional, Tuple
 DTYPE_MAP = {
     "bf16": ("nv_bfloat16", "bfloat16"),
     "fp16": ("nv_half", "float16"),
+    "e4m3": ("__nv_fp8_e4m3", "fp8_e4m3"),
 }
 
 MASK_MODES = {
@@ -283,6 +284,95 @@ def generate_batch_prefill_fa3_sources(
     return sources, ["-gencode", "arch=compute_90a,code=sm_90a"]
 
 
+def generate_batch_prefill_fp8_fa3_sources(
+    fi_src: Path, gen_dir: Path, vid: str,
+    dtype_c: str, dtype_name: str, hdim: int,
+    swa: bool,
+) -> Tuple[List[Path], List[str]]:
+    """Generate source files for an FP8 E4M3 prefill FA3 (SM90) variant.
+
+    FP8 prefill uses the same config template as FA3 but with:
+      - FP8 kernel inst templates (batch_prefill_fp8_{paged,ragged}_sm90_kernel_inst.jinja)
+      - FP8 wrapper (batch_prefill_fp8_sm90.cu)
+      - DefaultFP8Attention variant (per-head Q/K/V scales)
+      - Symmetric head_dim only (HEAD_DIM_QK == HEAD_DIM_VO)
+      - DTypeQ == DTypeKV (both FP8)
+    """
+    import jinja2
+
+    csrc = fi_src / "csrc"
+    out = gen_dir / vid
+    out.mkdir(parents=True, exist_ok=True)
+
+    # FP8 output dtype: bf16 if input is e4m3 with bf16 output, but the CUDA
+    # type for output is determined by the "output" dtype.  For FP8 kernels the
+    # output is always bf16 or fp16.
+    # We decide: e4m3 Q/KV → bf16 output (most common inference path).
+    dtype_o_c = "nv_bfloat16"
+
+    variant_name = "DefaultFP8Attention"
+    kwargs = {
+        "variant_decl": "#include<flashinfer/attention/hopper/variants.cuh>",
+        "variant_name": variant_name,
+        "dtype_q": dtype_c, "dtype_kv": dtype_c, "dtype_o": dtype_o_c,
+        "idtype": "int32_t",
+        "head_dim_qk": hdim, "head_dim_vo": hdim,  # must be symmetric for FP8
+        "pos_encoding_mode": "PosEncodingMode::kNone",
+        "use_sliding_window": str(swa).lower(),
+        "use_logits_soft_cap": "false",  # FP8 variant doesn't support logits_soft_cap
+        "use_fp16_qk_reduction": "false",
+        **dict(zip(
+            ("additional_params_decl", "additional_func_params", "additional_params_setter"),
+            _default_prefill_fp8_sm90_params(),
+        )),
+    }
+
+    # Config (same template as FA3)
+    with open(csrc / "batch_prefill_sm90_customize_config.jinja") as f:
+        config_str = jinja2.Template(f.read()).render(**kwargs)
+    (out / "batch_prefill_sm90_config.inc").write_text(config_str)
+
+    # FP8-specific kernel instantiations
+    with open(csrc / "batch_prefill_fp8_paged_sm90_kernel_inst.jinja") as f:
+        paged_templ = jinja2.Template(f.read())
+    with open(csrc / "batch_prefill_fp8_ragged_sm90_kernel_inst.jinja") as f:
+        ragged_templ = jinja2.Template(f.read())
+
+    sources = []
+    for mm in NEEDED_MASK_MODES:
+        for templ, prefix in [(paged_templ, "paged"), (ragged_templ, "ragged")]:
+            fname = f"batch_prefill_fp8_{prefix}_sm90_kernel_mask_{mm}.cu"
+            src = templ.render(mask_mode=MASK_MODES[mm], **kwargs)
+            (out / fname).write_text(src)
+            sources.append(out / fname)
+
+    # FP8 wrapper (batch_prefill_fp8_sm90.cu) — rename per variant
+    renames = {
+        "BatchPrefillWithKVCacheSM90Plan": f"{vid}_BatchPrefillWithKVCacheSM90Plan",
+        "BatchPrefillWithRaggedKVCacheSM90Run": f"{vid}_BatchPrefillWithRaggedKVCacheSM90Run",
+        "BatchPrefillWithPagedKVCacheSM90Run": f"{vid}_BatchPrefillWithPagedKVCacheSM90Run",
+    }
+    _copy_with_renames(csrc / "batch_prefill_fp8_sm90.cu", out / "batch_prefill_fp8_sm90.cu", renames)
+    sources.append(out / "batch_prefill_fp8_sm90.cu")
+
+    # Binding (same as FA3)
+    binding_src = _generate_renamed_binding(
+        csrc / "batch_prefill_sm90_jit_binding.cu",
+        "batch_prefill_sm90_config.inc",
+        {
+            "plan": f"__tvm_ffi_{vid}_plan",
+            "ragged_run": f"__tvm_ffi_{vid}_ragged_run",
+            "paged_run": f"__tvm_ffi_{vid}_paged_run",
+        },
+    )
+    for old, new in renames.items():
+        binding_src = binding_src.replace(old, new)
+    (out / "batch_prefill_fp8_sm90_binding.cu").write_text(binding_src)
+    sources.append(out / "batch_prefill_fp8_sm90_binding.cu")
+
+    return sources, ["-gencode", "arch=compute_90a,code=sm_90a"]
+
+
 def generate_batch_decode_mla_sources(
     fi_src: Path, gen_dir: Path, vid: str,
     dtype_c: str, dtype_name: str,
@@ -401,6 +491,94 @@ def generate_batch_mla_sources(
     sources.append(out / "batch_mla_binding.cu")
 
     return sources, []
+
+
+def _generate_activation_source(fi_src: Path, gen_dir: Path) -> Tuple[List[Path], List[str], dict]:
+    """Generate a combined activation .cu file for AOT compilation.
+
+    Creates silu_and_mul, gelu_and_mul, gelu_tanh_and_mul as TVM FFI functions.
+    These are JIT-generated in upstream FlashInfer — we create them statically.
+    """
+    out = gen_dir / "fi_activation"
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Find tvm_ffi_utils.h location
+    tvm_utils_include = fi_src / "csrc"
+
+    activation_cu = r'''
+#include <flashinfer/activation.cuh>
+#include <cuda_runtime.h>
+#include "tvm_ffi_utils.h"
+
+using namespace flashinfer;
+
+// ── Activation function definitions ──────────────────────────────
+
+__device__ __forceinline__ float silu(const float& val) {
+  return val / (1.0f + __expf(-val));
+}
+
+__device__ __forceinline__ float gelu(const float& val) {
+  constexpr float kAlpha = M_SQRT1_2;
+  return val * 0.5f * (1.0f + ::erf(val * kAlpha));
+}
+
+__device__ __forceinline__ float gelu_tanh(const float& val) {
+  const float cdf =
+      0.5f * (1.0f + math::tanh((0.7978845608028654f * (val + 0.044715f * val * val * val))));
+  return val * cdf;
+}
+
+// ── Launcher template ────────────────────────────────────────────
+
+template <float (*Activation)(const float&)>
+static void launch_act_and_mul(TensorView out, TensorView input) {
+  int d = input.size(input.ndim() - 1) / 2;
+  int64_t num_tokens = input.numel() / input.size(input.ndim() - 1);
+
+  cudaSetDevice(out.device().device_id);
+  const cudaStream_t stream = get_stream(out.device());
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
+    uint32_t vec_size = 16 / sizeof(c_type);
+    dim3 grid(num_tokens);
+    dim3 block(std::min((uint32_t)(d / vec_size), 1024U));
+
+    auto kernel = activation::act_and_mul_kernel<c_type, Activation>;
+    kernel<<<grid, block, 0, stream>>>(
+        static_cast<c_type*>(out.data_ptr()),
+        static_cast<const c_type*>(input.data_ptr()), d);
+    return true;
+  });
+}
+
+// ── TVM FFI exports ──────────────────────────────────────────────
+
+void silu_and_mul(TensorView out, TensorView input) {
+  launch_act_and_mul<silu>(out, input);
+}
+
+void gelu_and_mul(TensorView out, TensorView input) {
+  launch_act_and_mul<gelu>(out, input);
+}
+
+void gelu_tanh_and_mul(TensorView out, TensorView input) {
+  launch_act_and_mul<gelu_tanh>(out, input);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(silu_and_mul, silu_and_mul);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gelu_and_mul, gelu_and_mul);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gelu_tanh_and_mul, gelu_tanh_and_mul);
+'''
+
+    src_path = out / "activation.cu"
+    src_path.write_text(activation_cu)
+
+    symbols = ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul"]
+    vinfo = {
+        "vid": "fi_activation", "kind": "activation",
+        "symbols": {s: f"__tvm_ffi_{s}" for s in symbols},
+    }
+    return [src_path], [], vinfo
 
 
 def generate_utility_sources(
@@ -637,6 +815,23 @@ def _default_prefill_sm90_params():
     )
 
 
+def _default_prefill_fp8_sm90_params():
+    """Additional params for FP8 E4M3 prefill (SM90+ only).
+
+    Uses per-head Q/K/V scale tensors plus scalar fallbacks.
+    Matches FlashInfer's DefaultFP8Attention variant.
+    """
+    return _generate_additional_params(
+        tensor_names=[
+            "maybe_scale_q", "maybe_scale_k", "maybe_scale_v",
+        ],
+        tensor_dtypes=["float", "float", "float"],
+        scalar_names=["sm_scale", "scale_q_scalar", "scale_k_scalar", "scale_v_scalar"],
+        scalar_dtypes=["double", "double", "double", "double"],
+        is_sm90=True,
+    )
+
+
 # ── Compilation ────────────────────────────────────────────────────────
 
 def compile_source(
@@ -668,7 +863,7 @@ def compile_source(
     cmd = [
         "nvcc", "-c", str(src), "-o", str(obj),
         "-std=c++17", "--expt-relaxed-constexpr",
-        "-DFLASHINFER_ENABLE_BF16", "-DFLASHINFER_ENABLE_F16",
+        "-DFLASHINFER_ENABLE_BF16", "-DFLASHINFER_ENABLE_F16", "-DFLASHINFER_ENABLE_FP8",
         "-O3", "--use_fast_math",
         "-Xcompiler", "-fPIC",
     ]
@@ -724,8 +919,7 @@ def build_variant_matrix(
       - MLA decode + paged: (head_dim_ckv, head_dim_kpe) combos
       - FP16 + BF16
 
-    FP8 E4M3 KV cache variants are NOT included (requires mixed-precision
-    dtype_q != dtype_kv support in our compilation infrastructure).
+    FP8 E4M3 variants: SM90-only, symmetric head_dim, DTypeQ==DTypeKV==FP8.
     """
     if mla_dims is None:
         mla_dims = [(512, 64)]  # DeepSeek V2/V3 default
@@ -787,6 +981,26 @@ def build_variant_matrix(
                     "dtype": dtype, "dtype_c": dtype_c, "dtype_name": dtype_name,
                     "hdim_qk": 192, "hdim_vo": 128,
                     "swa": swa, "softcap": softcap,
+                    "arch_flags": sm90_flags,
+                })
+
+    # ── FP8 E4M3 prefill FA3 (SM90+ only) ──────────────────────────
+    # Both Q and KV are FP8 E4M3, output is BF16. Symmetric head_dim only.
+    # No logits_soft_cap support in FP8 variant.
+    if has_sm90:
+        fp8_dtype_c, fp8_dtype_name = DTYPE_MAP["e4m3"]
+        for hdim in head_dims:
+            if hdim not in (64, 128, 256):
+                continue  # FA3 only supports 64/128/256 for HEAD_DIM_VO
+            for swa in [False, True]:
+                vid = f"fi_prefill_fp8_fa3_e4m3_h{hdim}"
+                if swa:
+                    vid += "_swa"
+                variants.append({
+                    "vid": vid, "kind": "prefill_fp8", "backend": "fa3",
+                    "dtype": "e4m3", "dtype_c": fp8_dtype_c, "dtype_name": fp8_dtype_name,
+                    "hdim_qk": hdim, "hdim_vo": hdim,
+                    "swa": swa, "softcap": False,
                     "arch_flags": sm90_flags,
                 })
 
@@ -914,6 +1128,13 @@ def main():
                 v["hdim_qk"], v["hdim_vo"],
                 v["swa"], v["softcap"],
             )
+        elif v["kind"] == "prefill_fp8":
+            sources, extra = generate_batch_prefill_fp8_fa3_sources(
+                fi_src, gen_dir, v["vid"],
+                v["dtype_c"], v["dtype_name"],
+                v["hdim_qk"],
+                v["swa"],
+            )
         elif v["kind"] == "mla_decode":
             sources, extra = generate_batch_decode_mla_sources(
                 fi_src, gen_dir, v["vid"],
@@ -937,6 +1158,11 @@ def main():
     sm80_flags = ["-gencode", "arch=compute_80,code=compute_80",
                   "-gencode", "arch=compute_90,code=sm_90"]
     utility_variants = generate_utility_sources(fi_src, gen_dir)
+
+    # Activation fusions (silu_and_mul, gelu_and_mul, gelu_tanh_and_mul)
+    act_sources, act_extra, act_vinfo = _generate_activation_source(fi_src, gen_dir)
+    utility_variants.append((act_sources, act_extra, act_vinfo))
+
     for sources, extra, vinfo in utility_variants:
         for src in sources:
             compile_jobs.append((src, sm80_flags, extra, vinfo))
@@ -972,7 +1198,7 @@ def main():
             "backend": v.get("backend", "fa2"),
             "dtype": v["dtype"],
         }
-        if v["kind"] in ("decode", "prefill_fa2", "prefill_fa3"):
+        if v["kind"] in ("decode", "prefill_fa2", "prefill_fa3", "prefill_fp8"):
             entry["hdim_qk"] = v["hdim_qk"]
             entry["hdim_vo"] = v["hdim_vo"]
             entry["swa"] = v["swa"]
@@ -986,7 +1212,7 @@ def main():
                 "plan": f"__tvm_ffi_{v['vid']}_plan",
                 "run": f"__tvm_ffi_{v['vid']}_run",
             }
-        elif v["kind"].startswith("prefill"):
+        elif v["kind"].startswith("prefill"):  # prefill_fa2, prefill_fa3, prefill_fp8
             entry["symbols"] = {
                 "plan": f"__tvm_ffi_{v['vid']}_plan",
                 "ragged_run": f"__tvm_ffi_{v['vid']}_ragged_run",

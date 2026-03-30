@@ -658,6 +658,46 @@ fn bench_utilities(reg: &KernelRegistry) {
 
         unsafe { cudaFree(input); cudaFree(residual); cudaFree(weight); }
     }
+
+    // Activation fusions
+    for (name, label) in [
+        ("silu_and_mul", "silu*mul"),
+        ("gelu_and_mul", "gelu*mul"),
+        ("gelu_tanh_and_mul", "gelu_t*mul"),
+    ] {
+        if let Some(act_fn) = reg.get_utility(name) {
+            let tokens = 2048i64;
+            let hidden = 4096i64;
+            let input_dim = hidden * 2; // input is [tokens, 2*hidden]
+            let n_in = (tokens * input_dim) as usize;
+            let n_out = (tokens * hidden) as usize;
+            let input = gpu_alloc(n_in * 2);
+            let output = gpu_alloc(n_out * 2);
+
+            let in_s = [tokens, input_dim]; let in_st = strides(&in_s);
+            let out_s = [tokens, hidden]; let out_st = strides(&out_s);
+
+            let dl_in = gpu_dl(input, BF16_DT, &in_s, &in_st);
+            let dl_out = gpu_dl(output, BF16_DT, &out_s, &out_st);
+
+            unsafe { reg.set_stream(0, std::ptr::null_mut()); }
+
+            let args = [
+                TVMFFIAny::dltensor(&dl_out),
+                TVMFFIAny::dltensor(&dl_in),
+            ];
+
+            let ms = cuda_bench(5, 100, || {
+                unsafe { reg.call(act_fn, &args).unwrap(); }
+            });
+            // Read 2*hidden BF16 per token, write hidden BF16 per token
+            let gb = (n_in * 2 + n_out * 2) as f64 / 1e9;
+            let bw = gb / (ms as f64 * 1e-3);
+            println!("  {label:13} ({tokens}×{hidden}): {ms:.3} ms, {bw:.1} GB/s");
+
+            unsafe { cudaFree(input); cudaFree(output); }
+        }
+    }
 }
 
 fn main() {
