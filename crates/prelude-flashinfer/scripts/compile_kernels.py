@@ -610,13 +610,12 @@ def generate_utility_sources(
           "rope_quantize", "rope_quantize_append_paged_kv_cache"]),
         ("fi_cascade", ["cascade.cu"], "flashinfer_cascade_binding.cu", "cascade",
          ["merge_state", "merge_state_in_place", "merge_states"]),
+        # MoE routing kernel + all TRT-LLM common utilities (auto-discovered)
         ("fi_moe_routing",
-         ["fused_moe/noAuxTcKernels.cu",
-          "nv_internal/cpp/common/tllmException.cpp",
-          "nv_internal/cpp/common/stringUtils.cpp",
-          "nv_internal/cpp/common/logger.cpp",
-          "nv_internal/cpp/common/envUtils.cpp",
-          "nv_internal/cpp/common/memoryUtils.cu"],
+         ["fused_moe/noAuxTcKernels.cu"]
+         + [f"nv_internal/cpp/common/{f.name}"
+            for f in sorted((csrc / "nv_internal" / "cpp" / "common").iterdir())
+            if f.suffix in (".cpp", ".cu")],
          None, "moe_routing",
          ["NoAuxTc"]),
     ]
