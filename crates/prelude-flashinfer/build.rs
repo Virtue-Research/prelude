@@ -154,14 +154,17 @@ fn archive_objects(kernels_dir: &Path, out_dir: &Path) -> Result<bool> {
     let archive = out_dir.join("libflashinfer_kernels.a");
     if !archive.exists() {
         println!("cargo:warning=FlashInfer: creating archive ({} objects)", obj_files.len());
+        // Use `q` (quick append) not `r` (replace) — multiple variants have
+        // identically named .o files (e.g. batch_decode.o) and `r` would
+        // keep only the last one, losing symbols from other variants.
         let mut cmd = Command::new("ar");
-        cmd.arg("rcs").arg(&archive);
+        cmd.arg("qcs").arg(&archive);
         for obj in &obj_files {
             cmd.arg(obj);
         }
         let status = cmd.status().context("ar failed")?;
         if !status.success() {
-            anyhow::bail!("ar rcs failed");
+            anyhow::bail!("ar qcs failed");
         }
     }
 
