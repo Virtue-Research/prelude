@@ -254,6 +254,7 @@ fn compile_tvm_ffi(manifest_dir: &Path) -> Result<()> {
         }
     }
     println!("cargo:rustc-link-lib=dylib=cudart");
+    println!("cargo:rustc-link-lib=dylib=cublas");
     println!("cargo:rustc-link-lib=dylib=stdc++");
 
     Ok(())

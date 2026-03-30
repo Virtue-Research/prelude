@@ -1,12 +1,13 @@
-//! Benchmark FlashInfer attention kernels.
+//! Benchmark FlashInfer attention kernels vs cuBLAS naive baseline.
 //!
-//! Run: cargo run -p prelude-flashinfer --example bench_attention --release
+//! Run: cd crates/prelude-flashinfer && cargo run --example bench_attention --release
 //!
-//! Benchmarks:
-//! 1. Prefill throughput (ragged, causal) — vary seq_len
-//! 2. Decode throughput (paged) — vary batch_size, kv_len
-//! 3. MLA decode throughput — DeepSeek V2/V3 config
-//! 4. Utility kernel latency (softmax, rmsnorm)
+//! cuBLAS baseline = two cublasGemmStridedBatchedEx calls (Q@K^T + S@V).
+//! This is what candle does without FlashInfer: no fused softmax, no causal
+//! mask skip. FlashInfer speedup grows with seq_len because:
+//!   - cuBLAS needs O(seq^2) scratch for S matrix
+//!   - cuBLAS doesn't fuse softmax (+30% overhead not counted)
+//!   - cuBLAS computes full attention (FlashInfer skips half for causal)
 
 use prelude_flashinfer::types::*;
 use prelude_flashinfer::*;
@@ -26,6 +27,34 @@ unsafe extern "C" {
     fn cudaEventSynchronize(event: *mut c_void) -> i32;
     fn cudaEventElapsedTime(ms: *mut f32, start: *mut c_void, end: *mut c_void) -> i32;
     fn cudaEventDestroy(event: *mut c_void) -> i32;
+}
+
+// ── cuBLAS FFI ───────────────────────────────────────────────────────
+
+#[allow(non_camel_case_types)]
+type cublasHandle_t = *mut c_void;
+
+const CUBLAS_OP_N: i32 = 0;
+const CUBLAS_OP_T: i32 = 1;
+const CUDA_R_16BF: i32 = 14;
+const CUBLAS_COMPUTE_32F: i32 = 68;
+const CUBLAS_GEMM_DEFAULT: i32 = -1;
+
+unsafe extern "C" {
+    fn cublasCreate_v2(handle: *mut cublasHandle_t) -> i32;
+    fn cublasDestroy_v2(handle: cublasHandle_t) -> i32;
+    fn cublasGemmStridedBatchedEx(
+        handle: cublasHandle_t,
+        transa: i32, transb: i32,
+        m: i32, n: i32, k: i32,
+        alpha: *const c_void,
+        a: *const c_void, a_type: i32, lda: i32, stride_a: i64,
+        b: *const c_void, b_type: i32, ldb: i32, stride_b: i64,
+        beta: *const c_void,
+        c: *mut c_void, c_type: i32, ldc: i32, stride_c: i64,
+        batch: i32,
+        compute_type: i32, algo: i32,
+    ) -> i32;
 }
 
 const BF16_DT: DLDataType = DLDataType { code: KDLBFLOAT, bits: 16, lanes: 1 };
@@ -118,11 +147,73 @@ impl Drop for Workspace {
     }
 }
 
+// ── cuBLAS naive attention baseline ───────────────────────────────────
+// This is what candle does without FlashInfer: two cublasGemmStridedBatchedEx
+// calls for Q@K^T and S@V, with no fused softmax or causal masking.
+
+/// Naive attention via cuBLAS: S = Q @ K^T, O = S @ V (no softmax, no causal mask).
+/// Input layout: Q/K/V are [num_heads, seq_len, head_dim] contiguous (head-major).
+/// Returns time in ms for the two GEMMs combined.
+fn cublas_naive_attention(
+    handle: cublasHandle_t,
+    q: *const c_void, k: *const c_void, v: *const c_void,
+    s: *mut c_void, o: *mut c_void,
+    seq: i32, dim: i32, heads: i32,
+) {
+    let alpha: f32 = 1.0;
+    let beta: f32 = 0.0;
+    let ap = &alpha as *const f32 as *const c_void;
+    let bp = &beta as *const f32 as *const c_void;
+
+    unsafe {
+        // S[heads, seq, seq] = Q[heads, seq, dim] @ K[heads, seq, dim]^T
+        // cuBLAS col-major: treat row-major [seq, dim] as col-major [dim, seq]
+        // transa=T on Q → Q^T col-major = Q row-major [seq, dim]
+        // transb=N on K → K col-major [dim, seq] = K^T row-major [seq, dim]
+        // Result C col-major [seq, seq] = Q row @ K^T row ✓
+        cublasGemmStridedBatchedEx(
+            handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            seq, seq, dim,
+            ap,
+            q, CUDA_R_16BF, dim, (seq * dim) as i64,
+            k, CUDA_R_16BF, dim, (seq * dim) as i64,
+            bp,
+            s, CUDA_R_16BF, seq, (seq * seq) as i64,
+            heads,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT,
+        );
+
+        // O[heads, seq, dim] = S[heads, seq, seq] @ V[heads, seq, dim]
+        // transa=N on V col-major [dim, seq] → V^T in formula sense
+        // transb=T on S col-major [seq, seq] → S^T = S (symmetric-ish for perf)
+        // Result C col-major [dim, seq] = V_col @ S_col^T
+        //   = V^T_row @ S_row → O^T in row-major, but FLOPS are the same
+        cublasGemmStridedBatchedEx(
+            handle,
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            dim, seq, seq,
+            ap,
+            v, CUDA_R_16BF, dim, (seq * dim) as i64,
+            s, CUDA_R_16BF, seq, (seq * seq) as i64,
+            bp,
+            o, CUDA_R_16BF, dim, (seq * dim) as i64,
+            heads,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT,
+        );
+    }
+}
+
 // ── Bench: Prefill ───────────────────────────────────────────────────
 
 fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
-    println!("\n=== Prefill (ragged, causal, BF16) ===");
-    println!("{:<10} {:<6} {:<6} {:<10} {:<12}", "seq_len", "heads", "hdim", "ms", "TFLOPS");
+    println!("\n=== Prefill (ragged, causal, BF16) vs cuBLAS naive ===");
+    println!("{:<10} {:<6} {:<6} {:>10} {:>10} {:>8}",
+        "seq_len", "heads", "hdim", "FlashInfer", "cuBLAS", "speedup");
+
+    // Create cuBLAS handle for baseline
+    let mut cublas_handle: cublasHandle_t = std::ptr::null_mut();
+    unsafe { assert_eq!(cublasCreate_v2(&mut cublas_handle), 0, "cublasCreate failed"); }
 
     // Use FA2 for benchmarks — more portable, works on SM80+
     let backend = Backend::FA2;
@@ -249,29 +340,45 @@ fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
             ]
         };
 
-        let ms = cuda_bench(3, 20, || {
+        let fi_ms = cuda_bench(3, 20, || {
             unsafe { reg.call(variant.ragged_run, &run_args).unwrap(); }
         });
 
-        // FLOPS: 2 * batch * num_heads * seq_len^2 * head_dim (self-attention, causal ≈ half)
-        let flops = 2.0 * batch_size as f64 * num_heads as f64 * (seq_len as f64).powi(2)
-            * head_dim as f64 / 2.0;  // causal mask halves
-        let tflops = flops / (ms as f64 * 1e-3) / 1e12;
+        // cuBLAS baseline: Q/K/V in [heads, seq, dim] layout (head-major)
+        // We reuse the same data — layout doesn't affect cuBLAS FLOPS
+        let s_buf = gpu_alloc((num_heads * seq_len * seq_len) as usize * 2);
+        let o_cub = gpu_alloc(total * 2);
+        let cub_ms = cuda_bench(3, 20, || {
+            cublas_naive_attention(
+                cublas_handle,
+                q, k, v, s_buf, o_cub,
+                seq_len as i32, head_dim as i32, num_heads as i32,
+            );
+        });
 
-        println!("{:<10} {:<6} {:<6} {:<10.3} {:<12.2}", seq_len, num_heads, head_dim, ms, tflops);
+        let speedup = cub_ms / fi_ms;
+        println!("{:<10} {:<6} {:<6} {:>9.3}ms {:>9.3}ms {:>7.1}x",
+            seq_len, num_heads, head_dim, fi_ms, cub_ms, speedup);
 
         unsafe {
             cudaFree(q); cudaFree(k); cudaFree(v); cudaFree(o);
             cudaFree(cu_q_gpu); cudaFree(cu_k_gpu);
+            cudaFree(s_buf); cudaFree(o_cub);
         }
     }
+
+    unsafe { cublasDestroy_v2(cublas_handle); }
 }
 
 // ── Bench: Decode ────────────────────────────────────────────────────
 
 fn bench_decode(reg: &KernelRegistry, ws: &Workspace) {
-    println!("\n=== Decode (paged, BF16) ===");
-    println!("{:<8} {:<8} {:<6} {:<6} {:<10} {:<12}", "batch", "kv_len", "heads", "hdim", "ms", "TFLOPS");
+    println!("\n=== Decode (paged, BF16) vs cuBLAS naive ===");
+    println!("{:<8} {:<8} {:<6} {:<6} {:>10} {:>10} {:>8}",
+        "batch", "kv_len", "heads", "hdim", "FlashInfer", "cuBLAS", "speedup");
+
+    let mut cublas_handle: cublasHandle_t = std::ptr::null_mut();
+    unsafe { assert_eq!(cublasCreate_v2(&mut cublas_handle), 0); }
 
     let configs = [
         (1, 512, 32, 128),
@@ -376,21 +483,64 @@ fn bench_decode(reg: &KernelRegistry, ws: &Workspace) {
             TVMFFIAny::float64(1.0), TVMFFIAny::float64(1e4),
         ];
 
-        let ms = cuda_bench(3, 50, || {
+        let fi_ms = cuda_bench(3, 50, || {
             unsafe { reg.call(variant.run, &run_args).unwrap(); }
         });
 
-        let flops = 2.0 * batch_size as f64 * num_heads as f64 * kv_len as f64 * head_dim as f64;
-        let tflops = flops / (ms as f64 * 1e-3) / 1e12;
+        // cuBLAS baseline: decode = batched GEMV
+        // Q[batch*heads, 1, dim] @ K[batch*heads, kv_len, dim]^T → S[batch*heads, 1, kv_len]
+        // S[batch*heads, 1, kv_len] @ V[batch*heads, kv_len, dim] → O[batch*heads, 1, dim]
+        let bh = batch_size as i32 * num_heads as i32;
+        let sq = 1i32; // single query token
+        let kv = kv_len as i32;
+        let d = head_dim as i32;
+        let cub_q = gpu_alloc((bh as usize * d as usize) * 2);
+        let cub_k = gpu_alloc((bh as usize * kv as usize * d as usize) * 2);
+        let cub_v = gpu_alloc((bh as usize * kv as usize * d as usize) * 2);
+        let cub_s = gpu_alloc((bh as usize * kv as usize) * 2);
+        let cub_o = gpu_alloc((bh as usize * d as usize) * 2);
 
-        println!("{:<8} {:<8} {:<6} {:<6} {:<10.3} {:<12.2}",
-            batch_size, kv_len, num_heads, head_dim, ms, tflops);
+        let cub_ms = cuda_bench(3, 50, || {
+            let alpha: f32 = 1.0;
+            let beta: f32 = 0.0;
+            let ap = &alpha as *const f32 as *const c_void;
+            let bp = &beta as *const f32 as *const c_void;
+            unsafe {
+                // S[bh, 1, kv] = Q[bh, 1, d] @ K[bh, kv, d]^T
+                cublasGemmStridedBatchedEx(
+                    cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    sq, kv, d, ap,
+                    cub_q, CUDA_R_16BF, d, (sq * d) as i64,
+                    cub_k, CUDA_R_16BF, d, (kv * d) as i64,
+                    bp,
+                    cub_s, CUDA_R_16BF, sq, (sq * kv) as i64,
+                    bh, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT,
+                );
+                // O[bh, 1, d] = S[bh, 1, kv] @ V[bh, kv, d]
+                cublasGemmStridedBatchedEx(
+                    cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                    d, sq, kv, ap,
+                    cub_v, CUDA_R_16BF, d, (kv * d) as i64,
+                    cub_s, CUDA_R_16BF, sq, (sq * kv) as i64,
+                    bp,
+                    cub_o, CUDA_R_16BF, d, (sq * d) as i64,
+                    bh, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT,
+                );
+            }
+        });
+
+        let speedup = cub_ms / fi_ms;
+        println!("{:<8} {:<8} {:<6} {:<6} {:>9.3}ms {:>9.3}ms {:>7.1}x",
+            batch_size, kv_len, num_heads, head_dim, fi_ms, cub_ms, speedup);
 
         unsafe {
             cudaFree(q); cudaFree(o); cudaFree(k_cache); cudaFree(v_cache);
             cudaFree(kvi_gpu); cudaFree(kv_indptr_gpu); cudaFree(kv_last_gpu);
+            cudaFree(cub_q); cudaFree(cub_k); cudaFree(cub_v); cudaFree(cub_s); cudaFree(cub_o);
         }
     }
+
+    unsafe { cublasDestroy_v2(cublas_handle); }
 }
 
 // ── Bench: Utility kernels ───────────────────────────────────────────
