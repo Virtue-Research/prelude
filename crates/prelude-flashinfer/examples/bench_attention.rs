@@ -206,19 +206,15 @@ fn cublas_naive_attention(
 
 // ── Bench: Prefill ───────────────────────────────────────────────────
 
-fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
-    println!("\n=== Prefill (ragged, causal, BF16) vs cuBLAS naive ===");
+fn bench_prefill_backend(
+    reg: &KernelRegistry, ws: &Workspace, cublas_handle: cublasHandle_t,
+    backend: Backend, label: &str,
+) {
+    println!("\n=== Prefill {label} (causal, BF16) vs cuBLAS ===");
     println!("{:<10} {:<6} {:<6} {:>10} {:>10} {:>8}",
-        "seq_len", "heads", "hdim", "FlashInfer", "cuBLAS", "speedup");
+        "seq_len", "heads", "hdim", label, "cuBLAS*", "speedup");
 
-    // Create cuBLAS handle for baseline
-    let mut cublas_handle: cublasHandle_t = std::ptr::null_mut();
-    unsafe { assert_eq!(cublasCreate_v2(&mut cublas_handle), 0, "cublasCreate failed"); }
-
-    // Use FA2 for benchmarks — more portable, works on SM80+
-    let backend = Backend::FA2;
     let configs = [
-        (256, 32, 128),
         (512, 32, 128),
         (1024, 32, 128),
         (2048, 32, 128),
@@ -233,7 +229,7 @@ fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
         };
         let variant = match reg.get_prefill(&key) {
             Some(v) => v,
-            None => { println!("  Skipping ({seq_len}, {num_heads}, {head_dim}): no variant"); continue; }
+            None => { println!("{:<10} {:<6} {:<6} (no variant)", seq_len, num_heads, head_dim); continue; }
         };
 
         let batch_size = 1i64;
@@ -276,9 +272,9 @@ fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
         let dl_v = gpu_dl(v, BF16_DT, &k_s, &k_st);
         let dl_o = gpu_dl(o, BF16_DT, &q_s, &q_st);
 
-        unsafe { reg.set_stream(0, std::ptr::null_mut()); }
+        reg.set_stream(0, std::ptr::null_mut());
 
-        // Plan: FA2 has 19 args, FA3 has 16 args
+        // Plan
         let plan_args = if backend == Backend::FA2 {
             vec![
                 TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws),
@@ -293,7 +289,6 @@ fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
                 TVMFFIAny::int64(-1), TVMFFIAny::bool_val(false), TVMFFIAny::int64(0),
             ]
         } else {
-            // FA3/SM90 plan: 16 args (no fixed_split, disable_split, colocated_ctas)
             vec![
                 TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws),
                 TVMFFIAny::dltensor(&dl_pws),
@@ -307,9 +302,9 @@ fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
             ]
         };
         let plan_info = unsafe { reg.call(variant.plan, &plan_args).expect("plan failed") };
+        unsafe { cudaDeviceSynchronize(); } // wait for plan GPU work
 
         let sm_scale = 1.0 / (head_dim as f64).sqrt();
-        // Run: FA2 has 25 args, FA3 has 21 args
         let run_args = if backend == Backend::FA2 {
             vec![
                 TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws), plan_info,
@@ -324,7 +319,6 @@ fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
                 TVMFFIAny::float64(1.0), TVMFFIAny::float64(1e4), TVMFFIAny::int64(0),
             ]
         } else {
-            // FA3/SM90: base 14 args + additional 7 (prefix_len, token_pos, max_item, scale_v, softcap, sm_scale, scale_v_scalar)
             vec![
                 TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws), plan_info,
                 TVMFFIAny::dltensor(&dl_q), TVMFFIAny::dltensor(&dl_k), TVMFFIAny::dltensor(&dl_v),
@@ -332,11 +326,8 @@ fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
                 TVMFFIAny::dltensor(&dl_o), TVMFFIAny::none(),
                 TVMFFIAny::int64(1), TVMFFIAny::int64(0), TVMFFIAny::int64(-1),
                 TVMFFIAny::bool_val(false),
-                // additional: prefix_len, token_pos, max_item, scale_v
                 TVMFFIAny::none(), TVMFFIAny::none(), TVMFFIAny::none(), TVMFFIAny::none(),
-                TVMFFIAny::float64(0.0),       // logits_soft_cap
-                TVMFFIAny::float64(sm_scale),  // sm_scale
-                TVMFFIAny::float64(1.0),       // scale_v_scalar
+                TVMFFIAny::float64(0.0), TVMFFIAny::float64(sm_scale), TVMFFIAny::float64(1.0),
             ]
         };
 
@@ -344,9 +335,9 @@ fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
             unsafe { reg.call(variant.ragged_run, &run_args).unwrap(); }
         });
 
-        // cuBLAS baseline: Q/K/V in [heads, seq, dim] layout (head-major)
-        // We reuse the same data — layout doesn't affect cuBLAS FLOPS
-        let s_buf = gpu_alloc((num_heads * seq_len * seq_len) as usize * 2);
+        // cuBLAS baseline: two GEMMs (Q@K^T + S@V), no softmax, no causal mask
+        let s_size = (num_heads * seq_len * seq_len) as usize;
+        let s_buf = gpu_alloc(s_size * 2);
         let o_cub = gpu_alloc(total * 2);
         let cub_ms = cuda_bench(3, 20, || {
             cublas_naive_attention(
@@ -366,6 +357,21 @@ fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
             cudaFree(s_buf); cudaFree(o_cub);
         }
     }
+}
+
+fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
+    let mut cublas_handle: cublasHandle_t = std::ptr::null_mut();
+    unsafe { assert_eq!(cublasCreate_v2(&mut cublas_handle), 0, "cublasCreate failed"); }
+
+    // FA2 (SM80+)
+    bench_prefill_backend(reg, ws, cublas_handle, Backend::FA2, "FA2");
+
+    // FA3 (SM90+, Hopper TMA)
+    if reg.arch() >= 90 {
+        bench_prefill_backend(reg, ws, cublas_handle, Backend::FA3, "FA3");
+    }
+
+    println!("\n  * cuBLAS = two GEMMs only (no softmax, no causal mask)");
 
     unsafe { cublasDestroy_v2(cublas_handle); }
 }
