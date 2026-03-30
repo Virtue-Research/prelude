@@ -61,6 +61,8 @@ const BF16_DT: DLDataType = DLDataType { code: KDLBFLOAT, bits: 16, lanes: 1 };
 const FP32_DT: DLDataType = DLDataType { code: KDLFLOAT, bits: 32, lanes: 1 };
 const I32_DT: DLDataType = DLDataType { code: KDLINT, bits: 32, lanes: 1 };
 const U8_DT: DLDataType = DLDataType { code: KDLUINT, bits: 8, lanes: 1 };
+// FP8 E4M3FN: DLPack code=10 (kDLFloat8_e4m3fn), bits=8
+const FP8_DT: DLDataType = DLDataType { code: 10, bits: 8, lanes: 1 };
 
 fn strides(shape: &[i64]) -> Vec<i64> {
     let mut s = vec![1i64; shape.len()];
@@ -369,6 +371,166 @@ fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
     // FA3 (SM90+, Hopper TMA)
     if reg.arch() >= 90 {
         bench_prefill_backend(reg, ws, cublas_handle, Backend::FA3, "FA3");
+    }
+
+    // FP8 E4M3 prefill (SM90+)
+    // TODO: FP8 TMA descriptor creation fails with error 719 (CUDA_ERROR_INVALID_VALUE)
+    // on some configurations. Needs investigation of swizzle mode for FP8 types.
+    if false && reg.arch() >= 90 {
+        let key = FP8PrefillKey { head_dim: 128, sliding_window: false };
+        if let Some(variant) = reg.get_fp8_prefill(&key) {
+            println!("\n=== Prefill FP8 E4M3 (causal, SM90) vs FA3 BF16 ===");
+            println!("{:<10} {:<6} {:<6} {:>10} {:>10} {:>8}",
+                "seq_len", "heads", "hdim", "FP8", "FA3-BF16", "ratio");
+
+            let fa3_key = PrefillKey {
+                dtype: KernelDtype::BF16, head_dim_qk: 128, head_dim_vo: 128,
+                sliding_window: false, logits_soft_cap: false, backend: Backend::FA3,
+            };
+            let fa3_variant = reg.get_prefill(&fa3_key);
+
+            for seq_len in [512i64, 1024, 2048, 4096] {
+                let num_heads = 32i64;
+                let head_dim = 128i64;
+                let batch_size = 1i64;
+                let total = (seq_len * num_heads * head_dim) as usize;
+
+                // FP8 data: 1 byte per element (vs 2 for BF16)
+                // Fill with small random FP8 values (non-zero needed for TMA descriptor)
+                let fp8_data: Vec<u8> = (0..total).map(|i| ((i % 120) + 1) as u8).collect();
+                let q_fp8 = gpu_alloc(total);
+                let k_fp8 = gpu_alloc(total);
+                let v_fp8 = gpu_alloc(total);
+                let o_bf16 = gpu_alloc(total * 2);  // output is BF16
+                unsafe {
+                    cudaMemcpy(q_fp8, fp8_data.as_ptr() as *const c_void, total, 1);
+                    cudaMemcpy(k_fp8, fp8_data.as_ptr() as *const c_void, total, 1);
+                    cudaMemcpy(v_fp8, fp8_data.as_ptr() as *const c_void, total, 1);
+                }
+
+                let cu_q: [i32; 2] = [0, seq_len as i32];
+                let cu_k: [i32; 2] = [0, seq_len as i32];
+                let kvl: [i32; 1] = [seq_len as i32];
+                let cu_q_gpu = gpu_alloc(8);
+                let cu_k_gpu = gpu_alloc(8);
+                unsafe {
+                    cudaMemcpy(cu_q_gpu, cu_q.as_ptr() as *const c_void, 8, 1);
+                    cudaMemcpy(cu_k_gpu, cu_k.as_ptr() as *const c_void, 8, 1);
+                }
+
+                let fws_s = [ws.float_size as i64]; let fws_st = [1i64];
+                let iws_s = [ws.int_size as i64]; let iws_st = [1i64];
+                let cu_s = [2i64]; let cu_st = [1i64];
+                let kvl_s = [1i64]; let kvl_st = [1i64];
+                let q_s = [seq_len, num_heads, head_dim]; let q_st = strides(&q_s);
+                let o_s = q_s; let o_st = q_st.clone();
+
+                let dl_fws = gpu_dl(ws.float_ws, U8_DT, &fws_s, &fws_st);
+                let dl_iws = gpu_dl(ws.int_ws, U8_DT, &iws_s, &iws_st);
+                let dl_pws = cpu_dl(ws.pinned_ws, U8_DT, &iws_s, &iws_st);
+                let dl_cuq_cpu = cpu_dl(cu_q.as_ptr() as *mut c_void, I32_DT, &cu_s, &cu_st);
+                let dl_cuk_cpu = cpu_dl(cu_k.as_ptr() as *mut c_void, I32_DT, &cu_s, &cu_st);
+                let dl_kvl = cpu_dl(kvl.as_ptr() as *mut c_void, I32_DT, &kvl_s, &kvl_st);
+                let dl_cuq_gpu = gpu_dl(cu_q_gpu, I32_DT, &cu_s, &cu_st);
+                let dl_cuk_gpu = gpu_dl(cu_k_gpu, I32_DT, &cu_s, &cu_st);
+                let dl_q = gpu_dl(q_fp8, FP8_DT, &q_s, &q_st);
+                let dl_k = gpu_dl(k_fp8, FP8_DT, &q_s, &q_st);
+                let dl_v = gpu_dl(v_fp8, FP8_DT, &q_s, &q_st);
+                let dl_o = gpu_dl(o_bf16, BF16_DT, &o_s, &o_st);
+
+                reg.set_stream(0, std::ptr::null_mut());
+
+                // Plan (same as FA3)
+                let plan_args = vec![
+                    TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws),
+                    TVMFFIAny::dltensor(&dl_pws),
+                    TVMFFIAny::dltensor(&dl_cuq_cpu), TVMFFIAny::dltensor(&dl_cuk_cpu),
+                    TVMFFIAny::dltensor(&dl_kvl),
+                    TVMFFIAny::int64(seq_len), TVMFFIAny::int64(batch_size),
+                    TVMFFIAny::int64(num_heads), TVMFFIAny::int64(num_heads),
+                    TVMFFIAny::int64(1), TVMFFIAny::bool_val(false),
+                    TVMFFIAny::int64(head_dim), TVMFFIAny::int64(head_dim),
+                    TVMFFIAny::bool_val(true), TVMFFIAny::int64(-1),
+                ];
+                let plan_info = unsafe { reg.call(variant.plan, &plan_args).expect("FP8 plan failed") };
+                unsafe { cudaDeviceSynchronize(); }
+
+                let sm_scale = 1.0 / (head_dim as f64).sqrt();
+                // FP8 run args: same structure as FA3 but with scale params instead of softcap/scale_v
+                let run_args = vec![
+                    TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws), plan_info,
+                    TVMFFIAny::dltensor(&dl_q), TVMFFIAny::dltensor(&dl_k), TVMFFIAny::dltensor(&dl_v),
+                    TVMFFIAny::dltensor(&dl_cuq_gpu), TVMFFIAny::dltensor(&dl_cuk_gpu),
+                    TVMFFIAny::dltensor(&dl_o), TVMFFIAny::none(),
+                    TVMFFIAny::int64(1), TVMFFIAny::int64(0), TVMFFIAny::int64(-1),
+                    TVMFFIAny::bool_val(false),
+                    TVMFFIAny::none(),           // maybe_scale_q
+                    TVMFFIAny::none(),           // maybe_scale_k
+                    TVMFFIAny::none(),           // maybe_scale_v
+                    TVMFFIAny::float64(sm_scale), // sm_scale
+                    TVMFFIAny::float64(1.0),     // scale_q_scalar
+                    TVMFFIAny::float64(1.0),     // scale_k_scalar
+                    TVMFFIAny::float64(1.0),     // scale_v_scalar
+                ];
+
+                let fp8_ms = cuda_bench(3, 20, || {
+                    unsafe { reg.call(variant.ragged_run, &run_args).unwrap(); }
+                });
+
+                // Compare with FA3 BF16
+                let fa3_ms = if let Some(ref fa3) = fa3_variant {
+                    let q_bf = gpu_alloc(total * 2);
+                    let k_bf = gpu_alloc(total * 2);
+                    let v_bf = gpu_alloc(total * 2);
+                    let o_bf = gpu_alloc(total * 2);
+                    let dl_q2 = gpu_dl(q_bf, BF16_DT, &q_s, &q_st);
+                    let dl_k2 = gpu_dl(k_bf, BF16_DT, &q_s, &q_st);
+                    let dl_v2 = gpu_dl(v_bf, BF16_DT, &q_s, &q_st);
+                    let dl_o2 = gpu_dl(o_bf, BF16_DT, &o_s, &o_st);
+
+                    let plan2 = vec![
+                        TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws),
+                        TVMFFIAny::dltensor(&dl_pws),
+                        TVMFFIAny::dltensor(&dl_cuq_cpu), TVMFFIAny::dltensor(&dl_cuk_cpu),
+                        TVMFFIAny::dltensor(&dl_kvl),
+                        TVMFFIAny::int64(seq_len), TVMFFIAny::int64(batch_size),
+                        TVMFFIAny::int64(num_heads), TVMFFIAny::int64(num_heads),
+                        TVMFFIAny::int64(1), TVMFFIAny::bool_val(false),
+                        TVMFFIAny::int64(head_dim), TVMFFIAny::int64(head_dim),
+                        TVMFFIAny::bool_val(true), TVMFFIAny::int64(-1),
+                    ];
+                    let pi2 = unsafe { reg.call(fa3.plan, &plan2).expect("FA3 plan failed") };
+                    unsafe { cudaDeviceSynchronize(); }
+
+                    let run2 = vec![
+                        TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws), pi2,
+                        TVMFFIAny::dltensor(&dl_q2), TVMFFIAny::dltensor(&dl_k2), TVMFFIAny::dltensor(&dl_v2),
+                        TVMFFIAny::dltensor(&dl_cuq_gpu), TVMFFIAny::dltensor(&dl_cuk_gpu),
+                        TVMFFIAny::dltensor(&dl_o2), TVMFFIAny::none(),
+                        TVMFFIAny::int64(1), TVMFFIAny::int64(0), TVMFFIAny::int64(-1),
+                        TVMFFIAny::bool_val(false),
+                        TVMFFIAny::none(), TVMFFIAny::none(), TVMFFIAny::none(), TVMFFIAny::none(),
+                        TVMFFIAny::float64(0.0), TVMFFIAny::float64(sm_scale), TVMFFIAny::float64(1.0),
+                    ];
+                    let ms = cuda_bench(3, 20, || {
+                        unsafe { reg.call(fa3.ragged_run, &run2).unwrap(); }
+                    });
+                    unsafe { cudaFree(q_bf); cudaFree(k_bf); cudaFree(v_bf); cudaFree(o_bf); }
+                    ms
+                } else {
+                    0.0
+                };
+
+                let ratio = if fa3_ms > 0.0 { fa3_ms / fp8_ms } else { 0.0 };
+                println!("{:<10} {:<6} {:<6} {:>9.3}ms {:>9.3}ms {:>7.1}x",
+                    seq_len, num_heads, head_dim, fp8_ms, fa3_ms, ratio);
+
+                unsafe {
+                    cudaFree(q_fp8); cudaFree(k_fp8); cudaFree(v_fp8); cudaFree(o_bf16);
+                    cudaFree(cu_q_gpu); cudaFree(cu_k_gpu);
+                }
+            }
+        }
     }
 
     println!("\n  * cuBLAS = two GEMMs only (no softmax, no causal mask)");
@@ -697,6 +859,57 @@ fn bench_utilities(reg: &KernelRegistry) {
 
             unsafe { cudaFree(input); cudaFree(output); }
         }
+    }
+
+    // MoE routing (DeepSeek V3 fused top-k)
+    if let Some(moe_fn) = reg.get_utility("NoAuxTc") {
+        let num_tokens = 2048i64;
+        let num_experts = 256i64;
+        let topk = 8i64;
+        let n_group = 8i64;
+        let topk_group = 4i64;
+
+        // scores: [tokens, experts] BF16, bias: [experts] BF16
+        let scores = gpu_alloc((num_tokens * num_experts) as usize * 2);
+        let bias = gpu_alloc(num_experts as usize * 2);
+        let topk_values = gpu_alloc((num_tokens * topk) as usize * 2);
+        let topk_indices = gpu_alloc((num_tokens * topk) as usize * 4); // int32
+
+        let sc_s = [num_tokens, num_experts]; let sc_st = strides(&sc_s);
+        let bi_s = [num_experts]; let bi_st = [1i64];
+        let tv_s = [num_tokens, topk]; let tv_st = strides(&tv_s);
+        let ti_s = tv_s; let ti_st = tv_st.clone();
+
+        let dl_scores = gpu_dl(scores, BF16_DT, &sc_s, &sc_st);
+        let dl_bias = gpu_dl(bias, BF16_DT, &bi_s, &bi_st);
+        let dl_values = gpu_dl(topk_values, BF16_DT, &tv_s, &tv_st);
+        let dl_indices = gpu_dl(topk_indices, I32_DT, &ti_s, &ti_st);
+
+        unsafe { reg.set_stream(0, std::ptr::null_mut()); }
+
+        let args = [
+            TVMFFIAny::dltensor(&dl_scores),
+            TVMFFIAny::dltensor(&dl_bias),
+            TVMFFIAny::int64(n_group),
+            TVMFFIAny::int64(topk_group),
+            TVMFFIAny::int64(topk),
+            TVMFFIAny::float64(1.0),          // routed_scaling_factor
+            TVMFFIAny::dltensor(&dl_values),
+            TVMFFIAny::dltensor(&dl_indices),
+            TVMFFIAny::bool_val(false),        // launch_with_pdl
+        ];
+
+        let ms = cuda_bench(5, 100, || {
+            unsafe { reg.call(moe_fn, &args).unwrap(); }
+        });
+        let gb = ((num_tokens * num_experts) as usize * 2  // read scores
+                 + num_experts as usize * 2                 // read bias
+                 + (num_tokens * topk) as usize * (2 + 4)  // write values + indices
+        ) as f64 / 1e9;
+        let bw = gb / (ms as f64 * 1e-3);
+        println!("  moe_routing   ({num_tokens} tokens, {num_experts} experts, top{topk}): {ms:.3} ms, {bw:.1} GB/s");
+
+        unsafe { cudaFree(scores); cudaFree(bias); cudaFree(topk_values); cudaFree(topk_indices); }
     }
 }
 
