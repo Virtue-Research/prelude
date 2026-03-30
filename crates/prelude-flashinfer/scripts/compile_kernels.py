@@ -283,25 +283,232 @@ def generate_batch_prefill_fa3_sources(
     return sources, ["-gencode", "arch=compute_90a,code=sm_90a"]
 
 
+def generate_batch_decode_mla_sources(
+    fi_src: Path, gen_dir: Path, vid: str,
+    dtype_c: str, dtype_name: str,
+    head_dim_ckv: int, head_dim_kpe: int,
+    swa: bool, softcap: bool,
+) -> Tuple[List[Path], List[str]]:
+    """Generate source files for a batch_decode MLA variant (SM80 cute backend)."""
+    import jinja2
+
+    csrc = fi_src / "csrc"
+    out = gen_dir / vid
+    out.mkdir(parents=True, exist_ok=True)
+
+    # qo_tile_len: 128 for ckv<=256, 64 otherwise
+    qo_tile_len = 128 if head_dim_ckv <= 256 else 64
+
+    variant_name = (
+        f"DefaultAttention<false, {str(swa).lower()}, "
+        f"{str(softcap).lower()}, false>"
+    )
+    with open(csrc / "batch_decode_mla_config.jinja") as f:
+        config_templ = jinja2.Template(f.read())
+
+    config_str = config_templ.render(
+        dtype_q=dtype_c, dtype_kv=dtype_c, dtype_o=dtype_c,
+        dtype_idx="int32_t",
+        use_sliding_window=str(swa).lower(),
+        use_logits_soft_cap=str(softcap).lower(),
+        head_dim_ckv=head_dim_ckv, head_dim_kpe=head_dim_kpe,
+        qo_tile_len=qo_tile_len,
+    )
+    (out / "mla_config.inc").write_text(config_str)
+
+    # cute SM80 backend only supports FP16; use standard plan/run for BF16
+    sources = []
+    renames = {
+        "BatchDecodeWithPagedKVCachePlanMLA": f"{vid}_BatchDecodeWithPagedKVCachePlanMLA",
+        "BatchDecodeWithPagedKVCacheRunMLA": f"{vid}_BatchDecodeWithPagedKVCacheRunMLA",
+    }
+    if dtype_c == "nv_half":
+        # FP16: use cute SM80 (single file with plan + run)
+        _copy_with_renames(csrc / "batch_decode_mla_cute_sm80.cu",
+                           out / "batch_decode_mla_cute_sm80.cu", renames)
+        sources.append(out / "batch_decode_mla_cute_sm80.cu")
+    else:
+        # BF16: use standard plan + run
+        _copy_with_renames(csrc / "batch_decode_mla_plan.cu",
+                           out / "batch_decode_mla_plan.cu", renames)
+        _copy_with_renames(csrc / "batch_decode_mla_run.cu",
+                           out / "batch_decode_mla_run.cu", renames)
+        sources.append(out / "batch_decode_mla_plan.cu")
+        sources.append(out / "batch_decode_mla_run.cu")
+
+    # Binding
+    binding_src = _generate_renamed_binding(
+        csrc / "batch_decode_mla_binding.cu",
+        "mla_config.inc",
+        {
+            "plan": f"__tvm_ffi_{vid}_plan",
+            "run": f"__tvm_ffi_{vid}_run",
+        },
+    )
+    for old, new in renames.items():
+        binding_src = binding_src.replace(old, new)
+    (out / "batch_decode_mla_binding.cu").write_text(binding_src)
+    sources.append(out / "batch_decode_mla_binding.cu")
+
+    return sources, []
+
+
+def generate_batch_mla_sources(
+    fi_src: Path, gen_dir: Path, vid: str,
+    dtype_c: str, dtype_name: str,
+    head_dim_ckv: int, head_dim_kpe: int,
+) -> Tuple[List[Path], List[str]]:
+    """Generate source files for batch MLA paged attention (FA2 backend)."""
+    import jinja2
+
+    csrc = fi_src / "csrc"
+    out = gen_dir / vid
+    out.mkdir(parents=True, exist_ok=True)
+
+    with open(csrc / "batch_mla_config.jinja") as f:
+        config_templ = jinja2.Template(f.read())
+
+    config_str = config_templ.render(
+        dtype_q=dtype_c, dtype_kv=dtype_c, dtype_o=dtype_c,
+        dtype_idx="int32_t",
+        head_dim_ckv=head_dim_ckv, head_dim_kpe=head_dim_kpe,
+    )
+    (out / "batch_mla_config.inc").write_text(config_str)
+
+    # Plan + Run source
+    sources = []
+    renames = {
+        "BatchMLAPagedAttentionPlan": f"{vid}_BatchMLAPagedAttentionPlan",
+        "BatchMLAPagedAttentionRun": f"{vid}_BatchMLAPagedAttentionRun",
+    }
+    _copy_with_renames(csrc / "batch_mla_plan.cu", out / "batch_mla_plan.cu", renames)
+    _copy_with_renames(csrc / "batch_mla_run.cu", out / "batch_mla_run.cu", renames)
+    sources.append(out / "batch_mla_plan.cu")
+    sources.append(out / "batch_mla_run.cu")
+
+    # Binding
+    binding_src = _generate_renamed_binding(
+        csrc / "batch_mla_binding.cu",
+        "batch_mla_config.inc",
+        {
+            "plan": f"__tvm_ffi_{vid}_plan",
+            "run": f"__tvm_ffi_{vid}_run",
+        },
+    )
+    for old, new in renames.items():
+        binding_src = binding_src.replace(old, new)
+    (out / "batch_mla_binding.cu").write_text(binding_src)
+    sources.append(out / "batch_mla_binding.cu")
+
+    return sources, []
+
+
+def generate_utility_sources(
+    fi_src: Path, gen_dir: Path,
+) -> List[Tuple[List[Path], List[str], dict]]:
+    """Generate source files for non-templated utility kernels.
+
+    Returns list of (sources, extra_flags, variant_info) tuples.
+    """
+    csrc = fi_src / "csrc"
+    results = []
+
+    # Each utility module: (dir_name, source_files, binding_file, kind, symbols)
+    modules = [
+        ("fi_page", ["page.cu"], "flashinfer_page_binding.cu", "page",
+         ["append_paged_kv_cache", "append_paged_mla_kv_cache"]),
+        ("fi_sampling", ["sampling.cu", "renorm.cu"], "flashinfer_sampling_binding.cu", "sampling",
+         ["softmax", "sampling_from_probs", "sampling_from_logits",
+          "top_k_sampling_from_probs", "top_p_sampling_from_probs",
+          "min_p_sampling_from_probs", "top_k_top_p_sampling_from_probs",
+          "top_k_renorm_probs", "top_p_renorm_probs", "top_k_mask_logits",
+          "chain_speculative_sampling"]),
+        ("fi_norm", ["norm.cu"], "flashinfer_norm_binding.cu", "norm",
+         ["rmsnorm", "fused_add_rmsnorm", "gemma_rmsnorm", "gemma_fused_add_rmsnorm",
+          "rmsnorm_quant", "fused_add_rmsnorm_quant"]),
+        ("fi_rope", ["rope.cu"], "flashinfer_rope_binding.cu", "rope",
+         ["apply_rope", "apply_llama31_rope", "apply_rope_pos_ids",
+          "apply_llama31_rope_pos_ids", "apply_rope_pos_ids_cos_sin_cache",
+          "rope_quantize", "rope_quantize_append_paged_kv_cache"]),
+        ("fi_cascade", ["cascade.cu"], "flashinfer_cascade_binding.cu", "cascade",
+         ["merge_state", "merge_state_in_place", "merge_states"]),
+    ]
+
+    for dir_name, src_files, binding_file, kind, symbols in modules:
+        out = gen_dir / dir_name
+        out.mkdir(parents=True, exist_ok=True)
+        sources = []
+        for src_file in src_files:
+            src_path = csrc / src_file
+            if src_path.exists():
+                if kind == "norm" and src_file == "norm.cu":
+                    # Patch: exclude layernorm (requires TensorRT-LLM headers)
+                    src_text = src_path.read_text()
+                    src_text = src_text.replace(
+                        '#include <flashinfer/norm.cuh>',
+                        '#define FLASHINFER_NORM_NO_LAYERNORM\n#include <flashinfer/norm.cuh>'
+                    )
+                    # Remove layernorm function body
+                    lines = src_text.split('\n')
+                    filtered = []
+                    skip = False
+                    for line in lines:
+                        if 'void layernorm(' in line:
+                            skip = True
+                        if skip and line.strip() == '}':
+                            skip = False
+                            continue
+                        if not skip:
+                            filtered.append(line)
+                    (out / src_file).write_text('\n'.join(filtered))
+                elif kind == "norm" and src_file == binding_file:
+                    # Remove layernorm binding
+                    src_text = src_path.read_text()
+                    lines = [l for l in src_text.split('\n')
+                             if 'layernorm' not in l.lower()
+                             or 'rmsnorm' in l.lower()]
+                    (out / src_file).write_text('\n'.join(lines))
+                    continue  # already handled
+                else:
+                    shutil.copy2(src_path, out / src_file)
+                sources.append(out / src_file)
+        binding_path = csrc / binding_file
+        if binding_path.exists() and not (out / binding_file).exists():
+            if kind == "norm":
+                # Remove layernorm binding export
+                src_text = binding_path.read_text()
+                lines = [l for l in src_text.split('\n')
+                         if 'layernorm' not in l]
+                (out / binding_file).write_text('\n'.join(lines))
+            else:
+                shutil.copy2(binding_path, out / binding_file)
+            sources.append(out / binding_file)
+
+        vinfo = {
+            "vid": dir_name, "kind": kind,
+            "symbols": {s: f"__tvm_ffi_{s}" for s in symbols},
+        }
+        results.append((sources, [], vinfo))
+
+    return results
+
+
 def generate_page_sources(
     fi_src: Path, gen_dir: Path,
 ) -> Tuple[List[Path], List[str]]:
-    """Generate page.cu (append_paged_kv_cache) with renamed symbols."""
+    """Generate page.cu (append_paged_kv_cache) with renamed symbols.
+    DEPRECATED: use generate_utility_sources() instead.
+    """
     csrc = fi_src / "csrc"
     out = gen_dir / "fi_page"
     out.mkdir(parents=True, exist_ok=True)
 
-    # Read original and add TVM FFI export at the bottom
-    original = (csrc / "page.cu").read_text()
-    # The original page.cu doesn't use TVM_FFI_DLL_EXPORT_TYPED_FUNC.
-    # The binding is in flashinfer_page_binding.cu. Let's check:
     binding_path = csrc / "flashinfer_page_binding.cu"
     if binding_path.exists():
         shutil.copy2(csrc / "page.cu", out / "page.cu")
         shutil.copy2(binding_path, out / "flashinfer_page_binding.cu")
         return [out / "page.cu", out / "flashinfer_page_binding.cu"], []
     else:
-        # page.cu has the functions directly, we'll just compile it
         shutil.copy2(csrc / "page.cu", out / "page.cu")
         return [out / "page.cu"], []
 
@@ -506,6 +713,7 @@ def _find_tvm_ffi_include(fi_src: Path) -> Optional[Path]:
 
 def build_variant_matrix(
     archs: List[int], head_dims: List[int], dtypes: List[str],
+    mla_dims: List[Tuple[int, int]] = None,
 ) -> List[dict]:
     """Build the list of kernel variants to compile.
 
@@ -513,11 +721,15 @@ def build_variant_matrix(
       - FA2: decode + prefill, swa × softcap combinations
       - FA3: prefill only (decode uses prefill on SM90), swa × softcap
       - Asymmetric head_dim (192,128) for FA3
+      - MLA decode + paged: (head_dim_ckv, head_dim_kpe) combos
       - FP16 + BF16
 
     FP8 E4M3 KV cache variants are NOT included (requires mixed-precision
     dtype_q != dtype_kv support in our compilation infrastructure).
     """
+    if mla_dims is None:
+        mla_dims = [(512, 64)]  # DeepSeek V2/V3 default
+
     variants = []
     sm80_flags = ["-gencode", "arch=compute_80,code=compute_80",
                   "-gencode", "arch=compute_90,code=sm_90"]
@@ -578,6 +790,31 @@ def build_variant_matrix(
                     "arch_flags": sm90_flags,
                 })
 
+    # ── MLA variants ──────────────────────────────────────────────────
+    for dtype in dtypes:
+        dtype_c, dtype_name = DTYPE_MAP[dtype]
+        for ckv, kpe in mla_dims:
+            # MLA decode (cute SM80 backend, supports SM80+)
+            # Only compile (no-swa, no-softcap) since MLA rarely uses these
+            vid = f"fi_mla_decode_{dtype}_c{ckv}k{kpe}"
+            variants.append({
+                "vid": vid, "kind": "mla_decode", "backend": "fa2",
+                "dtype": dtype, "dtype_c": dtype_c, "dtype_name": dtype_name,
+                "head_dim_ckv": ckv, "head_dim_kpe": kpe,
+                "swa": False, "softcap": False,
+                "arch_flags": sm80_flags,
+            })
+
+            # MLA paged attention (FA2, supports SM80+)
+            vid = f"fi_mla_paged_{dtype}_c{ckv}k{kpe}"
+            variants.append({
+                "vid": vid, "kind": "mla_paged", "backend": "fa2",
+                "dtype": dtype, "dtype_c": dtype_c, "dtype_name": dtype_name,
+                "head_dim_ckv": ckv, "head_dim_kpe": kpe,
+                "swa": False, "softcap": False,
+                "arch_flags": sm80_flags,
+            })
+
     return variants
 
 
@@ -633,9 +870,18 @@ def main():
     head_dims = [int(d) for d in args.head_dims.split(",")]
     dtypes = args.dtypes.split(",")
 
-    variants = build_variant_matrix(archs, head_dims, dtypes)
+    # Parse MLA dims (e.g., "512x64,256x64")
+    mla_dims_str = os.environ.get("PRELUDE_FLASHINFER_MLA_DIMS", "512x64")
+    mla_dims = []
+    for d in mla_dims_str.split(","):
+        d = d.strip()
+        if d:
+            ckv, kpe = d.split("x")
+            mla_dims.append((int(ckv), int(kpe)))
+
+    variants = build_variant_matrix(archs, head_dims, dtypes, mla_dims)
     print(f"FlashInfer AOT: {len(variants)} variants, archs={archs}, "
-          f"head_dims={head_dims}, dtypes={dtypes}")
+          f"head_dims={head_dims}, dtypes={dtypes}, mla_dims={mla_dims}")
 
     if args.dry_run:
         for v in variants:
@@ -668,17 +914,32 @@ def main():
                 v["hdim_qk"], v["hdim_vo"],
                 v["swa"], v["softcap"],
             )
+        elif v["kind"] == "mla_decode":
+            sources, extra = generate_batch_decode_mla_sources(
+                fi_src, gen_dir, v["vid"],
+                v["dtype_c"], v["dtype_name"],
+                v["head_dim_ckv"], v["head_dim_kpe"],
+                v["swa"], v["softcap"],
+            )
+        elif v["kind"] == "mla_paged":
+            sources, extra = generate_batch_mla_sources(
+                fi_src, gen_dir, v["vid"],
+                v["dtype_c"], v["dtype_name"],
+                v["head_dim_ckv"], v["head_dim_kpe"],
+            )
         else:
             continue
 
         for src in sources:
             compile_jobs.append((src, v["arch_flags"], extra, v))
 
-    # Also add page module
-    page_sources, page_extra = generate_page_sources(fi_src, gen_dir)
-    for src in page_sources:
-        compile_jobs.append((src, ["-gencode", "arch=compute_80,code=compute_80", "-gencode", "arch=compute_90,code=sm_90"], page_extra,
-                             {"vid": "fi_page", "kind": "page"}))
+    # Utility kernels (non-templated, compiled once)
+    sm80_flags = ["-gencode", "arch=compute_80,code=compute_80",
+                  "-gencode", "arch=compute_90,code=sm_90"]
+    utility_variants = generate_utility_sources(fi_src, gen_dir)
+    for sources, extra, vinfo in utility_variants:
+        for src in sources:
+            compile_jobs.append((src, sm80_flags, extra, vinfo))
 
     print(f"Phase 2: Compiling {len(compile_jobs)} source files with {args.workers} workers...")
 
@@ -708,13 +969,18 @@ def main():
         entry = {
             "vid": v["vid"],
             "kind": v["kind"],
-            "backend": v["backend"],
+            "backend": v.get("backend", "fa2"),
             "dtype": v["dtype"],
-            "hdim_qk": v["hdim_qk"],
-            "hdim_vo": v["hdim_vo"],
-            "swa": v["swa"],
-            "softcap": v["softcap"],
         }
+        if v["kind"] in ("decode", "prefill_fa2", "prefill_fa3"):
+            entry["hdim_qk"] = v["hdim_qk"]
+            entry["hdim_vo"] = v["hdim_vo"]
+            entry["swa"] = v["swa"]
+            entry["softcap"] = v["softcap"]
+        if v["kind"] in ("mla_decode", "mla_paged"):
+            entry["head_dim_ckv"] = v["head_dim_ckv"]
+            entry["head_dim_kpe"] = v["head_dim_kpe"]
+
         if v["kind"] == "decode":
             entry["symbols"] = {
                 "plan": f"__tvm_ffi_{v['vid']}_plan",
@@ -726,7 +992,20 @@ def main():
                 "ragged_run": f"__tvm_ffi_{v['vid']}_ragged_run",
                 "paged_run": f"__tvm_ffi_{v['vid']}_paged_run",
             }
+        elif v["kind"] in ("mla_decode", "mla_paged"):
+            entry["symbols"] = {
+                "plan": f"__tvm_ffi_{v['vid']}_plan",
+                "run": f"__tvm_ffi_{v['vid']}_run",
+            }
         manifest["variants"].append(entry)
+
+    # Utility modules
+    for _, _, vinfo in utility_variants:
+        manifest["variants"].append({
+            "vid": vinfo["vid"],
+            "kind": vinfo["kind"],
+            "symbols": vinfo["symbols"],
+        })
 
     manifest_path = out_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))

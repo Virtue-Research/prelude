@@ -60,6 +60,22 @@ pub struct DecodeKey {
     pub logits_soft_cap: bool,
 }
 
+/// Key for MLA decode kernel (DeepSeek V2/V3).
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct MLADecodeKey {
+    pub dtype: KernelDtype,
+    pub head_dim_ckv: u32,
+    pub head_dim_kpe: u32,
+}
+
+/// Key for MLA paged attention kernel.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct MLAPagedKey {
+    pub dtype: KernelDtype,
+    pub head_dim_ckv: u32,
+    pub head_dim_kpe: u32,
+}
+
 /// Function pointers for a batch prefill variant.
 /// Each variant exports: plan, ragged_run, paged_run.
 pub struct PrefillVariant {
@@ -71,6 +87,18 @@ pub struct PrefillVariant {
 /// Function pointers for a batch decode variant.
 /// Each variant exports: plan, run.
 pub struct DecodeVariant {
+    pub plan: TVMSafeCallFn,
+    pub run: TVMSafeCallFn,
+}
+
+/// Function pointers for MLA decode.
+pub struct MLADecodeVariant {
+    pub plan: TVMSafeCallFn,
+    pub run: TVMSafeCallFn,
+}
+
+/// Function pointers for MLA paged attention.
+pub struct MLAPagedVariant {
     pub plan: TVMSafeCallFn,
     pub run: TVMSafeCallFn,
 }
@@ -138,6 +166,21 @@ impl KernelRegistry {
     /// Look up a batch decode variant.
     pub fn get_decode(&self, key: &DecodeKey) -> Option<DecodeVariant> {
         lookup_decode(key)
+    }
+
+    /// Look up an MLA decode variant (DeepSeek V2/V3).
+    pub fn get_mla_decode(&self, key: &MLADecodeKey) -> Option<MLADecodeVariant> {
+        lookup_mla_decode(key)
+    }
+
+    /// Look up an MLA paged attention variant.
+    pub fn get_mla_paged(&self, key: &MLAPagedKey) -> Option<MLAPagedVariant> {
+        lookup_mla_paged(key)
+    }
+
+    /// Look up a utility kernel by name (e.g., "softmax", "rmsnorm", "apply_rope").
+    pub fn get_utility(&self, name: &str) -> Option<TVMSafeCallFn> {
+        lookup_utility(name)
     }
 
     /// Set CUDA stream for subsequent kernel calls.

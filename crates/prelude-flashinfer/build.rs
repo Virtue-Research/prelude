@@ -23,6 +23,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_HEAD_DIMS");
     println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_DTYPES");
     println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_WORKERS");
+    println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_MLA_DIMS");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
@@ -267,6 +268,9 @@ fn generate_dispatch(
         std::fs::write(&path, concat!(
             "pub(crate) fn lookup_prefill(_key: &crate::loader::PrefillKey) -> Option<crate::loader::PrefillVariant> { None }\n",
             "pub(crate) fn lookup_decode(_key: &crate::loader::DecodeKey) -> Option<crate::loader::DecodeVariant> { None }\n",
+            "pub(crate) fn lookup_mla_decode(_key: &crate::loader::MLADecodeKey) -> Option<crate::loader::MLADecodeVariant> { None }\n",
+            "pub(crate) fn lookup_mla_paged(_key: &crate::loader::MLAPagedKey) -> Option<crate::loader::MLAPagedVariant> { None }\n",
+            "pub(crate) fn lookup_utility(_name: &str) -> Option<crate::loader::TVMSafeCallFn> { None }\n",
         ))?;
         return Ok(());
     }
@@ -296,7 +300,7 @@ fn generate_dispatch(
 
     // Prefill lookup
     writeln!(code, "pub(crate) fn lookup_prefill(key: &crate::loader::PrefillKey) -> Option<crate::loader::PrefillVariant> {{")?;
-    writeln!(code, "    use crate::loader::{{KernelDtype, Backend, PrefillVariant}};")?;
+    writeln!(code, "    use crate::loader::PrefillVariant;")?;
     writeln!(code, "    match (key.dtype as u8, key.head_dim_qk, key.head_dim_vo, key.sliding_window, key.logits_soft_cap, key.backend as u8) {{")?;
 
     for v in variants {
@@ -329,7 +333,7 @@ fn generate_dispatch(
 
     // Decode lookup
     writeln!(code, "pub(crate) fn lookup_decode(key: &crate::loader::DecodeKey) -> Option<crate::loader::DecodeVariant> {{")?;
-    writeln!(code, "    use crate::loader::{{KernelDtype, DecodeVariant}};")?;
+    writeln!(code, "    use crate::loader::DecodeVariant;")?;
     writeln!(code, "    match (key.dtype as u8, key.head_dim_qk, key.head_dim_vo, key.sliding_window, key.logits_soft_cap) {{")?;
 
     for v in variants {
@@ -349,6 +353,76 @@ fn generate_dispatch(
         writeln!(code,
             "        ({dtype_val}, {hdim_qk}, {hdim_vo}, {swa}, {softcap}) => Some(DecodeVariant {{ plan: {plan}, run: {run} }}),"
         )?;
+    }
+    writeln!(code, "        _ => None,")?;
+    writeln!(code, "    }}")?;
+    writeln!(code, "}}")?;
+    writeln!(code)?;
+
+    // MLA decode lookup
+    writeln!(code, "pub(crate) fn lookup_mla_decode(key: &crate::loader::MLADecodeKey) -> Option<crate::loader::MLADecodeVariant> {{")?;
+    writeln!(code, "    use crate::loader::MLADecodeVariant;")?;
+    writeln!(code, "    match (key.dtype as u8, key.head_dim_ckv, key.head_dim_kpe) {{")?;
+
+    for v in variants {
+        if v["kind"].as_str().unwrap() != "mla_decode" { continue; }
+        let symbols = v["symbols"].as_object().unwrap();
+        let plan = symbols["plan"].as_str().unwrap();
+        let run = symbols["run"].as_str().unwrap();
+
+        let dtype_val: u8 = match v["dtype"].as_str().unwrap() {
+            "fp16" => 1, _ => 0,
+        };
+        let ckv = v["head_dim_ckv"].as_u64().unwrap();
+        let kpe = v["head_dim_kpe"].as_u64().unwrap();
+
+        writeln!(code,
+            "        ({dtype_val}, {ckv}, {kpe}) => Some(MLADecodeVariant {{ plan: {plan}, run: {run} }}),"
+        )?;
+    }
+    writeln!(code, "        _ => None,")?;
+    writeln!(code, "    }}")?;
+    writeln!(code, "}}")?;
+    writeln!(code)?;
+
+    // MLA paged lookup
+    writeln!(code, "pub(crate) fn lookup_mla_paged(key: &crate::loader::MLAPagedKey) -> Option<crate::loader::MLAPagedVariant> {{")?;
+    writeln!(code, "    use crate::loader::MLAPagedVariant;")?;
+    writeln!(code, "    match (key.dtype as u8, key.head_dim_ckv, key.head_dim_kpe) {{")?;
+
+    for v in variants {
+        if v["kind"].as_str().unwrap() != "mla_paged" { continue; }
+        let symbols = v["symbols"].as_object().unwrap();
+        let plan = symbols["plan"].as_str().unwrap();
+        let run = symbols["run"].as_str().unwrap();
+
+        let dtype_val: u8 = match v["dtype"].as_str().unwrap() {
+            "fp16" => 1, _ => 0,
+        };
+        let ckv = v["head_dim_ckv"].as_u64().unwrap();
+        let kpe = v["head_dim_kpe"].as_u64().unwrap();
+
+        writeln!(code,
+            "        ({dtype_val}, {ckv}, {kpe}) => Some(MLAPagedVariant {{ plan: {plan}, run: {run} }}),"
+        )?;
+    }
+    writeln!(code, "        _ => None,")?;
+    writeln!(code, "    }}")?;
+    writeln!(code, "}}")?;
+    writeln!(code)?;
+
+    // Utility kernel lookup
+    writeln!(code, "pub(crate) fn lookup_utility(name: &str) -> Option<crate::loader::TVMSafeCallFn> {{")?;
+    writeln!(code, "    match name {{")?;
+
+    for v in variants {
+        let kind = v["kind"].as_str().unwrap();
+        if !["page", "sampling", "norm", "rope", "cascade"].contains(&kind) { continue; }
+        let symbols = v["symbols"].as_object().unwrap();
+        for (name, sym) in symbols {
+            let s = sym.as_str().unwrap();
+            writeln!(code, "        \"{name}\" => Some({s}),")?;
+        }
     }
     writeln!(code, "        _ => None,")?;
     writeln!(code, "    }}")?;

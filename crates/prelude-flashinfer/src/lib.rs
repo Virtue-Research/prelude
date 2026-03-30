@@ -16,6 +16,7 @@ pub mod loader;
 pub mod types;
 
 pub use loader::{
-    Backend, DecodeKey, DecodeVariant, KernelDtype, KernelRegistry, MaskMode,
-    PrefillKey, PrefillVariant, TVMSafeCallFn,
+    Backend, DecodeKey, DecodeVariant, KernelDtype, KernelRegistry,
+    MLADecodeKey, MLADecodeVariant, MLAPagedKey, MLAPagedVariant,
+    MaskMode, PrefillKey, PrefillVariant, TVMSafeCallFn,
 };
