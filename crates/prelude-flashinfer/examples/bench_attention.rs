@@ -374,9 +374,7 @@ fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
     }
 
     // FP8 E4M3 prefill (SM90+)
-    // TODO: FP8 TMA descriptor creation fails with error 719 (CUDA_ERROR_INVALID_VALUE)
-    // on some configurations. Needs investigation of swizzle mode for FP8 types.
-    if false && reg.arch() >= 90 {
+    if reg.arch() >= 90 {
         let key = FP8PrefillKey { head_dim: 128, sliding_window: false };
         if let Some(variant) = reg.get_fp8_prefill(&key) {
             println!("\n=== Prefill FP8 E4M3 (causal, SM90) vs FA3 BF16 ===");

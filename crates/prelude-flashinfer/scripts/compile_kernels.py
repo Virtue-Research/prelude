@@ -880,6 +880,7 @@ def compile_source(
         "nvcc", "-c", str(src), "-o", str(obj),
         "-std=c++17", "--expt-relaxed-constexpr",
         "-DFLASHINFER_ENABLE_BF16", "-DFLASHINFER_ENABLE_F16", "-DFLASHINFER_ENABLE_FP8",
+        "-DNDEBUG",
         "-O3", "--use_fast_math",
         "-Xcompiler", "-fPIC",
     ]
