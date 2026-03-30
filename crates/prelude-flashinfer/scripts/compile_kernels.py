@@ -613,7 +613,10 @@ def generate_utility_sources(
         ("fi_moe_routing",
          ["fused_moe/noAuxTcKernels.cu",
           "nv_internal/cpp/common/tllmException.cpp",
-          "nv_internal/cpp/common/stringUtils.cpp"],
+          "nv_internal/cpp/common/stringUtils.cpp",
+          "nv_internal/cpp/common/logger.cpp",
+          "nv_internal/cpp/common/envUtils.cpp",
+          "nv_internal/cpp/common/memoryUtils.cu"],
          None, "moe_routing",
          ["NoAuxTc"]),
     ]
