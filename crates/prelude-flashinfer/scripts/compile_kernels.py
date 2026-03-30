@@ -610,9 +610,11 @@ def generate_utility_sources(
           "rope_quantize", "rope_quantize_append_paged_kv_cache"]),
         ("fi_cascade", ["cascade.cu"], "flashinfer_cascade_binding.cu", "cascade",
          ["merge_state", "merge_state_in_place", "merge_states"]),
-        # NOTE: MoE routing (noAuxTcKernels.cu) is excluded because it depends
-        # on TensorRT-LLM internal headers that are only partially vendored in
-        # FlashInfer (missing cudaUtils.h, cudaBf16Wrapper.h, tllmException.h, etc.)
+        ("fi_moe_routing",
+         ["fused_moe/noAuxTcKernels.cu",
+          "nv_internal/cpp/common/tllmException.cpp"],
+         None, "moe_routing",
+         ["NoAuxTc"]),
     ]
 
     for dir_name, src_files, binding_file, kind, symbols in modules:
@@ -854,8 +856,9 @@ def compile_source(
     include_dirs = [
         str(fi_src / "include"),
         str(fi_src / "csrc"),
-        str(fi_src / "csrc" / "nv_internal"),  # vendored TRT-LLM headers
-        str(fi_src / "csrc" / "fused_moe"),    # MoE helper headers
+        str(fi_src / "csrc" / "nv_internal"),          # vendored TRT-LLM impl headers
+        str(fi_src / "csrc" / "nv_internal" / "include"),  # vendored TRT-LLM public headers
+        str(fi_src / "csrc" / "fused_moe"),            # MoE helper headers
         str(src.parent),  # for config .inc files
     ]
     # CUTLASS headers (needed for SM90/Hopper kernels)
@@ -936,7 +939,7 @@ def build_variant_matrix(
 
     variants = []
     sm80_flags = ["-gencode", "arch=compute_80,code=compute_80",
-                  "-gencode", "arch=compute_90,code=sm_90"]
+                  "-gencode", "arch=compute_90a,code=sm_90a"]
     sm90_flags = ["-gencode", "arch=compute_90a,code=sm_90a"]
     has_sm90 = any(a >= 90 for a in archs)
 
@@ -1059,8 +1062,9 @@ def main():
                         help="Path to FlashInfer source")
     parser.add_argument("--out-dir", type=Path, required=True,
                         help="Output directory for .o files and manifest")
-    parser.add_argument("-j", "--workers", type=int, default=4,
-                        help="Parallel compilation workers")
+    parser.add_argument("-j", "--workers", type=int,
+                        default=os.cpu_count() or 8,
+                        help="Parallel compilation workers (default: all CPUs)")
     parser.add_argument("--archs", type=str, default="sm_80,sm_90",
                         help="Target SM architectures")
     parser.add_argument("--head-dims", type=str, default="64,96,128,192,256",
@@ -1165,8 +1169,9 @@ def main():
             compile_jobs.append((src, v["arch_flags"], extra, v))
 
     # Utility kernels (non-templated, compiled once)
+    # Use sm_90a (arch-specific) to satisfy arch_condition.h check in CUDA 12.9+
     sm80_flags = ["-gencode", "arch=compute_80,code=compute_80",
-                  "-gencode", "arch=compute_90,code=sm_90"]
+                  "-gencode", "arch=compute_90a,code=sm_90a"]
     utility_variants = generate_utility_sources(fi_src, gen_dir)
 
     # Activation fusions (silu_and_mul, gelu_and_mul, gelu_tanh_and_mul)

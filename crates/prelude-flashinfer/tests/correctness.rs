@@ -255,6 +255,12 @@ fn activation_kernel_lookup() {
 }
 
 #[test]
+fn moe_routing_kernel_lookup() {
+    let reg = KernelRegistry::new();
+    assert!(reg.get_utility("NoAuxTc").is_some(), "NoAuxTc (MoE routing) not found");
+}
+
+#[test]
 fn utility_kernel_lookup() {
     let reg = KernelRegistry::new();
 

@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/prelude-core", "crates/prelude-server", "crates/prelude-microbench", "crates/prelude-cutlass-gemm", "crates/prelude-deepgemm"]
-exclude = ["crates/candle-core", "crates/candle-paged-attn", "crates/candle-flash-attn-v3", "crates/prelude-flash-attn-v4", "crates/prelude-flashinfer"]
+members = ["crates/prelude-core", "crates/prelude-server", "crates/prelude-microbench", "crates/prelude-cutlass-gemm", "crates/prelude-deepgemm", "crates/prelude-flashinfer"]
+exclude = ["crates/candle-core", "crates/candle-paged-attn", "crates/candle-flash-attn-v3", "crates/prelude-flash-attn-v4"]
 resolver = "2"
 
 [workspace.package]
