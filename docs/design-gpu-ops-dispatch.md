@@ -1012,6 +1012,72 @@ fn sp_attention(x: &Tensor, ops: &Ops) -> Result<Tensor> {
 
 **Ring attention:** Rotate K/V between neighbors. Each rank computes partial attention and accumulates. Requires custom attention loop — not expressible through `AttentionOps` alone. Model owns the ring loop and calls `CommOps` for send/recv between steps.
 
+### Expert Parallelism (EP)
+
+EP distributes **complete experts** across ranks for MoE models (vs TP which shards each expert's weights). A model with 256 experts on EP=8 gives each rank 32 experts.
+
+**Three-phase pattern: dispatch → compute → combine**
+
+```
+Phase 1 — DISPATCH: Route tokens to expert-owning ranks (all-to-all)
+    Router selects top-K experts per token
+    All-to-all sends each token to the rank that owns its expert
+
+Phase 2 — COMPUTE: Local grouped GEMM on owned experts
+    Each rank runs grouped_gemm on its local experts
+    Only processes tokens routed to its experts
+
+Phase 3 — COMBINE: Send results back to original ranks (all-to-all)
+    Reverse all-to-all returns expert outputs to token-owning ranks
+    Results weighted by router scores and summed
+```
+
+In our design, EP is a **model-level building block** using `CommOps` + `GemmOps`:
+
+```rust
+struct MoELayer {
+    gate: MoeGate,                     // router
+    expert_weights: Tensor,            // [num_local_experts, N, K]
+    ep_size: usize,                    // expert parallel world size
+    ep_rank: usize,                    // this rank's EP index
+}
+
+impl MoELayer {
+    fn forward(&self, x: &Tensor, ops: &Ops) -> Result<Tensor> {
+        // 1. Route: select top-K experts per token
+        let (topk_ids, topk_weights) = self.gate.route(x)?;
+
+        if self.ep_size > 1 {
+            // 2. Dispatch: all-to-all sends tokens to expert owners
+            let (recv_tokens, recv_meta) = ep_dispatch(x, &topk_ids, ops)?;
+
+            // 3. Compute: local grouped GEMM on owned experts
+            let expert_out = ops.gemm.grouped_gemm(
+                &recv_tokens, &self.expert_weights,
+                &recv_meta.sorted_ids, &recv_meta.expert_ids, &recv_meta.num_tokens,
+            )?;
+
+            // 4. Combine: all-to-all sends results back
+            ep_combine(&expert_out, &recv_meta, &topk_weights, ops)
+        } else {
+            // EP=1: standard local MoE (same as Qwen3 example)
+            ops.gemm.grouped_gemm(x, &self.expert_weights, ..)
+        }
+    }
+}
+
+/// EP dispatch: all-to-all to send tokens to expert-owning ranks.
+fn ep_dispatch(x: &Tensor, topk_ids: &Tensor, ops: &Ops) -> Result<(Tensor, DispatchMeta)> {
+    let (send_counts, recv_counts) = compute_dispatch_layout(topk_ids, ops.comm.ep_size())?;
+    let recv_tokens = ops.comm.all_to_all(x, &send_counts, &recv_counts)?;
+    Ok((recv_tokens, DispatchMeta { .. }))
+}
+```
+
+**EP + TP combined:** When EP=8 and TP=2 on 16 GPUs, experts are distributed across 8 EP ranks, and each expert's weight is sharded across 2 TP ranks. After expert compute, results are all-reduced across the TP group.
+
+**Multiple dispatch backends:** The `all_to_all` in `CommOps` is the base primitive. Production systems use specialized backends (DeepEP for NVLink+RDMA, FlashInfer, Mooncake for elastic EP) that fuse quantization + communication for higher throughput. These can be exposed as device-specific optimizations on `CudaOps`, similar to how `CudaOps::precompute_paged_plan_graphed` is CUDA-specific.
+
 ## LoRA (Low-Rank Adaptation)
 
 Multi-LoRA serving: a single batch contains tokens from different LoRA adapters.
@@ -1325,6 +1391,7 @@ Model code never changes — the dispatch layer absorbs all device differences.
 | TPU (XLA) | `TpuOps`: static shapes, Pallas attention, XLA auto-fuses element-wise chains |
 | ROCm arch variation | `RocmArch` enum (gfx942/950/1100), FP8 format auto-selected per arch |
 | Tensor parallelism | `CommOps` trait (all_reduce, all_gather), attention ops are TP-agnostic |
+| Expert parallelism | `CommOps::all_to_all` for dispatch/combine, `GemmOps::grouped_gemm` for local compute |
 | Sequence parallelism | `CommOps::reduce_scatter` + `all_gather` around local attention |
 | Multi-LoRA serving | `FusedOps::fused_lora_matmul` (BGMV/Punica), fallback to per-adapter matmul |
 | Speculative decoding | Engine-level; tree attention via `MaskType::Custom(Tensor)` |
