@@ -442,31 +442,316 @@ impl FusedOps for CudaOps {
 
 ### ROCm
 
+HIP is largely a CUDA translation layer (llama.cpp recompiles all CUDA kernels as HIP),
+but production inference uses dedicated AMD libraries: Composable Kernels (CK) for attention,
+aiter for flash attention on MI300/MI350, hipBLAS for GEMM.
+
+Key constraints:
+- **Wave size**: CDNA (MI300/MI350) = wave64, RDNA (RX 7000/9000) = wave32.
+- **LDS (shared memory)**: MI300 = 64KB, MI350 = 160KB. Kernel tile sizes must vary.
+- **FP8 format**: MI300 (gfx942) uses FNUZ, MI350 (gfx950) uses E4M3. Both need support.
+- **Flash attention**: aiter library (gfx942/gfx950 only), CK flash attn, or CUDA-translated kernels.
+
 ```rust
 struct RocmOps {
-    ck_flash: CKFlashAttnHandle,
-    rocblas: RocblasHandle,
+    arch: RocmArch,                       // gfx942, gfx950, gfx1100, ...
+    ck_flash: Option<CKFlashAttnHandle>,  // CK flash attention (CDNA only)
+    aiter: Option<AiterHandle>,           // aiter flash attention (gfx942/950)
+    hipblas: HipblasHandle,
+}
+
+/// AMD GPU architecture. Determines available kernels and tuning.
+enum RocmArch {
+    Gfx942,   // MI300/MI325X (CDNA3, wave64, 64KB LDS, FP8 FNUZ)
+    Gfx950,   // MI350 (CDNA4, wave64, 160KB LDS, FP8 E4M3+FNUZ)
+    Gfx1100,  // RX 7900 (RDNA3, wave32, WMMA, no MFMA)
+    Gfx1200,  // RX 9000 (RDNA4, wave32)
 }
 
 impl AttentionOps for RocmOps {
     fn varlen_attention(&self, q, k, v, params) -> Result<Tensor> {
-        self.ck_flash.varlen(q, k, v, params)
+        // aiter: best on MI300/MI350
+        if let Some(aiter) = &self.aiter {
+            return aiter.varlen(q, k, v, params);
+        }
+        // CK flash attention: CDNA fallback
+        if let Some(ck) = &self.ck_flash {
+            return ck.varlen(q, k, v, params);
+        }
+        // hipBLAS SDPA: universal fallback
+        hip::sdpa_varlen(q, k, v, params)
     }
+
     fn paged_attention(&self, q, key_cache, value_cache, params) -> Result<Tensor> {
-        self.ck_flash.paged(q, key_cache, value_cache, params)
+        if let Some(aiter) = &self.aiter {
+            return aiter.paged(q, key_cache, value_cache, params);
+        }
+        if let Some(ck) = &self.ck_flash {
+            return ck.paged(q, key_cache, value_cache, params);
+        }
+        bail!("paged attention requires CK or aiter on ROCm")
+    }
+}
+
+impl GemmOps for RocmOps {
+    fn matmul(&self, a, b) -> Result<Tensor> {
+        self.hipblas.gemm(a, b)
+    }
+    fn quantized_matmul(&self, a, b, scale_a, scale_b, quant) -> Result<Tensor> {
+        match quant {
+            QuantScheme::Fp8E4m3 => match self.arch {
+                RocmArch::Gfx942 => hip::fp8_fnuz_gemm(a, b, scale_a, scale_b),
+                RocmArch::Gfx950 => hip::fp8_e4m3_gemm(a, b, scale_a, scale_b),
+                _ => bail!("FP8 GEMM requires MI300+ (gfx942+)"),
+            },
+            _ => hip::quantized_gemm(a, b, scale_a, scale_b, quant),
+        }
     }
 }
 
 impl FusedOps for RocmOps {
-    // ROCm has no fused qknorm_rope kernel yet
-    fn fused_qknorm_rope(&self, ..) -> Option<Result<..>> { None }
     fn fused_add_rmsnorm(&self, ..) -> Option<Result<..>> { Some(hip::fused_add_rmsnorm(..)) }
     fn fused_silu_mul(&self, ..) -> Option<Result<..>> { None }
+    fn fused_qknorm_rope(&self, ..) -> Option<Result<..>> { None }
     fn fused_knorm_rope_cache_write(&self, ..) -> Option<Result<..>> { None }
-    fn fused_adaln_zero(&self, ..) -> Option<Result<..>> { None }  // TODO: CK may add this
+    fn fused_adaln_zero(&self, ..) -> Option<Result<..>> { None }
     fn fused_scale_shift(&self, ..) -> Option<Result<..>> { None }
 }
 ```
+
+### Metal (Apple Silicon)
+
+Metal is mature for on-device inference (llama.cpp has 67 Metal ops including flash attention).
+Key characteristics:
+- **Unified memory**: CPU/GPU share address space. No explicit transfers.
+- **Simdgroup** (warp equivalent) = 32 threads. Simdgroup matrix multiply on Apple7+.
+- **No streams**: single command queue, concurrency via operator reordering + memory barriers.
+- **BFloat16**: Metal3+ / Apple6+ (M1 and later). No FP64.
+- **Quantization**: excellent — Q4_0/1, Q5_0/1, Q8_0, Q4_K/Q5_K/Q6_K, IQ4_NL, MXFP4 all in MSL.
+- **No paged KV cache** in current llama.cpp Metal. Contiguous KV only.
+- **No CUDA-like tensor cores**, but simdgroup_multiply_accumulate provides cooperative matmul.
+
+```rust
+struct MetalOps {
+    device: MetalDevice,       // MTLDevice handle
+    has_simdgroup_mm: bool,    // Apple7+ — cooperative matmul
+    has_bfloat: bool,          // Metal3+ / Apple6+
+    max_threadgroup_mem: usize, // typically 32KB
+}
+
+impl AttentionOps for MetalOps {
+    fn varlen_attention(&self, q, k, v, params) -> Result<Tensor> {
+        // Metal flash attention (MSL compute shader, simdgroup-based tiling)
+        metal::flash_attn_varlen(q, k, v, params)
+    }
+    fn paged_attention(&self, ..) -> Result<Tensor> {
+        // Paged KV not yet implemented on Metal.
+        // For on-device: use varlen_attention with contiguous KV.
+        bail!("paged attention not supported on Metal — use varlen_attention with contiguous KV")
+    }
+}
+
+impl GemmOps for MetalOps {
+    fn matmul(&self, a, b) -> Result<Tensor> {
+        if self.has_simdgroup_mm {
+            metal::simdgroup_matmul(a, b)  // cooperative matrix path
+        } else {
+            metal::scalar_matmul(a, b)      // fallback
+        }
+    }
+    fn quantized_matmul(&self, a, b, scale_a, scale_b, quant) -> Result<Tensor> {
+        // Metal has excellent quantized matmul — in-shader dequant + compute
+        metal::quantized_matmul(a, b, scale_a, scale_b, quant)
+    }
+}
+
+impl NormOps for MetalOps {
+    fn rms_norm(&self, x, weight, eps) -> Result<Tensor> { metal::rms_norm(x, weight, eps) }
+    fn layer_norm(&self, x, weight, bias, eps) -> Result<Tensor> { metal::layer_norm(x, weight, bias, eps) }
+    fn group_norm(&self, x, weight, bias, groups, eps) -> Result<Tensor> { metal::group_norm(x, weight, bias, groups, eps) }
+}
+
+impl FusedOps for MetalOps {
+    // Metal can fuse some ops (RoPE is a single shader, RMSNorm+add can be one shader)
+    fn fused_add_rmsnorm(&self, ..) -> Option<Result<..>> { Some(metal::fused_add_rmsnorm(..)) }
+    fn fused_silu_mul(&self, ..) -> Option<Result<..>> { Some(metal::fused_silu_mul(..)) }
+    fn fused_qknorm_rope(&self, ..) -> Option<Result<..>> { None }
+    fn fused_knorm_rope_cache_write(&self, ..) -> Option<Result<..>> { None }
+    fn fused_adaln_zero(&self, ..) -> Option<Result<..>> { None } // can add later as MSL shader
+    fn fused_scale_shift(&self, ..) -> Option<Result<..>> { None }
+}
+
+impl OpsSession for MetalOps {
+    fn begin_forward(&self) {}   // no plan cache needed
+    fn end_forward(&self) {}
+    fn precompute_paged_plan(&self, ..) -> Result<()> { Ok(()) }
+}
+```
+
+### Vulkan
+
+Cross-vendor GPU compute (AMD, Intel, Nvidia, Qualcomm, mobile).
+llama.cpp has a production-ready Vulkan backend with 151 GLSL compute shaders.
+
+Key characteristics:
+- **SPIR-V shaders**: GLSL → SPIR-V at build time. Specialization constants for tile sizes.
+- **Subgroup operations**: warp-like, but subgroup size varies (32 Nvidia/AMD, 16 Intel Arc).
+- **Cooperative matrix**: optional extension (VK_KHR_cooperative_matrix) — Nvidia only currently.
+- **Shared memory**: explicit `shared` arrays in compute shaders (~96KB max per workgroup).
+- **Descriptor sets**: buffer bindings per pipeline (overhead vs CUDA kernel args).
+- **No paged attention**: confirmed. No vLLM/sglang Vulkan support either.
+- **Flash attention**: yes — scalar path + cooperative matrix paths (Nvidia).
+- **Quantization**: full coverage (Q4_0 through IQ4_NL, MXFP4).
+- **BFloat16**: requires VK_KHR_shader_bfloat16 extension (not universal).
+
+Best for edge/mobile inference with quantized models. Not suited for data center serving
+(no paged attention, no async compute guarantees, descriptor binding overhead).
+
+```rust
+struct VulkanOps {
+    device: VulkanDevice,
+    has_cooperative_matrix: bool,  // VK_KHR_cooperative_matrix (Nvidia)
+    has_bfloat16: bool,           // VK_KHR_shader_bfloat16
+    subgroup_size: u32,           // 32 (Nvidia/AMD), 16 (Intel Arc), 64 (AMD GCN)
+    max_workgroup_shared_mem: u32, // typically 32-96KB
+}
+
+impl AttentionOps for VulkanOps {
+    fn varlen_attention(&self, q, k, v, params) -> Result<Tensor> {
+        if self.has_cooperative_matrix {
+            vk::flash_attn_coopmat(q, k, v, params)
+        } else {
+            vk::flash_attn_scalar(q, k, v, params)
+        }
+    }
+    fn paged_attention(&self, ..) -> Result<Tensor> {
+        bail!("paged attention not supported on Vulkan")
+    }
+}
+
+impl GemmOps for VulkanOps {
+    fn matmul(&self, a, b) -> Result<Tensor> {
+        // Dispatch by matrix size: small/medium/large tile strategies
+        if self.has_cooperative_matrix {
+            vk::matmul_coopmat(a, b)       // tensor-core-like path
+        } else {
+            vk::matmul_tiled(a, b)          // scalar tiled matmul
+        }
+    }
+    fn quantized_matmul(&self, a, b, scale_a, scale_b, quant) -> Result<Tensor> {
+        // In-shader dequant + compute (same approach as Metal)
+        vk::quantized_matmul(a, b, scale_a, scale_b, quant)
+    }
+}
+
+impl FusedOps for VulkanOps {
+    // Vulkan can fuse simple element-wise chains into single compute shaders
+    fn fused_add_rmsnorm(&self, ..) -> Option<Result<..>> { Some(vk::fused_add_rmsnorm(..)) }
+    fn fused_silu_mul(&self, ..) -> Option<Result<..>> { Some(vk::fused_silu_mul(..)) }
+    fn fused_qknorm_rope(&self, ..) -> Option<Result<..>> { None }
+    fn fused_knorm_rope_cache_write(&self, ..) -> Option<Result<..>> { None }
+    fn fused_adaln_zero(&self, ..) -> Option<Result<..>> { None }
+    fn fused_scale_shift(&self, ..) -> Option<Result<..>> { None }
+}
+
+impl OpsSession for VulkanOps {
+    fn begin_forward(&self) {}   // no plan cache
+    fn end_forward(&self) {}
+    fn precompute_paged_plan(&self, ..) -> Result<()> { Ok(()) }
+}
+```
+
+### TPU (via XLA/Pallas)
+
+Fundamentally different execution model from all other devices:
+- **No imperative execution**: all ops compiled to XLA HLO IR, then optimized and executed.
+- **Static shapes required**: batch and sequence dimensions must be padded to fixed sizes.
+- **Paged attention supported**: via JAX Pallas kernels (custom TPU kernels in XLA).
+- **Head size alignment**: must be multiple of 128 bytes (MXU constraint).
+- **BF16 native**: recommended dtype. FP16 emulated (slower). No FP64.
+- **No custom GPU kernels**: everything goes through XLA ops or Pallas.
+- **Compilation caching**: expensive first-run compilation, fast replays. OpsSession maps to this.
+- **SPMD**: distributed execution via sharding annotations, not explicit all-reduce.
+
+The trait interface works for TPU — the TpuOps implementation internally:
+1. Builds XLA computation graphs from op calls.
+2. Pads dynamic shapes to static sizes.
+3. Caches compiled HLO programs keyed by shape signature.
+4. Executes via PJRT (Portable JAX Runtime).
+
+```rust
+struct TpuOps {
+    pjrt_client: PjrtClient,              // XLA runtime
+    pallas_attn: PallasFlashAttn,         // Pallas flash attention kernel
+    compiled_cache: CompiledProgramCache,  // HLO → compiled executable cache
+    page_size: usize,                      // 16-256, varies by max_model_len
+}
+
+impl AttentionOps for TpuOps {
+    fn varlen_attention(&self, q, k, v, params) -> Result<Tensor> {
+        // Pallas flash attention — pad heads to 128-byte alignment
+        let q = self.pad_head_dim(q)?;
+        let k = self.pad_head_dim(k)?;
+        let v = self.pad_head_dim(v)?;
+        self.pallas_attn.varlen(q, k, v, params)
+    }
+
+    fn paged_attention(&self, q, key_cache, value_cache, params) -> Result<Tensor> {
+        // TPU supports paged attention via Pallas ragged_paged_attention
+        let q = self.pad_head_dim(q)?;
+        self.pallas_attn.ragged_paged(q, key_cache, value_cache, params)
+    }
+}
+
+impl GemmOps for TpuOps {
+    fn matmul(&self, a, b) -> Result<Tensor> {
+        // XLA dot_general — compiled and optimized for MXU (128x128 systolic array)
+        xla::dot_general(a, b)
+    }
+    fn quantized_matmul(&self, a, b, scale_a, scale_b, quant) -> Result<Tensor> {
+        match quant {
+            QuantScheme::Int8 => xla::int8_matmul(a, b, scale_a, scale_b),
+            QuantScheme::Fp8E4m3 => xla::fp8_matmul(a, b, scale_a, scale_b),
+            _ => bail!("W4A16/W4A4 not natively supported on TPU — use INT8 or FP8"),
+        }
+    }
+}
+
+impl FusedOps for TpuOps {
+    // XLA auto-fuses many element-wise patterns during HLO optimization.
+    // Explicit FusedOps methods return None — XLA handles fusion internally.
+    // This means the model's fallback path (separate ops) is actually optimal on TPU
+    // because XLA will fuse them during compilation anyway.
+    fn fused_add_rmsnorm(&self, ..) -> Option<Result<..>> { None }
+    fn fused_silu_mul(&self, ..) -> Option<Result<..>> { None }
+    fn fused_qknorm_rope(&self, ..) -> Option<Result<..>> { None }
+    fn fused_knorm_rope_cache_write(&self, ..) -> Option<Result<..>> { None }
+    fn fused_adaln_zero(&self, ..) -> Option<Result<..>> { None }
+    fn fused_scale_shift(&self, ..) -> Option<Result<..>> { None }
+}
+
+impl OpsSession for TpuOps {
+    fn begin_forward(&self) {
+        // Mark start of XLA tracing scope.
+        // Ops called between begin/end are traced into a single HLO program.
+        self.compiled_cache.begin_trace();
+    }
+    fn end_forward(&self) {
+        // Compile traced program (or retrieve from cache), execute on TPU.
+        self.compiled_cache.end_trace_and_execute();
+    }
+    fn precompute_paged_plan(&self, block_tables, cu_seqlens_k, block_size, graph_buffers) -> Result<()> {
+        // Pallas KV cache update — write scheduling metadata.
+        // Uses TPU VMEM (software-managed scratch) for DMA-efficient page table access.
+        self.pallas_attn.precompute_plan(block_tables, cu_seqlens_k, block_size)
+    }
+}
+```
+
+**Why FusedOps returns `None` on TPU:** XLA's HLO optimizer automatically fuses
+element-wise op sequences (add + norm, silu * mul, etc.) during compilation.
+The model's explicit fallback path (calling separate NormOps + ActivationOps)
+produces the same fused kernel after XLA compilation. No manual fusion needed.
 
 ### CPU
 
@@ -601,23 +886,82 @@ fn create_ops(device: &Device, config: &OpsConfig) -> Ops {
         DeviceType::Cuda => {
             let cuda = Arc::new(CudaOps::new(config));
             Ops {
-                attn: cuda.clone(),
-                kv_cache: cuda.clone(),
-                gemm: cuda.clone(),
-                norm: cuda.clone(),
-                act: cuda.clone(),
-                conv: cuda.clone(),
-                fused: cuda.clone(),
-                session: cuda,
+                attn: cuda.clone(), kv_cache: cuda.clone(), gemm: cuda.clone(),
+                norm: cuda.clone(), act: cuda.clone(), conv: cuda.clone(),
+                fused: cuda.clone(), session: cuda,
             }
         }
-        DeviceType::Rocm => { /* similar with RocmOps */ }
-        DeviceType::Cpu => { /* CpuOps */ }
+        DeviceType::Rocm => {
+            let rocm = Arc::new(RocmOps::new(config));
+            Ops {
+                attn: rocm.clone(), kv_cache: rocm.clone(), gemm: rocm.clone(),
+                norm: rocm.clone(), act: rocm.clone(), conv: rocm.clone(),
+                fused: rocm.clone(), session: rocm,
+            }
+        }
+        DeviceType::Metal => {
+            let metal = Arc::new(MetalOps::new(config));
+            Ops {
+                attn: metal.clone(), kv_cache: metal.clone(), gemm: metal.clone(),
+                norm: metal.clone(), act: metal.clone(), conv: metal.clone(),
+                fused: metal.clone(), session: metal,
+            }
+        }
+        DeviceType::Vulkan => {
+            let vk = Arc::new(VulkanOps::new(config));
+            Ops {
+                attn: vk.clone(), kv_cache: vk.clone(), gemm: vk.clone(),
+                norm: vk.clone(), act: vk.clone(), conv: vk.clone(),
+                fused: vk.clone(), session: vk,
+            }
+        }
+        DeviceType::Tpu => {
+            let tpu = Arc::new(TpuOps::new(config));
+            Ops {
+                attn: tpu.clone(), kv_cache: tpu.clone(), gemm: tpu.clone(),
+                norm: tpu.clone(), act: tpu.clone(), conv: tpu.clone(),
+                fused: tpu.clone(), session: tpu,
+            }
+        }
+        DeviceType::Cpu => {
+            let cpu = Arc::new(CpuOps);
+            Ops {
+                attn: cpu.clone(), kv_cache: cpu.clone(), gemm: cpu.clone(),
+                norm: cpu.clone(), act: cpu.clone(), conv: cpu.clone(),
+                fused: cpu.clone(), session: cpu,
+            }
+        }
     }
 }
 ```
 
 All fields populated for every device. Methods on unsupported ops return errors (`bail!("paged attention not supported on {device}")`) rather than panicking or silently degrading.
+
+## Device Capability Matrix
+
+What each device supports today. "Planned" = not yet implemented but feasible.
+
+| Capability | CUDA | ROCm | Metal | Vulkan | TPU | CPU |
+|------------|------|------|-------|--------|-----|-----|
+| **varlen_attention** | FA4 / FlashInfer | CK / aiter | MSL flash attn | GLSL flash attn | Pallas | matmul SDPA |
+| **paged_attention** | FlashInfer | CK / aiter | — | — | Pallas ragged | — |
+| **matmul** | DeepGEMM/CUTLASS/cuBLAS | hipBLAS | simdgroup mm | tiled / coopmat | XLA dot_general | BLAS |
+| **quantized_matmul** | DeepGEMM FP8, CUTLASS INT8 | hipBLAS FP8 | in-shader dequant (Q4-Q8, IQ) | in-shader dequant (Q4-Q8, IQ) | XLA INT8/FP8 | dequant + BLAS |
+| **rms_norm** | fused CUDA | HIP kernel | MSL shader | GLSL shader | XLA auto-fuse | vectorized |
+| **layer_norm** | fused CUDA | HIP kernel | MSL shader | GLSL shader | XLA auto-fuse | vectorized |
+| **group_norm** | fused CUDA | HIP kernel | MSL shader | GLSL shader | XLA auto-fuse | vectorized |
+| **conv1d / conv2d** | cuDNN / custom | hipDNN | MSL shader | GLSL shader | XLA conv | fallback |
+| **fused_add_rmsnorm** | FlashInfer kernel | HIP kernel | MSL shader | GLSL shader | XLA auto-fuse | vectorized |
+| **fused_adaln_zero** | Triton/CUDA kernel | — (planned) | — (planned) | — | XLA auto-fuse | — |
+| **fused_qknorm_rope** | FlashInfer kernel | — | — | — | — | — |
+| **OpsSession** | FlashInfer plan cache | no-op | no-op | no-op | XLA compile cache | no-op |
+| **CUDA graphs** | yes | HIP graphs (6.1+) | — | — | — | — |
+| **BFloat16** | SM80+ | all CDNA | Apple6+/Metal3+ | extension req'd | native | optional |
+| **FP8** | SM89+ | gfx942 (FNUZ), gfx950 (E4M3) | — | — | v5e+ | — |
+
+**Key insight:** The trait interface is the same across all devices. The difference is which
+methods return real results vs errors, and which `FusedOps` return `Some` vs `None`.
+Model code never changes — the dispatch layer absorbs all device differences.
 
 ## Summary
 
@@ -635,6 +979,10 @@ All fields populated for every device. Methods on unsupported ops return errors 
 | Chunked prefill | `paged_attention` with `max_seqlen_q > 1`, varlen kernel handles mixed Q lengths |
 | AdaLN (diffusion) | `FusedOps::fused_adaln_zero` / `fused_scale_shift`, `None` fallback to separate ops |
 | Quantized inference | `GemmOps::quantized_matmul` with `QuantScheme` dispatch |
+| Metal (Apple) | `MetalOps`: flash attn + quantized matmul via MSL; no paged attention |
+| Vulkan (cross-vendor) | `VulkanOps`: flash attn + quantized matmul via SPIR-V; edge/mobile focus |
+| TPU (XLA) | `TpuOps`: static shapes, Pallas attention, XLA auto-fuses element-wise chains |
+| ROCm arch variation | `RocmArch` enum (gfx942/950/1100), FP8 format auto-selected per arch |
 
 ## Model Examples
 
@@ -971,5 +1319,177 @@ impl QuantizedLinear {
 ```
 
 On CUDA: routes to DeepGEMM FP8 (SM90+) or cuBLAS FP8.
-On ROCm: routes to CK FP8 GEMM or hipBLASLt FP8.
+On ROCm: routes to hipBLAS FP8 (gfx942 FNUZ or gfx950 E4M3 auto-selected).
 On CPU: `quantized_matmul` dequantizes and falls back to BLAS.
+
+### Example 7: Llama-3-8B on Apple M4 (Metal, Q4_K Quantized)
+
+On-device inference with 4-bit quantized weights on Apple Silicon.
+Uses Metal compute shaders (MSL) with simdgroup matrix multiply.
+
+```rust
+// Same model code as any other device — only Ops differ.
+// Weights are loaded as Q4_K quantized tensors.
+
+struct QuantizedLinear {
+    weight_q4k: Tensor,      // [N, K] in Q4_K (4-bit with K-means, 32 elements per block)
+    weight_scale: Tensor,    // per-group scales
+}
+
+impl QuantizedLinear {
+    fn forward(&self, x: &Tensor, ops: &Ops) -> Result<Tensor> {
+        // Metal dequantizes in-shader during compute (no separate dequant pass)
+        ops.gemm.quantized_matmul(
+            x, &self.weight_q4k,
+            None, Some(&self.weight_scale),
+            QuantScheme::W4A16 { group_size: 32 },
+        )
+    }
+}
+
+// Model forward is identical to CUDA/ROCm version
+fn forward(x: &Tensor, ops: &Ops) -> Result<Tensor> {
+    let h = ops.norm.rms_norm(x, &self.ln, eps)?;
+    let qkv = self.qkv_proj.forward(&h, ops)?;  // quantized matmul via Metal
+    let (q, k, v) = split_qkv(&qkv, 32, 8);
+    let (q, k) = apply_rope(&q, &k, &cos, &sin)?;
+
+    // Metal flash attention (MSL compute shader, simdgroup tiling)
+    // No paged KV — uses contiguous varlen attention
+    let o = ops.attn.varlen_attention(&q, &k, &v, &VarlenParams {
+        mask: MaskType::Causal,
+        ..
+    })?;
+    // ...
+}
+```
+
+Key points:
+- **Same model code** as CUDA. The only difference is `create_ops(DeviceType::Metal, ..)`.
+- **Unified memory**: no CPU→GPU transfers. Tensors allocated once, visible to both.
+- **Q4_K quantized matmul**: Metal MSL shader dequantizes in-register during compute. No separate dequant kernel — more memory-efficient than CUDA's approach for small batch.
+- **No paged attention**: Metal uses `varlen_attention` with contiguous KV. Acceptable for single-user on-device inference (no batching needed).
+- **No fused_qknorm_rope**: `FusedOps` returns `None`, model falls back to separate `rms_norm` + `apply_rope`. Correct, just uses 2 Metal dispatches instead of 1.
+
+### Example 8: Flux on Vulkan (Edge Diffusion, Cross-Vendor GPU)
+
+Running Flux image generation on an Intel Arc or AMD RX GPU via Vulkan.
+Same model code as CUDA Flux example — only device dispatch differs.
+
+```rust
+// Exactly the same FluxDoubleBlock code as Example 2.
+// On Vulkan:
+//   - fused_adaln_zero returns None → model uses layer_norm + scale + shift (3 shaders)
+//   - varlen_attention uses GLSL flash attention shader (scalar or cooperative matrix)
+//   - matmul uses tiled GLSL compute shader (or cooperative matrix on Nvidia)
+
+fn flux_forward_on_vulkan(img: &Tensor, txt: &Tensor, temb: &Tensor, ops: &Ops) -> Result<..> {
+    // AdaLN-Zero: fused_adaln_zero returns None on Vulkan
+    let img_normed = match ops.fused.fused_adaln_zero(img, &ln, None, &scale, &shift, &gate, eps) {
+        Some(r) => r?,
+        None => {
+            // Fallback: 3 separate Vulkan compute dispatches (layer_norm, scale, shift)
+            // Performance penalty ~10-20% vs fused kernel, but correct.
+            let n = ops.norm.layer_norm(img, &ln, None, eps)?;
+            let n = &n * &(1.0 + &scale)? + &shift;
+            (n, gate.clone())
+        }
+    };
+
+    // Joint attention: same GLSL flash attention shader, bidirectional
+    let q = cat(&[&txt_q, &img_q], 0)?;
+    let k = cat(&[&txt_k, &img_k], 0)?;
+    let v = cat(&[&txt_v, &img_v], 0)?;
+    let attn_out = ops.attn.varlen_attention(&q, &k, &v, &VarlenParams {
+        mask: MaskType::Bidirectional,
+        ..
+    })?;
+    // ...
+}
+```
+
+Key points:
+- **Same model code**. No `#[cfg(vulkan)]` anywhere.
+- **Fusion degrades gracefully**: `fused_adaln_zero` → `None` → 3 separate shaders. ~10-20% slower per block, but diffusion is latency-tolerant (20-50 denoising steps dominate).
+- **Flash attention works on Vulkan**: GLSL compute shader with configurable tile sizes via specialization constants. Performance ~60-70% of CUDA on comparable Nvidia hardware.
+- **Quantized weights**: Vulkan supports Q4_0 through IQ4_NL in-shader dequant — important for running Flux on 8GB consumer GPUs.
+- **Cross-vendor**: same binary runs on AMD, Intel, Nvidia, Qualcomm.
+
+### Example 9: Llama-3-70B on TPU v5e (XLA, Paged Attention)
+
+Data center inference on TPU with paged KV cache. Key difference:
+static shapes and XLA compilation.
+
+```rust
+// Same model code. TpuOps handles XLA constraints internally.
+
+fn forward(x: &Tensor, ops: &Ops, kv: &PagedKvCtx) -> Result<Tensor> {
+    let h = ops.norm.rms_norm(x, &self.ln, eps)?;      // → XLA rms_norm op
+    let qkv = ops.gemm.matmul(&h, &self.qkv_proj)?;    // → XLA dot_general (MXU)
+    let (q, k, v) = split_qkv(&qkv, 64, 8);
+    let (q, k) = apply_rope(&q, &k, &cos, &sin)?;
+
+    // KV cache write
+    ops.kv_cache.reshape_and_cache(&k, &v, &kv.cache_k, &kv.cache_v, &kv.slots)?;
+
+    // Paged attention — TPU supports this via Pallas
+    // TpuOps internally pads head_dim to 128-byte alignment
+    let o = ops.attn.paged_attention(&q, &kv.cache_k, &kv.cache_v, &PagedParams {
+        block_tables: kv.block_tables.clone(),
+        max_seqlen_q: 1,  // decode
+        ..
+    })?;
+
+    // MLP: fused_silu_mul returns None on TPU, but XLA auto-fuses the fallback
+    let gate = ops.gemm.matmul(&h, &self.gate_proj)?;
+    let up = ops.gemm.matmul(&h, &self.up_proj)?;
+    let h = match ops.fused.fused_silu_mul(&gate, &up) {
+        None => (ops.act.silu(&gate)? * &up)?,  // XLA fuses silu + mul automatically
+        Some(r) => r?,
+    };
+    ops.gemm.matmul(&h, &self.down_proj)
+}
+```
+
+Key points:
+- **Same model code** as CUDA. `TpuOps` handles shape padding and XLA compilation internally.
+- **Paged attention works on TPU** via Pallas `ragged_paged_attention`. Page size auto-computed (16 for long sequences, up to 256 for short).
+- **FusedOps all return `None`** — intentionally. XLA's HLO optimizer fuses element-wise chains (silu+mul, add+rmsnorm) automatically during compilation. The model's fallback path produces the same fused kernel.
+- **OpsSession maps to XLA compilation**: `begin_forward()` starts HLO tracing, `end_forward()` compiles and executes. Second call hits cache — near-zero overhead.
+- **Static shapes**: `TpuOps` pads batch/seq to nearest power-of-2 internally. Model code doesn't know.
+- **BF16 native**: TPU MXU is BF16. `matmul` on TPU is always BF16 accumulation → fastest path.
+
+### Example 10: Qwen3-4B on MI300X (ROCm, FP8 FNUZ)
+
+LLM inference on AMD MI300X with FP8 quantization. ROCm uses HIP flash attention
+and hipBLAS with architecture-specific FP8 format.
+
+```rust
+// Same model code. RocmOps auto-selects FP8 FNUZ for gfx942.
+
+fn forward(x: &Tensor, ops: &Ops, kv: &PagedKvCtx) -> Result<Tensor> {
+    let h = ops.norm.rms_norm(x, &self.ln, eps)?;     // HIP fused kernel
+
+    // FP8 quantized matmul — RocmOps detects gfx942, uses FNUZ format
+    let (h_fp8, act_scale) = quantize_per_token_fp8(h)?;
+    let qkv = ops.gemm.quantized_matmul(
+        &h_fp8, &self.qkv_fp8,
+        Some(&act_scale), Some(&self.qkv_scale),
+        QuantScheme::Fp8E4m3,  // RocmOps internally maps to FNUZ on gfx942
+    )?;
+
+    let (q, k, v) = split_qkv(&qkv, 32, 8);
+    let (q, k) = apply_rope(&q, &k, &cos, &sin)?;
+    ops.kv_cache.reshape_and_cache(&k, &v, &kv.cache_k, &kv.cache_v, &kv.slots)?;
+
+    // Paged attention — aiter flash attention on gfx942
+    let o = ops.attn.paged_attention(&q, &kv.cache_k, &kv.cache_v, &paged_params)?;
+    // ...
+}
+```
+
+Key points:
+- **Same model code** as CUDA FP8 example. `QuantScheme::Fp8E4m3` is device-agnostic.
+- **FP8 FNUZ auto-selected**: `RocmOps` detects gfx942, maps E4M3 request to FNUZ format internally. On gfx950, it would use native E4M3. Model doesn't know.
+- **aiter flash attention**: specialized for MI300/MI350. Falls back to CK on older AMD hardware.
+- **HIP graphs**: supported on ROCm 6.1+. `OpsSession` manages HIP graph capture/replay same as CUDA graphs.
