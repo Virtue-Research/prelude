@@ -2363,7 +2363,345 @@ Key points:
 - **No KV cache rollback needed** — rejected tokens have `slot_mapping = -1`, `reshape_and_cache` skips them.
 - **Engine-only concern** — model code is unchanged.
 
-### Example 17: Adding a New Fused Kernel (Developer Workflow)
+### Example 17: DeepSeek-V3 MLA (Multi-Head Latent Attention, Asymmetric Head Dims)
+
+MLA compresses KV into low-rank latents: `head_dim_q = 192` but `head_dim_kv = 128`.
+The implementation derives this from tensor shapes — no special params needed.
+
+```rust
+impl DeepSeekMLA {
+    fn forward(&self, x: &Tensor, ops: &Ops, kv: &PagedKvCtx) -> Result<Tensor> {
+        let (residual, h) = blocks::residual_norm(x, &self.residual, &self.ln, eps, ops)?;
+
+        // Q projection: full dimension (192)
+        let q = ops.gemm.matmul(&h, &self.q_proj)?;        // [total, nq_heads, 192]
+        // KV projection: compressed latent dimension (128)
+        let kv_compressed = ops.gemm.matmul(&h, &self.kv_proj)?;  // [total, nkv_heads, 128]
+        let k = ops.gemm.matmul(&kv_compressed, &self.k_up)?;     // [total, nkv_heads, 128]
+        let v = ops.gemm.matmul(&kv_compressed, &self.v_up)?;     // [total, nkv_heads, 128]
+
+        // RoPE on partial dims: first 64 dims of Q get RoPE, rest are position-independent
+        let (q_rope, q_nope) = q.split_at(/*dim=*/-1, 64)?;
+        let q_rope = apply_rope(&q_rope, cos, sin)?;
+        let q = cat(&[&q_rope, &q_nope], -1)?;              // [total, nq_heads, 192]
+        let k = apply_rope(&k, cos, sin)?;                   // [total, nkv_heads, 128]
+
+        // Attention: Q [_, _, 192] × K [_, _, 128] → head_dim asymmetry
+        // Implementation inspects tensor shapes to select correct kernel variant
+        ops.kv_cache.reshape_and_cache(&k, &v, &kv.cache_k, &kv.cache_v, &kv.slots)?;
+        let o = ops.attn.paged_attention(&q, &kv.cache_k, &kv.cache_v, &PagedParams {
+            mask: MaskType::Causal,
+            ..
+        })?;  // output: [total, nq_heads, 128] (head_dim_v, not head_dim_q)
+
+        let h = ops.gemm.matmul(&o, &self.o_proj)?;
+        blocks::row_parallel(&h, &self.o_proj_shard, ops)
+    }
+}
+```
+
+Key points:
+- **head_dim_q (192) ≠ head_dim_kv (128)**. No special parameter — the attention impl reads `Q.shape[-1]` and `K.shape[-1]` to select the right kernel.
+- **Output dim = head_dim_v (128)**, not head_dim_q. The attention kernel handles this internally.
+- **Partial RoPE**: only first 64 dims of Q/K get rotary embedding. Rest is position-independent (absorbed latent). This is model-level, not ops-level.
+- KV cache stores compressed 128-dim K/V, saving ~33% memory vs full 192-dim.
+
+### Example 18: Whisper (Encoder-Decoder, Cross-Attention)
+
+Speech recognition with separate audio encoder and text decoder.
+Decoder uses cross-attention: Q from decoder, K/V from encoder. Same `varlen_attention`.
+
+```rust
+// Stage 1: Audio encoder (bidirectional, no KV cache)
+impl WhisperEncoder {
+    fn forward(&self, mel: &Tensor, ops: &Ops) -> Result<Tensor> {
+        // Conv1d feature extraction
+        let h = ops.conv.conv1d(mel, &self.conv1, Some(&self.conv1_bias), 1, 1)?;
+        let h = ops.act.gelu(&h)?;
+        let h = ops.conv.conv1d(&h, &self.conv2, Some(&self.conv2_bias), 2, 1)?;
+        let h = ops.act.gelu(&h)?;
+
+        // Transformer encoder with bidirectional attention
+        for layer in &self.layers {
+            let (residual, h_norm) = blocks::residual_layer_norm(&h, &h, &layer.ln1, None, eps, ops)?;
+            let (q, k, v) = layer.qkv_proj(&h_norm, ops)?;
+            let o = ops.attn.varlen_attention(&q, &k, &v, &VarlenParams {
+                mask: MaskType::Bidirectional,  // encoder: full attention
+                ..
+            })?;
+            h = (&residual + &ops.gemm.matmul(&o, &layer.o_proj)?)?;
+            // MLP
+            let (residual, h_norm) = blocks::residual_layer_norm(&h, &h, &layer.ln2, None, eps, ops)?;
+            h = (&residual + &layer.mlp(&h_norm, ops)?)?;
+        }
+        Ok(h)
+    }
+}
+
+// Stage 2: Text decoder (causal self-attention + cross-attention to encoder)
+impl WhisperDecoderLayer {
+    fn forward(
+        &self, x: &Tensor, encoder_out: &Tensor, ops: &Ops,
+        kv: &PagedKvCtx,
+        encoder_seqlens: &Tensor,  // cu_seqlens for encoder output
+    ) -> Result<Tensor> {
+        // Self-attention (causal, with KV cache)
+        let (residual, h) = blocks::residual_layer_norm(x, x, &self.ln1, None, eps, ops)?;
+        let (q, k, v) = self.self_attn_qkv(&h, ops)?;
+        ops.kv_cache.reshape_and_cache(&k, &v, &kv.cache_k, &kv.cache_v, &kv.slots)?;
+        let o = ops.attn.paged_attention(&q, &kv.cache_k, &kv.cache_v, &PagedParams {
+            mask: MaskType::Causal,
+            ..
+        })?;
+        let h = (&residual + &ops.gemm.matmul(&o, &self.self_o_proj)?)?;
+
+        // Cross-attention: Q from decoder, K/V from encoder
+        let (residual, h_norm) = blocks::residual_layer_norm(&h, &h, &self.ln2, None, eps, ops)?;
+        let q = ops.gemm.matmul(&h_norm, &self.cross_q_proj)?;       // [dec_total, heads, hdim]
+        let k = ops.gemm.matmul(encoder_out, &self.cross_k_proj)?;   // [enc_total, heads, hdim]
+        let v = ops.gemm.matmul(encoder_out, &self.cross_v_proj)?;   // [enc_total, heads, hdim]
+        let o = ops.attn.varlen_attention(&q, &k, &v, &VarlenParams {
+            cu_seqlens_q: kv.cu_seqlens_q.clone(),  // decoder sequence lengths
+            cu_seqlens_k: encoder_seqlens.clone(),    // encoder sequence lengths (different!)
+            mask: MaskType::Bidirectional,            // cross-attention: no causal mask
+            ..
+        })?;
+        let h = (&residual + &ops.gemm.matmul(&o, &self.cross_o_proj)?)?;
+
+        // MLP
+        let (residual, h_norm) = blocks::residual_layer_norm(&h, &h, &self.ln3, None, eps, ops)?;
+        Ok((&residual + &self.mlp(&h_norm, ops)?)?)
+    }
+}
+```
+
+Key points:
+- **Cross-attention is just `varlen_attention`** with different `cu_seqlens_q` (decoder) and `cu_seqlens_k` (encoder). No special method needed.
+- Decoder has **both** self-attention (causal, paged KV cache) and cross-attention (bidirectional, contiguous K/V). Two different attention calls in one layer.
+- Encoder K/V are computed once and reused across all decoder layers/steps. Model caches them.
+- `layer_norm` (not `rms_norm`): Whisper uses pre-LN with LayerNorm. Same `NormOps`.
+
+### Example 19: HunyuanVideo (Video Diffusion, Temporal + Spatial Attention)
+
+Video generation DiT. Each block has two attention calls: spatial (within-frame) and
+temporal (across-frame at same position). Both use `varlen_attention` with different cu_seqlens.
+
+```rust
+impl HunyuanVideoBlock {
+    fn forward(
+        &self, x: &Tensor, ops: &Ops,
+        temb: &Tensor,              // timestep embedding
+        num_frames: usize,          // T
+        spatial_tokens: usize,      // H*W per frame
+    ) -> Result<Tensor> {
+        // x shape: [batch * T * H*W, hidden]  (packed varlen)
+        let total = num_frames * spatial_tokens;
+
+        // ── Spatial attention: each frame attends within itself ──
+        let (norm_x, gate_s) = blocks::adaln_zero(x, &self.ln_s, None, &s1, &h1, &g1, eps, ops)?;
+        let (q, k, v) = self.spatial_qkv(&norm_x, ops)?;
+
+        // cu_seqlens: [0, H*W, 2*H*W, ..., T*H*W] — one "sequence" per frame
+        let spatial_seqlens = (0..=num_frames).map(|i| i * spatial_tokens).collect();
+        let o_spatial = ops.attn.varlen_attention(&q, &k, &v, &VarlenParams {
+            cu_seqlens_q: Tensor::from_slice(&spatial_seqlens),
+            cu_seqlens_k: Tensor::from_slice(&spatial_seqlens),
+            max_seqlen_q: spatial_tokens,   // H*W
+            max_seqlen_k: spatial_tokens,
+            mask: MaskType::Bidirectional,
+            ..
+        })?;
+        let x = (x + &(ops.gemm.matmul(&o_spatial, &self.s_out)? * &gate_s)?)?;
+
+        // ── Temporal attention: same spatial position attends across frames ──
+        let (norm_x, gate_t) = blocks::adaln_zero(&x, &self.ln_t, None, &s2, &h2, &g2, eps, ops)?;
+
+        // Reshape: [batch, T, H*W, hidden] → transpose → [batch, H*W, T, hidden] → pack
+        let x_temporal = rearrange_spatial_to_temporal(&norm_x, num_frames, spatial_tokens)?;
+        let (q, k, v) = self.temporal_qkv(&x_temporal, ops)?;
+
+        // cu_seqlens: [0, T, 2*T, ..., H*W*T] — one "sequence" per spatial position
+        let temporal_seqlens = (0..=spatial_tokens).map(|i| i * num_frames).collect();
+        let o_temporal = ops.attn.varlen_attention(&q, &k, &v, &VarlenParams {
+            cu_seqlens_q: Tensor::from_slice(&temporal_seqlens),
+            cu_seqlens_k: Tensor::from_slice(&temporal_seqlens),
+            max_seqlen_q: num_frames,       // T
+            max_seqlen_k: num_frames,
+            mask: MaskType::Bidirectional,   // no causal across frames
+            ..
+        })?;
+
+        // Transpose back and residual
+        let o_temporal = rearrange_temporal_to_spatial(&o_temporal, num_frames, spatial_tokens)?;
+        let x = (&x + &(ops.gemm.matmul(&o_temporal, &self.t_out)? * &gate_t)?)?;
+
+        // MLP
+        let (norm_x, gate_m) = blocks::adaln_zero(&x, &self.ln_m, None, &s3, &h3, &g3, eps, ops)?;
+        let x = (&x + &(blocks::gelu_mlp(&norm_x, &self.fc1, &self.fc2, ops)? * &gate_m)?)?;
+        Ok(x)
+    }
+}
+```
+
+Key points:
+- **Spatial + temporal = two `varlen_attention` calls** with different `cu_seqlens`. No special "video attention" trait.
+- Spatial: `cu_seqlens = [0, H*W, 2*H*W, ...]` — each frame is a separate sequence.
+- Temporal: transpose tokens so frames become the sequence dim, then `cu_seqlens = [0, T, 2*T, ...]`.
+- **Same building blocks as image diffusion** (`blocks::adaln_zero`, `blocks::gelu_mlp`). Kernel optimizations transfer.
+- **Same `AttentionOps`** as LLM. Just different sequence packing via `cu_seqlens`.
+
+### Example 20: Mistral + Gemma Variants (Sliding Window, Softcap)
+
+Shows how `MaskType` and `VarlenParams` parameters cover model-specific attention patterns.
+No new ops needed — just different parameter values.
+
+```rust
+// Mistral: sliding window attention (attend only to last 4096 tokens)
+impl MistralLayer {
+    fn forward(&self, x: &Tensor, ops: &Ops, kv: &PagedKvCtx) -> Result<Tensor> {
+        // ... standard norm, QKV, RoPE ...
+        let o = ops.attn.paged_attention(&q, &kv.cache_k, &kv.cache_v, &PagedParams {
+            mask: MaskType::SlidingWindow { left: 4096, right: 0 },  // causal + window
+            ..
+        })?;
+        // ... standard output proj, MLP ...
+    }
+}
+
+// Gemma2: softcap (logit capping at 30.0)
+impl Gemma2Layer {
+    fn forward(&self, x: &Tensor, ops: &Ops, kv: &PagedKvCtx) -> Result<Tensor> {
+        // ... standard norm, QKV, RoPE ...
+
+        // Alternating attention: global (even layers) + sliding window (odd layers)
+        let mask = if self.layer_idx % 2 == 0 {
+            MaskType::Causal
+        } else {
+            MaskType::SlidingWindow { left: 4096, right: 0 }
+        };
+
+        let o = ops.attn.varlen_attention(&q, &k, &v, &VarlenParams {
+            mask,
+            softcap: Some(30.0),  // Gemma2 attention logit capping
+            ..
+        })?;
+        // ...
+    }
+}
+
+// Gemma3: softcap 50.0 + bidirectional prefix (for prompt caching)
+impl Gemma3Layer {
+    fn forward(&self, x: &Tensor, ops: &Ops, kv: &PagedKvCtx) -> Result<Tensor> {
+        // ...
+        let o = ops.attn.paged_attention(&q, &kv.cache_k, &kv.cache_v, &PagedParams {
+            softcap: Some(50.0),
+            mask: MaskType::SlidingWindow { left: 1024, right: 0 },
+            ..
+        })?;
+        // ...
+    }
+}
+```
+
+Key points:
+- **Sliding window** is just a parameter: `MaskType::SlidingWindow { left: N, right: 0 }`.
+- **Softcap** is just a parameter: `VarlenParams { softcap: Some(30.0) }`. FA4 and FlashInfer both support it natively.
+- **Per-layer alternating attention** (Gemma2) is model logic, not ops logic.
+- **No building block needed** for these — they're just different `VarlenParams` / `PagedParams` values.
+
+### Example 21: BGE / GTE (Embedding Model, Encoder-Only for Retrieval)
+
+BERT-like encoder-only model for text embedding / retrieval. Simplest use of the design:
+bidirectional attention, no KV cache, no generation, no decoder.
+
+```rust
+impl BgeLayer {
+    fn forward(&self, x: &Tensor, ops: &Ops) -> Result<Tensor> {
+        let (residual, h) = blocks::residual_layer_norm(x, x, &self.ln1, Some(&self.ln1_bias), eps, ops)?;
+        let (q, k, v) = self.qkv_proj(&h, ops)?;
+        let o = ops.attn.varlen_attention(&q, &k, &v, &VarlenParams {
+            mask: MaskType::Bidirectional,
+            ..
+        })?;
+        let h = (&residual + &ops.gemm.matmul(&o, &self.o_proj)?)?;
+        let (residual, h) = blocks::residual_layer_norm(&h, &h, &self.ln2, Some(&self.ln2_bias), eps, ops)?;
+        Ok((&residual + &blocks::gelu_mlp(&h, &self.fc1, &self.fc2, ops)?)?)
+    }
+}
+
+// Usage: encode once, pool, return embedding
+fn embed(text: &str, model: &BgeModel, ops: &Ops) -> Result<Tensor> {
+    let ids = tokenize(text);
+    ops.session.begin_forward();
+    let hidden = model.forward(&ids, ops)?;
+    ops.session.end_forward();
+    mean_pool(&hidden)  // average over tokens → single vector
+}
+```
+
+Key points:
+- **Minimal use of the design**: `varlen_attention` + `layer_norm` + `gelu_mlp`. No KV cache, no paged, no fusion tricks.
+- Same building blocks as everything else — `residual_layer_norm`, `gelu_mlp`.
+- `layer_norm` with bias (BERT-style), not `rms_norm` (LLM-style). Both in `NormOps`.
+- Runs on any device including CPU (no paged attention needed).
+
+### Example 22: CUDA Graph Capture/Replay (Engine-Level)
+
+Shows how the engine uses `OpsSession` + CUDA-specific graph capture.
+This is engine code, not model code.
+
+```rust
+// Engine's CUDA graph runner (knows it's on CUDA)
+fn setup_cuda_graph(
+    model: &dyn Model,
+    ops: &Ops,
+    cuda_ops: &CudaOps,       // downcast from ops.session
+    max_batch: usize,
+) -> CudaGraph {
+    // 1. Allocate fixed-address buffers
+    let graph_bufs = cuda_ops.allocate_graph_buffers(max_batch, max_blocks_per_seq);
+    let input_buf = cuda_ops.allocate_fixed_tensor([max_batch, hidden_dim]);
+
+    // 2. Precompute plan with graph buffers (outside capture)
+    ops.session.begin_forward();
+    cuda_ops.precompute_paged_plan_graphed(&block_tables, &cu_seqlens_k, block_size, &graph_bufs);
+
+    // 3. Capture
+    let stream = cuda_ops.stream();
+    stream.begin_capture();
+    model.forward(&input_buf, ops, &kv_ctx);    // all kernel launches captured
+    let graph = stream.end_capture();
+    ops.session.end_forward();
+
+    CudaGraph { graph, graph_bufs, input_buf }
+}
+
+fn replay_cuda_graph(
+    graph: &CudaGraph,
+    ops: &Ops,
+    cuda_ops: &CudaOps,
+    batch_input: &Tensor,
+    block_tables: &Tensor,
+    cu_seqlens_k: &Tensor,
+) -> Result<Tensor> {
+    // Update fixed-address buffers (memcpy, no reallocation)
+    graph.input_buf.copy_from(batch_input);
+    ops.session.begin_forward();
+    cuda_ops.precompute_paged_plan_graphed(block_tables, cu_seqlens_k, block_size, &graph.graph_bufs);
+    graph.graph.launch();
+    ops.session.end_forward();
+    Ok(graph.output_buf.clone())
+}
+```
+
+Key points:
+- **Engine knows it's on CUDA** — downcasts to `CudaOps` for graph-specific methods.
+- **`OpsSession::begin_forward/end_forward`** is generic (all devices). Graph capture is CUDA-specific.
+- **Model code is unaware of graphs** — same `model.forward()` call whether captured or not.
+- **Fixed-address buffers**: `allocate_graph_buffers` and `allocate_fixed_tensor` return GPU tensors at stable addresses that survive graph replay.
+- **precompute_paged_plan_graphed**: updates FlashInfer metadata in graph buffers (outside capture, before each replay).
+
+### Example 23: Adding a New Fused Kernel (Developer Workflow, Always Keep Last)
 
 Scenario: kernel dev adds `fused_geglu` (GELU-gated MLP fusion) to CudaOps.
 Shows the minimal change set.
