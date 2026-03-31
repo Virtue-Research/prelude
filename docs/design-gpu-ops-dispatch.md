@@ -12,12 +12,16 @@
 ## Layering
 
 ```
-Model code          calls         Op traits
+Model code          composes      Building blocks (shared layers)
+Building blocks     call          Op traits (+ FusedOps fallback logic)
 Op traits           implemented by    Device ops (CudaOps, RocmOps, CpuOps, ...)
 Device ops          dispatches to     Kernel libraries (FA4, FlashInfer, CK, cuBLAS, XLA, ...)
 ```
 
-Models only see op traits. Device ops are constructed once at engine init and injected into models.
+**Building blocks** are shared layer implementations (e.g., `ResidualNormBlock`, `GatedMLP`, `AttentionBlock`).
+They contain the `FusedOps` match/fallback logic. Models compose building blocks instead of calling
+raw ops. **When a new fused kernel is added, the building block is updated once, and all models
+that use it benefit automatically.** This is how one kernel optimization reaches many models.
 
 ## Tensor Layout Conventions
 
@@ -1198,9 +1202,168 @@ consumes them. No ops changes needed — both models call the same `Ops` interfa
 | KV cache rollback | Engine (slot_mapping with -1) | `reshape_and_cache` skips -1 slots |
 | Rejection sampling | Engine (GPU kernel) | Not an op trait concern |
 
+## Shared Building Blocks
+
+Building blocks are **shared layer implementations** that contain fusion/fallback logic.
+Models compose them instead of calling raw ops. This is how one kernel optimization
+reaches all models automatically.
+
+### Why Building Blocks
+
+**Problem:** Without building blocks, every model must write its own fusion fallback:
+
+```rust
+// Qwen3 model code — manual fusion logic
+let (residual, h) = match ops.fused.fused_add_rmsnorm(x, &res, &w, eps) {
+    Some(r) => r?,
+    None => { let r = (x + &res)?; let h = ops.norm.rms_norm(&r, &w, eps)?; (r, h) }
+};
+```
+
+If 20 models have this pattern, adding `fused_add_rmsnorm` requires updating all 20.
+
+**Solution:** The building block contains the logic once:
+
+```rust
+// blocks/norm.rs — written once, used by all models
+pub fn residual_norm(
+    residual: &Tensor, x: &Tensor, weight: &Tensor, eps: f32, ops: &Ops,
+) -> Result<(Tensor, Tensor)> {
+    match ops.fused.fused_add_rmsnorm(residual, x, weight, eps) {
+        Some(r) => r,
+        None => {
+            let r = (residual + x)?;
+            let h = ops.norm.rms_norm(&r, weight, eps)?;
+            Ok((r, h))
+        }
+    }
+}
+```
+
+Now the model just writes `blocks::residual_norm(&residual, &h, &w, eps, ops)?`.
+When the kernel dev adds `fused_add_rmsnorm` to CudaOps, all 20 models benefit with zero changes.
+
+### Building Block Catalog
+
+```rust
+// ── Normalization ───────────────────────────────────────────────
+
+/// Residual add + RMSNorm. Fuses to 1 kernel on CUDA, 2 ops elsewhere.
+pub fn residual_norm(residual, x, weight, eps, ops) -> (Tensor, Tensor);
+
+/// Residual add + LayerNorm. Same pattern for diffusion models.
+pub fn residual_layer_norm(residual, x, weight, bias, eps, ops) -> (Tensor, Tensor);
+
+/// AdaLN-Zero: layer_norm + scale + shift + gate. Fuses to 1 kernel on CUDA.
+pub fn adaln_zero(x, weight, bias, scale, shift, gate, eps, ops) -> (Tensor, Tensor);
+
+/// AdaLN continuous: layer_norm + scale + shift (no gate).
+pub fn adaln_continuous(x, weight, bias, scale, shift, eps, ops) -> Tensor;
+
+// ── Attention helpers ───────────────────────────────────────────
+
+/// QK-norm + RoPE. Fuses to 1 kernel on CUDA (FlashInfer fused_qknorm_rope).
+pub fn qk_norm_rope(q, k, qw, kw, cos, sin, pos, eps, ops) -> (Tensor, Tensor);
+
+/// K-norm + RoPE + KV cache write. Fuses to 1 kernel on CUDA.
+pub fn knorm_rope_cache_write(k, v, kw, cos, sin, pos, cache_k, cache_v, slots, eps, ops) -> ();
+
+// ── MLP ─────────────────────────────────────────────────────────
+
+/// SiLU-gated MLP: silu(gate) * up → down. Fuses gate*up to 1 kernel.
+pub fn gated_mlp(x, gate_proj, up_proj, down_proj, ops) -> Tensor;
+
+/// GELU MLP (diffusion): gelu(fc1) → fc2. Uses gelu_approximate on CUDA.
+pub fn gelu_mlp(x, fc1, fc2, ops) -> Tensor;
+
+// ── Linear layers (TP-aware) ────────────────────────────────────
+
+/// Column-parallel linear: sharded output, optional all-gather.
+pub fn col_parallel(x, weight_shard, gather_output, ops) -> Tensor;
+
+/// Row-parallel linear: sharded input, all-reduce output.
+pub fn row_parallel(x, weight_shard, ops) -> Tensor;
+
+/// LoRA-augmented linear: base matmul + multi-adapter LoRA.
+/// Fuses to BGMV/Punica on CUDA, per-adapter fallback elsewhere.
+pub fn lora_linear(x, base_weight, lora_a, lora_b, adapter_ids, scale, ops) -> Tensor;
+
+// ── MoE ─────────────────────────────────────────────────────────
+
+/// MoE layer: route → (optional EP dispatch) → grouped GEMM → (optional EP combine).
+pub fn moe_layer(x, gate, expert_weights, ep_config, ops) -> Tensor;
+```
+
+### How Models Use Building Blocks
+
+```rust
+// Qwen3 layer — using building blocks, no fusion logic visible
+fn forward(&self, x: &Tensor, ops: &Ops, kv: &PagedKvCtx) -> Result<Tensor> {
+    // 1. Pre-attention norm (building block handles fusion internally)
+    let (residual, h) = blocks::residual_norm(x, &self.residual, &self.ln1, eps, ops)?;
+
+    // 2. QKV projection (building block handles TP + optional LoRA)
+    let qkv = blocks::col_parallel(&h, &self.qkv_shard, false, ops)?;
+    let (q, k, v) = split_qkv(&qkv, num_heads_per_rank, num_kv_heads_per_rank);
+
+    // 3. QK-norm + RoPE (building block handles fusion internally)
+    let (q, k) = blocks::qk_norm_rope(&q, &k, &self.qw, &self.kw, cos, sin, pos, eps, ops)?;
+
+    // 4. Attention (raw op — no fusion opportunity here)
+    ops.kv_cache.reshape_and_cache(&k, &v, &kv.cache_k, &kv.cache_v, &kv.slots)?;
+    let o = ops.attn.paged_attention(&q, &kv.cache_k, &kv.cache_v, &params)?;
+    let h = blocks::row_parallel(&o, &self.o_proj_shard, ops)?;
+
+    // 5. Post-attention norm + MoE (building block handles EP + fusion)
+    let (residual, h) = blocks::residual_norm(&residual, &h, &self.ln2, eps, ops)?;
+    let h = blocks::moe_layer(&h, &self.gate, &self.expert_weights, &self.ep_config, ops)?;
+    Ok((&residual + &h)?)
+}
+```
+
+```rust
+// Flux double block — same building blocks, different composition
+fn forward(&self, img: &Tensor, txt: &Tensor, temb: &Tensor, ops: &Ops) -> Result<..> {
+    let (scale1, shift1, gate1, ..) = self.img_mod.forward(temb)?;
+
+    // AdaLN-Zero (building block handles fusion internally)
+    let (img_normed, img_gate) = blocks::adaln_zero(
+        img, &self.img_ln, None, &scale1, &shift1, &gate1, eps, ops,
+    )?;
+
+    // QK-norm (same building block as Qwen3, different context)
+    let img_q = ops.norm.rms_norm(&img_q, &self.img_q_norm, eps)?;
+    // ...
+
+    // Joint attention (raw op)
+    let attn_out = ops.attn.varlen_attention(&q, &k, &v, &params)?;
+
+    // GELU MLP (building block)
+    let mlp_out = blocks::gelu_mlp(&img_mlp_in, &self.fc1, &self.fc2, ops)?;
+    // ...
+}
+```
+
+### Kernel Optimization Reach
+
+When a kernel dev adds a new optimization, how many models benefit?
+
+| Optimization | Changed in | Models that benefit |
+|-------------|-----------|-------------------|
+| Faster FlashInfer FA3 | `CudaOps::varlen_attention` | **All models** (every model calls attention) |
+| `fused_add_rmsnorm` kernel | `CudaOps` + `blocks::residual_norm` | **All transformer models** (Qwen3, Llama, Gemma, ...) |
+| `fused_adaln_zero` kernel | `CudaOps` + `blocks::adaln_zero` | **All diffusion models** (Flux, HunyuanVideo, Sana, ...) |
+| `fused_qknorm_rope` kernel | `CudaOps` + `blocks::qk_norm_rope` | **All QK-norm models** (Qwen3, Gemma3, ...) |
+| `fused_silu_mul` kernel | `CudaOps` + `blocks::gated_mlp` | **All SiLU-gated MLP models** (most LLMs) |
+| DeepGEMM FP8 improvement | `CudaOps::matmul` | **All models** (every model does matmul) |
+| BGMV LoRA kernel | `CudaOps` + `blocks::lora_linear` | **All LoRA-served models** |
+| Better NCCL all-reduce | `CudaOps::all_reduce_sum` | **All TP-distributed models** |
+
+**Rule of thumb:** Ops-level improvements (attention, matmul) reach ALL models. Building-block-level improvements (fusion) reach all models that use that building block. Both are O(1) changes for O(N) model benefit.
+
 ## Model Code Pattern
 
-Models receive `&Ops` and use it for all device-dependent operations:
+Models compose building blocks for common patterns and call raw ops for model-specific logic:
 
 ```rust
 // LLM attention layer
@@ -1323,7 +1486,8 @@ and their own internals. No cross-subsystem code reading required.
 
 | Subsystem | Needs to know | Does NOT need to know |
 |-----------|--------------|----------------------|
-| **Model impl** (Qwen3, Flux, TTS) | Op trait signatures, `Ops` bundle | Any device impl, kernel library, engine |
+| **Model impl** (Qwen3, Flux, TTS) | Building block APIs, `Ops` bundle | Any device impl, kernel library, engine |
+| **Building blocks** (residual_norm, gated_mlp, ...) | Op trait signatures, `FusedOps` match pattern | Device internals, model specifics |
 | **CudaOps** | Op trait signatures, FA4/FlashInfer/DeepGEMM/cuBLAS APIs | Model code, other devices |
 | **RocmOps** | Op trait signatures, CK/aiter/hipBLAS APIs | CUDA code, model code |
 | **MetalOps** | Op trait signatures, Metal/MSL API | CUDA/ROCm code, model code |
@@ -1375,7 +1539,8 @@ Model code never changes — the dispatch layer absorbs all device differences.
 | Concern | Solution |
 |---------|----------|
 | FA4 can't decode | `CudaOps::paged_attention` routes Q=1 to FlashInfer |
-| Fusion control | `FusedOps` trait, model checks `Option` return |
+| Fusion control | `FusedOps` trait + building blocks encapsulate fallback logic |
+| Kernel → multi-model reach | Building blocks: one optimization update → all models using that block benefit |
 | Multi-device | Traits implemented per device, model code unchanged |
 | Multi-model | Same `AttentionOps` for causal/bidirectional/cross-attention via `MaskType` + `VarlenParams` |
 | DeltaNet/Mamba | Not `AttentionOps`; model-owned, closure-injected into TransformerBlock |
