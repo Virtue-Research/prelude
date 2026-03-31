@@ -42,20 +42,29 @@ Implementations that need different internal layouts (e.g., TPU 128-byte alignme
 must transpose/pad internally and return the canonical layout.
 
 ```
-Q, K, V (attention):     [total_tokens, num_heads, head_dim]       — varlen (packed batch)
-O (attention output):     [total_tokens, num_heads, head_dim_v]
-key_cache, value_cache:   [num_blocks, block_size, num_heads_k, head_dim]  — paged KV
-cu_seqlens:               [batch_size + 1]                          — i32, cumulative sequence offsets
-block_tables:             [batch_size, max_blocks_per_seq]          — i32, block indices
-slot_mapping:             [total_tokens]                            — i32, flat slot indices
+Model data (Tensor — lives on device):
+  Q, K, V (attention):     [total_tokens, num_heads, head_dim]       — varlen (packed batch)
+  O (attention output):     [total_tokens, num_heads, head_dim_v]
+  key_cache, value_cache:   [num_blocks, block_size, num_heads_k, head_dim]  — paged KV
+  Linear weights:           [out_features, in_features]               — row-major
+  Norm weights:             [hidden_dim]
+  Bias:                     [out_features]
+  Conv1d input:             [batch, channels, length]
+  Conv2d input:             [batch, channels, height, width]
 
-Linear weights:           [out_features, in_features]               — row-major (Fortran-style for BLAS)
-Norm weights:             [hidden_dim]
-Bias:                     [out_features]
-
-Conv1d input:             [batch, channels, length]
-Conv2d input:             [batch, channels, height, width]
+Scheduling metadata (&[u32] — plain host-side data, device uploads internally):
+  cu_seqlens:               [batch_size + 1]                          — cumulative sequence offsets
+  block_tables:             [batch_size * max_blocks_per_seq]         — flattened block indices
+  slot_mapping:             [total_tokens]                            — flat slot indices
 ```
+
+**Why scheduling metadata is `&[u32]`, not `Tensor`:**
+Scheduling metadata (cu_seqlens, block_tables, slot_mapping) describes batch structure,
+not model computation. It is small, constructed by the engine on the host, and doesn't
+benefit from GPU-side storage at the trait boundary. Each device handles upload internally:
+CUDA/ROCm memcpy to a pre-allocated GPU buffer; Metal zero-copy (unified memory);
+TPU includes as XLA constants; CPU/Vulkan use directly. This keeps the trait interface
+device-agnostic — no assumptions about where integer metadata lives.
 
 **Why packed varlen** (`[total_tokens, ...]` with `cu_seqlens`) instead of padded batch (`[batch, max_seq, ...]`):
 - No wasted compute on padding tokens.
@@ -98,22 +107,31 @@ trait AttentionOps: Send + Sync {
     ) -> Result<Tensor>;
 }
 
-struct VarlenParams {
-    pub cu_seqlens_q: Tensor,     // [batch+1]
-    pub cu_seqlens_k: Tensor,     // [batch+1], may differ from cu_seqlens_q (cross-attention, prefill+cache)
-    pub max_seqlen_q: usize,
-    pub max_seqlen_k: usize,
+/// Scheduling metadata uses plain `&[u32]`, not `Tensor`.
+/// These are small integer arrays describing batch structure (not model data).
+/// Device implementations handle GPU upload internally:
+///   - CUDA/ROCm: pre-allocated GPU buffer, memcpy before kernel launch.
+///   - Metal: unified memory, zero-copy wrap.
+///   - TPU: included in XLA trace as constants.
+///   - CPU/Vulkan: used directly.
+struct VarlenParams<'a> {
+    pub cu_seqlens_q: &'a [u32],  // [batch+1], cumulative sequence offsets
+    pub cu_seqlens_k: &'a [u32],  // [batch+1], may differ from cu_seqlens_q (cross-attention)
+    pub max_seqlen_q: u32,
+    pub max_seqlen_k: u32,
     pub scale: f32,
     pub mask: MaskType,
     pub softcap: Option<f32>,     // Gemma2/3 logit capping
 }
 
-struct PagedParams {
-    pub block_tables: Tensor,     // [batch, max_blocks_per_seq]
-    pub cu_seqlens_q: Tensor,     // [batch+1]
-    pub cu_seqlens_k: Tensor,     // [batch+1]
-    pub max_seqlen_q: usize,
-    pub max_seqlen_k: usize,
+struct PagedParams<'a> {
+    pub block_tables: &'a [u32],  // [batch * max_blocks_per_seq], flattened block indices
+    pub num_seqs: u32,
+    pub max_blocks_per_seq: u32,
+    pub cu_seqlens_q: &'a [u32],  // [batch+1]
+    pub cu_seqlens_k: &'a [u32],  // [batch+1]
+    pub max_seqlen_q: u32,
+    pub max_seqlen_k: u32,
     pub scale: f32,
     pub mask: MaskType,
 }
@@ -154,7 +172,7 @@ trait KvCacheOps: Send + Sync {
         &self,
         key: &Tensor, value: &Tensor,
         key_cache: &Tensor, value_cache: &Tensor,
-        slot_mapping: &Tensor,
+        slot_mapping: &[u32],   // scheduling metadata, same as cu_seqlens
     ) -> Result<()>;
 }
 ```
