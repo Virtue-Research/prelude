@@ -19,6 +19,41 @@ Device ops          dispatches to     Kernel libraries (FA4, FlashInfer, CK, cuB
 
 Models only see op traits. Device ops are constructed once at engine init and injected into models.
 
+## Tensor Layout Conventions
+
+All op traits use a shared set of tensor layout conventions. These are **part of the contract**
+— every device implementation must accept and produce tensors in these layouts.
+Implementations that need different internal layouts (e.g., TPU 128-byte alignment)
+must transpose/pad internally and return the canonical layout.
+
+```
+Q, K, V (attention):     [total_tokens, num_heads, head_dim]       — varlen (packed batch)
+O (attention output):     [total_tokens, num_heads, head_dim_v]
+key_cache, value_cache:   [num_blocks, block_size, num_heads_k, head_dim]  — paged KV
+cu_seqlens:               [batch_size + 1]                          — i32, cumulative sequence offsets
+block_tables:             [batch_size, max_blocks_per_seq]          — i32, block indices
+slot_mapping:             [total_tokens]                            — i32, flat slot indices
+
+Linear weights:           [out_features, in_features]               — row-major (Fortran-style for BLAS)
+Norm weights:             [hidden_dim]
+Bias:                     [out_features]
+
+Conv1d input:             [batch, channels, length]
+Conv2d input:             [batch, channels, height, width]
+```
+
+**Why packed varlen** (`[total_tokens, ...]` with `cu_seqlens`) instead of padded batch (`[batch, max_seq, ...]`):
+- No wasted compute on padding tokens.
+- Natural for continuous batching (variable-length sequences in one batch).
+- Required by FlashAttention, FlashInfer, CK, Pallas — all major attention kernels.
+- Diffusion uses this too: batch of images with different token counts → single packed tensor.
+
+**Device-internal exceptions** (invisible to model code):
+- TPU pads head_dim to 128-byte alignment internally.
+- Metal may transpose for simdgroup_multiply_accumulate efficiency.
+- Vulkan may pad workgroup-aligned dimensions.
+These are implementation details — the trait boundary always uses canonical layouts.
+
 ## Op Traits
 
 ### Attention
@@ -30,10 +65,6 @@ trait AttentionOps: Send + Sync {
     /// Covers: LLM prefill (causal), diffusion self-attention (bidirectional),
     /// cross-attention (Q and K/V from different sources with different cu_seqlens),
     /// sliding window, softcap.
-    ///
-    /// Q: [total_q, num_heads_q, head_dim]
-    /// K: [total_k, num_heads_k, head_dim_k]   (head_dim_k may differ from head_dim for MLA)
-    /// V: [total_k, num_heads_k, head_dim_v]
     fn varlen_attention(
         &self,
         q: &Tensor, k: &Tensor, v: &Tensor,
@@ -44,9 +75,6 @@ trait AttentionOps: Send + Sync {
     ///
     /// Covers: LLM decode (Q=1), chunked prefill (mixed Q lengths),
     /// LLM prefill with prefix cache reuse (Q>1, K/V already in cache).
-    ///
-    /// Q: [total_q, num_heads_q, head_dim]
-    /// key_cache/value_cache: [num_blocks, block_size, num_heads_k, head_dim]
     fn paged_attention(
         &self,
         q: &Tensor,
@@ -212,16 +240,18 @@ trait ConvOps: Send + Sync {
 Fused kernels are **separate ops that return `Option`**. `None` = not supported on this device, model falls back to separate ops. This is not a hint system — the model explicitly checks the return value.
 
 ```rust
+/// All methods have default `{ None }` — devices only override what they support.
+/// Adding a new fusion method requires NO changes to existing device implementations.
 trait FusedOps: Send + Sync {
     /// Fused residual add + RMSNorm: computes (x + h) and rms_norm(x + h) in one kernel.
     fn fused_add_rmsnorm(
         &self, residual: &Tensor, x: &Tensor, weight: &Tensor, eps: f32,
-    ) -> Option<Result<(Tensor, Tensor)>>;
+    ) -> Option<Result<(Tensor, Tensor)>> { None }
 
     /// Fused SiLU(gate) * up.
     fn fused_silu_mul(
         &self, gate: &Tensor, up: &Tensor,
-    ) -> Option<Result<Tensor>>;
+    ) -> Option<Result<Tensor>> { None }
 
     /// Fused QK-norm + RoPE: normalize Q and K, apply rotary embedding.
     fn fused_qknorm_rope(
@@ -230,7 +260,7 @@ trait FusedOps: Send + Sync {
         q_weight: &Tensor, k_weight: &Tensor,
         cos: &Tensor, sin: &Tensor,
         position_ids: &Tensor, eps: f32,
-    ) -> Option<Result<(Tensor, Tensor)>>;
+    ) -> Option<Result<(Tensor, Tensor)>> { None }
 
     /// Fused K-norm + RoPE + KV cache write.
     fn fused_knorm_rope_cache_write(
@@ -241,7 +271,7 @@ trait FusedOps: Send + Sync {
         position_ids: &Tensor,
         key_cache: &Tensor, value_cache: &Tensor,
         slot_mapping: &Tensor, eps: f32,
-    ) -> Option<Result<()>>;
+    ) -> Option<Result<()>> { None }
 
     /// Fused Adaptive Layer Norm (AdaLN-Zero).
     ///
@@ -256,7 +286,7 @@ trait FusedOps: Send + Sync {
         weight: &Tensor, bias: Option<&Tensor>,
         scale: &Tensor, shift: &Tensor, gate: &Tensor,
         eps: f32,
-    ) -> Option<Result<(Tensor, Tensor)>>; // (normed_and_shifted, gate) or (gated_output, normed)
+    ) -> Option<Result<(Tensor, Tensor)>> { None }
 
     /// Fused scale + shift (continuous AdaLN variant).
     ///
@@ -268,7 +298,7 @@ trait FusedOps: Send + Sync {
         weight: &Tensor, bias: Option<&Tensor>,
         scale: &Tensor, shift: &Tensor,
         eps: f32,
-    ) -> Option<Result<Tensor>>;
+    ) -> Option<Result<Tensor>> { None }
 }
 ```
 
@@ -304,8 +334,8 @@ If cache write were a "hint" inside `paged_attention`, step 1 couldn't exist as 
 
 Some devices have per-forward-pass state that must be managed:
 - **FlashInfer**: plan cache (expensive scheduling, computed once, reused across N layers)
-- **CUDA graphs**: pre-allocated buffers with fixed GPU addresses
 - **XLA (TPU)**: compilation cache, trace-based execution
+- **CUDA/HIP graphs**: pre-allocated buffers with fixed GPU addresses
 
 ```rust
 trait OpsSession: Send + Sync {
@@ -315,18 +345,47 @@ trait OpsSession: Send + Sync {
     /// Clear per-forward-pass state. Called after model.forward().
     fn end_forward(&self);
 
-    /// Pre-compute paged attention scheduling for CUDA graph capture.
-    /// Writes metadata to pre-allocated buffers (fixed GPU addresses).
+    /// Pre-compute paged attention scheduling for the current batch.
+    /// Converts block_tables → kernel-specific metadata (e.g., FlashInfer indptr/indices).
+    /// Called once before model.forward(), reused across all N layers.
     fn precompute_paged_plan(
         &self,
         block_tables: &Tensor,
         cu_seqlens_k: &Tensor,
         block_size: usize,
-        graph_buffers: Option<&GraphMetaBuffers>,
+    ) -> Result<()>;
+}
+```
+
+**Devices without session state** (CPU, Metal, Vulkan) implement all methods as no-ops.
+
+### Graph Capture (CUDA/HIP-internal concern)
+
+CUDA graphs require pre-allocated buffers at fixed GPU addresses. This is a CUDA-specific
+optimization that does NOT belong in the shared `OpsSession` trait — the engine doesn't
+need to know about it.
+
+Instead, `CudaOps` exposes a **device-specific** graph capture API. The engine's CUDA
+graph runner downcasts to `CudaOps` (since it already knows it's on CUDA) and calls
+device-specific methods:
+
+```rust
+/// CUDA-specific extension. Not in OpsSession trait.
+impl CudaOps {
+    /// Allocate pre-sized GPU buffers for graph metadata.
+    pub fn allocate_graph_buffers(&self, max_batch: usize, max_blocks: usize) -> GraphMetaBuffers;
+
+    /// Pre-compute paged plan into fixed-address graph buffers (for capture/replay).
+    pub fn precompute_paged_plan_graphed(
+        &self,
+        block_tables: &Tensor,
+        cu_seqlens_k: &Tensor,
+        block_size: usize,
+        graph_buffers: &GraphMetaBuffers,
     ) -> Result<()>;
 }
 
-/// Pre-allocated GPU tensors for CUDA graph metadata.
+/// Pre-allocated GPU tensors with fixed addresses for CUDA graph replay.
 struct GraphMetaBuffers {
     pub indptr: Tensor,
     pub indices: Tensor,
@@ -334,22 +393,30 @@ struct GraphMetaBuffers {
 }
 ```
 
-**CUDA graph flow:**
+**CUDA graph flow** (engine's CUDA graph runner, not generic engine):
 
 ```
 Capture:
-    session.precompute_paged_plan(..., Some(&graph_buffers))   // outside capture
-    stream.begin_capture()
-    model.forward(...)                                          // captured
-    stream.end_capture() → graph
+    let cuda_ops: &CudaOps = ops.downcast();   // engine knows it's on CUDA
+    let graph_bufs = cuda_ops.allocate_graph_buffers(max_batch, max_blocks);
+    cuda_ops.precompute_paged_plan_graphed(.., &graph_bufs);    // outside capture
+    stream.begin_capture();
+    model.forward(..);                                           // captured
+    stream.end_capture() → graph;
 
 Replay:
-    update_input_buffers(...)                                   // memcpy to fixed addresses
-    session.precompute_paged_plan(..., Some(&graph_buffers))   // update metadata
-    graph.launch()
+    update_input_buffers(..);
+    cuda_ops.precompute_paged_plan_graphed(.., &graph_bufs);    // update metadata
+    graph.launch();
 ```
 
-**Devices without session state** (CPU, Vulkan) implement `begin_forward` / `end_forward` as no-ops.
+**Why not in OpsSession:** `GraphMetaBuffers` is meaningless on Metal/Vulkan/TPU/CPU.
+Putting it in the shared trait forces every device to handle CUDA-specific types.
+Keeping it as a `CudaOps` method means the engine's CUDA graph runner is the only code
+that knows about it — and that runner already knows it's on CUDA.
+
+**HIP graphs:** Same pattern. `RocmOps` has equivalent `precompute_paged_plan_graphed` method.
+HIP 6.1+ supports graph capture/replay with the same API shape.
 
 ## Ops Bundle
 
@@ -430,6 +497,8 @@ impl GemmOps for CudaOps {
     }
 }
 
+// CudaOps overrides all fusions — only lists the ones it supports.
+// Unlisted methods inherit the default `{ None }`.
 impl FusedOps for CudaOps {
     fn fused_add_rmsnorm(&self, ..) -> Option<Result<..>> { Some(gpu::fused_add_rmsnorm(..)) }
     fn fused_silu_mul(&self, ..) -> Option<Result<..>> { Some(gpu::fused_silu_mul(..)) }
@@ -509,13 +578,9 @@ impl GemmOps for RocmOps {
     }
 }
 
+// Only override what ROCm supports — everything else inherits default `{ None }`.
 impl FusedOps for RocmOps {
     fn fused_add_rmsnorm(&self, ..) -> Option<Result<..>> { Some(hip::fused_add_rmsnorm(..)) }
-    fn fused_silu_mul(&self, ..) -> Option<Result<..>> { None }
-    fn fused_qknorm_rope(&self, ..) -> Option<Result<..>> { None }
-    fn fused_knorm_rope_cache_write(&self, ..) -> Option<Result<..>> { None }
-    fn fused_adaln_zero(&self, ..) -> Option<Result<..>> { None }
-    fn fused_scale_shift(&self, ..) -> Option<Result<..>> { None }
 }
 ```
 
@@ -571,14 +636,10 @@ impl NormOps for MetalOps {
     fn group_norm(&self, x, weight, bias, groups, eps) -> Result<Tensor> { metal::group_norm(x, weight, bias, groups, eps) }
 }
 
+// Metal: override what MSL shaders exist for. Rest inherits default `{ None }`.
 impl FusedOps for MetalOps {
-    // Metal can fuse some ops (RoPE is a single shader, RMSNorm+add can be one shader)
     fn fused_add_rmsnorm(&self, ..) -> Option<Result<..>> { Some(metal::fused_add_rmsnorm(..)) }
     fn fused_silu_mul(&self, ..) -> Option<Result<..>> { Some(metal::fused_silu_mul(..)) }
-    fn fused_qknorm_rope(&self, ..) -> Option<Result<..>> { None }
-    fn fused_knorm_rope_cache_write(&self, ..) -> Option<Result<..>> { None }
-    fn fused_adaln_zero(&self, ..) -> Option<Result<..>> { None } // can add later as MSL shader
-    fn fused_scale_shift(&self, ..) -> Option<Result<..>> { None }
 }
 
 impl OpsSession for MetalOps {
@@ -644,14 +705,10 @@ impl GemmOps for VulkanOps {
     }
 }
 
+// Vulkan: fuse simple element-wise chains. Rest inherits default `{ None }`.
 impl FusedOps for VulkanOps {
-    // Vulkan can fuse simple element-wise chains into single compute shaders
     fn fused_add_rmsnorm(&self, ..) -> Option<Result<..>> { Some(vk::fused_add_rmsnorm(..)) }
     fn fused_silu_mul(&self, ..) -> Option<Result<..>> { Some(vk::fused_silu_mul(..)) }
-    fn fused_qknorm_rope(&self, ..) -> Option<Result<..>> { None }
-    fn fused_knorm_rope_cache_write(&self, ..) -> Option<Result<..>> { None }
-    fn fused_adaln_zero(&self, ..) -> Option<Result<..>> { None }
-    fn fused_scale_shift(&self, ..) -> Option<Result<..>> { None }
 }
 
 impl OpsSession for VulkanOps {
@@ -717,18 +774,8 @@ impl GemmOps for TpuOps {
     }
 }
 
-impl FusedOps for TpuOps {
-    // XLA auto-fuses many element-wise patterns during HLO optimization.
-    // Explicit FusedOps methods return None — XLA handles fusion internally.
-    // This means the model's fallback path (separate ops) is actually optimal on TPU
-    // because XLA will fuse them during compilation anyway.
-    fn fused_add_rmsnorm(&self, ..) -> Option<Result<..>> { None }
-    fn fused_silu_mul(&self, ..) -> Option<Result<..>> { None }
-    fn fused_qknorm_rope(&self, ..) -> Option<Result<..>> { None }
-    fn fused_knorm_rope_cache_write(&self, ..) -> Option<Result<..>> { None }
-    fn fused_adaln_zero(&self, ..) -> Option<Result<..>> { None }
-    fn fused_scale_shift(&self, ..) -> Option<Result<..>> { None }
-}
+// TPU: all default `{ None }`. XLA auto-fuses the fallback path during HLO compilation.
+impl FusedOps for TpuOps {}
 
 impl OpsSession for TpuOps {
     fn begin_forward(&self) {
@@ -740,7 +787,7 @@ impl OpsSession for TpuOps {
         // Compile traced program (or retrieve from cache), execute on TPU.
         self.compiled_cache.end_trace_and_execute();
     }
-    fn precompute_paged_plan(&self, block_tables, cu_seqlens_k, block_size, graph_buffers) -> Result<()> {
+    fn precompute_paged_plan(&self, block_tables, cu_seqlens_k, block_size) -> Result<()> {
         // Pallas KV cache update — write scheduling metadata.
         // Uses TPU VMEM (software-managed scratch) for DMA-efficient page table access.
         self.pallas_attn.precompute_plan(block_tables, cu_seqlens_k, block_size)
@@ -767,16 +814,9 @@ impl AttentionOps for CpuOps {
     }
 }
 
+// CPU: only fused_add_rmsnorm (vectorized). Rest inherits default `{ None }`.
 impl FusedOps for CpuOps {
-    fn fused_add_rmsnorm(&self, ..) -> Option<Result<..>> {
-        Some(cpu::fused_add_rmsnorm(..))  // CPU has a vectorized version
-    }
-    // All others: None (fallback to separate ops)
-    fn fused_qknorm_rope(&self, ..) -> Option<Result<..>> { None }
-    fn fused_silu_mul(&self, ..) -> Option<Result<..>> { None }
-    fn fused_knorm_rope_cache_write(&self, ..) -> Option<Result<..>> { None }
-    fn fused_adaln_zero(&self, ..) -> Option<Result<..>> { None }
-    fn fused_scale_shift(&self, ..) -> Option<Result<..>> { None }
+    fn fused_add_rmsnorm(&self, ..) -> Option<Result<..>> { Some(cpu::fused_add_rmsnorm(..)) }
 }
 
 impl OpsSession for CpuOps {
@@ -937,6 +977,31 @@ fn create_ops(device: &Device, config: &OpsConfig) -> Ops {
 
 All fields populated for every device. Methods on unsupported ops return errors (`bail!("paged attention not supported on {device}")`) rather than panicking or silently degrading.
 
+## Subsystem Independence
+
+Each subsystem can be developed by one person who only knows the trait signatures (shared contract)
+and their own internals. No cross-subsystem code reading required.
+
+| Subsystem | Needs to know | Does NOT need to know |
+|-----------|--------------|----------------------|
+| **Model impl** (Qwen3, Flux, TTS) | Op trait signatures, `Ops` bundle | Any device impl, kernel library, engine |
+| **CudaOps** | Op trait signatures, FA4/FlashInfer/DeepGEMM/cuBLAS APIs | Model code, other devices |
+| **RocmOps** | Op trait signatures, CK/aiter/hipBLAS APIs | CUDA code, model code |
+| **MetalOps** | Op trait signatures, Metal/MSL API | CUDA/ROCm code, model code |
+| **VulkanOps** | Op trait signatures, Vulkan/SPIR-V API | Other devices, model code |
+| **TpuOps** | Op trait signatures, XLA/Pallas API | Other devices, model code |
+| **Kernel wrapper** (FA4, FlashInfer, DeepGEMM) | Kernel library C API | Op traits, model code, other wrappers |
+| **Engine/Scheduler** | `OpsSession`, `PagedKvCtx`, model `forward()` signature | Kernel implementations, device internals |
+| **KV Cache Manager** | Block allocation logic, `block_tables`/`slot_mapping` layout | Attention kernels, device code |
+
+**Three design choices that enable this:**
+
+1. **`FusedOps` default methods** — adding a new fusion only touches the trait definition (1 line with `{ None }` default) and the device that implements it. Other devices don't change. Model developer adds call site + fallback. No cross-team coordination needed beyond agreeing on the method signature.
+
+2. **Tensor layout conventions** — formalized in the doc (above), not just comments. Every device implementation accepts and returns canonical layouts. Device-internal transformations (TPU 128-byte padding, Metal transpose) are invisible to callers.
+
+3. **Graph capture is device-internal** — `GraphMetaBuffers` and CUDA graph capture/replay are `CudaOps` methods, not in `OpsSession`. The engine's generic path uses `session.begin_forward()` / `session.end_forward()`. Only the CUDA-specific graph runner (which already knows it's on CUDA) calls `CudaOps::precompute_paged_plan_graphed`.
+
 ## Device Capability Matrix
 
 What each device supports today. "Planned" = not yet implemented but feasible.
@@ -973,7 +1038,7 @@ Model code never changes — the dispatch layer absorbs all device differences.
 | Multi-model | Same `AttentionOps` for causal/bidirectional/cross-attention via `MaskType` + `VarlenParams` |
 | DeltaNet/Mamba | Not `AttentionOps`; model-owned, closure-injected into TransformerBlock |
 | FlashInfer plan cache | `OpsSession::begin_forward()` / `end_forward()` |
-| CUDA graphs | `precompute_paged_plan(graph_buffers)` with pre-allocated fixed-address tensors |
+| CUDA graphs | `CudaOps::precompute_paged_plan_graphed` (device-specific, not in shared trait) |
 | KV cache write timing | `KvCacheOps::reshape_and_cache` separate from `AttentionOps` |
 | MLA head_dim asymmetry | Derived from tensor shapes, not params |
 | Chunked prefill | `paged_attention` with `max_seqlen_q > 1`, varlen kernel handles mixed Q lengths |
