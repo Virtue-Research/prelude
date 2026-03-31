@@ -37,6 +37,7 @@ pub enum MaskMode {
     NonCausal = 0,
     Causal = 1,
     CustomMask = 2,
+    MultiItemScoring = 3,
 }
 
 /// Key for looking up a batch prefill kernel variant.

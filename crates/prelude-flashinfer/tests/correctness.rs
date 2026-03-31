@@ -725,7 +725,7 @@ fn fa3_prefill_execution() {
         let dl_cuq_gpu = gpu_dl(cu_q_gpu, I32_DT, &cu_s, &cu_st);
         let dl_cuk_gpu = gpu_dl(cu_k_gpu, I32_DT, &cu_s, &cu_st);
 
-        // FA3 SM90 ragged_run: 21 params with SM90 additional params
+        // FA3 SM90 ragged_run: 22 params with SM90 additional params
         let run_args = [
             TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws),
             plan_info,
@@ -742,6 +742,7 @@ fn fa3_prefill_execution() {
             TVMFFIAny::float64(0.0),   // logits_soft_cap
             TVMFFIAny::float64(sm_scale),
             TVMFFIAny::float64(1.0),   // scale_v_scalar
+            TVMFFIAny::int64(0),       // token_pos_in_items_len
         ];
         reg.call(variant.ragged_run, &run_args).expect("FA3 ragged_run failed");
         cudaDeviceSynchronize();
@@ -1022,6 +1023,7 @@ fn silu_and_mul_activation() {
         let args = [
             TVMFFIAny::dltensor(&dl_out),
             TVMFFIAny::dltensor(&dl_in),
+            TVMFFIAny::bool_val(false), // enable_pdl
         ];
         reg.call(silu_fn, &args).expect("silu_and_mul failed");
         cudaDeviceSynchronize();

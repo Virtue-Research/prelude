@@ -510,6 +510,7 @@ fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
                         TVMFFIAny::bool_val(false),
                         TVMFFIAny::none(), TVMFFIAny::none(), TVMFFIAny::none(), TVMFFIAny::none(),
                         TVMFFIAny::float64(0.0), TVMFFIAny::float64(sm_scale), TVMFFIAny::float64(1.0),
+                        TVMFFIAny::int64(0), // token_pos_in_items_len
                     ];
                     let ms = cuda_bench(3, 20, || {
                         unsafe { reg.call(fa3.ragged_run, &run2).unwrap(); }
@@ -846,6 +847,7 @@ fn bench_utilities(reg: &KernelRegistry) {
             let args = [
                 TVMFFIAny::dltensor(&dl_out),
                 TVMFFIAny::dltensor(&dl_in),
+                TVMFFIAny::bool_val(false), // enable_pdl
             ];
 
             let ms = cuda_bench(5, 100, || {

@@ -993,7 +993,7 @@ __device__ __forceinline__ float gelu_tanh(const float& val) {
 // ── Launcher template ────────────────────────────────────────────
 
 template <float (*Activation)(const float&)>
-static void launch_act_and_mul(TensorView out, TensorView input) {
+static void launch_act_and_mul(TensorView out, TensorView input, bool enable_pdl) {
   int d = input.size(input.ndim() - 1) / 2;
   int64_t num_tokens = input.numel() / input.size(input.ndim() - 1);
 
@@ -1001,29 +1001,41 @@ static void launch_act_and_mul(TensorView out, TensorView input) {
   const cudaStream_t stream = get_stream(out.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
-    dim3 grid(num_tokens);
-    dim3 block(std::min((uint32_t)(d / vec_size), 1024U));
+
+    cudaLaunchConfig_t config;
+    config.gridDim = num_tokens;
+    config.blockDim = std::min(d / vec_size, 1024U);
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+    config.numAttrs = 1;
+    config.attrs = attrs;
 
     auto kernel = activation::act_and_mul_kernel<c_type, Activation>;
-    kernel<<<grid, block, 0, stream>>>(
+    cudaLaunchKernelEx(&config, kernel,
         static_cast<c_type*>(out.data_ptr()),
-        static_cast<const c_type*>(input.data_ptr()), d);
+        static_cast<c_type*>(input.data_ptr()), d);
+
+    cudaError_t err = cudaGetLastError();
+    TVM_FFI_ICHECK(err == cudaSuccess) << "Failed to launch kernel: " << cudaGetErrorString(err);
     return true;
   });
 }
 
 // ── TVM FFI exports ──────────────────────────────────────────────
 
-void silu_and_mul(TensorView out, TensorView input) {
-  launch_act_and_mul<silu>(out, input);
+void silu_and_mul(TensorView out, TensorView input, bool enable_pdl) {
+  launch_act_and_mul<silu>(out, input, enable_pdl);
 }
 
-void gelu_and_mul(TensorView out, TensorView input) {
-  launch_act_and_mul<gelu>(out, input);
+void gelu_and_mul(TensorView out, TensorView input, bool enable_pdl) {
+  launch_act_and_mul<gelu>(out, input, enable_pdl);
 }
 
-void gelu_tanh_and_mul(TensorView out, TensorView input) {
-  launch_act_and_mul<gelu_tanh>(out, input);
+void gelu_tanh_and_mul(TensorView out, TensorView input, bool enable_pdl) {
+  launch_act_and_mul<gelu_tanh>(out, input, enable_pdl);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(silu_and_mul, silu_and_mul);
@@ -1101,10 +1113,6 @@ def generate_utility_sources(
                     # Patch: exclude layernorm (requires TensorRT-LLM headers
                     # that the upstream norm.cuh pulls in for LayerNorm).
                     src_text = src_path.read_text()
-                    src_text = src_text.replace(
-                        '#include <flashinfer/norm.cuh>',
-                        '#define FLASHINFER_NORM_NO_LAYERNORM\n#include <flashinfer/norm.cuh>'
-                    )
                     # Remove layernorm function body using brace-counting
                     # so we correctly skip nested braces (macros, lambdas).
                     lines = src_text.split('\n')
@@ -1335,8 +1343,9 @@ def _default_prefill_sm90_params():
             "maybe_max_item_len_ptr", "maybe_scale_v",
         ],
         tensor_dtypes=["uint32_t", "uint16_t", "uint16_t", "float"],
-        scalar_names=["logits_soft_cap", "sm_scale", "scale_v_scalar"],
-        scalar_dtypes=["double", "double", "double"],
+        scalar_names=["logits_soft_cap", "sm_scale", "scale_v_scalar",
+                       "token_pos_in_items_len"],
+        scalar_dtypes=["double", "double", "double", "int64_t"],
         is_sm90=True,
     )
 
