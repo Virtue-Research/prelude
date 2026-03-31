@@ -2028,7 +2028,167 @@ Key points:
 - **aiter flash attention**: specialized for MI300/MI350. Falls back to CK on older AMD hardware.
 - **HIP graphs**: supported on ROCm 6.1+. `OpsSession` manages HIP graph capture/replay same as CUDA graphs.
 
-### Example 11: Multi-LoRA Serving (Llama-3-8B, 50 Concurrent Adapters)
+### Example 11: LLaDA2 (Diffusion LLM, Bidirectional Demasking)
+
+Diffusion LLM: generates text by iteratively replacing [MASK] tokens with predicted tokens.
+**Not autoregressive** — uses bidirectional attention (all tokens see all tokens).
+The model architecture is a standard transformer, but with `MaskType::Bidirectional`.
+
+```rust
+// Model forward: identical structure to a standard LLM, just bidirectional attention.
+impl LLaDA2Layer {
+    fn forward(&self, x: &Tensor, ops: &Ops) -> Result<Tensor> {
+        let (residual, h) = blocks::residual_norm(x, &self.residual, &self.ln1, eps, ops)?;
+
+        let qkv = blocks::col_parallel(&h, &self.qkv_shard, false, ops)?;
+        let (q, k, v) = split_qkv(&qkv, num_heads_per_rank, num_kv_heads_per_rank);
+
+        // Bidirectional attention — every token attends to every token (no causal mask)
+        let o = ops.attn.varlen_attention(&q, &k, &v, &VarlenParams {
+            mask: MaskType::Bidirectional,   // ← only difference from AR LLM
+            ..
+        })?;
+
+        let h = blocks::row_parallel(&o, &self.o_proj_shard, ops)?;
+        let (residual, h) = blocks::residual_norm(&residual, &h, &self.ln2, eps, ops)?;
+        let h = blocks::moe_layer(&h, &self.gate, &self.expert_weights, &self.ep_config, ops)?;
+        Ok((&residual + &h)?)
+    }
+}
+```
+
+The **denoising loop** is engine-level (not model-level):
+
+```rust
+// Engine's DLLM decode loop
+fn dllm_generate(model: &LLaDA2, ops: &Ops, prompt_ids: &[u32], block_size: usize) -> Vec<u32> {
+    // Start with prompt + block_size MASK tokens
+    let mut ids = [prompt_ids, &vec![MASK_ID; block_size]].concat();
+
+    // Iterative denoising: up to block_size iterations per block
+    for _ in 0..block_size {
+        // Full forward pass (bidirectional attention over all tokens)
+        ops.session.begin_forward();
+        let logits = model.forward(&embed(&ids), ops)?;  // [total_len, vocab]
+        ops.session.end_forward();
+
+        // Confidence thresholding: replace high-confidence masks
+        let probs = ops.act.softmax(&logits, /*dim=*/-1)?;  // softmax over vocab
+        let (max_probs, predicted) = probs.max(/*dim=*/-1)?;
+
+        // Replace MASK positions where confidence > threshold
+        for pos in mask_positions(&ids) {
+            if max_probs[pos] > 0.95 {
+                ids[pos] = predicted[pos];
+            }
+        }
+
+        if !ids.contains(&MASK_ID) { break; }  // all masks replaced
+    }
+    ids[prompt_ids.len()..].to_vec()
+}
+```
+
+Key points:
+- **Same building blocks as Qwen3**: `residual_norm`, `col_parallel`, `row_parallel`, `moe_layer`. All kernel optimizations on these benefit LLaDA2 too.
+- **Only attention mask differs**: `MaskType::Bidirectional` instead of `Causal`. The kernel is the same FlashAttention with `causal=false`.
+- **No KV cache for generation** (recompute every iteration). Can optionally cache across denoising iterations for speed.
+- **No paged attention**: uses `varlen_attention` since there's no incremental decode.
+- **Engine owns the denoising loop**: model.forward() is called block_size times. Scheduler controls when to stop.
+
+### Example 12: Flux Full Pipeline (Denoising Loop + CFG + VAE Decode)
+
+Complete image generation pipeline. Shows engine-level orchestration and how different
+sub-models (text encoder, DiT, VAE) each get their own `Ops`.
+
+```rust
+// Engine's Flux pipeline — NOT model code
+fn flux_generate(
+    prompt: &str,
+    dit: &FluxDiT,                // DiT transformer (Example 2)
+    text_encoder: &T5Encoder,     // text encoder (bidirectional attention)
+    vae: &AutoencoderKL,          // VAE decoder (conv2d + group_norm)
+    ops: &Ops,
+    num_steps: usize,
+    guidance_scale: f32,
+) -> Result<Image> {
+    // ── Stage 1: Text encoding (single forward pass) ────────────
+    let text_embeds = text_encoder.forward(&tokenize(prompt), ops)?;
+    let pooled = text_encoder.pool(&text_embeds)?;
+
+    // ── Stage 2: Denoising loop (num_steps iterations) ──────────
+    let mut latents = Tensor::randn(&[1, 16, h/8, w/8])?;  // random noise
+    let timesteps = flow_match_schedule(num_steps);           // e.g., [1.0, 0.95, ..., 0.0]
+
+    for i in 0..num_steps {
+        let t = timesteps[i];
+        let dt = timesteps[i] - timesteps[i + 1];
+        let temb = timestep_embed(t)?;                        // sinusoidal → MLP
+
+        ops.session.begin_forward();
+
+        // Classifier-Free Guidance: 2x batch (conditional + unconditional)
+        let latents_cfg = cat(&[&latents, &latents], 0)?;    // [2, 16, h/8, w/8]
+        let text_cfg = cat(&[&text_embeds, &null_embeds], 0)?;
+
+        // DiT forward (same FluxDoubleBlock as Example 2, processes 2x batch)
+        let noise_pred = dit.forward(&latents_cfg, &text_cfg, &pooled, &temb, ops)?;
+
+        ops.session.end_forward();
+
+        // CFG: guided = uncond + scale * (cond - uncond)
+        let (cond_pred, uncond_pred) = noise_pred.chunk(2, 0)?;
+        let guided = (&uncond_pred + guidance_scale * &(&cond_pred - &uncond_pred)?)?;
+
+        // Euler step: latents = latents + dt * guided
+        latents = (&latents + dt * &guided)?;
+    }
+
+    // ── Stage 3: VAE decode (latent → RGB image) ────────────────
+    let image = vae.decode(&latents, ops)?;
+    Ok(image)
+}
+
+// VAE decoder: conv2d + group_norm + silu pipeline
+impl AutoencoderKL {
+    fn decode(&self, latents: &Tensor, ops: &Ops) -> Result<Tensor> {
+        let mut h = ops.gemm.matmul(latents, &self.post_quant_conv)?;
+
+        // ResNet blocks + upsampling
+        for block in &self.decoder_blocks {
+            // ResNet: group_norm → silu → conv2d → group_norm → silu → conv2d + residual
+            let residual = h.clone();
+            h = ops.norm.group_norm(&h, &block.norm1, Some(&block.bias1), 32, eps)?;
+            h = ops.act.silu(&h)?;
+            h = ops.conv.conv2d(&h, &block.conv1, Some(&block.conv1_bias), [1,1], [1,1])?;
+            h = ops.norm.group_norm(&h, &block.norm2, Some(&block.bias2), 32, eps)?;
+            h = ops.act.silu(&h)?;
+            h = ops.conv.conv2d(&h, &block.conv2, Some(&block.conv2_bias), [1,1], [1,1])?;
+            h = (&h + &residual)?;
+
+            // Upsample (nearest + conv2d)
+            if let Some(up) = &block.upsample {
+                h = nearest_upsample_2x(&h)?;
+                h = ops.conv.conv2d(&h, &up.conv, Some(&up.bias), [1,1], [1,1])?;
+            }
+        }
+
+        // Final norm + conv
+        h = ops.norm.group_norm(&h, &self.final_norm, Some(&self.final_bias), 32, eps)?;
+        h = ops.act.silu(&h)?;
+        ops.conv.conv2d(&h, &self.final_conv, Some(&self.final_conv_bias), [1,1], [1,1])
+    }
+}
+```
+
+Key points:
+- **Three sub-models, same `Ops`**: text encoder (bidirectional attention), DiT (AdaLN + joint attention), VAE (conv2d + group_norm). All share `Ops`.
+- **CFG is 2x batch**: conditional + unconditional latents batched together. DiT processes both in one forward pass. Engine splits output after.
+- **Denoising loop is engine-level**: scheduler controls timesteps, model.forward() called num_steps times.
+- **VAE decoder uses `ConvOps` + `NormOps` only**: no attention. Pure conv2d + group_norm + silu pipeline. Kernel optimizations on `conv2d` and `group_norm` benefit all diffusion VAE decoders.
+- **Building blocks inside DiT**: `blocks::adaln_zero`, `blocks::gelu_mlp` — same as Example 2.
+
+### Example 13: Multi-LoRA Serving (Llama-3-8B, 50 Concurrent Adapters)
 
 Multi-tenant serving: each request uses a different LoRA adapter. A single batch contains
 tokens from 50 different adapters. Uses `blocks::lora_linear` for fused BGMV dispatch.
@@ -2069,7 +2229,7 @@ Key points:
 - On CPU/Metal: fallback splits batch by adapter, runs separate matmuls. Correct but slower.
 - **Attention is identical to non-LoRA** — LoRA only wraps linear layers.
 
-### Example 12: Qwen3.5 Hybrid (DeltaNet + Softmax, Per-Layer Dispatch)
+### Example 14: Qwen3.5 Hybrid (DeltaNet + Softmax, Per-Layer Dispatch)
 
 Qwen3.5 uses DeltaNet (linear attention) for ~75% of layers and softmax attention for ~25%.
 DeltaNet is model-owned (closure injection), softmax goes through `AttentionOps`.
@@ -2111,7 +2271,7 @@ Key points:
 - But DeltaNet layers **still use building blocks** for everything else: `residual_norm`, `gated_mlp`, `ops.gemm.matmul`. Kernel optimizations on these benefit DeltaNet layers too.
 - Only the token mixer differs per layer. MLP, norms, projections are identical.
 
-### Example 13: DeepSeek-V3 with EP (Expert Parallelism, 256 Experts on 8 GPUs)
+### Example 15: DeepSeek-V3 with EP (Expert Parallelism, 256 Experts on 8 GPUs)
 
 MoE model with 256 routed experts distributed across 8 EP ranks (32 experts each).
 Uses `blocks::moe_layer` which handles EP dispatch/combine internally.
@@ -2160,7 +2320,7 @@ Key points:
 - Same model code works for EP=1 (single GPU) and EP=8 (8 GPUs).
 - `CommOps::all_to_all` used inside `ep_dispatch`/`ep_combine`.
 
-### Example 14: Speculative Decoding (EAGLE Draft + Target Verify)
+### Example 16: Speculative Decoding (EAGLE Draft + Target Verify)
 
 Engine-level orchestration. Both draft and target models use the same `Ops`.
 
@@ -2203,7 +2363,7 @@ Key points:
 - **No KV cache rollback needed** — rejected tokens have `slot_mapping = -1`, `reshape_and_cache` skips them.
 - **Engine-only concern** — model code is unchanged.
 
-### Example 15: Adding a New Fused Kernel (Developer Workflow)
+### Example 17: Adding a New Fused Kernel (Developer Workflow)
 
 Scenario: kernel dev adds `fused_geglu` (GELU-gated MLP fusion) to CudaOps.
 Shows the minimal change set.
