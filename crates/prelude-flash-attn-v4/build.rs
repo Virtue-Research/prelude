@@ -283,6 +283,12 @@ fn compile_tvm_ffi_static(manifest_dir: &Path, out_dir: &Path) -> Result<()> {
         build.file(f);
     }
 
+    // TVM error helper for extracting error messages from TVM FFI calls
+    let error_helper = manifest_dir.join("src/tvm_error_helper.cc");
+    if error_helper.exists() {
+        build.file(&error_helper);
+    }
+
     // Use +whole-archive so kernel .o files can resolve TVM symbols at link time.
     build.link_lib_modifier("+whole-archive");
     build
@@ -386,20 +392,6 @@ fn ensure_fa4_source(out_dir: &Path) -> Result<PathBuf> {
 
     if !fa4_src.join("flash_attn/cute/__init__.py").exists() {
         anyhow::bail!("flash_attn/cute/ not found in cloned repo");
-    }
-
-    // Upstream bug: create_softcap_scoremod missing seqlen_info param.
-    // Tracked in https://github.com/Dao-AILab/flash-attention/pull/2366
-    let utils_py = fa4_src.join("flash_attn/cute/utils.py");
-    if utils_py.exists() {
-        let content = std::fs::read_to_string(&utils_py)?;
-        let patched = content.replace(
-            "def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, aux_tensors):",
-            "def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):",
-        );
-        if patched != content {
-            std::fs::write(&utils_py, patched)?;
-        }
     }
 
     Ok(fa4_src)
@@ -585,7 +577,7 @@ fn ensure_python_env(out_dir: &Path) -> Result<String> {
         .unwrap_or(false);
 
     let base_pkgs = &[
-        "nvidia-cutlass-dsl",
+        "nvidia-cutlass-dsl>=4.4.2",
         "quack-kernels@git+https://github.com/Dao-AILab/quack.git",
         "torch",
         "einops",
@@ -613,7 +605,7 @@ fn ensure_python_env(out_dir: &Path) -> Result<String> {
     if !status.success() {
         anyhow::bail!(
             "Failed to install FA4 Python deps.\n\
-             Requires: pip install nvidia-cutlass-dsl torch"
+             Requires: pip install 'nvidia-cutlass-dsl>=4.4.2' torch"
         );
     }
 

@@ -140,6 +140,9 @@ unsafe extern "C" {
         device_type: i32, device_id: i32,
         stream: *mut c_void, out_original: *mut *mut c_void,
     ) -> i32;
+    /// Extract error message from TVM FFI's thread-local error state.
+    /// Defined in src/tvm_error_helper.cc.
+    fn prelude_tvm_get_last_error(out_len: *mut usize) -> *const u8;
 }
 
 const CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
@@ -150,13 +153,11 @@ const CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MINOR: i32 = 76;
 fn detect_gpu_arch() -> u32 {
     unsafe {
         let mut device = 0i32;
-        if cudaGetDevice(&mut device) != 0 {
-            return 0;
-        }
+        if cudaGetDevice(&mut device) != 0 { return 0; }
         let mut major = 0i32;
         let mut minor = 0i32;
-        cudaDeviceGetAttribute(&mut major, CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MAJOR, device);
-        cudaDeviceGetAttribute(&mut minor, CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MINOR, device);
+        if cudaDeviceGetAttribute(&mut major, CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MAJOR, device) != 0 { return 0; }
+        if cudaDeviceGetAttribute(&mut minor, CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MINOR, device) != 0 { return 0; }
         (major * 10 + minor) as u32
     }
 }
@@ -221,22 +222,32 @@ impl KernelRegistry {
             )
         };
         if ret != 0 {
-            // Sync and get CUDA error for detailed diagnostics
-            let cuda_detail = unsafe {
+            let detail = unsafe {
+                // Try TVM FFI error message first
+                let mut msg_len: usize = 0;
+                let msg_ptr = prelude_tvm_get_last_error(&mut msg_len);
+                let tvm_msg = if !msg_ptr.is_null() && msg_len > 0 {
+                    String::from_utf8_lossy(std::slice::from_raw_parts(msg_ptr, msg_len)).into_owned()
+                } else {
+                    String::new()
+                };
+
                 cudaDeviceSynchronize();
-                let cuda_err = cudaGetLastError();
-                if cuda_err != 0 {
-                    let ptr = cudaGetErrorString(cuda_err);
+                let err = cudaGetLastError();
+                if !tvm_msg.is_empty() {
+                    tvm_msg
+                } else if err != 0 {
+                    let ptr = cudaGetErrorString(err);
                     if !ptr.is_null() {
-                        format!("CUDA error {cuda_err}: {}", std::ffi::CStr::from_ptr(ptr).to_string_lossy())
+                        format!("CUDA error {err}: {}", std::ffi::CStr::from_ptr(ptr).to_string_lossy())
                     } else {
-                        format!("CUDA error {cuda_err}")
+                        format!("CUDA error {err}")
                     }
                 } else {
-                    "no CUDA error (TVM FFI internal failure)".to_string()
+                    "TVM FFI internal failure (no error message available)".to_string()
                 }
             };
-            return Err(format!("FA4 kernel call failed (code {ret}): {cuda_detail}"));
+            return Err(format!("FA4 kernel call failed (code {ret}): {detail}"));
         }
         Ok(())
     }

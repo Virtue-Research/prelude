@@ -47,6 +47,10 @@ def _patch_flash_attn_import():
 
 _patch_flash_attn_import()
 os.environ.setdefault("FLASH_ATTENTION_FAKE_TENSOR", "1")
+# Disable CLC work-stealing scheduler (new compile_key dimension since upstream 98024f9).
+# CLC is SM90-only and opt-in; our AOT kernels use the default persistent scheduler.
+os.environ.setdefault("FA_CLC", "0")
+os.environ.setdefault("FA_DISABLE_2CTA", "0")
 
 
 def get_arch_from_env():

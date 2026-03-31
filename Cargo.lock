@@ -2669,7 +2669,10 @@ name = "prelude-flash-attn-v4"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "candle-flash-attn-v3",
+ "candle-paged-attn",
  "cc",
+ "half",
  "hex",
  "serde_json",
  "sha2",
