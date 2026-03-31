@@ -2303,3 +2303,316 @@ fn moe_routing_execution() {
         cudaFree(topk_values_ptr); cudaFree(topk_indices_ptr);
     }
 }
+
+#[test]
+fn pod_variant_lookup() {
+    let reg = KernelRegistry::new();
+    let key = PodKey {
+        dtype: KernelDtype::BF16,
+        head_dim_qk: 128,
+        head_dim_vo: 128,
+    };
+    let variant = reg.get_pod(&key);
+    if variant.is_some() {
+        println!("POD BF16 h128: found (merged swa/softcap, kCausal+kCustom mask modes)");
+    } else {
+        println!("POD BF16 h128: not compiled (expected if using minimal kernel set)");
+    }
+}
+
+#[test]
+fn pod_execution() {
+    // POD (Prefill-On-Decode): mixed batch with prefill + decode in one kernel.
+    // We reuse prefill plan and decode plan, then call POD run with both plan_infos.
+    let reg = KernelRegistry::new();
+    let ws = Workspace::new();
+
+    let pod_key = PodKey {
+        dtype: KernelDtype::BF16,
+        head_dim_qk: 128,
+        head_dim_vo: 128,
+    };
+    let pod_variant = match reg.get_pod(&pod_key) {
+        Some(v) => v,
+        None => {
+            println!("POD BF16 h128 not compiled, skipping execution test");
+            return;
+        }
+    };
+
+    // Also need prefill and decode plan functions
+    // POD uses PrefillPlanInfo for BOTH sides (prefill + decode).
+    // The decode side is treated as a prefill with Q=1.
+    let prefill_variant = reg.get_prefill(&PrefillKey {
+        dtype: KernelDtype::BF16, head_dim_qk: 128, head_dim_vo: 128,
+        sliding_window: false, logits_soft_cap: false, backend: Backend::FA2,
+    }).expect("Prefill variant needed for POD plan");
+
+    let num_qo_heads = 2i64;
+    let num_kv_heads = 2i64;
+    let head_dim = 128i64;
+    let page_size = 16i64;
+
+    // Prefill request: seq_len_p tokens of Q, kv_len_p tokens of KV
+    let seq_len_p = 8i64;
+    let kv_len_p = 8i64;
+    let num_pages_p = (kv_len_p + page_size - 1) / page_size;
+
+    // Decode request: 1 token of Q, kv_len_d tokens of KV
+    let kv_len_d = 32i64;
+    let num_pages_d = (kv_len_d + page_size - 1) / page_size;
+
+    let total_pages = num_pages_p + num_pages_d;
+
+    unsafe {
+        // ── Allocate shared KV cache ──
+        let kv_elems = (total_pages * page_size * num_kv_heads * head_dim) as usize;
+        let k_bf16: Vec<u16> = (0..kv_elems).map(|i| f32_to_bf16(0.005 * (i as f32 % 11.0))).collect();
+        let v_bf16: Vec<u16> = (0..kv_elems).map(|i| f32_to_bf16(0.01 * (i as f32 % 5.0))).collect();
+        let k_cache = gpu_upload(&k_bf16);
+        let v_cache = gpu_upload(&v_bf16);
+
+        // ── Prefill Q [seq_len_p, num_qo_heads, head_dim] ──
+        let q_p_elems = (seq_len_p * num_qo_heads * head_dim) as usize;
+        let q_p_bf16: Vec<u16> = (0..q_p_elems).map(|i| f32_to_bf16(0.01 * (i as f32 % 10.0))).collect();
+        let q_p_ptr = gpu_upload(&q_p_bf16);
+        let o_p_ptr = gpu_alloc(q_p_elems * 2);
+
+        // ── Decode Q [1, num_qo_heads, head_dim] ──
+        let q_d_elems = (1 * num_qo_heads * head_dim) as usize;
+        let q_d_bf16: Vec<u16> = (0..q_d_elems).map(|i| f32_to_bf16(0.02 * (i as f32 % 7.0))).collect();
+        let q_d_ptr = gpu_upload(&q_d_bf16);
+        let o_d_ptr = gpu_alloc(q_d_elems * 2);
+
+        // ── Page tables ──
+        // Prefill: pages [0, num_pages_p)
+        let kv_indptr_p: Vec<i32> = vec![0, num_pages_p as i32];
+        let kv_indices_p: Vec<i32> = (0..num_pages_p as i32).collect();
+        let kv_last_page_p = vec![
+            if kv_len_p % page_size == 0 { page_size as i32 } else { (kv_len_p % page_size) as i32 }
+        ];
+        // Decode: pages [num_pages_p, total_pages)
+        let kv_indptr_d: Vec<i32> = vec![0, num_pages_d as i32];
+        let kv_indices_d: Vec<i32> = (num_pages_p as i32..total_pages as i32).collect();
+        let kv_last_page_d = vec![
+            if kv_len_d % page_size == 0 { page_size as i32 } else { (kv_len_d % page_size) as i32 }
+        ];
+
+        // Prefill qo_indptr
+        let qo_indptr_p: Vec<i32> = vec![0, seq_len_p as i32];
+        // Decode qo_indptr (1 token per seq)
+        let qo_indptr_d: Vec<i32> = vec![0, 1];
+
+        // Upload page tables
+        let kv_indptr_p_gpu = gpu_upload(&kv_indptr_p);
+        let kv_indices_p_gpu = gpu_upload(&kv_indices_p);
+        let kv_last_p_gpu = gpu_upload(&kv_last_page_p);
+        let qo_indptr_p_gpu = gpu_upload(&qo_indptr_p);
+
+        let kv_indptr_d_gpu = gpu_upload(&kv_indptr_d);
+        let kv_indices_d_gpu = gpu_upload(&kv_indices_d);
+        let kv_last_d_gpu = gpu_upload(&kv_last_page_d);
+        let qo_indptr_d_gpu = gpu_upload(&qo_indptr_d);
+
+        // ── SM-aware scheduling buffer ──
+        let num_sm = 132i64; // H200
+        let sched_elems = (num_sm + 2) as usize;
+        let sched_ptr = gpu_alloc(sched_elems * 4);
+        cudaMemset(sched_ptr, 0, sched_elems * 4);
+
+        reg.set_stream(0, std::ptr::null_mut());
+
+        // ── Workspaces ──
+        let (dl_fws, _fws_s, _fws_st) = ws.dl_float();
+        let (dl_iws, _iws_s, _iws_st) = ws.dl_int();
+        let (dl_pws, _pws_s, _pws_st) = ws.dl_pinned();
+
+        // ── Step 1: Prefill Plan ──
+        let cu_s = [2i64]; // batch_size + 1 = 1 + 1
+        let cu_st = contiguous_strides(&cu_s);
+        let kvl_s = [1i64]; // batch_size = 1
+        let kvl_st = contiguous_strides(&kvl_s);
+        let kvl_data_p: [i32; 1] = [kv_len_p as i32];
+        let dl_cuq_p_cpu = cpu_dl(qo_indptr_p.as_ptr() as *mut c_void, I32_DT, &cu_s, &cu_st);
+        let dl_cuk_p_cpu = cpu_dl(kv_indptr_p.as_ptr() as *mut c_void, I32_DT, &cu_s, &cu_st);
+        let dl_kvl_p = cpu_dl(kvl_data_p.as_ptr() as *mut c_void, I32_DT, &kvl_s, &kvl_st);
+
+        let plan_p_args = [
+            TVMFFIAny::dltensor(&dl_fws),
+            TVMFFIAny::dltensor(&dl_iws),
+            TVMFFIAny::dltensor(&dl_pws),
+            TVMFFIAny::dltensor(&dl_cuq_p_cpu),
+            TVMFFIAny::dltensor(&dl_cuk_p_cpu),
+            TVMFFIAny::dltensor(&dl_kvl_p),
+            TVMFFIAny::int64(kv_len_p),        // total_len
+            TVMFFIAny::int64(1),               // batch_size
+            TVMFFIAny::int64(num_qo_heads),
+            TVMFFIAny::int64(num_kv_heads),
+            TVMFFIAny::int64(page_size),
+            TVMFFIAny::bool_val(false),        // cuda_graph
+            TVMFFIAny::int64(head_dim),
+            TVMFFIAny::int64(head_dim),
+            TVMFFIAny::bool_val(true),         // causal
+            TVMFFIAny::int64(-1),              // window_left
+            TVMFFIAny::int64(-1),              // fixed_split_size
+            TVMFFIAny::bool_val(false),        // disable_split_kv
+            TVMFFIAny::int64(0),               // num_colocated_ctas
+        ];
+        let plan_info_p = reg.call(prefill_variant.plan, &plan_p_args)
+            .expect("Prefill plan failed for POD");
+
+        // ── Step 2: Decode Plan (uses prefill plan — POD treats decode as prefill with Q=1) ──
+        let qo_indptr_d_cpu: Vec<i32> = vec![0, 1]; // Q=1
+        let kv_indptr_d_cpu_plan = kv_indptr_d.clone();
+        let kvl_data_d: [i32; 1] = [kv_len_d as i32];
+        let dl_cuq_d_cpu = cpu_dl(qo_indptr_d_cpu.as_ptr() as *mut c_void, I32_DT, &cu_s, &cu_st);
+        let dl_cuk_d_cpu = cpu_dl(kv_indptr_d_cpu_plan.as_ptr() as *mut c_void, I32_DT, &cu_s, &cu_st);
+        let dl_kvl_d = cpu_dl(kvl_data_d.as_ptr() as *mut c_void, I32_DT, &kvl_s, &kvl_st);
+
+        let plan_d_args = [
+            TVMFFIAny::dltensor(&dl_fws),
+            TVMFFIAny::dltensor(&dl_iws),
+            TVMFFIAny::dltensor(&dl_pws),
+            TVMFFIAny::dltensor(&dl_cuq_d_cpu),
+            TVMFFIAny::dltensor(&dl_cuk_d_cpu),
+            TVMFFIAny::dltensor(&dl_kvl_d),
+            TVMFFIAny::int64(kv_len_d),        // total_len
+            TVMFFIAny::int64(1),               // batch_size
+            TVMFFIAny::int64(num_qo_heads),
+            TVMFFIAny::int64(num_kv_heads),
+            TVMFFIAny::int64(page_size),
+            TVMFFIAny::bool_val(false),        // cuda_graph
+            TVMFFIAny::int64(head_dim),
+            TVMFFIAny::int64(head_dim),
+            TVMFFIAny::bool_val(true),         // causal
+            TVMFFIAny::int64(-1),              // window_left
+            TVMFFIAny::int64(-1),              // fixed_split_size
+            TVMFFIAny::bool_val(false),        // disable_split_kv
+            TVMFFIAny::int64(0),               // num_colocated_ctas
+        ];
+        let plan_info_d = reg.call(prefill_variant.plan, &plan_d_args)
+            .expect("Decode-side prefill plan failed for POD");
+
+        // ── Step 3: POD Run ──
+        let sm_scale = 1.0 / (head_dim as f64).sqrt();
+
+        // Build DLTensors for POD
+        let q_p_s = [seq_len_p, num_qo_heads, head_dim];
+        let q_p_st = contiguous_strides(&q_p_s);
+        let q_d_s = [1i64, num_qo_heads, head_dim];
+        let q_d_st = contiguous_strides(&q_d_s);
+        let kv_s = [total_pages, page_size, num_kv_heads, head_dim];
+        let kv_st = contiguous_strides(&kv_s);
+        let sched_s = [num_sm + 2];
+        let sched_st = contiguous_strides(&sched_s);
+
+        let dl_qp = gpu_dl(q_p_ptr, BF16_DT, &q_p_s, &q_p_st);
+        let dl_op = gpu_dl(o_p_ptr, BF16_DT, &q_p_s, &q_p_st);
+        let dl_qd = gpu_dl(q_d_ptr, BF16_DT, &q_d_s, &q_d_st);
+        let dl_od = gpu_dl(o_d_ptr, BF16_DT, &q_d_s, &q_d_st);
+        let dl_k = gpu_dl(k_cache, BF16_DT, &kv_s, &kv_st);
+        let dl_v = gpu_dl(v_cache, BF16_DT, &kv_s, &kv_st);
+        let dl_sched = gpu_dl(sched_ptr, I32_DT, &sched_s, &sched_st);
+
+        let kvi_p_s = [kv_indices_p.len() as i64];
+        let kvi_p_st = contiguous_strides(&kvi_p_s);
+        let kvi_d_s = [kv_indices_d.len() as i64];
+        let kvi_d_st = contiguous_strides(&kvi_d_s);
+        let kv_indptr_s = [2i64];
+        let kv_indptr_st = contiguous_strides(&kv_indptr_s);
+        let kvlp_s = [1i64];
+        let kvlp_st = contiguous_strides(&kvlp_s);
+
+        let dl_kv_indptr_p = gpu_dl(kv_indptr_p_gpu, I32_DT, &kv_indptr_s, &kv_indptr_st);
+        let dl_kv_indices_p = gpu_dl(kv_indices_p_gpu, I32_DT, &kvi_p_s, &kvi_p_st);
+        let dl_kv_last_p = gpu_dl(kv_last_p_gpu, I32_DT, &kvlp_s, &kvlp_st);
+        let dl_qo_indptr_p = gpu_dl(qo_indptr_p_gpu, I32_DT, &kv_indptr_s, &kv_indptr_st);
+
+        let dl_kv_indptr_d = gpu_dl(kv_indptr_d_gpu, I32_DT, &kv_indptr_s, &kv_indptr_st);
+        let dl_kv_indices_d = gpu_dl(kv_indices_d_gpu, I32_DT, &kvi_d_s, &kvi_d_st);
+        let dl_kv_last_d = gpu_dl(kv_last_d_gpu, I32_DT, &kvlp_s, &kvlp_st);
+        let dl_qo_indptr_d = gpu_dl(qo_indptr_d_gpu, I32_DT, &kv_indptr_s, &kv_indptr_st);
+
+        // POD run: prefill params, decode params, enable_pdl, sm_aware_sched
+        let run_args = [
+            // ── Prefill params ──
+            TVMFFIAny::dltensor(&dl_fws),
+            TVMFFIAny::dltensor(&dl_iws),
+            plan_info_p,
+            TVMFFIAny::dltensor(&dl_qp),
+            TVMFFIAny::dltensor(&dl_k),
+            TVMFFIAny::dltensor(&dl_v),
+            TVMFFIAny::dltensor(&dl_qo_indptr_p),
+            TVMFFIAny::dltensor(&dl_kv_indptr_p),
+            TVMFFIAny::dltensor(&dl_kv_indices_p),
+            TVMFFIAny::dltensor(&dl_kv_last_p),
+            TVMFFIAny::dltensor(&dl_op),
+            TVMFFIAny::none(),              // maybe_lse_p
+            TVMFFIAny::int64(1),            // mask_mode_p = Causal
+            TVMFFIAny::int64(0),            // layout_p = NHD
+            TVMFFIAny::int64(-1),           // window_left_p
+            TVMFFIAny::none(),              // custom_mask_p
+            TVMFFIAny::none(),              // mask_indptr_p
+            TVMFFIAny::none(),              // alibi_slopes_p
+            TVMFFIAny::float64(0.0),        // logits_soft_cap_p
+            TVMFFIAny::float64(sm_scale),
+            TVMFFIAny::float64(1.0),        // rope_rcp_scale_p
+            TVMFFIAny::float64(1e4),        // rope_rcp_theta_p
+            // ── Decode params ──
+            TVMFFIAny::dltensor(&dl_fws),
+            TVMFFIAny::dltensor(&dl_iws),
+            plan_info_d,
+            TVMFFIAny::dltensor(&dl_qd),
+            TVMFFIAny::dltensor(&dl_k),
+            TVMFFIAny::dltensor(&dl_v),
+            TVMFFIAny::dltensor(&dl_qo_indptr_d),
+            TVMFFIAny::dltensor(&dl_kv_indptr_d),
+            TVMFFIAny::dltensor(&dl_kv_indices_d),
+            TVMFFIAny::dltensor(&dl_kv_last_d),
+            TVMFFIAny::dltensor(&dl_od),
+            TVMFFIAny::none(),              // maybe_lse_d
+            TVMFFIAny::int64(1),            // mask_mode_d = Causal
+            TVMFFIAny::int64(0),            // layout_d = NHD
+            TVMFFIAny::int64(-1),           // window_left_d
+            TVMFFIAny::none(),              // custom_mask_d
+            TVMFFIAny::none(),              // mask_indptr_d
+            TVMFFIAny::none(),              // alibi_slopes_d
+            TVMFFIAny::float64(0.0),        // logits_soft_cap_d
+            TVMFFIAny::float64(sm_scale),
+            TVMFFIAny::float64(1.0),        // rope_rcp_scale_d
+            TVMFFIAny::float64(1e4),        // rope_rcp_theta_d
+            // ── POD-specific ──
+            TVMFFIAny::bool_val(false),     // enable_pdl
+            TVMFFIAny::dltensor(&dl_sched),
+        ];
+        reg.call(pod_variant.run, &run_args)
+            .expect("POD run failed");
+        cudaDeviceSynchronize();
+
+        // ── Verify prefill output ──
+        let out_p_bf16 = gpu_download::<u16>(o_p_ptr, q_p_elems);
+        let out_p_f32: Vec<f32> = out_p_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
+        let sum_p: f32 = out_p_f32.iter().map(|v| v.abs()).sum();
+        assert!(sum_p > 0.0, "POD prefill output is all zeros");
+        assert!(out_p_f32.iter().all(|v| v.is_finite()), "POD prefill output has NaN/Inf");
+
+        // ── Verify decode output ──
+        let out_d_bf16 = gpu_download::<u16>(o_d_ptr, q_d_elems);
+        let out_d_f32: Vec<f32> = out_d_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
+        let sum_d: f32 = out_d_f32.iter().map(|v| v.abs()).sum();
+        assert!(sum_d > 0.0, "POD decode output is all zeros");
+        assert!(out_d_f32.iter().all(|v| v.is_finite()), "POD decode output has NaN/Inf");
+
+        println!("POD execution BF16 h128: PASS (prefill_sum={sum_p:.4}, decode_sum={sum_d:.4})");
+
+        // Benchmark moved to examples/bench_pod.rs
+
+        // Cleanup
+        cudaFree(q_p_ptr); cudaFree(o_p_ptr);
+        cudaFree(q_d_ptr); cudaFree(o_d_ptr);
+        cudaFree(k_cache); cudaFree(v_cache);
+        cudaFree(kv_indptr_p_gpu); cudaFree(kv_indices_p_gpu); cudaFree(kv_last_p_gpu); cudaFree(qo_indptr_p_gpu);
+        cudaFree(kv_indptr_d_gpu); cudaFree(kv_indices_d_gpu); cudaFree(kv_last_d_gpu); cudaFree(qo_indptr_d_gpu);
+        cudaFree(sched_ptr);
+    }
+}

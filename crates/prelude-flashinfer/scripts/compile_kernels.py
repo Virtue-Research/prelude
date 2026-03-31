@@ -40,6 +40,10 @@ MASK_MODES = {
 # All mask modes referenced by DISPATCH_MASK_MODE must be compiled.
 NEEDED_MASK_MODES = [0, 1, 2, 3]
 
+# POD only needs causal + custom (spec decode). kNone and kMultiItemScoring
+# are meaningless in mixed prefill+decode batches.
+POD_MASK_MODES = [1, 2]  # kCausal, kCustom
+
 
 def variant_id(kind: str, backend: str, dtype: str, hdim_qk: int, hdim_vo: int,
                swa: bool = False, softcap: bool = False) -> str:
@@ -668,7 +672,7 @@ def generate_batch_pod_sources(
     dtype_c: str, dtype_name: str, hdim_qk: int, hdim_vo: int,
     swa_p: bool, softcap_p: bool, swa_d: bool, softcap_d: bool,
 ) -> Tuple[List[Path], List[str]]:
-    """Generate source files for a batch POD (Prefill+Decode) variant.
+    """Generate source files for a batch POD (Prefill+Decode) variant (unmerged, legacy).
 
     POD dispatches both prefill and decode within a single kernel launch
     using SM-aware scheduling. Uses FA2 kernels (SM80+).
@@ -731,6 +735,210 @@ def generate_batch_pod_sources(
     sources.append(out / "batch_pod.cu")
 
     # Binding — TVM FFI export with variant-specific symbol
+    binding_src = _generate_renamed_binding(
+        csrc / "batch_pod_jit_binding.cu",
+        "batch_pod_config.inc",
+        {
+            "batch_pod_with_kv_cache_tensor": f"__tvm_ffi_{vid}_run",
+        },
+    )
+    for old, new in renames.items():
+        binding_src = binding_src.replace(old, new)
+    (out / "batch_pod_binding.cu").write_text(binding_src)
+    sources.append(out / "batch_pod_binding.cu")
+
+    return sources, []
+
+
+def generate_batch_pod_merged_sources(
+    fi_src: Path, gen_dir: Path, vid: str,
+    dtype_c: str, dtype_name: str, hdim_qk: int, hdim_vo: int,
+) -> Tuple[List[Path], List[str]]:
+    """Generate MERGED source files for a batch POD (Prefill+Decode) variant.
+
+    All swa/softcap/mask_mode combos in ONE compilation unit per (dtype, hdim).
+    Same merging approach as FA2 prefill: swa/softcap dispatched at runtime via
+    lambda templates, mask modes via explicit template instantiation.
+
+    For inference: swa_p==swa_d and softcap_p==softcap_d (same model), so we
+    dispatch on 2 booleans (swa, softcap) → 4 combos.
+
+    Per CTA_TILE_Q file: 4 swa/cap × 16 mask pairs = 64 instantiations.
+    Split into 3 files by CTA_TILE_Q → 64 instantiations each (like FA3 prefill).
+    """
+    import jinja2
+
+    csrc = fi_src / "csrc"
+    out = gen_dir / vid
+    out.mkdir(parents=True, exist_ok=True)
+
+    # ── Merged config.inc ──────────────────────────────────────────
+    # Render with dummy swa/softcap (overridden by DISPATCH_context below)
+    with open(csrc / "batch_pod_customize_config.jinja") as f:
+        config_templ = jinja2.Template(f.read())
+
+    config_str = config_templ.render(
+        dtype_q=dtype_c, dtype_kv=dtype_c, dtype_o=dtype_c,
+        idtype="int32_t",
+        head_dim_qk=hdim_qk, head_dim_vo=hdim_vo,
+        pos_encoding_mode_p="PosEncodingMode::kNone",
+        pos_encoding_mode_d="PosEncodingMode::kNone",
+        use_sliding_window_p="false", use_logits_soft_cap_p="false",
+        use_sliding_window_d="false", use_logits_soft_cap_d="false",
+        use_fp16_qk_reduction="false",
+        variant_name_p="DefaultAttention<use_custom_mask_p, false, false, false>",
+        variant_name_d="DefaultAttention<use_custom_mask_d, false, false, false>",
+    )
+
+    # Replace DISPATCH_context to add runtime swa/softcap lambda dispatch.
+    # Original: nested DISPATCH_MASK_MODE only.
+    # Merged: DISPATCH_MASK_MODE + runtime swa/softcap via lambda.
+    old_dispatch = (
+        '#define DISPATCH_context(MASK_MODE_P, MASK_MODE_D, DTypeQ, DTypeKV, HEAD_DIM_QK,    \\\n'
+        '            USE_SLIDING_WINDOW_P, USE_SLIDING_WINDOW_D, USE_LOGITS_SOFT_CAP, ...)   \\\n'
+        '  DISPATCH_MASK_MODE(mask_mode_p, MASK_MODE_P, {                                    \\\n'
+        '    DISPATCH_MASK_MODE(mask_mode_d, MASK_MODE_D, {                                  \\\n'
+        '      __VA_ARGS__();                                                                \\\n'
+        '    });                                                                             \\\n'
+        '});'
+    )
+    # POD uses window_left_p/logits_soft_cap_p (not window_left/logits_soft_cap).
+    # For inference: swa_p==swa_d, softcap_p==softcap_d, so dispatch on _p variant.
+    new_dispatch = (
+        '#define DISPATCH_context(MASK_MODE_P, MASK_MODE_D, DTypeQ, DTypeKV, HEAD_DIM_QK,    \\\n'
+        '            USE_SLIDING_WINDOW_P, USE_SLIDING_WINDOW_D, USE_LOGITS_SOFT_CAP, ...)   \\\n'
+        '  DISPATCH_MASK_MODE(mask_mode_p, MASK_MODE_P, {                                    \\\n'
+        '    DISPATCH_MASK_MODE(mask_mode_d, MASK_MODE_D, {                                  \\\n'
+        '      auto _run = [&]<bool _SWA, bool _CAP>() {                                    \\\n'
+        '        constexpr auto USE_SLIDING_WINDOW_P = _SWA;                                 \\\n'
+        '        constexpr auto USE_SLIDING_WINDOW_D = _SWA;                                 \\\n'
+        '        constexpr auto USE_LOGITS_SOFT_CAP_P = _CAP;                                \\\n'
+        '        constexpr auto USE_LOGITS_SOFT_CAP_D = _CAP;                                \\\n'
+        '        constexpr auto use_custom_mask_p = MASK_MODE_P == MaskMode::kCustom;         \\\n'
+        '        constexpr auto use_custom_mask_d = MASK_MODE_D == MaskMode::kCustom;         \\\n'
+        '        __VA_ARGS__();                                                              \\\n'
+        '      };                                                                            \\\n'
+        '      bool _swa = (window_left_p >= 0);                                             \\\n'
+        '      bool _cap = (logits_soft_cap_p > 0.0);                                        \\\n'
+        '      if (!_swa && !_cap) _run.template operator()<false, false>();                  \\\n'
+        '      else if (_swa && !_cap) _run.template operator()<true, false>();               \\\n'
+        '      else if (!_swa && _cap) _run.template operator()<false, true>();               \\\n'
+        '      else _run.template operator()<true, true>();                                   \\\n'
+        '    });                                                                             \\\n'
+        '});'
+    )
+    old_config = config_str
+    config_str = config_str.replace(old_dispatch, new_dispatch)
+    assert config_str != old_config, (
+        "DISPATCH_context replacement failed in batch_pod — upstream macro may have changed"
+    )
+
+    # Remove the constexpr swa/softcap lines (they're now inside the lambda)
+    for line in [
+        "constexpr auto USE_LOGITS_SOFT_CAP_P = false;",
+        "constexpr auto USE_SLIDING_WINDOW_P = false;",
+        "constexpr auto USE_LOGITS_SOFT_CAP_D = false;",
+        "constexpr auto USE_SLIDING_WINDOW_D = false;",
+    ]:
+        config_str = config_str.replace(line, f"// merged: {line.strip()} (dispatched at runtime)")
+
+    # Override DISPATCH_MASK_MODE to only emit kCausal + kCustom cases.
+    # The upstream macro generates switch cases for all 4 mask modes, but POD only
+    # needs kCausal (normal serving) and kCustom (spec decode). Without this override,
+    # the linker would require template instantiations for kNone and kMultiItemScoring
+    # which we don't compile.
+    config_str += r"""
+
+// Override DISPATCH_MASK_MODE: POD only needs kCausal + kCustom
+#ifdef DISPATCH_MASK_MODE
+#undef DISPATCH_MASK_MODE
+#endif
+#define DISPATCH_MASK_MODE(mask_mode, MASK_MODE, ...)                          \
+  switch (mask_mode) {                                                         \
+    case MaskMode::kCausal: {                                                  \
+      constexpr MaskMode MASK_MODE = MaskMode::kCausal;                        \
+      __VA_ARGS__                                                              \
+      break;                                                                   \
+    }                                                                          \
+    case MaskMode::kCustom: {                                                  \
+      constexpr MaskMode MASK_MODE = MaskMode::kCustom;                        \
+      __VA_ARGS__                                                              \
+      break;                                                                   \
+    }                                                                          \
+    default: {                                                                 \
+      std::ostringstream err_msg;                                              \
+      err_msg << "POD only supports kCausal and kCustom mask modes, got: "     \
+              << int(mask_mode);                                               \
+      throw flashinfer::Error(__FUNCTION__, __FILE__, __LINE__, err_msg.str());\
+    }                                                                          \
+  }
+"""
+
+    (out / "batch_pod_config.inc").write_text(config_str)
+
+    # ── Merged kernel instantiations (split by CTA_TILE_Q) ────────
+    # POD only needs kCausal + kCustom mask modes (POD_MASK_MODES).
+    # Per file: 4 swa/cap combos × 4 mask pairs (2×2) = 16 instantiations
+    # 3 files (CTA_TILE_Q ∈ {16, 64, 128}) → 48 total
+    swa_cap_combos = [(False, False), (True, False), (False, True), (True, True)]
+    pod_masks = {k: v for k, v in MASK_MODES.items() if k in POD_MASK_MODES}
+
+    sources = []
+    for cta in [16, 64, 128]:
+        lines = [
+            '#include <flashinfer/attention/default_prefill_params.cuh>',
+            '#include <flashinfer/attention/default_decode_params.cuh>',
+            '#include <flashinfer/attention/variants.cuh>',
+            '#include <flashinfer/attention/scheduler.cuh>',
+            '#include <flashinfer/attention/mask.cuh>',
+            '#include <flashinfer/attention/batch_pod.cuh>',
+            '#include <flashinfer/pos_enc.cuh>',
+            '#include <flashinfer/utils.cuh>',
+            '#include <flashinfer/page.cuh>',
+            '',
+            '#include "batch_pod_config.inc"',
+            '',
+            'using namespace flashinfer;',
+            '',
+            'namespace flashinfer {',
+            '',
+        ]
+        for _, mm_p_name in pod_masks.items():
+            for _, mm_d_name in pod_masks.items():
+                for swa, cap in swa_cap_combos:
+                    var_p = (
+                        f"DefaultAttention<{mm_p_name} == MaskMode::kCustom, "
+                        f"{str(swa).lower()}, {str(cap).lower()}, false>"
+                    )
+                    var_d = (
+                        f"DefaultAttention<{mm_d_name} == MaskMode::kCustom, "
+                        f"{str(swa).lower()}, {str(cap).lower()}, false>"
+                    )
+                    lines.append(
+                        f"template cudaError_t BatchPODWithKVCacheTensorDispatched<"
+                        f"{hdim_qk}, {hdim_vo}, PosEncodingMode::kNone, "
+                        f"false, /*CTA_TILE_Q_P=*/{cta}, {mm_p_name}, "
+                        f"/*CTA_TILE_Q_D=*/16, {mm_d_name}, "
+                        f"{var_p}, {var_d}, PrefillParams, DecodeParams>"
+                        f"(PrefillParams prefill_params, {dtype_c}* tmp_v_p, float* tmp_s_p, "
+                        f"DecodeParams decode_params, {dtype_c}* tmp_v_d, float* tmp_s_d, "
+                        f"bool enable_pdl, cudaStream_t stream, int* sm_aware_sched);"
+                    )
+            lines.append('')
+        lines.append('};  // namespace flashinfer')
+
+        kernel_path = out / f"merged_kernels_cta{cta}.cu"
+        kernel_path.write_text('\n'.join(lines))
+        sources.append(kernel_path)
+
+    # ── batch_pod.cu (dispatch) — reuse upstream with renamed symbols ──
+    renames = {
+        "batch_pod_with_kv_cache_tensor": f"{vid}_batch_pod_with_kv_cache_tensor",
+    }
+    _copy_with_renames(csrc / "batch_pod.cu", out / "batch_pod.cu", renames)
+    sources.append(out / "batch_pod.cu")
+
+    # ── Binding — TVM FFI export with variant-specific symbol ──
     binding_src = _generate_renamed_binding(
         csrc / "batch_pod_jit_binding.cu",
         "batch_pod_config.inc",
@@ -1344,10 +1552,19 @@ def build_variant_matrix(
             })
 
     # ── POD (Prefill+Decode) mixed batching ─────────────────────────
-    # POD is intentionally excluded from AOT by upstream (aot.py comment by Zihao):
-    # each variant generates 16 mask combos × 3 CTA tiles = 48 kernel instantiations,
-    # which makes the static archive exceed the 2GB linker limit.
-    # The generate_batch_pod_sources() function is available for future JIT use.
+    # MERGED: all swa/softcap/mask_mode combos in one compilation unit per (dtype, hdim).
+    # Split by CTA_TILE_Q into 3 .cu files, each with 64 instantiations (like FA3 prefill).
+    # Assumes swa_p==swa_d, softcap_p==softcap_d (same model in continuous batching).
+    for dtype in dtypes:
+        dtype_c, dtype_name = DTYPE_MAP[dtype]
+        for hdim in head_dims:
+            vid = variant_id("pod", "fa2", dtype, hdim, hdim)
+            variants.append({
+                "vid": vid, "kind": "pod_merged", "backend": "fa2",
+                "dtype": dtype, "dtype_c": dtype_c, "dtype_name": dtype_name,
+                "hdim_qk": hdim, "hdim_vo": hdim,
+                "arch_flags": sm80_flags,
+            })
 
     return variants
 
@@ -1473,6 +1690,12 @@ def main():
                 v["swa_p"], v["softcap_p"],
                 v["swa_d"], v["softcap_d"],
             )
+        elif v["kind"] == "pod_merged":
+            sources, extra = generate_batch_pod_merged_sources(
+                fi_src, gen_dir, v["vid"],
+                v["dtype_c"], v["dtype_name"],
+                v["hdim_qk"], v["hdim_vo"],
+            )
         else:
             continue
 
@@ -1566,7 +1789,7 @@ def main():
             "backend": v.get("backend", "fa2"),
             "dtype": v["dtype"],
         }
-        if v["kind"] in ("decode", "prefill_fa2", "prefill_fa3", "prefill_fp8"):
+        if v["kind"] in ("decode", "prefill_fa2", "prefill_fa3", "prefill_fp8", "pod_merged"):
             # Merged: swa/softcap dispatched at runtime, not in key
             entry["hdim_qk"] = v["hdim_qk"]
             entry["hdim_vo"] = v["hdim_vo"]
@@ -1597,7 +1820,7 @@ def main():
                 "plan": f"__tvm_ffi_{v['vid']}_plan",
                 "run": f"__tvm_ffi_{v['vid']}_run",
             }
-        elif v["kind"] == "pod":
+        elif v["kind"] in ("pod", "pod_merged"):
             entry["symbols"] = {
                 "run": f"__tvm_ffi_{v['vid']}_run",
             }

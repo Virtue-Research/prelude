@@ -287,6 +287,7 @@ fn generate_dispatch(kernels_dir: &Path, out_dir: &Path, has_kernels: bool) -> R
             "pub(crate) fn lookup_decode(_key: &crate::loader::DecodeKey) -> Option<crate::loader::DecodeVariant> { None }\n",
             "pub(crate) fn lookup_mla_decode(_key: &crate::loader::MLADecodeKey) -> Option<crate::loader::MLADecodeVariant> { None }\n",
             "pub(crate) fn lookup_mla_paged(_key: &crate::loader::MLAPagedKey) -> Option<crate::loader::MLAPagedVariant> { None }\n",
+            "pub(crate) fn lookup_pod(_key: &crate::loader::PodKey) -> Option<crate::loader::PodVariant> { None }\n",
             "pub(crate) fn lookup_utility(_name: &str) -> Option<crate::loader::TVMSafeCallFn> { None }\n",
         ))?;
         return Ok(());
@@ -413,6 +414,21 @@ fn generate_dispatch(kernels_dir: &Path, out_dir: &Path, has_kernels: bool) -> R
         let ckv = v.head_dim_ckv.context("mla_paged variant missing head_dim_ckv")?;
         let kpe = v.head_dim_kpe.context("mla_paged variant missing head_dim_kpe")?;
         writeln!(code, "        ({dv}, {ckv}, {kpe}) => Some(MLAPagedVariant {{ plan: {plan}, run: {run} }}),")?;
+    }
+    writeln!(code, "        _ => None,")?;
+    writeln!(code, "    }}\n}}\n")?;
+
+    // POD (Prefill-On-Decode) lookup (merged: swa/softcap dispatched at runtime)
+    writeln!(code, "pub(crate) fn lookup_pod(key: &crate::loader::PodKey) -> Option<crate::loader::PodVariant> {{")?;
+    writeln!(code, "    use crate::loader::PodVariant;")?;
+    writeln!(code, "    match (key.dtype as u8, key.head_dim_qk, key.head_dim_vo) {{")?;
+    for v in &manifest.variants {
+        if v.kind != "pod_merged" { continue; }
+        let run = &v.symbols["run"];
+        let dv = dtype_val(&v.dtype);
+        let hqk = v.hdim_qk.context("pod variant missing hdim_qk")?;
+        let hvo = v.hdim_vo.context("pod variant missing hdim_vo")?;
+        writeln!(code, "        ({dv}, {hqk}, {hvo}) => Some(PodVariant {{ run: {run} }}),")?;
     }
     writeln!(code, "        _ => None,")?;
     writeln!(code, "    }}\n}}\n")?;

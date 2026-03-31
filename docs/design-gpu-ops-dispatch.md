@@ -14,7 +14,7 @@
 ## Goals
 
 1. Model code is device-agnostic: no `#[cfg(feature = "cuda")]` in models.
-2. Model code is kernel-agnostic: models never reference FA4, FlashInfer, cuBLAS, etc.
+2. Model code is kernel-agnostic: models never reference FA4, FlashInfer, CUTLASS, etc.
 3. Each operation independently dispatches to the best available kernel for the device + parameters.
 4. Multi-device: CUDA, ROCm, TPU, Vulkan, CPU share the same model code.
 5. Multi-model: AR (LLM), diffusion, TTS, vision all use the same op traits.
@@ -26,7 +26,7 @@
 Model code          composes      Building blocks (shared layers)
 Building blocks     call          Op traits (+ FusedOps fallback logic)
 Op traits           implemented by    Device ops (CudaOps, RocmOps, CpuOps, ...)
-Device ops          dispatches to     Kernel libraries (FA4, FlashInfer, CK, cuBLAS, XLA, ...)
+Device ops          dispatches to     Kernel libraries (FA4, FlashInfer, DeepGEMM, CUTLASS, CK, XLA, ...)
 ```
 
 **Building blocks** are shared layer implementations (e.g., `ResidualNormBlock`, `GatedMLP`, `AttentionBlock`).
@@ -146,6 +146,7 @@ struct PagedParams<'a> {
     pub max_seqlen_k: u32,
     pub scale: f32,
     pub mask: MaskType,
+    pub softcap: Option<f32>,     // Gemma2/3 logit capping (same as VarlenParams)
 }
 
 enum MaskType {
@@ -198,16 +199,16 @@ Separate from `AttentionOps` because:
 
 ```rust
 trait GemmOps: Send + Sync {
-    /// Matrix multiply. Dispatch: DeepGEMM > CUTLASS > cuBLAS > rocBLAS > XLA > CPU BLAS.
+    /// Matrix multiply. Dispatch: DeepGEMM > CUTLASS > CK > XLA > CPU BLAS.
     ///
     /// Dtype-aware: if inputs are FP8/INT8, the implementation routes to
-    /// quantized GEMM kernels (DeepGEMM FP8, CUTLASS INT8, cuBLAS FP8, etc.).
+    /// quantized GEMM kernels (DeepGEMM FP8, CUTLASS INT8, CK FP8, etc.).
     /// Scale factors are tensor metadata, not separate parameters.
     fn matmul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor>;
 
     /// Quantized matmul with explicit per-tensor/per-channel scaling.
     ///
-    /// Covers FP8 (DeepGEMM/cuBLAS), W4A16 (AWQ), W4A4 (Nunchaku/GPTQ) variants.
+    /// Covers FP8 (DeepGEMM/CK), W4A16 (AWQ), W4A4 (Nunchaku/GPTQ) variants.
     /// For weight-only quantization: a is activations (BF16/FP16), b is quantized weights.
     /// scale_a: per-token or per-tensor activation scale (None for weight-only quant).
     /// scale_b: per-channel or per-group weight scale.
@@ -232,7 +233,7 @@ trait GemmOps: Send + Sync {
 
 /// Quantization scheme for quantized_matmul dispatch.
 enum QuantScheme {
-    /// FP8 E4M3 with per-tensor/per-token scaling (DeepGEMM, cuBLAS).
+    /// FP8 E4M3 with per-tensor/per-token scaling (DeepGEMM, CUTLASS, CK).
     Fp8E4m3,
     /// Weight-only 4-bit with per-group scaling (AWQ, GPTQ).
     W4A16 { group_size: usize },
@@ -276,19 +277,27 @@ trait ActivationOps: Send + Sync {
 trait ConvOps: Send + Sync {
     fn conv1d(&self, input: &Tensor, weight: &Tensor, bias: Option<&Tensor>,
               stride: usize, padding: usize) -> Result<Tensor>;
+    fn conv_transpose1d(&self, input: &Tensor, weight: &Tensor, bias: Option<&Tensor>,
+                        stride: usize, padding: usize, output_padding: usize) -> Result<Tensor>;
     fn conv2d(&self, input: &Tensor, weight: &Tensor, bias: Option<&Tensor>,
               stride: [usize; 2], padding: [usize; 2]) -> Result<Tensor>;
 }
 ```
 
 - Diffusion: conv2d (UNet, DiT).
-- TTS: conv1d (vocoder, encoder).
+- TTS: conv1d + conv_transpose1d (vocoder upsampling, encoder).
 - LLM: conv1d (DeltaNet/Mamba causal conv).
 
 ### Communication (Distributed)
 
 ```rust
 trait CommOps: Send + Sync {
+    /// Number of ranks in the communication group.
+    fn world_size(&self) -> usize;
+
+    /// This rank's index in the communication group.
+    fn rank(&self) -> usize;
+
     /// Sum-reduce tensor across all ranks in the tensor-parallel group.
     fn all_reduce_sum(&self, x: &Tensor) -> Result<Tensor>;
 
@@ -305,8 +314,8 @@ trait CommOps: Send + Sync {
 ```
 
 **Device implementations:**
-- **CUDA**: NCCL (default), custom all-reduce for single-node TP (P2P), symmetric memory on H100+.
-- **ROCm**: RCCL (NCCL equivalent), custom all-reduce on MI300 (QuickAllReduce).
+- **CUDA**: NCCL (vendored/statically linked), custom all-reduce for single-node TP (P2P), symmetric memory on H100+.
+- **ROCm**: RCCL (vendored/statically linked), custom all-reduce on MI300 (QuickAllReduce).
 - **TPU**: XLA collective ops (compiled into HLO, hardware-optimized).
 - **Single-device** (Metal, Vulkan, CPU): identity passthrough (TP=1, no communication needed).
 
@@ -367,7 +376,7 @@ trait FusedOps: Send + Sync {
         cos: &Tensor, sin: &Tensor,
         position_ids: &Tensor,
         key_cache: &Tensor, value_cache: &Tensor,
-        slot_mapping: &Tensor, eps: f32,
+        slot_mapping: &[u32], eps: f32,   // scheduling metadata, same &[u32] as reshape_and_cache
     ) -> Option<Result<()>> { None }
 
     /// Fused Adaptive Layer Norm (AdaLN-Zero).
@@ -463,10 +472,12 @@ trait OpsSession: Send + Sync {
     /// Pre-compute paged attention scheduling for the current batch.
     /// Converts block_tables → kernel-specific metadata (e.g., FlashInfer indptr/indices).
     /// Called once before model.forward(), reused across all N layers.
+    ///
+    /// Same `&[u32]` convention as attention params — device uploads internally.
     fn precompute_paged_plan(
         &self,
-        block_tables: &Tensor,
-        cu_seqlens_k: &Tensor,
+        block_tables: &[u32],       // [batch * max_blocks_per_seq]
+        cu_seqlens_k: &[u32],       // [batch + 1]
         block_size: usize,
     ) -> Result<()>;
 }
@@ -491,10 +502,11 @@ impl CudaOps {
     pub fn allocate_graph_buffers(&self, max_batch: usize, max_blocks: usize) -> GraphMetaBuffers;
 
     /// Pre-compute paged plan into fixed-address graph buffers (for capture/replay).
+    /// Same &[u32] input — CudaOps memcpys into graph_buffers' fixed-address GPU tensors.
     pub fn precompute_paged_plan_graphed(
         &self,
-        block_tables: &Tensor,
-        cu_seqlens_k: &Tensor,
+        block_tables: &[u32],
+        cu_seqlens_k: &[u32],
         block_size: usize,
         graph_buffers: &GraphMetaBuffers,
     ) -> Result<()>;
@@ -553,20 +565,75 @@ struct Ops {
 
 All fields are always present. Devices that don't support an op category (e.g., Vulkan has no `paged_attention`) return errors from those methods. This is simpler than `Option<Arc<dyn ...>>` — the error message is more informative than a missing field.
 
+## Runtime Dependencies
+
+Binary distribution: the compiled binary should run with **only the GPU driver installed**.
+No SDK, no toolkit, no pip packages. This constrains which kernel libraries we can use —
+everything must be vendored and AOT-compiled into the binary at build time.
+
+**One binary per device target.** Different devices are NOT bundled into one binary:
+- CUDA kernels (FA4 multi-arch + FlashInfer + DeepGEMM + CUTLASS) are hundreds of MB alone.
+  Adding ROCm CK kernels, Metal shaders, and Vulkan SPIR-V would push a single binary past 1GB.
+- Build toolchains conflict: nvcc and hipcc cannot easily coexist in one build.
+- Users only need one: MI300X users don't need CUDA, M4 users don't need ROCm.
+
+Compile-time feature flags select the device target:
+```
+cargo build --features cuda    →  prelude-cuda    (Linux x86_64)
+cargo build --features rocm    →  prelude-rocm    (Linux x86_64)
+cargo build --features metal   →  prelude-metal   (macOS aarch64)
+cargo build --features vulkan  →  prelude-vulkan  (cross-platform)
+cargo build --features tpu     →  prelude-tpu     (Linux x86_64, GCP)
+cargo build                    →  prelude-cpu     (cross-platform)
+```
+
+Model code compiles identically in all targets — only the `Ops` implementation differs.
+This is the same architecture that llama.cpp uses (separate Metal/Vulkan/CUDA backends,
+one build target at a time).
+
+| Device | Runtime dependency | Build dependency (not needed at runtime) |
+|--------|-------------------|----------------------------------------|
+| **CUDA** | NVIDIA driver (libcuda.so) | CUDA toolkit (nvcc) for AOT compilation |
+| **ROCm** | AMD driver + HIP runtime (libamdhip64.so) | ROCm SDK (hipcc) for AOT compilation |
+| **Metal** | macOS (Metal.framework built-in) | Xcode command line tools |
+| **Vulkan** | GPU driver (Vulkan ICD) | Vulkan SDK (glslc) for SPIR-V compilation |
+| **TPU** | PJRT runtime (libpjrt_tpu.so), dlopen at runtime | JAX/XLA build tools |
+| **CPU** | None | C compiler |
+
+**What this means for kernel selection:**
+
+- **No cuBLAS, no cuDNN, no hipBLAS, no hipDNN.** These are CUDA/ROCm toolkit components,
+  not part of the driver. We vendor and AOT-compile everything:
+  - GEMM: DeepGEMM (vendored) → CUTLASS (vendored, header-only) → no fallback needed
+  - Attention: FA4 (vendored, TVM AOT) → FlashInfer (vendored, AOT)
+  - Conv: CUTLASS conv (vendored) or custom CUDA/HIP kernels
+  - Norm/activation/element-wise: custom kernels (FlashInfer utilities, Triton AOT)
+- **ROCm follows the same pattern**: CK (header-only, vendored) for GEMM + attention,
+  aiter kernels (vendored, AOT) for flash attention. All compiled with hipcc at build time,
+  runtime only needs libamdhip64.so from the driver package.
+- **NCCL/RCCL** for communication: vendored and statically linked, or use driver-bundled version.
+- **TPU exception**: TPU has no public low-level API — the only programming interface is
+  XLA/PJRT runtime (libpjrt_tpu.so). There is no way to AOT-compile TPU kernels
+  independently; all kernel generation happens inside XLA JIT. The binary dlopen's
+  libpjrt_tpu.so at runtime — same pattern as CUDA dlopen's libcuda.so from the driver.
+  GCP TPU VMs already have PJRT pre-installed. Users do NOT need Python, JAX, or any SDK.
+
 ## Device Implementations
 
 ### CUDA
 
 ```rust
 struct CudaOps {
-    fa4: Option<FA4Registry>,
-    fi: FlashInferRegistry,
-    deepgemm: Option<DeepGemmRegistry>,
-    cutlass: Option<CutlassHandle>,
-    cublas: CublasHandle,
+    fa4: Option<FA4Registry>,       // vendored, AOT-compiled
+    fi: FlashInferRegistry,          // vendored, AOT-compiled
+    deepgemm: Option<DeepGemmRegistry>,  // vendored, AOT-compiled
+    cutlass: Option<CutlassHandle>,  // vendored, header-only, AOT-compiled
     fi_workspace: FlashInferWorkspace,
 }
 ```
+
+No cuBLAS, no cuDNN. All kernels are vendored and statically linked.
+Runtime dependency: NVIDIA driver only (libcuda.so).
 
 Dispatch logic is explicit if-else, not a capability system:
 
@@ -600,16 +667,12 @@ impl AttentionOps for CudaOps {
 
 impl GemmOps for CudaOps {
     fn matmul(&self, a, b) -> Result<Tensor> {
-        // DeepGEMM: SM90+ BF16
+        // DeepGEMM: SM90+ BF16/FP8
         if let Some(dg) = &self.deepgemm {
             if let Ok(out) = dg.try_gemm(a, b) { return Ok(out); }
         }
-        // CUTLASS: SM80+
-        if let Some(cutlass) = &self.cutlass {
-            if let Ok(out) = cutlass.try_gemm(a, b) { return Ok(out); }
-        }
-        // cuBLAS: always available
-        self.cublas.gemm(a, b)
+        // CUTLASS: SM80+ (vendored, no cuBLAS needed)
+        self.cutlass.gemm(a, b)
     }
 }
 
@@ -628,22 +691,21 @@ impl FusedOps for CudaOps {
 
 ### ROCm
 
-HIP is largely a CUDA translation layer (llama.cpp recompiles all CUDA kernels as HIP),
-but production inference uses dedicated AMD libraries: Composable Kernels (CK) for attention,
-aiter for flash attention on MI300/MI350, hipBLAS for GEMM.
+All kernels vendored and AOT-compiled with hipcc at build time.
+Runtime dependency: AMD driver + HIP runtime (libamdhip64.so) only. No hipBLAS, no hipDNN.
 
 Key constraints:
 - **Wave size**: CDNA (MI300/MI350) = wave64, RDNA (RX 7000/9000) = wave32.
 - **LDS (shared memory)**: MI300 = 64KB, MI350 = 160KB. Kernel tile sizes must vary.
 - **FP8 format**: MI300 (gfx942) uses FNUZ, MI350 (gfx950) uses E4M3. Both need support.
-- **Flash attention**: aiter library (gfx942/gfx950 only), CK flash attn, or CUDA-translated kernels.
+- **Flash attention**: aiter kernels (gfx942/gfx950 only), CK flash attn for other CDNA.
 
 ```rust
 struct RocmOps {
     arch: RocmArch,                       // gfx942, gfx950, gfx1100, ...
-    ck_flash: Option<CKFlashAttnHandle>,  // CK flash attention (CDNA only)
-    aiter: Option<AiterHandle>,           // aiter flash attention (gfx942/950)
-    hipblas: HipblasHandle,
+    ck_flash: Option<CKFlashAttnHandle>,  // CK flash attention (vendored, CDNA only)
+    ck_gemm: CKGemmHandle,               // CK GEMM (vendored, header-only, AOT-compiled)
+    aiter: Option<AiterHandle>,           // aiter flash attention (vendored, gfx942/950)
 }
 
 /// AMD GPU architecture. Determines available kernels and tuning.
@@ -660,12 +722,11 @@ impl AttentionOps for RocmOps {
         if let Some(aiter) = &self.aiter {
             return aiter.varlen(q, k, v, params);
         }
-        // CK flash attention: CDNA fallback
+        // CK flash attention: CDNA fallback (vendored)
         if let Some(ck) = &self.ck_flash {
             return ck.varlen(q, k, v, params);
         }
-        // hipBLAS SDPA: universal fallback
-        hip::sdpa_varlen(q, k, v, params)
+        bail!("flash attention requires CK or aiter on ROCm")
     }
 
     fn paged_attention(&self, q, key_cache, value_cache, params) -> Result<Tensor> {
@@ -681,16 +742,17 @@ impl AttentionOps for RocmOps {
 
 impl GemmOps for RocmOps {
     fn matmul(&self, a, b) -> Result<Tensor> {
-        self.hipblas.gemm(a, b)
+        // CK GEMM: vendored, AOT-compiled (no hipBLAS needed)
+        self.ck_gemm.gemm(a, b)
     }
     fn quantized_matmul(&self, a, b, scale_a, scale_b, quant) -> Result<Tensor> {
         match quant {
             QuantScheme::Fp8E4m3 => match self.arch {
-                RocmArch::Gfx942 => hip::fp8_fnuz_gemm(a, b, scale_a, scale_b),
-                RocmArch::Gfx950 => hip::fp8_e4m3_gemm(a, b, scale_a, scale_b),
+                RocmArch::Gfx942 => self.ck_gemm.fp8_fnuz_gemm(a, b, scale_a, scale_b),
+                RocmArch::Gfx950 => self.ck_gemm.fp8_e4m3_gemm(a, b, scale_a, scale_b),
                 _ => bail!("FP8 GEMM requires MI300+ (gfx942+)"),
             },
-            _ => hip::quantized_gemm(a, b, scale_a, scale_b, quant),
+            _ => self.ck_gemm.quantized_gemm(a, b, scale_a, scale_b, quant),
         }
     }
 }
@@ -1463,62 +1525,70 @@ fn forward(&self, x: &Tensor, context: &Tensor, ops: &Ops) -> Result<Tensor> {
 
 ## Construction
 
+Each binary target compiles exactly one device implementation (selected by feature flag).
+The `create_ops` function is straightforward — no runtime device detection needed.
+
 ```rust
-fn create_ops(device: &Device, config: &OpsConfig) -> Ops {
-    match device.device_type() {
-        DeviceType::Cuda => {
-            let cuda = Arc::new(CudaOps::new(config));
-            Ops {
-                attn: cuda.clone(), kv_cache: cuda.clone(), gemm: cuda.clone(),
-                norm: cuda.clone(), act: cuda.clone(), conv: cuda.clone(),
-                comm: cuda.clone(), fused: cuda.clone(), session: cuda,
-            }
+fn create_ops(config: &OpsConfig) -> Ops {
+    // Feature flags are mutually exclusive: only one device per binary.
+    #[cfg(feature = "cuda")]
+    {
+        let cuda = Arc::new(CudaOps::new(config));
+        Ops {
+            attn: cuda.clone(), kv_cache: cuda.clone(), gemm: cuda.clone(),
+            norm: cuda.clone(), act: cuda.clone(), conv: cuda.clone(),
+            comm: cuda.clone(), fused: cuda.clone(), session: cuda,
         }
-        DeviceType::Rocm => {
-            let rocm = Arc::new(RocmOps::new(config));
-            Ops {
-                attn: rocm.clone(), kv_cache: rocm.clone(), gemm: rocm.clone(),
-                norm: rocm.clone(), act: rocm.clone(), conv: rocm.clone(),
-                comm: rocm.clone(), fused: rocm.clone(), session: rocm,
-            }
+    }
+    #[cfg(feature = "rocm")]
+    {
+        let rocm = Arc::new(RocmOps::new(config));
+        Ops {
+            attn: rocm.clone(), kv_cache: rocm.clone(), gemm: rocm.clone(),
+            norm: rocm.clone(), act: rocm.clone(), conv: rocm.clone(),
+            comm: rocm.clone(), fused: rocm.clone(), session: rocm,
         }
-        DeviceType::Metal => {
-            let metal = Arc::new(MetalOps::new(config));
-            Ops {
-                attn: metal.clone(), kv_cache: metal.clone(), gemm: metal.clone(),
-                norm: metal.clone(), act: metal.clone(), conv: metal.clone(),
-                comm: metal.clone(), fused: metal.clone(), session: metal,
-            }
+    }
+    #[cfg(feature = "metal")]
+    {
+        let metal = Arc::new(MetalOps::new(config));
+        Ops {
+            attn: metal.clone(), kv_cache: metal.clone(), gemm: metal.clone(),
+            norm: metal.clone(), act: metal.clone(), conv: metal.clone(),
+            comm: metal.clone(), fused: metal.clone(), session: metal,
         }
-        DeviceType::Vulkan => {
-            let vk = Arc::new(VulkanOps::new(config));
-            Ops {
-                attn: vk.clone(), kv_cache: vk.clone(), gemm: vk.clone(),
-                norm: vk.clone(), act: vk.clone(), conv: vk.clone(),
-                comm: vk.clone(), fused: vk.clone(), session: vk,
-            }
+    }
+    #[cfg(feature = "vulkan")]
+    {
+        let vk = Arc::new(VulkanOps::new(config));
+        Ops {
+            attn: vk.clone(), kv_cache: vk.clone(), gemm: vk.clone(),
+            norm: vk.clone(), act: vk.clone(), conv: vk.clone(),
+            comm: vk.clone(), fused: vk.clone(), session: vk,
         }
-        DeviceType::Tpu => {
-            let tpu = Arc::new(TpuOps::new(config));
-            Ops {
-                attn: tpu.clone(), kv_cache: tpu.clone(), gemm: tpu.clone(),
-                norm: tpu.clone(), act: tpu.clone(), conv: tpu.clone(),
-                comm: tpu.clone(), fused: tpu.clone(), session: tpu,
-            }
+    }
+    #[cfg(feature = "tpu")]
+    {
+        let tpu = Arc::new(TpuOps::new(config));
+        Ops {
+            attn: tpu.clone(), kv_cache: tpu.clone(), gemm: tpu.clone(),
+            norm: tpu.clone(), act: tpu.clone(), conv: tpu.clone(),
+            comm: tpu.clone(), fused: tpu.clone(), session: tpu,
         }
-        DeviceType::Cpu => {
-            let cpu = Arc::new(CpuOps);
-            Ops {
-                attn: cpu.clone(), kv_cache: cpu.clone(), gemm: cpu.clone(),
-                norm: cpu.clone(), act: cpu.clone(), conv: cpu.clone(),
-                comm: cpu.clone(), fused: cpu.clone(), session: cpu,
-            }
+    }
+    #[cfg(not(any(feature = "cuda", feature = "rocm", feature = "metal", feature = "vulkan", feature = "tpu")))]
+    {
+        let cpu = Arc::new(CpuOps);
+        Ops {
+            attn: cpu.clone(), kv_cache: cpu.clone(), gemm: cpu.clone(),
+            norm: cpu.clone(), act: cpu.clone(), conv: cpu.clone(),
+            comm: cpu.clone(), fused: cpu.clone(), session: cpu,
         }
     }
 }
 ```
 
-All fields populated for every device. Methods on unsupported ops return errors (`bail!("paged attention not supported on {device}")`) rather than panicking or silently degrading.
+All `Ops` fields populated. Methods on unsupported ops return errors (`bail!("paged attention not supported on {device}")`) rather than panicking or silently degrading. The `#[cfg]` here is the **only** place device-specific code appears outside of the device impl crates — model code has zero `#[cfg]`.
 
 ## Subsystem Independence
 
@@ -1529,8 +1599,8 @@ and their own internals. No cross-subsystem code reading required.
 |-----------|--------------|----------------------|
 | **Model impl** (Qwen3, Flux, TTS) | Building block APIs, `Ops` bundle | Any device impl, kernel library, engine |
 | **Building blocks** (residual_norm, gated_mlp, ...) | Op trait signatures, `FusedOps` match pattern | Device internals, model specifics |
-| **CudaOps** | Op trait signatures, FA4/FlashInfer/DeepGEMM/cuBLAS APIs | Model code, other devices |
-| **RocmOps** | Op trait signatures, CK/aiter/hipBLAS APIs | CUDA code, model code |
+| **CudaOps** | Op trait signatures, FA4/FlashInfer/DeepGEMM/CUTLASS APIs | Model code, other devices |
+| **RocmOps** | Op trait signatures, CK/aiter APIs | CUDA code, model code |
 | **MetalOps** | Op trait signatures, Metal/MSL API | CUDA/ROCm code, model code |
 | **VulkanOps** | Op trait signatures, Vulkan/SPIR-V API | Other devices, model code |
 | **TpuOps** | Op trait signatures, XLA/Pallas API | Other devices, model code |
@@ -1555,12 +1625,12 @@ What each device supports today. "Planned" = not yet implemented but feasible.
 |------------|------|------|-------|--------|-----|-----|
 | **varlen_attention** | FA4 / FlashInfer | CK / aiter | MSL flash attn | GLSL flash attn | Pallas | matmul SDPA |
 | **paged_attention** | FlashInfer | CK / aiter | — | — | Pallas ragged | — |
-| **matmul** | DeepGEMM/CUTLASS/cuBLAS | hipBLAS | simdgroup mm | tiled / coopmat | XLA dot_general | BLAS |
-| **quantized_matmul** | DeepGEMM FP8, CUTLASS INT8 | hipBLAS FP8 | in-shader dequant (Q4-Q8, IQ) | in-shader dequant (Q4-Q8, IQ) | XLA INT8/FP8 | dequant + BLAS |
+| **matmul** | DeepGEMM / CUTLASS | CK GEMM | simdgroup mm | tiled / coopmat | XLA dot_general | BLAS |
+| **quantized_matmul** | DeepGEMM FP8, CUTLASS INT8 | CK FP8 | in-shader dequant (Q4-Q8, IQ) | in-shader dequant (Q4-Q8, IQ) | XLA INT8/FP8 | dequant + BLAS |
 | **rms_norm** | fused CUDA | HIP kernel | MSL shader | GLSL shader | XLA auto-fuse | vectorized |
 | **layer_norm** | fused CUDA | HIP kernel | MSL shader | GLSL shader | XLA auto-fuse | vectorized |
 | **group_norm** | fused CUDA | HIP kernel | MSL shader | GLSL shader | XLA auto-fuse | vectorized |
-| **conv1d / conv2d** | cuDNN / custom | hipDNN | MSL shader | GLSL shader | XLA conv | fallback |
+| **conv1d / conv2d / conv_transpose1d** | CUTLASS conv / custom | CK conv / custom | MSL shader | GLSL shader | XLA conv | fallback |
 | **fused_add_rmsnorm** | FlashInfer kernel | HIP kernel | MSL shader | GLSL shader | XLA auto-fuse | vectorized |
 | **fused_adaln_zero** | Triton/CUDA kernel | — (planned) | — (planned) | — | XLA auto-fuse | — |
 | **fused_qknorm_rope** | FlashInfer kernel | — | — | — | — | — |
@@ -1836,8 +1906,8 @@ impl Code2Wav {
     fn decode_chunk(&self, codes: &Tensor, ops: &Ops) -> Result<Tensor> {
         let mut h = self.embed(codes)?;  // [B, hidden, T]
         for block in &self.decoder {
-            // ConvTranspose1d upsampling (not in ConvOps — use raw kernel or extend)
-            h = block.upsample.forward(&h)?;
+            // ConvTranspose1d upsampling
+            h = ops.conv.conv_transpose1d(&h, &block.upsample_weight, None, block.stride, block.padding, 0)?;
             for cnx in &block.convnext {
                 // Depthwise conv1d + LayerNorm + GELU + pointwise conv1d
                 let residual = h.clone();
@@ -1857,7 +1927,7 @@ Key points:
 - Code2Wav uses `conv1d` + `layer_norm` + `gelu` — all in existing op traits.
 - Streaming: engine feeds 10-token chunks to `decode_chunk()`. Each chunk produces a waveform segment. No attention at all — pure convolutional.
 - Each pipeline stage gets its own `Ops` bundle. Code2Wav doesn't need `AttentionOps` or `KvCacheOps`, but they're still present in the bundle (methods would error if called).
-- ConvTranspose1d (upsampling) is not in `ConvOps` — extend later if needed, or use raw kernel call.
+- `conv_transpose1d` (upsampling) is in `ConvOps` — used here for learned upsampling between ConvNeXt blocks.
 
 ### Example 6: FP8 Quantized Inference (DeepSeek-V3 with FP8 Weights)
 
@@ -1882,8 +1952,8 @@ impl QuantizedLinear {
 }
 ```
 
-On CUDA: routes to DeepGEMM FP8 (SM90+) or cuBLAS FP8.
-On ROCm: routes to hipBLAS FP8 (gfx942 FNUZ or gfx950 E4M3 auto-selected).
+On CUDA: routes to DeepGEMM FP8 (SM90+) or CUTLASS FP8.
+On ROCm: routes to CK FP8 (gfx942 FNUZ or gfx950 E4M3 auto-selected).
 On CPU: `quantized_matmul` dequantizes and falls back to BLAS.
 
 ### Example 7: Llama-3-8B on Apple M4 (Metal, Q4_K Quantized)
@@ -1999,7 +2069,7 @@ fn forward(x: &Tensor, ops: &Ops, kv: &PagedKvCtx) -> Result<Tensor> {
     // Paged attention — TPU supports this via Pallas
     // TpuOps internally pads head_dim to 128-byte alignment
     let o = ops.attn.paged_attention(&q, &kv.cache_k, &kv.cache_v, &PagedParams {
-        block_tables: kv.block_tables.clone(),
+        block_tables: &kv.block_tables,
         max_seqlen_q: 1,  // decode
         ..
     })?;
@@ -2026,7 +2096,7 @@ Key points:
 ### Example 10: Qwen3-4B on MI300X (ROCm, FP8 FNUZ)
 
 LLM inference on AMD MI300X with FP8 quantization. ROCm uses HIP flash attention
-and hipBLAS with architecture-specific FP8 format.
+and CK GEMM with architecture-specific FP8 format.
 
 ```rust
 // Same model code. RocmOps auto-selects FP8 FNUZ for gfx942.
@@ -2473,7 +2543,7 @@ impl WhisperDecoderLayer {
     fn forward(
         &self, x: &Tensor, encoder_out: &Tensor, ops: &Ops,
         kv: &PagedKvCtx,
-        encoder_seqlens: &Tensor,  // cu_seqlens for encoder output
+        encoder_seqlens: &[u32],   // cu_seqlens for encoder output
     ) -> Result<Tensor> {
         // Self-attention (causal, with KV cache)
         let (residual, h) = blocks::residual_layer_norm(x, x, &self.ln1, None, eps, ops)?;
@@ -2491,8 +2561,8 @@ impl WhisperDecoderLayer {
         let k = ops.gemm.matmul(encoder_out, &self.cross_k_proj)?;   // [enc_total, heads, hdim]
         let v = ops.gemm.matmul(encoder_out, &self.cross_v_proj)?;   // [enc_total, heads, hdim]
         let o = ops.attn.varlen_attention(&q, &k, &v, &VarlenParams {
-            cu_seqlens_q: kv.cu_seqlens_q.clone(),  // decoder sequence lengths
-            cu_seqlens_k: encoder_seqlens.clone(),    // encoder sequence lengths (different!)
+            cu_seqlens_q: &kv.cu_seqlens_q,   // decoder sequence lengths
+            cu_seqlens_k: encoder_seqlens,    // encoder sequence lengths (different!)
             mask: MaskType::Bidirectional,            // cross-attention: no causal mask
             ..
         })?;
@@ -2532,12 +2602,12 @@ impl HunyuanVideoBlock {
         let (q, k, v) = self.spatial_qkv(&norm_x, ops)?;
 
         // cu_seqlens: [0, H*W, 2*H*W, ..., T*H*W] — one "sequence" per frame
-        let spatial_seqlens = (0..=num_frames).map(|i| i * spatial_tokens).collect();
+        let spatial_seqlens: Vec<u32> = (0..=num_frames).map(|i| (i * spatial_tokens) as u32).collect();
         let o_spatial = ops.attn.varlen_attention(&q, &k, &v, &VarlenParams {
-            cu_seqlens_q: Tensor::from_slice(&spatial_seqlens),
-            cu_seqlens_k: Tensor::from_slice(&spatial_seqlens),
-            max_seqlen_q: spatial_tokens,   // H*W
-            max_seqlen_k: spatial_tokens,
+            cu_seqlens_q: &spatial_seqlens,
+            cu_seqlens_k: &spatial_seqlens,
+            max_seqlen_q: spatial_tokens as u32,   // H*W
+            max_seqlen_k: spatial_tokens as u32,
             mask: MaskType::Bidirectional,
             ..
         })?;
@@ -2551,11 +2621,11 @@ impl HunyuanVideoBlock {
         let (q, k, v) = self.temporal_qkv(&x_temporal, ops)?;
 
         // cu_seqlens: [0, T, 2*T, ..., H*W*T] — one "sequence" per spatial position
-        let temporal_seqlens = (0..=spatial_tokens).map(|i| i * num_frames).collect();
+        let temporal_seqlens: Vec<u32> = (0..=spatial_tokens).map(|i| (i * num_frames) as u32).collect();
         let o_temporal = ops.attn.varlen_attention(&q, &k, &v, &VarlenParams {
-            cu_seqlens_q: Tensor::from_slice(&temporal_seqlens),
-            cu_seqlens_k: Tensor::from_slice(&temporal_seqlens),
-            max_seqlen_q: num_frames,       // T
+            cu_seqlens_q: &temporal_seqlens,
+            cu_seqlens_k: &temporal_seqlens,
+            max_seqlen_q: num_frames as u32,       // T
             max_seqlen_k: num_frames,
             mask: MaskType::Bidirectional,   // no causal across frames
             ..
@@ -2711,8 +2781,8 @@ fn replay_cuda_graph(
     ops: &Ops,
     cuda_ops: &CudaOps,
     batch_input: &Tensor,
-    block_tables: &Tensor,
-    cu_seqlens_k: &Tensor,
+    block_tables: &[u32],
+    cu_seqlens_k: &[u32],
 ) -> Result<Tensor> {
     // Update fixed-address buffers (memcpy, no reallocation)
     graph.input_buf.copy_from(batch_input);

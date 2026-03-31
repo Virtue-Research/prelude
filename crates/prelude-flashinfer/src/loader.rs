@@ -84,6 +84,15 @@ pub struct MLAPagedKey {
     pub head_dim_kpe: u32,
 }
 
+/// Key for looking up a POD (Prefill-On-Decode) kernel variant.
+/// Merged: swa/softcap dispatched at runtime inside the CUDA kernel.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct PodKey {
+    pub dtype: KernelDtype,
+    pub head_dim_qk: u32,
+    pub head_dim_vo: u32,
+}
+
 /// Function pointers for a batch prefill variant.
 /// Each variant exports: plan, ragged_run, paged_run.
 pub struct PrefillVariant {
@@ -108,6 +117,12 @@ pub struct MLADecodeVariant {
 /// Function pointers for MLA paged attention.
 pub struct MLAPagedVariant {
     pub plan: TVMSafeCallFn,
+    pub run: TVMSafeCallFn,
+}
+
+/// Function pointers for POD (Prefill-On-Decode) mixed batching.
+/// Single kernel handles both prefill (Q>1) and decode (Q=1) in one launch.
+pub struct PodVariant {
     pub run: TVMSafeCallFn,
 }
 
@@ -191,6 +206,11 @@ impl KernelRegistry {
     /// Look up an MLA paged attention variant.
     pub fn get_mla_paged(&self, key: &MLAPagedKey) -> Option<MLAPagedVariant> {
         lookup_mla_paged(key)
+    }
+
+    /// Look up a POD (Prefill-On-Decode) variant for mixed batching.
+    pub fn get_pod(&self, key: &PodKey) -> Option<PodVariant> {
+        lookup_pod(key)
     }
 
     /// Look up a utility kernel by name (e.g., "softmax", "rmsnorm", "apply_rope").
