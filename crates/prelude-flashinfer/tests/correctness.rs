@@ -2589,27 +2589,96 @@ fn pod_execution() {
             .expect("POD run failed");
         cudaDeviceSynchronize();
 
-        // ── Verify prefill output ──
-        let out_p_bf16 = gpu_download::<u16>(o_p_ptr, q_p_elems);
-        let out_p_f32: Vec<f32> = out_p_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
-        let sum_p: f32 = out_p_f32.iter().map(|v| v.abs()).sum();
-        assert!(sum_p > 0.0, "POD prefill output is all zeros");
-        assert!(out_p_f32.iter().all(|v| v.is_finite()), "POD prefill output has NaN/Inf");
+        // ── Save POD output ──
+        let pod_p_bf16 = gpu_download::<u16>(o_p_ptr, q_p_elems);
+        let pod_p_f32: Vec<f32> = pod_p_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
+        let pod_d_bf16 = gpu_download::<u16>(o_d_ptr, q_d_elems);
+        let pod_d_f32: Vec<f32> = pod_d_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
 
-        // ── Verify decode output ──
-        let out_d_bf16 = gpu_download::<u16>(o_d_ptr, q_d_elems);
-        let out_d_f32: Vec<f32> = out_d_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
-        let sum_d: f32 = out_d_f32.iter().map(|v| v.abs()).sum();
-        assert!(sum_d > 0.0, "POD decode output is all zeros");
-        assert!(out_d_f32.iter().all(|v| v.is_finite()), "POD decode output has NaN/Inf");
+        assert!(pod_p_f32.iter().map(|v| v.abs()).sum::<f32>() > 0.0, "POD prefill output is all zeros");
+        assert!(pod_d_f32.iter().map(|v| v.abs()).sum::<f32>() > 0.0, "POD decode output is all zeros");
+        assert!(pod_p_f32.iter().all(|v| v.is_finite()), "POD prefill output has NaN/Inf");
+        assert!(pod_d_f32.iter().all(|v| v.is_finite()), "POD decode output has NaN/Inf");
 
-        println!("POD execution BF16 h128: PASS (prefill_sum={sum_p:.4}, decode_sum={sum_d:.4})");
+        // ── Run separate paged prefill for reference ──
+        let o_ref_p_ptr = gpu_alloc(q_p_elems * 2);
+        cudaMemset(o_ref_p_ptr, 0, q_p_elems * 2);
+        let dl_o_ref_p = gpu_dl(o_ref_p_ptr, BF16_DT, &q_p_s, &q_p_st);
+        let sep_prefill_args = [
+            TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws), plan_info_p,
+            TVMFFIAny::dltensor(&dl_qp), TVMFFIAny::dltensor(&dl_k), TVMFFIAny::dltensor(&dl_v),
+            TVMFFIAny::dltensor(&dl_qo_indptr_p), TVMFFIAny::dltensor(&dl_kv_indptr_p),
+            TVMFFIAny::dltensor(&dl_kv_indices_p), TVMFFIAny::dltensor(&dl_kv_last_p),
+            TVMFFIAny::dltensor(&dl_o_ref_p), TVMFFIAny::none(),
+            TVMFFIAny::int64(1), TVMFFIAny::int64(0), TVMFFIAny::int64(-1), TVMFFIAny::bool_val(false),
+            TVMFFIAny::none(), TVMFFIAny::none(), TVMFFIAny::none(),
+            TVMFFIAny::none(), TVMFFIAny::none(), TVMFFIAny::none(),
+            TVMFFIAny::float64(0.0), TVMFFIAny::float64(sm_scale), TVMFFIAny::float64(1.0), TVMFFIAny::float64(1e4),
+            TVMFFIAny::int64(0),
+        ];
+        reg.call(prefill_variant.paged_run, &sep_prefill_args)
+            .expect("Separate paged prefill failed");
+        cudaDeviceSynchronize();
+        let ref_p_bf16 = gpu_download::<u16>(o_ref_p_ptr, q_p_elems);
+        let ref_p_f32: Vec<f32> = ref_p_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
 
-        // Benchmark moved to examples/bench_pod.rs
+        // ── Run separate decode for reference ──
+        let o_ref_d_ptr = gpu_alloc(q_d_elems * 2);
+        cudaMemset(o_ref_d_ptr, 0, q_d_elems * 2);
+        let dl_o_ref_d = gpu_dl(o_ref_d_ptr, BF16_DT, &q_d_s, &q_d_st);
+        let decode_variant = reg.get_decode(&DecodeKey {
+            dtype: KernelDtype::BF16, head_dim_qk: 128, head_dim_vo: 128,
+            sliding_window: false, logits_soft_cap: false,
+        }).unwrap();
+        let cu_d_dec_s = [2i64]; let cu_d_dec_st = contiguous_strides(&cu_d_dec_s);
+        let dl_indptr_d_dec = cpu_dl(kv_indptr_d.as_ptr() as *mut c_void, I32_DT, &cu_d_dec_s, &cu_d_dec_st);
+        let empty_s = [0i64]; let empty_st = contiguous_strides(&empty_s);
+        let dl_eq = gpu_dl(std::ptr::null_mut(), BF16_DT, &empty_s, &empty_st);
+        let dl_ek = gpu_dl(std::ptr::null_mut(), BF16_DT, &empty_s, &empty_st);
+        let dec_plan = reg.call(decode_variant.plan, &[
+            TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws), TVMFFIAny::dltensor(&dl_pws),
+            TVMFFIAny::dltensor(&dl_indptr_d_dec),
+            TVMFFIAny::int64(1), TVMFFIAny::int64(num_qo_heads), TVMFFIAny::int64(num_kv_heads),
+            TVMFFIAny::int64(page_size), TVMFFIAny::bool_val(false),
+            TVMFFIAny::int64(-1), TVMFFIAny::float64(0.0),
+            TVMFFIAny::int64(head_dim), TVMFFIAny::int64(head_dim),
+            TVMFFIAny::dltensor(&dl_eq), TVMFFIAny::dltensor(&dl_ek),
+        ]).unwrap();
+        let sep_decode_args = [
+            TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws), dec_plan,
+            TVMFFIAny::dltensor(&dl_qd), TVMFFIAny::dltensor(&dl_k), TVMFFIAny::dltensor(&dl_v),
+            TVMFFIAny::dltensor(&dl_kv_indptr_d), TVMFFIAny::dltensor(&dl_kv_indices_d),
+            TVMFFIAny::dltensor(&dl_kv_last_d),
+            TVMFFIAny::dltensor(&dl_o_ref_d), TVMFFIAny::none(),
+            TVMFFIAny::int64(0), TVMFFIAny::int64(-1), TVMFFIAny::bool_val(false),
+            TVMFFIAny::none(), TVMFFIAny::float64(0.0), TVMFFIAny::float64(sm_scale),
+            TVMFFIAny::float64(1.0), TVMFFIAny::float64(1e4),
+        ];
+        reg.call(decode_variant.run, &sep_decode_args)
+            .expect("Separate decode failed");
+        cudaDeviceSynchronize();
+        let ref_d_bf16 = gpu_download::<u16>(o_ref_d_ptr, q_d_elems);
+        let ref_d_f32: Vec<f32> = ref_d_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
+
+        // ── Compare POD vs Separate ──
+        let max_diff_p: f32 = pod_p_f32.iter().zip(ref_p_f32.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let max_diff_d: f32 = pod_d_f32.iter().zip(ref_d_f32.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        // BF16 has ~0.4% relative error; for values ~0.01-0.1 range, absolute tolerance ~0.01
+        assert!(max_diff_p < 0.05,
+            "POD vs separate prefill output mismatch: max_diff={max_diff_p}");
+        assert!(max_diff_d < 0.05,
+            "POD vs separate decode output mismatch: max_diff={max_diff_d}");
+
+        println!("POD correctness BF16 h128: PASS (prefill_max_diff={max_diff_p:.6}, decode_max_diff={max_diff_d:.6})");
 
         // Cleanup
-        cudaFree(q_p_ptr); cudaFree(o_p_ptr);
-        cudaFree(q_d_ptr); cudaFree(o_d_ptr);
+        cudaFree(q_p_ptr); cudaFree(o_p_ptr); cudaFree(o_ref_p_ptr);
+        cudaFree(q_d_ptr); cudaFree(o_d_ptr); cudaFree(o_ref_d_ptr);
         cudaFree(k_cache); cudaFree(v_cache);
         cudaFree(kv_indptr_p_gpu); cudaFree(kv_indices_p_gpu); cudaFree(kv_last_p_gpu); cudaFree(qo_indptr_p_gpu);
         cudaFree(kv_indptr_d_gpu); cudaFree(kv_indices_d_gpu); cudaFree(kv_last_d_gpu); cudaFree(qo_indptr_d_gpu);

@@ -22,6 +22,7 @@ unsafe extern "C" {
     fn cudaMemset(ptr: *mut c_void, value: i32, count: usize) -> i32;
     fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32) -> i32;
     fn cudaDeviceSynchronize() -> i32;
+    fn cudaGetLastError() -> i32;
     fn cudaEventCreate(event: *mut *mut c_void) -> i32;
     fn cudaEventRecord(event: *mut c_void, stream: *mut c_void) -> i32;
     fn cudaEventSynchronize(event: *mut c_void) -> i32;
@@ -999,11 +1000,16 @@ fn bench_pod(reg: &KernelRegistry, ws: &Workspace) {
     println!("{}", "-".repeat(82));
 
     // Configs: (num_qo_heads, num_kv_heads, decode_batch, prefill_q_len, kv_len_decode)
-    // NOTE: POD needs separate workspace buffers for prefill/decode sides.
-    // Larger configs need workspace allocation per-side (TODO).
+    // NOTE: FA2 paged prefill has a known issue with 32 heads + seq_len >= 64
+    //       ("illegal instruction"), so we use 2 heads for larger configs.
     let configs = [
-        (2, 2, 1, 8, 32,      "1 prefill(8) + 1 decode(kv32) [small]"),
-        (32, 8, 1, 8, 128,    "1 prefill(8) + 1 decode(kv128)"),
+        (2, 2, 1, 8, 32,       "1 prefill(8) + 1 decode(kv32) [2h]"),
+        (32, 8, 1, 8, 128,     "1 prefill(8) + 1 decode(kv128) [32h GQA]"),
+        (2, 2, 1, 64, 512,     "1 prefill(64) + 1 decode(kv512) [2h]"),
+        (2, 2, 1, 128, 2048,   "1 prefill(128) + 1 decode(kv2048) [2h]"),
+        (2, 2, 16, 32, 512,    "1 prefill(32) + 16 decode(kv512) [2h]"),
+        (2, 2, 64, 32, 1024,   "1 prefill(32) + 64 decode(kv1024) [2h]"),
+        (2, 2, 128, 64, 2048,  "1 prefill(64) + 128 decode(kv2048) [2h]"),
     ];
 
     for (nqh, nkh, dec_batch, pq_len, kv_d, label) in configs {
@@ -1094,12 +1100,25 @@ fn bench_pod(reg: &KernelRegistry, ws: &Workspace) {
 
             let sm_scale = 1.0 / (head_dim as f64).sqrt();
 
-            // Build DLTensors
-            let fws_s = [ws.float_size as i64]; let fws_st = strides(&fws_s);
-            let iws_s = [ws.int_size as i64]; let iws_st = strides(&iws_s);
-            let dl_fws = gpu_dl(ws.float_ws, U8_DT, &fws_s, &fws_st);
-            let dl_iws = gpu_dl(ws.int_ws, U8_DT, &iws_s, &iws_st);
+            // POD needs SEPARATE workspace buffers for prefill and decode sides
+            // (they run concurrently on different SMs, shared workspace = corruption)
+            let fws_size = ws.float_size;
+            let iws_size = ws.int_size;
+            let fws_s = [fws_size as i64]; let fws_st = strides(&fws_s);
+            let iws_s = [iws_size as i64]; let iws_st = strides(&iws_s);
+            // Prefill side workspace
+            let dl_fws_p = gpu_dl(ws.float_ws, U8_DT, &fws_s, &fws_st);
+            let dl_iws_p = gpu_dl(ws.int_ws, U8_DT, &iws_s, &iws_st);
             let dl_pws = cpu_dl(ws.pinned_ws, U8_DT, &iws_s, &iws_st);
+            // Decode side workspace (separate allocation)
+            let fws_d_ptr = gpu_alloc(fws_size);
+            let iws_d_ptr = gpu_alloc(iws_size);
+            let dl_fws_d = gpu_dl(fws_d_ptr, U8_DT, &fws_s, &fws_st);
+            let dl_iws_d = gpu_dl(iws_d_ptr, U8_DT, &iws_s, &iws_st);
+            // Pinned workspace for decode-side plan
+            let pws_layout = std::alloc::Layout::from_size_align(iws_size, 64).unwrap();
+            let pws_d_ptr = std::alloc::alloc_zeroed(pws_layout) as *mut c_void;
+            let dl_pws_d = cpu_dl(pws_d_ptr, U8_DT, &iws_s, &iws_st);
             let kv_s = [total_pages, page_size, num_kv_heads, head_dim];
             let kv_st = strides(&kv_s);
             let dl_k = gpu_dl(k_cache, BF16_DT, &kv_s, &kv_st);
@@ -1135,7 +1154,7 @@ fn bench_pod(reg: &KernelRegistry, ws: &Workspace) {
             let dl_cuk_p = cpu_dl(kv_indptr_p.as_ptr() as _, I32_DT, &cu_p_s, &cu_p_st);
             let dl_kvl_p = cpu_dl(kvl_data_p.as_ptr() as _, I32_DT, &kvl_p_s, &kvl_p_st);
             let plan_p = reg.call(prefill_variant.plan, &[
-                TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws), TVMFFIAny::dltensor(&dl_pws),
+                TVMFFIAny::dltensor(&dl_fws_p), TVMFFIAny::dltensor(&dl_iws_p), TVMFFIAny::dltensor(&dl_pws),
                 TVMFFIAny::dltensor(&dl_cuq_p), TVMFFIAny::dltensor(&dl_cuk_p), TVMFFIAny::dltensor(&dl_kvl_p),
                 TVMFFIAny::int64(kv_len_p), TVMFFIAny::int64(1),
                 TVMFFIAny::int64(num_qo_heads), TVMFFIAny::int64(num_kv_heads),
@@ -1153,7 +1172,7 @@ fn bench_pod(reg: &KernelRegistry, ws: &Workspace) {
             let dl_cuk_d = cpu_dl(kv_indptr_d.as_ptr() as _, I32_DT, &cu_d_s, &cu_d_st);
             let dl_kvl_d = cpu_dl(kvl_data_d.as_ptr() as _, I32_DT, &kvl_d_s, &kvl_d_st);
             let plan_d = reg.call(prefill_variant.plan, &[
-                TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws), TVMFFIAny::dltensor(&dl_pws),
+                TVMFFIAny::dltensor(&dl_fws_d), TVMFFIAny::dltensor(&dl_iws_d), TVMFFIAny::dltensor(&dl_pws_d),
                 TVMFFIAny::dltensor(&dl_cuq_d), TVMFFIAny::dltensor(&dl_cuk_d), TVMFFIAny::dltensor(&dl_kvl_d),
                 TVMFFIAny::int64(kv_len_d), TVMFFIAny::int64(dec_batch),
                 TVMFFIAny::int64(num_qo_heads), TVMFFIAny::int64(num_kv_heads),
@@ -1163,9 +1182,9 @@ fn bench_pod(reg: &KernelRegistry, ws: &Workspace) {
                 TVMFFIAny::int64(-1), TVMFFIAny::bool_val(false), TVMFFIAny::int64(0),
             ]).unwrap();
 
-            // ── POD run args ──
+            // ── POD run args (prefill side uses _p workspace, decode side uses _d) ──
             let pod_args = [
-                TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws), plan_p,
+                TVMFFIAny::dltensor(&dl_fws_p), TVMFFIAny::dltensor(&dl_iws_p), plan_p,
                 TVMFFIAny::dltensor(&dl_qp), TVMFFIAny::dltensor(&dl_k), TVMFFIAny::dltensor(&dl_v),
                 TVMFFIAny::dltensor(&dl_qo_indptr_p), TVMFFIAny::dltensor(&dl_kv_indptr_p),
                 TVMFFIAny::dltensor(&dl_kv_indices_p), TVMFFIAny::dltensor(&dl_kv_last_p),
@@ -1173,7 +1192,7 @@ fn bench_pod(reg: &KernelRegistry, ws: &Workspace) {
                 TVMFFIAny::int64(1), TVMFFIAny::int64(0), TVMFFIAny::int64(-1),
                 TVMFFIAny::none(), TVMFFIAny::none(), TVMFFIAny::none(),
                 TVMFFIAny::float64(0.0), TVMFFIAny::float64(sm_scale), TVMFFIAny::float64(1.0), TVMFFIAny::float64(1e4),
-                TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws), plan_d,
+                TVMFFIAny::dltensor(&dl_fws_d), TVMFFIAny::dltensor(&dl_iws_d), plan_d,
                 TVMFFIAny::dltensor(&dl_qd), TVMFFIAny::dltensor(&dl_k), TVMFFIAny::dltensor(&dl_v),
                 TVMFFIAny::dltensor(&dl_qo_indptr_d), TVMFFIAny::dltensor(&dl_kv_indptr_d),
                 TVMFFIAny::dltensor(&dl_kv_indices_d), TVMFFIAny::dltensor(&dl_kv_last_d),
@@ -1184,9 +1203,9 @@ fn bench_pod(reg: &KernelRegistry, ws: &Workspace) {
                 TVMFFIAny::bool_val(false), TVMFFIAny::dltensor(&dl_sched),
             ];
 
-            // ── Separate: paged prefill + decode ──
+            // ── Separate: paged prefill + decode (sequential, share _p workspace) ──
             let sep_prefill_args = [
-                TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws), plan_p,
+                TVMFFIAny::dltensor(&dl_fws_p), TVMFFIAny::dltensor(&dl_iws_p), plan_p,
                 TVMFFIAny::dltensor(&dl_qp), TVMFFIAny::dltensor(&dl_k), TVMFFIAny::dltensor(&dl_v),
                 TVMFFIAny::dltensor(&dl_qo_indptr_p), TVMFFIAny::dltensor(&dl_kv_indptr_p),
                 TVMFFIAny::dltensor(&dl_kv_indices_p), TVMFFIAny::dltensor(&dl_kv_last_p),
@@ -1204,7 +1223,7 @@ fn bench_pod(reg: &KernelRegistry, ws: &Workspace) {
             let dl_eq = gpu_dl(std::ptr::null_mut(), BF16_DT, &empty_s, &empty_st);
             let dl_ek = gpu_dl(std::ptr::null_mut(), BF16_DT, &empty_s, &empty_st);
             let dec_plan = reg.call(decode_variant.plan, &[
-                TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws), TVMFFIAny::dltensor(&dl_pws),
+                TVMFFIAny::dltensor(&dl_fws_p), TVMFFIAny::dltensor(&dl_iws_p), TVMFFIAny::dltensor(&dl_pws),
                 TVMFFIAny::dltensor(&dl_indptr_d_cpu),
                 TVMFFIAny::int64(dec_batch), TVMFFIAny::int64(num_qo_heads), TVMFFIAny::int64(num_kv_heads),
                 TVMFFIAny::int64(page_size), TVMFFIAny::bool_val(false),
@@ -1213,7 +1232,7 @@ fn bench_pod(reg: &KernelRegistry, ws: &Workspace) {
                 TVMFFIAny::dltensor(&dl_eq), TVMFFIAny::dltensor(&dl_ek),
             ]).unwrap();
             let sep_decode_args = [
-                TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws), dec_plan,
+                TVMFFIAny::dltensor(&dl_fws_p), TVMFFIAny::dltensor(&dl_iws_p), dec_plan,
                 TVMFFIAny::dltensor(&dl_qd), TVMFFIAny::dltensor(&dl_k), TVMFFIAny::dltensor(&dl_v),
                 TVMFFIAny::dltensor(&dl_kv_indptr_d), TVMFFIAny::dltensor(&dl_kv_indices_d),
                 TVMFFIAny::dltensor(&dl_kv_last_d),
@@ -1223,13 +1242,49 @@ fn bench_pod(reg: &KernelRegistry, ws: &Workspace) {
                 TVMFFIAny::float64(1.0), TVMFFIAny::float64(1e4),
             ];
 
-            // ── Run benchmarks ──
+            // ── Run benchmarks (skip config if kernel fails) ──
+            // Validate POD first
+            if let Err(e) = reg.call(pod_variant.run, &pod_args) {
+                cudaDeviceSynchronize(); // clear error state
+                println!("{:<50} {:>10} {:>10} {:>8}", label, "FAIL", "-", "-");
+                eprintln!("  POD error: {e}");
+                cudaFree(k_cache); cudaFree(v_cache);
+                cudaFree(q_p); cudaFree(o_p); cudaFree(q_d); cudaFree(o_d);
+                cudaFree(qo_indptr_p_gpu); cudaFree(kv_indptr_p_gpu); cudaFree(kv_indices_p_gpu); cudaFree(kv_last_p_gpu);
+                cudaFree(qo_indptr_d_gpu); cudaFree(kv_indptr_d_gpu); cudaFree(kv_indices_d_gpu); cudaFree(kv_last_d_gpu);
+                cudaFree(sched); cudaFree(fws_d_ptr); cudaFree(iws_d_ptr);
+                std::alloc::dealloc(pws_d_ptr as *mut u8, pws_layout);
+                continue;
+            }
+            cudaDeviceSynchronize();
+
             let pod_ms = cuda_bench(10, 200, || {
                 reg.call(pod_variant.run, &pod_args).unwrap();
             });
+
+            // Validate separate path (reset CUDA error state first)
+            cudaDeviceSynchronize(); cudaGetLastError();
+            let sep_ok = reg.call(prefill_variant.paged_run, &sep_prefill_args).is_ok() && {
+                cudaDeviceSynchronize();
+                reg.call(decode_variant.run, &sep_decode_args).is_ok()
+            };
+            cudaDeviceSynchronize(); cudaGetLastError(); // clear any sticky errors
+
+            if !sep_ok {
+                let pod_us = pod_ms * 1000.0;
+                println!("{:<50} {:>10.1} {:>10} {:>8}", label, pod_us, "SEP_ERR", "-");
+                cudaFree(k_cache); cudaFree(v_cache);
+                cudaFree(q_p); cudaFree(o_p); cudaFree(q_d); cudaFree(o_d);
+                cudaFree(qo_indptr_p_gpu); cudaFree(kv_indptr_p_gpu); cudaFree(kv_indices_p_gpu); cudaFree(kv_last_p_gpu);
+                cudaFree(qo_indptr_d_gpu); cudaFree(kv_indptr_d_gpu); cudaFree(kv_indices_d_gpu); cudaFree(kv_last_d_gpu);
+                cudaFree(sched); cudaFree(fws_d_ptr); cudaFree(iws_d_ptr);
+                std::alloc::dealloc(pws_d_ptr as *mut u8, pws_layout);
+                continue;
+            }
+
             let sep_ms = cuda_bench(10, 200, || {
-                reg.call(prefill_variant.paged_run, &sep_prefill_args).unwrap();
-                reg.call(decode_variant.run, &sep_decode_args).unwrap();
+                reg.call(prefill_variant.paged_run, &sep_prefill_args).ok();
+                reg.call(decode_variant.run, &sep_decode_args).ok();
             });
 
             let pod_us = pod_ms * 1000.0;
@@ -1241,7 +1296,8 @@ fn bench_pod(reg: &KernelRegistry, ws: &Workspace) {
             cudaFree(q_p); cudaFree(o_p); cudaFree(q_d); cudaFree(o_d);
             cudaFree(qo_indptr_p_gpu); cudaFree(kv_indptr_p_gpu); cudaFree(kv_indices_p_gpu); cudaFree(kv_last_p_gpu);
             cudaFree(qo_indptr_d_gpu); cudaFree(kv_indptr_d_gpu); cudaFree(kv_indices_d_gpu); cudaFree(kv_last_d_gpu);
-            cudaFree(sched);
+            cudaFree(sched); cudaFree(fws_d_ptr); cudaFree(iws_d_ptr);
+            std::alloc::dealloc(pws_d_ptr as *mut u8, pws_layout);
         }
     }
 }
