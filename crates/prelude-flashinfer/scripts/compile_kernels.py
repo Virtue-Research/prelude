@@ -1555,6 +1555,8 @@ def build_variant_matrix(
     # MERGED: all swa/softcap/mask_mode combos in one compilation unit per (dtype, hdim).
     # Split by CTA_TILE_Q into 3 .cu files, each with 64 instantiations (like FA3 prefill).
     # Assumes swa_p==swa_d, softcap_p==softcap_d (same model in continuous batching).
+    # SM80 only: POD is FA2-based, on SM90+ separate FA3 prefill + FA2 decode is faster.
+    sm80_only_flags = ["-gencode", "arch=compute_80,code=compute_80"]
     for dtype in dtypes:
         dtype_c, dtype_name = DTYPE_MAP[dtype]
         for hdim in head_dims:
@@ -1563,7 +1565,7 @@ def build_variant_matrix(
                 "vid": vid, "kind": "pod_merged", "backend": "fa2",
                 "dtype": dtype, "dtype_c": dtype_c, "dtype_name": dtype_name,
                 "hdim_qk": hdim, "hdim_vo": hdim,
-                "arch_flags": sm80_flags,
+                "arch_flags": sm80_only_flags,
             })
 
     return variants
