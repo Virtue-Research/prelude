@@ -107,6 +107,11 @@ enum MaskType {
     Causal,
     Bidirectional,
     SlidingWindow { left: usize, right: usize },
+    /// Custom attention mask tensor. Used for speculative decoding tree attention:
+    /// each token attends to its ancestors in the draft tree, not a simple causal pattern.
+    /// Mask shape: [max_seqlen_q, max_seqlen_k], values are 0.0 (attend) or -inf (mask).
+    /// Passed to attention kernel as additive bias on logits (before softmax).
+    Custom(Tensor),
 }
 ```
 
@@ -235,6 +240,53 @@ trait ConvOps: Send + Sync {
 - TTS: conv1d (vocoder, encoder).
 - LLM: conv1d (DeltaNet/Mamba causal conv).
 
+### Communication (Distributed)
+
+```rust
+trait CommOps: Send + Sync {
+    /// Sum-reduce tensor across all ranks in the tensor-parallel group.
+    fn all_reduce_sum(&self, x: &Tensor) -> Result<Tensor>;
+
+    /// Concatenate tensor shards from all ranks along `dim`.
+    fn all_gather(&self, x: &Tensor, dim: usize) -> Result<Tensor>;
+
+    /// Reduce-scatter: reduce across ranks, then scatter result shards.
+    fn reduce_scatter(&self, x: &Tensor, dim: usize) -> Result<Tensor>;
+
+    /// All-to-all: each rank sends/receives different data to/from every other rank.
+    /// Used for Ulysses sequence parallelism and MoE expert routing.
+    fn all_to_all(&self, x: &Tensor, input_splits: &[usize], output_splits: &[usize]) -> Result<Tensor>;
+}
+```
+
+**Device implementations:**
+- **CUDA**: NCCL (default), custom all-reduce for single-node TP (P2P), symmetric memory on H100+.
+- **ROCm**: RCCL (NCCL equivalent), custom all-reduce on MI300 (QuickAllReduce).
+- **TPU**: XLA collective ops (compiled into HLO, hardware-optimized).
+- **Single-device** (Metal, Vulkan, CPU): identity passthrough (TP=1, no communication needed).
+
+**How TP uses CommOps:**
+
+```rust
+/// RowParallelLinear: shard input, local GEMM, all-reduce output.
+fn row_parallel_forward(x: &Tensor, ops: &Ops) -> Result<Tensor> {
+    let out = ops.gemm.matmul(x, &self.weight_shard)?;  // local GEMM
+    ops.comm.all_reduce_sum(&out)                         // synchronize
+}
+
+/// ColumnParallelLinear: local GEMM on sharded weights, optionally all-gather.
+fn col_parallel_forward(x: &Tensor, ops: &Ops) -> Result<Tensor> {
+    let out = ops.gemm.matmul(x, &self.weight_shard)?;  // local GEMM
+    if self.gather_output {
+        ops.comm.all_gather(&out, /*dim=*/-1)             // reconstruct full output
+    } else {
+        Ok(out)  // keep sharded (e.g., QKV stays sharded for local attention)
+    }
+}
+```
+
+**Key insight: attention ops don't know about TP.** `QKVParallelLinear` is a `ColumnParallelLinear` that shards Q/K/V output across ranks. Each rank gets `num_heads / TP` heads. The attention kernel receives already-sharded Q/K/V and computes locally — no all-reduce inside attention. All-reduce happens in the `RowParallelLinear` output projection after attention.
+
 ### Fusion
 
 Fused kernels are **separate ops that return `Option`**. `None` = not supported on this device, model falls back to separate ops. This is not a hint system — the model explicitly checks the return value.
@@ -298,6 +350,24 @@ trait FusedOps: Send + Sync {
         weight: &Tensor, bias: Option<&Tensor>,
         scale: &Tensor, shift: &Tensor,
         eps: f32,
+    ) -> Option<Result<Tensor>> { None }
+
+    /// Fused multi-LoRA matmul: y = base_weight @ x + scale * (lora_b @ lora_a @ x)
+    ///
+    /// Each token in the batch can use a different LoRA adapter (for multi-tenant serving).
+    /// adapter_indices: [batch] mapping each token to its adapter (-1 = no LoRA).
+    /// lora_a: [num_adapters, rank, in_features], lora_b: [num_adapters, out_features, rank].
+    ///
+    /// Without fusion: split batch by adapter, N separate matmuls, merge. O(N) kernel launches.
+    /// With fusion (BGMV/Punica): single kernel handles all adapters. O(1) launch.
+    fn fused_lora_matmul(
+        &self,
+        x: &Tensor,
+        base_weight: &Tensor,
+        lora_a: &Tensor,
+        lora_b: &Tensor,
+        adapter_indices: &Tensor,
+        lora_scale: f32,
     ) -> Option<Result<Tensor>> { None }
 }
 ```
@@ -430,6 +500,7 @@ struct Ops {
     pub norm: Arc<dyn NormOps>,
     pub act: Arc<dyn ActivationOps>,
     pub conv: Arc<dyn ConvOps>,
+    pub comm: Arc<dyn CommOps>,
     pub fused: Arc<dyn FusedOps>,
     pub session: Arc<dyn OpsSession>,
 }
@@ -506,6 +577,7 @@ impl FusedOps for CudaOps {
     fn fused_knorm_rope_cache_write(&self, ..) -> Option<Result<..>> { Some(gpu::fused_knorm_rope_kv_write(..)) }
     fn fused_adaln_zero(&self, ..) -> Option<Result<..>> { Some(gpu::fused_adaln_zero(..)) }
     fn fused_scale_shift(&self, ..) -> Option<Result<..>> { Some(gpu::fused_scale_shift(..)) }
+    fn fused_lora_matmul(&self, ..) -> Option<Result<..>> { Some(gpu::bgmv_lora(..)) }
 }
 ```
 
@@ -859,6 +931,207 @@ match self.layer_type(i) {
 
 If DeltaNet needs multi-device support in the future, it gets its own trait (`LinearAttentionOps` or `RecurrentOps`). It does not share a trait with softmax attention.
 
+## Distributed Execution
+
+### Tensor Parallelism (TP)
+
+TP shards model weights across N GPUs. **Attention ops don't know about TP** — all parallelism is handled by the linear layers that surround them.
+
+```
+Input (full hidden_state, identical on all ranks)
+    ↓
+[ColumnParallelLinear] QKV projection (each rank: num_heads/TP heads)
+    ↓
+[Local attention kernel] — each rank computes on its shard, no communication
+    ↓
+[RowParallelLinear] O projection → all_reduce_sum across ranks
+    ↓
+Output (full hidden_state, identical on all ranks)
+```
+
+Model code with TP:
+
+```rust
+struct ParallelAttention {
+    qkv_proj: ColumnParallelLinear,  // weight: [3*heads/TP*hdim, hidden]
+    o_proj: RowParallelLinear,        // weight: [hidden, heads/TP*hdim]
+}
+
+impl ParallelAttention {
+    fn forward(&self, x: &Tensor, ops: &Ops, kv: &PagedKvCtx) -> Result<Tensor> {
+        // ColumnParallel: local GEMM, output is sharded (heads/TP)
+        let qkv = self.qkv_proj.forward(x, ops)?;      // no communication
+        let (q, k, v) = split_qkv(&qkv, num_heads_per_rank, num_kv_heads_per_rank);
+
+        // Attention is LOCAL — each rank has its own Q/K/V shard
+        ops.kv_cache.reshape_and_cache(&k, &v, &kv.cache_k, &kv.cache_v, &kv.slots)?;
+        let o = ops.attn.paged_attention(&q, &kv.cache_k, &kv.cache_v, &params)?;
+
+        // RowParallel: local GEMM + all_reduce
+        self.o_proj.forward(&o, ops)                     // all_reduce inside
+    }
+}
+
+struct RowParallelLinear { weight_shard: Tensor }
+
+impl RowParallelLinear {
+    fn forward(&self, x: &Tensor, ops: &Ops) -> Result<Tensor> {
+        let out = ops.gemm.matmul(x, &self.weight_shard)?;
+        ops.comm.all_reduce_sum(&out)
+    }
+}
+```
+
+**KV cache with TP:** Each rank holds `num_kv_heads / TP` heads in its cache. No communication during KV cache access — each rank reads its own shard.
+
+**GQA + TP edge case:** When `num_kv_heads < TP` (e.g., 8 KV heads with TP=16), KV heads are replicated: each rank gets 1 KV head replicated from the global set. The attention kernel handles K→Q head broadcasting locally.
+
+### Pipeline Parallelism (PP)
+
+PP splits layers across stages. **Engine-level orchestration, not ops-level.**
+
+```
+Stage 0 (GPU 0): layers [0:16]  → send activations → Stage 1 (GPU 1): layers [16:32]
+```
+
+Each stage has its own `Ops` bundle (same device type). The engine manages send/recv of activations between stages. No impact on op traits.
+
+### Sequence Parallelism (SP)
+
+For long-sequence diffusion/video models. Two patterns:
+
+**Ulysses (all-to-all):** Shard sequence dim across ranks, all-gather before attention, reduce-scatter after.
+
+```rust
+fn sp_attention(x: &Tensor, ops: &Ops) -> Result<Tensor> {
+    let x_local = ops.comm.reduce_scatter(x, /*dim=*/0)?;  // shard sequence
+    let o_local = ops.attn.varlen_attention(&q, &k, &v, &params)?;  // local attention
+    ops.comm.all_gather(&o_local, /*dim=*/0)                 // reconstruct full sequence
+}
+```
+
+**Ring attention:** Rotate K/V between neighbors. Each rank computes partial attention and accumulates. Requires custom attention loop — not expressible through `AttentionOps` alone. Model owns the ring loop and calls `CommOps` for send/recv between steps.
+
+## LoRA (Low-Rank Adaptation)
+
+Multi-LoRA serving: a single batch contains tokens from different LoRA adapters.
+Each token maps to a different adapter (or no adapter).
+
+**Core computation:** `y = W @ x + scale * (lora_b @ lora_a @ x)`
+
+### Where LoRA Sits
+
+LoRA is a `FusedOps` concern. The fused BGMV/Punica kernel handles all adapters in one launch:
+
+```rust
+struct LoRALinear {
+    base_weight: Tensor,                 // [out, in] — shared, possibly quantized
+    lora_a: Tensor,                      // [num_adapters, rank, in]
+    lora_b: Tensor,                      // [num_adapters, out, rank]
+    scale: f32,                          // alpha / rank
+}
+
+impl LoRALinear {
+    fn forward(&self, x: &Tensor, adapter_indices: &Tensor, ops: &Ops) -> Result<Tensor> {
+        match ops.fused.fused_lora_matmul(
+            x, &self.base_weight, &self.lora_a, &self.lora_b, adapter_indices, self.scale,
+        ) {
+            Some(r) => r?,
+            None => {
+                // Fallback: base matmul + per-adapter LoRA (slow but correct)
+                let base = ops.gemm.matmul(x, &self.base_weight)?;
+                lora_fallback(&base, x, &self.lora_a, &self.lora_b, adapter_indices, self.scale, ops)
+            }
+        }
+    }
+}
+```
+
+- **CUDA:** `fused_lora_matmul` returns `Some` — Punica/BGMV kernel. O(1) kernel launch for all adapters.
+- **Other devices:** returns `None` — fallback splits batch by adapter_id, runs N matmuls. Correct but slower.
+
+### LoRA + Quantization
+
+Base weight can be quantized (W4A16, FP8). LoRA weights are always FP16/BF16:
+
+```rust
+fn forward(&self, x: &Tensor, adapter_indices: &Tensor, ops: &Ops) -> Result<Tensor> {
+    // Base: quantized matmul
+    let base = ops.gemm.quantized_matmul(x, &self.base_weight_q4, None, Some(&self.scale), W4A16 { .. })?;
+    // LoRA: FP16 matmul (separate, always full precision)
+    let lora = lora_forward(x, &self.lora_a, &self.lora_b, adapter_indices, ops)?;
+    Ok((&base + &lora)?)
+}
+```
+
+### LoRA + TP
+
+With tensor parallelism, `lora_a` is replicated across ranks, `lora_b` is sharded like the base weight. All-gather between A and B phases:
+
+```rust
+// In ColumnParallelLinear + LoRA:
+let shrunk = matmul(x, &self.lora_a)?;               // local: x @ lora_a
+let gathered = ops.comm.all_gather(&shrunk, -1)?;     // synchronize
+let expanded = matmul(&gathered, &self.lora_b_shard)?; // local: shard of lora_b
+```
+
+## Speculative Decoding
+
+Speculative decoding is **engine-level orchestration**. It does not change op traits
+(except `MaskType::Custom` for tree attention masks).
+
+### Flow
+
+```
+1. Draft model generates N candidate tokens autoregressively
+   — uses ops.attn.paged_attention() with max_seqlen_q=1, same as normal decode
+
+2. Target model verifies all N+1 positions in one forward pass
+   — uses ops.attn.paged_attention() with max_seqlen_q=N+1 (chunked prefill)
+
+3. Engine compares logits, accepts k ≤ N tokens via rejection sampling
+
+4. KV cache: rejected tokens' slots marked with PADDING_SLOT_ID = -1
+   — reshape_and_cache skips -1 slots, no explicit rollback needed
+```
+
+### Tree Attention (EAGLE/Medusa)
+
+Tree-based speculation generates a tree of candidates (multiple branching paths).
+Verification uses a custom attention mask where each token attends to its ancestors:
+
+```rust
+// Engine constructs tree mask: [tree_len, tree_len]
+// 0.0 = attend, -inf = mask
+let tree_mask = build_tree_mask(&draft_tree);
+
+// Target model forward with custom mask
+let params = PagedParams {
+    mask: MaskType::Custom(tree_mask),  // not simple Causal
+    ..
+};
+let logits = ops.attn.paged_attention(&q, &kv.cache_k, &kv.cache_v, &params)?;
+```
+
+The attention kernel passes the custom mask as additive bias on logits (before softmax).
+Flash Attention supports this natively via the `attn_bias` parameter.
+
+### EAGLE: Hidden State Reuse
+
+EAGLE's draft model takes the target model's hidden states as input (not re-embedded tokens).
+This is model-level: the target model exposes intermediate hidden states, and the draft model
+consumes them. No ops changes needed — both models call the same `Ops` interface.
+
+### Impact on Ops Design
+
+| Spec decode concern | Where it lives | Impact on ops |
+|---------------------|---------------|---------------|
+| Draft model forward | Engine | None — same `Ops` as normal inference |
+| Target verification | Engine | None — chunked prefill via `paged_attention` |
+| Tree attention mask | `MaskType::Custom(Tensor)` | Already in `AttentionOps` |
+| KV cache rollback | Engine (slot_mapping with -1) | `reshape_and_cache` skips -1 slots |
+| Rejection sampling | Engine (GPU kernel) | Not an op trait concern |
+
 ## Model Code Pattern
 
 Models receive `&Ops` and use it for all device-dependent operations:
@@ -928,7 +1201,7 @@ fn create_ops(device: &Device, config: &OpsConfig) -> Ops {
             Ops {
                 attn: cuda.clone(), kv_cache: cuda.clone(), gemm: cuda.clone(),
                 norm: cuda.clone(), act: cuda.clone(), conv: cuda.clone(),
-                fused: cuda.clone(), session: cuda,
+                comm: cuda.clone(), fused: cuda.clone(), session: cuda,
             }
         }
         DeviceType::Rocm => {
@@ -936,7 +1209,7 @@ fn create_ops(device: &Device, config: &OpsConfig) -> Ops {
             Ops {
                 attn: rocm.clone(), kv_cache: rocm.clone(), gemm: rocm.clone(),
                 norm: rocm.clone(), act: rocm.clone(), conv: rocm.clone(),
-                fused: rocm.clone(), session: rocm,
+                comm: rocm.clone(), fused: rocm.clone(), session: rocm,
             }
         }
         DeviceType::Metal => {
@@ -944,7 +1217,7 @@ fn create_ops(device: &Device, config: &OpsConfig) -> Ops {
             Ops {
                 attn: metal.clone(), kv_cache: metal.clone(), gemm: metal.clone(),
                 norm: metal.clone(), act: metal.clone(), conv: metal.clone(),
-                fused: metal.clone(), session: metal,
+                comm: metal.clone(), fused: metal.clone(), session: metal,
             }
         }
         DeviceType::Vulkan => {
@@ -952,7 +1225,7 @@ fn create_ops(device: &Device, config: &OpsConfig) -> Ops {
             Ops {
                 attn: vk.clone(), kv_cache: vk.clone(), gemm: vk.clone(),
                 norm: vk.clone(), act: vk.clone(), conv: vk.clone(),
-                fused: vk.clone(), session: vk,
+                comm: vk.clone(), fused: vk.clone(), session: vk,
             }
         }
         DeviceType::Tpu => {
@@ -960,7 +1233,7 @@ fn create_ops(device: &Device, config: &OpsConfig) -> Ops {
             Ops {
                 attn: tpu.clone(), kv_cache: tpu.clone(), gemm: tpu.clone(),
                 norm: tpu.clone(), act: tpu.clone(), conv: tpu.clone(),
-                fused: tpu.clone(), session: tpu,
+                comm: tpu.clone(), fused: tpu.clone(), session: tpu,
             }
         }
         DeviceType::Cpu => {
@@ -968,7 +1241,7 @@ fn create_ops(device: &Device, config: &OpsConfig) -> Ops {
             Ops {
                 attn: cpu.clone(), kv_cache: cpu.clone(), gemm: cpu.clone(),
                 norm: cpu.clone(), act: cpu.clone(), conv: cpu.clone(),
-                fused: cpu.clone(), session: cpu,
+                comm: cpu.clone(), fused: cpu.clone(), session: cpu,
             }
         }
     }
@@ -991,6 +1264,7 @@ and their own internals. No cross-subsystem code reading required.
 | **VulkanOps** | Op trait signatures, Vulkan/SPIR-V API | Other devices, model code |
 | **TpuOps** | Op trait signatures, XLA/Pallas API | Other devices, model code |
 | **Kernel wrapper** (FA4, FlashInfer, DeepGEMM) | Kernel library C API | Op traits, model code, other wrappers |
+| **Comm backend** (NCCL, RCCL, XLA coll.) | `CommOps` trait, communication library API | Model code, attention kernels |
 | **Engine/Scheduler** | `OpsSession`, `PagedKvCtx`, model `forward()` signature | Kernel implementations, device internals |
 | **KV Cache Manager** | Block allocation logic, `block_tables`/`slot_mapping` layout | Attention kernels, device code |
 
@@ -1019,6 +1293,8 @@ What each device supports today. "Planned" = not yet implemented but feasible.
 | **fused_add_rmsnorm** | FlashInfer kernel | HIP kernel | MSL shader | GLSL shader | XLA auto-fuse | vectorized |
 | **fused_adaln_zero** | Triton/CUDA kernel | — (planned) | — (planned) | — | XLA auto-fuse | — |
 | **fused_qknorm_rope** | FlashInfer kernel | — | — | — | — | — |
+| **fused_lora_matmul** | BGMV/Punica kernel | — (planned) | — | — | XLA custom op | — |
+| **CommOps** | NCCL / custom AR | RCCL | — (single device) | — (single device) | XLA collective | — (single device) |
 | **OpsSession** | FlashInfer plan cache | no-op | no-op | no-op | XLA compile cache | no-op |
 | **CUDA graphs** | yes | HIP graphs (6.1+) | — | — | — | — |
 | **BFloat16** | SM80+ | all CDNA | Apple6+/Metal3+ | extension req'd | native | optional |
@@ -1048,6 +1324,10 @@ Model code never changes — the dispatch layer absorbs all device differences.
 | Vulkan (cross-vendor) | `VulkanOps`: flash attn + quantized matmul via SPIR-V; edge/mobile focus |
 | TPU (XLA) | `TpuOps`: static shapes, Pallas attention, XLA auto-fuses element-wise chains |
 | ROCm arch variation | `RocmArch` enum (gfx942/950/1100), FP8 format auto-selected per arch |
+| Tensor parallelism | `CommOps` trait (all_reduce, all_gather), attention ops are TP-agnostic |
+| Sequence parallelism | `CommOps::reduce_scatter` + `all_gather` around local attention |
+| Multi-LoRA serving | `FusedOps::fused_lora_matmul` (BGMV/Punica), fallback to per-adapter matmul |
+| Speculative decoding | Engine-level; tree attention via `MaskType::Custom(Tensor)` |
 
 ## Model Examples
 
