@@ -1,5 +1,16 @@
 # Ops Dispatch Architecture
 
+## Principles
+
+1. **Subsystem isolation:** A person working on one subsystem should be able to do their job
+   without reading or understanding any other subsystem's code. Model devs don't read kernel code.
+   Kernel devs don't read model code. Device backend devs don't read other backends.
+   The trait signatures are the complete contract between subsystems.
+
+2. **Kernel optimization reach:** When a kernel optimization is added, as many models as possible
+   should benefit automatically without per-model code changes. This is achieved via shared
+   building blocks — optimize one building block, all models that use it benefit. O(1) change → O(N) benefit.
+
 ## Goals
 
 1. Model code is device-agnostic: no `#[cfg(feature = "cuda")]` in models.
@@ -1565,149 +1576,95 @@ Model code never changes — the dispatch layer absorbs all device differences.
 
 Concrete examples showing how real model architectures map onto this design.
 
-### Example 1: Qwen3-32B (LLM with GQA + MoE)
+### Example 1: Qwen3-32B (LLM with GQA + MoE, Building Blocks)
 
 Standard AR LLM. 64 layers, GQA (40 Q heads / 8 KV heads), hdim 128, MoE (8 active / 128 total experts).
+Uses building blocks — no fusion fallback logic in model code.
 
 ```rust
-struct Qwen3Layer {
-    ln1: Tensor, ln2: Tensor,
-    qkv_proj: Linear, o_proj: Linear,
-    gate_proj: Linear, up_proj: Linear, down_proj: Linear,
-    gate: MoeGate,       // router
-    expert_weights: Tensor, // [128, N, K]
-}
-
 impl Qwen3Layer {
     fn forward(&self, x: &Tensor, ops: &Ops, kv: &PagedKvCtx) -> Result<Tensor> {
-        // 1. Pre-attention norm + attention
-        let (residual, h) = match ops.fused.fused_add_rmsnorm(x, &self.residual, &self.ln1, eps) {
-            Some(r) => r?,
-            None => {
-                let r = (x + &self.residual)?;
-                let h = ops.norm.rms_norm(&r, &self.ln1, eps)?;
-                (r, h)
-            }
-        };
-        let qkv = ops.gemm.matmul(&h, &self.qkv_proj)?;
-        let (q, k, v) = split_qkv(&qkv, 40, 8);
-        let (q, k) = apply_rope(&q, &k, &kv.cos, &kv.sin, &kv.positions)?;
+        // 1. Pre-attention: building block handles fused_add_rmsnorm internally
+        let (residual, h) = blocks::residual_norm(x, &self.residual, &self.ln1, eps, ops)?;
+
+        // 2. QKV projection (TP-aware)
+        let qkv = blocks::col_parallel(&h, &self.qkv_shard, false, ops)?;
+        let (q, k, v) = split_qkv(&qkv, num_heads_per_rank, num_kv_heads_per_rank);
+
+        // 3. QK-norm + RoPE: building block handles fused_qknorm_rope internally
+        let (q, k) = blocks::qk_norm_rope(&q, &k, &self.qw, &self.kw, cos, sin, pos, eps, ops)?;
+
+        // 4. KV cache + attention (raw ops — no building block needed)
         ops.kv_cache.reshape_and_cache(&k, &v, &kv.cache_k, &kv.cache_v, &kv.slots)?;
         let o = ops.attn.paged_attention(&q, &kv.cache_k, &kv.cache_v, &paged_params)?;
-        let h = ops.gemm.matmul(&o, &self.o_proj)?;
+        let h = blocks::row_parallel(&o, &self.o_proj_shard, ops)?;
 
-        // 2. Post-attention norm + MoE
-        let (residual, h) = match ops.fused.fused_add_rmsnorm(&residual, &h, &self.ln2, eps) {
-            Some(r) => r?,
-            None => {
-                let r = (&residual + &h)?;
-                let h = ops.norm.rms_norm(&r, &self.ln2, eps)?;
-                (r, h)
-            }
-        };
-        let (indices, weights) = self.gate.route(&h)?;          // top-8 routing
-        let moe_out = ops.gemm.grouped_gemm(                    // per-expert GEMM
-            &h, &self.expert_weights, &indices, &expert_ids, &num_tokens,
-        )?;
-        Ok((&residual + &moe_out)?)
+        // 5. Post-attention norm + MoE
+        let (residual, h) = blocks::residual_norm(&residual, &h, &self.ln2, eps, ops)?;
+        let h = blocks::moe_layer(&h, &self.gate, &self.expert_weights, &self.ep_config, ops)?;
+        Ok((&residual + &h)?)
     }
 }
 ```
 
 Key points:
+- **No `match` / `None` / fallback** in model code. All fusion logic is inside building blocks.
 - `paged_attention` handles both decode (Q=1) and chunked prefill (Q>1). Model doesn't distinguish.
-- `grouped_gemm` for MoE. Same op on CUDA (DeepGEMM grouped) and ROCm (CK grouped GEMM).
-- Fused ops (`fused_add_rmsnorm`) have explicit fallback. Runs correctly on CPU.
+- `blocks::moe_layer` handles EP dispatch/combine internally when `ep_config.ep_size > 1`.
+- If a kernel dev adds `fused_add_rmsnorm` to CudaOps, this model benefits with zero changes.
 
-### Example 2: Flux (Diffusion Transformer, Text-to-Image)
+### Example 2: Flux (Diffusion Transformer, Building Blocks)
 
 DiT with joint text+image attention. 19 double-stream blocks + 38 single-stream blocks.
 No KV cache, no paged attention, no causal masking.
 
 ```rust
-struct FluxDoubleBlock {
-    img_ln: Tensor, txt_ln: Tensor,
-    img_qkv: Linear, txt_qkv: Linear,
-    img_out: Linear, txt_out: Linear,
-    img_mlp: MLP, txt_mlp: MLP,
-}
-
 impl FluxDoubleBlock {
-    fn forward(
-        &self, img: &Tensor, txt: &Tensor,
-        temb: &Tensor,  // timestep embedding → (scale, shift, gate) per sub-layer
-        ops: &Ops,
-    ) -> Result<(Tensor, Tensor)> {
-        // 1. AdaLN-Zero on image stream
-        let (img_scale1, img_shift1, img_gate1, img_scale2, img_shift2, img_gate2) =
-            self.img_mod.forward(temb)?;  // MLP: temb → 6 modulation params
-        let (txt_scale1, txt_shift1, txt_gate1, txt_scale2, txt_shift2, txt_gate2) =
-            self.txt_mod.forward(temb)?;
+    fn forward(&self, img: &Tensor, txt: &Tensor, temb: &Tensor, ops: &Ops) -> Result<(Tensor, Tensor)> {
+        // Timestep modulation: MLP maps temb → 6 affine params per stream
+        let (is1, ih1, ig1, is2, ih2, ig2) = self.img_mod.forward(temb)?;
+        let (ts1, th1, tg1, ts2, th2, tg2) = self.txt_mod.forward(temb)?;
 
-        // 2. Norm + modulate image
-        let img_normed = match ops.fused.fused_adaln_zero(
-            img, &self.img_ln, None, &img_scale1, &img_shift1, &img_gate1, eps,
-        ) {
-            Some(r) => r?,
-            None => {
-                let n = ops.norm.layer_norm(img, &self.img_ln, None, eps)?;
-                let n = &n * &(1.0 + &img_scale1)? + &img_shift1;  // modulate
-                (n, img_gate1.clone())
-            }
-        };
+        // 1. AdaLN-Zero (building block handles fused_adaln_zero internally)
+        let (img_n, img_gate) = blocks::adaln_zero(img, &self.img_ln, None, &is1, &ih1, &ig1, eps, ops)?;
+        let (txt_n, txt_gate) = blocks::adaln_zero(txt, &self.txt_ln, None, &ts1, &th1, &tg1, eps, ops)?;
 
-        // 3. Q/K/V projections, RMSNorm on Q/K
-        let img_qkv = ops.gemm.matmul(&img_normed.0, &self.img_qkv)?;
-        let txt_qkv = ops.gemm.matmul(&txt_normed.0, &self.txt_qkv)?;
-        let (img_q, img_k, img_v) = split_qkv(&img_qkv, num_heads, num_heads);
-        let (txt_q, txt_k, txt_v) = split_qkv(&txt_qkv, num_heads, num_heads);
+        // 2. QKV + QK-norm
+        let (img_q, img_k, img_v) = self.img_qkv_proj(&img_n, ops)?;
+        let (txt_q, txt_k, txt_v) = self.txt_qkv_proj(&txt_n, ops)?;
         let img_q = ops.norm.rms_norm(&img_q, &self.img_q_norm, eps)?;
         let img_k = ops.norm.rms_norm(&img_k, &self.img_k_norm, eps)?;
         let txt_q = ops.norm.rms_norm(&txt_q, &self.txt_q_norm, eps)?;
         let txt_k = ops.norm.rms_norm(&txt_k, &self.txt_k_norm, eps)?;
 
-        // 4. Joint attention: concat text + image, single attention call
-        let q = cat(&[&txt_q, &img_q], /*seq_dim=*/0)?;
-        let k = cat(&[&txt_k, &img_k], /*seq_dim=*/0)?;
-        let v = cat(&[&txt_v, &img_v], /*seq_dim=*/0)?;
-        let params = VarlenParams {
-            cu_seqlens_q: /* single sequence */,
-            cu_seqlens_k: /* same */,
-            max_seqlen_q: txt_len + img_len,
-            max_seqlen_k: txt_len + img_len,
-            scale: 1.0 / (head_dim as f32).sqrt(),
-            mask: MaskType::Bidirectional,  // no causal mask for diffusion
-            softcap: None,
-        };
-        let attn_out = ops.attn.varlen_attention(&q, &k, &v, &params)?;
-
-        // 5. Split output, apply gate, residual
+        // 3. Joint attention: concat text + image, bidirectional
+        let q = cat(&[&txt_q, &img_q], 0)?;
+        let k = cat(&[&txt_k, &img_k], 0)?;
+        let v = cat(&[&txt_v, &img_v], 0)?;
+        let attn_out = ops.attn.varlen_attention(&q, &k, &v, &VarlenParams {
+            mask: MaskType::Bidirectional, ..
+        })?;
         let (txt_attn, img_attn) = attn_out.split_at(txt_len)?;
-        let img_attn = ops.gemm.matmul(&img_attn, &self.img_out)?;
-        let img = (img + &(&img_attn * &img_normed.1)?)?;  // residual + gate
 
-        // 6. MLP with AdaLN-Zero (second sub-layer)
-        let img_mlp_in = match ops.fused.fused_adaln_zero(
-            &img, &self.img_ln2, None, &img_scale2, &img_shift2, &img_gate2, eps,
-        ) {
-            Some(r) => r?,
-            None => { /* fallback: layer_norm + scale + shift */ }
-        };
-        let img_mlp_out = self.img_mlp.forward(&img_mlp_in.0, ops)?;
-        let img = (&img + &(&img_mlp_out * &img_mlp_in.1)?)?;
+        // 4. Output proj + gated residual
+        let img = (img + &(ops.gemm.matmul(&img_attn, &self.img_out)? * &img_gate)?)?;
+        let txt = (txt + &(ops.gemm.matmul(&txt_attn, &self.txt_out)? * &txt_gate)?)?;
 
-        // (txt stream is symmetric, omitted for brevity)
+        // 5. MLP sub-layer with AdaLN-Zero
+        let (img_n2, img_gate2) = blocks::adaln_zero(&img, &self.img_ln2, None, &is2, &ih2, &ig2, eps, ops)?;
+        let img = (&img + &(blocks::gelu_mlp(&img_n2, &self.img_fc1, &self.img_fc2, ops)? * &img_gate2)?)?;
+        // (txt symmetric, omitted)
+
         Ok((img, txt))
     }
 }
 ```
 
 Key points:
-- `fused_adaln_zero` is called 4x per double block (2 per stream × 2 sub-layers). 19 blocks = 76 fused kernel calls vs 304 element-wise ops without fusion.
-- Joint attention: model concatenates text + image tokens, calls `varlen_attention` with `MaskType::Bidirectional`. No special "joint attention" trait needed.
-- No KV cache, no `paged_attention`, no `KvCacheOps`. Diffusion is stateless.
-- `layer_norm` (not `rms_norm`): diffusion uses LayerNorm, LLM uses RMSNorm. Both in `NormOps`.
-- On CPU/Vulkan: `fused_adaln_zero` returns `None`, model falls back to separate ops. Correct but slower.
+- `blocks::adaln_zero` called 4x per double block. 19 blocks = 76 calls. Building block handles fused/fallback internally.
+- Joint attention: concat text + image → `varlen_attention` with `MaskType::Bidirectional`. Same `AttentionOps` as LLM.
+- No KV cache, no paged attention. Diffusion is stateless per denoising step.
+- Same building blocks (`rms_norm`, `gelu_mlp`) as LLM — kernel optimizations on these benefit both.
 
 ### Example 3: Qwen3-TTS Code Predictor (Small Causal AR, No KV Cache)
 
@@ -2070,3 +2027,215 @@ Key points:
 - **FP8 FNUZ auto-selected**: `RocmOps` detects gfx942, maps E4M3 request to FNUZ format internally. On gfx950, it would use native E4M3. Model doesn't know.
 - **aiter flash attention**: specialized for MI300/MI350. Falls back to CK on older AMD hardware.
 - **HIP graphs**: supported on ROCm 6.1+. `OpsSession` manages HIP graph capture/replay same as CUDA graphs.
+
+### Example 11: Multi-LoRA Serving (Llama-3-8B, 50 Concurrent Adapters)
+
+Multi-tenant serving: each request uses a different LoRA adapter. A single batch contains
+tokens from 50 different adapters. Uses `blocks::lora_linear` for fused BGMV dispatch.
+
+```rust
+impl LoRALlamaLayer {
+    fn forward(&self, x: &Tensor, ops: &Ops, kv: &PagedKvCtx, adapter_ids: &Tensor) -> Result<Tensor> {
+        let (residual, h) = blocks::residual_norm(x, &self.residual, &self.ln1, eps, ops)?;
+
+        // LoRA-augmented QKV: building block handles fused_lora_matmul internally
+        let qkv = blocks::lora_linear(
+            &h, &self.qkv_weight, &self.qkv_lora_a, &self.qkv_lora_b,
+            adapter_ids, self.lora_scale, ops,
+        )?;
+        let (q, k, v) = split_qkv(&qkv, 32, 8);
+
+        // Attention is unchanged — LoRA only affects linear layers
+        let (q, k) = blocks::qk_norm_rope(&q, &k, &self.qw, &self.kw, cos, sin, pos, eps, ops)?;
+        ops.kv_cache.reshape_and_cache(&k, &v, &kv.cache_k, &kv.cache_v, &kv.slots)?;
+        let o = ops.attn.paged_attention(&q, &kv.cache_k, &kv.cache_v, &params)?;
+
+        // LoRA-augmented output projection
+        let h = blocks::lora_linear(
+            &o, &self.o_proj_weight, &self.o_proj_lora_a, &self.o_proj_lora_b,
+            adapter_ids, self.lora_scale, ops,
+        )?;
+
+        let (residual, h) = blocks::residual_norm(&residual, &h, &self.ln2, eps, ops)?;
+        let h = blocks::gated_mlp(&h, &self.gate, &self.up, &self.down, ops)?;
+        Ok((&residual + &h)?)
+    }
+}
+```
+
+Key points:
+- `adapter_ids: [batch]` maps each token to its LoRA adapter (-1 = no adapter).
+- On CUDA: `fused_lora_matmul` uses BGMV/Punica kernel — O(1) kernel launch for all 50 adapters.
+- On CPU/Metal: fallback splits batch by adapter, runs separate matmuls. Correct but slower.
+- **Attention is identical to non-LoRA** — LoRA only wraps linear layers.
+
+### Example 12: Qwen3.5 Hybrid (DeltaNet + Softmax, Per-Layer Dispatch)
+
+Qwen3.5 uses DeltaNet (linear attention) for ~75% of layers and softmax attention for ~25%.
+DeltaNet is model-owned (closure injection), softmax goes through `AttentionOps`.
+
+```rust
+impl Qwen35Model {
+    fn forward(&self, x: &Tensor, ops: &Ops, kv: &PagedKvCtx) -> Result<Tensor> {
+        let mut h = self.embed(x)?;
+        for (i, layer) in self.layers.iter().enumerate() {
+            h = match self.layer_type(i) {
+                LayerType::Softmax => {
+                    // Standard attention via building blocks (same as Qwen3)
+                    layer.forward_softmax(&h, ops, kv)?
+                }
+                LayerType::DeltaNet => {
+                    // DeltaNet: model-owned, uses conv1d + recurrent state
+                    // Still uses ops.norm and ops.gemm — only the mixer is different
+                    let (residual, h) = blocks::residual_norm(&h, &layer.residual, &layer.ln1, eps, ops)?;
+
+                    // Conv1d causal scan (DeltaNet-specific, not in AttentionOps)
+                    let h = self.deltanet[i].causal_conv(&h, &self.conv_states[i])?;
+                    // Recurrent state update (not expressible as attention)
+                    let h = self.deltanet[i].recurrent_step(&h, &self.recurrent_states[i])?;
+
+                    let h = ops.gemm.matmul(&h, &layer.o_proj)?;  // still uses GemmOps
+                    let (residual, h) = blocks::residual_norm(&residual, &h, &layer.ln2, eps, ops)?;
+                    let h = blocks::gated_mlp(&h, &layer.gate, &layer.up, &layer.down, ops)?;
+                    (&residual + &h)?
+                }
+            };
+        }
+        Ok(h)
+    }
+}
+```
+
+Key points:
+- **DeltaNet doesn't go through `AttentionOps`** — it has fundamentally different state (conv + recurrent).
+- But DeltaNet layers **still use building blocks** for everything else: `residual_norm`, `gated_mlp`, `ops.gemm.matmul`. Kernel optimizations on these benefit DeltaNet layers too.
+- Only the token mixer differs per layer. MLP, norms, projections are identical.
+
+### Example 13: DeepSeek-V3 with EP (Expert Parallelism, 256 Experts on 8 GPUs)
+
+MoE model with 256 routed experts distributed across 8 EP ranks (32 experts each).
+Uses `blocks::moe_layer` which handles EP dispatch/combine internally.
+
+```rust
+impl DeepSeekV3Layer {
+    fn forward(&self, x: &Tensor, ops: &Ops, kv: &PagedKvCtx) -> Result<Tensor> {
+        // Attention (same as any other LLM)
+        let (residual, h) = blocks::residual_norm(x, &self.residual, &self.ln1, eps, ops)?;
+        let (q, k, v) = self.qkv_mla(&h, ops)?;  // MLA: compressed KV, head_dim_v != head_dim_q
+        ops.kv_cache.reshape_and_cache(&k, &v, &kv.cache_k, &kv.cache_v, &kv.slots)?;
+        let o = ops.attn.paged_attention(&q, &kv.cache_k, &kv.cache_v, &params)?;
+        let h = blocks::row_parallel(&o, &self.o_proj_shard, ops)?;
+
+        // MoE with EP: building block handles dispatch → grouped GEMM → combine
+        let (residual, h) = blocks::residual_norm(&residual, &h, &self.ln2, eps, ops)?;
+        let h = blocks::moe_layer(&h, &self.gate, &self.expert_weights, &EpConfig {
+            ep_size: 8,
+            ep_rank: self.ep_rank,
+            num_local_experts: 32,
+        }, ops)?;
+        Ok((&residual + &h)?)
+    }
+}
+```
+
+`blocks::moe_layer` internally:
+```rust
+pub fn moe_layer(x: &Tensor, gate: &MoeGate, weights: &Tensor, ep: &EpConfig, ops: &Ops) -> Result<Tensor> {
+    let (topk_ids, topk_weights) = gate.route(x)?;
+    if ep.ep_size > 1 {
+        // Phase 1: all-to-all dispatch tokens to expert owners
+        let (recv, meta) = ep_dispatch(x, &topk_ids, ep, ops)?;
+        // Phase 2: local grouped GEMM on owned experts
+        let out = ops.gemm.grouped_gemm(&recv, weights, &meta.sorted_ids, ..)?;
+        // Phase 3: all-to-all combine results back
+        ep_combine(&out, &meta, &topk_weights, ops)
+    } else {
+        ops.gemm.grouped_gemm(x, weights, ..)
+    }
+}
+```
+
+Key points:
+- Model code is clean — `blocks::moe_layer` hides all EP complexity.
+- Same model code works for EP=1 (single GPU) and EP=8 (8 GPUs).
+- `CommOps::all_to_all` used inside `ep_dispatch`/`ep_combine`.
+
+### Example 14: Speculative Decoding (EAGLE Draft + Target Verify)
+
+Engine-level orchestration. Both draft and target models use the same `Ops`.
+
+```rust
+// Engine's speculative decode loop (NOT model code)
+fn speculative_step(
+    draft_model: &Model, target_model: &Model,
+    ops: &Ops, kv: &PagedKvCtx,
+) -> Result<Vec<Token>> {
+    // 1. Draft: generate N candidates autoregressively
+    let mut draft_tokens = Vec::new();
+    for _ in 0..N {
+        let logits = draft_model.forward(&draft_input, ops, &draft_kv)?;
+        let token = sample(&logits);
+        draft_tokens.push(token);
+    }
+
+    // 2. Build tree mask for verification
+    let tree_mask = build_tree_mask(&draft_tokens);  // [N+1, max_kv_len]
+
+    // 3. Target: verify all candidates in one forward pass
+    let target_params = PagedParams {
+        max_seqlen_q: N + 1,                    // all draft tokens + 1 bonus
+        mask: MaskType::Custom(tree_mask),       // tree attention mask
+        ..
+    };
+    let target_logits = target_model.forward(&all_candidates, ops, &target_kv)?;
+
+    // 4. Rejection sampling: accept k ≤ N tokens
+    let accepted = rejection_sample(&draft_logits, &target_logits);
+
+    // 5. KV cache: rejected slots already have -1 in slot_mapping → skipped by reshape_and_cache
+    Ok(accepted)
+}
+```
+
+Key points:
+- **Both models use the same `Ops`** — draft and target share the same attention/GEMM kernels.
+- **Tree attention** via `MaskType::Custom(Tensor)` — passed as additive bias to attention kernel.
+- **No KV cache rollback needed** — rejected tokens have `slot_mapping = -1`, `reshape_and_cache` skips them.
+- **Engine-only concern** — model code is unchanged.
+
+### Example 15: Adding a New Fused Kernel (Developer Workflow)
+
+Scenario: kernel dev adds `fused_geglu` (GELU-gated MLP fusion) to CudaOps.
+Shows the minimal change set.
+
+```rust
+// Step 1: Add method to FusedOps trait with default { None } (1 line)
+trait FusedOps {
+    // ... existing methods ...
+    fn fused_geglu(&self, gate: &Tensor, up: &Tensor) -> Option<Result<Tensor>> { None }
+}
+// ← RocmOps, MetalOps, VulkanOps, TpuOps, CpuOps: ZERO changes (inherit None)
+
+// Step 2: Override in CudaOps (the only device that has the kernel)
+impl FusedOps for CudaOps {
+    fn fused_geglu(&self, gate, up) -> Option<Result<Tensor>> {
+        Some(triton::fused_geglu(gate, up))
+    }
+}
+
+// Step 3: Update the building block (1 function change)
+pub fn gelu_mlp(x: &Tensor, fc1: &Tensor, fc2: &Tensor, ops: &Ops) -> Result<Tensor> {
+    let hidden = ops.gemm.matmul(x, fc1)?;
+    let (gate, up) = hidden.chunk(2, -1)?;
+    let h = match ops.fused.fused_geglu(&gate, &up) {
+        Some(r) => r?,
+        None => (ops.act.gelu(&gate)? * &up)?,  // fallback: separate ops
+    };
+    ops.gemm.matmul(&h, fc2)
+}
+// ← All models using blocks::gelu_mlp (Flux, Sana, all diffusion models) benefit automatically
+```
+
+Total changes: **3 locations** (trait def, CudaOps, building block).
+Models changed: **0**.
+Models that benefit: **all models using `blocks::gelu_mlp`**.
