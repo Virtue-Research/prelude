@@ -2683,6 +2683,7 @@ dependencies = [
  "anyhow",
  "cc",
  "hex",
+ "serde",
  "serde_json",
  "sha2",
  "tracing",

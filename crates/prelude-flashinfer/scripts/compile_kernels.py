@@ -59,10 +59,11 @@ def variant_id(kind: str, backend: str, dtype: str, hdim_qk: int, hdim_vo: int,
 def generate_batch_decode_sources(
     fi_src: Path, gen_dir: Path, vid: str,
     dtype_c: str, dtype_name: str, hdim_qk: int, hdim_vo: int,
-    swa: bool, softcap: bool,
 ) -> Tuple[List[Path], List[str]]:
-    """Generate source files for a batch_decode variant.
-    Returns (source_paths, extra_nvcc_flags).
+    """Generate MERGED source files for a batch_decode variant.
+
+    All swa/softcap combos in ONE compilation unit per (dtype, hdim).
+    4 swa/cap × 1 kernel = 4 template instantiations (decode has no mask_mode dispatch).
     """
     import jinja2
 
@@ -70,41 +71,81 @@ def generate_batch_decode_sources(
     out = gen_dir / vid
     out.mkdir(parents=True, exist_ok=True)
 
-    # Render config .inc
+    additional = dict(zip(
+        ("additional_params_decl", "additional_func_params", "additional_params_setter"),
+        _default_decode_params(),
+    ))
+
+    # ── Merged config.inc ──────────────────────────────────────────
     with open(csrc / "batch_decode_customize_config.jinja") as f:
         config_templ = jinja2.Template(f.read())
 
-    variant_name = (
-        f"DefaultAttention<false, {str(swa).lower()}, "
-        f"{str(softcap).lower()}, false>"
+    config_str = config_templ.render(
+        variant_decl="#include<flashinfer/attention/variants.cuh>",
+        variant_name="DefaultAttention<false, false, false, false>",  # placeholder
+        dtype_q=dtype_c, dtype_kv=dtype_c, dtype_o=dtype_c,
+        idtype="int32_t",
+        head_dim_qk=hdim_qk, head_dim_vo=hdim_vo,
+        pos_encoding_mode="PosEncodingMode::kNone",
+        use_sliding_window="false", use_logits_soft_cap="false",
+        **additional,
     )
-    kwargs = {
-        "variant_decl": "#include<flashinfer/attention/variants.cuh>",
-        "variant_name": variant_name,
-        "dtype_q": dtype_c, "dtype_kv": dtype_c, "dtype_o": dtype_c,
-        "idtype": "int32_t",
-        "head_dim_qk": hdim_qk, "head_dim_vo": hdim_vo,
-        "pos_encoding_mode": "PosEncodingMode::kNone",
-        "use_sliding_window": str(swa).lower(),
-        "use_logits_soft_cap": str(softcap).lower(),
-        **dict(zip(
-            ("additional_params_decl", "additional_func_params", "additional_params_setter"),
-            _default_decode_params(),
-        )),
-    }
-    config_str = config_templ.render(**kwargs)
+    # Replace DISPATCH_context with runtime swa/softcap dispatch
+    old_config = config_str
+    config_str = config_str.replace(
+        '#define DISPATCH_context('
+        'DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM_QK, HEAD_DIM_VO, '
+        'POS_ENCODING_MODE, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, '
+        'AttentionVariant, Params, ...) { \\\n'
+        '  using AttentionVariant = DefaultAttention<false, false, false, false>; \\\n'
+        '  __VA_ARGS__(); \\\n'
+        '}',
+        '#define DISPATCH_context('
+        'DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM_QK, HEAD_DIM_VO, '
+        'POS_ENCODING_MODE, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, '
+        'AttentionVariant, Params, ...) { \\\n'
+        '  auto _run = [&]<bool _SWA, bool _CAP>() { \\\n'
+        '    using AttentionVariant = DefaultAttention<false, _SWA, _CAP, false>; \\\n'
+        '    __VA_ARGS__(); \\\n'
+        '  }; \\\n'
+        '  bool _swa = (window_left >= 0); \\\n'
+        '  bool _cap = (logits_soft_cap > 0.0); \\\n'
+        '  if (!_swa && !_cap) _run.template operator()<false, false>(); \\\n'
+        '  else if (_swa && !_cap) _run.template operator()<true, false>(); \\\n'
+        '  else if (!_swa && _cap) _run.template operator()<false, true>(); \\\n'
+        '  else _run.template operator()<true, true>(); \\\n'
+        '}',
+    )
+    assert config_str != old_config, "DISPATCH_context replacement failed in batch_decode — upstream macro may have changed"
     (out / "batch_decode_config.inc").write_text(config_str)
 
-    # Render kernel instantiation
-    with open(csrc / "batch_decode_kernel_inst.jinja") as f:
-        kernel_templ = jinja2.Template(f.read())
-    kernel_src = kernel_templ.render(**kwargs)
-    (out / "batch_decode_kernel.cu").write_text(kernel_src)
+    # ── Merged kernel instantiations (4 swa/cap combos) ──────────
+    swa_cap_combos = [(False, False), (True, False), (False, True), (True, True)]
+    lines = [
+        '#include <flashinfer/attention/decode.cuh>',
+        '#include "batch_decode_config.inc"',
+        '',
+        'using namespace flashinfer;',
+        '',
+        'namespace flashinfer {',
+        '',
+    ]
+    for swa, cap in swa_cap_combos:
+        var = f"DefaultAttention<false, {str(swa).lower()}, {str(cap).lower()}, false>"
+        lines.append(
+            f"template cudaError_t "
+            f"BatchDecodeWithPagedKVCacheDispatched<{hdim_qk}, "
+            f"PosEncodingMode::kNone, {var}, Params>"
+            f"(Params params, {dtype_c}* tmp_v, float* tmp_s, "
+            f"bool enable_pdl, cudaStream_t stream);"
+        )
+    lines.extend(['', '};'])
 
-    sources = [out / "batch_decode_kernel.cu"]
+    kernel_path = out / "merged_kernels.cu"
+    kernel_path.write_text('\n'.join(lines))
+    sources = [kernel_path]
 
-    # batch_decode.cu defines BatchDecodeWithPagedKVCacheRun — rename per variant
-    # to avoid duplicate symbols across AOT variants.
+    # ── batch_decode.cu (dispatch) ──
     renames = {
         "BatchDecodeWithPagedKVCacheRun": f"{vid}_BatchDecodeWithPagedKVCacheRun",
         "BatchDecodeWithPagedKVCachePlan": f"{vid}_BatchDecodeWithPagedKVCachePlan",
@@ -112,7 +153,7 @@ def generate_batch_decode_sources(
     _copy_with_renames(csrc / "batch_decode.cu", out / "batch_decode.cu", renames)
     sources.append(out / "batch_decode.cu")
 
-    # Generate modified binding with variant-specific symbol names
+    # ── Binding ──
     binding_src = _generate_renamed_binding(
         csrc / "batch_decode_jit_binding.cu",
         "batch_decode_config.inc",
@@ -121,12 +162,10 @@ def generate_batch_decode_sources(
             "run": f"__tvm_ffi_{vid}_run",
         },
     )
-    # Also rename the internal function calls in the binding
     for old, new in renames.items():
         binding_src = binding_src.replace(old, new)
-    binding_path = out / "batch_decode_binding.cu"
-    binding_path.write_text(binding_src)
-    sources.append(binding_path)
+    (out / "batch_decode_binding.cu").write_text(binding_src)
+    sources.append(out / "batch_decode_binding.cu")
 
     return sources, []
 
@@ -134,55 +173,109 @@ def generate_batch_decode_sources(
 def generate_batch_prefill_fa2_sources(
     fi_src: Path, gen_dir: Path, vid: str,
     dtype_c: str, dtype_name: str, hdim_qk: int, hdim_vo: int,
-    swa: bool, softcap: bool,
 ) -> Tuple[List[Path], List[str]]:
-    """Generate source files for a batch_prefill FA2 variant."""
+    """Generate MERGED source files for a batch_prefill FA2 variant.
+
+    All swa/softcap/mask_mode/layout combos in ONE compilation unit per (dtype, hdim).
+    This is the deepgemm-style approach: 96 template instantiations in one .cu,
+    with runtime dispatch for swa/softcap/mask_mode.
+    Reduces FA2 prefill from 400 .o files to ~30.
+    """
     import jinja2
 
     csrc = fi_src / "csrc"
     out = gen_dir / vid
     out.mkdir(parents=True, exist_ok=True)
 
-    variant_name = (
-        f"DefaultAttention<false, {str(swa).lower()}, "
-        f"{str(softcap).lower()}, false>"
-    )
-    kwargs = {
-        "variant_decl": "#include<flashinfer/attention/variants.cuh>",
-        "variant_name": variant_name,
-        "dtype_q": dtype_c, "dtype_kv": dtype_c, "dtype_o": dtype_c,
-        "idtype": "int32_t",
-        "head_dim_qk": hdim_qk, "head_dim_vo": hdim_vo,
-        "pos_encoding_mode": "PosEncodingMode::kNone",
-        "use_sliding_window": str(swa).lower(),
-        "use_logits_soft_cap": str(softcap).lower(),
-        "use_fp16_qk_reduction": "false",
-        **dict(zip(
-            ("additional_params_decl", "additional_func_params", "additional_params_setter"),
-            _default_prefill_params(),
-        )),
-    }
+    additional = dict(zip(
+        ("additional_params_decl", "additional_func_params", "additional_params_setter"),
+        _default_prefill_params(),
+    ))
 
-    # Config
+    # ── Merged config.inc ──────────────────────────────────────────
+    # Same as upstream but DISPATCH_context dispatches swa/softcap at runtime.
     with open(csrc / "batch_prefill_customize_config.jinja") as f:
-        config_str = jinja2.Template(f.read()).render(**kwargs)
+        config_templ = jinja2.Template(f.read())
+
+    # Render with (swa=false, cap=false) as dummy — we override DISPATCH_context below
+    config_str = config_templ.render(
+        variant_decl="#include<flashinfer/attention/variants.cuh>",
+        variant_name="DefaultAttention<use_custom_mask, false, false, false>",  # placeholder
+        dtype_q=dtype_c, dtype_kv=dtype_c, dtype_o=dtype_c,
+        idtype="int32_t",
+        head_dim_qk=hdim_qk, head_dim_vo=hdim_vo,
+        pos_encoding_mode="PosEncodingMode::kNone",
+        use_sliding_window="false", use_logits_soft_cap="false",
+        use_fp16_qk_reduction="false",
+        **additional,
+    )
+    # Replace the hardcoded DISPATCH_context with runtime swa/softcap dispatch
+    old_config = config_str
+    config_str = config_str.replace(
+        '#define DISPATCH_context('
+        'DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, '
+        'POS_ENCODING_MODE, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, '
+        'AttentionVariant, RaggedParams, PagedParams, ...) \\\n'
+        '  DISPATCH_MASK_MODE(mask_mode, MASK_MODE, { \\\n'
+        '    constexpr auto use_custom_mask = MASK_MODE == MaskMode::kCustom; \\\n'
+        '    using AttentionVariant = DefaultAttention<use_custom_mask, false, false, false>; \\\n'
+        '    __VA_ARGS__(); \\\n'
+        '  })',
+        # Merged: runtime dispatch swa/softcap via window_left and logits_soft_cap
+        '#define DISPATCH_context('
+        'DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, '
+        'POS_ENCODING_MODE, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, '
+        'AttentionVariant, RaggedParams, PagedParams, ...) \\\n'
+        '  DISPATCH_MASK_MODE(mask_mode, MASK_MODE, { \\\n'
+        '    constexpr auto use_custom_mask = MASK_MODE == MaskMode::kCustom; \\\n'
+        '    auto _run = [&]<bool _SWA, bool _CAP>() { \\\n'
+        '      using AttentionVariant = DefaultAttention<use_custom_mask, _SWA, _CAP, false>; \\\n'
+        '      __VA_ARGS__(); \\\n'
+        '    }; \\\n'
+        '    bool _swa = (window_left >= 0); \\\n'
+        '    bool _cap = (logits_soft_cap > 0.0); \\\n'
+        '    if (!_swa && !_cap) _run.template operator()<false, false>(); \\\n'
+        '    else if (_swa && !_cap) _run.template operator()<true, false>(); \\\n'
+        '    else if (!_swa && _cap) _run.template operator()<false, true>(); \\\n'
+        '    else _run.template operator()<true, true>(); \\\n'
+        '  })',
+    )
+    assert config_str != old_config, "DISPATCH_context replacement failed in batch_prefill_fa2 — upstream macro may have changed"
     (out / "batch_prefill_config.inc").write_text(config_str)
 
-    # Kernel instantiations for needed mask modes
-    with open(csrc / "batch_prefill_paged_kernel_inst.jinja") as f:
-        paged_templ = jinja2.Template(f.read())
-    with open(csrc / "batch_prefill_ragged_kernel_inst.jinja") as f:
-        ragged_templ = jinja2.Template(f.read())
+    # ── Merged kernel instantiations (ONE .cu for all combos) ──────
+    # 4 swa/cap × 4 mask_modes × 2 layouts × 3 CTA_TILE_Q = 96 instantiations
+    lines = [
+        '#include <flashinfer/attention/prefill.cuh>',
+        '#include "batch_prefill_config.inc"',
+        '',
+        'namespace flashinfer {',
+        '',
+    ]
+    swa_cap_combos = [(False, False), (True, False), (False, True), (True, True)]
+    for mm_val, mm_name in MASK_MODES.items():
+        for swa, cap in swa_cap_combos:
+            var = f"DefaultAttention<{mm_name} == MaskMode::kCustom, {str(swa).lower()}, {str(cap).lower()}, false>"
+            for cta in [16, 64, 128]:
+                for func, params in [("BatchPrefillWithPagedKVCacheDispatched", "PagedParams"),
+                                     ("BatchPrefillWithRaggedKVCacheDispatched", "RaggedParams")]:
+                    lines.append(
+                        f"template cudaError_t {func}<"
+                        f"/*CTA_TILE_Q=*/{cta}, {hdim_qk}, {hdim_vo}, "
+                        f"PosEncodingMode::kNone, false, {mm_name}, "
+                        f"{var}, {params}>"
+                        f"({params} params, {dtype_c}* tmp_v, float* tmp_s, "
+                        f"bool enable_pdl, cudaStream_t stream);"
+                    )
+        lines.append('')
+    lines.append('};  // namespace flashinfer')
 
-    sources = []
-    for mm in NEEDED_MASK_MODES:
-        for templ, prefix in [(paged_templ, "paged"), (ragged_templ, "ragged")]:
-            fname = f"batch_prefill_{prefix}_kernel_mask_{mm}.cu"
-            src = templ.render(mask_mode=MASK_MODES[mm], **kwargs)
-            (out / fname).write_text(src)
-            sources.append(out / fname)
+    kernel_path = out / "merged_kernels.cu"
+    kernel_path.write_text('\n'.join(lines))
 
-    # batch_prefill.cu defines BatchPrefillWith{Ragged,Paged}KVCacheRun — rename per variant
+    sources = [kernel_path]
+
+    # ── batch_prefill.cu (dispatch) — reuse upstream with renamed symbols ──
     renames = {
         "BatchPrefillWithKVCachePlan": f"{vid}_BatchPrefillWithKVCachePlan",
         "BatchPrefillWithRaggedKVCacheRun": f"{vid}_BatchPrefillWithRaggedKVCacheRun",
@@ -191,7 +284,7 @@ def generate_batch_prefill_fa2_sources(
     _copy_with_renames(csrc / "batch_prefill.cu", out / "batch_prefill.cu", renames)
     sources.append(out / "batch_prefill.cu")
 
-    # Generate modified binding
+    # ── Binding ──
     binding_src = _generate_renamed_binding(
         csrc / "batch_prefill_jit_binding.cu",
         "batch_prefill_config.inc",
@@ -212,52 +305,102 @@ def generate_batch_prefill_fa2_sources(
 def generate_batch_prefill_fa3_sources(
     fi_src: Path, gen_dir: Path, vid: str,
     dtype_c: str, dtype_name: str, hdim_qk: int, hdim_vo: int,
-    swa: bool, softcap: bool,
 ) -> Tuple[List[Path], List[str]]:
-    """Generate source files for a batch_prefill FA3 (SM90) variant."""
+    """Generate MERGED source files for a batch_prefill FA3 (SM90) variant.
+
+    All swa/softcap/mask_mode combos in ONE compilation unit per (dtype, hdim).
+    FA3 variant: DefaultAttention<softcap>, USE_SLIDING_WINDOW is a separate template param.
+    2 swa × 2 softcap × 4 mask × 2 scheduler × 2 layout = 64 instantiations.
+    """
     import jinja2
 
     csrc = fi_src / "csrc"
     out = gen_dir / vid
     out.mkdir(parents=True, exist_ok=True)
 
-    variant_name = f"DefaultAttention<{str(softcap).lower()}>"
-    kwargs = {
-        "variant_decl": "#include<flashinfer/attention/hopper/variants.cuh>",
-        "variant_name": variant_name,
-        "dtype_q": dtype_c, "dtype_kv": dtype_c, "dtype_o": dtype_c,
-        "idtype": "int32_t",
-        "head_dim_qk": hdim_qk, "head_dim_vo": hdim_vo,
-        "pos_encoding_mode": "PosEncodingMode::kNone",
-        "use_sliding_window": str(swa).lower(),
-        "use_logits_soft_cap": str(softcap).lower(),
-        "use_fp16_qk_reduction": "false",
-        **dict(zip(
-            ("additional_params_decl", "additional_func_params", "additional_params_setter"),
-            _default_prefill_sm90_params(),
-        )),
-    }
+    additional = dict(zip(
+        ("additional_params_decl", "additional_func_params", "additional_params_setter"),
+        _default_prefill_sm90_params(),
+    ))
 
-    # Config
+    # ── Merged config.inc ──────────────────────────────────────────
     with open(csrc / "batch_prefill_sm90_customize_config.jinja") as f:
-        config_str = jinja2.Template(f.read()).render(**kwargs)
+        config_templ = jinja2.Template(f.read())
+
+    config_str = config_templ.render(
+        variant_decl="#include<flashinfer/attention/hopper/variants.cuh>",
+        variant_name="DefaultAttention<false>",  # placeholder
+        dtype_q=dtype_c, dtype_kv=dtype_c, dtype_o=dtype_c,
+        idtype="int32_t",
+        head_dim_qk=hdim_qk, head_dim_vo=hdim_vo,
+        pos_encoding_mode="PosEncodingMode::kNone",
+        use_sliding_window="false", use_logits_soft_cap="false",
+        use_fp16_qk_reduction="false",
+        **additional,
+    )
+    # Replace DISPATCH_context: runtime swa/softcap dispatch
+    # FA3: variant = DefaultAttention<CAP>, USE_SLIDING_WINDOW is separate template param
+    # batch_prefill_sm90.cu uses USE_SLIDING_WINDOW directly in Dispatched<..., USE_SLIDING_WINDOW, ...>
+    # So we need USE_SLIDING_WINDOW as a compile-time bool visible in __VA_ARGS__
+    old_config = config_str
+    config_str = config_str.replace(
+        '#define DISPATCH_context('
+        'DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, '
+        'USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, RaggedParams, PagedParams, ...) \\\n'
+        '  DISPATCH_MASK_MODE(mask_mode, MASK_MODE, { '
+        'using AttentionVariant = DefaultAttention<false>; __VA_ARGS__();})',
+        # Merged: runtime dispatch swa/softcap
+        '#define DISPATCH_context('
+        'DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, '
+        '_USE_SLIDING_WINDOW, _USE_LOGITS_SOFT_CAP, AttentionVariant, RaggedParams, PagedParams, ...) \\\n'
+        '  DISPATCH_MASK_MODE(mask_mode, MASK_MODE, { \\\n'
+        '    auto _run = [&]<bool USE_SLIDING_WINDOW, bool _CAP>() { \\\n'
+        '      using AttentionVariant = DefaultAttention<_CAP>; \\\n'
+        '      __VA_ARGS__(); \\\n'
+        '    }; \\\n'
+        '    bool _swa = (window_left >= 0); \\\n'
+        '    bool _cap = (logits_soft_cap > 0.0); \\\n'
+        '    if (!_swa && !_cap) _run.template operator()<false, false>(); \\\n'
+        '    else if (_swa && !_cap) _run.template operator()<true, false>(); \\\n'
+        '    else if (!_swa && _cap) _run.template operator()<false, true>(); \\\n'
+        '    else _run.template operator()<true, true>(); \\\n'
+        '  })',
+    )
+    assert config_str != old_config, "DISPATCH_context replacement failed in batch_prefill_fa3 — upstream macro may have changed"
     (out / "batch_prefill_sm90_config.inc").write_text(config_str)
 
-    # Kernel instantiations
-    with open(csrc / "batch_prefill_paged_sm90_kernel_inst.jinja") as f:
-        paged_templ = jinja2.Template(f.read())
-    with open(csrc / "batch_prefill_ragged_sm90_kernel_inst.jinja") as f:
-        ragged_templ = jinja2.Template(f.read())
+    # ── Merged kernel instantiations ──────────────────────────────
+    # 2 swa × 2 softcap × 4 mask × 2 scheduler × 2 layout = 64 instantiations
+    lines = [
+        '#include <flashinfer/attention/hopper/prefill_sm90.cuh>',
+        '#include "batch_prefill_sm90_config.inc"',
+        '',
+        'namespace flashinfer {',
+        '',
+    ]
+    swa_cap_combos = [(False, False), (True, False), (False, True), (True, True)]
+    for mm_name in MASK_MODES.values():
+        for swa, cap in swa_cap_combos:
+            var = f"DefaultAttention<{str(cap).lower()}>"
+            for same_sched in ["true", "false"]:
+                for func, params in [("BatchPrefillWithPagedKVCacheDispatched", "PagedParams"),
+                                     ("BatchPrefillWithRaggedKVCacheDispatched", "RaggedParams")]:
+                    lines.append(
+                        f"template cudaError_t {func}"
+                        f"<{hdim_qk}, {hdim_vo}, {mm_name}, "
+                        f"/*USE_SLIDING_WINDOW=*/{str(swa).lower()}, "
+                        f"/*SAME_SCHEDULER_FOR_ALL_HEADS=*/{same_sched}, "
+                        f"{var}, {params}>"
+                        f"({params}& params, bool enable_pdl, cudaStream_t stream);"
+                    )
+        lines.append('')
+    lines.append('};  // namespace flashinfer')
 
-    sources = []
-    for mm in NEEDED_MASK_MODES:
-        for templ, prefix in [(paged_templ, "paged"), (ragged_templ, "ragged")]:
-            fname = f"batch_prefill_{prefix}_sm90_kernel_mask_{mm}.cu"
-            src = templ.render(mask_mode=MASK_MODES[mm], **kwargs)
-            (out / fname).write_text(src)
-            sources.append(out / fname)
+    kernel_path = out / "merged_kernels.cu"
+    kernel_path.write_text('\n'.join(lines))
+    sources = [kernel_path]
 
-    # batch_prefill_sm90.cu defines BatchPrefillWith{Ragged,Paged}KVCacheSM90Run — rename per variant
+    # ── batch_prefill_sm90.cu (dispatch) ──
     renames = {
         "BatchPrefillWithKVCacheSM90Plan": f"{vid}_BatchPrefillWithKVCacheSM90Plan",
         "BatchPrefillWithRaggedKVCacheSM90Run": f"{vid}_BatchPrefillWithRaggedKVCacheSM90Run",
@@ -266,7 +409,7 @@ def generate_batch_prefill_fa3_sources(
     _copy_with_renames(csrc / "batch_prefill_sm90.cu", out / "batch_prefill_sm90.cu", renames)
     sources.append(out / "batch_prefill_sm90.cu")
 
-    # Generate modified binding
+    # ── Binding ──
     binding_src = _generate_renamed_binding(
         csrc / "batch_prefill_sm90_jit_binding.cu",
         "batch_prefill_sm90_config.inc",
@@ -287,16 +430,12 @@ def generate_batch_prefill_fa3_sources(
 def generate_batch_prefill_fp8_fa3_sources(
     fi_src: Path, gen_dir: Path, vid: str,
     dtype_c: str, dtype_name: str, hdim: int,
-    swa: bool,
 ) -> Tuple[List[Path], List[str]]:
-    """Generate source files for an FP8 E4M3 prefill FA3 (SM90) variant.
+    """Generate MERGED source files for FP8 E4M3 prefill FA3 (SM90).
 
-    FP8 prefill uses the same config template as FA3 but with:
-      - FP8 kernel inst templates (batch_prefill_fp8_{paged,ragged}_sm90_kernel_inst.jinja)
-      - FP8 wrapper (batch_prefill_fp8_sm90.cu)
-      - DefaultFP8Attention variant (per-head Q/K/V scales)
-      - Symmetric head_dim only (HEAD_DIM_QK == HEAD_DIM_VO)
-      - DTypeQ == DTypeKV (both FP8)
+    All swa/mask combos in ONE compilation unit per hdim.
+    FP8: no softcap, only swa varies. Variant is always DefaultFP8Attention.
+    2 swa × 4 mask × 2 scheduler × 2 layout = 32 instantiations.
     """
     import jinja2
 
@@ -304,49 +443,80 @@ def generate_batch_prefill_fp8_fa3_sources(
     out = gen_dir / vid
     out.mkdir(parents=True, exist_ok=True)
 
-    # FP8 output dtype: bf16 if input is e4m3 with bf16 output, but the CUDA
-    # type for output is determined by the "output" dtype.  For FP8 kernels the
-    # output is always bf16 or fp16.
-    # We decide: e4m3 Q/KV → bf16 output (most common inference path).
     dtype_o_c = "nv_bfloat16"
+    additional = dict(zip(
+        ("additional_params_decl", "additional_func_params", "additional_params_setter"),
+        _default_prefill_fp8_sm90_params(),
+    ))
 
-    variant_name = "DefaultFP8Attention"
-    kwargs = {
-        "variant_decl": "#include<flashinfer/attention/hopper/variants.cuh>",
-        "variant_name": variant_name,
-        "dtype_q": dtype_c, "dtype_kv": dtype_c, "dtype_o": dtype_o_c,
-        "idtype": "int32_t",
-        "head_dim_qk": hdim, "head_dim_vo": hdim,  # must be symmetric for FP8
-        "pos_encoding_mode": "PosEncodingMode::kNone",
-        "use_sliding_window": str(swa).lower(),
-        "use_logits_soft_cap": "false",  # FP8 variant doesn't support logits_soft_cap
-        "use_fp16_qk_reduction": "false",
-        **dict(zip(
-            ("additional_params_decl", "additional_func_params", "additional_params_setter"),
-            _default_prefill_fp8_sm90_params(),
-        )),
-    }
-
-    # Config (same template as FA3)
+    # ── Merged config.inc ──────────────────────────────────────────
     with open(csrc / "batch_prefill_sm90_customize_config.jinja") as f:
-        config_str = jinja2.Template(f.read()).render(**kwargs)
+        config_templ = jinja2.Template(f.read())
+
+    config_str = config_templ.render(
+        variant_decl="#include<flashinfer/attention/hopper/variants.cuh>",
+        variant_name="DefaultFP8Attention",
+        dtype_q=dtype_c, dtype_kv=dtype_c, dtype_o=dtype_o_c,
+        idtype="int32_t",
+        head_dim_qk=hdim, head_dim_vo=hdim,
+        pos_encoding_mode="PosEncodingMode::kNone",
+        use_sliding_window="false", use_logits_soft_cap="false",
+        use_fp16_qk_reduction="false",
+        **additional,
+    )
+    # Replace DISPATCH_context: runtime swa dispatch (no softcap for FP8)
+    old_config = config_str
+    config_str = config_str.replace(
+        '#define DISPATCH_context('
+        'DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, '
+        'USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, RaggedParams, PagedParams, ...) \\\n'
+        '  DISPATCH_MASK_MODE(mask_mode, MASK_MODE, { '
+        'using AttentionVariant = DefaultFP8Attention; __VA_ARGS__();})',
+        '#define DISPATCH_context('
+        'DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, '
+        '_USE_SLIDING_WINDOW, _USE_LOGITS_SOFT_CAP, AttentionVariant, RaggedParams, PagedParams, ...) \\\n'
+        '  DISPATCH_MASK_MODE(mask_mode, MASK_MODE, { \\\n'
+        '    auto _run = [&]<bool USE_SLIDING_WINDOW>() { \\\n'
+        '      using AttentionVariant = DefaultFP8Attention; \\\n'
+        '      __VA_ARGS__(); \\\n'
+        '    }; \\\n'
+        '    if (window_left >= 0) _run.template operator()<true>(); \\\n'
+        '    else _run.template operator()<false>(); \\\n'
+        '  })',
+    )
+    assert config_str != old_config, "DISPATCH_context replacement failed in batch_prefill_fp8 — upstream macro may have changed"
     (out / "batch_prefill_sm90_config.inc").write_text(config_str)
 
-    # FP8-specific kernel instantiations
-    with open(csrc / "batch_prefill_fp8_paged_sm90_kernel_inst.jinja") as f:
-        paged_templ = jinja2.Template(f.read())
-    with open(csrc / "batch_prefill_fp8_ragged_sm90_kernel_inst.jinja") as f:
-        ragged_templ = jinja2.Template(f.read())
+    # ── Merged kernel instantiations ──────────────────────────────
+    # 2 swa × 4 mask × 2 scheduler × 2 layout = 32 instantiations
+    lines = [
+        '#include <flashinfer/attention/hopper/quantization/prefill_sm90.cuh>',
+        '#include "batch_prefill_sm90_config.inc"',
+        '',
+        'namespace flashinfer {',
+        '',
+    ]
+    for mm_name in MASK_MODES.values():
+        for swa in [False, True]:
+            for same_sched in ["true", "false"]:
+                for func, params in [("BatchFP8PrefillWithPagedKVCacheDispatched", "PagedParams"),
+                                     ("BatchFP8PrefillWithRaggedKVCacheDispatched", "RaggedParams")]:
+                    lines.append(
+                        f"template cudaError_t {func}"
+                        f"<{hdim}, {mm_name}, "
+                        f"/*USE_SLIDING_WINDOW=*/{str(swa).lower()}, "
+                        f"/*SAME_SCHEDULER_FOR_ALL_HEADS=*/{same_sched}, "
+                        f"DefaultFP8Attention, {params}>"
+                        f"({params}& params, bool enable_pdl, cudaStream_t stream);"
+                    )
+        lines.append('')
+    lines.append('};  // namespace flashinfer')
 
-    sources = []
-    for mm in NEEDED_MASK_MODES:
-        for templ, prefix in [(paged_templ, "paged"), (ragged_templ, "ragged")]:
-            fname = f"batch_prefill_fp8_{prefix}_sm90_kernel_mask_{mm}.cu"
-            src = templ.render(mask_mode=MASK_MODES[mm], **kwargs)
-            (out / fname).write_text(src)
-            sources.append(out / fname)
+    kernel_path = out / "merged_kernels.cu"
+    kernel_path.write_text('\n'.join(lines))
+    sources = [kernel_path]
 
-    # FP8 wrapper (batch_prefill_fp8_sm90.cu) — rename per variant
+    # ── FP8 dispatch ──
     renames = {
         "BatchPrefillWithKVCacheSM90Plan": f"{vid}_BatchPrefillWithKVCacheSM90Plan",
         "BatchPrefillWithRaggedKVCacheSM90Run": f"{vid}_BatchPrefillWithRaggedKVCacheSM90Run",
@@ -355,7 +525,7 @@ def generate_batch_prefill_fp8_fa3_sources(
     _copy_with_renames(csrc / "batch_prefill_fp8_sm90.cu", out / "batch_prefill_fp8_sm90.cu", renames)
     sources.append(out / "batch_prefill_fp8_sm90.cu")
 
-    # Binding (same as FA3)
+    # ── Binding ──
     binding_src = _generate_renamed_binding(
         csrc / "batch_prefill_sm90_jit_binding.cu",
         "batch_prefill_sm90_config.inc",
@@ -493,6 +663,89 @@ def generate_batch_mla_sources(
     return sources, []
 
 
+def generate_batch_pod_sources(
+    fi_src: Path, gen_dir: Path, vid: str,
+    dtype_c: str, dtype_name: str, hdim_qk: int, hdim_vo: int,
+    swa_p: bool, softcap_p: bool, swa_d: bool, softcap_d: bool,
+) -> Tuple[List[Path], List[str]]:
+    """Generate source files for a batch POD (Prefill+Decode) variant.
+
+    POD dispatches both prefill and decode within a single kernel launch
+    using SM-aware scheduling. Uses FA2 kernels (SM80+).
+    """
+    import jinja2
+
+    csrc = fi_src / "csrc"
+    out = gen_dir / vid
+    out.mkdir(parents=True, exist_ok=True)
+
+    variant_name_p = (
+        f"DefaultAttention<use_custom_mask_p, {str(swa_p).lower()}, "
+        f"{str(softcap_p).lower()}, false>"
+    )
+    variant_name_d = (
+        f"DefaultAttention<use_custom_mask_d, {str(swa_d).lower()}, "
+        f"{str(softcap_d).lower()}, false>"
+    )
+    kwargs = {
+        "dtype_q": dtype_c, "dtype_kv": dtype_c, "dtype_o": dtype_c,
+        "idtype": "int32_t",
+        "head_dim_qk": hdim_qk, "head_dim_vo": hdim_vo,
+        "pos_encoding_mode_p": "PosEncodingMode::kNone",
+        "pos_encoding_mode_d": "PosEncodingMode::kNone",
+        "use_sliding_window_p": str(swa_p).lower(),
+        "use_logits_soft_cap_p": str(softcap_p).lower(),
+        "use_sliding_window_d": str(swa_d).lower(),
+        "use_logits_soft_cap_d": str(softcap_d).lower(),
+        "use_fp16_qk_reduction": "false",
+        "variant_name_p": variant_name_p,
+        "variant_name_d": variant_name_d,
+    }
+
+    # Config
+    with open(csrc / "batch_pod_customize_config.jinja") as f:
+        config_str = jinja2.Template(f.read()).render(**kwargs)
+    (out / "batch_pod_config.inc").write_text(config_str)
+
+    # Kernel instantiations for all mask mode combos (4×4 = 16 files)
+    with open(csrc / "batch_pod_kernel_inst.jinja") as f:
+        kernel_templ = jinja2.Template(f.read())
+
+    sources = []
+    for mm_p in NEEDED_MASK_MODES:
+        for mm_d in NEEDED_MASK_MODES:
+            fname = f"batch_pod_kernel_mask_{mm_p}p_{mm_d}d.cu"
+            src = kernel_templ.render(
+                mask_mode_p=MASK_MODES[mm_p],
+                mask_mode_d=MASK_MODES[mm_d],
+                **kwargs,
+            )
+            (out / fname).write_text(src)
+            sources.append(out / fname)
+
+    # batch_pod.cu — rename the main function per variant
+    renames = {
+        "batch_pod_with_kv_cache_tensor": f"{vid}_batch_pod_with_kv_cache_tensor",
+    }
+    _copy_with_renames(csrc / "batch_pod.cu", out / "batch_pod.cu", renames)
+    sources.append(out / "batch_pod.cu")
+
+    # Binding — TVM FFI export with variant-specific symbol
+    binding_src = _generate_renamed_binding(
+        csrc / "batch_pod_jit_binding.cu",
+        "batch_pod_config.inc",
+        {
+            "batch_pod_with_kv_cache_tensor": f"__tvm_ffi_{vid}_run",
+        },
+    )
+    for old, new in renames.items():
+        binding_src = binding_src.replace(old, new)
+    (out / "batch_pod_binding.cu").write_text(binding_src)
+    sources.append(out / "batch_pod_binding.cu")
+
+    return sources, []
+
+
 def _generate_activation_source(fi_src: Path, gen_dir: Path) -> Tuple[List[Path], List[str], dict]:
     """Generate a combined activation .cu file for AOT compilation.
 
@@ -610,6 +863,15 @@ def generate_utility_sources(
           "rope_quantize", "rope_quantize_append_paged_kv_cache"]),
         ("fi_cascade", ["cascade.cu"], "flashinfer_cascade_binding.cu", "cascade",
          ["merge_state", "merge_state_in_place", "merge_states"]),
+        # FP4 KV cache dequantization (SM80+, LUT-based)
+        ("fi_fp4_dequant", ["fp4_kv_dequantization.cu"], None, "fp4",
+         ["nvfp4_kv_dequant"]),
+        # FP4 KV cache quantization (SM100+ for HW path, software fallback for SM80+)
+        ("fi_fp4_quant", ["fp4_kv_quantization.cu"], None, "fp4",
+         ["nvfp4_kv_quant"]),
+        # Quantization utilities: packbits / segment_packbits (GPU kernels for sparse mask packing)
+        ("fi_quantization", ["quantization.cu"], "flashinfer_quantization_binding.cu", "quantization",
+         ["packbits", "segment_packbits"]),
         # MoE routing kernel + all TRT-LLM common utilities (auto-discovered)
         ("fi_moe_routing",
          ["fused_moe/noAuxTcKernels.cu"]
@@ -628,33 +890,76 @@ def generate_utility_sources(
             src_path = csrc / src_file
             if src_path.exists():
                 if kind == "norm" and src_file == "norm.cu":
-                    # Patch: exclude layernorm (requires TensorRT-LLM headers)
+                    # Patch: exclude layernorm (requires TensorRT-LLM headers
+                    # that the upstream norm.cuh pulls in for LayerNorm).
                     src_text = src_path.read_text()
                     src_text = src_text.replace(
                         '#include <flashinfer/norm.cuh>',
                         '#define FLASHINFER_NORM_NO_LAYERNORM\n#include <flashinfer/norm.cuh>'
                     )
-                    # Remove layernorm function body
+                    # Remove layernorm function body using brace-counting
+                    # so we correctly skip nested braces (macros, lambdas).
                     lines = src_text.split('\n')
                     filtered = []
                     skip = False
+                    brace_depth = 0
+                    seen_open = False
                     for line in lines:
-                        if 'void layernorm(' in line:
+                        if not skip and 'void layernorm(' in line:
                             skip = True
-                        if skip and line.strip() == '}':
-                            skip = False
+                            brace_depth = 0
+                            seen_open = False
+                        if skip:
+                            brace_depth += line.count('{') - line.count('}')
+                            if line.count('{') > 0:
+                                seen_open = True
+                            if seen_open and brace_depth <= 0:
+                                skip = False
                             continue
-                        if not skip:
-                            filtered.append(line)
+                        filtered.append(line)
                     (out / src_file).write_text('\n'.join(filtered))
-                elif kind == "norm" and src_file == binding_file:
-                    # Remove layernorm binding
+                elif kind == "fp4" and src_file == "fp4_kv_quantization.cu":
+                    # Patch: replace __trap() fallback with software E2M1 for pre-SM100.
+                    # The upstream guards E2M1 with #if __CUDA_ARCH__ >= 1000 / #else __trap() / #endif.
+                    # We replace the __trap() branch with a correct software implementation.
                     src_text = src_path.read_text()
-                    lines = [l for l in src_text.split('\n')
-                             if 'layernorm' not in l.lower()
-                             or 'rmsnorm' in l.lower()]
-                    (out / src_file).write_text('\n'.join(lines))
-                    continue  # already handled
+                    trap_marker = '__trap();\n  return 0;'
+                    assert trap_marker in src_text, (
+                        "FP4 __trap() replacement failed in fp4_kv_quantization.cu — "
+                        "upstream E2M1 __trap() marker not found, upstream may have changed"
+                    )
+                    sw_fallback = (
+                        '// Software E2M1 round-nearest with saturation (prelude AOT, pre-SM100)\n'
+                        '  auto sw_e2m1 = [](float v) -> uint8_t {\n'
+                        '    float av = fabsf(v);\n'
+                        '    uint8_t sign = v < 0.0f ? 0x8u : 0u;\n'
+                        '    uint8_t mag;\n'
+                        '    if (av < 0.25f) mag = 0;\n'
+                        '    else if (av < 0.75f) mag = 1;\n'
+                        '    else if (av < 1.25f) mag = 2;\n'
+                        '    else if (av < 1.75f) mag = 3;\n'
+                        '    else if (av < 2.5f) mag = 4;\n'
+                        '    else if (av < 3.5f) mag = 5;\n'
+                        '    else if (av < 5.0f) mag = 6;\n'
+                        '    else mag = 7;\n'
+                        '    return sign | mag;\n'
+                        '  };\n'
+                        '  uint32_t val = 0;\n'
+                        '  #pragma unroll\n'
+                        '  for (int i = 0; i < 4; i++) {\n'
+                        '    uint8_t lo = sw_e2m1(array[i].x);\n'
+                        '    uint8_t hi = sw_e2m1(array[i].y);\n'
+                        '    val |= ((uint32_t)((hi << 4) | lo)) << (i * 8);\n'
+                        '  }\n'
+                        '  return val;'
+                    )
+                    old_text = src_text
+                    src_text = src_text.replace(trap_marker, sw_fallback, 1)
+                    assert src_text != old_text, (
+                        "FP4 __trap() replacement failed in fp4_kv_quantization.cu — "
+                        "replace() did not modify the source"
+                    )
+                    (out / src_file).write_text(src_text)
                 else:
                     # Handle subdirectory sources (e.g. fused_moe/foo.cu → foo.cu)
                     dst_name = Path(src_file).name
@@ -852,7 +1157,9 @@ def compile_source(
     arch_flags: List[str], extra_flags: List[str],
 ) -> Optional[Path]:
     """Compile a single .cu file to .o using nvcc."""
-    obj = out_dir / (src.stem + ".o")
+    # Prefix .o with variant dir name so filenames are unique across variants
+    # (ar archives use basename only, so duplicates would collide).
+    obj = out_dir / (out_dir.name + "_" + src.stem + ".o")
     if obj.exists() and obj.stat().st_mtime > src.stat().st_mtime:
         return obj  # up-to-date
 
@@ -950,56 +1257,49 @@ def build_variant_matrix(
     swa_softcap_combos = [(False, False), (True, False), (False, True), (True, True)]
 
     # Standard symmetric head_dim variants
+    # FA2 decode + prefill: MERGED — one variant per (dtype, hdim), swa/softcap dispatched at runtime
     for dtype in dtypes:
         dtype_c, dtype_name = DTYPE_MAP[dtype]
         for hdim in head_dims:
-            # Batch decode FA2
-            for swa, softcap in swa_softcap_combos:
-                vid = variant_id("decode", "fa2", dtype, hdim, hdim, swa=swa, softcap=softcap)
-                variants.append({
-                    "vid": vid, "kind": "decode", "backend": "fa2",
-                    "dtype": dtype, "dtype_c": dtype_c, "dtype_name": dtype_name,
-                    "hdim_qk": hdim, "hdim_vo": hdim,
-                    "swa": swa, "softcap": softcap,
-                    "arch_flags": sm80_flags,
-                })
+            # Batch decode FA2 (merged: all swa/softcap in one compilation unit)
+            vid = variant_id("decode", "fa2", dtype, hdim, hdim)
+            variants.append({
+                "vid": vid, "kind": "decode", "backend": "fa2",
+                "dtype": dtype, "dtype_c": dtype_c, "dtype_name": dtype_name,
+                "hdim_qk": hdim, "hdim_vo": hdim,
+                "arch_flags": sm80_flags,
+            })
 
-            # Batch prefill FA2
-            for swa, softcap in swa_softcap_combos:
-                vid = variant_id("prefill", "fa2", dtype, hdim, hdim, swa=swa, softcap=softcap)
-                variants.append({
-                    "vid": vid, "kind": "prefill_fa2", "backend": "fa2",
-                    "dtype": dtype, "dtype_c": dtype_c, "dtype_name": dtype_name,
-                    "hdim_qk": hdim, "hdim_vo": hdim,
-                    "swa": swa, "softcap": softcap,
-                    "arch_flags": sm80_flags,
-                })
+            # Batch prefill FA2 (merged: all swa/softcap/mask in one compilation unit)
+            vid = variant_id("prefill", "fa2", dtype, hdim, hdim)
+            variants.append({
+                "vid": vid, "kind": "prefill_fa2", "backend": "fa2",
+                "dtype": dtype, "dtype_c": dtype_c, "dtype_name": dtype_name,
+                "hdim_qk": hdim, "hdim_vo": hdim,
+                "arch_flags": sm80_flags,
+            })
 
-            # Batch prefill FA3 (SM90+ only, HEAD_DIM_VO must be 64/128/256)
+            # Batch prefill FA3 (SM90+, merged: all swa/softcap in one compilation unit)
             if has_sm90 and hdim in (64, 128, 256):
-                for swa, softcap in swa_softcap_combos:
-                    vid = variant_id("prefill", "fa3", dtype, hdim, hdim, swa=swa, softcap=softcap)
-                    variants.append({
-                        "vid": vid, "kind": "prefill_fa3", "backend": "fa3",
-                        "dtype": dtype, "dtype_c": dtype_c, "dtype_name": dtype_name,
-                        "hdim_qk": hdim, "hdim_vo": hdim,
-                        "swa": swa, "softcap": softcap,
-                        "arch_flags": sm90_flags,
-                    })
-
-    # Asymmetric head_dim: FA3 (192,128) — used by some models
-    if has_sm90:
-        for dtype in dtypes:
-            dtype_c, dtype_name = DTYPE_MAP[dtype]
-            for swa, softcap in swa_softcap_combos:
-                vid = variant_id("prefill", "fa3", dtype, 192, 128, swa=swa, softcap=softcap)
+                vid = variant_id("prefill", "fa3", dtype, hdim, hdim)
                 variants.append({
                     "vid": vid, "kind": "prefill_fa3", "backend": "fa3",
                     "dtype": dtype, "dtype_c": dtype_c, "dtype_name": dtype_name,
-                    "hdim_qk": 192, "hdim_vo": 128,
-                    "swa": swa, "softcap": softcap,
+                    "hdim_qk": hdim, "hdim_vo": hdim,
                     "arch_flags": sm90_flags,
                 })
+
+    # Asymmetric head_dim: FA3 (192,128) — merged
+    if has_sm90:
+        for dtype in dtypes:
+            dtype_c, dtype_name = DTYPE_MAP[dtype]
+            vid = variant_id("prefill", "fa3", dtype, 192, 128)
+            variants.append({
+                "vid": vid, "kind": "prefill_fa3", "backend": "fa3",
+                "dtype": dtype, "dtype_c": dtype_c, "dtype_name": dtype_name,
+                "hdim_qk": 192, "hdim_vo": 128,
+                "arch_flags": sm90_flags,
+            })
 
     # ── FP8 E4M3 prefill FA3 (SM90+ only) ──────────────────────────
     # Both Q and KV are FP8 E4M3, output is BF16. Symmetric head_dim only.
@@ -1009,17 +1309,14 @@ def build_variant_matrix(
         for hdim in head_dims:
             if hdim not in (64, 128, 256):
                 continue  # FA3 only supports 64/128/256 for HEAD_DIM_VO
-            for swa in [False, True]:
-                vid = f"fi_prefill_fp8_fa3_e4m3_h{hdim}"
-                if swa:
-                    vid += "_swa"
-                variants.append({
-                    "vid": vid, "kind": "prefill_fp8", "backend": "fa3",
-                    "dtype": "e4m3", "dtype_c": fp8_dtype_c, "dtype_name": fp8_dtype_name,
-                    "hdim_qk": hdim, "hdim_vo": hdim,
-                    "swa": swa, "softcap": False,
-                    "arch_flags": sm90_flags,
-                })
+            # Merged: all swa in one compilation unit per hdim
+            vid = f"fi_prefill_fp8_fa3_e4m3_h{hdim}"
+            variants.append({
+                "vid": vid, "kind": "prefill_fp8", "backend": "fa3",
+                "dtype": "e4m3", "dtype_c": fp8_dtype_c, "dtype_name": fp8_dtype_name,
+                "hdim_qk": hdim, "hdim_vo": hdim,
+                "arch_flags": sm90_flags,
+            })
 
     # ── MLA variants ──────────────────────────────────────────────────
     for dtype in dtypes:
@@ -1045,6 +1342,12 @@ def build_variant_matrix(
                 "swa": False, "softcap": False,
                 "arch_flags": sm80_flags,
             })
+
+    # ── POD (Prefill+Decode) mixed batching ─────────────────────────
+    # POD is intentionally excluded from AOT by upstream (aot.py comment by Zihao):
+    # each variant generates 16 mask combos × 3 CTA tiles = 48 kernel instantiations,
+    # which makes the static archive exceed the 2GB linker limit.
+    # The generate_batch_pod_sources() function is available for future JIT use.
 
     return variants
 
@@ -1130,28 +1433,24 @@ def main():
                 fi_src, gen_dir, v["vid"],
                 v["dtype_c"], v["dtype_name"],
                 v["hdim_qk"], v["hdim_vo"],
-                v["swa"], v["softcap"],
             )
         elif v["kind"] == "prefill_fa2":
             sources, extra = generate_batch_prefill_fa2_sources(
                 fi_src, gen_dir, v["vid"],
                 v["dtype_c"], v["dtype_name"],
                 v["hdim_qk"], v["hdim_vo"],
-                v["swa"], v["softcap"],
             )
         elif v["kind"] == "prefill_fa3":
             sources, extra = generate_batch_prefill_fa3_sources(
                 fi_src, gen_dir, v["vid"],
                 v["dtype_c"], v["dtype_name"],
                 v["hdim_qk"], v["hdim_vo"],
-                v["swa"], v["softcap"],
             )
         elif v["kind"] == "prefill_fp8":
             sources, extra = generate_batch_prefill_fp8_fa3_sources(
                 fi_src, gen_dir, v["vid"],
                 v["dtype_c"], v["dtype_name"],
                 v["hdim_qk"],
-                v["swa"],
             )
         elif v["kind"] == "mla_decode":
             sources, extra = generate_batch_decode_mla_sources(
@@ -1165,6 +1464,14 @@ def main():
                 fi_src, gen_dir, v["vid"],
                 v["dtype_c"], v["dtype_name"],
                 v["head_dim_ckv"], v["head_dim_kpe"],
+            )
+        elif v["kind"] == "pod":
+            sources, extra = generate_batch_pod_sources(
+                fi_src, gen_dir, v["vid"],
+                v["dtype_c"], v["dtype_name"],
+                v["hdim_qk"], v["hdim_vo"],
+                v["swa_p"], v["softcap_p"],
+                v["swa_d"], v["softcap_d"],
             )
         else:
             continue
@@ -1181,6 +1488,48 @@ def main():
     # Activation fusions (silu_and_mul, gelu_and_mul, gelu_tanh_and_mul)
     act_sources, act_extra, act_vinfo = _generate_activation_source(fi_src, gen_dir)
     utility_variants.append((act_sources, act_extra, act_vinfo))
+
+    # SM100 (Blackwell) FMHA — CUTLASS-based FMHA for SM100+.
+    # Requires: CUDA 12.8+, PRELUDE_FLASHINFER_ARCHS containing sm_100.
+    # The upstream kernels use a different architecture (CUTLASS SM100 FMHA runner)
+    # with runtime dispatch for head_dim and mask_mode.
+    # Source files: csrc/fmha_cutlass_sm100.cu, csrc/blackwell_fmha_plan.cu,
+    #               csrc/fmha_cutlass_sm100_binding.cu
+    has_sm100 = any(a >= 100 for a in archs)
+    if has_sm100:
+        sm100_csrc = fi_src / "csrc"
+        sm100_out = gen_dir / "fi_fmha_sm100"
+        sm100_out.mkdir(parents=True, exist_ok=True)
+        sm100_sources = []
+        sm100_flags = ["-gencode", "arch=compute_100a,code=sm_100a"]
+        for src_file in ["fmha_cutlass_sm100.cu", "blackwell_fmha_plan.cu"]:
+            src_path = sm100_csrc / src_file
+            if src_path.exists():
+                shutil.copy2(src_path, sm100_out / src_file)
+                sm100_sources.append(sm100_out / src_file)
+        # Rename exports to avoid collision with other plan/run symbols
+        binding_path = sm100_csrc / "fmha_cutlass_sm100_binding.cu"
+        if binding_path.exists():
+            bsrc = binding_path.read_text()
+            bsrc = bsrc.replace(
+                'TVM_FFI_DLL_EXPORT_TYPED_FUNC(run,',
+                'TVM_FFI_DLL_EXPORT_TYPED_FUNC(fmha_sm100_run,',
+            ).replace(
+                'TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan,',
+                'TVM_FFI_DLL_EXPORT_TYPED_FUNC(fmha_sm100_plan,',
+            )
+            (sm100_out / "fmha_cutlass_sm100_binding.cu").write_text(bsrc)
+            sm100_sources.append(sm100_out / "fmha_cutlass_sm100_binding.cu")
+        sm100_vinfo = {
+            "vid": "fi_fmha_sm100", "kind": "fmha_sm100",
+            "symbols": {
+                "fmha_sm100_run": "__tvm_ffi_fmha_sm100_run",
+                "fmha_sm100_plan": "__tvm_ffi_fmha_sm100_plan",
+            },
+        }
+        for src in sm100_sources:
+            compile_jobs.append((src, sm100_flags, [], sm100_vinfo))
+        print(f"  SM100 FMHA: {len(sm100_sources)} sources (requires CUDA 12.8+)")
 
     for sources, extra, vinfo in utility_variants:
         for src in sources:
@@ -1218,13 +1567,19 @@ def main():
             "dtype": v["dtype"],
         }
         if v["kind"] in ("decode", "prefill_fa2", "prefill_fa3", "prefill_fp8"):
+            # Merged: swa/softcap dispatched at runtime, not in key
             entry["hdim_qk"] = v["hdim_qk"]
             entry["hdim_vo"] = v["hdim_vo"]
-            entry["swa"] = v["swa"]
-            entry["softcap"] = v["softcap"]
         if v["kind"] in ("mla_decode", "mla_paged"):
             entry["head_dim_ckv"] = v["head_dim_ckv"]
             entry["head_dim_kpe"] = v["head_dim_kpe"]
+        if v["kind"] == "pod":
+            entry["hdim_qk"] = v["hdim_qk"]
+            entry["hdim_vo"] = v["hdim_vo"]
+            entry["swa_p"] = v["swa_p"]
+            entry["softcap_p"] = v["softcap_p"]
+            entry["swa_d"] = v["swa_d"]
+            entry["softcap_d"] = v["softcap_d"]
 
         if v["kind"] == "decode":
             entry["symbols"] = {
@@ -1242,6 +1597,10 @@ def main():
                 "plan": f"__tvm_ffi_{v['vid']}_plan",
                 "run": f"__tvm_ffi_{v['vid']}_run",
             }
+        elif v["kind"] == "pod":
+            entry["symbols"] = {
+                "run": f"__tvm_ffi_{v['vid']}_run",
+            }
         manifest["variants"].append(entry)
 
     # Utility modules
@@ -1250,6 +1609,14 @@ def main():
             "vid": vinfo["vid"],
             "kind": vinfo["kind"],
             "symbols": vinfo["symbols"],
+        })
+
+    # SM100 FMHA (if compiled)
+    if has_sm100:
+        manifest["variants"].append({
+            "vid": sm100_vinfo["vid"],
+            "kind": sm100_vinfo["kind"],
+            "symbols": sm100_vinfo["symbols"],
         })
 
     manifest_path = out_dir / "manifest.json"

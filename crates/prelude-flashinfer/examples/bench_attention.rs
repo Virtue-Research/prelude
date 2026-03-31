@@ -859,6 +859,63 @@ fn bench_utilities(reg: &KernelRegistry) {
         }
     }
 
+    // FP4 KV cache quantization/dequantization
+    if let (Some(quant_fn), Some(dequant_fn)) = (
+        reg.get_utility("nvfp4_kv_quant"),
+        reg.get_utility("nvfp4_kv_dequant"),
+    ) {
+        let m = 2048i64;   // tokens
+        let k = 4096i64;   // head_dim * num_kv_heads (e.g. 128 * 32)
+        let n = (m * k) as usize;
+
+        let input = gpu_alloc(n * 2);           // BF16
+        let fp4_out = gpu_alloc(n / 2);          // packed FP4
+        let scales = gpu_alloc((m * k / 16) as usize); // FP8 block scales
+        let global_scale_val: f32 = 1.0;
+        let gs = gpu_alloc(4);
+        unsafe { cudaMemcpy(gs, &global_scale_val as *const f32 as *const c_void, 4, 1); }
+        let output = gpu_alloc(n * 2);           // BF16 dequantized
+
+        let in_s = [m, k]; let in_st = strides(&in_s);
+        let fp4_s = [m, k / 2]; let fp4_st = strides(&fp4_s);
+        let sc_s = [m, k / 16]; let sc_st = strides(&sc_s);
+        let gs_s = [1i64]; let gs_st = [1i64];
+        let out_s = [m, k]; let out_st = strides(&out_s);
+
+        let dl_in = gpu_dl(input, BF16_DT, &in_s, &in_st);
+        let dl_fp4 = gpu_dl(fp4_out, U8_DT, &fp4_s, &fp4_st);
+        let dl_sc = gpu_dl(scales, U8_DT, &sc_s, &sc_st);
+        let dl_gs = gpu_dl(gs, FP32_DT, &gs_s, &gs_st);
+        let dl_out = gpu_dl(output, BF16_DT, &out_s, &out_st);
+
+        unsafe { reg.set_stream(0, std::ptr::null_mut()); }
+
+        let quant_args = [
+            TVMFFIAny::dltensor(&dl_in), TVMFFIAny::dltensor(&dl_gs),
+            TVMFFIAny::dltensor(&dl_fp4), TVMFFIAny::dltensor(&dl_sc),
+        ];
+        let dequant_args = [
+            TVMFFIAny::dltensor(&dl_fp4), TVMFFIAny::dltensor(&dl_sc),
+            TVMFFIAny::dltensor(&dl_gs), TVMFFIAny::dltensor(&dl_out),
+        ];
+
+        let ms_q = cuda_bench(5, 100, || {
+            unsafe { reg.call(quant_fn, &quant_args).unwrap(); }
+        });
+        let ms_dq = cuda_bench(5, 100, || {
+            unsafe { reg.call(dequant_fn, &dequant_args).unwrap(); }
+        });
+        let gb_in = (n * 2) as f64 / 1e9;
+        let gb_fp4 = (n / 2 + (m * k / 16) as usize) as f64 / 1e9;
+        let bw_q = gb_in / (ms_q as f64 * 1e-3);
+        let bw_dq = (gb_fp4 + gb_in) / (ms_dq as f64 * 1e-3);
+        let ratio = (n * 2) as f64 / (n as f64 / 2.0 + (m * k / 16) as f64);
+        println!("  fp4_quant    ({m}×{k}): {ms_q:.3} ms, {bw_q:.1} GB/s");
+        println!("  fp4_dequant  ({m}×{k}): {ms_dq:.3} ms, {bw_dq:.1} GB/s, compression={ratio:.1}x");
+
+        unsafe { cudaFree(input); cudaFree(fp4_out); cudaFree(scales); cudaFree(gs); cudaFree(output); }
+    }
+
     // MoE routing (DeepSeek V3 fused top-k)
     if let Some(moe_fn) = reg.get_utility("NoAuxTc") {
         let num_tokens = 2048i64;
