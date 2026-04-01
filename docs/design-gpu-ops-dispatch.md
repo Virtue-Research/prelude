@@ -177,10 +177,25 @@ enum MaskType {
 
 ```rust
 trait KvCacheOps: Send + Sync {
+    /// Query per-head cache slot layout for KV cache allocation.
+    ///
+    /// The engine calls this once at model load time to determine how much memory
+    /// each KV cache slot needs. Standard bf16 cache returns head_dim elements at
+    /// the model dtype. KV cache quantization (e.g., TurboQuant, KV-FP8) returns
+    /// a different slot size and/or dtype to reflect the compressed representation.
+    ///
+    /// Default: uncompressed — head_dim elements at the given dtype.
+    fn cache_slot_spec(&self, head_dim: usize, dtype: DType) -> CacheSlotSpec {
+        CacheSlotSpec { slot_size: head_dim, dtype }
+    }
+
     /// Write K/V to paged cache at given slot positions.
     ///
     /// Separate from attention because models control timing.
     /// Example: Qwen3 runs fused_knorm_rope_cache_write() before attention.
+    ///
+    /// When KV cache quantization is enabled, this method handles encoding
+    /// (quantize + pack) internally — callers always pass bf16/fp16 K/V tensors.
     fn reshape_and_cache(
         &self,
         key: &Tensor, value: &Tensor,
@@ -188,12 +203,24 @@ trait KvCacheOps: Send + Sync {
         slot_mapping: &[u32],   // scheduling metadata, same as cu_seqlens
     ) -> Result<()>;
 }
+
+/// Cache slot layout descriptor. Returned by `cache_slot_spec`.
+struct CacheSlotSpec {
+    pub slot_size: usize,  // number of elements (or bytes for packed formats) per head per token
+    pub dtype: DType,      // element type: bf16, fp8, u8 (for bit-packed quantization)
+}
 ```
 
 Separate from `AttentionOps` because:
 1. Not all models use KV cache (diffusion doesn't).
 2. Models must control when cache writes happen relative to other fusions.
 3. Some devices may not support paged KV at all (Vulkan, early TPU).
+
+**Design decisions:**
+
+- **`cache_slot_spec` enables KV cache quantization without model changes.** The engine queries slot layout at load time. Standard cache returns `(head_dim, bf16)`. Quantized cache (TurboQuant, KV-FP8) returns a different size/dtype. The engine allocates accordingly. Model code never knows — it passes bf16 K/V to `reshape_and_cache`, and the device impl encodes internally.
+
+- **Encode/decode is device-internal.** `reshape_and_cache` handles encoding (quantize + pack). `paged_attention` handles decoding (unpack + dequant) before running the attention kernel. Because `CudaOps` implements both `KvCacheOps` and `AttentionOps`, encode/decode coordination is internal state — no new trait methods, no model changes.
 
 ### GEMM
 
@@ -310,6 +337,18 @@ trait CommOps: Send + Sync {
     /// All-to-all: each rank sends/receives different data to/from every other rank.
     /// Used for Ulysses sequence parallelism and MoE expert routing.
     fn all_to_all(&self, x: &Tensor, input_splits: &[usize], output_splits: &[usize]) -> Result<Tensor>;
+
+    /// Point-to-point send to a specific remote rank/group.
+    /// Used for attention-FFN disaggregation: attention side sends hidden states to FFN workers.
+    /// Transport is device-internal (NVLink P2P, NCCL send, RDMA, StepMesh, etc.).
+    fn send(&self, x: &Tensor, dst: RemoteTarget) -> Result<()> {
+        bail!("point-to-point send not supported on this device")
+    }
+
+    /// Point-to-point receive from a specific remote rank/group.
+    fn recv(&self, src: RemoteTarget) -> Result<Tensor> {
+        bail!("point-to-point recv not supported on this device")
+    }
 }
 ```
 
@@ -1185,6 +1224,88 @@ fn ep_dispatch(x: &Tensor, topk_ids: &Tensor, ops: &Ops) -> Result<(Tensor, Disp
 
 **Multiple dispatch backends:** The `all_to_all` in `CommOps` is the base primitive. Production systems use specialized backends (DeepEP for NVLink+RDMA, FlashInfer, Mooncake for elastic EP) that fuse quantization + communication for higher throughput. These can be exposed as device-specific optimizations on `CudaOps`, similar to how `CudaOps::precompute_paged_plan_graphed` is CUDA-specific.
 
+### Attention-FFN Disaggregation (AFD)
+
+AFD physically separates attention and FFN/expert layers onto different GPU pools.
+For large MoE models (DeepSeek-V3, Qwen3-MoE), this is significant:
+- **Attention GPUs**: hold KV cache (memory-bound during decode), no expert weights
+- **FFN GPUs**: hold expert weights (compute-bound), no KV cache
+- Removing expert weights from attention GPUs frees massive memory for KV cache → larger batch sizes
+
+AFD is handled by `blocks::moe_layer` as a third distribution mode alongside local and EP:
+
+```rust
+/// MoE distribution mode. Configured at model load time.
+enum MoeMode {
+    /// All experts on this GPU. Single-device or TP-only.
+    Local,
+    /// Expert parallelism: experts distributed across EP ranks via all-to-all.
+    ExpertParallel(EpConfig),
+    /// Attention-FFN disaggregation: attention and FFN on separate GPU pools.
+    Disaggregated(AfdConfig),
+}
+
+struct AfdConfig {
+    role: AfdRole,
+    ffn_target: RemoteTarget,  // address of FFN worker pool
+}
+
+enum AfdRole {
+    Attention,  // this process runs attention, sends hidden states to FFN
+    Ffn,        // this process runs experts, receives hidden states from attention
+}
+```
+
+```rust
+pub fn moe_layer(x: &Tensor, gate: &MoeGate, weights: &Tensor,
+                 config: &MoeConfig, ops: &Ops) -> Result<Tensor> {
+    match &config.mode {
+        MoeMode::Local => {
+            let (topk_ids, topk_weights) = gate.route(x)?;
+            ops.gemm.grouped_gemm(x, weights, ..)
+        }
+        MoeMode::ExpertParallel(ep) => {
+            let (topk_ids, topk_weights) = gate.route(x)?;
+            let (recv_tokens, meta) = ep_dispatch(x, &topk_ids, ep, ops)?;
+            let out = ops.gemm.grouped_gemm(&recv_tokens, weights, ..)?;
+            ep_combine(&out, &meta, &topk_weights, ops)
+        }
+        MoeMode::Disaggregated(afd) => match afd.role {
+            AfdRole::Attention => {
+                // Route locally, then send hidden states + routing info to FFN pool
+                let (topk_ids, topk_weights) = gate.route(x)?;
+                ops.comm.send(&x, afd.ffn_target)?;
+                ops.comm.send(&topk_ids, afd.ffn_target)?;
+                ops.comm.send(&topk_weights, afd.ffn_target)?;
+                // Wait for FFN result
+                ops.comm.recv(afd.ffn_target)
+            }
+            AfdRole::Ffn => {
+                // Receive hidden states + routing info from attention pool
+                let hidden = ops.comm.recv(afd.ffn_target)?;
+                let topk_ids = ops.comm.recv(afd.ffn_target)?;
+                let topk_weights = ops.comm.recv(afd.ffn_target)?;
+                // Compute experts locally
+                let out = ops.gemm.grouped_gemm(&hidden, weights, ..)?;
+                // Send result back to attention pool
+                ops.comm.send(&out, afd.ffn_target)?;
+                Ok(out)
+            }
+        }
+    }
+}
+```
+
+**Model code is unchanged.** The model still calls `blocks::moe_layer(&h, &gate, &weights, &config, ops)`.
+The `MoeMode` is set at model load time based on deployment configuration. The building block
+absorbs the disaggregation logic, just like it absorbs EP logic.
+
+**Comparison with SGLang's approach:** SGLang replaces the MoE class with `AFDATTNMoE` / `AFDFFNMoE`
+(model code changes). Our approach keeps AFD inside the building block — the model never knows.
+
+**Scheduler impact:** The FFN side needs a passive event loop (see scheduler doc: FFN follower mode).
+The attention side's scheduler is unchanged — it runs the same `step()` / `update()` loop.
+
 ## LoRA (Low-Rank Adaptation)
 
 Multi-LoRA serving: a single batch contains tokens from different LoRA adapters.
@@ -1393,8 +1514,10 @@ pub fn lora_linear(x, base_weight, lora_a, lora_b, adapter_ids, scale, ops) -> T
 
 // ── MoE ─────────────────────────────────────────────────────────
 
-/// MoE layer: route → (optional EP dispatch) → grouped GEMM → (optional EP combine).
-pub fn moe_layer(x, gate, expert_weights, ep_config, ops) -> Tensor;
+/// MoE layer: route → dispatch → grouped GEMM → combine.
+/// Handles three modes internally: local, expert parallel (EP), and
+/// attention-FFN disaggregation (AFD). Model code is the same for all modes.
+pub fn moe_layer(x, gate, expert_weights, moe_config, ops) -> Tensor;
 ```
 
 ### How Models Use Building Blocks
@@ -1635,11 +1758,13 @@ What each device supports today. "Planned" = not yet implemented but feasible.
 | **fused_adaln_zero** | Triton/CUDA kernel | — (planned) | — (planned) | — | XLA auto-fuse | — |
 | **fused_qknorm_rope** | FlashInfer kernel | — | — | — | — | — |
 | **fused_lora_matmul** | BGMV/Punica kernel | — (planned) | — | — | XLA custom op | — |
-| **CommOps** | NCCL / custom AR | RCCL | — (single device) | — (single device) | XLA collective | — (single device) |
+| **CommOps** | NCCL / custom AR / StepMesh | RCCL | — (single device) | — (single device) | XLA collective | — (single device) |
+| **send/recv (AFD)** | NCCL P2P / StepMesh / RDMA | RCCL P2P | — | — | — | — |
 | **OpsSession** | FlashInfer plan cache | no-op | no-op | no-op | XLA compile cache | no-op |
 | **CUDA graphs** | yes | HIP graphs (6.1+) | — | — | — | — |
 | **BFloat16** | SM80+ | all CDNA | Apple6+/Metal3+ | extension req'd | native | optional |
 | **FP8** | SM89+ | gfx942 (FNUZ), gfx950 (E4M3) | — | — | v5e+ | — |
+| **KV cache quant** | TurboQuant (device-internal) | — (planned) | — | — | — | — |
 
 **Key insight:** The trait interface is the same across all devices. The difference is which
 methods return real results vs errors, and which `FusedOps` return `Some` vs `None`.
@@ -1668,9 +1793,11 @@ Model code never changes — the dispatch layer absorbs all device differences.
 | ROCm arch variation | `RocmArch` enum (gfx942/950/1100), FP8 format auto-selected per arch |
 | Tensor parallelism | `CommOps` trait (all_reduce, all_gather), attention ops are TP-agnostic |
 | Expert parallelism | `CommOps::all_to_all` for dispatch/combine, `GemmOps::grouped_gemm` for local compute |
+| Attention-FFN disaggregation | `blocks::moe_layer` with `MoeMode::Disaggregated`, `CommOps::send/recv` for hidden state transfer |
 | Sequence parallelism | `CommOps::reduce_scatter` + `all_gather` around local attention |
 | Multi-LoRA serving | `FusedOps::fused_lora_matmul` (BGMV/Punica), fallback to per-adapter matmul |
 | Speculative decoding | Engine-level; tree attention via `MaskType::Custom(Tensor)` |
+| KV cache quantization | `cache_slot_spec` for layout query, encode/decode device-internal in `reshape_and_cache` / `paged_attention` |
 
 ## Model Examples
 
@@ -2801,7 +2928,230 @@ Key points:
 - **Fixed-address buffers**: `allocate_graph_buffers` and `allocate_fixed_tensor` return GPU tensors at stable addresses that survive graph replay.
 - **precompute_paged_plan_graphed**: updates FlashInfer metadata in graph buffers (outside capture, before each replay).
 
-### Example 23: Adding a New Fused Kernel (Developer Workflow, Always Keep Last)
+### Example 23: TurboQuant KV Cache Compression (KV Cache Quantization, Zero Model Changes)
+
+KV cache quantization that compresses K/V to 2-4 bits using vector quantization.
+Based on [TurboQuant](https://arxiv.org/abs/2504.19874). Shows how `cache_slot_spec`
+and device-internal encode/decode make this transparent to model code.
+
+**Algorithm:** Random rotation (Fast Walsh-Hadamard Transform) → Lloyd-Max scalar quantization
+→ bit-pack into uint8. Decode is the reverse. After decode, standard bf16 K/V feed into
+unmodified attention kernels.
+
+**Integration: 4 touch points, 0 model changes.**
+
+```rust
+// ── Step 1: OpsConfig ────────────────────────────────────────────
+// User specifies KV cache quantization at startup (CLI flag / config file).
+struct OpsConfig {
+    // ... existing fields ...
+    pub kv_cache_quant: Option<KvCacheQuantConfig>,
+}
+
+enum KvCacheQuantConfig {
+    TurboQuant {
+        bits: u8,              // 2, 3, 4
+        lite: bool,            // skip rotation for speed
+        outlier_fraction: f32, // fraction of channels kept at bf16 (0.0 = none)
+    },
+    // Future: KV-FP8, KIVI, etc.
+}
+```
+
+```rust
+// ── Step 2: CudaOps stores TurboQuant state ──────────────────────
+struct CudaOps {
+    fa4: Option<FA4Registry>,
+    fi: FlashInferRegistry,
+    deepgemm: Option<DeepGemmRegistry>,
+    cutlass: Option<CutlassHandle>,
+    fi_workspace: FlashInferWorkspace,
+    tq: Option<TurboQuantState>,       // ← only addition to CudaOps
+}
+
+/// Pre-computed TurboQuant state (created once at model load).
+struct TurboQuantState {
+    bits: u8,
+    lite: bool,
+    codebook: Tensor,          // Lloyd-Max quantization levels [2^bits]
+    sign_flips: Tensor,        // deterministic random signs for Hadamard rotation
+    n_outlier_channels: usize, // channels kept at bf16
+    slot_bytes: usize,         // pre-computed: outlier_bytes + packed_bytes + norm_bytes
+}
+```
+
+```rust
+// ── Step 3: KvCacheOps — cache_slot_spec + encode in reshape_and_cache ──
+impl KvCacheOps for CudaOps {
+    fn cache_slot_spec(&self, head_dim: usize, dtype: DType) -> CacheSlotSpec {
+        match &self.tq {
+            Some(tq) => CacheSlotSpec {
+                slot_size: tq.slot_bytes,
+                dtype: DType::U8,  // packed quantized representation
+            },
+            None => CacheSlotSpec { slot_size: head_dim, dtype },
+        }
+    }
+
+    fn reshape_and_cache(&self, key, value, key_cache, value_cache, slot_mapping) -> Result<()> {
+        match &self.tq {
+            Some(tq) => {
+                // Encode: bf16 K/V → rotate → quantize → bit-pack → write uint8 cache
+                tq_encode_and_cache(tq, key, value, key_cache, value_cache, slot_mapping)
+            }
+            None => {
+                // Standard bf16 cache write
+                standard_reshape_and_cache(key, value, key_cache, value_cache, slot_mapping)
+            }
+        }
+    }
+}
+```
+
+```rust
+// ── Step 4: AttentionOps — decode before attention ───────────────
+impl AttentionOps for CudaOps {
+    fn paged_attention(&self, q, key_cache, value_cache, params) -> Result<Tensor> {
+        match &self.tq {
+            Some(tq) => {
+                // Decode: unpack → codebook lookup → inverse Hadamard → bf16 K/V
+                let (k_bf16, v_bf16) = tq_decode_cache(tq, key_cache, value_cache, params)?;
+                // Standard attention on decoded bf16 — kernel is unchanged
+                fi_paged_prefill(&self.fi, &self.fi_workspace, q, &k_bf16, &v_bf16, params)
+            }
+            None => {
+                if params.max_seqlen_q == 1 {
+                    fi_paged_decode(&self.fi, &self.fi_workspace, q, key_cache, value_cache, params)
+                } else {
+                    // ... standard FA4 / FlashInfer dispatch (same as before) ...
+                    fi_paged_prefill(&self.fi, &self.fi_workspace, q, key_cache, value_cache, params)
+                }
+            }
+        }
+    }
+
+    // varlen_attention: unchanged (TurboQuant only affects paged KV cache)
+    fn varlen_attention(&self, q, k, v, params) -> Result<Tensor> { /* same as before */ }
+}
+```
+
+```rust
+// ── Engine cache allocation (only place outside CudaOps that changes) ──
+fn allocate_kv_cache(ops: &Ops, num_blocks: usize, block_size: usize,
+                     num_kv_heads: usize, head_dim: usize, dtype: DType) -> (Tensor, Tensor) {
+    let spec = ops.kv_cache.cache_slot_spec(head_dim, dtype);
+    // TurboQuant: [num_blocks, block_size, num_kv_heads, slot_bytes] in u8
+    // Standard:   [num_blocks, block_size, num_kv_heads, head_dim] in bf16
+    let shape = [num_blocks, block_size, num_kv_heads, spec.slot_size];
+    (Tensor::zeros(&shape, spec.dtype), Tensor::zeros(&shape, spec.dtype))
+}
+```
+
+```rust
+// ── Model code: ZERO changes ────────────────────────────────────
+// This is the exact same Qwen3 forward from Example 1. Not one line differs.
+impl Qwen3Layer {
+    fn forward(&self, x: &Tensor, ops: &Ops, kv: &PagedKvCtx) -> Result<Tensor> {
+        let (residual, h) = blocks::residual_norm(x, &self.residual, &self.ln1, eps, ops)?;
+        let qkv = blocks::col_parallel(&h, &self.qkv_shard, false, ops)?;
+        let (q, k, v) = split_qkv(&qkv, num_heads_per_rank, num_kv_heads_per_rank);
+        let (q, k) = blocks::qk_norm_rope(&q, &k, &self.qw, &self.kw, cos, sin, pos, eps, ops)?;
+
+        // These two calls are identical to non-quantized mode.
+        // CudaOps handles encode/decode internally.
+        ops.kv_cache.reshape_and_cache(&k, &v, &kv.cache_k, &kv.cache_v, &kv.slots)?;
+        let o = ops.attn.paged_attention(&q, &kv.cache_k, &kv.cache_v, &paged_params)?;
+
+        let h = blocks::row_parallel(&o, &self.o_proj_shard, ops)?;
+        let (residual, h) = blocks::residual_norm(&residual, &h, &self.ln2, eps, ops)?;
+        let h = blocks::moe_layer(&h, &self.gate, &self.expert_weights, &self.ep_config, ops)?;
+        Ok((&residual + &h)?)
+    }
+}
+```
+
+Key points:
+- **4 touch points**: `OpsConfig` (config), `CudaOps` (state), `KvCacheOps` (encode + spec), `AttentionOps` (decode). Compare vLLM's 19+ touch points for the same feature.
+- **0 model changes**: model code passes bf16 K/V to `reshape_and_cache` and calls `paged_attention` exactly as before. Encode/decode is device-internal.
+- **No new registries, no new backends, no new base classes**: just `if let Some(tq)` branches inside existing CudaOps methods.
+- **Other devices unaffected**: `RocmOps`, `MetalOps`, etc. inherit `cache_slot_spec` default (uncompressed). Adding TurboQuant to ROCm later is another `if let Some(tq)` in RocmOps — same pattern.
+- **Building blocks unaffected**: `blocks::residual_norm`, `blocks::qk_norm_rope`, etc. don't touch cache. No changes needed.
+- **`cache_slot_spec` is general**: future KV cache quantization methods (KV-FP8, KIVI, etc.) use the same `cache_slot_spec` + encode/decode pattern. The mechanism is not TurboQuant-specific.
+
+**Contrast with vLLM:**
+
+| Concern | vLLM | Prelude |
+|---------|------|---------|
+| Configuration | Literal type + dict + validation class (3 files) | `OpsConfig` field (1 struct) |
+| Registration | Quant registry + backend enum + selector (3 files) | None — `CudaOps` internal |
+| Attention integration | 5 conditional branches in Attention layer | `if let Some(tq)` in `paged_attention` |
+| Cache layout | Custom `get_kv_cache_spec()` override | `cache_slot_spec()` default method |
+| Model code | Unchanged | Unchanged |
+| Other backends | Must handle `kv_cache_dtype` checks | Inherit default, unaffected |
+| Total touch points | 19+ | 4 |
+
+The difference is architectural: vLLM's attention backend is monolithic (cache + attention coupled), so a cache-only change requires a new backend. Prelude's `KvCacheOps` / `AttentionOps` separation means cache compression is a device-internal concern — the right abstraction boundary absorbs the change.
+
+### Example 24: Attention-FFN Disaggregation (AFD, MoE on Separate GPUs)
+
+DeepSeek-V3 with 256 experts. Attention layers on 8 GPUs (TP=8), expert layers on 32 FFN GPUs
+(EP=32, 8 experts each). Shows how `blocks::moe_layer` absorbs AFD without model code changes.
+
+```rust
+// ── Model code: ZERO changes ────────────────────────────────────
+// Same DeepSeek-V3 forward from Example 15. Not one line differs.
+impl DeepSeekV3Layer {
+    fn forward(&self, x: &Tensor, ops: &Ops, kv: &PagedKvCtx) -> Result<Tensor> {
+        let (residual, h) = blocks::residual_norm(x, &self.residual, &self.ln1, eps, ops)?;
+        let (q, k, v) = self.qkv_mla(&h, ops)?;
+        ops.kv_cache.reshape_and_cache(&k, &v, &kv.cache_k, &kv.cache_v, &kv.slots)?;
+        let o = ops.attn.paged_attention(&q, &kv.cache_k, &kv.cache_v, &params)?;
+        let h = blocks::row_parallel(&o, &self.o_proj_shard, ops)?;
+
+        let (residual, h) = blocks::residual_norm(&residual, &h, &self.ln2, eps, ops)?;
+        // This call is identical to non-AFD. MoeConfig determines behavior.
+        let h = blocks::moe_layer(&h, &self.gate, &self.expert_weights, &self.moe_config, ops)?;
+        Ok((&residual + &h)?)
+    }
+}
+```
+
+```rust
+// ── What differs: MoeConfig at load time ─────────────────────────
+
+// Non-AFD deployment (all on same GPUs):
+let moe_config = MoeConfig { mode: MoeMode::ExpertParallel(EpConfig { ep_size: 8, .. }) };
+
+// AFD deployment (attention + FFN on separate GPUs):
+// Attention side:
+let moe_config = MoeConfig { mode: MoeMode::Disaggregated(AfdConfig {
+    role: AfdRole::Attention,
+    ffn_target: RemoteTarget::new("ffn-pool:9000"),
+}) };
+// FFN side:
+let moe_config = MoeConfig { mode: MoeMode::Disaggregated(AfdConfig {
+    role: AfdRole::Ffn,
+    ffn_target: RemoteTarget::new("attn-pool:9000"),
+}) };
+```
+
+```rust
+// ── Inside blocks::moe_layer (building block, not model code) ───
+// Attention side: route → send → recv
+// FFN side: recv → grouped_gemm → send
+// See AFD section under "Expert Parallelism" for full implementation.
+```
+
+Key points:
+- **Model code is the same** as Example 15 (DeepSeek-V3 with EP). Only `MoeConfig` differs.
+- **Deployment choice, not code choice.** Switch from EP to AFD by changing config, not code.
+- **`blocks::moe_layer` absorbs three modes:** `Local`, `ExpertParallel`, `Disaggregated`.
+  Model devs never see the difference.
+- **Contrast with SGLang:** SGLang replaces the MoE class with `AFDATTNMoE` / `AFDFFNMoE`
+  per model, and currently only supports Qwen3MoE. Our approach works for any model using
+  `blocks::moe_layer` — DeepSeek-V3, Qwen3-MoE, future MoE models — with zero per-model work.
+
+### Example 25: Adding a New Fused Kernel (Developer Workflow, Always Keep Last)
 
 Scenario: kernel dev adds `fused_geglu` (GELU-gated MLP fusion) to CudaOps.
 Shows the minimal change set.
