@@ -1,0 +1,11 @@
+[package]
+name = "prelude-quant-gemm"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "GPU quantized matrix multiply (GGUF formats). MMVQ for decode, tiled MMQ for prefill."
+
+[dev-dependencies]
+candle-core = { path = "../candle-core", features = ["cuda"] }
+half = "2.7.1"
+rand = "0.10.0"

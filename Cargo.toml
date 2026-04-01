@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/prelude-core", "crates/prelude-server", "crates/prelude-microbench", "crates/prelude-cutlass-gemm", "crates/prelude-deepgemm", "crates/prelude-flashinfer", "crates/prelude-flash-attn-v4"]
+members = ["crates/prelude-core", "crates/prelude-server", "crates/prelude-microbench", "crates/prelude-cutlass-gemm", "crates/prelude-deepgemm", "crates/prelude-flashinfer", "crates/prelude-flash-attn-v4", "crates/prelude-quant-gemm"]
 exclude = ["crates/candle-core", "crates/candle-paged-attn", "crates/candle-flash-attn-v3"]
 resolver = "2"
 
@@ -45,6 +45,7 @@ prelude-flash-attn-v4 = { path = "crates/prelude-flash-attn-v4" }
 prelude-deepgemm = { path = "crates/prelude-deepgemm" }
 prelude-cutlass-gemm = { path = "crates/prelude-cutlass-gemm" }
 prelude-flashinfer = { path = "crates/prelude-flashinfer" }
+prelude-quant-gemm = { path = "crates/prelude-quant-gemm" }
 
 # Tokenization & model loading
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }

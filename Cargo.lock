@@ -2655,6 +2655,7 @@ dependencies = [
  "prelude-deepgemm",
  "prelude-flash-attn-v4",
  "prelude-flashinfer",
+ "prelude-quant-gemm",
  "rand 0.10.0",
  "rayon",
  "serde",
@@ -2727,6 +2728,15 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "prelude-quant-gemm"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "half",
+ "rand 0.10.0",
 ]
 
 [[package]]
