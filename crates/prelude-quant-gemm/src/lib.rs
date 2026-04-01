@@ -17,6 +17,16 @@ unsafe extern "C" {
         ggml_type_id: i32,
     );
 
+    fn llama_mmvq_mul_mat_vec(
+        w: *const c_void,
+        x_q8: *const c_void,
+        y: *mut f32,
+        n: i64,
+        k: i64,
+        ggml_type_id: i32,
+        stream: *const c_void,
+    );
+
     fn llama_mmq_quantize_q8_1(
         x_bf16: *const c_void,
         x_q8: *mut c_void,
@@ -84,6 +94,27 @@ pub unsafe fn dequantize_ref(
 ) {
     unsafe {
         llama_dequantize(data, output, num_elements, weight_type as i32);
+    }
+}
+
+/// Fused matrix-vector multiply with quantized weights (MMVQ).
+///
+/// Computes `y[N] = W[N,K] @ x[K]` where W is GGUF-quantized and x is Q8_1.
+/// Uses llama.cpp's vec_dot functions for correctness across all formats.
+///
+/// # Safety
+/// All pointers must be valid CUDA device pointers. `stream` must be a valid `cudaStream_t`.
+pub unsafe fn mul_mat_vec_q(
+    w: *const c_void,
+    x_q8: *const c_void,
+    y: *mut f32,
+    n: i64,
+    k: i64,
+    weight_type: GgmlType,
+    stream: *const c_void,
+) {
+    unsafe {
+        llama_mmvq_mul_mat_vec(w, x_q8, y, n, k, weight_type as i32, stream);
     }
 }
 

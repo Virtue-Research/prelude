@@ -1,9 +1,10 @@
-// FFI entry points for vendored llama.cpp MMQ kernels.
+// FFI entry points for vendored llama.cpp MMQ + MMVQ kernels.
 // Bridges Rust → C → C++ template dispatch.
 
 #include "mmq_ffi.h"
 #include "llama_mmq/common.cuh"
 #include "llama_mmq/mmq.cuh"
+#include "llama_mmq/vecdotq.cuh"
 
 // Include quantize implementation directly (single translation unit).
 #include "llama_mmq/quantize.cu"
@@ -208,6 +209,164 @@ extern "C" void llama_mmq_mul_mat(
         case GGML_TYPE_Q4_K:  launch_mmq_typed<GGML_TYPE_Q4_K> (W, x_q8, y, M, N, K, stream); break;
         case GGML_TYPE_Q5_K:  launch_mmq_typed<GGML_TYPE_Q5_K> (W, x_q8, y, M, N, K, stream); break;
         case GGML_TYPE_Q6_K:  launch_mmq_typed<GGML_TYPE_Q6_K> (W, x_q8, y, M, N, K, stream); break;
+        default: break;
+    }
+}
+
+// ── MMVQ: fused matrix-vector multiply with quantized weights ───────────
+//
+// vec_dot function pointer type + dispatch (from llama.cpp mmvq.cu)
+typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
+
+static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:    return vec_dot_q4_0_q8_1;
+        case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1;
+        case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
+        case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
+        case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
+        case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
+        case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
+        case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
+        case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1;
+        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1;
+        case GGML_TYPE_IQ2_XXS: return vec_dot_iq2_xxs_q8_1;
+        case GGML_TYPE_IQ2_XS:  return vec_dot_iq2_xs_q8_1;
+        case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1;
+        case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
+        case GGML_TYPE_IQ3_S:   return vec_dot_iq3_s_q8_1;
+        case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
+        case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
+        case GGML_TYPE_IQ1_S:   return vec_dot_iq1_s_q8_1;
+        case GGML_TYPE_IQ1_M:   return vec_dot_iq1_m_q8_1;
+        case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
+        case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
+        default:                return nullptr;
+    }
+}
+
+static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:    return VDR_Q4_0_Q8_1_MMVQ;
+        case GGML_TYPE_Q4_1:    return VDR_Q4_1_Q8_1_MMVQ;
+        case GGML_TYPE_Q5_0:    return VDR_Q5_0_Q8_1_MMVQ;
+        case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ;
+        case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
+        case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
+        case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;
+        case GGML_TYPE_Q4_K:    return VDR_Q4_K_Q8_1_MMVQ;
+        case GGML_TYPE_Q5_K:    return VDR_Q5_K_Q8_1_MMVQ;
+        case GGML_TYPE_Q6_K:    return VDR_Q6_K_Q8_1_MMVQ;
+        case GGML_TYPE_IQ2_XXS: return VDR_IQ2_XXS_Q8_1_MMVQ;
+        case GGML_TYPE_IQ2_XS:  return VDR_IQ2_XS_Q8_1_MMVQ;
+        case GGML_TYPE_IQ2_S:   return VDR_IQ2_S_Q8_1_MMVQ;
+        case GGML_TYPE_IQ3_XXS: return VDR_IQ3_XXS_Q8_1_MMVQ;
+        case GGML_TYPE_IQ3_S:   return VDR_IQ3_S_Q8_1_MMVQ;
+        case GGML_TYPE_IQ4_NL:  return VDR_IQ4_NL_Q8_1_MMVQ;
+        case GGML_TYPE_IQ4_XS:  return VDR_IQ4_XS_Q8_1_MMVQ;
+        case GGML_TYPE_IQ1_S:   return VDR_IQ1_S_Q8_1_MMVQ;
+        case GGML_TYPE_IQ1_M:   return VDR_IQ1_M_Q8_1_MMVQ;
+        case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
+        case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
+        default:                return 1;
+    }
+}
+//
+// Uses llama.cpp's vec_dot functions from vecdotq.cuh directly.
+// Kernel uses the same thread-to-work mapping as llama.cpp's mul_mat_vec_q.
+// Input: quantized weights W[N,K] + Q8_1-quantized activations x[K]
+// Output: float y[N]
+
+#define MMVQ_NWARPS 4
+
+template <ggml_type type>
+static __global__ void llama_mmvq_kernel(
+    const void* __restrict__ W,
+    const void* __restrict__ x_q8,
+    float* __restrict__ y,
+    int64_t N,
+    int64_t K
+) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr vec_dot_q_cuda_t vec_dot = get_vec_dot_q_cuda(type);
+
+    const int row = blockIdx.x;
+    if (row >= (int)N) return;
+
+    const int tid = threadIdx.y * 32 + threadIdx.x;
+    const int blocks_per_row = K / qk;
+    const int stride_row = blocks_per_row;  // contiguous rows
+    constexpr int blocks_per_iter = vdr * MMVQ_NWARPS * 32 / qi;
+
+    const block_q8_1* q8 = (const block_q8_1*)x_q8;
+
+    float sum = 0.0f;
+    for (int kbx = tid / (qi / vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk / QK8_1);
+        const int kqs = vdr * (tid % (qi / vdr));
+        sum += vec_dot(W, q8 + kby, row * stride_row + kbx, kqs);
+    }
+
+    // Warp reduce
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+        sum += __shfl_xor_sync(0xffffffff, sum, mask);
+
+    // Cross-warp reduce via shared memory
+    __shared__ float sdata[MMVQ_NWARPS];
+    if (threadIdx.x == 0) sdata[threadIdx.y] = sum;
+    __syncthreads();
+
+    if (tid == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < MMVQ_NWARPS; w++) total += sdata[w];
+        y[row] = total;
+    }
+}
+
+template <ggml_type type>
+static void launch_mmvq_typed(
+    const void* W, const void* x_q8, float* y,
+    int64_t N, int64_t K,
+    cudaStream_t stream
+) {
+    dim3 block(32, MMVQ_NWARPS);
+    dim3 grid((int)N);
+    llama_mmvq_kernel<type><<<grid, block, 0, stream>>>(W, x_q8, y, N, K);
+}
+
+extern "C" void llama_mmvq_mul_mat_vec(
+    const void* W, const void* x_q8, float* y,
+    int64_t N, int64_t K,
+    int ggml_type_id,
+    void* stream_ptr
+) {
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+
+    switch (ggml_type_id) {
+        case GGML_TYPE_Q4_0:    launch_mmvq_typed<GGML_TYPE_Q4_0>   (W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_Q4_1:    launch_mmvq_typed<GGML_TYPE_Q4_1>   (W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_Q5_0:    launch_mmvq_typed<GGML_TYPE_Q5_0>   (W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_Q5_1:    launch_mmvq_typed<GGML_TYPE_Q5_1>   (W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_Q8_0:    launch_mmvq_typed<GGML_TYPE_Q8_0>   (W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_Q2_K:    launch_mmvq_typed<GGML_TYPE_Q2_K>   (W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_Q3_K:    launch_mmvq_typed<GGML_TYPE_Q3_K>   (W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_Q4_K:    launch_mmvq_typed<GGML_TYPE_Q4_K>   (W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_Q5_K:    launch_mmvq_typed<GGML_TYPE_Q5_K>   (W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_Q6_K:    launch_mmvq_typed<GGML_TYPE_Q6_K>   (W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_IQ2_XXS: launch_mmvq_typed<GGML_TYPE_IQ2_XXS>(W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_IQ2_XS:  launch_mmvq_typed<GGML_TYPE_IQ2_XS> (W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_IQ2_S:   launch_mmvq_typed<GGML_TYPE_IQ2_S>  (W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_IQ3_XXS: launch_mmvq_typed<GGML_TYPE_IQ3_XXS>(W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_IQ3_S:   launch_mmvq_typed<GGML_TYPE_IQ3_S>  (W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_IQ4_NL:  launch_mmvq_typed<GGML_TYPE_IQ4_NL> (W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_IQ4_XS:  launch_mmvq_typed<GGML_TYPE_IQ4_XS> (W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_IQ1_S:   launch_mmvq_typed<GGML_TYPE_IQ1_S>  (W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_IQ1_M:   launch_mmvq_typed<GGML_TYPE_IQ1_M>  (W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_MXFP4:   launch_mmvq_typed<GGML_TYPE_MXFP4>  (W, x_q8, y, N, K, stream); break;
+        case GGML_TYPE_NVFP4:   launch_mmvq_typed<GGML_TYPE_NVFP4>  (W, x_q8, y, N, K, stream); break;
         default: break;
     }
 }

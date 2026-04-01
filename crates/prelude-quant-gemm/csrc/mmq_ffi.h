@@ -27,6 +27,17 @@ void llama_mmq_mul_mat(
     void* stream          // cudaStream_t
 );
 
+// MMVQ: fused matrix-vector multiply with quantized weights (decode M=1).
+// y[N] = W[N,K] @ x[K] where W is quantized and x is Q8_1.
+void llama_mmvq_mul_mat_vec(
+    const void* W,        // device quantized weights [N, K/qk blocks]
+    const void* x_q8,     // device Q8_1-quantized activations [K/32 blocks]
+    float* y,             // device F32 output [N]
+    int64_t N, int64_t K,
+    int ggml_type_id,     // GGML type of weights
+    void* stream          // cudaStream_t
+);
+
 // CPU dequantize reference (for correctness testing).
 // Dispatches to llama.cpp's scalar dequantize_row_* by type ID.
 void llama_dequantize(
