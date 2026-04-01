@@ -51,6 +51,7 @@ tokenizers = { version = "0.22.2", default-features = false, features = ["onig"]
 fastokens = { git = "https://github.com/rucnyz/fastokens" }
 hf-hub = "0.5.0"
 rand = "0.10.0"
+bc-mimalloc = { version = "0.1", features = ["v3"] }
 
 [profile.release]
 lto = "thin"

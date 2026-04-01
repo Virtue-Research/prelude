@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
+
 use prelude_core::engine::InferenceEngine;
 use prelude_core::types::{
     ClassificationInputs, ClassifyRequest, GenerateRequest, PromptInput, SamplingParams, StopConfig,

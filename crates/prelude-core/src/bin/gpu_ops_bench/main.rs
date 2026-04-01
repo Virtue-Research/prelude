@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
+
 //! GPU kernel micro-benchmark suite.
 //!
 //! Compares our dispatch path vs cuBLAS/reference for GEMM, attention, etc.

@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
+
 //! Quick correctness and performance test for fused CUDA kernels.
 //! Requires `--features cuda` to build and run.
 

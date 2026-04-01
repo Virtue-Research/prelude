@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 

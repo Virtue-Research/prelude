@@ -56,6 +56,7 @@ inventory = "0.3"
 rayon = "1.11.0"
 nix = { version = "0.31", features = ["sched"] }
 tokenizers = { workspace = true, optional = true }
+bc-mimalloc.workspace = true
 
 [[bin]]
 name = "cpu_ops_bench"

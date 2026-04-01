@@ -32,6 +32,7 @@ uuid.workspace = true
 hf-hub.workspace = true
 
 prelude-core = { path = "../prelude-core", default-features = false }
+bc-mimalloc.workspace = true
 base64 = "0.22.1"
 minijinja = "2.18.0"
 minijinja-contrib = { version = "2.18.0", features = ["pycompat"] }

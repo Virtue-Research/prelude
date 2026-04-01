@@ -6,6 +6,9 @@
 //! With oneDNN GEMM:
 //!   cargo run -p prelude-core --bin cpu_ops_bench --release --features onednn
 
+#[global_allocator]
+static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
+
 mod attention;
 mod gemm;
 mod quant;
@@ -131,10 +134,17 @@ fn main() -> Result<()> {
 
     // -- RMSNorm --
     if run("rmsnorm") {
-        println!("\n=== RMSNorm ===");
+        println!("\n=== RMSNorm (BF16) ===");
         for &hidden in hiddens {
             for &batch in batches {
                 rmsnorm::bench(hidden, batch, warmup, repeats)?;
+            }
+            println!();
+        }
+        println!("=== RMSNorm (F16 / F32) ===");
+        for &hidden in hiddens {
+            for &batch in &[1, 16, 256] {
+                rmsnorm::bench_dtypes(hidden, batch, warmup, repeats)?;
             }
             println!();
         }
@@ -142,10 +152,17 @@ fn main() -> Result<()> {
 
     // -- Fused Add+RMSNorm --
     if run("fused") {
-        println!("=== Fused Add+RMSNorm ===");
+        println!("=== Fused Add+RMSNorm (BF16) ===");
         for &hidden in hiddens {
             for &batch in batches {
                 rmsnorm::bench_fused(hidden, batch, warmup, repeats)?;
+            }
+            println!();
+        }
+        println!("=== Fused Add+RMSNorm (F16 / F32) ===");
+        for &hidden in hiddens {
+            for &batch in &[1, 16, 256] {
+                rmsnorm::bench_fused_dtypes(hidden, batch, warmup, repeats)?;
             }
             println!();
         }
