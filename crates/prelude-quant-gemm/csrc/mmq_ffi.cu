@@ -66,11 +66,20 @@ template void mul_mat_q_case<GGML_TYPE_Q4_1>(ggml_backend_cuda_context &, const 
 template void mul_mat_q_case<GGML_TYPE_Q5_0>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
 template void mul_mat_q_case<GGML_TYPE_Q5_1>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
 template void mul_mat_q_case<GGML_TYPE_Q8_0>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
+template void mul_mat_q_case<GGML_TYPE_MXFP4>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
 template void mul_mat_q_case<GGML_TYPE_Q2_K>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
 template void mul_mat_q_case<GGML_TYPE_Q3_K>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
 template void mul_mat_q_case<GGML_TYPE_Q4_K>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
 template void mul_mat_q_case<GGML_TYPE_Q5_K>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
 template void mul_mat_q_case<GGML_TYPE_Q6_K>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
+template void mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
+template void mul_mat_q_case<GGML_TYPE_IQ2_XS>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
+template void mul_mat_q_case<GGML_TYPE_IQ2_S>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
+template void mul_mat_q_case<GGML_TYPE_IQ3_XXS>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
+template void mul_mat_q_case<GGML_TYPE_IQ3_S>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
+template void mul_mat_q_case<GGML_TYPE_IQ1_S>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
+template void mul_mat_q_case<GGML_TYPE_IQ4_NL>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
+template void mul_mat_q_case<GGML_TYPE_IQ4_XS>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
 
 #include <cuda_bf16.h>
 
@@ -199,16 +208,25 @@ extern "C" void llama_mmq_mul_mat(
     }
 
     switch (ggml_type_id) {
-        case GGML_TYPE_Q4_0:  launch_mmq_typed<GGML_TYPE_Q4_0> (W, x_q8, y, M, N, K, stream); break;
-        case GGML_TYPE_Q4_1:  launch_mmq_typed<GGML_TYPE_Q4_1> (W, x_q8, y, M, N, K, stream); break;
-        case GGML_TYPE_Q5_0:  launch_mmq_typed<GGML_TYPE_Q5_0> (W, x_q8, y, M, N, K, stream); break;
-        case GGML_TYPE_Q5_1:  launch_mmq_typed<GGML_TYPE_Q5_1> (W, x_q8, y, M, N, K, stream); break;
-        case GGML_TYPE_Q8_0:  launch_mmq_typed<GGML_TYPE_Q8_0> (W, x_q8, y, M, N, K, stream); break;
-        case GGML_TYPE_Q2_K:  launch_mmq_typed<GGML_TYPE_Q2_K> (W, x_q8, y, M, N, K, stream); break;
-        case GGML_TYPE_Q3_K:  launch_mmq_typed<GGML_TYPE_Q3_K> (W, x_q8, y, M, N, K, stream); break;
-        case GGML_TYPE_Q4_K:  launch_mmq_typed<GGML_TYPE_Q4_K> (W, x_q8, y, M, N, K, stream); break;
-        case GGML_TYPE_Q5_K:  launch_mmq_typed<GGML_TYPE_Q5_K> (W, x_q8, y, M, N, K, stream); break;
-        case GGML_TYPE_Q6_K:  launch_mmq_typed<GGML_TYPE_Q6_K> (W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_Q4_0:    launch_mmq_typed<GGML_TYPE_Q4_0>   (W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_Q4_1:    launch_mmq_typed<GGML_TYPE_Q4_1>   (W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_Q5_0:    launch_mmq_typed<GGML_TYPE_Q5_0>   (W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_Q5_1:    launch_mmq_typed<GGML_TYPE_Q5_1>   (W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_Q8_0:    launch_mmq_typed<GGML_TYPE_Q8_0>   (W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_MXFP4:   launch_mmq_typed<GGML_TYPE_MXFP4>  (W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_Q2_K:    launch_mmq_typed<GGML_TYPE_Q2_K>   (W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_Q3_K:    launch_mmq_typed<GGML_TYPE_Q3_K>   (W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_Q4_K:    launch_mmq_typed<GGML_TYPE_Q4_K>   (W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_Q5_K:    launch_mmq_typed<GGML_TYPE_Q5_K>   (W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_Q6_K:    launch_mmq_typed<GGML_TYPE_Q6_K>   (W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_IQ2_XXS: launch_mmq_typed<GGML_TYPE_IQ2_XXS>(W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_IQ2_XS:  launch_mmq_typed<GGML_TYPE_IQ2_XS> (W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_IQ2_S:   launch_mmq_typed<GGML_TYPE_IQ2_S>  (W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_IQ3_XXS: launch_mmq_typed<GGML_TYPE_IQ3_XXS>(W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_IQ3_S:   launch_mmq_typed<GGML_TYPE_IQ3_S>  (W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_IQ1_S:   launch_mmq_typed<GGML_TYPE_IQ1_S>  (W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_IQ4_NL:  launch_mmq_typed<GGML_TYPE_IQ4_NL> (W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_IQ4_XS:  launch_mmq_typed<GGML_TYPE_IQ4_XS> (W, x_q8, y, M, N, K, stream); break;
         default: break;
     }
 }

@@ -25,6 +25,8 @@ fn to_ggml_type(dtype: candle_core::quantized::GgmlDType) -> Option<prelude_quan
         GgmlDType::Q4K  => Some(GgmlType::Q4K),
         GgmlDType::Q5K  => Some(GgmlType::Q5K),
         GgmlDType::Q6K  => Some(GgmlType::Q6K),
+        // IQ and FP4 formats don't have GgmlDType mappings in candle,
+        // but can be used via prelude_quant_gemm::GgmlType directly.
         _ => None,
     }
 }

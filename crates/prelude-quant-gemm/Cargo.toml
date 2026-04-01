@@ -6,7 +6,7 @@ license = "MIT"
 description = "GPU quantized matrix multiply (GGUF formats). MMVQ for decode, tiled MMQ for prefill."
 
 [dependencies]
-cudarc = { version = "0.19.4", features = ["std", "cuda-version-from-build-system"] }
+cudarc = { version = "0.19.4", features = ["std", "cuda-version-from-build-system", "f16"] }
 half = "2.7.1"
 
 [dev-dependencies]
