@@ -128,16 +128,24 @@ fn find_flashinfer_source(out_dir: &Path) -> Result<PathBuf> {
 // ── Kernel compilation ───────────────────────────────────────────────
 
 fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fi_src: &Path) -> Result<()> {
-    // If manifest exists, kernels were already compiled (incremental is inside python)
-    if kernels_dir.join("manifest.json").exists() {
-        let n = walkdir_ext(kernels_dir, "o").len();
-        println!("cargo:warning=FlashInfer: {n} kernel objects up-to-date");
-        return Ok(());
-    }
-
-    println!("cargo:warning=FlashInfer: compiling kernels...");
-
     let script = manifest_dir.join("scripts/compile_kernels.py");
+    let manifest = kernels_dir.join("manifest.json");
+
+    // Skip recompilation only if manifest exists AND is newer than the build script.
+    if manifest.exists() {
+        let script_mtime = script.metadata()?.modified()?;
+        let manifest_mtime = manifest.metadata()?.modified()?;
+        if manifest_mtime > script_mtime {
+            let n = walkdir_ext(kernels_dir, "o").len();
+            println!("cargo:warning=FlashInfer: {n} kernel objects up-to-date");
+            return Ok(());
+        }
+        println!("cargo:warning=FlashInfer: compile_kernels.py changed, recompiling...");
+        // Remove stale manifest so the script regenerates everything
+        std::fs::remove_file(&manifest)?;
+    } else {
+        println!("cargo:warning=FlashInfer: compiling kernels...");
+    }
     let python = find_python()?;
 
     let archs = env::var("PRELUDE_FLASHINFER_ARCHS")
@@ -268,8 +276,9 @@ fn compile_tvm_ffi(manifest_dir: &Path) -> Result<()> {
             break;
         }
     }
-    println!("cargo:rustc-link-lib=dylib=cudart");
-    println!("cargo:rustc-link-lib=dylib=cublas");
+    println!("cargo:rustc-link-lib=static=cudart_static");
+    println!("cargo:rustc-link-lib=dylib=rt");   // required by cudart_static
+    println!("cargo:rustc-link-lib=dylib=dl");   // required by cudart_static
     println!("cargo:rustc-link-lib=dylib=stdc++");
 
     Ok(())

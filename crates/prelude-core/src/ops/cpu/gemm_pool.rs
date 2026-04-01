@@ -16,7 +16,7 @@
 //!   CPU_GEMM_SPIN_MS=N   — spin duration in ms before parking (default 200)
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Function signature for dispatch work.
 /// Called on each active worker thread with (thread_id, num_threads, context_ptr).
@@ -69,6 +69,8 @@ pub struct GemmPool {
     shared: Arc<PoolShared>,
     n_threads: usize,
     handles: Vec<std::thread::JoinHandle<()>>,
+    /// Serializes concurrent dispatch calls — only one dispatch may be in-flight at a time.
+    dispatch_lock: Mutex<()>,
 }
 
 impl GemmPool {
@@ -118,6 +120,7 @@ impl GemmPool {
             shared,
             n_threads,
             handles,
+            dispatch_lock: Mutex::new(()),
         }
     }
 
@@ -132,6 +135,7 @@ impl GemmPool {
     /// - `f` must be safe to call concurrently from `n_threads` threads.
     #[inline]
     pub unsafe fn dispatch(&self, f: DispatchFn, ctx: *const u8, n_threads: usize) {
+        let _guard = self.dispatch_lock.lock().unwrap();
         let n = n_threads.min(self.n_threads);
         if n == 0 {
             return;

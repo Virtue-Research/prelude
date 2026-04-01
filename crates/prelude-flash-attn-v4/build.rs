@@ -331,7 +331,9 @@ fn compile_tvm_ffi_static(manifest_dir: &Path, out_dir: &Path) -> Result<()> {
     if let Ok(cuda_path) = env::var("CUDA_PATH") {
         println!("cargo:rustc-link-search=native={cuda_path}/lib64");
     }
-    println!("cargo:rustc-link-lib=dylib=cudart");
+    println!("cargo:rustc-link-lib=static=cudart_static");
+    println!("cargo:rustc-link-lib=dylib=rt");   // required by cudart_static
+    println!("cargo:rustc-link-lib=dylib=dl");   // required by cudart_static
 
     // C++ stdlib
     println!("cargo:rustc-link-lib=dylib=stdc++");

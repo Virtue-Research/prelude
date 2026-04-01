@@ -150,11 +150,16 @@ def generate_batch_decode_sources(
     sources = [kernel_path]
 
     # ── batch_decode.cu (dispatch) ──
+    # Include decode.cuh so that BatchDecodeWithPagedKVCacheKernel is defined (not
+    # just forward-declared via scheduler.cuh).  WorkEstimationDispatched takes a
+    # function pointer to the kernel; without the definition in this TU the SM90a
+    # cubin linker fails with "undefined hidden symbol".
     renames = {
         "BatchDecodeWithPagedKVCacheRun": f"{vid}_BatchDecodeWithPagedKVCacheRun",
         "BatchDecodeWithPagedKVCachePlan": f"{vid}_BatchDecodeWithPagedKVCachePlan",
     }
-    _copy_with_renames(csrc / "batch_decode.cu", out / "batch_decode.cu", renames)
+    _copy_with_renames(csrc / "batch_decode.cu", out / "batch_decode.cu", renames,
+                       extra_includes=["flashinfer/attention/decode.cuh"])
     sources.append(out / "batch_decode.cu")
 
     # ── Binding ──
@@ -1227,11 +1232,15 @@ def generate_page_sources(
 
 # ── Symbol renaming ────────────────────────────────────────────────────
 
-def _copy_with_renames(src: Path, dst: Path, renames: Dict[str, str]) -> None:
+def _copy_with_renames(src: Path, dst: Path, renames: Dict[str, str],
+                       extra_includes: Optional[List[str]] = None) -> None:
     """Copy a .cu file, prepending #define macros to rename symbols."""
     defines = "\n".join(f"#define {old} {new}" for old, new in renames.items())
+    includes = ""
+    if extra_includes:
+        includes = "\n".join(f"#include <{h}>" for h in extra_includes) + "\n"
     original = src.read_text()
-    dst.write_text(f"// AOT variant rename\n{defines}\n\n{original}")
+    dst.write_text(f"// AOT variant rename\n{defines}\n{includes}\n{original}")
 
 
 def _generate_renamed_binding(

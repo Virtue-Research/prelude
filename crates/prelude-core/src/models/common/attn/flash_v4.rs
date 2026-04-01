@@ -9,8 +9,16 @@ use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::{DType, Result, Tensor};
 use half::bf16;
-use prelude_flash_attn_v4::{KernelKey, KernelRegistry};
+use prelude_flash_attn_v4::{KernelDtype, KernelKey, KernelRegistry};
 use std::ffi::c_void;
+
+fn to_kernel_dtype(dt: DType) -> KernelDtype {
+    match dt {
+        DType::BF16 => KernelDtype::BF16,
+        DType::F16 => KernelDtype::FP16,
+        _ => KernelDtype::BF16,
+    }
+}
 
 /// Get the FA4 kernel registry (cached singleton — arch detection is one-time only).
 fn get_registry() -> &'static KernelRegistry {
@@ -191,6 +199,7 @@ pub fn varlen_paged(
                 &cu_q_shape, &seqused_k_shape, &pt_shape,
                 device_id,
                 None, None, // no window
+                to_kernel_dtype(q.dtype()),
             ).map_err(|e| candle_core::Error::Msg(format!("FA4 paged kernel error: {e}")))?;
         }
     }
@@ -297,6 +306,7 @@ fn call_fa4(
                 device_id,
                 window_left, window_right,
                 None, None, // no seqused
+                to_kernel_dtype(q.dtype()),
             ).map_err(|e| candle_core::Error::Msg(format!("FA4 kernel error: {e}")))?;
         }
     }

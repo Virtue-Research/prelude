@@ -85,8 +85,7 @@ cargo test --manifest-path crates/prelude-flash-attn-v4/Cargo.toml \
 
 ```bash
 # Kernel-level microbenchmark (CUDA events for accurate GPU timing)
-cargo run --manifest-path crates/prelude-flash-attn-v4/Cargo.toml \
-    --example bench_kernel --release
+cargo run -p prelude-flash-attn-v4 --bin bench_kernel --release
 
 # Config: FA4_BENCH_WARMUP=5, FA4_BENCH_REPEATS=20
 # Sweeps seq_len 128–8192, reports median/min/max latency + tokens/s + TFLOPS

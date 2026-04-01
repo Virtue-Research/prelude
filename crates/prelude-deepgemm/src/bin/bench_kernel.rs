@@ -1,6 +1,6 @@
 //! DeepGEMM BF16/FP8 GEMM performance benchmark — DeepGEMM vs cuBLAS/cuBLASLt.
 //!
-//! Run:  cargo run -p prelude-deepgemm --example bench_gemm --release
+//! Run:  cargo run -p prelude-deepgemm --bin bench_kernel --release
 
 use std::ffi::c_void;
 use std::sync::Arc;

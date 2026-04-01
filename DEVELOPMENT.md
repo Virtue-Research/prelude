@@ -17,7 +17,7 @@ docker run -v $(pwd):/workspace prelude-dev \
 
 # Run tests
 docker run -v $(pwd):/workspace prelude-dev \
-  cargo test -p prelude-core --lib -- --test-threads=1
+  cargo test -p prelude-core --lib
 ```
 
 `--gpus all` is ignored on machines without NVIDIA runtime — same image works everywhere.
@@ -32,9 +32,18 @@ The image includes: Rust stable, CUDA 12.8 toolkit, cmake, llama.cpp (for benchm
 |---------------|---------|---------------------|
 | Rust (stable) | 1.85+   | All builds          |
 | CMake         | >= 3.18 | oneDNN (CPU builds) |
-| CUDA Toolkit  | 12.x    | GPU builds          |
+| CUDA Toolkit  | >= 12.x | GPU builds          |
 
 oneDNN is auto-downloaded and statically linked on first build.
+### Python
+
+```shell
+uv venv .venv --python 3.12 --seed
+source .venv/bin/activate
+
+uv pip install transformers torch requests numpy cmake
+```
+
 
 ### Build
 
@@ -42,8 +51,8 @@ oneDNN is auto-downloaded and statically linked on first build.
 # CPU only (default)
 cargo build -p prelude-core --release
 
-# GPU — full stack
-cargo build -p prelude-server --release --features flashinfer-v4,deepgemm
+# full stack
+cargo build -p prelude-server --release --features full
 
 # Check everything compiles
 cargo check --workspace --all-targets
@@ -52,12 +61,18 @@ cargo check --workspace --all-targets
 ### Test
 
 ```bash
-# All library tests (single-threaded to avoid GemmPool conflicts)
-cargo test -p prelude-core --lib -- --test-threads=1
+# CPU library tests
+cargo test -p prelude-core --lib
 
 # Specific module
 cargo test -p prelude-core --lib -- quant
 cargo test -p prelude-core --lib -- linear
+
+# GPU kernel correctness tests
+cargo test -p prelude-cutlass-gemm --release
+cargo test -p prelude-deepgemm --release
+cargo test -p prelude-flashinfer --release
+cargo test -p prelude-flash-attn-v4 --release
 ```
 
 ### Benchmark
@@ -65,10 +80,14 @@ cargo test -p prelude-core --lib -- linear
 ```bash
 # CPU kernel benchmarks (quantized, GEMM, attention, etc.)
 cargo run -p prelude-core --bin cpu_ops_bench --release
-
-# Filter specific benchmark
 cargo run -p prelude-core --bin cpu_ops_bench --release -- quant
 cargo run -p prelude-core --bin cpu_ops_bench --release -- gemm
+
+# GPU kernel benchmarks
+cargo run -p prelude-cutlass-gemm --bin bench_kernel --release
+cargo run -p prelude-deepgemm --bin bench_kernel --release
+cargo run -p prelude-flashinfer --bin bench_kernel --release
+cargo run -p prelude-flash-attn-v4 --bin bench_kernel --release
 ```
 
 ## Feature flags

@@ -14,11 +14,17 @@ pub use loader::{KernelDtype, KernelKey, KernelRegistry, TVMSafeCallFn};
 
 // ── Shared helpers ─────────────────────────────────────────────────────
 
-fn make_dtypes() -> (DLDataType, DLDataType, DLDataType) {
-    let bf16 = DLDataType { code: KDLBFLOAT, bits: 16, lanes: 1 };
+fn half_dl_dtype(dtype: KernelDtype) -> DLDataType {
+    match dtype {
+        KernelDtype::BF16 => DLDataType { code: KDLBFLOAT, bits: 16, lanes: 1 },
+        KernelDtype::FP16 => DLDataType { code: KDLFLOAT, bits: 16, lanes: 1 },
+    }
+}
+
+fn make_aux_dtypes() -> (DLDataType, DLDataType) {
     let f32_dt = DLDataType { code: KDLFLOAT, bits: 32, lanes: 1 };
     let i32_dt = DLDataType { code: KDLINT, bits: 32, lanes: 1 };
-    (bf16, f32_dt, i32_dt)
+    (f32_dt, i32_dt)
 }
 
 fn make_dltensor(
@@ -95,21 +101,23 @@ pub unsafe fn fa4_varlen_fwd(
     window_size_right: Option<i32>,
     seqused_q_ptr: Option<*mut c_void>,
     seqused_k_ptr: Option<*mut c_void>,
+    dtype: KernelDtype,
 ) -> Result<(), String> {
     let device = DLDevice { device_type: KDLCUDA, device_id };
-    let (bf16, f32_dtype, i32_dtype) = make_dtypes();
+    let half_dt = half_dl_dtype(dtype);
+    let (f32_dtype, i32_dtype) = make_aux_dtypes();
 
     let q_strides = contiguous_strides(q_shape);
-    let dl_q = make_dltensor(q_ptr, device, bf16, q_shape, &q_strides);
+    let dl_q = make_dltensor(q_ptr, device, half_dt, q_shape, &q_strides);
 
     let k_strides = contiguous_strides(k_shape);
-    let dl_k = make_dltensor(k_ptr, device, bf16, k_shape, &k_strides);
+    let dl_k = make_dltensor(k_ptr, device, half_dt, k_shape, &k_strides);
 
     let v_strides = contiguous_strides(k_shape);
-    let dl_v = make_dltensor(v_ptr, device, bf16, k_shape, &v_strides);
+    let dl_v = make_dltensor(v_ptr, device, half_dt, k_shape, &v_strides);
 
     let o_strides = contiguous_strides(o_shape);
-    let dl_o = make_dltensor(o_ptr, device, bf16, o_shape, &o_strides);
+    let dl_o = make_dltensor(o_ptr, device, half_dt, o_shape, &o_strides);
 
     let lse_strides = contiguous_strides(lse_shape);
     let dl_lse = make_dltensor(lse_ptr, device, f32_dtype, lse_shape, &lse_strides);
@@ -197,21 +205,23 @@ pub unsafe fn fa4_varlen_paged_fwd(
     device_id: i32,
     window_size_left: Option<i32>,
     window_size_right: Option<i32>,
+    dtype: KernelDtype,
 ) -> Result<(), String> {
     let device = DLDevice { device_type: KDLCUDA, device_id };
-    let (bf16, f32_dtype, i32_dtype) = make_dtypes();
+    let half_dt = half_dl_dtype(dtype);
+    let (f32_dtype, i32_dtype) = make_aux_dtypes();
 
     let q_strides = contiguous_strides(q_shape);
-    let dl_q = make_dltensor(q_ptr, device, bf16, q_shape, &q_strides);
+    let dl_q = make_dltensor(q_ptr, device, half_dt, q_shape, &q_strides);
 
     let k_strides = contiguous_strides(k_shape);
-    let dl_k = make_dltensor(k_ptr, device, bf16, k_shape, &k_strides);
+    let dl_k = make_dltensor(k_ptr, device, half_dt, k_shape, &k_strides);
 
     let v_strides = contiguous_strides(k_shape);
-    let dl_v = make_dltensor(v_ptr, device, bf16, k_shape, &v_strides);
+    let dl_v = make_dltensor(v_ptr, device, half_dt, k_shape, &v_strides);
 
     let o_strides = contiguous_strides(o_shape);
-    let dl_o = make_dltensor(o_ptr, device, bf16, o_shape, &o_strides);
+    let dl_o = make_dltensor(o_ptr, device, half_dt, o_shape, &o_strides);
 
     let lse_strides = contiguous_strides(lse_shape);
     let dl_lse = make_dltensor(lse_ptr, device, f32_dtype, lse_shape, &lse_strides);

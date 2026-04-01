@@ -1,6 +1,6 @@
 //! Benchmark FlashInfer attention kernels vs cuBLAS naive baseline.
 //!
-//! Run: cd crates/prelude-flashinfer && cargo run --example bench_attention --release
+//! Run: cargo run -p prelude-flashinfer --bin bench_kernel --release
 //!
 //! cuBLAS baseline = two cublasGemmStridedBatchedEx calls (Q@K^T + S@V).
 //! This is what candle does without FlashInfer: no fused softmax, no causal
@@ -30,7 +30,7 @@ unsafe extern "C" {
     fn cudaEventDestroy(event: *mut c_void) -> i32;
 }
 
-// ── cuBLAS FFI ───────────────────────────────────────────────────────
+// ── cuBLAS via dlopen (no link-time dependency) ─────────────────────
 
 #[allow(non_camel_case_types)]
 type cublasHandle_t = *mut c_void;
@@ -41,21 +41,40 @@ const CUDA_R_16BF: i32 = 14;
 const CUBLAS_COMPUTE_32F: i32 = 68;
 const CUBLAS_GEMM_DEFAULT: i32 = -1;
 
-unsafe extern "C" {
-    fn cublasCreate_v2(handle: *mut cublasHandle_t) -> i32;
-    fn cublasDestroy_v2(handle: cublasHandle_t) -> i32;
-    fn cublasGemmStridedBatchedEx(
-        handle: cublasHandle_t,
-        transa: i32, transb: i32,
-        m: i32, n: i32, k: i32,
-        alpha: *const c_void,
-        a: *const c_void, a_type: i32, lda: i32, stride_a: i64,
-        b: *const c_void, b_type: i32, ldb: i32, stride_b: i64,
-        beta: *const c_void,
-        c: *mut c_void, c_type: i32, ldc: i32, stride_c: i64,
-        batch: i32,
-        compute_type: i32, algo: i32,
-    ) -> i32;
+type FnCreate = unsafe extern "C" fn(*mut cublasHandle_t) -> i32;
+type FnDestroy = unsafe extern "C" fn(cublasHandle_t) -> i32;
+type FnGemmEx = unsafe extern "C" fn(
+    cublasHandle_t, i32, i32, i32, i32, i32,
+    *const c_void,
+    *const c_void, i32, i32, i64,
+    *const c_void, i32, i32, i64,
+    *const c_void,
+    *mut c_void, i32, i32, i64,
+    i32, i32, i32,
+) -> i32;
+
+struct CuBlas {
+    create: FnCreate,
+    destroy: FnDestroy,
+    gemm: FnGemmEx,
+}
+
+impl CuBlas {
+    fn load() -> Option<Self> {
+        unsafe extern "C" {
+            fn dlopen(filename: *const i8, flags: i32) -> *mut c_void;
+            fn dlsym(handle: *mut c_void, symbol: *const i8) -> *mut c_void;
+        }
+        unsafe {
+            let lib = dlopen(b"libcublas.so\0".as_ptr() as _, 0x101); // RTLD_LAZY|RTLD_GLOBAL
+            if lib.is_null() { return None; }
+            Some(Self {
+                create: std::mem::transmute(dlsym(lib, b"cublasCreate_v2\0".as_ptr() as _)),
+                destroy: std::mem::transmute(dlsym(lib, b"cublasDestroy_v2\0".as_ptr() as _)),
+                gemm: std::mem::transmute(dlsym(lib, b"cublasGemmStridedBatchedEx\0".as_ptr() as _)),
+            })
+        }
+    }
 }
 
 const BF16_DT: DLDataType = DLDataType { code: KDLBFLOAT, bits: 16, lanes: 1 };
@@ -158,7 +177,7 @@ impl Drop for Workspace {
 /// Input layout: Q/K/V are [num_heads, seq_len, head_dim] contiguous (head-major).
 /// Returns time in ms for the two GEMMs combined.
 fn cublas_naive_attention(
-    handle: cublasHandle_t,
+    cublas: &CuBlas, handle: cublasHandle_t,
     q: *const c_void, k: *const c_void, v: *const c_void,
     s: *mut c_void, o: *mut c_void,
     seq: i32, dim: i32, heads: i32,
@@ -174,7 +193,7 @@ fn cublas_naive_attention(
         // transa=T on Q → Q^T col-major = Q row-major [seq, dim]
         // transb=N on K → K col-major [dim, seq] = K^T row-major [seq, dim]
         // Result C col-major [seq, seq] = Q row @ K^T row ✓
-        cublasGemmStridedBatchedEx(
+        (cublas.gemm)(
             handle,
             CUBLAS_OP_T, CUBLAS_OP_N,
             seq, seq, dim,
@@ -192,7 +211,7 @@ fn cublas_naive_attention(
         // transb=T on S col-major [seq, seq] → S^T = S (symmetric-ish for perf)
         // Result C col-major [dim, seq] = V_col @ S_col^T
         //   = V^T_row @ S_row → O^T in row-major, but FLOPS are the same
-        cublasGemmStridedBatchedEx(
+        (cublas.gemm)(
             handle,
             CUBLAS_OP_N, CUBLAS_OP_T,
             dim, seq, seq,
@@ -210,7 +229,7 @@ fn cublas_naive_attention(
 // ── Bench: Prefill ───────────────────────────────────────────────────
 
 fn bench_prefill_backend(
-    reg: &KernelRegistry, ws: &Workspace, cublas_handle: cublasHandle_t,
+    reg: &KernelRegistry, ws: &Workspace, cublas: &CuBlas, cublas_handle: cublasHandle_t,
     backend: Backend, label: &str,
 ) {
     println!("\n=== Prefill {label} (causal, BF16) vs cuBLAS ===");
@@ -331,6 +350,7 @@ fn bench_prefill_backend(
                 TVMFFIAny::bool_val(false),
                 TVMFFIAny::none(), TVMFFIAny::none(), TVMFFIAny::none(), TVMFFIAny::none(),
                 TVMFFIAny::float64(0.0), TVMFFIAny::float64(sm_scale), TVMFFIAny::float64(1.0),
+                TVMFFIAny::int64(0),       // token_pos_in_items_len
             ]
         };
 
@@ -344,7 +364,7 @@ fn bench_prefill_backend(
         let o_cub = gpu_alloc(total * 2);
         let cub_ms = cuda_bench(3, 20, || {
             cublas_naive_attention(
-                cublas_handle,
+                cublas, cublas_handle,
                 q, k, v, s_buf, o_cub,
                 seq_len as i32, head_dim as i32, num_heads as i32,
             );
@@ -363,15 +383,16 @@ fn bench_prefill_backend(
 }
 
 fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
+    let cublas = CuBlas::load().expect("failed to dlopen libcublas.so");
     let mut cublas_handle: cublasHandle_t = std::ptr::null_mut();
-    unsafe { assert_eq!(cublasCreate_v2(&mut cublas_handle), 0, "cublasCreate failed"); }
+    unsafe { assert_eq!((cublas.create)(&mut cublas_handle), 0, "cublasCreate failed"); }
 
     // FA2 (SM80+)
-    bench_prefill_backend(reg, ws, cublas_handle, Backend::FA2, "FA2");
+    bench_prefill_backend(reg, ws, &cublas, cublas_handle, Backend::FA2, "FA2");
 
     // FA3 (SM90+, Hopper TMA)
     if reg.arch() >= 90 {
-        bench_prefill_backend(reg, ws, cublas_handle, Backend::FA3, "FA3");
+        bench_prefill_backend(reg, ws, &cublas, cublas_handle, Backend::FA3, "FA3");
     }
 
     // FP8 E4M3 prefill (SM90+)
@@ -535,7 +556,7 @@ fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
 
     println!("\n  * cuBLAS = two GEMMs only (no softmax, no causal mask)");
 
-    unsafe { cublasDestroy_v2(cublas_handle); }
+    unsafe { (cublas.destroy)(cublas_handle); }
 }
 
 // ── Bench: Decode ────────────────────────────────────────────────────
@@ -545,8 +566,9 @@ fn bench_decode(reg: &KernelRegistry, ws: &Workspace) {
     println!("{:<8} {:<8} {:<6} {:<6} {:>10} {:>10} {:>8}",
         "batch", "kv_len", "heads", "hdim", "FlashInfer", "cuBLAS", "speedup");
 
+    let cublas = CuBlas::load().expect("failed to dlopen libcublas.so");
     let mut cublas_handle: cublasHandle_t = std::ptr::null_mut();
-    unsafe { assert_eq!(cublasCreate_v2(&mut cublas_handle), 0); }
+    unsafe { assert_eq!((cublas.create)(&mut cublas_handle), 0); }
 
     let configs = [
         (1, 512, 32, 128),
@@ -675,7 +697,7 @@ fn bench_decode(reg: &KernelRegistry, ws: &Workspace) {
             let bp = &beta as *const f32 as *const c_void;
             unsafe {
                 // S[bh, 1, kv] = Q[bh, 1, d] @ K[bh, kv, d]^T
-                cublasGemmStridedBatchedEx(
+                (cublas.gemm)(
                     cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
                     sq, kv, d, ap,
                     cub_q, CUDA_R_16BF, d, (sq * d) as i64,
@@ -685,7 +707,7 @@ fn bench_decode(reg: &KernelRegistry, ws: &Workspace) {
                     bh, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT,
                 );
                 // O[bh, 1, d] = S[bh, 1, kv] @ V[bh, kv, d]
-                cublasGemmStridedBatchedEx(
+                (cublas.gemm)(
                     cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T,
                     d, sq, kv, ap,
                     cub_v, CUDA_R_16BF, d, (kv * d) as i64,
@@ -708,7 +730,7 @@ fn bench_decode(reg: &KernelRegistry, ws: &Workspace) {
         }
     }
 
-    unsafe { cublasDestroy_v2(cublas_handle); }
+    unsafe { (cublas.destroy)(cublas_handle); }
 }
 
 // ── Bench: Utility kernels ───────────────────────────────────────────

@@ -3,9 +3,9 @@
 //! Compares FA4 GPU output against a naive CPU attention reference implementation.
 //! Uses deterministic sin/cos input patterns for reproducibility.
 //!
-//! Run: cargo test -p prelude-flash-attn-v4 --test correctness -- --ignored --nocapture
+//! Run: cargo test -p prelude-flash-attn-v4 --release --test correctness
 
-use half::bf16;
+use half::{bf16, f16};
 use prelude_flash_attn_v4::{KernelDtype, KernelKey, KernelRegistry};
 use std::ffi::c_void;
 
@@ -20,6 +20,8 @@ unsafe extern "C" {
     fn cudaFree(devPtr: *mut c_void) -> i32;
     fn cudaMemset(devPtr: *mut c_void, value: i32, count: usize) -> i32;
     fn cudaStreamCreate(stream: *mut *mut c_void) -> i32;
+    fn cudaStreamSynchronize(stream: *mut c_void) -> i32;
+    fn cudaStreamDestroy(stream: *mut c_void) -> i32;
 }
 
 const H2D: i32 = 1;
@@ -32,15 +34,10 @@ fn cuda_check(code: i32, msg: &str) {
     }
 }
 
-fn test_stream() -> *mut c_void {
-    use std::sync::OnceLock;
-    static STREAM: OnceLock<usize> = OnceLock::new();
-    let ptr = *STREAM.get_or_init(|| {
-        let mut stream: *mut c_void = std::ptr::null_mut();
-        cuda_check(unsafe { cudaStreamCreate(&mut stream) }, "cudaStreamCreate");
-        stream as usize
-    });
-    ptr as *mut c_void
+fn new_stream() -> *mut c_void {
+    let mut stream: *mut c_void = std::ptr::null_mut();
+    cuda_check(unsafe { cudaStreamCreate(&mut stream) }, "cudaStreamCreate");
+    stream
 }
 
 // ── GPU memory helpers ──────────────────────────────────────────────
@@ -173,17 +170,32 @@ fn naive_attention(
 
 // ── Test helpers ────────────────────────────────────────────────────
 
-fn generate_deterministic_bf16(count: usize, seed: u32) -> Vec<bf16> {
+fn generate_deterministic_f32(count: usize, seed: u32) -> Vec<f32> {
     (0..count)
-        .map(|i| {
-            let x = ((i as f32 + seed as f32 * 0.1) * 0.01).sin() * 0.5;
-            bf16::from_f32(x)
-        })
+        .map(|i| ((i as f32 + seed as f32 * 0.1) * 0.01).sin() * 0.5)
         .collect()
 }
 
-fn bf16_to_f32(data: &[bf16]) -> Vec<f32> {
-    data.iter().map(|x| x.to_f32()).collect()
+/// Generate half-precision data and return (gpu-uploadable bytes as Vec<u16>, f32 reference).
+fn generate_deterministic_half(count: usize, seed: u32, dtype: KernelDtype) -> (Vec<u16>, Vec<f32>) {
+    let f32_data = generate_deterministic_f32(count, seed);
+    let half_data: Vec<u16> = match dtype {
+        KernelDtype::BF16 => f32_data.iter().map(|&x| bf16::from_f32(x).to_bits()).collect(),
+        KernelDtype::FP16 => f32_data.iter().map(|&x| f16::from_f32(x).to_bits()).collect(),
+    };
+    // Convert back through half for accurate reference (matches quantization loss)
+    let ref_f32: Vec<f32> = match dtype {
+        KernelDtype::BF16 => half_data.iter().map(|&b| bf16::from_bits(b).to_f32()).collect(),
+        KernelDtype::FP16 => half_data.iter().map(|&b| f16::from_bits(b).to_f32()).collect(),
+    };
+    (half_data, ref_f32)
+}
+
+fn half_output_to_f32(data: &[u16], dtype: KernelDtype) -> Vec<f32> {
+    match dtype {
+        KernelDtype::BF16 => data.iter().map(|&b| bf16::from_bits(b).to_f32()).collect(),
+        KernelDtype::FP16 => data.iter().map(|&b| f16::from_bits(b).to_f32()).collect(),
+    }
 }
 
 fn compare_outputs(actual: &[f32], expected: &[f32], atol: f32, rtol: f32) -> (f32, f32, usize) {
@@ -248,13 +260,10 @@ fn run_test(
 
     let q_elems = total_tokens * num_heads_q * head_dim;
     let k_elems = total_tokens * num_heads_k * head_dim;
-    let q_bf16 = generate_deterministic_bf16(q_elems, 1);
-    let k_bf16 = generate_deterministic_bf16(k_elems, 2);
-    let v_bf16 = generate_deterministic_bf16(k_elems, 3);
+    let (q_half, q_f32) = generate_deterministic_half(q_elems, 1, dtype);
+    let (k_half, k_f32) = generate_deterministic_half(k_elems, 2, dtype);
+    let (v_half, v_f32) = generate_deterministic_half(k_elems, 3, dtype);
 
-    let q_f32 = bf16_to_f32(&q_bf16);
-    let k_f32 = bf16_to_f32(&k_bf16);
-    let v_f32 = bf16_to_f32(&v_bf16);
     let expected = naive_attention(
         &q_f32, &k_f32, &v_f32,
         num_heads_q, num_heads_k, head_dim,
@@ -262,9 +271,9 @@ fn run_test(
         softmax_scale, causal, softcap, window_left, window_right,
     );
 
-    let q_gpu = gpu_upload(&q_bf16);
-    let k_gpu = gpu_upload(&k_bf16);
-    let v_gpu = gpu_upload(&v_bf16);
+    let q_gpu = gpu_upload(&q_half);
+    let k_gpu = gpu_upload(&k_half);
+    let v_gpu = gpu_upload(&v_half);
     let o_gpu = gpu_alloc(q_elems * 2);
     let cu_gpu = gpu_upload(cu_seqlens);
 
@@ -275,16 +284,18 @@ fn run_test(
     let cu_shape: [i64; 1] = [(batch_size + 1) as _];
 
     let result = unsafe {
+        let stream = new_stream();
         prelude_flash_attn_v4::fa4_varlen_fwd(
             &registry, func,
             q_gpu, k_gpu, v_gpu, o_gpu,
             std::ptr::null_mut(),
             softmax_scale,
-            test_stream(),
+            stream,
             cu_gpu, cu_gpu,
             &q_shape, &k_shape, &o_shape, &lse_shape, &cu_shape,
             0, window_left, window_right,
             None, None,
+            dtype,
         )
     };
     result.expect("FA4 kernel call failed");
@@ -292,8 +303,8 @@ fn run_test(
     cuda_check(unsafe { cudaDeviceSynchronize() }, "sync after kernel");
     assert_eq!(unsafe { cudaGetLastError() }, 0, "CUDA error after kernel");
 
-    let out_bf16: Vec<bf16> = gpu_download(o_gpu, q_elems);
-    let actual = bf16_to_f32(&out_bf16);
+    let out_half: Vec<u16> = gpu_download(o_gpu, q_elems);
+    let actual = half_output_to_f32(&out_half, dtype);
 
     let (max_diff, mean_diff, mismatches) = compare_outputs(&actual, &expected, atol, rtol);
     eprintln!(
@@ -359,11 +370,11 @@ fn run_test_paged(
     let total_blocks: usize = blocks_per_seq.iter().sum();
 
     let q_elems = total_q * num_heads_q * head_dim;
-    let q_bf16 = generate_deterministic_bf16(q_elems, 1);
+    let (q_half, q_f32) = generate_deterministic_half(q_elems, 1, KernelDtype::BF16);
 
     let total_k: usize = seq_lens_k.iter().sum();
-    let k_flat_bf16 = generate_deterministic_bf16(total_k * num_heads_k * head_dim, 2);
-    let v_flat_bf16 = generate_deterministic_bf16(total_k * num_heads_k * head_dim, 3);
+    let (k_flat_half, k_f32) = generate_deterministic_half(total_k * num_heads_k * head_dim, 2, KernelDtype::BF16);
+    let (v_flat_half, v_f32) = generate_deterministic_half(total_k * num_heads_k * head_dim, 3, KernelDtype::BF16);
 
     let mut page_table = vec![0i32; batch_size * max_blocks_per_seq];
     let mut next_block = 0usize;
@@ -375,8 +386,8 @@ fn run_test_paged(
     }
 
     let cache_elems = total_blocks * block_size * num_heads_k * head_dim;
-    let mut k_cache = vec![bf16::ZERO; cache_elems];
-    let mut v_cache = vec![bf16::ZERO; cache_elems];
+    let mut k_cache = vec![0u16; cache_elems];
+    let mut v_cache = vec![0u16; cache_elems];
 
     let mut k_offset = 0usize;
     for seq in 0..batch_size {
@@ -391,18 +402,13 @@ fn run_test_paged(
                     let dst = phys_block * block_size * num_heads_k * head_dim
                         + blk_offset * num_heads_k * head_dim
                         + h * head_dim + d;
-                    k_cache[dst] = k_flat_bf16[src];
-                    v_cache[dst] = v_flat_bf16[src];
+                    k_cache[dst] = k_flat_half[src];
+                    v_cache[dst] = v_flat_half[src];
                 }
             }
         }
         k_offset += seq_lens_k[seq];
     }
-
-    // CPU reference: flat K/V
-    let q_f32 = bf16_to_f32(&q_bf16);
-    let k_f32 = bf16_to_f32(&k_flat_bf16);
-    let v_f32 = bf16_to_f32(&v_flat_bf16);
 
     let mut cu_seqlens_k_flat = vec![0i32; batch_size + 1];
     for (i, &len) in seq_lens_k.iter().enumerate() {
@@ -417,7 +423,7 @@ fn run_test_paged(
     );
 
     // GPU
-    let q_gpu = gpu_upload(&q_bf16);
+    let q_gpu = gpu_upload(&q_half);
     let k_cache_gpu = gpu_upload(&k_cache);
     let v_cache_gpu = gpu_upload(&v_cache);
     let o_gpu = gpu_alloc(q_elems * 2);
@@ -433,8 +439,9 @@ fn run_test_paged(
     let seqused_k_shape: [i64; 1] = [batch_size as _];
     let pt_shape: [i64; 2] = [batch_size as _, max_blocks_per_seq as _];
 
+    let stream = new_stream();
     let registry2 = KernelRegistry::new();
-    registry2.set_stream(0, test_stream());
+    registry2.set_stream(0, stream);
 
     let result = unsafe {
         prelude_flash_attn_v4::fa4_varlen_paged_fwd(
@@ -442,13 +449,14 @@ fn run_test_paged(
             q_gpu, k_cache_gpu, v_cache_gpu, o_gpu,
             std::ptr::null_mut(),
             softmax_scale,
-            test_stream(),
+            stream,
             cu_q_gpu,
             seqused_k_gpu,
             pt_gpu,
             &q_shape, &k_shape, &o_shape, &lse_shape,
             &cu_q_shape, &seqused_k_shape, &pt_shape,
             0, None, None,
+            KernelDtype::BF16,
         )
     };
     result.expect("FA4 paged kernel call failed");
@@ -456,8 +464,8 @@ fn run_test_paged(
     cuda_check(unsafe { cudaDeviceSynchronize() }, "sync after paged kernel");
     assert_eq!(unsafe { cudaGetLastError() }, 0, "CUDA error after paged kernel");
 
-    let out_bf16: Vec<bf16> = gpu_download(o_gpu, q_elems);
-    let actual = bf16_to_f32(&out_bf16);
+    let out_half: Vec<u16> = gpu_download(o_gpu, q_elems);
+    let actual = half_output_to_f32(&out_half, KernelDtype::BF16);
 
     let (max_diff, mean_diff, mismatches) = compare_outputs(&actual, &expected, atol, rtol);
     eprintln!(
@@ -477,21 +485,21 @@ fn run_test_paged(
 // ── Non-paged tests ────────────────────────────────────────────────
 
 #[test]
-#[ignore]
+
 fn test_fa4_single_seq_causal() {
     eprintln!("test_fa4_single_seq_causal: hdim=128, gqa=1, seq=64");
     run_test(128, 8, 8, &[0, 64], true, None, None, None, KernelDtype::BF16, 1e-2, 1e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_single_seq_noncausal() {
     eprintln!("test_fa4_single_seq_noncausal: hdim=128, gqa=1, seq=64");
     run_test(128, 8, 8, &[0, 64], false, None, None, None, KernelDtype::BF16, 1e-2, 1e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_multi_seq() {
     eprintln!("test_fa4_multi_seq: hdim=128, gqa=1, seqs=[32,48,16]");
     run_test(128, 8, 8, &[0, 32, 80, 96], true, None, None, None, KernelDtype::BF16, 1e-2, 1e-2);
@@ -500,35 +508,35 @@ fn test_fa4_multi_seq() {
 // ── GQA variants ───────────────────────────────────────────────────
 
 #[test]
-#[ignore]
+
 fn test_fa4_gqa2() {
     eprintln!("test_fa4_gqa2: hdim=128, gqa=2, seq=64");
     run_test(128, 16, 8, &[0, 64], true, None, None, None, KernelDtype::BF16, 1e-2, 1e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_gqa4() {
     eprintln!("test_fa4_gqa4: hdim=128, gqa=4, seq=64");
     run_test(128, 32, 8, &[0, 64], true, None, None, None, KernelDtype::BF16, 1e-2, 1e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_gqa8() {
     eprintln!("test_fa4_gqa8: hdim=128, gqa=8, seq=64");
     run_test(128, 64, 8, &[0, 64], true, None, None, None, KernelDtype::BF16, 1e-2, 1e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_gqa16() {
     eprintln!("test_fa4_gqa16: hdim=128, gqa=16, seq=64");
     run_test(128, 128, 8, &[0, 64], true, None, None, None, KernelDtype::BF16, 1e-2, 1e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_gqa32() {
     eprintln!("test_fa4_gqa32: hdim=128, gqa=32, seq=64");
     run_test(128, 256, 8, &[0, 64], true, None, None, None, KernelDtype::BF16, 1e-2, 1e-2);
@@ -537,28 +545,28 @@ fn test_fa4_gqa32() {
 // ── Head dimension variants ────────────────────────────────────────
 
 #[test]
-#[ignore]
+
 fn test_fa4_hdim64() {
     eprintln!("test_fa4_hdim64: hdim=64, gqa=1, seq=64");
     run_test(64, 8, 8, &[0, 64], true, None, None, None, KernelDtype::BF16, 1e-2, 1e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_hdim96() {
     eprintln!("test_fa4_hdim96: hdim=96, gqa=1, seq=64");
     run_test(96, 8, 8, &[0, 64], true, None, None, None, KernelDtype::BF16, 1e-2, 1e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_hdim192() {
     eprintln!("test_fa4_hdim192: hdim=192, gqa=1, seq=32");
     run_test(192, 8, 8, &[0, 32], true, None, None, None, KernelDtype::BF16, 1e-2, 1e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_hdim256() {
     eprintln!("test_fa4_hdim256: hdim=256, gqa=1, seq=32");
     run_test(256, 8, 8, &[0, 32], true, None, None, None, KernelDtype::BF16, 1e-2, 1e-2);
@@ -567,14 +575,14 @@ fn test_fa4_hdim256() {
 // ── Sliding window ─────────────────────────────────────────────────
 
 #[test]
-#[ignore]
+
 fn test_fa4_window() {
     eprintln!("test_fa4_window: hdim=128, gqa=1, seq=128, window_left=32");
     run_test(128, 8, 8, &[0, 128], true, Some(32), Some(0), None, KernelDtype::BF16, 1e-2, 1e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_window_gqa4() {
     eprintln!("test_fa4_window_gqa4: hdim=128, gqa=4, seq=128, window_left=64");
     run_test(128, 32, 8, &[0, 128], true, Some(64), Some(0), None, KernelDtype::BF16, 1e-2, 1e-2);
@@ -583,21 +591,21 @@ fn test_fa4_window_gqa4() {
 // ── Softcap ────────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
+
 fn test_fa4_softcap30() {
     eprintln!("test_fa4_softcap30: hdim=128, gqa=1, seq=64, softcap=30.0 (Gemma2)");
     run_test(128, 8, 8, &[0, 64], true, None, None, Some(30.0), KernelDtype::BF16, 2e-2, 2e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_softcap50() {
     eprintln!("test_fa4_softcap50: hdim=128, gqa=1, seq=64, softcap=50.0 (Gemma3)");
     run_test(128, 8, 8, &[0, 64], true, None, None, Some(50.0), KernelDtype::BF16, 2e-2, 2e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_softcap_window() {
     eprintln!("test_fa4_softcap_window: hdim=128, softcap=30.0, window_left=32");
     run_test(128, 8, 8, &[0, 128], true, Some(32), Some(0), Some(30.0), KernelDtype::BF16, 2e-2, 2e-2);
@@ -606,14 +614,14 @@ fn test_fa4_softcap_window() {
 // ── FP16 dtype ─────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
+
 fn test_fa4_fp16() {
     eprintln!("test_fa4_fp16: hdim=128, gqa=1, seq=64, fp16");
     run_test(128, 8, 8, &[0, 64], true, None, None, None, KernelDtype::FP16, 1e-2, 1e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_fp16_gqa4() {
     eprintln!("test_fa4_fp16_gqa4: hdim=128, gqa=4, seq=64, fp16");
     run_test(128, 32, 8, &[0, 64], true, None, None, None, KernelDtype::FP16, 1e-2, 1e-2);
@@ -622,14 +630,14 @@ fn test_fa4_fp16_gqa4() {
 // ── Longer sequences ───────────────────────────────────────────────
 
 #[test]
-#[ignore]
+
 fn test_fa4_long_seq() {
     eprintln!("test_fa4_long_seq: hdim=128, gqa=4, seq=512");
     run_test(128, 32, 8, &[0, 512], true, None, None, None, KernelDtype::BF16, 1e-2, 1e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_long_seq_noncausal() {
     eprintln!("test_fa4_long_seq_noncausal: hdim=128, gqa=4, seq=256");
     run_test(128, 32, 8, &[0, 256], false, None, None, None, KernelDtype::BF16, 1e-2, 1e-2);
@@ -638,7 +646,7 @@ fn test_fa4_long_seq_noncausal() {
 // ── Determinism ────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
+
 fn test_fa4_determinism() {
     eprintln!("test_fa4_determinism: run twice, assert bitwise equal");
 
@@ -659,13 +667,13 @@ fn test_fa4_determinism() {
     let q_elems = total_tokens * num_heads_q * head_dim;
     let k_elems = total_tokens * num_heads_k * head_dim;
 
-    let q_bf16 = generate_deterministic_bf16(q_elems, 10);
-    let k_bf16 = generate_deterministic_bf16(k_elems, 20);
-    let v_bf16 = generate_deterministic_bf16(k_elems, 30);
+    let (q_half, _) = generate_deterministic_half(q_elems, 10, KernelDtype::BF16);
+    let (k_half, _) = generate_deterministic_half(k_elems, 20, KernelDtype::BF16);
+    let (v_half, _) = generate_deterministic_half(k_elems, 30, KernelDtype::BF16);
 
-    let q_gpu = gpu_upload(&q_bf16);
-    let k_gpu = gpu_upload(&k_bf16);
-    let v_gpu = gpu_upload(&v_bf16);
+    let q_gpu = gpu_upload(&q_half);
+    let k_gpu = gpu_upload(&k_half);
+    let v_gpu = gpu_upload(&v_half);
     let o_gpu = gpu_alloc(q_elems * 2);
     let cu_seqlens: [i32; 2] = [0, total_tokens as i32];
     let cu_gpu = gpu_upload(&cu_seqlens);
@@ -691,19 +699,20 @@ fn test_fa4_determinism() {
                 cu_gpu, cu_gpu,
                 &q_shape, &k_shape, &o_shape, &lse_shape, &cu_shape,
                 0, None, None, None, None,
+                KernelDtype::BF16,
             )
             .expect("kernel failed");
         }
         cuda_check(unsafe { cudaDeviceSynchronize() }, "sync");
 
-        let out: Vec<bf16> = gpu_download(o_gpu, q_elems);
-        outputs.push(out);
+        let out: Vec<u16> = gpu_download(o_gpu, q_elems);
         eprintln!("  run {run}: first 4 values = {:?}",
-                  &outputs.last().unwrap()[..4].iter().map(|x: &bf16| x.to_f32()).collect::<Vec<_>>());
+                  &out[..4].iter().map(|&b| bf16::from_bits(b).to_f32()).collect::<Vec<_>>());
+        outputs.push(out);
     }
 
-    let a: Vec<u16> = outputs[0].iter().map(|x: &bf16| x.to_bits()).collect();
-    let b: Vec<u16> = outputs[1].iter().map(|x: &bf16| x.to_bits()).collect();
+    let a = &outputs[0];
+    let b = &outputs[1];
     assert_eq!(a, b, "FA4 kernel is not deterministic (bitwise mismatch)");
     eprintln!("  determinism: PASS (bitwise equal)");
 
@@ -713,56 +722,56 @@ fn test_fa4_determinism() {
 // ── Paged KV tests ─────────────────────────────────────────────────
 
 #[test]
-#[ignore]
+
 fn test_fa4_paged_hdim128_gqa1() {
     eprintln!("test_fa4_paged_hdim128_gqa1: single seq, 64 Q tokens, 256 KV tokens");
     run_test_paged(128, 8, 8, &[64], &[256], 1e-2, 1e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_paged_hdim128_gqa4() {
     eprintln!("test_fa4_paged_hdim128_gqa4: single seq, 32 Q, 128 KV");
     run_test_paged(128, 32, 8, &[32], &[128], 1e-2, 1e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_paged_hdim128_multi_seq() {
     eprintln!("test_fa4_paged_hdim128_multi_seq: 3 seqs with different lengths");
     run_test_paged(128, 16, 8, &[32, 16, 48], &[256, 128, 384], 1e-2, 1e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_paged_hdim64() {
     eprintln!("test_fa4_paged_hdim64: gqa=2, single seq");
     run_test_paged(64, 16, 8, &[64], &[256], 1e-2, 1e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_paged_hdim96() {
     eprintln!("test_fa4_paged_hdim96: gqa=4, single seq");
     run_test_paged(96, 32, 8, &[64], &[256], 1e-2, 1e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_paged_gqa8() {
     eprintln!("test_fa4_paged_gqa8: hdim=128, gqa=8, multi seq");
     run_test_paged(128, 64, 8, &[32, 64], &[256, 512], 1e-2, 1e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_paged_gqa16() {
     eprintln!("test_fa4_paged_gqa16: hdim=128, gqa=16, single seq");
     run_test_paged(128, 128, 8, &[32], &[256], 1e-2, 1e-2);
 }
 
 #[test]
-#[ignore]
+
 fn test_fa4_paged_long_kv() {
     eprintln!("test_fa4_paged_long_kv: hdim=128, gqa=4, 16 Q tokens, 2048 KV tokens");
     run_test_paged(128, 32, 8, &[16], &[2048], 1e-2, 1e-2);
