@@ -10,6 +10,13 @@ use std::ffi::c_void;
 // ── FFI declarations ────────────────────────────────────────────────────
 
 unsafe extern "C" {
+    fn llama_dequantize(
+        data: *const c_void,
+        output: *mut f32,
+        num_elements: i64,
+        ggml_type_id: i32,
+    );
+
     fn llama_mmq_quantize_q8_1(
         x_bf16: *const c_void,
         x_q8: *mut c_void,
@@ -37,19 +44,48 @@ unsafe extern "C" {
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgmlType {
-    Q4_0 = 2,
-    Q4_1 = 3,
-    Q5_0 = 6,
-    Q5_1 = 7,
-    Q8_0 = 8,
-    Q2K  = 10,
-    Q3K  = 11,
-    Q4K  = 12,
-    Q5K  = 13,
-    Q6K  = 14,
+    Q4_0    = 2,
+    Q4_1    = 3,
+    Q5_0    = 6,
+    Q5_1    = 7,
+    Q8_0    = 8,
+    Q2K     = 10,
+    Q3K     = 11,
+    Q4K     = 12,
+    Q5K     = 13,
+    Q6K     = 14,
+    IQ2XXS  = 16,
+    IQ2XS   = 17,
+    IQ3XXS  = 18,
+    IQ1S    = 19,
+    IQ4NL   = 20,
+    IQ3S    = 21,
+    IQ2S    = 22,
+    IQ4XS   = 23,
+    IQ1M    = 29,
+    MXFP4   = 30,
+    NVFP4   = 33,
 }
 
 // ── Public API ──────────────────────────────────────────────────────────
+
+/// CPU dequantize reference: converts quantized blocks to f32 using llama.cpp's scalar code.
+///
+/// Used for correctness testing — the CPU output serves as ground truth for GPU kernel verification.
+///
+/// # Safety
+/// `data` must point to valid quantized block data of the given type.
+/// `output` must have space for `num_elements` floats.
+pub unsafe fn dequantize_ref(
+    data: *const c_void,
+    output: *mut f32,
+    num_elements: i64,
+    weight_type: GgmlType,
+) {
+    unsafe {
+        llama_dequantize(data, output, num_elements, weight_type as i32);
+    }
+}
 
 /// Quantize BF16 activations to Q8_1_MMQ format on GPU.
 ///

@@ -27,6 +27,15 @@ void llama_mmq_mul_mat(
     void* stream          // cudaStream_t
 );
 
+// CPU dequantize reference (for correctness testing).
+// Dispatches to llama.cpp's scalar dequantize_row_* by type ID.
+void llama_dequantize(
+    const void* data,       // quantized block data (host memory)
+    float* output,          // f32 output buffer
+    int64_t num_elements,   // total number of values (not bytes)
+    int ggml_type_id        // GGML_TYPE_IQ4_NL = 20, etc.
+);
+
 #ifdef __cplusplus
 }
 #endif
