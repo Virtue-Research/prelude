@@ -124,6 +124,55 @@ fn main() {
     let gpu = Gpu::new().expect("No CUDA device found");
     println!("prelude-quant-gemm benchmark\n");
 
+    // ── Dequantize benchmark ──────────────────────────────────────────────
+
+    println!("╔═══════════════════════════════════════════╗");
+    println!("║  Dequantize Throughput (quantized → BF16)  ║");
+    println!("╚═══════════════════════════════════════════╝\n");
+    println!("  warmup={WARMUP} repeats={REPEATS}\n");
+
+    let deq_formats: &[(GgmlType, &str)] = &[
+        (GgmlType::Q4_0,   "Q4_0"),
+        (GgmlType::Q4K,    "Q4_K"),
+        (GgmlType::Q6K,    "Q6_K"),
+        (GgmlType::IQ4NL,  "IQ4NL"),
+        (GgmlType::IQ4XS,  "IQ4XS"),
+        (GgmlType::IQ3S,   "IQ3S"),
+        (GgmlType::MXFP4,  "MXFP4"),
+    ];
+
+    let deq_sizes: &[(usize, &str)] = &[
+        (4096 * 4096,   "4K×4K"),
+        (4096 * 11008,  "4K×11K"),
+        (5120 * 25600,  "5K×26K"),
+    ];
+
+    for &(n, label) in deq_sizes {
+        print!("  {label:>7} ({:>5.1}M)", n as f64 / 1e6);
+        for &(t, name) in deq_formats {
+            let qk = block_elems(t);
+            if n % qk != 0 { print!("  {name}=skip"); continue; }
+            let total_bytes = (n / qk) * block_bytes(t);
+            let raw = random_bytes(total_bytes, 42 + t as u64);
+            let d_input = gpu.upload(&raw);
+            let mut d_output: CudaSlice<half::bf16> = gpu.alloc_zeros(n);
+
+            let us = bench_us(|| unsafe {
+                let (ip, _g1) = d_input.device_ptr(&gpu.stream);
+                let (op, _g2) = d_output.device_ptr_mut(&gpu.stream);
+                prelude_quant_gemm::gpu_dequantize(
+                    ip as *const c_void, op as *mut c_void,
+                    n as i64, t, gpu.stream_ptr(),
+                );
+            }, &gpu);
+
+            let gb_s = (n as f64 * 2.0) / us / 1e3; // BF16 output bytes / time
+            print!("  {name}={us:.0}us({gb_s:.0}GB/s)");
+        }
+        println!();
+    }
+    println!();
+
     // ── MMVQ benchmark (decode M=1) ─────────────────────────────────────
 
     println!("╔═══════════════════════════════════════════╗");

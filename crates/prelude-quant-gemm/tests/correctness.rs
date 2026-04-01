@@ -37,6 +37,11 @@ impl Gpu {
         self.stream.clone_dtoh(d).unwrap()
     }
 
+    fn download_bf16_as_f32(&self, d: &CudaSlice<half::bf16>) -> Vec<f32> {
+        let bf16_vec: Vec<half::bf16> = self.stream.clone_dtoh(d).unwrap();
+        bf16_vec.iter().map(|v| v.to_f32()).collect()
+    }
+
     fn sync(&self) { self.stream.synchronize().unwrap(); }
 }
 
@@ -222,6 +227,188 @@ fn mmvq_correctness() {
         for &(t, label) in formats {
             if k % block_elems(t) != 0 { continue; }
             test_mmvq(t, label, n, k, &gpu);
+        }
+        println!();
+    }
+}
+
+// ── GPU dequantize correctness: gpu_dequantize vs dequantize_ref ────────
+
+fn test_gpu_dequantize(t: GgmlType, label: &str, num_elements: usize, gpu: &Gpu) {
+    let qk = block_elems(t);
+    assert_eq!(num_elements % qk, 0);
+    let total_bytes = (num_elements / qk) * block_bytes(t);
+
+    let raw = random_bytes(total_bytes, 77 + t as u64);
+
+    // CPU reference
+    let ref_f32 = cpu_dequantize(&raw, num_elements, t);
+
+    // GPU dequantize → BF16
+    let d_input = gpu.upload(&raw);
+    let mut d_output: CudaSlice<half::bf16> = gpu.alloc_zeros(num_elements);
+
+    unsafe {
+        let (ip, _g1) = d_input.device_ptr(&gpu.stream);
+        let (op, _g2) = d_output.device_ptr_mut(&gpu.stream);
+        prelude_quant_gemm::gpu_dequantize(
+            ip as *const c_void,
+            op as *mut c_void,
+            num_elements as i64,
+            t,
+            gpu.stream_ptr(),
+        );
+    }
+    gpu.sync();
+
+    let gpu_f32 = gpu.download_bf16_as_f32(&d_output);
+
+    // Compare (BF16 has ~7-bit mantissa, so some error expected)
+    let mut max_abs: f32 = 0.0;
+    let mut fail_count = 0usize;
+    for (r, g) in ref_f32.iter().zip(gpu_f32.iter()) {
+        let err = (r - g).abs();
+        max_abs = max_abs.max(err);
+        let tol = 0.02 + 0.02 * r.abs().max(g.abs());
+        if err > tol { fail_count += 1; }
+    }
+
+    println!("  {label:>6} [{num_elements:>6}]  {}  max_abs={max_abs:.4}  fail={fail_count}/{num_elements}",
+        if fail_count == 0 { "PASS" } else { "FAIL" });
+    assert_eq!(fail_count, 0,
+        "{label} [{num_elements}]: {fail_count}/{num_elements} failed (max_abs={max_abs})");
+}
+
+#[test]
+fn gpu_dequantize_correctness() {
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => { eprintln!("No CUDA device, skipping"); return; }
+    };
+
+    let all_formats: &[(GgmlType, &str)] = &[
+        (GgmlType::Q4_0,   "Q4_0"),
+        (GgmlType::Q4_1,   "Q4_1"),
+        (GgmlType::Q5_0,   "Q5_0"),
+        (GgmlType::Q5_1,   "Q5_1"),
+        (GgmlType::Q8_0,   "Q8_0"),
+        (GgmlType::Q2K,    "Q2_K"),
+        (GgmlType::Q3K,    "Q3_K"),
+        (GgmlType::Q4K,    "Q4_K"),
+        (GgmlType::Q5K,    "Q5_K"),
+        (GgmlType::Q6K,    "Q6_K"),
+        (GgmlType::IQ4NL,  "IQ4NL"),
+        (GgmlType::IQ4XS,  "IQ4XS"),
+        (GgmlType::IQ3S,   "IQ3S"),
+        (GgmlType::IQ3XXS, "IQ3XX"),
+        (GgmlType::IQ2S,   "IQ2S"),
+        (GgmlType::IQ2XS,  "IQ2XS"),
+        (GgmlType::IQ2XXS, "IQ2XX"),
+        (GgmlType::IQ1S,   "IQ1S"),
+        (GgmlType::IQ1M,   "IQ1M"),
+        (GgmlType::MXFP4,  "MXFP4"),
+        (GgmlType::NVFP4,  "NVFP4"),
+    ];
+
+    println!("\n=== GPU Dequantize Correctness (GPU BF16 vs llama.cpp CPU F32) ===\n");
+    for &n in &[256usize, 1024, 4096] {
+        for &(t, label) in all_formats {
+            if n % block_elems(t) != 0 { continue; }
+            test_gpu_dequantize(t, label, n, &gpu);
+        }
+        println!();
+    }
+}
+
+// ── Tiled MMQ correctness: GPU tiled MMQ vs CPU dequant + f32 matmul ────
+
+fn test_tiled_mmq(t: GgmlType, label: &str, m: usize, n: usize, k: usize, gpu: &Gpu) {
+    let qk = block_elems(t);
+    assert_eq!(k % qk, 0);
+    let total_w_bytes = n * (k / qk) * block_bytes(t);
+
+    let raw_w = random_bytes(total_w_bytes, 55 + t as u64);
+    let w_f32 = cpu_dequantize(&raw_w, n * k, t);
+
+    // CPU reference: f32 matmul Y[M,N] = X[M,K] @ W[N,K]^T
+    let x_f32: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.007).cos()).collect();
+    let mut ref_y = vec![0.0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum = 0.0f64;
+            for l in 0..k {
+                sum += x_f32[i * k + l] as f64 * w_f32[j * k + l] as f64;
+            }
+            ref_y[i * n + j] = sum as f32;
+        }
+    }
+
+    // GPU: BF16 activations → quantize Q8_1 → tiled MMQ
+    let x_bf16: Vec<half::bf16> = x_f32.iter().map(|v| half::bf16::from_f32(*v)).collect();
+    let d_w = gpu.upload(&raw_w);
+    let d_x = gpu.upload(&x_bf16);
+
+    // Q8_1_MMQ buffer (conservative size)
+    let ne00_padded = ((k + 511) / 512) * 512;
+    let q8_buf_size = m * (ne00_padded / 128) * 144 + m * 144;
+    let mut d_q8: CudaSlice<u8> = gpu.alloc_zeros(q8_buf_size);
+    let mut d_y: CudaSlice<f32> = gpu.alloc_zeros(m * n);
+
+    unsafe {
+        let (xp, _g1) = d_x.device_ptr(&gpu.stream);
+        let (qp, _g2) = d_q8.device_ptr_mut(&gpu.stream);
+        let (wp, _g3) = d_w.device_ptr(&gpu.stream);
+        let (yp, _g4) = d_y.device_ptr_mut(&gpu.stream);
+        prelude_quant_gemm::quantize_q8_1(
+            xp as *const c_void, qp as *mut c_void,
+            m as i64, k as i64, t, gpu.stream_ptr(),
+        );
+        prelude_quant_gemm::mul_mat_q(
+            wp as *const c_void, qp as *const c_void, yp as *mut f32,
+            m as i64, n as i64, k as i64,
+            t, 0, gpu.stream_ptr(),
+        );
+    }
+    gpu.sync();
+
+    let gpu_y = gpu.download_f32(&d_y);
+
+    let mut max_rel: f32 = 0.0;
+    let mut fail_count = 0usize;
+    for (r, g) in ref_y.iter().zip(gpu_y.iter()) {
+        let err = (r - g).abs();
+        let denom = r.abs().max(1e-6);
+        let rel = err / denom;
+        max_rel = max_rel.max(rel);
+        // Double quantization (weight + Q8_1 activation) = higher tolerance
+        if rel > 0.3 && err > 2.0 { fail_count += 1; }
+    }
+
+    let total = m * n;
+    println!("  {label:>5} [{m}×{n}×{k}]  {}  max_rel={max_rel:.4}  fail={fail_count}/{total}",
+        if fail_count == 0 { "PASS" } else { "FAIL" });
+    assert_eq!(fail_count, 0,
+        "{label} [{m}×{n}×{k}]: {fail_count}/{total} failed (max_rel={max_rel})");
+}
+
+#[test]
+fn tiled_mmq_correctness() {
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => { eprintln!("No CUDA device, skipping"); return; }
+    };
+
+    let formats: &[(GgmlType, &str)] = &[
+        (GgmlType::Q4_0, "Q4_0"),
+        (GgmlType::Q4K,  "Q4_K"),
+        (GgmlType::Q6K,  "Q6_K"),
+    ];
+
+    println!("\n=== Tiled MMQ Correctness (GPU vs CPU dequant+matmul) ===\n");
+    for &(m, n, k) in &[(32usize, 256, 1024), (64, 512, 4096)] {
+        for &(t, label) in formats {
+            if k % block_elems(t) != 0 { continue; }
+            test_tiled_mmq(t, label, m, n, k, &gpu);
         }
         println!();
     }
