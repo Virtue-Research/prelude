@@ -110,3 +110,13 @@ pub fn dequantize_q5k_bf16(quantized_data: &Tensor, num_elements: usize) -> Resu
 pub fn dequantize_q6k_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
     dequantize_to_bf16(quantized_data, num_elements, "dequantize_q6_K_bf16")
 }
+
+/// Dequantize IQ4_NL blocks to BF16 on GPU.
+pub fn dequantize_iq4_nl_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
+    dequantize_to_bf16(quantized_data, num_elements, "dequantize_iq4_nl_bf16")
+}
+
+/// Dequantize IQ4_XS blocks to BF16 on GPU.
+pub fn dequantize_iq4_xs_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
+    dequantize_to_bf16(quantized_data, num_elements, "dequantize_iq4_xs_bf16")
+}

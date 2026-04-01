@@ -413,6 +413,82 @@ extern "C" __global__ void dequantize_q5_K_bf16(
     y[i] = __float2bfloat16(d * (float)(q5_low + q5_high * 16) - min_val);
 }
 
+// ── IQ4_NL block structure and lookup table ─────────────────────────────
+
+#define QK4_NL 32
+
+struct block_iq4_nl {
+    uint16_t d;        // FP16 scale
+    uint8_t qs[16];    // 32 × 4-bit non-linear indices
+};
+
+struct block_iq4_xs {
+    uint16_t d;        // FP16 super-block scale
+    uint16_t scales_h; // upper 2 bits of 8 sub-block scales
+    uint8_t scales_l[4]; // lower 4 bits of 8 sub-block scales
+    uint8_t qs[128];   // 256 × 4-bit non-linear indices
+};
+
+__device__ static const int8_t kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
+// ── IQ4_NL dequantize (32 values/block → BF16) ─────────────────────────
+
+extern "C" __global__ void dequantize_iq4_nl_bf16(
+    const block_iq4_nl* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    uint64_t num_elements
+) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_elements) return;
+
+    const uint64_t block_idx = i / QK4_NL;
+    const uint32_t within_block = i % QK4_NL;
+
+    const block_iq4_nl& blk = x[block_idx];
+    const float d = fp16_to_f32(blk.d);
+
+    const uint32_t nibble = (within_block < 16)
+        ? (blk.qs[within_block] & 0xF)
+        : (blk.qs[within_block - 16] >> 4);
+
+    y[i] = __float2bfloat16(d * (float)kvalues_iq4nl[nibble]);
+}
+
+// ── IQ4_XS dequantize (256 values/block → BF16) ────────────────────────
+
+extern "C" __global__ void dequantize_iq4_xs_bf16(
+    const block_iq4_xs* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    uint64_t num_elements
+) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_elements) return;
+
+    const uint64_t block_idx = i / QK_K;
+    const uint32_t within_block = i % QK_K;
+
+    const block_iq4_xs& blk = x[block_idx];
+    const float d_all = fp16_to_f32(blk.d);
+
+    // Which 32-element sub-block?
+    const uint32_t sub = within_block / 32;
+    const uint32_t within_sub = within_block % 32;
+
+    // Extract 6-bit scale for this sub-block
+    int ls = (blk.scales_l[sub / 2] >> ((sub % 2) * 4)) & 0x0F;
+    ls |= ((blk.scales_h >> (sub * 2)) & 0x03) << 4;
+    const float dl = d_all * (float)(ls - 32);
+
+    // Extract 4-bit index → lookup in table
+    const uint32_t nibble = (within_sub < 16)
+        ? (blk.qs[sub * 16 + within_sub] & 0xF)
+        : (blk.qs[sub * 16 + within_sub - 16] >> 4);
+
+    y[i] = __float2bfloat16(dl * (float)kvalues_iq4nl[nibble]);
+}
+
 // ── Q6_K dequantize (256 values/block → BF16) ───────────────────────────
 
 extern "C" __global__ void dequantize_q6_K_bf16(

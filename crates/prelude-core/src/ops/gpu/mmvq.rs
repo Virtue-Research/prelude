@@ -182,3 +182,15 @@ pub fn mmvq_q5_K(w: &Tensor, x: &Tensor, n: usize, k: usize) -> Result<Tensor> {
 pub fn mmvq_q6_K(w: &Tensor, x: &Tensor, n: usize, k: usize) -> Result<Tensor> {
     mmvq(w, x, n, k, "mmvq_q6_K", 256)
 }
+
+// ── IQ (Importance-based Quantization) formats ─────────────────────────
+
+/// MMVQ with IQ4_NL weights (4.5 bpw, non-linear 4-bit, 32 elements/block).
+pub fn mmvq_iq4_nl(w: &Tensor, x: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+    mmvq(w, x, n, k, "mmvq_iq4_nl", 32)
+}
+
+/// MMVQ with IQ4_XS weights (4.25 bpw, non-linear 4-bit + sub-block scales, 256 elements/block).
+pub fn mmvq_iq4_xs(w: &Tensor, x: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+    mmvq(w, x, n, k, "mmvq_iq4_xs", 256)
+}

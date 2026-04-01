@@ -232,6 +232,54 @@ pub struct BlockQ8K {
 
 const _: () = assert!(core::mem::size_of::<BlockQ8K>() == 292);
 
+// ── IQ (Importance-based Quantization) formats ─────────────────────────
+
+/// Number of elements per IQ4_NL block.
+pub const QK4_NL: usize = 32;
+
+/// IQ4_NL non-linear lookup table: 4-bit indices → signed 8-bit values.
+///
+/// These 16 values are statistically optimal for normal-distributed weights,
+/// replacing the uniform `[-8..+7]` mapping used by Q4_0.
+pub const KVALUES_IQ4NL: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
+
+/// IQ4_NL: 32 values → 18 bytes (4.5 bpw, non-linear).
+///
+/// Same struct layout as Q4_0 (d + 16 nibble bytes), but nibble values are
+/// indices into [`KVALUES_IQ4NL`] instead of uniform `[0..15]` with offset -8.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockIQ4NL {
+    /// FP16 scale (delta), stored as raw `u16` bits.
+    pub d: u16,
+    /// 32 × 4-bit non-linear indices, two per byte → 16 bytes.
+    pub qs: [u8; QK4_NL / 2],
+}
+
+const _: () = assert!(core::mem::size_of::<BlockIQ4NL>() == 18);
+
+/// IQ4_XS: 256 values → 136 bytes (4.25 bpw, non-linear + per-sub-block scales).
+///
+/// Uses the same [`KVALUES_IQ4NL`] lookup table as IQ4_NL, but adds per-sub-block
+/// 6-bit scales (4 low bits in `scales_l`, 2 high bits packed in `scales_h`).
+/// 8 sub-blocks of 32 elements each.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockIQ4XS {
+    /// FP16 super-block scale (delta).
+    pub d: u16,
+    /// Packed upper 2 bits of 8 sub-block scales (2 bits × 8 = 16 bits).
+    pub scales_h: u16,
+    /// Packed lower 4 bits of 8 sub-block scales (4 bits × 8 = 32 bits = 4 bytes).
+    pub scales_l: [u8; QK_K / 64],
+    /// 256 × 4-bit non-linear indices, two per byte → 128 bytes.
+    pub qs: [u8; QK_K / 2],
+}
+
+const _: () = assert!(core::mem::size_of::<BlockIQ4XS>() == 136);
+
 /// Extract the j-th (scale, min) pair from a Q4_K packed scales array.
 ///
 /// The 12-byte `scales` array encodes 8 × 6-bit scales and 8 × 6-bit mins
@@ -281,6 +329,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<BlockQ5K>(), 176);
         assert_eq!(core::mem::size_of::<BlockQ6K>(), 210);
         assert_eq!(core::mem::size_of::<BlockQ8K>(), 292);
+        assert_eq!(core::mem::size_of::<BlockIQ4NL>(), 18);
+        assert_eq!(core::mem::size_of::<BlockIQ4XS>(), 136);
     }
 
     #[test]

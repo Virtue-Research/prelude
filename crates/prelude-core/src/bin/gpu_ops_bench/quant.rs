@@ -80,6 +80,9 @@ pub fn verify(device: &Device) -> Result<()> {
         verify_format(GgmlDType::Q5_1, "dequantize_q5_1_bf16", "Q5_1", n, device)?;
         verify_format(GgmlDType::Q8_0, "dequantize_q8_0_bf16", "Q8_0", n, device)?;
 
+        // IQ4_NL (32-element blocks, manual verification)
+        verify_iq4_nl_dequant(n, device)?;
+
         // K-quants use 256-element blocks
         if n % 256 == 0 {
             verify_format(GgmlDType::Q2K, "dequantize_q2_K_bf16", "Q2_K", n, device)?;
@@ -87,9 +90,68 @@ pub fn verify(device: &Device) -> Result<()> {
             verify_format(GgmlDType::Q4K, "dequantize_q4_K_bf16", "Q4_K", n, device)?;
             verify_format(GgmlDType::Q5K, "dequantize_q5_K_bf16", "Q5_K", n, device)?;
             verify_format(GgmlDType::Q6K, "dequantize_q6_K_bf16", "Q6_K", n, device)?;
+
+            // IQ4_XS (256-element blocks)
+            verify_iq4_xs_dequant(n, device)?;
         }
         println!();
     }
+    Ok(())
+}
+
+/// Verify IQ4_NL dequantize: manual blocks → GPU dequant → compare vs expected.
+fn verify_iq4_nl_dequant(n: usize, device: &Device) -> Result<()> {
+    let (raw_bytes, expected_f32) = make_iq4_nl_data(1, n, 42);
+
+    let gpu_bytes = Tensor::from_vec(raw_bytes, ((n / QK4_NL) * 18,), device)?;
+    let gpu_bf16 = quant::dequantize_to_bf16(&gpu_bytes, n, "dequantize_iq4_nl_bf16")?;
+    let gpu_f32: Vec<f32> = gpu_bf16
+        .to_dtype(DType::F32)?
+        .to_device(&Device::Cpu)?
+        .to_vec1()?;
+
+    let mut max_abs: f32 = 0.0;
+    let mut fail_count = 0usize;
+    for (r, g) in expected_f32.iter().zip(gpu_f32.iter()) {
+        let err = (r - g).abs();
+        max_abs = max_abs.max(err);
+        let tol = 0.01 + 0.01 * r.abs().max(g.abs());
+        if err > tol {
+            fail_count += 1;
+        }
+    }
+    let status = if fail_count == 0 { "PASS" } else { "FAIL" };
+    println!(
+        "  IQ4NL [{n:>6}]  {status}  max_abs={max_abs:.6}  fail={fail_count}/{n}"
+    );
+    Ok(())
+}
+
+/// Verify IQ4_XS dequantize: manual blocks → GPU dequant → compare vs expected.
+fn verify_iq4_xs_dequant(n: usize, device: &Device) -> Result<()> {
+    let (raw_bytes, expected_f32) = make_iq4_xs_data(1, n, 42);
+
+    let gpu_bytes = Tensor::from_vec(raw_bytes, ((n / QK_K) * 136,), device)?;
+    let gpu_bf16 = quant::dequantize_to_bf16(&gpu_bytes, n, "dequantize_iq4_xs_bf16")?;
+    let gpu_f32: Vec<f32> = gpu_bf16
+        .to_dtype(DType::F32)?
+        .to_device(&Device::Cpu)?
+        .to_vec1()?;
+
+    let mut max_abs: f32 = 0.0;
+    let mut fail_count = 0usize;
+    for (r, g) in expected_f32.iter().zip(gpu_f32.iter()) {
+        let err = (r - g).abs();
+        max_abs = max_abs.max(err);
+        let tol = 0.01 + 0.01 * r.abs().max(g.abs());
+        if err > tol {
+            fail_count += 1;
+        }
+    }
+    let status = if fail_count == 0 { "PASS" } else { "FAIL" };
+    println!(
+        "  IQ4XS [{n:>6}]  {status}  max_abs={max_abs:.6}  fail={fail_count}/{n}"
+    );
     Ok(())
 }
 
@@ -252,6 +314,108 @@ fn block_bytes(dtype: GgmlDType) -> usize {
     }
 }
 
+// ── IQ4_NL manual block creation (candle doesn't have IQ GgmlDType) ────
+
+use prelude_core::ops::cpu::quant::types::{BlockIQ4NL, BlockIQ4XS, KVALUES_IQ4NL, QK4_NL, QK_K};
+
+/// Create random IQ4_NL blocks and return (raw_bytes, expected_f32_values).
+fn make_iq4_nl_data(n: usize, k: usize, seed: u64) -> (Vec<u8>, Vec<f32>) {
+    assert_eq!(k % QK4_NL, 0);
+    let blocks_per_row = k / QK4_NL;
+    let total_blocks = n * blocks_per_row;
+
+    let mut state = seed;
+    let mut next = || -> u64 {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state
+    };
+
+    let mut raw_bytes = Vec::with_capacity(total_blocks * 18);
+    let mut expected = Vec::with_capacity(n * k);
+
+    for _ in 0..total_blocks {
+        let scale = ((next() % 1000) as f32 / 500.0) - 1.0;
+        let d = half::f16::from_f32(scale).to_bits();
+
+        let mut qs = [0u8; 16];
+        let mut block_vals = [0.0f32; 32];
+        for j in 0..16 {
+            let lo = (next() % 16) as u8;
+            let hi = (next() % 16) as u8;
+            qs[j] = lo | (hi << 4);
+            block_vals[j] = scale * KVALUES_IQ4NL[lo as usize] as f32;
+            block_vals[j + 16] = scale * KVALUES_IQ4NL[hi as usize] as f32;
+        }
+
+        raw_bytes.extend_from_slice(&d.to_le_bytes());
+        raw_bytes.extend_from_slice(&qs);
+        expected.extend_from_slice(&block_vals);
+    }
+
+    (raw_bytes, expected)
+}
+
+/// Create random IQ4_XS blocks and return (raw_bytes, expected_f32_values).
+fn make_iq4_xs_data(n: usize, k: usize, seed: u64) -> (Vec<u8>, Vec<f32>) {
+    assert_eq!(k % QK_K, 0);
+    let blocks_per_row = k / QK_K;
+    let total_blocks = n * blocks_per_row;
+
+    let mut state = seed;
+    let mut next = || -> u64 {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state
+    };
+
+    let mut raw_bytes = Vec::with_capacity(total_blocks * 136);
+    let mut expected = Vec::with_capacity(n * k);
+
+    for _ in 0..total_blocks {
+        let d_all = ((next() % 1000) as f32 / 500.0) - 1.0;
+        let d_bits = half::f16::from_f32(d_all).to_bits();
+
+        // Generate 8 sub-block scales (6-bit each, stored as 4 low + 2 high)
+        let mut scales_l = [0u8; 4];
+        let mut scales_h: u16 = 0;
+        let mut sub_scales = [0i32; 8];
+        for sub in 0..8 {
+            let s = (next() % 64) as i32; // 0..63, will subtract 32 at decode
+            sub_scales[sub] = s - 32;
+            let lo = (s & 0x0F) as u8;
+            let hi = ((s >> 4) & 0x03) as u16;
+            if sub % 2 == 0 {
+                scales_l[sub / 2] |= lo;
+            } else {
+                scales_l[sub / 2] |= lo << 4;
+            }
+            scales_h |= hi << (sub * 2);
+        }
+
+        // Generate qs and compute expected values
+        let mut qs = [0u8; 128];
+        let mut block_vals = [0.0f32; 256];
+        for sub in 0..8 {
+            let dl = d_all * sub_scales[sub] as f32;
+            for j in 0..16 {
+                let lo = (next() % 16) as u8;
+                let hi = (next() % 16) as u8;
+                qs[sub * 16 + j] = lo | (hi << 4);
+                block_vals[sub * 32 + j] = dl * KVALUES_IQ4NL[lo as usize] as f32;
+                block_vals[sub * 32 + j + 16] = dl * KVALUES_IQ4NL[hi as usize] as f32;
+            }
+        }
+
+        // Serialize block: d(2) + scales_h(2) + scales_l(4) + qs(128) = 136 bytes
+        raw_bytes.extend_from_slice(&d_bits.to_le_bytes());
+        raw_bytes.extend_from_slice(&scales_h.to_le_bytes());
+        raw_bytes.extend_from_slice(&scales_l);
+        raw_bytes.extend_from_slice(&qs);
+        expected.extend_from_slice(&block_vals);
+    }
+
+    (raw_bytes, expected)
+}
+
 /// Verify all MMVQ formats.
 pub fn verify_mmvq(device: &Device) -> Result<()> {
     println!("=== GPU MMVQ Correctness ===");
@@ -279,8 +443,97 @@ pub fn verify_mmvq(device: &Device) -> Result<()> {
             verify_mmvq_format(GgmlDType::Q5K, "mmvq_q5_K", "Q5_K", n, k, 256, device)?;
             verify_mmvq_format(GgmlDType::Q6K, "mmvq_q6_K", "Q6_K", n, k, 256, device)?;
         }
+
+        // IQ formats (manual block creation)
+        verify_iq4_nl_mmvq(n, k, device)?;
+        if k % 256 == 0 {
+            verify_iq4_xs_mmvq(n, k, device)?;
+        }
         println!();
     }
+    Ok(())
+}
+
+/// Verify IQ4_NL MMVQ: create blocks manually → GPU MMVQ → compare vs CPU dot.
+fn verify_iq4_nl_mmvq(n: usize, k: usize, device: &Device) -> Result<()> {
+    let (raw_bytes, expected_f32) = make_iq4_nl_data(n, k, 42);
+
+    // Compute reference: dequantized weights dot activations
+    let x_data: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.013).cos()).collect();
+    let mut ref_output = vec![0.0f32; n];
+    for i in 0..n {
+        ref_output[i] = expected_f32[i * k..(i + 1) * k]
+            .iter()
+            .zip(x_data.iter())
+            .map(|(w, x)| w * x)
+            .sum();
+    }
+
+    // Upload to GPU and run MMVQ
+    let gpu_w = Tensor::from_vec(raw_bytes, (n * (k / QK4_NL) * 18,), device)?;
+    let gpu_x = Tensor::from_vec(x_data, (k,), &Device::Cpu)?
+        .to_dtype(DType::BF16)?
+        .to_device(device)?;
+
+    let gpu_y = mmvq::mmvq(&gpu_w, &gpu_x, n, k, "mmvq_iq4_nl", 32)?;
+    let gpu_output: Vec<f32> = gpu_y.to_device(&Device::Cpu)?.to_vec1()?;
+
+    // Compare
+    let mut max_rel: f32 = 0.0;
+    let mut fail_count = 0usize;
+    for (r, g) in ref_output.iter().zip(gpu_output.iter()) {
+        let err = (r - g).abs();
+        let denom = r.abs().max(1e-6);
+        let rel = err / denom;
+        max_rel = max_rel.max(rel);
+        if rel > 0.15 && err > 0.5 {
+            fail_count += 1;
+        }
+    }
+    let status = if fail_count == 0 { "PASS" } else { "FAIL" };
+    println!(
+        "  IQ4NL [{n:>4}×{k:>5}]  {status}  max_rel={max_rel:.4}  fail={fail_count}/{n}"
+    );
+    Ok(())
+}
+
+/// Verify IQ4_XS MMVQ: create blocks manually → GPU MMVQ → compare vs CPU dot.
+fn verify_iq4_xs_mmvq(n: usize, k: usize, device: &Device) -> Result<()> {
+    let (raw_bytes, expected_f32) = make_iq4_xs_data(n, k, 42);
+
+    let x_data: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.013).cos()).collect();
+    let mut ref_output = vec![0.0f32; n];
+    for i in 0..n {
+        ref_output[i] = expected_f32[i * k..(i + 1) * k]
+            .iter()
+            .zip(x_data.iter())
+            .map(|(w, x)| w * x)
+            .sum();
+    }
+
+    let gpu_w = Tensor::from_vec(raw_bytes, (n * (k / QK_K) * 136,), device)?;
+    let gpu_x = Tensor::from_vec(x_data, (k,), &Device::Cpu)?
+        .to_dtype(DType::BF16)?
+        .to_device(device)?;
+
+    let gpu_y = mmvq::mmvq(&gpu_w, &gpu_x, n, k, "mmvq_iq4_xs", 256)?;
+    let gpu_output: Vec<f32> = gpu_y.to_device(&Device::Cpu)?.to_vec1()?;
+
+    let mut max_rel: f32 = 0.0;
+    let mut fail_count = 0usize;
+    for (r, g) in ref_output.iter().zip(gpu_output.iter()) {
+        let err = (r - g).abs();
+        let denom = r.abs().max(1e-6);
+        let rel = err / denom;
+        max_rel = max_rel.max(rel);
+        if rel > 0.15 && err > 0.5 {
+            fail_count += 1;
+        }
+    }
+    let status = if fail_count == 0 { "PASS" } else { "FAIL" };
+    println!(
+        "  IQ4XS [{n:>4}×{k:>5}]  {status}  max_rel={max_rel:.4}  fail={fail_count}/{n}"
+    );
     Ok(())
 }
 

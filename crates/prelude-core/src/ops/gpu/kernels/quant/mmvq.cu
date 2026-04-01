@@ -668,6 +668,109 @@ extern "C" __global__ void name(                                            \
     if (lane == 0) y[row] = sum;                                            \
 }
 
+// ── IQ block structures ────────────────────────────────────────────────
+
+#define QK4_NL 32
+
+struct __align__(2) block_iq4_nl {  // 18 bytes (same layout as Q4_0)
+    uint16_t d;
+    uint8_t qs[16];
+};
+
+struct __align__(2) block_iq4_xs {  // 136 bytes
+    uint16_t d;
+    uint16_t scales_h;
+    uint8_t scales_l[4];
+    uint8_t qs[128];
+};
+
+// ── IQ4_NL lookup table ────────────────────────────────────────────────
+
+__device__ static const int8_t kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
+// ── get_int_from_table_16: 4-bit nibble → 8-bit table lookup ───────────
+//
+// Takes an int32 containing 8 packed 4-bit indices and returns int2 where
+// .x has looked-up values for even nibbles, .y for odd nibbles.
+// Uses __byte_perm for efficient byte selection on CUDA.
+
+__device__ __forceinline__ int2 get_int_from_table_16(int q4, const int8_t* table) {
+    const uint32_t* table32 = (const uint32_t*)table;
+    const uint32_t low_high_selection = (0x32103210 | ((q4 & 0x88888888) >> 1));
+    uint32_t tmp[2];
+    #pragma unroll
+    for (uint32_t i = 0; i < 2; ++i) {
+        const uint32_t shift = 16 * i;
+        const uint32_t low  = __byte_perm(table32[0], table32[1], q4 >> shift);
+        const uint32_t high = __byte_perm(table32[2], table32[3], q4 >> shift);
+        tmp[i] = __byte_perm(low, high, low_high_selection >> shift);
+    }
+    return make_int2(
+        __byte_perm(tmp[0], tmp[1], 0x6420),
+        __byte_perm(tmp[0], tmp[1], 0x7531)
+    );
+}
+
+// ── IQ4_NL × Q8_1: non-linear 4-bit ───────────────────────────────────
+
+__device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
+    const block_iq4_nl& w, const block_q8_1& a
+) {
+    float d4 = fp16_to_f32(w.d);
+    float d8 = fp16_to_f32(a.d);
+
+    const int* q8 = (const int*)a.qs;  // Q8_1 is 4-byte aligned
+
+    int sumi = 0;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        int aux_q4 = load_int(w.qs + j * 4);
+        int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
+        sumi = __dp4a(v.x, q8[j], sumi);
+        sumi = __dp4a(v.y, q8[j + 4], sumi);
+    }
+
+    return d4 * d8 * (float)sumi;
+}
+
+// ── IQ4_XS × Q8_1: non-linear 4-bit with per-sub-block scales ─────────
+
+__device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
+    const block_iq4_xs& w, const block_q8_1* a
+) {
+    float d_all = fp16_to_f32(w.d);
+    float sumf = 0.0f;
+
+    for (int sub = 0; sub < 8; sub++) {
+        float d8 = fp16_to_f32(a[sub].d);
+        const int* q8 = (const int*)a[sub].qs;
+
+        // Extract 6-bit scale: 4 low bits from scales_l + 2 high bits from scales_h
+        int ls = (w.scales_l[sub / 2] >> ((sub % 2) * 4)) & 0x0F;
+        ls |= ((w.scales_h >> (sub * 2)) & 0x03) << 4;
+        float scale = (float)(ls - 32);
+
+        // Process 32 elements (16 bytes of qs → 32 nibbles)
+        int qs_base = sub * 16;
+        int sumi = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int aux_q4 = load_int(w.qs + qs_base + j * 4);
+            int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
+            sumi = __dp4a(v.x, q8[j], sumi);
+            sumi = __dp4a(v.y, q8[j + 4], sumi);
+        }
+
+        sumf += d8 * (float)sumi * scale;
+    }
+
+    return d_all * sumf;
+}
+
+// ── MMVQ kernel instantiations ─────────────────────────────────────────
+
 MMVQ_KERNEL_SIMPLE(mmvq_q4_0, block_q4_0, vec_dot_q4_0_q8_1)
 MMVQ_KERNEL_SIMPLE(mmvq_q4_1, block_q4_1, vec_dot_q4_1_q8_1)
 MMVQ_KERNEL_SIMPLE(mmvq_q5_0, block_q5_0, vec_dot_q5_0_q8_1)
@@ -679,3 +782,6 @@ MMVQ_KERNEL_KQUANT(mmvq_q3_K, block_q3_K, vec_dot_q3_K_q8_1)
 MMVQ_KERNEL_KQUANT(mmvq_q4_K, block_q4_K, vec_dot_q4_K_q8_1)
 MMVQ_KERNEL_KQUANT(mmvq_q5_K, block_q5_K, vec_dot_q5_K_q8_1)
 MMVQ_KERNEL_KQUANT(mmvq_q6_K, block_q6_K, vec_dot_q6_K_q8_1)
+
+MMVQ_KERNEL_SIMPLE(mmvq_iq4_nl, block_iq4_nl, vec_dot_iq4_nl_q8_1)
+MMVQ_KERNEL_KQUANT(mmvq_iq4_xs, block_iq4_xs, vec_dot_iq4_xs_q8_1)
