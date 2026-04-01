@@ -23,6 +23,9 @@ pub(crate) const PTX_KNORM_ROPE_KV_WRITE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/knorm_rope_kv_write.ptx"));
 pub(crate) const PTX_SCATTER_KV_CACHE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/scatter_kv_cache.ptx"));
+pub(crate) const PTX_DEQUANTIZE: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/dequantize.ptx"));
+pub(crate) const PTX_MMVQ: &str = include_str!(concat!(env!("OUT_DIR"), "/mmvq.ptx"));
 
 // Module names for cudarc caching
 pub(crate) const MOD_ADD: &str = "elementwise_add";
@@ -33,6 +36,8 @@ pub(crate) const MOD_QKNORM_ROPE: &str = "rope_qknorm";
 pub(crate) const MOD_MOE_ROUTING: &str = "moe_routing";
 pub(crate) const MOD_KNORM_ROPE_KV_WRITE: &str = "kvcache_knorm_rope_kv_write";
 pub(crate) const MOD_SCATTER_KV_CACHE: &str = "kvcache_scatter_kv_cache";
+pub(crate) const MOD_DEQUANTIZE: &str = "quant_dequantize";
+pub(crate) const MOD_MMVQ: &str = "quant_mmvq";
 
 pub mod elementwise;
 pub mod gemm;
@@ -40,6 +45,10 @@ pub mod rmsnorm;
 pub mod rope;
 pub mod moe;
 pub mod kv_cache;
+pub mod quant;
+pub mod mmvq;
+#[cfg(feature = "quant-gemm")]
+pub mod tiled_mmq;
 
 pub use self::elementwise::*;
 pub use self::rmsnorm::*;

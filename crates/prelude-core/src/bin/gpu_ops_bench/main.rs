@@ -1,24 +1,26 @@
+// GPU kernel micro-benchmark suite.
+//
+// Compares our dispatch path vs cuBLAS/reference for GEMM, attention, etc.
+//
+// Usage:
+//   # All benchmarks, all models:
+//   CUDA_VISIBLE_DEVICES=1 cargo run -p prelude-core --bin gpu_ops_bench --release \
+//       --features flashinfer-v4,cutlass-gemm,deepgemm,bench-cublas,onednn
+//
+//   # Filter by model (substring match):
+//   ... -- 8B
+//
+//   # Run specific benchmark only:
+//   ... -- --gemm
+//   ... -- --gemm 8B
+//   ... -- --quant
+
 #[global_allocator]
 static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
 
-//! GPU kernel micro-benchmark suite.
-//!
-//! Compares our dispatch path vs cuBLAS/reference for GEMM, attention, etc.
-//!
-//! Usage:
-//!   # All benchmarks, all models:
-//!   CUDA_VISIBLE_DEVICES=1 cargo run -p prelude-core --bin gpu_ops_bench --release \
-//!       --features flashinfer-v4,cutlass-gemm,deepgemm,bench-cublas,onednn
-//!
-//!   # Filter by model (substring match):
-//!   ... -- 8B
-//!
-//!   # Run specific benchmark only:
-//!   ... -- --gemm
-//!   ... -- --gemm 8B
-
 mod common;
 mod gemm;
+mod quant;
 
 use candle_core::{Device, Result};
 
@@ -28,12 +30,18 @@ fn main() -> Result<()> {
     // Parse: --bench flags, --verify, and model filters
     let mut run_gemm = false;
     let mut run_verify = false;
+    let mut run_quant = false;
+    let mut run_mmvq = false;
+    let mut run_tiled_mmq = false;
     let mut filter = Vec::new();
 
     for arg in &args {
         match arg.as_str() {
             "--gemm" => run_gemm = true,
             "--verify" => run_verify = true,
+            "--quant" => run_quant = true,
+            "--mmvq" => run_mmvq = true,
+            "--tiled-mmq" => run_tiled_mmq = true,
             "--" => {},  // cargo passes this as separator
             s if s.starts_with("--") => eprintln!("Unknown flag: {s}"),
             _ => filter.push(arg.clone()),
@@ -41,8 +49,8 @@ fn main() -> Result<()> {
     }
 
     // Default: run all benchmarks if none specified
-    let run_all = !run_gemm && !run_verify;
-    if run_all { run_gemm = true; }
+    let run_all = !run_gemm && !run_verify && !run_quant && !run_mmvq && !run_tiled_mmq;
+    if run_all { run_gemm = true; run_quant = true; run_mmvq = true; run_tiled_mmq = true; }
 
     println!("GPU Kernel Micro-Benchmark{}\n",
         if filter.is_empty() { String::new() }
@@ -91,6 +99,42 @@ fn main() -> Result<()> {
 
         println!("d/cub = dispatch/cuBLAS  c/cub = cutlass/cuBLAS  (1.0=parity <1=faster)");
         println!("✓ ≤1.05x  ~ ≤1.3x  ✗ >2x  ✗✗ >5x");
+    }
+
+    if run_quant {
+        println!("\n╔══════════════════════════════════════╗");
+        println!("║     GPU Dequantize Correctness       ║");
+        println!("╚══════════════════════════════════════╝\n");
+        quant::verify(&device)?;
+
+        println!("\n╔══════════════════════════════════════╗");
+        println!("║     GPU Dequantize Throughput         ║");
+        println!("╚══════════════════════════════════════╝\n");
+        quant::bench(&device)?;
+    }
+
+    if run_mmvq {
+        println!("\n╔══════════════════════════════════════╗");
+        println!("║        GPU MMVQ Correctness          ║");
+        println!("╚══════════════════════════════════════╝\n");
+        quant::verify_mmvq(&device)?;
+
+        println!("\n╔══════════════════════════════════════╗");
+        println!("║        GPU MMVQ Throughput            ║");
+        println!("╚══════════════════════════════════════╝\n");
+        quant::bench_mmvq(&device)?;
+    }
+
+    if run_tiled_mmq {
+        #[cfg(feature = "quant-gemm")]
+        {
+            println!("\n╔══════════════════════════════════════╗");
+            println!("║     GPU Tiled MMQ Throughput          ║");
+            println!("╚══════════════════════════════════════╝\n");
+            quant::bench_tiled_mmq(&device)?;
+        }
+        #[cfg(not(feature = "quant-gemm"))]
+        println!("Tiled MMQ requires --features quant-gemm");
     }
     Ok(())
 }
