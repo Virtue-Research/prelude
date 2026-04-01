@@ -1336,17 +1336,21 @@ mod tests {
             println!("INT8 brgemm not available, skipping");
             return;
         }
-        // Create a BF16 tensor and quantize to INT8
+        // Create a BF16 tensor and quantize
+        // Note: brgemm_quantize_bf16_s8 outputs u8 values (= s8 + 128) stored as i8
         let data: Vec<half::bf16> = (0..256)
             .map(|i| half::bf16::from_f32((i as f32 / 128.0) - 1.0))
             .collect();
         let t = Tensor::from_vec(data.clone(), (4, 64), &Device::Cpu).unwrap();
-        let (s8_buf, scale) = brgemm_quantize_bf16_s8(&t).unwrap();
-        assert_eq!(s8_buf.len(), 256);
+        let (buf, scale) = brgemm_quantize_bf16_s8(&t).unwrap();
+        assert_eq!(buf.len(), 256);
         assert!(scale > 0.0, "scale should be positive");
-        // Check that max quantized value is near 127
-        let max_q = s8_buf.iter().map(|x| x.abs() as i32).max().unwrap();
-        assert!(max_q >= 120, "max quantized value should be near 127, got {max_q}");
+        // Max original value ≈ 1.0 → s8=127 → u8=255 (stored as i8=-1)
+        // Min original value ≈ -1.0 → s8=-127 → u8=1 (stored as i8=1)
+        let max_u8 = buf.iter().map(|&x| x as u8).max().unwrap();
+        let min_u8 = buf.iter().map(|&x| x as u8).min().unwrap();
+        assert!(max_u8 >= 248, "max u8 should be near 255, got {max_u8}");
+        assert!(min_u8 <= 8, "min u8 should be near 1, got {min_u8}");
     }
 
     #[test]
@@ -1395,7 +1399,6 @@ mod tests {
         let n = 32;
         let m = 2;
 
-        // Create BF16 weight and pack
         let w_data: Vec<half::bf16> = (0..(n * k))
             .map(|i| half::bf16::from_f32(((i as f32 * 0.003) - 0.5).sin() * 0.1))
             .collect();
@@ -1407,15 +1410,355 @@ mod tests {
             .collect();
         let input = Tensor::from_vec(input_data, (m, k), &Device::Cpu).unwrap();
 
-        // Test with no post-ops (just F32→BF16 conversion via post-ops path)
+        // No post-ops (just fused F32→BF16 conversion) should match plain path
         let out_plain = brgemm_gemm_forward_pub(&input, &packed, m, k, n).unwrap();
         let out_postops = brgemm_gemm_forward_postops(&input, &packed, None, 0, m, k, n).unwrap();
 
         let a = out_plain.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let b = out_postops.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let max_diff = a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        println!("postops vs plain max_diff: {max_diff}");
         assert!(max_diff < 1e-3, "postops path should match plain path, max_diff={max_diff}");
+    }
+
+    #[test]
+    fn test_postops_bias_applied() {
+        init();
+        if !brgemm_available() { return; }
+        let k = 64;
+        let n = 32;
+        let m = 2;
+
+        let w_data: Vec<half::bf16> = (0..n * k)
+            .map(|i| half::bf16::from_f32(((i as f32 * 0.003) - 0.5).sin() * 0.1))
+            .collect();
+        let w_tensor = Tensor::from_vec(w_data, (n, k), &Device::Cpu).unwrap();
+        let packed = BrgemmPackedWeight::pack(&w_tensor).unwrap().unwrap();
+
+        let input_data: Vec<half::bf16> = (0..m * k)
+            .map(|i| half::bf16::from_f32((i as f32 * 0.01) - 0.32))
+            .collect();
+        let input = Tensor::from_vec(input_data, (m, k), &Device::Cpu).unwrap();
+
+        // Large bias so effect is visible
+        let bias_data: Vec<half::bf16> = (0..n)
+            .map(|i| half::bf16::from_f32(10.0 + i as f32))
+            .collect();
+        let bias = Tensor::from_vec(bias_data, (n,), &Device::Cpu).unwrap();
+
+        let out_no_bias = brgemm_gemm_forward_postops(&input, &packed, None, 0, m, k, n).unwrap();
+        let out_bias = brgemm_gemm_forward_postops(&input, &packed, Some(&bias), BRGEMM_POSTOP_BIAS, m, k, n).unwrap();
+
+        let a = out_no_bias.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = out_bias.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let bias_f32 = bias.to_dtype(DType::F32).unwrap().to_vec1::<f32>().unwrap();
+
+        // Each output element should differ by approximately bias[col]
+        for row in 0..m {
+            for col in 0..n {
+                let diff = b[row * n + col] - a[row * n + col];
+                let expected = bias_f32[col];
+                let err = (diff - expected).abs();
+                assert!(err < 0.5, "bias mismatch at [{row},{col}]: diff={diff}, expected={expected}, err={err}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_postops_gelu_applied() {
+        init();
+        if !brgemm_available() { return; }
+        let k = 64;
+        let n = 32;
+        let m = 2;
+
+        let w_data: Vec<half::bf16> = (0..n * k)
+            .map(|i| half::bf16::from_f32(((i as f32 * 0.003) - 0.5).sin() * 0.1))
+            .collect();
+        let w_tensor = Tensor::from_vec(w_data, (n, k), &Device::Cpu).unwrap();
+        let packed = BrgemmPackedWeight::pack(&w_tensor).unwrap().unwrap();
+
+        let input_data: Vec<half::bf16> = (0..m * k)
+            .map(|i| half::bf16::from_f32((i as f32 * 0.01) - 0.32))
+            .collect();
+        let input = Tensor::from_vec(input_data, (m, k), &Device::Cpu).unwrap();
+
+        let out_plain = brgemm_gemm_forward_postops(&input, &packed, None, 0, m, k, n).unwrap();
+        let out_gelu = brgemm_gemm_forward_postops(&input, &packed, None, BRGEMM_POSTOP_GELU_TANH, m, k, n).unwrap();
+
+        let a = out_plain.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = out_gelu.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        // GELU(x) ≠ x for most x, verify output actually changed
+        let mut changed = 0;
+        for i in 0..a.len() {
+            if (a[i] - b[i]).abs() > 1e-6 { changed += 1; }
+        }
+        assert!(changed > a.len() / 2, "GELU should change most elements, only {changed}/{} changed", a.len());
+
+        // Verify GELU correctness: compare with manual GELU on plain output
+        for i in 0..a.len() {
+            let x = a[i];
+            let expected = 0.5 * x * (1.0 + (0.7978845608f32 * (x + 0.044715 * x * x * x)).tanh());
+            let err = (b[i] - expected).abs();
+            assert!(err < 0.05, "GELU mismatch at [{i}]: got={}, expected={expected}, err={err}", b[i]);
+        }
+    }
+
+    #[test]
+    fn test_postops_bias_gelu_combined() {
+        init();
+        if !brgemm_available() { return; }
+        let k = 64;
+        let n = 32;
+        let m = 4;
+
+        let w_data: Vec<half::bf16> = (0..n * k)
+            .map(|i| half::bf16::from_f32(((i as f32 * 0.003) - 0.5).sin() * 0.1))
+            .collect();
+        let w_tensor = Tensor::from_vec(w_data, (n, k), &Device::Cpu).unwrap();
+        let packed = BrgemmPackedWeight::pack(&w_tensor).unwrap().unwrap();
+
+        let input_data: Vec<half::bf16> = (0..m * k)
+            .map(|i| half::bf16::from_f32((i as f32 * 0.01) - 0.32))
+            .collect();
+        let input = Tensor::from_vec(input_data, (m, k), &Device::Cpu).unwrap();
+
+        let bias_data: Vec<half::bf16> = (0..n)
+            .map(|i| half::bf16::from_f32(0.1 * i as f32 - 1.5))
+            .collect();
+        let bias = Tensor::from_vec(bias_data, (n,), &Device::Cpu).unwrap();
+
+        // Fused bias + GELU
+        let flags = BRGEMM_POSTOP_BIAS | BRGEMM_POSTOP_GELU_TANH;
+        let out_fused = brgemm_gemm_forward_postops(&input, &packed, Some(&bias), flags, m, k, n).unwrap();
+
+        // Manual: plain GEMM → add bias → GELU
+        let out_plain = brgemm_gemm_forward_postops(&input, &packed, None, 0, m, k, n).unwrap();
+        let out_manual = Tensor::gelu(&out_plain.broadcast_add(&bias).unwrap()).unwrap();
+
+        let a = out_fused.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = out_manual.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let max_diff = a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        // BF16 rounding + GELU approximation (tanh vs erf) gives some tolerance
+        assert!(max_diff < 0.1, "fused bias+GELU should match manual, max_diff={max_diff}");
+    }
+
+    #[test]
+    fn test_s8_diagnostic() {
+        // Diagnostic: manually verify INT8 GEMM output for a trivial case
+        init();
+        if !brgemm_s8_available() { return; }
+
+        let k = 32;
+        let n = 32;
+        let m = 1;
+
+        // weight: all ones, scales: all 1.0
+        let w_s8 = vec![1i8; n * k];
+        let scales = vec![1.0f32; n];
+        let packed = BrgemmS8PackedWeight::pack(&w_s8, &scales, k, n).unwrap();
+
+        // input: [0.1, 0.2, ..., 0.1*K] in BF16
+        let input_data: Vec<half::bf16> = (0..k)
+            .map(|i| half::bf16::from_f32((i + 1) as f32 * 0.1))
+            .collect();
+        let input = Tensor::from_vec(input_data, (m, k), &Device::Cpu).unwrap();
+
+        // Expected: each output[j] = sum(input_s8[c]) * a_scale * 1.0
+        // With input values [0.1, 0.2, ..., 3.2], a_scale = 3.2/127 ≈ 0.0252
+        // input_s8[c] = round(input[c] / a_scale) = round(input[c] * 127/3.2)
+        // sum(input_s8) ≈ sum(input) / a_scale = 52.8 / 0.0252 ≈ 2095
+        // output ≈ 2095 * 0.0252 * 1.0 ≈ 52.8
+        let expected_sum: f32 = (1..=k as i32).map(|i| i as f32 * 0.1).sum();
+        let out = brgemm_s8_gemm_forward(&input, &packed, m, k, n).unwrap();
+        let out_f32 = out.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        println!("INT8 diagnostic: expected≈{expected_sum:.1}, got[0]={:.4}, got[15]={:.4}, got[31]={:.4}",
+            out_f32[0], out_f32[15], out_f32[31]);
+
+        for j in 0..n {
+            let err = (out_f32[j] - expected_sum).abs();
+            assert!(err < 2.0, "INT8 diagnostic [{j}]: got={:.4}, expected≈{expected_sum:.1}, err={err:.4}", out_f32[j]);
+        }
+
+        // Test 2: per-row weights with per-channel scales
+        // w_s8[j,c] = (j % 5 - 2) for all c. scales[j] = 0.01 * (j+1).
+        let w2_s8: Vec<i8> = (0..n * k).map(|i| ((i / k) % 5) as i8 - 2).collect();
+        let scales2: Vec<f32> = (0..n).map(|j| 0.01 * (j as f32 + 1.0)).collect();
+        let packed2 = BrgemmS8PackedWeight::pack(&w2_s8, &scales2, k, n).unwrap();
+
+        let out2 = brgemm_s8_gemm_forward(&input, &packed2, m, k, n).unwrap();
+        let out2_f32 = out2.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        // Manual reference: brgemm does u8×s8 with compensation.
+        // D[j] = (sum(u8*w) + comp) * a_scale * scales2[j]
+        //       = sum(s8_orig*w) * a_scale * scales2[j]
+        // Note: quantize outputs u8 stored as i8. Recover original s8 = u8 - 128.
+        let (input_u8_vec, a_scale) = brgemm_quantize_bf16_s8(&input).unwrap();
+        let sum_input_s8: i64 = input_u8_vec.iter().map(|&v| (v as u8) as i64 - 128).sum();
+
+        for j in 0..n {
+            let w_val = ((j % 5) as i8 - 2) as f64;
+            let expected = (sum_input_s8 as f64) * w_val * (a_scale as f64) * (scales2[j] as f64);
+            let got = out2_f32[j] as f64;
+            let err = (got - expected).abs();
+            if err > 0.5 {
+                println!("INT8 per-channel [{j}]: w_val={w_val}, scale={:.4}, expected={expected:.4}, got={got:.4}, err={err:.4}",
+                    scales2[j]);
+            }
+            assert!(err < 1.0, "INT8 per-channel [{j}] err={err:.4}");
+        }
+        println!("INT8 per-channel scales: PASS");
+
+        // Test 3: weights that vary within each row (catches VNNI packing bugs)
+        let k3 = 32;
+        let n3 = 32;
+        let w3_s8: Vec<i8> = (0..n3 * k3).map(|i| ((i % k3) as i8) - 16).collect();
+        let scales3 = vec![1.0f32; n3];
+        let packed3 = BrgemmS8PackedWeight::pack(&w3_s8, &scales3, k3, n3).unwrap();
+
+        // Simple input: [1, 1, 1, ...] in INT8 (all ones)
+        let input3_data: Vec<half::bf16> = vec![half::bf16::from_f32(1.0); k3];
+        let input3 = Tensor::from_vec(input3_data, (1, k3), &Device::Cpu).unwrap();
+
+        let out3 = brgemm_s8_gemm_forward(&input3, &packed3, 1, k3, n3).unwrap();
+        let out3_f32 = out3.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        // With input ≈ all 1s (after quantization to INT8):
+        // input_s8[c] ≈ round(1.0 * 127) = 127
+        // C[j] = sum_c(127 * w3_s8[j,c]) = 127 * sum_c(c - 16) for c in 0..31
+        // sum_c(c - 16) = sum(0..31) - 16*32 = 496 - 512 = -16
+        // C[j] = 127 * (-16) = -2032
+        // D[j] = -2032 * a_scale * 1.0 = -2032 * (1.0/127) ≈ -16.0
+        let expected3 = -16.0f32;
+        println!("INT8 varied-K: expected≈{expected3:.1}, got[0]={:.4}, got[15]={:.4}, got[31]={:.4}",
+            out3_f32[0], out3_f32[15], out3_f32[31]);
+        for j in 0..n3 {
+            let err = (out3_f32[j] - expected3).abs();
+            assert!(err < 1.0, "INT8 varied-K [{j}]: got={:.4}, expected={expected3:.1}, err={err:.4}", out3_f32[j]);
+        }
+        println!("INT8 varied-K within row: PASS");
+    }
+
+    #[test]
+    fn test_s8_accuracy_vs_f32() {
+        init();
+        if !brgemm_s8_available() { return; }
+
+        for &(m, k, n) in &[(1, 32, 32), (2, 64, 32), (4, 128, 64)] {
+            let w_f32: Vec<f32> = (0..n * k)
+                .map(|i| ((i as f32 * 0.013) + 0.2).cos() * 0.1)
+                .collect();
+            let mut w_s8 = vec![0i8; n * k];
+            let mut scales = vec![0.0f32; n];
+            for row in 0..n {
+                let slice = &w_f32[row * k..(row + 1) * k];
+                let max_abs = slice.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                scales[row] = max_abs / 127.0;
+                let inv = if max_abs > 0.0 { 127.0 / max_abs } else { 0.0 };
+                for c in 0..k {
+                    w_s8[row * k + c] = (slice[c] * inv).round().clamp(-128.0, 127.0) as i8;
+                }
+            }
+            let packed = BrgemmS8PackedWeight::pack(&w_s8, &scales, k, n).unwrap();
+
+            let input_data: Vec<half::bf16> = (0..m * k)
+                .map(|i| half::bf16::from_f32(((i as f32 * 0.007) - 0.5).sin()))
+                .collect();
+            let input = Tensor::from_vec(input_data, (m, k), &Device::Cpu).unwrap();
+
+            let out_s8 = brgemm_s8_gemm_forward(&input, &packed, m, k, n).unwrap();
+
+            // F32 reference using the QUANTIZED weight (not original) for fair comparison
+            // This isolates GEMM correctness from quantization error
+            let mut w_dequant = vec![0.0f32; n * k];
+            for row in 0..n {
+                for c in 0..k {
+                    w_dequant[row * k + c] = w_s8[row * k + c] as f32 * scales[row];
+                }
+            }
+            let w_tensor = Tensor::from_vec(w_dequant, (n, k), &Device::Cpu).unwrap();
+
+            // Also dequantize input for fair comparison
+            // Note: quantize outputs u8 (=s8+128) stored as i8. Recover s8 for dequant.
+            let (input_u8_buf, a_scale) = brgemm_quantize_bf16_s8(&input).unwrap();
+            let input_dequant: Vec<f32> = input_u8_buf.iter().map(|&v| ((v as u8) as i32 - 128) as f32 * a_scale).collect();
+            let in_tensor = Tensor::from_vec(input_dequant, (m, k), &Device::Cpu).unwrap();
+
+            let out_ref = in_tensor.matmul(&w_tensor.t().unwrap()).unwrap();
+
+            let a = out_s8.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let b = out_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+            let mut max_abs_err = 0.0f32;
+            let mut worst_idx = 0;
+            for (idx, (&va, &vb)) in a.iter().zip(b.iter()).enumerate() {
+                let e = (va - vb).abs();
+                if e > max_abs_err { max_abs_err = e; worst_idx = idx; }
+            }
+            let wi = worst_idx / n;
+            let wj = worst_idx % n;
+            println!("INT8 [{m}x{k}x{n}] max_abs={max_abs_err:.6} at [{wi},{wj}]: got={:.6}, ref={:.6}, a_scale={a_scale:.8}",
+                a[worst_idx], b[worst_idx]);
+
+            // Manually compute the expected dot product for the worst element
+            // input_u8 contains u8 stored as i8; recover s8 = u8 - 128
+            let mut manual_c: i64 = 0;
+            for c in 0..k {
+                let s8_val = input_u8_buf[wi * k + c] as u8 as i64 - 128;
+                manual_c += s8_val * w_s8[wj * k + c] as i64;
+            }
+            let manual_d = manual_c as f64 * a_scale as f64 * scales[wj] as f64;
+            println!("  manual: C_int={manual_c}, D={manual_d:.6}, brgemm_got={:.6}, ref={:.6}",
+                a[worst_idx], b[worst_idx]);
+            assert!(max_abs_err < 1.0, "INT8 GEMM error too large: [{m}x{k}x{n}] max_abs={max_abs_err}");
+        }
+    }
+
+    #[test]
+    fn test_s8_realistic_configs() {
+        init();
+        if !brgemm_s8_available() { return; }
+
+        // Test configs matching real model dimensions
+        for &(m, k, n) in &[(1, 896, 4864), (4, 1536, 8960), (16, 896, 4864)] {
+            let w_f32: Vec<f32> = (0..n * k)
+                .map(|i| ((i as f32 * 0.0031) + 0.1).sin() * 0.05)
+                .collect();
+            let mut w_s8 = vec![0i8; n * k];
+            let mut scales = vec![0.0f32; n];
+            for row in 0..n {
+                let slice = &w_f32[row * k..(row + 1) * k];
+                let max_abs = slice.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                scales[row] = max_abs / 127.0;
+                let inv = if max_abs > 0.0 { 127.0 / max_abs } else { 0.0 };
+                for c in 0..k {
+                    w_s8[row * k + c] = (slice[c] * inv).round().clamp(-128.0, 127.0) as i8;
+                }
+            }
+            let packed = BrgemmS8PackedWeight::pack(&w_s8, &scales, k, n).unwrap();
+
+            let input_data: Vec<half::bf16> = (0..m * k)
+                .map(|i| half::bf16::from_f32(((i as f32 * 0.007) - 0.5).sin()))
+                .collect();
+            let input = Tensor::from_vec(input_data, (m, k), &Device::Cpu).unwrap();
+            let out = brgemm_s8_gemm_forward(&input, &packed, m, k, n).unwrap();
+            assert_eq!(out.dims(), &[m, n]);
+            assert_eq!(out.dtype(), DType::BF16);
+        }
+    }
+
+    #[test]
+    fn test_f8_unavailable_returns_none() {
+        init();
+        // FP8 requires AVX10.2 AMX-2, not available on AMD EPYC
+        if brgemm_f8_available() {
+            println!("FP8 is available on this CPU, skipping negative test");
+            return;
+        }
+        let weight = vec![0u8; 64 * 32];
+        let scales = vec![1.0f32; 32];
+        assert!(BrgemmF8PackedWeight::pack(&weight, &scales, 64, 32).is_none());
     }
 
     #[test]

@@ -266,6 +266,99 @@ pub fn bench_postops(m: usize, k: usize, n: usize, warmup: usize, repeats: usize
     Ok(())
 }
 
+/// Benchmark individual post-ops configurations.
+pub fn bench_postops_variants(m: usize, k: usize, n: usize, warmup: usize, repeats: usize) -> Result<()> {
+    use prelude_core::ops::onednn::{
+        brgemm_available, brgemm_gemm_forward_postops, BrgemmPackedWeight,
+        BRGEMM_POSTOP_BIAS, BRGEMM_POSTOP_GELU_TANH, BRGEMM_POSTOP_RELU,
+    };
+    if !brgemm_available() { return Ok(()); }
+
+    let device = Device::Cpu;
+    let input_data: Vec<bf16> = (0..m * k).map(|i| bf16::from_f32(((i as f32 * 0.007) - 0.5).sin())).collect();
+    let input = Tensor::from_vec(input_data, (m, k), &device)?;
+    let weight_data: Vec<bf16> = (0..n * k).map(|i| bf16::from_f32(((i as f32 * 0.013) + 0.2).cos())).collect();
+    let weight = Tensor::from_vec(weight_data, (n, k), &device)?;
+    let packed = BrgemmPackedWeight::pack(&weight)?.expect("pack");
+    let bias_data: Vec<bf16> = (0..n).map(|i| bf16::from_f32((i as f32 * 0.001) - 0.05)).collect();
+    let bias = Tensor::from_vec(bias_data, (n,), &device)?;
+
+    let configs: &[(&str, Option<&Tensor>, i32)] = &[
+        ("plain   ", None, 0),
+        ("bias    ", Some(&bias), BRGEMM_POSTOP_BIAS),
+        ("gelu    ", None, BRGEMM_POSTOP_GELU_TANH),
+        ("relu    ", None, BRGEMM_POSTOP_RELU),
+        ("bias+gel", Some(&bias), BRGEMM_POSTOP_BIAS | BRGEMM_POSTOP_GELU_TANH),
+    ];
+
+    let label = format!("[{m}x{k}x{n}]");
+    for &(name, ref b, flags) in configs {
+        let bias_arg = b.as_deref();
+        for _ in 0..warmup {
+            let _ = brgemm_gemm_forward_postops(&input, &packed, bias_arg, flags, m, k, n)?;
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..repeats {
+            let _ = brgemm_gemm_forward_postops(&input, &packed, bias_arg, flags, m, k, n)?;
+        }
+        let us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
+        println!("  postops {label:<22} {name}={us:>10.1}us");
+    }
+    Ok(())
+}
+
+/// INT8 W8A8 accuracy: compare quantized GEMM against F32 reference.
+pub fn verify_s8_accuracy(m: usize, k: usize, n: usize) -> Result<()> {
+    use prelude_core::ops::onednn::{brgemm_s8_available, BrgemmS8PackedWeight, brgemm_s8_gemm_forward};
+    if !brgemm_s8_available() { return Ok(()); }
+
+    let device = Device::Cpu;
+
+    let w_f32: Vec<f32> = (0..n * k).map(|i| ((i as f32 * 0.013) + 0.2).cos()).collect();
+    let mut w_s8 = vec![0i8; n * k];
+    let mut scales = vec![0.0f32; n];
+    for row in 0..n {
+        let slice = &w_f32[row * k..(row + 1) * k];
+        let max_abs = slice.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        scales[row] = max_abs / 127.0;
+        let inv = if max_abs > 0.0 { 127.0 / max_abs } else { 0.0 };
+        for c in 0..k {
+            w_s8[row * k + c] = (slice[c] * inv).round().clamp(-128.0, 127.0) as i8;
+        }
+    }
+    let packed = BrgemmS8PackedWeight::pack(&w_s8, &scales, k, n).expect("INT8 pack");
+
+    let input_data: Vec<bf16> = (0..m * k).map(|i| bf16::from_f32(((i as f32 * 0.007) - 0.5).sin())).collect();
+    let input = Tensor::from_vec(input_data.clone(), (m, k), &device)?;
+
+    let out_s8 = brgemm_s8_gemm_forward(&input, &packed, m, k, n)?;
+    let w_tensor = Tensor::from_vec(w_f32, (n, k), &device)?;
+    let out_ref = input.to_dtype(DType::F32)?.matmul(&w_tensor.t()?)?;
+
+    let a = out_s8.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let b = out_ref.flatten_all()?.to_vec1::<f32>()?;
+
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    let atol = 0.1f32;
+    let rtol = 0.1f32;
+    let mut fail = 0usize;
+    for (&va, &vb) in a.iter().zip(b.iter()) {
+        let abs_err = (va - vb).abs();
+        let denom = va.abs().max(vb.abs());
+        let rel_err = if denom > 1e-6 { abs_err / denom } else { 0.0 };
+        max_abs = max_abs.max(abs_err);
+        max_rel = max_rel.max(rel_err);
+        if abs_err > atol + rtol * denom { fail += 1; }
+    }
+    let status = if fail == 0 { "PASS" } else { "FAIL" };
+    println!(
+        "  s8_acc [{m:>3}x{k:>4}x{n:>5}] {status}: max_abs={max_abs:.6}, max_rel={max_rel:.6}, fail={fail}/{} (atol={atol}, rtol={rtol})",
+        a.len(),
+    );
+    Ok(())
+}
+
 /// Accuracy: compare GEMM backends against candle F32 reference
 pub fn verify_accuracy(m: usize, k: usize, n: usize) -> Result<()> {
     let device = Device::Cpu;

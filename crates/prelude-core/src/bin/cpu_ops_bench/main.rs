@@ -223,6 +223,16 @@ fn main() -> Result<()> {
         for &(m, k, n) in gemm_configs {
             gemm::bench_postops(m, k, n, 5, gemm_repeats)?;
         }
+
+        println!("\n=== GEMM post-ops variants (plain / bias / gelu / relu / bias+gelu) ===");
+        let postops_configs: &[(usize, usize, usize)] = &[
+            (1, 896, 4864), (16, 896, 4864), (64, 896, 4864),
+            (1, 3584, 18944), (16, 3584, 18944),
+        ];
+        for &(m, k, n) in postops_configs {
+            gemm::bench_postops_variants(m, k, n, 5, gemm_repeats)?;
+            println!();
+        }
     }
 
     // -- Quantized kernels --
@@ -261,6 +271,13 @@ fn main() -> Result<()> {
             println!("  Pass criteria: |a-b| <= atol + rtol*max(|a|,|b|) (atol=5e-2, rtol=5e-2)");
             for &(m, k, n) in gemm_configs {
                 gemm::verify_accuracy(m, k, n)?;
+            }
+        }
+        {
+            println!("\n=== Numerical accuracy: INT8 W8A8 vs F32 ===");
+            println!("  Pass criteria: |a-b| <= atol + rtol*max(|a|,|b|) (atol=0.1, rtol=0.1)");
+            for &(m, k, n) in gemm_configs {
+                gemm::verify_s8_accuracy(m, k, n)?;
             }
         }
     }

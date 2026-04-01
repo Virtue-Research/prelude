@@ -1153,18 +1153,30 @@ void brgemm_attn_release() {
 }
 
 // ── INT8 BRGeMM (W8A8) ─────────────────────────────────────────────────
-// INT8 × INT8 → F32 accumulation → scale × dequant → BF16 output.
-// Uses per-channel weight scales + per-tensor activation scale.
+// U8 × S8 → F32 accumulation → compensation → scale → BF16 output.
+//
+// The brgemm ukernel API does NOT handle s8→u8 compensation internally
+// (see upstream: brgemm_desc_.req_s8s8_compensation = false, with comment
+// "Users must add compensation on their own as a binary post-op").
+//
+// AVX-512 VNNI only has VPDPBUSD (u8×s8). For W8A8 we:
+//   1. Quantize BF16 input to u8 (= clamp(round(x/scale)) + 128)
+//   2. Run brgemm u8×s8 → F32 (native VPDPBUSD, no compensation needed inside)
+//   3. Subtract compensation: C -= 128 × Σ_k(weight_s8[j,k]) per column
+//   4. Apply scales: D = C × a_scale × b_scale[j] → BF16
+//
+// Steps 3-4 are fused via post-ops: binary_add(comp) + A/B scales + BF16 output.
 
 struct brgemm_s8_packed_b {
     void* data;           // packed weight buffer, 64-byte aligned
     float* scales;        // per-channel F32 scales [N]
+    float* col_comp;      // per-column compensation: -128 * Σ_k(w_s8[j,k]) as F32 [N]
     int64_t k, n;
     int64_t block_n;
     int64_t n_blocks;
 };
 
-// Thread-local INT8 brgemm kernel cache (with scales + BF16 output)
+// Thread-local INT8 brgemm kernel cache (u8×s8 with compensation post-op)
 struct BrgemmS8Key {
     int64_t m, n, k, ldd;
     bool operator==(const BrgemmS8Key& o) const {
@@ -1188,16 +1200,32 @@ static BrgemmS8Kernel& get_brgemm_s8_kernel(int64_t m, int64_t n, int64_t k, int
     if (it != tls_brgemm_s8.end()) return it->second;
 
     BrgemmS8Kernel kern{};
+    // u8×s8 → F32, with A/B scales and binary_add post-op for compensation.
+    //
+    // Execution order in execute_postops:
+    //   1. C = GEMM(u8_A, s8_B)           — native VPDPBUSD
+    //   2. C *= a_scale * b_scale[j]       — dequantization
+    //   3. D = C + comp_scaled[j]          — s8→u8 compensation (binary_add)
+    //   4. Convert D → BF16               — set via d_dt
+    //
+    // comp_scaled[j] = -128 * Σ_k(w[j,k]) * a_scale * b_scale[j]
+    // Precomputed at runtime since a_scale is dynamic.
     CHECK_DNNL(dnnl_brgemm_create(&kern.brgemm, m, n, k,
         /*batch_size*/1, /*lda*/k, /*ldb*/n, /*ldc*/n,
-        dnnl_s8, dnnl_s8, dnnl_f32));
+        dnnl_u8, dnnl_s8, dnnl_f32));
     CHECK_DNNL(dnnl_brgemm_set_add_C(kern.brgemm, 0));
     CHECK_DNNL(dnnl_brgemm_set_A_scales(kern.brgemm, 0));  // per-tensor
-    CHECK_DNNL(dnnl_brgemm_set_B_scales(kern.brgemm, 2));  // per-channel (N values)
+    CHECK_DNNL(dnnl_brgemm_set_B_scales(kern.brgemm, 2));  // per-channel
 
-    // Output as BF16 via post-ops path
+    // Binary_add post-op for compensation [1, N] F32
     dnnl_post_ops_t post_ops = nullptr;
     CHECK_DNNL(dnnl_post_ops_create(&post_ops));
+    dnnl_dims_t comp_dims = {1, n};
+    dnnl_memory_desc_t comp_md = nullptr;
+    CHECK_DNNL(dnnl_memory_desc_create_with_tag(&comp_md, 2, comp_dims, dnnl_f32, dnnl_ab));
+    CHECK_DNNL(dnnl_post_ops_append_binary(post_ops, dnnl_binary_add, comp_md));
+    dnnl_memory_desc_destroy(comp_md);
+
     CHECK_DNNL(dnnl_brgemm_set_post_ops(kern.brgemm, ldd, dnnl_bf16, post_ops));
     dnnl_post_ops_destroy(post_ops);
 
@@ -1218,7 +1246,7 @@ int brgemm_s8_available(void) {
 
     dnnl_brgemm_t brg = nullptr;
     dnnl_status_t s = dnnl_brgemm_create(&brg, 1, 32, 64,
-        1, 64, 32, 32, dnnl_s8, dnnl_s8, dnnl_f32);
+        1, 64, 32, 32, dnnl_u8, dnnl_s8, dnnl_f32);
     if (s == dnnl_success && brg) {
         s = dnnl_brgemm_finalize(brg);
         if (s == dnnl_success) s = dnnl_brgemm_generate(brg);
@@ -1262,7 +1290,6 @@ brgemm_s8_packed_b_t brgemm_s8_pack(
                 }
             }
         }
-        // Tail K elements (k % 4)
         int64_t k_tail = k % vnni;
         if (k_tail > 0) {
             for (int64_t j = 0; j < actual_n; j++) {
@@ -1277,9 +1304,20 @@ brgemm_s8_packed_b_t brgemm_s8_pack(
     float* scales_copy = (float*)malloc(n * sizeof(float));
     memcpy(scales_copy, scales, n * sizeof(float));
 
+    // Precompute per-column compensation: -128 * Σ_k(weight_s8[j,k])
+    float* col_comp = (float*)malloc(n * sizeof(float));
+    for (int64_t j = 0; j < n; j++) {
+        int64_t sum = 0;
+        for (int64_t c = 0; c < k; c++) {
+            sum += weight[j * k + c];
+        }
+        col_comp[j] = -128.0f * (float)sum;
+    }
+
     auto* pw = new brgemm_s8_packed_b();
     pw->data = packed;
     pw->scales = scales_copy;
+    pw->col_comp = col_comp;
     pw->k = k;
     pw->n = n;
     pw->block_n = block_n;
@@ -1291,6 +1329,7 @@ void brgemm_s8_pack_destroy(brgemm_s8_packed_b_t pw) {
     if (!pw) return;
     free(pw->data);
     free(pw->scales);
+    free(pw->col_comp);
     delete pw;
 }
 
@@ -1300,7 +1339,6 @@ float brgemm_quantize_bf16_s8(
     const uint16_t* in = (const uint16_t*)input_bf16;
     int64_t n = m * k;
 
-    // Find max absolute value
     float max_abs = 0.0f;
     for (int64_t i = 0; i < n; i++) {
         float abs_v = fabsf(bf16_to_f32(in[i]));
@@ -1309,7 +1347,8 @@ float brgemm_quantize_bf16_s8(
 
     float scale = max_abs / 127.0f;
     if (max_abs == 0.0f) {
-        memset(out_s8, 0, n);
+        // Output u8 zero-point = 128
+        memset(out_s8, (int8_t)(uint8_t)128, n);
         return scale;
     }
 
@@ -1318,7 +1357,8 @@ float brgemm_quantize_bf16_s8(
         float v = bf16_to_f32(in[i]);
         int32_t q = (int32_t)roundf(v * inv_scale);
         q = std::max(-128, std::min(127, q));
-        out_s8[i] = (int8_t)q;
+        // Store as u8 = s8 + 128 (reinterpreted as int8_t for FFI convenience)
+        out_s8[i] = (int8_t)(uint8_t)(q + 128);
     }
     return scale;
 }
@@ -1338,7 +1378,6 @@ void brgemm_s8_linear(
     int64_t block_n = pw->block_n;
     int64_t block_elems = k * block_n;
 
-    // Thread-local F32 accumulator
     static thread_local std::vector<float> tls_s8_acc;
     size_t acc_needed = (size_t)(m * BRGEMM_BLOCK_N);
     if (tls_s8_acc.size() < acc_needed) tls_s8_acc.resize(acc_needed);
@@ -1348,7 +1387,11 @@ void brgemm_s8_linear(
     int64_t nb_start = n_start / block_n;
     int64_t nb_end = (n_end + block_n - 1) / block_n;
 
-    // Create attr_params once, update per-block
+    // Thread-local buffer for runtime-scaled compensation
+    static thread_local std::vector<float> tls_comp_scaled;
+    if (tls_comp_scaled.size() < (size_t)BRGEMM_BLOCK_N)
+        tls_comp_scaled.resize(BRGEMM_BLOCK_N);
+
     dnnl_ukernel_attr_params_t params = nullptr;
     CHECK_DNNL(dnnl_ukernel_attr_params_create(&params));
     CHECK_DNNL(dnnl_ukernel_attr_params_set_A_scales(params, &a_scale));
@@ -1367,10 +1410,17 @@ void brgemm_s8_linear(
 
         const void* B = packed + nb * block_elems;
 
-        // Per-channel weight scales for this N-block
         CHECK_DNNL(dnnl_ukernel_attr_params_set_B_scales(params, pw->scales + nc));
 
-        // D_ptr points to column nc with stride n_total
+        // Compute runtime-scaled compensation:
+        // comp_scaled[j] = col_comp[nc+j] * a_scale * b_scale[nc+j]
+        // where col_comp = -128 * Σ_k(w[j,k])
+        for (int64_t j = 0; j < actual_n; j++) {
+            tls_comp_scaled[j] = pw->col_comp[nc + j] * a_scale * pw->scales[nc + j];
+        }
+        const void* po_args[1] = { tls_comp_scaled.data() };
+        CHECK_DNNL(dnnl_ukernel_attr_params_set_post_ops_args(params, po_args));
+
         uint16_t* D = out + nc;
 
         CHECK_DNNL(dnnl_brgemm_execute_postops(kern.brgemm,
