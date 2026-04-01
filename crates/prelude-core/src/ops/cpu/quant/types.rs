@@ -374,6 +374,48 @@ pub struct BlockIQ1M {
 
 const _: () = assert!(core::mem::size_of::<BlockIQ1M>() == 56);
 
+// ── FP4 formats ────────────────────────────────────────────────────────
+
+/// E2M1 lookup table: 4-bit → signed 8-bit. Shared by MXFP4 and NVFP4.
+///
+/// Values: `[0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12]`
+pub const KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// MXFP4: 32 values → 17 bytes (OCP MX spec).
+///
+/// E8M0 shared exponent + 32 packed 4-bit E2M1 values.
+/// Scale = 2^(e - 127), applied as `scale * 0.5 * kvalues_mxfp4[nibble]`.
+pub const QK_MXFP4: usize = 32;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockMXFP4 {
+    /// E8M0 shared exponent (pure power-of-2 scale).
+    pub e: u8,
+    /// 32 × 4-bit E2M1 values, two per byte → 16 bytes.
+    pub qs: [u8; QK_MXFP4 / 2],
+}
+
+const _: () = assert!(core::mem::size_of::<BlockMXFP4>() == 17);
+
+/// NVFP4: 64 values → 36 bytes (NVIDIA Blackwell spec).
+///
+/// 4 × UE4M3 per-sub-block scales + 64 packed 4-bit E2M1 values.
+/// Sub-block size = 16 elements.
+pub const QK_NVFP4: usize = 64;
+pub const QK_NVFP4_SUB: usize = 16;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockNVFP4 {
+    /// UE4M3 scales: one per 16-element sub-block → 4 bytes.
+    pub d: [u8; QK_NVFP4 / QK_NVFP4_SUB],
+    /// 64 × 4-bit E2M1 values, two per byte → 32 bytes.
+    pub qs: [u8; QK_NVFP4 / 2],
+}
+
+const _: () = assert!(core::mem::size_of::<BlockNVFP4>() == 36);
+
 /// Extract the j-th (scale, min) pair from a Q4_K packed scales array.
 ///
 /// The 12-byte `scales` array encodes 8 × 6-bit scales and 8 × 6-bit mins
@@ -432,6 +474,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<BlockIQ2XXS>(), 66);
         assert_eq!(core::mem::size_of::<BlockIQ1S>(), 50);
         assert_eq!(core::mem::size_of::<BlockIQ1M>(), 56);
+        assert_eq!(core::mem::size_of::<BlockMXFP4>(), 17);
+        assert_eq!(core::mem::size_of::<BlockNVFP4>(), 36);
     }
 
     #[test]

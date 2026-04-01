@@ -41,6 +41,7 @@ pub use types::{
     BlockQ2K, BlockQ3K, BlockQ4K, BlockQ5K, BlockQ6K, BlockQ8K,
     BlockIQ4NL, BlockIQ4XS, BlockIQ3S, BlockIQ3XXS,
     BlockIQ2S, BlockIQ2XS, BlockIQ2XXS, BlockIQ1S, BlockIQ1M,
+    BlockMXFP4, BlockNVFP4,
 };
 pub use q4_0::vec_dot_q4_0_q8_0;
 pub use q4_1::vec_dot_q4_1_q8_1;

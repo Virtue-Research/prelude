@@ -1170,3 +1170,132 @@ MMVQ_KERNEL_KQUANT(mmvq_iq2_xs,  block_iq2_xs,  vec_dot_iq2_xs_q8_1)
 MMVQ_KERNEL_KQUANT(mmvq_iq2_s,   block_iq2_s,   vec_dot_iq2_s_q8_1)
 MMVQ_KERNEL_KQUANT(mmvq_iq1_s,   block_iq1_s,   vec_dot_iq1_s_q8_1)
 MMVQ_KERNEL_KQUANT(mmvq_iq1_m,   block_iq1_m,   vec_dot_iq1_m_q8_1)
+
+// ── FP4 formats (MXFP4 / NVFP4) ───────────────────────────────────────
+
+#define QK_MXFP4 32
+#define QK_NVFP4 64
+#define QK_NVFP4_SUB 16
+
+__device__ static const int8_t kvalues_mxfp4[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12
+};
+
+struct __align__(1) block_mxfp4 {  // 17 bytes
+    uint8_t e;
+    uint8_t qs[16];
+};
+
+struct __align__(4) block_nvfp4 {  // 36 bytes
+    uint8_t d[4];
+    uint8_t qs[32];
+};
+
+// E8M0 → float: 2^(x - 127)
+__device__ __forceinline__ float e8m0_to_f32(uint8_t x) {
+    if (x == 0) {
+        uint32_t bits = 0x00400000u;
+        float r; memcpy(&r, &bits, 4); return r;
+    }
+    uint32_t bits = (uint32_t)x << 23;
+    float r; memcpy(&r, &bits, 4); return r;
+}
+
+// UE4M3 → float (unsigned, 4 exp bits bias=7, 3 mantissa bits)
+__device__ __forceinline__ float ue4m3_to_f32(uint8_t x) {
+    if (x == 0 || x == 0x7F) return 0.0f;
+    int e = (x >> 3) & 0xF;
+    int m = x & 0x7;
+    float raw;
+    if (e == 0) {
+        raw = ldexpf((float)m, -9);
+    } else {
+        raw = ldexpf(1.0f + (float)m / 8.0f, e - 7);
+    }
+    return raw * 0.5f;
+}
+
+// ── MXFP4 × Q8_1: E8M0 shared exponent ────────────────────────────────
+
+__device__ __forceinline__ float vec_dot_mxfp4_q8_1(
+    const block_mxfp4& w, const block_q8_1& a
+) {
+    float d_mxfp4 = e8m0_to_f32(w.e) * 0.5f;
+    float d8 = fp16_to_f32(a.d);
+
+    const int* q8 = (const int*)a.qs;
+
+    int sumi = 0;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        int aux_q4 = load_int(w.qs + j * 4);
+        int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+        sumi = __dp4a(v.x, q8[j], sumi);
+        sumi = __dp4a(v.y, q8[j + 4], sumi);
+    }
+
+    return d_mxfp4 * d8 * (float)sumi;
+}
+
+// ── NVFP4 × Q8_1: per-sub-block UE4M3 scales ─────────────────────────
+
+__device__ __forceinline__ float vec_dot_nvfp4_q8_1(
+    const block_nvfp4& w, const block_q8_1* a  // 2 Q8_1 blocks for 64 elements
+) {
+    float sum = 0.0f;
+
+    // 4 sub-blocks of 16 elements each
+    for (int sub = 0; sub < 4; sub++) {
+        float d_nvfp4 = ue4m3_to_f32(w.d[sub]);
+        // Each Q8_1 block covers 32 elements → sub/2 selects block, sub%2 selects half
+        const block_q8_1& q8_blk = a[sub / 2];
+        float d8 = fp16_to_f32(q8_blk.d);
+        const int* q8 = (const int*)q8_blk.qs + (sub % 2) * 4; // offset 0 or 16 bytes
+
+        int sumi = 0;
+        int qs_base = sub * 8; // 16 elements = 8 bytes of packed nibbles
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            int aux_q4 = load_int(w.qs + qs_base + j * 4);
+            int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+            sumi = __dp4a(v.x, q8[j], sumi);
+            sumi = __dp4a(v.y, q8[j + 2], sumi);
+        }
+
+        sum += d_nvfp4 * d8 * (float)sumi;
+    }
+
+    return sum;
+}
+
+// MXFP4: simple 32-element blocks (same pattern as Q4_0)
+MMVQ_KERNEL_SIMPLE(mmvq_mxfp4, block_mxfp4, vec_dot_mxfp4_q8_1)
+
+// NVFP4: 64-element blocks with 2 Q8_1 blocks
+// Need a custom kernel since it's neither SIMPLE (32) nor KQUANT (256)
+extern "C" __global__ void mmvq_nvfp4(
+    const void* __restrict__ W,
+    const void* __restrict__ x_q8,
+    float* __restrict__ y,
+    uint32_t N,
+    uint32_t blocks_per_row
+) {
+    const uint32_t row = blockIdx.x * MMVQ_NWARPS + threadIdx.y;
+    if (row >= N) return;
+
+    const uint32_t lane = threadIdx.x;
+    const uint8_t* W_base = (const uint8_t*)W;
+    const block_q8_1* x = (const block_q8_1*)x_q8;
+    const uint64_t row_bytes = (uint64_t)blocks_per_row * sizeof(block_nvfp4);
+
+    float sum = 0.0f;
+    for (uint32_t blk = lane; blk < blocks_per_row; blk += WARP_SIZE) {
+        const block_nvfp4* wp =
+            (const block_nvfp4*)(W_base + row * row_bytes
+                                + (uint64_t)blk * sizeof(block_nvfp4));
+        sum += vec_dot_nvfp4_q8_1(*wp, x + blk * 2);  // 2 Q8_1 per NVFP4 block
+    }
+
+    sum = warp_reduce_sum_mmvq(sum);
+    if (lane == 0) y[row] = sum;
+}

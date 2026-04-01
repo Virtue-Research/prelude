@@ -229,3 +229,15 @@ pub fn mmvq_iq1_s(w: &Tensor, x: &Tensor, n: usize, k: usize) -> Result<Tensor> 
 pub fn mmvq_iq1_m(w: &Tensor, x: &Tensor, n: usize, k: usize) -> Result<Tensor> {
     mmvq(w, x, n, k, "mmvq_iq1_m", 256)
 }
+
+// ── FP4 formats ────────────────────────────────────────────────────────
+
+/// MMVQ with MXFP4 weights (OCP MX spec, E8M0 + E2M1, 32 elements/block).
+pub fn mmvq_mxfp4(w: &Tensor, x: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+    mmvq(w, x, n, k, "mmvq_mxfp4", 32)
+}
+
+/// MMVQ with NVFP4 weights (NVIDIA spec, UE4M3 + E2M1, 64 elements/block).
+pub fn mmvq_nvfp4(w: &Tensor, x: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+    mmvq(w, x, n, k, "mmvq_nvfp4", 64)
+}

@@ -83,6 +83,12 @@ pub fn verify(device: &Device) -> Result<()> {
         // IQ4_NL (32-element blocks, manual verification)
         verify_iq4_nl_dequant(n, device)?;
 
+        // MXFP4 (32-element blocks)
+        {
+            let (rb, exp) = make_mxfp4_data(1, n, 42);
+            verify_manual_dequant("MXFP4", n, &rb, &exp, "dequantize_mxfp4_bf16", device)?;
+        }
+
         // K-quants use 256-element blocks
         if n % 256 == 0 {
             verify_format(GgmlDType::Q2K, "dequantize_q2_K_bf16", "Q2_K", n, device)?;
@@ -93,6 +99,12 @@ pub fn verify(device: &Device) -> Result<()> {
 
             // IQ4_XS (256-element blocks)
             verify_iq4_xs_dequant(n, device)?;
+        }
+
+        // NVFP4 (64-element blocks)
+        if n % 64 == 0 {
+            let (rb, exp) = make_nvfp4_data(1, n, 42);
+            verify_manual_dequant("NVFP4", n, &rb, &exp, "dequantize_nvfp4_bf16", device)?;
         }
         println!();
     }
@@ -416,6 +428,152 @@ fn make_iq4_xs_data(n: usize, k: usize, seed: u64) -> (Vec<u8>, Vec<f32>) {
     (raw_bytes, expected)
 }
 
+use prelude_core::ops::cpu::quant::types::{
+    BlockMXFP4, BlockNVFP4, KVALUES_MXFP4, QK_MXFP4, QK_NVFP4, QK_NVFP4_SUB,
+};
+
+/// E8M0 → f32 conversion (matching GPU kernel).
+fn e8m0_to_f32(x: u8) -> f32 {
+    if x == 0 { return f32::from_bits(0x00400000); }
+    f32::from_bits((x as u32) << 23)
+}
+
+/// UE4M3 → f32 conversion (matching GPU kernel).
+fn ue4m3_to_f32(x: u8) -> f32 {
+    if x == 0 || x == 0x7F { return 0.0; }
+    let e = ((x >> 3) & 0xF) as i32;
+    let m = (x & 0x7) as f32;
+    let raw = if e == 0 { m * 2.0f32.powi(-9) } else { (1.0 + m / 8.0) * 2.0f32.powi(e - 7) };
+    raw * 0.5
+}
+
+/// Create random MXFP4 blocks and return (raw_bytes, expected_f32_values).
+fn make_mxfp4_data(n: usize, k: usize, seed: u64) -> (Vec<u8>, Vec<f32>) {
+    assert_eq!(k % QK_MXFP4, 0);
+    let total_blocks = n * (k / QK_MXFP4);
+    let mut state = seed;
+    let mut next = || -> u64 {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state
+    };
+
+    let mut raw_bytes = Vec::with_capacity(total_blocks * 17);
+    let mut expected = Vec::with_capacity(n * k);
+
+    for _ in 0..total_blocks {
+        let e = ((next() % 20) + 118) as u8;
+        let scale = e8m0_to_f32(e) * 0.5;
+        let mut qs = [0u8; 16];
+        let mut block_vals = [0.0f32; 32];
+        for j in 0..16 {
+            let lo = (next() % 16) as u8;
+            let hi = (next() % 16) as u8;
+            qs[j] = lo | (hi << 4);
+            block_vals[j] = scale * KVALUES_MXFP4[lo as usize] as f32;
+            block_vals[j + 16] = scale * KVALUES_MXFP4[hi as usize] as f32;
+        }
+        raw_bytes.push(e);
+        raw_bytes.extend_from_slice(&qs);
+        expected.extend_from_slice(&block_vals);
+    }
+    (raw_bytes, expected)
+}
+
+/// Create random NVFP4 blocks and return (raw_bytes, expected_f32_values).
+fn make_nvfp4_data(n: usize, k: usize, seed: u64) -> (Vec<u8>, Vec<f32>) {
+    assert_eq!(k % QK_NVFP4, 0);
+    let total_blocks = n * (k / QK_NVFP4);
+    let mut state = seed;
+    let mut next = || -> u64 {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state
+    };
+
+    let mut raw_bytes = Vec::with_capacity(total_blocks * 36);
+    let mut expected = Vec::with_capacity(n * k);
+
+    for _ in 0..total_blocks {
+        let mut d = [0u8; 4];
+        let mut sub_scales = [0.0f32; 4];
+        for s in 0..4 {
+            d[s] = ((next() % 60) + 10) as u8;
+            sub_scales[s] = ue4m3_to_f32(d[s]);
+        }
+        let mut qs = [0u8; 32];
+        let mut block_vals = [0.0f32; 64];
+        for sub in 0..4 {
+            for j in 0..8 {
+                let lo = (next() % 16) as u8;
+                let hi = (next() % 16) as u8;
+                qs[sub * 8 + j] = lo | (hi << 4);
+                block_vals[sub * 16 + j] = sub_scales[sub] * KVALUES_MXFP4[lo as usize] as f32;
+                block_vals[sub * 16 + j + 8] = sub_scales[sub] * KVALUES_MXFP4[hi as usize] as f32;
+            }
+        }
+        raw_bytes.extend_from_slice(&d);
+        raw_bytes.extend_from_slice(&qs);
+        expected.extend_from_slice(&block_vals);
+    }
+    (raw_bytes, expected)
+}
+
+/// Generic dequantize verify for manual-block formats.
+fn verify_manual_dequant(
+    label: &str, n: usize, raw_bytes: &[u8], expected: &[f32],
+    kernel: &str, device: &Device,
+) -> Result<()> {
+    let gpu_bytes = Tensor::from_vec(raw_bytes.to_vec(), (raw_bytes.len(),), device)?;
+    let gpu_bf16 = quant::dequantize_to_bf16(&gpu_bytes, n, kernel)?;
+    let gpu_f32: Vec<f32> = gpu_bf16.to_dtype(DType::F32)?.to_device(&Device::Cpu)?.to_vec1()?;
+
+    let mut max_abs: f32 = 0.0;
+    let mut fail_count = 0usize;
+    for (r, g) in expected.iter().zip(gpu_f32.iter()) {
+        let err = (r - g).abs();
+        max_abs = max_abs.max(err);
+        let tol = 0.01 + 0.01 * r.abs().max(g.abs());
+        if err > tol { fail_count += 1; }
+    }
+    let status = if fail_count == 0 { "PASS" } else { "FAIL" };
+    println!("  {label:>6} [{n:>6}]  {status}  max_abs={max_abs:.6}  fail={fail_count}/{n}");
+    Ok(())
+}
+
+/// Generic MMVQ verify for manual-block formats.
+fn verify_manual_mmvq(
+    label: &str, n: usize, k: usize,
+    raw_bytes: &[u8], expected_f32: &[f32],
+    kernel: &str, qk: usize, device: &Device,
+) -> Result<()> {
+    let x_data: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.013).cos()).collect();
+    let mut ref_output = vec![0.0f32; n];
+    for i in 0..n {
+        ref_output[i] = expected_f32[i * k..(i + 1) * k]
+            .iter().zip(x_data.iter()).map(|(w, x)| w * x).sum();
+    }
+
+    let block_bytes = raw_bytes.len() / n;
+    let gpu_w = Tensor::from_vec(raw_bytes.to_vec(), (raw_bytes.len(),), device)?;
+    let gpu_x = Tensor::from_vec(x_data, (k,), &Device::Cpu)?
+        .to_dtype(DType::BF16)?.to_device(device)?;
+
+    let gpu_y = mmvq::mmvq(&gpu_w, &gpu_x, n, k, kernel, qk)?;
+    let gpu_output: Vec<f32> = gpu_y.to_device(&Device::Cpu)?.to_vec1()?;
+
+    let mut max_rel: f32 = 0.0;
+    let mut fail_count = 0usize;
+    for (r, g) in ref_output.iter().zip(gpu_output.iter()) {
+        let err = (r - g).abs();
+        let denom = r.abs().max(1e-6);
+        let rel = err / denom;
+        max_rel = max_rel.max(rel);
+        if rel > 0.15 && err > 0.5 { fail_count += 1; }
+    }
+    let status = if fail_count == 0 { "PASS" } else { "FAIL" };
+    println!("  {label:>6} [{n:>4}×{k:>5}]  {status}  max_rel={max_rel:.4}  fail={fail_count}/{n}");
+    Ok(())
+}
+
 /// Verify all MMVQ formats.
 pub fn verify_mmvq(device: &Device) -> Result<()> {
     println!("=== GPU MMVQ Correctness ===");
@@ -448,6 +606,16 @@ pub fn verify_mmvq(device: &Device) -> Result<()> {
         verify_iq4_nl_mmvq(n, k, device)?;
         if k % 256 == 0 {
             verify_iq4_xs_mmvq(n, k, device)?;
+        }
+
+        // FP4 formats
+        {
+            let (rb, exp) = make_mxfp4_data(n, k, 42);
+            verify_manual_mmvq("MXFP4", n, k, &rb, &exp, "mmvq_mxfp4", 32, device)?;
+        }
+        if k % 64 == 0 {
+            let (rb, exp) = make_nvfp4_data(n, k, 42);
+            verify_manual_mmvq("NVFP4", n, k, &rb, &exp, "mmvq_nvfp4", 64, device)?;
         }
         println!();
     }

@@ -834,3 +834,80 @@ extern "C" __global__ void dequantize_iq1_m_bf16(
     float delta = -1.0f + IQ1M_DELTA - (float)(qhl & 0x08) * (2.0f * IQ1M_DELTA / 0x08);
     y[i] = __float2bfloat16(d * (float)sc_val * ((float)val + delta));
 }
+
+// ── FP4 formats ─────────────────────────────────────────────────────────
+
+#define QK_MXFP4 32
+#define QK_NVFP4 64
+#define QK_NVFP4_SUB 16
+
+__device__ static const int8_t kvalues_mxfp4_deq[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12
+};
+
+struct block_mxfp4_deq { uint8_t e; uint8_t qs[16]; };
+struct block_nvfp4_deq { uint8_t d[4]; uint8_t qs[32]; };
+
+__device__ __forceinline__ float e8m0_to_f32_deq(uint8_t x) {
+    if (x == 0) { uint32_t bits = 0x00400000u; float r; memcpy(&r, &bits, 4); return r; }
+    uint32_t bits = (uint32_t)x << 23;
+    float r; memcpy(&r, &bits, 4); return r;
+}
+
+__device__ __forceinline__ float ue4m3_to_f32_deq(uint8_t x) {
+    if (x == 0 || x == 0x7F) return 0.0f;
+    int e = (x >> 3) & 0xF;
+    int m = x & 0x7;
+    float raw = (e == 0) ? ldexpf((float)m, -9) : ldexpf(1.0f + (float)m / 8.0f, e - 7);
+    return raw * 0.5f;
+}
+
+// ── MXFP4 dequantize (32 values/block → BF16) ──────────────────────────
+
+extern "C" __global__ void dequantize_mxfp4_bf16(
+    const block_mxfp4_deq* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    uint64_t num_elements
+) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_elements) return;
+
+    const uint64_t block_idx = i / QK_MXFP4;
+    const uint32_t within_block = i % QK_MXFP4;
+
+    const block_mxfp4_deq& blk = x[block_idx];
+    const float d = e8m0_to_f32_deq(blk.e) * 0.5f;
+
+    const uint32_t nibble = (within_block < 16)
+        ? (blk.qs[within_block] & 0xF)
+        : (blk.qs[within_block - 16] >> 4);
+
+    y[i] = __float2bfloat16(d * (float)kvalues_mxfp4_deq[nibble]);
+}
+
+// ── NVFP4 dequantize (64 values/block → BF16) ──────────────────────────
+
+extern "C" __global__ void dequantize_nvfp4_bf16(
+    const block_nvfp4_deq* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    uint64_t num_elements
+) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_elements) return;
+
+    const uint64_t block_idx = i / QK_NVFP4;
+    const uint32_t within_block = i % QK_NVFP4;
+
+    const block_nvfp4_deq& blk = x[block_idx];
+
+    // Which 16-element sub-block?
+    const uint32_t sub = within_block / QK_NVFP4_SUB;
+    const uint32_t within_sub = within_block % QK_NVFP4_SUB;
+    const float d = ue4m3_to_f32_deq(blk.d[sub]);
+
+    const uint32_t nibble = (within_sub < 8)
+        ? (blk.qs[sub * 8 + within_sub] & 0xF)
+        : (blk.qs[sub * 8 + within_sub - 8] >> 4);
+
+    y[i] = __float2bfloat16(d * (float)kvalues_mxfp4_deq[nibble]);
+}
