@@ -17,6 +17,14 @@ unsafe extern "C" {
         ggml_type_id: i32,
     );
 
+    fn llama_gpu_dequantize(
+        input: *const c_void,
+        output: *mut c_void,
+        num_elements: i64,
+        ggml_type_id: i32,
+        stream: *const c_void,
+    );
+
     fn llama_mmvq_mul_mat_vec(
         w: *const c_void,
         x_q8: *const c_void,
@@ -94,6 +102,24 @@ pub unsafe fn dequantize_ref(
 ) {
     unsafe {
         llama_dequantize(data, output, num_elements, weight_type as i32);
+    }
+}
+
+/// GPU dequantize: converts quantized blocks to BF16 on GPU.
+///
+/// # Safety
+/// `input` must point to valid quantized block data on device.
+/// `output` must be a BF16 device buffer with space for `num_elements` values.
+/// `stream` must be a valid `cudaStream_t`.
+pub unsafe fn gpu_dequantize(
+    input: *const c_void,
+    output: *mut c_void,
+    num_elements: i64,
+    weight_type: GgmlType,
+    stream: *const c_void,
+) {
+    unsafe {
+        llama_gpu_dequantize(input, output, num_elements, weight_type as i32, stream);
     }
 }
 

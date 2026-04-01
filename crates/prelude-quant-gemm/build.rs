@@ -11,6 +11,8 @@ fn main() {
     println!("cargo:rerun-if-changed=csrc/mmq_ffi.cu");
     println!("cargo:rerun-if-changed=csrc/mmq_ffi.h");
     println!("cargo:rerun-if-changed=csrc/dequantize_ffi.c");
+    println!("cargo:rerun-if-changed=csrc/dequantize_gpu.cu");
+    println!("cargo:rerun-if-changed=csrc/iq_tables.cuh");
     println!("cargo:rerun-if-changed=csrc/llama_mmq/mmq.cuh");
     println!("cargo:rerun-if-changed=csrc/llama_mmq/common.cuh");
     println!("cargo:rerun-if-changed=csrc/llama_mmq/vecdotq.cuh");
@@ -79,7 +81,32 @@ fn main() {
         panic!("gcc compilation of dequantize_ffi.c failed");
     }
 
-    // Create static archive (both CUDA and CPU objects)
+    // Compile dequantize_gpu.cu → dequantize_gpu.o (GPU dequant kernels)
+    let deq_gpu_obj = out_dir.join("dequantize_gpu.o");
+    let status = Command::new(&nvcc)
+        .args([
+            "-std=c++17",
+            "-O3",
+            "--use_fast_math",
+            "--expt-relaxed-constexpr",
+            "-Xcompiler",
+            "-fPIC",
+            &gencode,
+            "-I",
+            csrc.to_str().unwrap(),
+            "-c",
+            csrc.join("dequantize_gpu.cu").to_str().unwrap(),
+            "-o",
+            deq_gpu_obj.to_str().unwrap(),
+        ])
+        .status()
+        .expect("Failed to run nvcc for dequantize_gpu.cu");
+
+    if !status.success() {
+        panic!("nvcc compilation of dequantize_gpu.cu failed");
+    }
+
+    // Create static archive (CUDA + CPU objects)
     let lib = out_dir.join("libprelude_quant_gemm.a");
     let status = Command::new(&nvcc)
         .args([
@@ -89,6 +116,7 @@ fn main() {
         ])
         .arg(&obj)
         .arg(&deq_obj)
+        .arg(&deq_gpu_obj)
         .status()
         .expect("Failed to run nvcc --lib");
 

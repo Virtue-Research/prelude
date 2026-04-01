@@ -59,14 +59,12 @@ fn main() {
             ("kvcache", "append.cu", "kv_append"),
             ("kvcache", "knorm_rope_kv_write.cu", "knorm_rope_kv_write"),
             ("kvcache", "scatter_kv_cache.cu", "scatter_kv_cache"),
-            ("quant", "dequantize.cu", "dequantize"),
-            ("quant", "mmvq.cu", "mmvq"),
         ];
 
         // Track all source files for rerun-if-changed
         println!("cargo:rerun-if-changed=src/ops/gpu/kernels/common/common.cuh");
         println!("cargo:rerun-if-changed=src/ops/gpu/kernels/common/vec_utils.cuh");
-        println!("cargo:rerun-if-changed=src/ops/gpu/kernels/quant/iq_tables.cuh");
+        // quant kernels (dequantize, mmvq) moved to prelude-quant-gemm
 
         for (category, filename, output_name) in kernel_modules.iter() {
             let kernel_src = kernels_dir.join(category).join(filename);

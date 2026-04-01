@@ -27,6 +27,15 @@ void llama_mmq_mul_mat(
     void* stream          // cudaStream_t
 );
 
+// GPU dequantize: converts quantized blocks to BF16 on GPU.
+void llama_gpu_dequantize(
+    const void* input,     // device quantized data (raw GGUF bytes)
+    void* output,          // device BF16 output buffer
+    int64_t num_elements,  // total number of values (not bytes)
+    int ggml_type_id,
+    void* stream           // cudaStream_t
+);
+
 // MMVQ: fused matrix-vector multiply with quantized weights (decode M=1).
 // y[N] = W[N,K] @ x[K] where W is quantized and x is Q8_1.
 void llama_mmvq_mul_mat_vec(

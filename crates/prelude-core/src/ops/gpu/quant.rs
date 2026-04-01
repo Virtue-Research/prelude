@@ -1,23 +1,23 @@
-//! GPU dequantization kernels for GGUF quantized formats.
+//! GPU dequantization — thin wrapper over prelude-quant-gemm FFI.
 //!
-//! Converts quantized weight blocks to BF16 on the GPU for use with standard GEMM.
-//! Supports: Q4_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K.
+//! Converts quantized weight blocks to BF16 on the GPU.
+//! All kernel implementations live in prelude-quant-gemm.
 
 use candle_core::backend::BackendStorage;
-use super::{MOD_DEQUANTIZE, PTX_DEQUANTIZE};
-use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
-use candle_core::cuda_backend::WrapErr;
+use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::{DType, Result, Tensor};
+use std::ffi::c_void;
 
 /// Dequantize a GGUF quantized tensor to BF16 on the GPU.
 ///
 /// `quantized_data` is a 1-D `u8` tensor containing the raw GGUF blocks.
 /// `num_elements` is the total number of values (not bytes).
+/// `weight_type` selects the quantization format.
 /// Returns a BF16 tensor of shape `[num_elements]`.
 pub fn dequantize_to_bf16(
     quantized_data: &Tensor,
     num_elements: usize,
-    kernel_name: &str,
+    weight_type: prelude_quant_gemm::GgmlType,
 ) -> Result<Tensor> {
     let (storage, layout) = quantized_data.storage_and_layout();
     let cuda_storage = match &*storage {
@@ -31,27 +31,26 @@ pub fn dequantize_to_bf16(
 
     let dev = cuda_storage.device().clone();
     let input_slice = cuda_storage.as_cuda_slice::<u8>()?.slice(layout.start_offset()..);
-    let out = unsafe { dev.alloc::<half::bf16>(num_elements) }?;
+    let output = unsafe { dev.alloc::<half::bf16>(num_elements) }?;
 
-    let threads = 256u32;
-    let blocks = ((num_elements as u32) + threads - 1) / threads;
+    let stream = dev.cuda_stream();
+    let raw_stream = unsafe { stream.cu_stream() } as *const c_void;
 
-    let func = dev.get_or_load_custom_func(kernel_name, MOD_DEQUANTIZE, PTX_DEQUANTIZE)?;
-    let cfg = LaunchConfig {
-        grid_dim: (blocks, 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let mut builder = func.builder();
-    builder.arg(&input_slice);
-    builder.arg(&out);
-    let n_val = num_elements as u64;
-    builder.arg(&n_val);
-    unsafe { builder.launch(cfg) }.w()?;
+    let in_ptr = input_slice.device_ptr(&stream).0 as *const c_void;
+    let out_ptr = output.device_ptr(&stream).0 as *mut c_void;
+
+    unsafe {
+        prelude_quant_gemm::gpu_dequantize(
+            in_ptr, out_ptr,
+            num_elements as i64,
+            weight_type,
+            raw_stream,
+        );
+    }
 
     drop(storage);
 
-    let out_storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
+    let out_storage = candle_core::CudaStorage::wrap_cuda_slice(output, dev);
     let out_tensor = Tensor::from_storage(
         candle_core::Storage::Cuda(out_storage),
         candle_core::Shape::from(num_elements),
@@ -59,109 +58,4 @@ pub fn dequantize_to_bf16(
         false,
     );
     Ok(out_tensor)
-}
-
-/// Dequantize Q4_0 blocks to BF16 on GPU.
-pub fn dequantize_q4_0_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_q4_0_bf16")
-}
-
-/// Dequantize Q4_1 blocks to BF16 on GPU.
-pub fn dequantize_q4_1_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_q4_1_bf16")
-}
-
-/// Dequantize Q5_0 blocks to BF16 on GPU.
-pub fn dequantize_q5_0_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_q5_0_bf16")
-}
-
-/// Dequantize Q5_1 blocks to BF16 on GPU.
-pub fn dequantize_q5_1_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_q5_1_bf16")
-}
-
-/// Dequantize Q8_0 blocks to BF16 on GPU.
-pub fn dequantize_q8_0_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_q8_0_bf16")
-}
-
-/// Dequantize Q2_K blocks to BF16 on GPU.
-pub fn dequantize_q2k_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_q2_K_bf16")
-}
-
-/// Dequantize Q3_K blocks to BF16 on GPU.
-pub fn dequantize_q3k_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_q3_K_bf16")
-}
-
-/// Dequantize Q4_K blocks to BF16 on GPU.
-pub fn dequantize_q4k_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_q4_K_bf16")
-}
-
-/// Dequantize Q5_K blocks to BF16 on GPU.
-pub fn dequantize_q5k_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_q5_K_bf16")
-}
-
-/// Dequantize Q6_K blocks to BF16 on GPU.
-pub fn dequantize_q6k_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_q6_K_bf16")
-}
-
-/// Dequantize IQ4_NL blocks to BF16 on GPU.
-pub fn dequantize_iq4_nl_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_iq4_nl_bf16")
-}
-
-/// Dequantize IQ4_XS blocks to BF16 on GPU.
-pub fn dequantize_iq4_xs_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_iq4_xs_bf16")
-}
-
-/// Dequantize IQ3_XXS blocks to BF16 on GPU.
-pub fn dequantize_iq3_xxs_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_iq3_xxs_bf16")
-}
-
-/// Dequantize IQ3_S blocks to BF16 on GPU.
-pub fn dequantize_iq3_s_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_iq3_s_bf16")
-}
-
-/// Dequantize IQ2_XXS blocks to BF16 on GPU.
-pub fn dequantize_iq2_xxs_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_iq2_xxs_bf16")
-}
-
-/// Dequantize IQ2_XS blocks to BF16 on GPU.
-pub fn dequantize_iq2_xs_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_iq2_xs_bf16")
-}
-
-/// Dequantize IQ2_S blocks to BF16 on GPU.
-pub fn dequantize_iq2_s_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_iq2_s_bf16")
-}
-
-/// Dequantize IQ1_S blocks to BF16 on GPU.
-pub fn dequantize_iq1_s_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_iq1_s_bf16")
-}
-
-/// Dequantize IQ1_M blocks to BF16 on GPU.
-pub fn dequantize_iq1_m_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_iq1_m_bf16")
-}
-
-/// Dequantize MXFP4 blocks to BF16 on GPU.
-pub fn dequantize_mxfp4_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_mxfp4_bf16")
-}
-
-/// Dequantize NVFP4 blocks to BF16 on GPU.
-pub fn dequantize_nvfp4_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
-    dequantize_to_bf16(quantized_data, num_elements, "dequantize_nvfp4_bf16")
 }
