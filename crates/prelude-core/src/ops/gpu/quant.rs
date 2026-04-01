@@ -120,3 +120,38 @@ pub fn dequantize_iq4_nl_bf16(quantized_data: &Tensor, num_elements: usize) -> R
 pub fn dequantize_iq4_xs_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
     dequantize_to_bf16(quantized_data, num_elements, "dequantize_iq4_xs_bf16")
 }
+
+/// Dequantize IQ3_XXS blocks to BF16 on GPU.
+pub fn dequantize_iq3_xxs_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
+    dequantize_to_bf16(quantized_data, num_elements, "dequantize_iq3_xxs_bf16")
+}
+
+/// Dequantize IQ3_S blocks to BF16 on GPU.
+pub fn dequantize_iq3_s_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
+    dequantize_to_bf16(quantized_data, num_elements, "dequantize_iq3_s_bf16")
+}
+
+/// Dequantize IQ2_XXS blocks to BF16 on GPU.
+pub fn dequantize_iq2_xxs_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
+    dequantize_to_bf16(quantized_data, num_elements, "dequantize_iq2_xxs_bf16")
+}
+
+/// Dequantize IQ2_XS blocks to BF16 on GPU.
+pub fn dequantize_iq2_xs_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
+    dequantize_to_bf16(quantized_data, num_elements, "dequantize_iq2_xs_bf16")
+}
+
+/// Dequantize IQ2_S blocks to BF16 on GPU.
+pub fn dequantize_iq2_s_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
+    dequantize_to_bf16(quantized_data, num_elements, "dequantize_iq2_s_bf16")
+}
+
+/// Dequantize IQ1_S blocks to BF16 on GPU.
+pub fn dequantize_iq1_s_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
+    dequantize_to_bf16(quantized_data, num_elements, "dequantize_iq1_s_bf16")
+}
+
+/// Dequantize IQ1_M blocks to BF16 on GPU.
+pub fn dequantize_iq1_m_bf16(quantized_data: &Tensor, num_elements: usize) -> Result<Tensor> {
+    dequantize_to_bf16(quantized_data, num_elements, "dequantize_iq1_m_bf16")
+}

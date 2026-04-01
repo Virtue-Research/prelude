@@ -280,6 +280,100 @@ pub struct BlockIQ4XS {
 
 const _: () = assert!(core::mem::size_of::<BlockIQ4XS>() == 136);
 
+/// IQ3_S: 256 values → 110 bytes (3.4375 bpw).
+///
+/// 3-bit codebook indices with explicit sign bits and per-sub-block scales.
+/// Uses `iq3s_grid` (512-entry) codebook.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockIQ3S {
+    pub d: u16,
+    pub qs: [u8; QK_K / 4],       // 64 bytes: low 8 bits of 3-bit indices
+    pub qh: [u8; QK_K / 32],      // 8 bytes: high bit of indices
+    pub signs: [u8; QK_K / 8],    // 32 bytes: sign bits
+    pub scales: [u8; QK_K / 64],   // 4 bytes: sub-block scales
+}
+
+const _: () = assert!(core::mem::size_of::<BlockIQ3S>() == 110);
+
+/// IQ3_XXS: 256 values → 98 bytes (3.0625 bpw).
+///
+/// 3-bit codebook indices using `iq3xxs_grid` (256-entry) codebook.
+/// Scales and signs packed into the qs array.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockIQ3XXS {
+    pub d: u16,
+    pub qs: [u8; 3 * QK_K / 8],   // 96 bytes
+}
+
+const _: () = assert!(core::mem::size_of::<BlockIQ3XXS>() == 98);
+
+/// IQ2_S: 256 values → 82 bytes (2.5625 bpw).
+///
+/// 2-bit codebook with `iq2s_grid` (1024-entry) + sign bits + scales.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockIQ2S {
+    pub d: u16,
+    pub qs: [u8; QK_K / 4],       // 64 bytes
+    pub qh: [u8; QK_K / 32],      // 8 bytes
+    pub scales: [u8; QK_K / 32],   // 8 bytes
+}
+
+const _: () = assert!(core::mem::size_of::<BlockIQ2S>() == 82);
+
+/// IQ2_XS: 256 values → 74 bytes (2.3125 bpw).
+///
+/// 2-bit codebook with `iq2xs_grid` (512-entry) + per-group scales.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockIQ2XS {
+    pub d: u16,
+    pub qs: [u16; QK_K / 8],      // 64 bytes (32 × u16)
+    pub scales: [u8; QK_K / 32],   // 8 bytes
+}
+
+const _: () = assert!(core::mem::size_of::<BlockIQ2XS>() == 74);
+
+/// IQ2_XXS: 256 values → 66 bytes (2.0625 bpw).
+///
+/// 2-bit codebook with `iq2xxs_grid` (256-entry). Scales packed in qs.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockIQ2XXS {
+    pub d: u16,
+    pub qs: [u16; QK_K / 8],      // 64 bytes (32 × u16)
+}
+
+const _: () = assert!(core::mem::size_of::<BlockIQ2XXS>() == 66);
+
+/// IQ1_S: 256 values → 50 bytes (1.5625 bpw).
+///
+/// 1-bit grid-based quantization using `iq1s_grid` (2048-entry) codebook.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockIQ1S {
+    pub d: u16,
+    pub qs: [u8; QK_K / 8],       // 32 bytes: grid index low bits
+    pub qh: [u16; QK_K / 32],     // 16 bytes: grid index high bits + scale
+}
+
+const _: () = assert!(core::mem::size_of::<BlockIQ1S>() == 50);
+
+/// IQ1_M: 256 values → 56 bytes (1.75 bpw).
+///
+/// Minimal 1-bit quantization. No FP16 scale field — scale is packed in scales array.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockIQ1M {
+    pub qs: [u8; QK_K / 8],       // 32 bytes: grid index low bits
+    pub qh: [u8; QK_K / 16],      // 16 bytes: grid index high + shift
+    pub scales: [u8; QK_K / 32],   // 8 bytes: 3-bit block scales
+}
+
+const _: () = assert!(core::mem::size_of::<BlockIQ1M>() == 56);
+
 /// Extract the j-th (scale, min) pair from a Q4_K packed scales array.
 ///
 /// The 12-byte `scales` array encodes 8 × 6-bit scales and 8 × 6-bit mins
@@ -331,6 +425,13 @@ mod tests {
         assert_eq!(core::mem::size_of::<BlockQ8K>(), 292);
         assert_eq!(core::mem::size_of::<BlockIQ4NL>(), 18);
         assert_eq!(core::mem::size_of::<BlockIQ4XS>(), 136);
+        assert_eq!(core::mem::size_of::<BlockIQ3S>(), 110);
+        assert_eq!(core::mem::size_of::<BlockIQ3XXS>(), 98);
+        assert_eq!(core::mem::size_of::<BlockIQ2S>(), 82);
+        assert_eq!(core::mem::size_of::<BlockIQ2XS>(), 74);
+        assert_eq!(core::mem::size_of::<BlockIQ2XXS>(), 66);
+        assert_eq!(core::mem::size_of::<BlockIQ1S>(), 50);
+        assert_eq!(core::mem::size_of::<BlockIQ1M>(), 56);
     }
 
     #[test]

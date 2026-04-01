@@ -533,3 +533,304 @@ extern "C" __global__ void dequantize_q6_K_bf16(
 
     y[i] = __float2bfloat16(dl * (float)q6_val);
 }
+
+// ── Remaining IQ formats: codebook-based dequantize ─────────────────────
+
+#include "iq_tables.cuh"
+
+// IQ block structures (matching GGUF on-disk layout)
+
+struct block_iq3_xxs { uint16_t d; uint8_t qs[96]; };
+struct block_iq3_s   { uint16_t d; uint8_t qs[64]; uint8_t qh[8]; uint8_t signs[32]; uint8_t scales[4]; };
+struct block_iq2_xxs { uint16_t d; uint16_t qs[32]; };
+struct block_iq2_xs  { uint16_t d; uint16_t qs[32]; uint8_t scales[8]; };
+struct block_iq2_s   { uint16_t d; uint8_t qs[64]; uint8_t qh[8]; uint8_t scales[8]; };
+struct block_iq1_s   { uint16_t d; uint8_t qs[32]; uint16_t qh[8]; };
+struct block_iq1_m   { uint8_t qs[32]; uint8_t qh[16]; uint8_t scales[8]; };
+
+// ── IQ3_XXS dequantize (256 values/block → BF16) ───────────────────────
+
+extern "C" __global__ void dequantize_iq3_xxs_bf16(
+    const block_iq3_xxs* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    uint64_t num_elements
+) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_elements) return;
+
+    const uint64_t block_idx = i / QK_K;
+    const uint32_t within_block = i % QK_K;
+    const block_iq3_xxs& blk = x[block_idx];
+    const float d = fp16_to_f32(blk.d);
+
+    // 256 elements in 8 groups of 32. Each group: 8 bytes indices + 4 bytes (signs+scale)
+    const uint32_t group = within_block / 32;
+    const uint32_t within_group = within_block % 32;
+
+    // Index byte: each byte encodes 4 values via iq3xxs_grid (uint32_t = 4 bytes = 4 values)
+    const uint32_t byte_idx = within_group / 4;
+    const uint32_t sub_idx = within_group % 4;
+
+    uint8_t q3_byte = blk.qs[group * 12 + byte_idx]; // 12 = 8 indices + 4 aux
+    uint32_t grid_val = iq3xxs_grid[q3_byte];
+    int8_t val = (int8_t)((grid_val >> (sub_idx * 8)) & 0xFF);
+
+    // Get sign from aux32
+    uint32_t aux32;
+    memcpy(&aux32, blk.qs + group * 12 + 8, 4);
+    uint8_t sign_byte = (aux32 >> (7 * (byte_idx / 2))) & 0x7F;
+    // Reconstruct 8th bit from parity
+    uint32_t p = __popc((uint32_t)sign_byte) & 1;
+    sign_byte = sign_byte ^ (p << 7);
+    int bit_idx = byte_idx * 4 + sub_idx;
+    if ((sign_byte >> bit_idx) & 1) val = -val;
+
+    int ls = aux32 >> 28;
+    float scale = d * (float)(ls * 2 + 1) * 0.5f;
+    y[i] = __float2bfloat16(scale * (float)val);
+}
+
+// ── IQ3_S dequantize (256 values/block → BF16) ─────────────────────────
+
+extern "C" __global__ void dequantize_iq3_s_bf16(
+    const block_iq3_s* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    uint64_t num_elements
+) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_elements) return;
+
+    const uint64_t block_idx = i / QK_K;
+    const uint32_t within_block = i % QK_K;
+    const block_iq3_s& blk = x[block_idx];
+    const float d_all = fp16_to_f32(blk.d);
+
+    const uint32_t group = within_block / 32;
+    const uint32_t within_group = within_block % 32;
+    const uint32_t byte_idx = within_group / 4;
+    const uint32_t sub_idx = within_group % 4;
+
+    // 9-bit codebook index: low 8 from qs, high 1 from qh
+    uint8_t qs_byte = blk.qs[group * 8 + byte_idx];
+    int qh_bit = (blk.qh[group] >> byte_idx) & 1;
+    uint32_t grid_val = iq3s_grid[qs_byte | (qh_bit << 8)];
+    int8_t val = (int8_t)((grid_val >> (sub_idx * 8)) & 0xFF);
+
+    // Sign bit
+    uint8_t sign_byte = blk.signs[group * 4 + byte_idx / 2];
+    int sign_bit_pos = (byte_idx % 2) * 4 + sub_idx;
+    if ((sign_byte >> sign_bit_pos) & 1) val = -val;
+
+    // Scale
+    int ls = 1 + 2 * ((blk.scales[group / 2] >> ((group % 2) * 4)) & 0x0F);
+    y[i] = __float2bfloat16(d_all * (float)ls * (float)val);
+}
+
+// ── IQ2_XXS dequantize (256 values/block → BF16) ───────────────────────
+
+extern "C" __global__ void dequantize_iq2_xxs_bf16(
+    const block_iq2_xxs* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    uint64_t num_elements
+) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_elements) return;
+
+    const uint64_t block_idx = i / QK_K;
+    const uint32_t within_block = i % QK_K;
+    const block_iq2_xxs& blk = x[block_idx];
+    const float d = fp16_to_f32(blk.d);
+
+    // 256 elements in 8 groups of 32
+    // Each group uses 2 uint16_t (4 bytes) for indices, and shares 4 bytes of aux
+    // Layout in qs[32]: groups of 2 uint16_t each (indices+signs), with scale in aux
+    const uint32_t group = within_block / 32;
+    const uint32_t within_group = within_block % 32;
+
+    // Each group of 32 elements uses 8 bytes: 4 bytes codebook indices, 4 bytes signs+scale
+    // The qs array (uint16_t[32] = 64 bytes) holds 8 groups × 8 bytes
+    const uint8_t* raw = (const uint8_t*)blk.qs + group * 8;
+    uint8_t cb_idx = raw[within_group / 8]; // codebook index byte
+    uint32_t aux32;
+    memcpy(&aux32, raw + 4, 4);
+
+    // Look up 8-element codebook entry (uint64_t → 8 bytes)
+    uint64_t grid_val = iq2xxs_grid[cb_idx];
+    int elem_in_8 = within_group % 8;
+    int8_t val = (int8_t)((grid_val >> (elem_in_8 * 8)) & 0xFF);
+
+    // Sign from ksigns
+    uint8_t sign_byte = (aux32 >> (7 * (within_group / 8))) & 0x7F;
+    uint32_t p = __popc((uint32_t)sign_byte) & 1;
+    sign_byte = sign_byte ^ (p << 7);
+    if ((sign_byte >> elem_in_8) & 1) val = -val;
+
+    int ls = (aux32 >> 27) | 1;  // scale * 2 + 1
+    float scale = d * (float)ls / 8.0f;
+    y[i] = __float2bfloat16(scale * (float)val);
+}
+
+// ── IQ2_XS dequantize (256 values/block → BF16) ────────────────────────
+
+extern "C" __global__ void dequantize_iq2_xs_bf16(
+    const block_iq2_xs* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    uint64_t num_elements
+) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_elements) return;
+
+    const uint64_t block_idx = i / QK_K;
+    const uint32_t within_block = i % QK_K;
+    const block_iq2_xs& blk = x[block_idx];
+    const float d = fp16_to_f32(blk.d);
+
+    // 256 elements: 32 qs entries (uint16_t), each encodes 8 values
+    // Each uint16_t: 9-bit grid index + 7-bit signs
+    const uint32_t qs_idx = within_block / 8;
+    const uint32_t elem_in_8 = within_block % 8;
+
+    uint16_t qval = blk.qs[qs_idx];
+    uint64_t grid_val = iq2xs_grid[qval & 0x1FF];
+    int8_t val = (int8_t)((grid_val >> (elem_in_8 * 8)) & 0xFF);
+
+    // Sign from upper 7 bits of qs entry (+ parity for 8th)
+    uint8_t sign_bits = (qval >> 9) & 0x7F;
+    uint32_t p = __popc((uint32_t)sign_bits) & 1;
+    sign_bits = sign_bits ^ (p << 7);
+    if ((sign_bits >> elem_in_8) & 1) val = -val;
+
+    // Per-16-element scale
+    const uint32_t scale_group = within_block / 16;
+    int ls = (scale_group % 2 == 0)
+        ? (blk.scales[scale_group / 2] & 0x0F)
+        : (blk.scales[scale_group / 2] >> 4);
+    float scale = d * ((float)ls * 2.0f + 1.0f) / 4.0f;
+    y[i] = __float2bfloat16(scale * (float)val);
+}
+
+// ── IQ2_S dequantize (256 values/block → BF16) ─────────────────────────
+
+extern "C" __global__ void dequantize_iq2_s_bf16(
+    const block_iq2_s* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    uint64_t num_elements
+) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_elements) return;
+
+    const uint64_t block_idx = i / QK_K;
+    const uint32_t within_block = i % QK_K;
+    const block_iq2_s& blk = x[block_idx];
+    const float d = fp16_to_f32(blk.d);
+
+    // 256 elements in groups of 8
+    const uint32_t group8 = within_block / 8;
+    const uint32_t elem_in_8 = within_block % 8;
+
+    // 10-bit grid index: low 8 from qs, high 2 from qh
+    uint8_t qs_byte = blk.qs[group8];
+    int qh_bits = (blk.qh[group8 / 4] >> ((group8 % 4) * 2)) & 0x03;
+    uint64_t grid_val = iq2s_grid[qs_byte | (qh_bits << 8)];
+    int8_t val = (int8_t)((grid_val >> (elem_in_8 * 8)) & 0xFF);
+
+    // Sign bits are in qs[QK_K/4..] area, packed 4 bits per 8 elements
+    uint8_t sign_byte = blk.qs[QK_K / 4 + group8 / 2];
+    int bit_pos = (group8 % 2) * 4 + (elem_in_8 / 2);
+    if ((sign_byte >> bit_pos) & 1) val = -val;
+
+    // Per-16-element scale
+    const uint32_t scale_group = within_block / 16;
+    int ls = (scale_group % 2 == 0)
+        ? (blk.scales[scale_group / 2] & 0x0F)
+        : (blk.scales[scale_group / 2] >> 4);
+    float scale = d * ((float)ls * 2.0f + 1.0f) / 4.0f;
+    y[i] = __float2bfloat16(scale * (float)val);
+}
+
+// ── IQ1_S dequantize (256 values/block → BF16) ─────────────────────────
+
+extern "C" __global__ void dequantize_iq1_s_bf16(
+    const block_iq1_s* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    uint64_t num_elements
+) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_elements) return;
+
+    const uint64_t block_idx = i / QK_K;
+    const uint32_t within_block = i % QK_K;
+    const block_iq1_s& blk = x[block_idx];
+    const float d = fp16_to_f32(blk.d);
+
+    // 256 elements: 8 groups of 32, each group uses qs[4] + qh[1]
+    const uint32_t group = within_block / 32;
+    const uint32_t within_group = within_block % 32;
+
+    // Each sub-group of 8: qs byte + 3 bits from qh → 11-bit grid index
+    const uint32_t sub = within_group / 8;
+    const uint32_t elem_in_8 = within_group % 8;
+
+    uint8_t qs_byte = blk.qs[group * 4 + sub];
+    uint16_t qh_val = blk.qh[group];
+    int grid_idx = qs_byte | (((qh_val >> (3 * sub)) & 0x07) << 8);
+
+    uint32_t grid = iq1s_grid_gpu[grid_idx];
+    // Grid packs 8 × 4-bit values: low nibbles and high nibbles
+    int nibble_idx = elem_in_8;
+    int val;
+    if (nibble_idx < 4) {
+        val = (int)((grid >> (nibble_idx * 8)) & 0x0F);
+    } else {
+        val = (int)((grid >> ((nibble_idx - 4) * 8 + 4)) & 0x0F);
+    }
+
+    float d1q = d * (float)(((qh_val >> 11) & 0x0E) + 1);
+    float delta = -1.0f + IQ1S_DELTA - (float)(qh_val & 0x8000) * (2.0f * IQ1S_DELTA / 0x8000);
+    y[i] = __float2bfloat16(d1q * (float)val + delta);
+}
+
+// ── IQ1_M dequantize (256 values/block → BF16) ─────────────────────────
+
+extern "C" __global__ void dequantize_iq1_m_bf16(
+    const block_iq1_m* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    uint64_t num_elements
+) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_elements) return;
+
+    const uint64_t block_idx = i / QK_K;
+    const uint32_t within_block = i % QK_K;
+    const block_iq1_m& blk = x[block_idx];
+
+    // Extract global scale from packed scales
+    const uint16_t* sc = (const uint16_t*)blk.scales;
+    uint16_t scale_u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0)
+                       | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
+    float d = __half2float(*reinterpret_cast<const __half*>(&scale_u16));
+
+    const uint32_t group = within_block / 32;
+    const uint32_t within_group = within_block % 32;
+    const uint32_t sub = within_group / 8;
+    const uint32_t elem_in_8 = within_group % 8;
+
+    uint8_t qs_byte = blk.qs[group * 4 + sub];
+    int qhl = blk.qh[2 * group + sub / 2] >> (4 * (sub % 2));
+    int grid_idx = qs_byte | ((qhl & 0x07) << 8);
+
+    uint32_t grid = iq1s_grid_gpu[grid_idx];
+    int val;
+    if (elem_in_8 < 4) {
+        val = (int)((grid >> (elem_in_8 * 8)) & 0x0F);
+    } else {
+        val = (int)((grid >> ((elem_in_8 - 4) * 8 + 4)) & 0x0F);
+    }
+
+    // Per-group scale
+    int tmp = sc[group / 2] >> (6 * (group % 2));
+    int sc_val = 2 * ((sub < 2 ? ((tmp >> 0) & 0x07) : ((tmp >> 3) & 0x07))) + 1;
+
+    float delta = -1.0f + IQ1M_DELTA - (float)(qhl & 0x08) * (2.0f * IQ1M_DELTA / 0x08);
+    y[i] = __float2bfloat16(d * (float)sc_val * ((float)val + delta));
+}

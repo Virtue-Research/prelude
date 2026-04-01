@@ -66,6 +66,7 @@ fn main() {
         // Track all source files for rerun-if-changed
         println!("cargo:rerun-if-changed=src/ops/gpu/kernels/common/common.cuh");
         println!("cargo:rerun-if-changed=src/ops/gpu/kernels/common/vec_utils.cuh");
+        println!("cargo:rerun-if-changed=src/ops/gpu/kernels/quant/iq_tables.cuh");
 
         for (category, filename, output_name) in kernel_modules.iter() {
             let kernel_src = kernels_dir.join(category).join(filename);

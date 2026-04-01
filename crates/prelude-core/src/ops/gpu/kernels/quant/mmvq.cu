@@ -785,3 +785,388 @@ MMVQ_KERNEL_KQUANT(mmvq_q6_K, block_q6_K, vec_dot_q6_K_q8_1)
 
 MMVQ_KERNEL_SIMPLE(mmvq_iq4_nl, block_iq4_nl, vec_dot_iq4_nl_q8_1)
 MMVQ_KERNEL_KQUANT(mmvq_iq4_xs, block_iq4_xs, vec_dot_iq4_xs_q8_1)
+
+// ── Remaining IQ formats (codebook-based) ──────────────────────────────
+//
+// These formats use large lookup tables (codebooks) to decode quantized
+// indices into signed int8 values, then dp4a with Q8_1 activations.
+
+#include "iq_tables.cuh"
+
+// ── Additional IQ block structures ─────────────────────────────────────
+
+struct __align__(2) block_iq3_xxs {  // 98 bytes
+    uint16_t d;
+    uint8_t qs[96];   // 3*QK_K/8: packed indices + signs + scales
+};
+
+struct __align__(2) block_iq3_s {    // 110 bytes
+    uint16_t d;
+    uint8_t qs[64];    // QK_K/4: low 8 bits of indices
+    uint8_t qh[8];     // QK_K/32: high bit of indices
+    uint8_t signs[32]; // QK_K/8: sign bits
+    uint8_t scales[4]; // QK_K/64: sub-block scales
+};
+
+struct __align__(2) block_iq2_xxs {  // 66 bytes
+    uint16_t d;
+    uint16_t qs[32];   // QK_K/8: packed codebook indices + signs + scales
+};
+
+struct __align__(2) block_iq2_xs {   // 74 bytes
+    uint16_t d;
+    uint16_t qs[32];   // QK_K/8: 9-bit index + 7-bit signs
+    uint8_t scales[8]; // QK_K/32: sub-block scales
+};
+
+struct __align__(2) block_iq2_s {    // 82 bytes
+    uint16_t d;
+    uint8_t qs[64];    // QK_K/4: low 8 bits of indices
+    uint8_t qh[8];     // QK_K/32: high bits
+    uint8_t scales[8]; // QK_K/32: sub-block scales
+};
+
+struct __align__(2) block_iq1_s {    // 50 bytes
+    uint16_t d;
+    uint8_t qs[32];    // QK_K/8: grid index low bits
+    uint16_t qh[8];    // QK_K/32: grid index high bits + scale/delta
+};
+
+struct __align__(2) block_iq1_m {    // 56 bytes (no d field!)
+    uint8_t qs[32];    // QK_K/8: grid index low bits
+    uint8_t qh[16];    // QK_K/16: grid index high + shift
+    uint8_t scales[8]; // QK_K/32: 3-bit block scales
+};
+
+// ── IQ helper: unpack sign bits ────────────────────────────────────────
+
+__device__ __forceinline__ uint32_t unpack_ksigns(uint8_t v) {
+    const uint32_t p = __popc((uint32_t)v) & 1;
+    const uint32_t s = v ^ (p << 7);
+    return s * 0x01010101u;
+}
+
+// ── IQ3_XXS × Q8_1 ────────────────────────────────────────────────────
+
+__device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
+    const block_iq3_xxs& w, const block_q8_1* a
+) {
+    float d_all = fp16_to_f32(w.d);
+    float sumf = 0.0f;
+
+    for (int iqs = 0; iqs < 16; iqs += 2) {
+        float d8 = fp16_to_f32(a[iqs / 2].d);
+        const int* q8 = (const int*)a[iqs / 2].qs;
+
+        int q3_lo = load_int(w.qs + iqs * 4);
+        int q3_hi = load_int(w.qs + iqs * 4 + 4);
+        const uint8_t* q3 = (const uint8_t*)&q3_lo;
+        const uint8_t* q3b = (const uint8_t*)&q3_hi;
+        uint32_t aux32 = load_int(w.qs + QK_K / 4 + (iqs / 2) * 4);
+
+        int sumi = 0;
+        #pragma unroll
+        for (int l0 = 0; l0 < 4; l0++) {
+            int2 grid_pos = make_int2(iq3xxs_grid[q3[l0]], iq3xxs_grid[q3b[l0]]);
+            uint32_t signs = unpack_ksigns(aux32 >> (7 * l0));
+
+            int signs0 = __vcmpne4(signs & 0x08040201, 0);
+            int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+            sumi = __dp4a(grid_l, q8[l0 * 2], sumi);
+
+            int signs1 = __vcmpne4(signs & 0x80402010, 0);
+            int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+            sumi = __dp4a(grid_h, q8[l0 * 2 + 1], sumi);
+        }
+
+        int ls = aux32 >> 28;
+        sumi = (ls * sumi + sumi / 2) / 2;
+        sumf += d8 * (float)sumi;
+    }
+
+    return d_all * sumf;
+}
+
+// ── IQ3_S × Q8_1 ──────────────────────────────────────────────────────
+
+__device__ __forceinline__ float vec_dot_iq3_s_q8_1(
+    const block_iq3_s& w, const block_q8_1* a
+) {
+    float d_all = fp16_to_f32(w.d);
+    float sumf = 0.0f;
+
+    for (int iqs = 0; iqs < 16; iqs += 2) {
+        float d8 = fp16_to_f32(a[iqs / 2].d);
+        const int* q8 = (const int*)a[iqs / 2].qs;
+
+        int qs_lo = load_int(w.qs + iqs * 4);
+        int qs_hi = load_int(w.qs + iqs * 4 + 4);
+        const uint8_t* qs = (const uint8_t*)&qs_lo;
+        const uint8_t* qsb = (const uint8_t*)&qs_hi;
+
+        int qh;
+        memcpy(&qh, w.qh + (iqs / 2) * 4, 4);
+
+        int signs_packed;
+        memcpy(&signs_packed, w.signs + (iqs / 2) * 4, 4);
+        const uint8_t* sp = (const uint8_t*)&signs_packed;
+
+        int sumi = 0;
+        #pragma unroll
+        for (int l0 = 0; l0 < 4; l0++) {
+            int2 grid_pos = make_int2(
+                iq3s_grid[qs[l0]  | ((qh << (8 - l0 * 2)) & 0x100)],
+                iq3s_grid[qsb[l0] | ((qh << (7 - l0 * 2)) & 0x100)]);
+
+            int signs0 = __vcmpne4(((sp[l0] & 0x03) << 7) | ((sp[l0] & 0x0C) << 21), 0);
+            int signs1 = __vcmpne4(((sp[l0] & 0x30) << 3) | ((sp[l0] & 0xC0) << 17), 0);
+
+            int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+            int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+
+            sumi = __dp4a(grid_l, q8[l0 * 2], sumi);
+            sumi = __dp4a(grid_h, q8[l0 * 2 + 1], sumi);
+        }
+
+        sumi *= 1 + 2 * ((w.scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
+        sumf += d8 * (float)sumi;
+    }
+
+    return d_all * sumf;
+}
+
+// ── IQ2_XXS × Q8_1 ────────────────────────────────────────────────────
+
+__device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
+    const block_iq2_xxs& w, const block_q8_1* a
+) {
+    float d_all = fp16_to_f32(w.d);
+    float sumf = 0.0f;
+
+    for (int iqs = 0; iqs < 16; iqs += 2) {
+        float d8 = fp16_to_f32(a[iqs / 2].d);
+        const int* q8 = (const int*)a[iqs / 2].qs;
+
+        int q2 = load_int((const uint8_t*)w.qs + iqs * 4);
+        const uint8_t* aux8 = (const uint8_t*)&q2;
+        uint32_t aux32;
+        memcpy(&aux32, (const uint8_t*)w.qs + iqs * 4 + 4, 4);
+
+        int sumi = 0;
+        #pragma unroll
+        for (int k0 = 0; k0 < 8; k0 += 2) {
+            const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[k0 / 2]];
+            const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
+
+            int signs0 = __vcmpne4(signs & 0x08040201, 0);
+            int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
+            sumi = __dp4a(grid0, q8[k0], sumi);
+
+            int signs1 = __vcmpne4(signs & 0x80402010, 0);
+            int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
+            sumi = __dp4a(grid1, q8[k0 + 1], sumi);
+        }
+
+        int ls = aux32 >> 27 | 1;
+        sumi = sumi * ls / 8;
+        sumf += d8 * (float)sumi;
+    }
+
+    return d_all * sumf;
+}
+
+// ── IQ2_XS × Q8_1 ─────────────────────────────────────────────────────
+
+__device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
+    const block_iq2_xs& w, const block_q8_1* a
+) {
+    float d_all = fp16_to_f32(w.d);
+    float sumf = 0.0f;
+
+    for (int iqs = 0; iqs < 16; iqs += 2) {
+        float d8 = fp16_to_f32(a[iqs / 2].d);
+        const int* q8 = (const int*)a[iqs / 2].qs;
+
+        int q2_lo = load_int((const uint8_t*)w.qs + iqs * 4);
+        int q2_hi = load_int((const uint8_t*)w.qs + iqs * 4 + 4);
+        const uint16_t* q2 = (const uint16_t*)&q2_lo;
+        const uint16_t* q2b = (const uint16_t*)&q2_hi;
+        int ls0 = w.scales[iqs / 2] & 0x0F;
+        int ls1 = w.scales[iqs / 2] >> 4;
+
+        int sumi0 = 0, sumi1 = 0;
+        #pragma unroll
+        for (int l0 = 0; l0 < 4; l0++) {
+            const uint16_t qval = (l0 < 2) ? q2[l0] : q2b[l0 - 2];
+            const uint2 grid_pos = ((const uint2*)iq2xs_grid)[qval & 0x1FF];
+            const uint32_t signs = unpack_ksigns(qval >> 9);
+
+            int signs0 = __vcmpne4(signs & 0x08040201, 0);
+            int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+            int signs1 = __vcmpne4(signs & 0x80402010, 0);
+            int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+
+            if (l0 < 2) {
+                sumi0 = __dp4a(grid_l, q8[l0 * 2], sumi0);
+                sumi0 = __dp4a(grid_h, q8[l0 * 2 + 1], sumi0);
+            } else {
+                sumi1 = __dp4a(grid_l, q8[l0 * 2], sumi1);
+                sumi1 = __dp4a(grid_h, q8[l0 * 2 + 1], sumi1);
+            }
+        }
+        int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
+        sumf += d8 * (float)sumi;
+    }
+
+    return d_all * sumf;
+}
+
+// ── IQ2_S × Q8_1 ──────────────────────────────────────────────────────
+
+__device__ __forceinline__ float vec_dot_iq2_s_q8_1(
+    const block_iq2_s& w, const block_q8_1* a
+) {
+    float d_all = fp16_to_f32(w.d);
+    float sumf = 0.0f;
+
+    for (int iqs = 0; iqs < 16; iqs += 2) {
+        float d8 = fp16_to_f32(a[iqs / 2].d);
+        const int* q8 = (const int*)a[iqs / 2].qs;
+
+        int qs_packed = load_int(w.qs + (iqs / 2) * 4);
+        const uint8_t* qs = (const uint8_t*)&qs_packed;
+        int qh;
+        memcpy(&qh, w.qh + (iqs / 2) * 4, 4);
+
+        int signs_packed = load_int(w.qs + QK_K / 4 + (iqs / 2) * 4);
+        const uint8_t* sp = (const uint8_t*)&signs_packed;
+
+        int ls0 = w.scales[iqs / 2] & 0x0F;
+        int ls1 = w.scales[iqs / 2] >> 4;
+
+        int sumi0 = 0, sumi1 = 0;
+        #pragma unroll
+        for (int l0 = 0; l0 < 4; l0++) {
+            const int* grid_pos = (const int*)(iq2s_grid + (qs[l0] | ((qh << (8 - l0 * 2)) & 0x300)));
+
+            int signs0 = __vcmpne4(((sp[l0] & 0x03) << 7) | ((sp[l0] & 0x0C) << 21), 0);
+            int signs1 = __vcmpne4(((sp[l0] & 0x30) << 3) | ((sp[l0] & 0xC0) << 17), 0);
+
+            int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
+            int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
+
+            if (l0 < 2) {
+                sumi0 = __dp4a(grid_l, q8[l0 * 2], sumi0);
+                sumi0 = __dp4a(grid_h, q8[l0 * 2 + 1], sumi0);
+            } else {
+                sumi1 = __dp4a(grid_l, q8[l0 * 2], sumi1);
+                sumi1 = __dp4a(grid_h, q8[l0 * 2 + 1], sumi1);
+            }
+        }
+        int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
+        sumf += d8 * (float)sumi;
+    }
+
+    return d_all * sumf;
+}
+
+// ── IQ1_S × Q8_1 ──────────────────────────────────────────────────────
+
+__device__ __forceinline__ float vec_dot_iq1_s_q8_1(
+    const block_iq1_s& w, const block_q8_1* a
+) {
+    float sumf = 0.0f;
+
+    for (int iqs = 0; iqs < 8; iqs++) {
+        const float2 ds = __half22float2(*(const __half2*)&a[iqs].d);
+        const int* q8 = (const int*)a[iqs].qs;
+
+        int qs_packed = load_int(w.qs + iqs * 4);
+        const uint8_t* qs = (const uint8_t*)&qs_packed;
+
+        uint16_t qh_val;
+        memcpy(&qh_val, &w.qh[iqs], 2);
+        int qh = (int)qh_val;
+
+        int sumi = 0;
+        #pragma unroll
+        for (int l0 = 0; l0 < 4; l0++) {
+            int grid = iq1s_grid_gpu[qs[l0] | (((qh >> (3 * l0)) & 0x07) << 8)];
+            int grid0 = (grid >> 0) & 0x0F0F0F0F;
+            int grid1 = (grid >> 4) & 0x0F0F0F0F;
+            sumi = __dp4a(grid0, q8[l0 * 2], sumi);
+            sumi = __dp4a(grid1, q8[l0 * 2 + 1], sumi);
+        }
+
+        float d1q = fp16_to_f32(w.d) * (float)(((qh >> 11) & 0x0E) + 1);
+        float delta = -1.0f + IQ1S_DELTA - (float)(qh & 0x8000) * (2.0f * IQ1S_DELTA / 0x8000);
+        sumf += d1q * (ds.x * (float)sumi + ds.y * delta);
+    }
+
+    return sumf;
+}
+
+// ── IQ1_M × Q8_1 ──────────────────────────────────────────────────────
+
+__device__ __forceinline__ float vec_dot_iq1_m_q8_1(
+    const block_iq1_m& w, const block_q8_1* a
+) {
+    float sumf = 0.0f;
+    int sumi_arr[2];
+    float sumf_arr[2];
+
+    for (int iqs = 0; iqs < 8; iqs++) {
+        const float2 ds = __half22float2(*(const __half2*)&a[iqs].d);
+        const int* q8 = (const int*)a[iqs].qs;
+
+        int qs_packed = load_int(w.qs + iqs * 4);
+        const uint8_t* qs = (const uint8_t*)&qs_packed;
+
+        sumi_arr[0] = 0; sumi_arr[1] = 0;
+        sumf_arr[0] = 0.0f; sumf_arr[1] = 0.0f;
+
+        #pragma unroll
+        for (int l0 = 0; l0 < 4; l0++) {
+            int qhl = w.qh[2 * iqs + l0 / 2] >> (4 * (l0 % 2));
+            int grid = iq1s_grid_gpu[qs[l0] | ((qhl & 0x07) << 8)];
+
+            int grid0 = (grid >> 0) & 0x0F0F0F0F;
+            int grid1 = (grid >> 4) & 0x0F0F0F0F;
+
+            sumi_arr[l0 / 2] = __dp4a(grid0, q8[l0 * 2], sumi_arr[l0 / 2]);
+            sumi_arr[l0 / 2] = __dp4a(grid1, q8[l0 * 2 + 1], sumi_arr[l0 / 2]);
+
+            float delta = -1.0f + IQ1M_DELTA - (float)(qhl & 0x08) * (2.0f * IQ1M_DELTA / 0x08);
+            int sumy = 0;
+            sumy = __dp4a(q8[l0 * 2], 0x01010101, sumy);
+            sumy = __dp4a(q8[l0 * 2 + 1], 0x01010101, sumy);
+            sumf_arr[l0 / 2] += delta * (float)sumy;
+        }
+
+        // Extract scale from packed scales array
+        const uint16_t* sc = (const uint16_t*)w.scales;
+        uint16_t scale_u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0)
+                           | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
+        float d = __half2float(*reinterpret_cast<const __half*>(&scale_u16))
+                * ds.x;
+
+        int tmp = sc[iqs / 2] >> (6 * (iqs % 2));
+        int sc0 = 2 * ((tmp >> 0) & 0x07) + 1;
+        int sc1 = 2 * ((tmp >> 3) & 0x07) + 1;
+
+        sumf += d * (((float)sumi_arr[0] + sumf_arr[0]) * (float)sc0
+                   + ((float)sumi_arr[1] + sumf_arr[1]) * (float)sc1);
+    }
+
+    return sumf;
+}
+
+// ── MMVQ kernel instantiations for remaining IQ formats ────────────────
+
+MMVQ_KERNEL_KQUANT(mmvq_iq3_xxs, block_iq3_xxs, vec_dot_iq3_xxs_q8_1)
+MMVQ_KERNEL_KQUANT(mmvq_iq3_s,   block_iq3_s,   vec_dot_iq3_s_q8_1)
+MMVQ_KERNEL_KQUANT(mmvq_iq2_xxs, block_iq2_xxs, vec_dot_iq2_xxs_q8_1)
+MMVQ_KERNEL_KQUANT(mmvq_iq2_xs,  block_iq2_xs,  vec_dot_iq2_xs_q8_1)
+MMVQ_KERNEL_KQUANT(mmvq_iq2_s,   block_iq2_s,   vec_dot_iq2_s_q8_1)
+MMVQ_KERNEL_KQUANT(mmvq_iq1_s,   block_iq1_s,   vec_dot_iq1_s_q8_1)
+MMVQ_KERNEL_KQUANT(mmvq_iq1_m,   block_iq1_m,   vec_dot_iq1_m_q8_1)

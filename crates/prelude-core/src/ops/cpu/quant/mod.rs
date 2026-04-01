@@ -39,7 +39,8 @@ pub mod matmul;
 pub use types::{
     BlockQ4_0, BlockQ4_1, BlockQ5_0, BlockQ5_1, BlockQ8_0, BlockQ8_1,
     BlockQ2K, BlockQ3K, BlockQ4K, BlockQ5K, BlockQ6K, BlockQ8K,
-    BlockIQ4NL, BlockIQ4XS,
+    BlockIQ4NL, BlockIQ4XS, BlockIQ3S, BlockIQ3XXS,
+    BlockIQ2S, BlockIQ2XS, BlockIQ2XXS, BlockIQ1S, BlockIQ1M,
 };
 pub use q4_0::vec_dot_q4_0_q8_0;
 pub use q4_1::vec_dot_q4_1_q8_1;

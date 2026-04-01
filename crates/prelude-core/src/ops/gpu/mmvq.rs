@@ -194,3 +194,38 @@ pub fn mmvq_iq4_nl(w: &Tensor, x: &Tensor, n: usize, k: usize) -> Result<Tensor>
 pub fn mmvq_iq4_xs(w: &Tensor, x: &Tensor, n: usize, k: usize) -> Result<Tensor> {
     mmvq(w, x, n, k, "mmvq_iq4_xs", 256)
 }
+
+/// MMVQ with IQ3_XXS weights (3.0625 bpw, 256 elements/block).
+pub fn mmvq_iq3_xxs(w: &Tensor, x: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+    mmvq(w, x, n, k, "mmvq_iq3_xxs", 256)
+}
+
+/// MMVQ with IQ3_S weights (3.4375 bpw, 256 elements/block).
+pub fn mmvq_iq3_s(w: &Tensor, x: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+    mmvq(w, x, n, k, "mmvq_iq3_s", 256)
+}
+
+/// MMVQ with IQ2_XXS weights (2.0625 bpw, 256 elements/block).
+pub fn mmvq_iq2_xxs(w: &Tensor, x: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+    mmvq(w, x, n, k, "mmvq_iq2_xxs", 256)
+}
+
+/// MMVQ with IQ2_XS weights (2.3125 bpw, 256 elements/block).
+pub fn mmvq_iq2_xs(w: &Tensor, x: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+    mmvq(w, x, n, k, "mmvq_iq2_xs", 256)
+}
+
+/// MMVQ with IQ2_S weights (2.5625 bpw, 256 elements/block).
+pub fn mmvq_iq2_s(w: &Tensor, x: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+    mmvq(w, x, n, k, "mmvq_iq2_s", 256)
+}
+
+/// MMVQ with IQ1_S weights (1.5625 bpw, 256 elements/block).
+pub fn mmvq_iq1_s(w: &Tensor, x: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+    mmvq(w, x, n, k, "mmvq_iq1_s", 256)
+}
+
+/// MMVQ with IQ1_M weights (1.75 bpw, 256 elements/block).
+pub fn mmvq_iq1_m(w: &Tensor, x: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+    mmvq(w, x, n, k, "mmvq_iq1_m", 256)
+}
