@@ -1379,6 +1379,7 @@ void brgemm_s8_linear(
     }
 
     dnnl_brgemm_release_hw_context();
+    tls_current = nullptr;
     dnnl_ukernel_attr_params_destroy(params);
 }
 
@@ -1625,6 +1626,7 @@ void brgemm_f8e4m3_linear(
     }
 
     dnnl_brgemm_release_hw_context();
+    tls_current = nullptr;
     dnnl_ukernel_attr_params_destroy(params);
 }
 
@@ -1758,6 +1760,7 @@ void brgemm_bf16_linear_postops(
     }
 
     dnnl_brgemm_release_hw_context();
+    tls_current = nullptr;
     dnnl_ukernel_attr_params_destroy(params);
 }
 
