@@ -19,7 +19,7 @@ set(ONEDNN_BUILD_GRAPH OFF CACHE BOOL "" FORCE)
 set(DNNL_ENABLE_JIT_PROFILING OFF CACHE BOOL "" FORCE)
 set(DNNL_ENABLE_ITT_TASKS OFF CACHE BOOL "" FORCE)
 
-# Enable brgemm micro-kernel API (experimental in v3.11)
+# Enable brgemm micro-kernel API (experimental)
 set(DNNL_EXPERIMENTAL_UKERNEL ON CACHE BOOL "" FORCE)
 
 # Threading: THREADPOOL — oneDNN calls our RayonThreadPool adapter.
@@ -30,8 +30,8 @@ message(STATUS "oneDNN FFI: using THREADPOOL runtime (rayon-backed)")
 FetchContent_Declare(
     onednn
     GIT_REPOSITORY https://github.com/uxlfoundation/oneDNN.git
-    GIT_TAG v3.11.1
-    GIT_SHALLOW TRUE
+    GIT_TAG main
+    GIT_SHALLOW FALSE
     GIT_PROGRESS TRUE
 )
 FetchContent_MakeAvailable(onednn)

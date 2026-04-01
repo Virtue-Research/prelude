@@ -213,6 +213,16 @@ fn main() -> Result<()> {
         for &(m, k, n) in gemm_configs {
             gemm::bench(m, k, n, 5, gemm_repeats)?;
         }
+
+        println!("\n=== GEMM (INT8 W8A8 linear) ===");
+        for &(m, k, n) in gemm_configs {
+            gemm::bench_s8(m, k, n, 5, gemm_repeats)?;
+        }
+
+        println!("\n=== GEMM (BF16 + fused post-ops: bias + GELU) ===");
+        for &(m, k, n) in gemm_configs {
+            gemm::bench_postops(m, k, n, 5, gemm_repeats)?;
+        }
     }
 
     // -- Quantized kernels --

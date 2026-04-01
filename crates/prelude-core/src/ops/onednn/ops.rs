@@ -932,6 +932,347 @@ pub unsafe fn brgemm_fused_silu_mul_raw(
     }
 }
 
+// ── INT8 BRGeMM (W8A8) packed weight API ─────────────────────────────
+
+/// Check if INT8 brgemm is available on this CPU (cached).
+pub fn brgemm_s8_available() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| unsafe { super::ffi::brgemm_s8_available() != 0 })
+}
+
+/// Pre-packed INT8 weight in VNNI format with per-channel scales.
+pub struct BrgemmS8PackedWeight {
+    ptr: *mut std::ffi::c_void,
+    pub k: usize,
+    pub n: usize,
+}
+
+impl std::fmt::Debug for BrgemmS8PackedWeight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrgemmS8PackedWeight")
+            .field("k", &self.k)
+            .field("n", &self.n)
+            .finish()
+    }
+}
+
+unsafe impl Send for BrgemmS8PackedWeight {}
+unsafe impl Sync for BrgemmS8PackedWeight {}
+
+impl BrgemmS8PackedWeight {
+    /// Pack an INT8 weight tensor `[N, K]` with per-channel scales `[N]`.
+    /// Returns None if INT8 brgemm is not available.
+    pub fn pack(weight_s8: &[i8], scales: &[f32], k: usize, n: usize) -> Option<Self> {
+        if !brgemm_s8_available() || weight_s8.len() < n * k || scales.len() < n {
+            return None;
+        }
+        let ptr = unsafe {
+            super::ffi::brgemm_s8_pack(
+                weight_s8.as_ptr(), scales.as_ptr(), k as i64, n as i64,
+            )
+        };
+        if ptr.is_null() { return None; }
+        Some(Self { ptr, k, n })
+    }
+}
+
+impl Drop for BrgemmS8PackedWeight {
+    fn drop(&mut self) {
+        unsafe { super::ffi::brgemm_s8_pack_destroy(self.ptr) }
+    }
+}
+
+/// Quantize BF16 input tensor to INT8 per-tensor.
+/// Returns (quantized_buffer, scale).
+pub fn brgemm_quantize_bf16_s8(input: &Tensor) -> Result<(Vec<i8>, f32)> {
+    let input = input.contiguous()?;
+    let dims = input.dims();
+    let m: usize = dims[..dims.len() - 1].iter().product();
+    let k = *dims.last().unwrap();
+
+    let (in_storage, in_layout) = input.storage_and_layout();
+    let in_data = match &*in_storage {
+        candle_core::Storage::Cpu(s) => s.as_slice::<half::bf16>()?,
+        _ => candle_core::bail!("brgemm_quantize_bf16_s8: CPU BF16 tensor required"),
+    };
+    let in_ptr = in_data[in_layout.start_offset()..].as_ptr() as *const std::ffi::c_void;
+
+    let mut out_s8 = vec![0i8; m * k];
+    let scale = unsafe {
+        super::ffi::brgemm_quantize_bf16_s8(in_ptr, out_s8.as_mut_ptr(), m as i64, k as i64)
+    };
+    drop(in_storage);
+    Ok((out_s8, scale))
+}
+
+/// Context for INT8 brgemm dispatch via spinning pool.
+#[repr(C)]
+struct BrgemmS8DispatchCtx {
+    input_ptr: usize,
+    a_scale: f32,
+    brg_ptr: usize,
+    output_ptr: usize,
+    m: i64,
+    n_total: usize,
+    block_n: usize,
+    n_blocks: usize,
+}
+
+unsafe fn brgemm_s8_pool_work(tid: usize, n_threads: usize, ctx_raw: *const u8) {
+    unsafe {
+        let ctx = &*(ctx_raw as *const BrgemmS8DispatchCtx);
+        let blocks_per_thread = (ctx.n_blocks + n_threads - 1) / n_threads;
+        let blk_start = tid * blocks_per_thread;
+        let blk_end = ((tid + 1) * blocks_per_thread).min(ctx.n_blocks);
+        let n_start = blk_start * ctx.block_n;
+        let n_end = (blk_end * ctx.block_n).min(ctx.n_total);
+        if n_start >= n_end { return; }
+
+        super::ffi::brgemm_s8_linear(
+            ctx.input_ptr as *const i8,
+            ctx.a_scale,
+            ctx.brg_ptr as *mut std::ffi::c_void,
+            ctx.output_ptr as *mut std::ffi::c_void,
+            ctx.m,
+            ctx.n_total as i64,
+            n_start as i64,
+            n_end as i64,
+        );
+    }
+}
+
+/// INT8 W8A8 GEMM: BF16 input → quantize → INT8 GEMM → BF16 output.
+pub fn brgemm_s8_gemm_forward(
+    input: &Tensor,
+    brg: &BrgemmS8PackedWeight,
+    m: usize, k: usize, n: usize,
+) -> Result<Tensor> {
+    let input = input.contiguous()?;
+    let (in_storage, in_layout) = input.storage_and_layout();
+    let in_data = match &*in_storage {
+        candle_core::Storage::Cpu(s) => s.as_slice::<half::bf16>()?,
+        _ => candle_core::bail!("brgemm_s8_gemm_forward: CPU tensor required"),
+    };
+    let in_ptr = in_data[in_layout.start_offset()..].as_ptr() as *const std::ffi::c_void;
+
+    // Step 1: Quantize BF16 → INT8
+    let mut input_s8 = vec![0i8; m * k];
+    let a_scale = unsafe {
+        super::ffi::brgemm_quantize_bf16_s8(in_ptr, input_s8.as_mut_ptr(), m as i64, k as i64)
+    };
+
+    drop(in_storage);
+
+    // Step 2: Dispatch INT8 GEMM
+    let mut out_buf = BRGEMM_OUT_BUF.with_borrow_mut(|buf| {
+        let mut taken = std::mem::take(buf);
+        taken.resize(m * n, 0u16);
+        taken
+    });
+
+    let block_n = 32_usize;
+    let n_blocks = (n + block_n - 1) / block_n;
+    let pool = crate::ops::cpu::gemm_pool::gemm_pool();
+    let num_threads = pool.num_threads().min(n_blocks).max(1);
+
+    let ctx = BrgemmS8DispatchCtx {
+        input_ptr: input_s8.as_ptr() as usize,
+        a_scale,
+        brg_ptr: brg.ptr as usize,
+        output_ptr: out_buf.as_mut_ptr() as usize,
+        m: m as i64,
+        n_total: n,
+        block_n,
+        n_blocks,
+    };
+
+    unsafe {
+        pool.dispatch(
+            brgemm_s8_pool_work,
+            &ctx as *const BrgemmS8DispatchCtx as *const u8,
+            num_threads,
+        );
+    }
+
+    let bf16_vec: Vec<half::bf16> = bytemuck::cast_vec(out_buf);
+    Tensor::from_vec(bf16_vec, &[m, n], &Device::Cpu)
+}
+
+// ── FP8 BRGeMM packed weight API ────────────────────────────────────────
+
+/// Check if FP8 (f8_e4m3) brgemm is available on this CPU (cached).
+pub fn brgemm_f8_available() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| unsafe { super::ffi::brgemm_f8_available() != 0 })
+}
+
+/// Pre-packed FP8-E4M3 weight in VNNI format with per-channel scales.
+pub struct BrgemmF8PackedWeight {
+    ptr: *mut std::ffi::c_void,
+    pub k: usize,
+    pub n: usize,
+}
+
+impl std::fmt::Debug for BrgemmF8PackedWeight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrgemmF8PackedWeight")
+            .field("k", &self.k)
+            .field("n", &self.n)
+            .finish()
+    }
+}
+
+unsafe impl Send for BrgemmF8PackedWeight {}
+unsafe impl Sync for BrgemmF8PackedWeight {}
+
+impl BrgemmF8PackedWeight {
+    /// Pack FP8-E4M3 weights `[N, K]` with per-channel scales `[N]`.
+    /// Returns None if FP8 brgemm is not available.
+    pub fn pack(weight_f8: &[u8], scales: &[f32], k: usize, n: usize) -> Option<Self> {
+        if !brgemm_f8_available() || weight_f8.len() < n * k || scales.len() < n {
+            return None;
+        }
+        let ptr = unsafe {
+            super::ffi::brgemm_f8e4m3_pack(
+                weight_f8.as_ptr() as *const std::ffi::c_void,
+                scales.as_ptr(), k as i64, n as i64,
+            )
+        };
+        if ptr.is_null() { return None; }
+        Some(Self { ptr, k, n })
+    }
+}
+
+impl Drop for BrgemmF8PackedWeight {
+    fn drop(&mut self) {
+        unsafe { super::ffi::brgemm_f8_pack_destroy(self.ptr) }
+    }
+}
+
+// ── BRGeMM post-ops constants ───────────────────────────────────────────
+
+pub const BRGEMM_POSTOP_BIAS: i32 = 1;
+pub const BRGEMM_POSTOP_GELU_TANH: i32 = 2;
+pub const BRGEMM_POSTOP_GELU_ERF: i32 = 4;
+pub const BRGEMM_POSTOP_RELU: i32 = 8;
+
+/// Context for BF16 brgemm with post-ops dispatch via spinning pool.
+#[repr(C)]
+struct BrgemmPostopsDispatchCtx {
+    input_ptr: usize,
+    brg_ptr: usize,
+    output_ptr: usize,
+    bias_ptr: usize, // 0 if no bias
+    postop_flags: i32,
+    m: i64,
+    n_total: usize,
+    block_n: usize,
+    n_blocks: usize,
+}
+
+unsafe fn brgemm_postops_pool_work(tid: usize, n_threads: usize, ctx_raw: *const u8) {
+    unsafe {
+        let ctx = &*(ctx_raw as *const BrgemmPostopsDispatchCtx);
+        let blocks_per_thread = (ctx.n_blocks + n_threads - 1) / n_threads;
+        let blk_start = tid * blocks_per_thread;
+        let blk_end = ((tid + 1) * blocks_per_thread).min(ctx.n_blocks);
+        let n_start = blk_start * ctx.block_n;
+        let n_end = (blk_end * ctx.block_n).min(ctx.n_total);
+        if n_start >= n_end { return; }
+
+        let bias = if ctx.bias_ptr != 0 {
+            ctx.bias_ptr as *const std::ffi::c_void
+        } else {
+            std::ptr::null()
+        };
+
+        super::ffi::brgemm_bf16_linear_postops(
+            ctx.input_ptr as *const std::ffi::c_void,
+            ctx.brg_ptr as *mut std::ffi::c_void,
+            ctx.output_ptr as *mut std::ffi::c_void,
+            bias,
+            ctx.postop_flags,
+            ctx.m,
+            ctx.n_total as i64,
+            n_start as i64,
+            n_end as i64,
+        );
+    }
+}
+
+/// BF16 GEMM with fused post-ops (bias, GELU, ReLU).
+/// Input: [M, K] BF16, Output: [M, N] BF16.
+/// bias: optional BF16 tensor [N].
+pub fn brgemm_gemm_forward_postops(
+    input: &Tensor,
+    brg: &BrgemmPackedWeight,
+    bias: Option<&Tensor>,
+    postop_flags: i32,
+    m: usize, _k: usize, n: usize,
+) -> Result<Tensor> {
+    let input = input.contiguous()?;
+    let (in_storage, in_layout) = input.storage_and_layout();
+    let in_data = match &*in_storage {
+        candle_core::Storage::Cpu(s) => s.as_slice::<half::bf16>()?,
+        _ => candle_core::bail!("brgemm_gemm_forward_postops: CPU tensor required"),
+    };
+    let in_ptr = in_data[in_layout.start_offset()..].as_ptr();
+
+    // Make bias contiguous and extract pointer (keep alive until dispatch completes)
+    let bias_contig = bias.map(|b| b.contiguous()).transpose()?;
+    let (_bias_storage, bias_ptr) = if let Some(ref b) = bias_contig {
+        let (bs, bl) = b.storage_and_layout();
+        let bd = match &*bs {
+            candle_core::Storage::Cpu(s) => s.as_slice::<half::bf16>()?,
+            _ => candle_core::bail!("brgemm_gemm_forward_postops: bias must be CPU BF16"),
+        };
+        let bp = bd[bl.start_offset()..].as_ptr() as usize;
+        (Some(bs), bp)
+    } else {
+        (None, 0usize)
+    };
+
+    let mut out_buf = BRGEMM_OUT_BUF.with_borrow_mut(|buf| {
+        let mut taken = std::mem::take(buf);
+        taken.resize(m * n, 0u16);
+        taken
+    });
+
+    let block_n = 32_usize;
+    let n_blocks = (n + block_n - 1) / block_n;
+    let pool = crate::ops::cpu::gemm_pool::gemm_pool();
+    let num_threads = pool.num_threads().min(n_blocks).max(1);
+
+    let ctx = BrgemmPostopsDispatchCtx {
+        input_ptr: in_ptr as usize,
+        brg_ptr: brg.ptr as usize,
+        output_ptr: out_buf.as_mut_ptr() as usize,
+        bias_ptr,
+        postop_flags,
+        m: m as i64,
+        n_total: n,
+        block_n,
+        n_blocks,
+    };
+
+    unsafe {
+        pool.dispatch(
+            brgemm_postops_pool_work,
+            &ctx as *const BrgemmPostopsDispatchCtx as *const u8,
+            num_threads,
+        );
+    }
+
+    drop(in_storage);
+    drop(_bias_storage);
+    drop(bias_contig);
+
+    let bf16_vec: Vec<half::bf16> = bytemuck::cast_vec(out_buf);
+    Tensor::from_vec(bf16_vec, &[m, n], &Device::Cpu)
+}
+
 /// Run the custom small-M BF16 GEMM using raw weight tensor.
 /// Input: [M, K], Weight: [N, K] (row-major), Output: [M, N]
 fn cpu_gemm_forward(input: &Tensor, weight: &Tensor, m: usize, k: usize, n: usize) -> Result<Tensor> {
@@ -975,6 +1316,107 @@ fn cpu_gemm_forward(input: &Tensor, weight: &Tensor, m: usize, k: usize, n: usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_brgemm_availability() {
+        init();
+        let bf16 = brgemm_available();
+        let s8 = brgemm_s8_available();
+        let f8 = brgemm_f8_available();
+        println!("brgemm BF16: {bf16}, INT8: {s8}, FP8: {f8}");
+        // BF16 and INT8 should both be available on AVX-512 VNNI CPUs
+        // FP8 requires AVX10.2 AMX-2 (not available on AMD EPYC)
+        assert!(bf16, "BF16 brgemm should be available");
+    }
+
+    #[test]
+    fn test_s8_quantize_roundtrip() {
+        init();
+        if !brgemm_s8_available() {
+            println!("INT8 brgemm not available, skipping");
+            return;
+        }
+        // Create a BF16 tensor and quantize to INT8
+        let data: Vec<half::bf16> = (0..256)
+            .map(|i| half::bf16::from_f32((i as f32 / 128.0) - 1.0))
+            .collect();
+        let t = Tensor::from_vec(data.clone(), (4, 64), &Device::Cpu).unwrap();
+        let (s8_buf, scale) = brgemm_quantize_bf16_s8(&t).unwrap();
+        assert_eq!(s8_buf.len(), 256);
+        assert!(scale > 0.0, "scale should be positive");
+        // Check that max quantized value is near 127
+        let max_q = s8_buf.iter().map(|x| x.abs() as i32).max().unwrap();
+        assert!(max_q >= 120, "max quantized value should be near 127, got {max_q}");
+    }
+
+    #[test]
+    fn test_s8_pack_and_gemm() {
+        init();
+        if !brgemm_s8_available() {
+            println!("INT8 brgemm not available, skipping");
+            return;
+        }
+        let k = 64;
+        let n = 32;
+        let m = 2;
+
+        // Create simple INT8 weights and scales
+        let weights: Vec<i8> = (0..n * k).map(|i| ((i % 5) as i8) - 2).collect();
+        let scales: Vec<f32> = (0..n).map(|_| 0.01f32).collect();
+
+        let packed = BrgemmS8PackedWeight::pack(&weights, &scales, k, n)
+            .expect("INT8 packing should succeed");
+        assert_eq!(packed.k, k);
+        assert_eq!(packed.n, n);
+
+        // Create BF16 input and run GEMM
+        let input_data: Vec<half::bf16> = (0..(m * k))
+            .map(|i| half::bf16::from_f32((i as f32 * 0.01) - 0.32))
+            .collect();
+        let input = Tensor::from_vec(input_data, (m, k), &Device::Cpu).unwrap();
+        let output = brgemm_s8_gemm_forward(&input, &packed, m, k, n).unwrap();
+        assert_eq!(output.dims(), &[m, n]);
+        assert_eq!(output.dtype(), DType::BF16);
+
+        // Check output is not all zeros
+        let out_f32 = output.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let max_abs = out_f32.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        println!("INT8 GEMM output max_abs: {max_abs}");
+    }
+
+    #[test]
+    fn test_bf16_postops_basic() {
+        init();
+        if !brgemm_available() {
+            println!("BF16 brgemm not available, skipping");
+            return;
+        }
+        let k = 64;
+        let n = 32;
+        let m = 2;
+
+        // Create BF16 weight and pack
+        let w_data: Vec<half::bf16> = (0..(n * k))
+            .map(|i| half::bf16::from_f32(((i as f32 * 0.003) - 0.5).sin() * 0.1))
+            .collect();
+        let w_tensor = Tensor::from_vec(w_data, (n, k), &Device::Cpu).unwrap();
+        let packed = BrgemmPackedWeight::pack(&w_tensor).unwrap().unwrap();
+
+        let input_data: Vec<half::bf16> = (0..(m * k))
+            .map(|i| half::bf16::from_f32((i as f32 * 0.01) - 0.32))
+            .collect();
+        let input = Tensor::from_vec(input_data, (m, k), &Device::Cpu).unwrap();
+
+        // Test with no post-ops (just F32→BF16 conversion via post-ops path)
+        let out_plain = brgemm_gemm_forward_pub(&input, &packed, m, k, n).unwrap();
+        let out_postops = brgemm_gemm_forward_postops(&input, &packed, None, 0, m, k, n).unwrap();
+
+        let a = out_plain.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = out_postops.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let max_diff = a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        println!("postops vs plain max_diff: {max_diff}");
+        assert!(max_diff < 1e-3, "postops path should match plain path, max_diff={max_diff}");
+    }
 
     #[test]
     fn test_compute_thread_grid() {
