@@ -705,6 +705,249 @@ fn verify_iq4_xs_mmvq(n: usize, k: usize, device: &Device) -> Result<()> {
     Ok(())
 }
 
+// ── Reference-based correctness tests (llama.cpp CPU dequantize as ground truth) ──
+
+#[cfg(feature = "quant-gemm")]
+use prelude_quant_gemm::GgmlType;
+
+/// Block size in bytes for each IQ/FP4 format.
+#[cfg(feature = "quant-gemm")]
+fn iq_block_bytes(t: GgmlType) -> usize {
+    match t {
+        GgmlType::IQ4NL  => 18,
+        GgmlType::IQ4XS  => 136,
+        GgmlType::IQ3S   => 110,
+        GgmlType::IQ3XXS => 98,
+        GgmlType::IQ2S   => 82,
+        GgmlType::IQ2XS  => 74,
+        GgmlType::IQ2XXS => 66,
+        GgmlType::IQ1S   => 50,
+        GgmlType::IQ1M   => 56,
+        GgmlType::MXFP4  => 17,
+        GgmlType::NVFP4  => 36,
+        _ => panic!("unsupported IQ type for block_bytes"),
+    }
+}
+
+/// Elements per block for each IQ/FP4 format.
+#[cfg(feature = "quant-gemm")]
+fn iq_block_elems(t: GgmlType) -> usize {
+    match t {
+        GgmlType::IQ4NL  => 32,
+        GgmlType::MXFP4  => 32,
+        GgmlType::NVFP4  => 64,
+        _                 => 256,  // All K-quant IQ formats use QK_K=256
+    }
+}
+
+/// GPU dequantize kernel name for each IQ/FP4 format.
+#[cfg(feature = "quant-gemm")]
+fn iq_dequant_kernel(t: GgmlType) -> &'static str {
+    match t {
+        GgmlType::IQ4NL  => "dequantize_iq4_nl_bf16",
+        GgmlType::IQ4XS  => "dequantize_iq4_xs_bf16",
+        GgmlType::IQ3S   => "dequantize_iq3_s_bf16",
+        GgmlType::IQ3XXS => "dequantize_iq3_xxs_bf16",
+        GgmlType::IQ2S   => "dequantize_iq2_s_bf16",
+        GgmlType::IQ2XS  => "dequantize_iq2_xs_bf16",
+        GgmlType::IQ2XXS => "dequantize_iq2_xxs_bf16",
+        GgmlType::IQ1S   => "dequantize_iq1_s_bf16",
+        GgmlType::IQ1M   => "dequantize_iq1_m_bf16",
+        GgmlType::MXFP4  => "dequantize_mxfp4_bf16",
+        GgmlType::NVFP4  => "dequantize_nvfp4_bf16",
+        _ => panic!("unsupported"),
+    }
+}
+
+/// GPU MMVQ kernel name for each IQ/FP4 format.
+#[cfg(feature = "quant-gemm")]
+fn iq_mmvq_kernel(t: GgmlType) -> &'static str {
+    match t {
+        GgmlType::IQ4NL  => "mmvq_iq4_nl",
+        GgmlType::IQ4XS  => "mmvq_iq4_xs",
+        GgmlType::IQ3S   => "mmvq_iq3_s",
+        GgmlType::IQ3XXS => "mmvq_iq3_xxs",
+        GgmlType::IQ2S   => "mmvq_iq2_s",
+        GgmlType::IQ2XS  => "mmvq_iq2_xs",
+        GgmlType::IQ2XXS => "mmvq_iq2_xxs",
+        GgmlType::IQ1S   => "mmvq_iq1_s",
+        GgmlType::IQ1M   => "mmvq_iq1_m",
+        GgmlType::MXFP4  => "mmvq_mxfp4",
+        GgmlType::NVFP4  => "mmvq_nvfp4",
+        _ => panic!("unsupported"),
+    }
+}
+
+/// Generate pseudo-random bytes (deterministic LCG).
+fn random_bytes(n: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed;
+    (0..n).map(|_| {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (state >> 33) as u8
+    }).collect()
+}
+
+/// Verify GPU dequantize against llama.cpp CPU reference for one IQ/FP4 format.
+///
+/// Strategy: generate random quantized blocks → dequantize on CPU (reference) and GPU → compare.
+#[cfg(feature = "quant-gemm")]
+fn verify_iq_dequant_ref(
+    t: GgmlType, label: &str, num_elements: usize, device: &Device,
+) -> Result<()> {
+    let qk = iq_block_elems(t);
+    assert_eq!(num_elements % qk, 0);
+    let num_blocks = num_elements / qk;
+    let block_sz = iq_block_bytes(t);
+    let total_bytes = num_blocks * block_sz;
+
+    // Generate random quantized data
+    let raw = random_bytes(total_bytes, 42 + t as u64);
+
+    // CPU reference: llama.cpp dequantize
+    let mut ref_f32 = vec![0.0f32; num_elements];
+    unsafe {
+        prelude_quant_gemm::dequantize_ref(
+            raw.as_ptr() as *const std::ffi::c_void,
+            ref_f32.as_mut_ptr(),
+            num_elements as i64,
+            t,
+        );
+    }
+
+    // GPU dequantize
+    let gpu_bytes = Tensor::from_vec(raw, (total_bytes,), device)?;
+    let gpu_bf16 = quant::dequantize_to_bf16(&gpu_bytes, num_elements, iq_dequant_kernel(t))?;
+    let gpu_f32: Vec<f32> = gpu_bf16.to_dtype(DType::F32)?.to_device(&Device::Cpu)?.to_vec1()?;
+
+    // Compare
+    let mut max_abs: f32 = 0.0;
+    let mut fail_count = 0usize;
+    let mut num_nonzero = 0usize;
+    for (r, g) in ref_f32.iter().zip(gpu_f32.iter()) {
+        if *r != 0.0 { num_nonzero += 1; }
+        let err = (r - g).abs();
+        max_abs = max_abs.max(err);
+        // BF16 has ~7-bit mantissa; tolerance scales with value magnitude
+        let tol = 0.02 + 0.02 * r.abs().max(g.abs());
+        if err > tol { fail_count += 1; }
+    }
+    let status = if fail_count == 0 { "PASS" } else { "FAIL" };
+    println!(
+        "  {label:>6} [{num_elements:>6}]  {status}  max_abs={max_abs:.6}  fail={fail_count}/{num_elements}  nonzero={num_nonzero}"
+    );
+    Ok(())
+}
+
+/// Verify GPU MMVQ against llama.cpp CPU dequantize + f32 dot for one IQ/FP4 format.
+#[cfg(feature = "quant-gemm")]
+fn verify_iq_mmvq_ref(
+    t: GgmlType, label: &str, n: usize, k: usize, device: &Device,
+) -> Result<()> {
+    let qk = iq_block_elems(t);
+    assert_eq!(k % qk, 0);
+    let blocks_per_row = k / qk;
+    let block_sz = iq_block_bytes(t);
+    let total_bytes = n * blocks_per_row * block_sz;
+
+    // Generate random quantized weights
+    let raw = random_bytes(total_bytes, 123 + t as u64);
+
+    // CPU reference: dequantize each row → f32 dot product with activation
+    let x_data: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.013).cos()).collect();
+    let mut ref_output = vec![0.0f32; n];
+
+    let mut full_deq = vec![0.0f32; n * k];
+    unsafe {
+        prelude_quant_gemm::dequantize_ref(
+            raw.as_ptr() as *const std::ffi::c_void,
+            full_deq.as_mut_ptr(),
+            (n * k) as i64,
+            t,
+        );
+    }
+    for i in 0..n {
+        ref_output[i] = full_deq[i * k..(i + 1) * k]
+            .iter().zip(x_data.iter()).map(|(w, x)| w * x).sum();
+    }
+
+    // GPU MMVQ
+    let gpu_w = Tensor::from_vec(raw, (total_bytes,), device)?;
+    let gpu_x = Tensor::from_vec(x_data, (k,), &Device::Cpu)?
+        .to_dtype(DType::BF16)?.to_device(device)?;
+    let gpu_y = mmvq::mmvq(&gpu_w, &gpu_x, n, k, iq_mmvq_kernel(t), qk)?;
+    let gpu_output: Vec<f32> = gpu_y.to_device(&Device::Cpu)?.to_vec1()?;
+
+    // Compare
+    let mut max_rel: f32 = 0.0;
+    let mut fail_count = 0usize;
+    for (r, g) in ref_output.iter().zip(gpu_output.iter()) {
+        let err = (r - g).abs();
+        let denom = r.abs().max(1e-6);
+        let rel = err / denom;
+        max_rel = max_rel.max(rel);
+        if rel > 0.15 && err > 0.5 { fail_count += 1; }
+    }
+    let status = if fail_count == 0 { "PASS" } else { "FAIL" };
+    println!(
+        "  {label:>6} [{n:>4}×{k:>5}]  {status}  max_rel={max_rel:.4}  fail={fail_count}/{n}"
+    );
+    Ok(())
+}
+
+/// All IQ/FP4 formats to test.
+#[cfg(feature = "quant-gemm")]
+const IQ_FORMATS: &[(GgmlType, &str)] = &[
+    (GgmlType::IQ4NL,  "IQ4NL"),
+    (GgmlType::IQ4XS,  "IQ4XS"),
+    (GgmlType::IQ3S,   "IQ3S"),
+    (GgmlType::IQ3XXS, "IQ3XX"),
+    (GgmlType::IQ2S,   "IQ2S"),
+    (GgmlType::IQ2XS,  "IQ2XS"),
+    (GgmlType::IQ2XXS, "IQ2XX"),
+    (GgmlType::IQ1S,   "IQ1S"),
+    (GgmlType::IQ1M,   "IQ1M"),
+    (GgmlType::MXFP4,  "MXFP4"),
+    (GgmlType::NVFP4,  "NVFP4"),
+];
+
+/// Verify all IQ/FP4 dequantize kernels against llama.cpp CPU reference.
+#[cfg(feature = "quant-gemm")]
+pub fn verify_iq_dequant(device: &Device) -> Result<()> {
+    println!("=== GPU IQ/FP4 Dequantize Correctness (vs llama.cpp CPU) ===\n");
+
+    // Test at sizes that are multiples of 256 (covers all block sizes)
+    for &n in &[256, 1024, 4096] {
+        for &(t, label) in IQ_FORMATS {
+            let qk = iq_block_elems(t);
+            if n % qk != 0 { continue; }
+            verify_iq_dequant_ref(t, label, n, device)?;
+        }
+        println!();
+    }
+    Ok(())
+}
+
+/// Verify all IQ/FP4 MMVQ kernels against llama.cpp CPU dequantize + f32 dot.
+#[cfg(feature = "quant-gemm")]
+pub fn verify_iq_mmvq(device: &Device) -> Result<()> {
+    println!("=== GPU IQ/FP4 MMVQ Correctness (vs llama.cpp CPU) ===\n");
+
+    let configs: &[(usize, usize)] = &[
+        (64, 1024),   // K=1024 is divisible by 256 and 64
+        (128, 4096),
+    ];
+
+    for &(n, k) in configs {
+        for &(t, label) in IQ_FORMATS {
+            let qk = iq_block_elems(t);
+            if k % qk != 0 { continue; }
+            verify_iq_mmvq_ref(t, label, n, k, device)?;
+        }
+        println!();
+    }
+    Ok(())
+}
+
 /// Helper: prepare quantized weights and BF16 activations for benchmarking.
 fn prepare_bench_data(
     dtype: GgmlDType,
