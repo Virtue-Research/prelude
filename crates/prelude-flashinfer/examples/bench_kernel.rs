@@ -1082,10 +1082,15 @@ fn bench_topk(reg: &KernelRegistry) {
 
             unsafe { reg.set_stream(0, std::ptr::null_mut()); }
 
+            // radix_topk(input, output_indices, output_values, row_states?, top_k, sorted, deterministic)
             let args = [
                 TVMFFIAny::dltensor(&dl_in),
-                TVMFFIAny::dltensor(&dl_vals),
                 TVMFFIAny::dltensor(&dl_idxs),
+                TVMFFIAny::dltensor(&dl_vals),
+                TVMFFIAny::none(),          // row_states_buffer
+                TVMFFIAny::int64(k),
+                TVMFFIAny::bool_val(true),  // sorted
+                TVMFFIAny::bool_val(true),  // deterministic
             ];
 
             let ms = cuda_bench(5, 100, || {
