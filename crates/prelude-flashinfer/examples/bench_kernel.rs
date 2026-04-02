@@ -998,7 +998,7 @@ fn bench_utilities(reg: &KernelRegistry) {
 fn bench_gemm(reg: &KernelRegistry) {
     println!("\n{:=<80}", "= GEMM Kernels ");
 
-    // BF16 GEMM
+    // BF16 GEMM (SM100+ via TGV GEMM module)
     if let Some(gemm) = reg.get_utility("bf16_gemm") {
         for &(m, n, k) in &[(1i64, 4096, 4096), (32, 4096, 4096), (128, 4096, 11008), (512, 4096, 11008)] {
             let a = gpu_alloc((m * k) as usize * 2);

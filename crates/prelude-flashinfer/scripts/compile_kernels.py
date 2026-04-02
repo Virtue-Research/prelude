@@ -1105,45 +1105,25 @@ def generate_utility_sources(
             if f.suffix in (".cpp", ".cu")],
          None, "moe_routing",
          ["NoAuxTc"]),
-        # ── New modules ─────────────────────────────────────────────
-        # TopK (GPU radix topk for sampling / MOE expert selection)
+        # ── New modules (matching upstream aot.py gen_all_modules) ──
+        # add_misc: topk, concat_mla
         ("fi_topk", ["topk.cu"], "flashinfer_topk_binding.cu", "topk",
          ["radix_topk", "radix_topk_page_table_transform",
           "radix_topk_ragged_transform", "can_implement_filtered_topk"]),
-        # Concat MLA K cache
         ("fi_concat_mla", ["concat_mla.cu"], None, "mla",
          ["concat_mla_k"]),
-        # GEMM: TGV + BF16 (tgv_gemm.cu re-exports bf16_gemm + bf16_gemm_tactic_num)
-        ("fi_gemm_bf16", ["tgv_gemm.cu"], None, "gemm",
-         ["tgv_gemm", "tgv_gemm_tactic_num", "bf16_gemm", "bf16_gemm_tactic_num"]),
-        # GEMM: FP8 (SM80 dispatch + SM100 instantiation compiled separately)
-        ("fi_gemm_fp8", ["fp8_gemm_cutlass.cu"], None, "gemm",
-         ["fp8_gemm", "fp8_gemm_tactic_num"]),
-        # GEMM: Segment/Group + BMM FP8 (SM80+)
-        ("fi_gemm_segment", ["group_gemm.cu", "bmm_fp8.cu"],
+        # add_moe: gen_gemm_module() — base GEMM (all archs, needs -lcublas -lcublasLt)
+        ("fi_gemm", ["group_gemm.cu", "bmm_fp8.cu"],
          "flashinfer_gemm_binding.cu", "gemm",
          ["cutlass_segment_gemm", "bmm_fp8"]),
-        # DSv3 / ML3 router GEMM
+        # add_moe: DSv3 / ML3 router GEMM
         ("fi_dsv3_router", ["dsv3_router_gemm.cu"], None, "moe",
          ["dsv3_router_gemm_op", "ml3_router_gemm_op"]),
-        # TRT-LLM AllReduce (IPC-based custom all-reduce)
-        ("fi_trtllm_allreduce", ["trtllm_allreduce.cu"], None, "comm",
-         ["trtllm_lamport_initialize", "trtllm_lamport_initialize_all",
-          "trtllm_custom_all_reduce"]),
-        # TRT-LLM AllReduce Fusion (fused allreduce + rmsnorm/bias)
-        ("fi_trtllm_allreduce_fusion", ["trtllm_allreduce_fusion.cu"], None, "comm",
-         ["trtllm_allreduce_fusion"]),
-        # TRT-LLM MOE AllReduce Fusion
-        ("fi_trtllm_moe_allreduce_fusion", ["trtllm_moe_allreduce_fusion.cu"], None, "comm",
-         ["trtllm_moe_allreduce_fusion", "trtllm_moe_finalize_allreduce_fusion"]),
-        # TRT-LLM MNNVL AllReduce
-        ("fi_trtllm_mnnvl_allreduce", ["trtllm_mnnvl_allreduce.cu"], None, "comm",
-         ["trtllm_mnnvl_allreduce_fusion"]),
-        # vLLM Custom AllReduce (needs -lcuda for cuPointerGetAttribute)
+        # add_comm: gen_vllm_comm_module() — all archs, needs -lcuda
         ("fi_vllm_allreduce", ["vllm_custom_all_reduce.cu"], None, "comm",
          ["get_graph_buffer_ipc_meta", "register_graph_buffers", "dispose",
           "meta_size", "register_buffer", "init_custom_ar", "all_reduce"]),
-        # CUTLASS MLA paged attention
+        # add_misc: CUTLASS MLA paged attention
         ("fi_cutlass_mla", ["cutlass_mla.cu"], "flashinfer_mla_binding.cu", "mla",
          ["cutlass_mla_paged_attention"]),
     ]
@@ -1823,86 +1803,132 @@ def main():
             compile_jobs.append((src, sm100_flags, [], sm100_vinfo))
         print(f"  SM100 FMHA: {len(sm100_sources)} sources (requires CUDA 12.8+)")
 
-    # ── SM90: GDN (Gated Delta Net) template instantiation ─────────────
+    # ── SM90 modules (matching upstream aot.py has_sm90 blocks) ────────
     has_sm90 = any(a >= 90 for a in archs)
-    sm90_util_flags = ["-gencode", "arch=compute_90a,code=sm_90a"]
+    sm90_flags = ["-gencode", "arch=compute_90a,code=sm_90a"]
     if has_sm90:
+        import jinja2
         sm90_modules = []
+        csrc = fi_src / "csrc"
 
-        # GDN prefill: 32 explicit template instantiations (4 bools × 2 dtypes)
-        gdn_out = gen_dir / "fi_gdn"
-        gdn_out.mkdir(parents=True, exist_ok=True)
-        gdn_sources = []
+        def _add_sm90_jinja(vid, kind, template_name, instances, extra_sources,
+                            binding_file, symbols, extra_flags=None):
+            """Render jinja template for each instance, copy extra sources, compile all."""
+            mod_out = gen_dir / vid
+            mod_out.mkdir(parents=True, exist_ok=True)
+            sources = []
+            with open(csrc / template_name) as f:
+                templ = jinja2.Template(f.read())
+            for params, fname in instances:
+                src_text = templ.render(**params)
+                fpath = mod_out / fname
+                fpath.write_text(src_text)
+                sources.append(fpath)
+            for sf in extra_sources:
+                sp = csrc / sf
+                if sp.exists():
+                    shutil.copy2(sp, mod_out / Path(sf).name)
+                    sources.append(mod_out / Path(sf).name)
+            if binding_file:
+                bp = csrc / binding_file
+                if bp.exists():
+                    shutil.copy2(bp, mod_out / Path(binding_file).name)
+                    sources.append(mod_out / Path(binding_file).name)
+            vinfo = {"vid": vid, "kind": kind,
+                     "symbols": {s: f"__tvm_ffi_{s}" for s in symbols}}
+            ef = extra_flags or []
+            for src in sources:
+                compile_jobs.append((src, sm90_flags, ef, vinfo))
+            sm90_modules.append(vinfo)
+            return len(sources)
 
-        # Copy launcher and kernel header
-        for sf in ["gdn_prefill_launcher.cu", "prefill_kernel_delta_rule_sm90.cu"]:
-            sp = fi_src / "csrc" / sf
+        # gen_gdn_prefill_sm90_module: 32 kernel instantiations via jinja
+        gdn_instances = []
+        for dtype in ["half", "nv_bfloat16"]:
+            for is_gva in ["false", "true"]:
+                for needs_beta in ["false", "true"]:
+                    for needs_alpha in ["false", "true"]:
+                        for init_state in ["false", "true"]:
+                            params = dict(dtype=dtype, is_gva=is_gva, needs_beta=needs_beta,
+                                          needs_alpha=needs_alpha, init_state=init_state)
+                            fname = (f"gdn_prefill_kernel_{dtype}_g{is_gva}"
+                                     f"b{needs_beta}a{needs_alpha}i{init_state}.cu")
+                            gdn_instances.append((params, fname))
+        n = _add_sm90_jinja(
+            "fi_gdn", "gdn", "gdn_prefill_sm90_kernel_inst.jinja",
+            gdn_instances,
+            ["gdn_prefill_launcher.cu", "prefill_kernel_delta_rule_sm90.cu"],
+            None, ["gdn_prefill"],
+            ["-DFLAT_SM90A_ENABLED"],
+        )
+        print(f"  SM90 GDN: {n} sources (32 jinja instantiations)")
+
+        # gen_gemm_sm90_module: 6 dtype pair instantiations via jinja
+        cutlass_dtype_map = {
+            "float16": "cutlass::half_t", "bfloat16": "cutlass::bfloat16_t",
+            "float8_e4m3fn": "cutlass::float_e4m3_t", "float8_e5m2": "cutlass::float_e5m2_t",
+        }
+        gemm90_dtype_pairs = [
+            ("float16", "float16"), ("bfloat16", "bfloat16"),
+            ("float8_e4m3fn", "float16"), ("float8_e5m2", "float16"),
+            ("float8_e4m3fn", "bfloat16"), ("float8_e5m2", "bfloat16"),
+        ]
+        gemm90_instances = []
+        for dtype_in, dtype_out in gemm90_dtype_pairs:
+            params = {"dtype_in": cutlass_dtype_map[dtype_in],
+                      "dtype_out": cutlass_dtype_map[dtype_out]}
+            fname = f"group_gemm_sm90_{dtype_in}_{dtype_out}.cu"
+            gemm90_instances.append((params, fname))
+        n = _add_sm90_jinja(
+            "fi_gemm_sm90", "gemm", "group_gemm_sm90_kernel_inst.jinja",
+            gemm90_instances,
+            ["group_gemm_sm90.cu"], "flashinfer_gemm_sm90_binding.cu",
+            ["cutlass_segment_gemm_sm90"],
+            ["-DCUTLASS_ENABLE_GDC_FOR_SM90=1"],
+        )
+        print(f"  SM90 GEMM: {n} sources (6 dtype pair instantiations)")
+
+        # gen_trtllm_comm_module: SM90+ comm (allreduce + fusion)
+        comm_out = gen_dir / "fi_trtllm_comm"
+        comm_out.mkdir(parents=True, exist_ok=True)
+        comm_sources = []
+        for sf in ["trtllm_allreduce.cu", "trtllm_allreduce_fusion.cu",
+                    "trtllm_moe_allreduce_fusion.cu"]:
+            sp = csrc / sf
             if sp.exists():
-                shutil.copy2(sp, gdn_out / sf)
-                gdn_sources.append(gdn_out / sf)
+                shutil.copy2(sp, comm_out / sf)
+                comm_sources.append(comm_out / sf)
+        comm_vinfo = {"vid": "fi_trtllm_comm", "kind": "comm",
+                      "symbols": {s: f"__tvm_ffi_{s}" for s in [
+                          "trtllm_lamport_initialize", "trtllm_lamport_initialize_all",
+                          "trtllm_custom_all_reduce", "trtllm_allreduce_fusion",
+                          "trtllm_moe_allreduce_fusion", "trtllm_moe_finalize_allreduce_fusion"]}}
+        for src in comm_sources:
+            compile_jobs.append((src, sm90_flags, [], comm_vinfo))
+        sm90_modules.append(comm_vinfo)
 
-        # Generate explicit template instantiations
-        gdn_inst = []
-        gdn_inst.append('#include "flashinfer/flat/prefill/prefill_kernel_delta_rule_sm90.cuh"')
-        gdn_inst.append('#include <cuda_bf16.h>')
-        gdn_inst.append('#include <cuda_fp16.h>')
-        gdn_inst.append('#include "cutlass/arch/arch.h"')
-        gdn_inst.append('namespace flat {')
-        for is_gva in ["false", "true"]:
-            for nb in ["false", "true"]:
-                for na in ["false", "true"]:
-                    for init in ["false", "true"]:
-                        for ctype in ["half", "nv_bfloat16"]:
-                            gdn_inst.append(
-                                f'template void launch_delta_rule_prefill_kernel_gbai'
-                                f'<{is_gva}, {nb}, {na}, {init}, cutlass::arch::Sm90, {ctype}, {ctype}, float>'
-                                f'(cudaStream_t, {ctype}*, float*, {ctype} const*, {ctype} const*, {ctype} const*, '
-                                f'float const*, float const*, float const*, int64_t const*, uint8_t*, '
-                                f'int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);'
-                            )
-        gdn_inst.append('}  // namespace flat')
-        gdn_inst_path = gdn_out / "gdn_template_inst.cu"
-        gdn_inst_path.write_text('\n'.join(gdn_inst))
-        gdn_sources.append(gdn_inst_path)
+        # gen_trtllm_mnnvl_comm_module: SM90+ MNNVL allreduce
+        mnnvl_out = gen_dir / "fi_trtllm_mnnvl"
+        mnnvl_out.mkdir(parents=True, exist_ok=True)
+        sp = csrc / "trtllm_mnnvl_allreduce.cu"
+        if sp.exists():
+            shutil.copy2(sp, mnnvl_out / "trtllm_mnnvl_allreduce.cu")
+            mnnvl_vinfo = {"vid": "fi_trtllm_mnnvl", "kind": "comm",
+                           "symbols": {"trtllm_mnnvl_allreduce_fusion": "__tvm_ffi_trtllm_mnnvl_allreduce_fusion"}}
+            compile_jobs.append((mnnvl_out / "trtllm_mnnvl_allreduce.cu", sm90_flags, [], mnnvl_vinfo))
+            sm90_modules.append(mnnvl_vinfo)
 
-        gdn_vinfo = {"vid": "fi_gdn", "kind": "gdn",
-                      "symbols": {"gdn_prefill": "__tvm_ffi_gdn_prefill"}}
-        gdn_extra = ["-DFLAT_SM90A_ENABLED"]
-        for src in gdn_sources:
-            compile_jobs.append((src, sm90_util_flags, gdn_extra, gdn_vinfo))
-        sm90_modules.append(([], [], gdn_vinfo))
-        print(f"  SM90 GDN: {len(gdn_sources)} sources (32 template instantiations)")
-
-        # Segment GEMM SM90
-        seg90_out = gen_dir / "fi_gemm_segment_sm90"
-        seg90_out.mkdir(parents=True, exist_ok=True)
-        seg90_sources = []
-        for src_file in ["group_gemm_sm90.cu"]:
-            src_path = fi_src / "csrc" / src_file
-            if src_path.exists():
-                shutil.copy2(src_path, seg90_out / src_file)
-                seg90_sources.append(seg90_out / src_file)
-        seg90_binding = fi_src / "csrc" / "flashinfer_gemm_sm90_binding.cu"
-        if seg90_binding.exists():
-            shutil.copy2(seg90_binding, seg90_out / "flashinfer_gemm_sm90_binding.cu")
-            seg90_sources.append(seg90_out / "flashinfer_gemm_sm90_binding.cu")
-        seg90_vinfo = {"vid": "fi_gemm_segment_sm90", "kind": "gemm",
-                       "symbols": {"cutlass_segment_gemm_sm90": "__tvm_ffi_cutlass_segment_gemm_sm90"}}
-        for src in seg90_sources:
-            compile_jobs.append((src, sm90_util_flags, [], seg90_vinfo))
-        sm90_modules.append(([], [], seg90_vinfo))
-
-
-        for _, _, vinfo in sm90_modules:
+        for vinfo in sm90_modules:
             utility_variants.append(([], [], vinfo))
 
-    # ── SM100 conditional modules ─────────────────────────────────────
-    sm100_util_flags = ["-gencode", "arch=compute_100a,code=sm_100a"]
+    # ── SM100 modules (matching upstream aot.py has_sm100 blocks) ──────
+    sm100_flags = ["-gencode", "arch=compute_100a,code=sm_100a"]
     if has_sm100:
+        import jinja2
         sm100_modules = []
         csrc = fi_src / "csrc"
 
-        def _add_sm100_module(vid, src_files, binding_file, symbols):
+        def _add_sm100_module(vid, src_files, binding_file, symbols, kind="gemm", extra_flags=None):
             mod_out = gen_dir / vid
             mod_out.mkdir(parents=True, exist_ok=True)
             mod_sources = []
@@ -1914,72 +1940,104 @@ def main():
             if binding_file:
                 bp = csrc / binding_file
                 if bp.exists():
-                    shutil.copy2(bp, mod_out / binding_file)
-                    mod_sources.append(mod_out / binding_file)
-            vinfo = {"vid": vid, "kind": "gemm",
+                    shutil.copy2(bp, mod_out / Path(binding_file).name)
+                    mod_sources.append(mod_out / Path(binding_file).name)
+            vinfo = {"vid": vid, "kind": kind,
                      "symbols": {s: f"__tvm_ffi_{s}" for s in symbols}}
+            ef = extra_flags or []
             for src in mod_sources:
-                compile_jobs.append((src, sm100_util_flags, [], vinfo))
+                compile_jobs.append((src, sm100_flags, ef, vinfo))
             sm100_modules.append(vinfo)
 
-        # FP8 GEMM SM100 template instantiation (12 files: 6 tile configs × 2 dtypes)
-        fp8_sm100_out = gen_dir / "fi_fp8_gemm_sm100_inst"
-        fp8_sm100_out.mkdir(parents=True, exist_ok=True)
-        fp8_sm100_sources = []
-        cta_configs = [(64,64,128), (64,128,128), (64,256,128), (128,64,128), (128,128,128), (128,256,128)]
+        # gen_gemm_sm100_module_cutlass_fp8: FP8 GEMM via jinja (12 instances)
+        fp8_out = gen_dir / "fi_fp8_gemm_cutlass"
+        fp8_out.mkdir(parents=True, exist_ok=True)
+        fp8_sources = []
+        # Copy main dispatch file
+        sp = csrc / "fp8_gemm_cutlass.cu"
+        if sp.exists():
+            shutil.copy2(sp, fp8_out / "fp8_gemm_cutlass.cu")
+            fp8_sources.append(fp8_out / "fp8_gemm_cutlass.cu")
+        # Generate SM100 instantiation files from upstream jinja
+        with open(csrc / "fp8_gemm_cutlass.jinja") as f:
+            fp8_templ = jinja2.Template(f.read())
+        cta_configs = [(64,64,128), (64,128,128), (64,256,128),
+                       (128,64,128), (128,128,128), (128,256,128)]
         for cta_m, cta_n, cta_k in cta_configs:
             for dtype in ["__nv_bfloat16", "half"]:
-                fname = f"fp8_inst_{dtype}_{cta_m}_{cta_n}_{cta_k}.cu"
-                src_text = (
-                    '#include "flashinfer/gemm/fp8_gemm_template_sm100.h"\n\n'
-                    'namespace flashinfer {\n'
-                    'namespace gemm {\n'
-                    f'    INSTANCE_FP8_GEMM_TEMPLATE_SM100({dtype}, {cta_m}, {cta_n}, {cta_k}, 1, 1, 1, _1SM);\n'
-                    f'    INSTANCE_FP8_GEMM_TEMPLATE_SM100({dtype}, {cta_m}, {cta_n}, {cta_k}, 1, 2, 1, _1SM);\n'
-                    f'    INSTANCE_FP8_GEMM_TEMPLATE_SM100({dtype}, {cta_m}, {cta_n}, {cta_k}, 1, 4, 1, _1SM);\n'
-                    f'    INSTANCE_FP8_GEMM_TEMPLATE_SM100({dtype}, {cta_m}, {cta_n}, {cta_k}, 2, 1, 1, _2SM);\n'
-                    f'    INSTANCE_FP8_GEMM_TEMPLATE_SM100({dtype}, {cta_m}, {cta_n}, {cta_k}, 2, 2, 1, _2SM);\n'
-                    '}  // namespace gemm\n'
-                    '}  // namespace flashinfer\n'
-                )
-                fpath = fp8_sm100_out / fname
+                src_text = fp8_templ.render(type=dtype, cta_m=cta_m, cta_n=cta_n, cta_k=cta_k)
+                fname = f"fp8_gemm_cutlass_{dtype}_{cta_m}_{cta_n}_{cta_k}.cu"
+                fpath = fp8_out / fname
                 fpath.write_text(src_text)
-                fp8_sm100_sources.append(fpath)
-        fp8_sm100_vinfo = {"vid": "fi_fp8_gemm_sm100_inst", "kind": "gemm", "symbols": {}}
-        for src in fp8_sm100_sources:
-            compile_jobs.append((src, sm100_util_flags, [], fp8_sm100_vinfo))
-        sm100_modules.append(fp8_sm100_vinfo)
-        print(f"  SM100 FP8 GEMM: {len(fp8_sm100_sources)} instantiation files")
+                fp8_sources.append(fpath)
+        fp8_vinfo = {"vid": "fi_fp8_gemm_cutlass", "kind": "gemm",
+                     "symbols": {"fp8_gemm": "__tvm_ffi_fp8_gemm",
+                                 "fp8_gemm_tactic_num": "__tvm_ffi_fp8_gemm_tactic_num"}}
+        fp8_extra = ["-DENABLE_BF16", "-DCUTLASS_ENABLE_GDC_FOR_SM100=1"]
+        for src in fp8_sources:
+            compile_jobs.append((src, sm100_flags, fp8_extra, fp8_vinfo))
+        sm100_modules.append(fp8_vinfo)
+        print(f"  SM100 FP8 GEMM: {len(fp8_sources)} sources (12 jinja + 1 dispatch)")
 
-        # FP4 GEMM (SM100)
+        # gen_tgv_gemm_sm10x_module: TGV decode GEMM via jinja (11 tile configs per dtype)
+        with open(csrc / "tgv_gemm.jinja") as f:
+            tgv_templ = jinja2.Template(f.read())
+        tgv_cta_configs = [
+            (64, 8, 6), (64, 8, 8), (64, 8, 10), (64, 8, 12),
+            (64, 16, 6), (64, 16, 8), (64, 16, 10),
+            (64, 32, 6), (64, 32, 8),
+            (64, 64, 6),
+            (128, 16, 6),
+        ]
+        for tgv_dtype in ["bf16", "fp16"]:
+            tgv_out = gen_dir / f"fi_tgv_gemm_{tgv_dtype}"
+            tgv_out.mkdir(parents=True, exist_ok=True)
+            tgv_sources = []
+            # Copy main dispatch file
+            sp = csrc / "tgv_gemm.cu"
+            if sp.exists():
+                shutil.copy2(sp, tgv_out / "tgv_gemm.cu")
+                tgv_sources.append(tgv_out / "tgv_gemm.cu")
+            for cta_m, cta_n, dma_stage in tgv_cta_configs:
+                src_text = tgv_templ.render(cta_m=cta_m, cta_n=cta_n,
+                                            dma_stage=dma_stage, dtype=tgv_dtype)
+                fname = f"tgv_gemm_{tgv_dtype}_{cta_m}x{cta_n}_{dma_stage}.cu"
+                fpath = tgv_out / fname
+                fpath.write_text(src_text)
+                tgv_sources.append(fpath)
+            tgv_vinfo = {"vid": f"fi_tgv_gemm_{tgv_dtype}", "kind": "gemm",
+                         "symbols": {"tgv_gemm": "__tvm_ffi_tgv_gemm",
+                                     "tgv_gemm_tactic_num": "__tvm_ffi_tgv_gemm_tactic_num",
+                                     "bf16_gemm": "__tvm_ffi_bf16_gemm",
+                                     "bf16_gemm_tactic_num": "__tvm_ffi_bf16_gemm_tactic_num"}}
+            tgv_extra = ["-DCUTLASS_ENABLE_GDC_FOR_SM100=1"]
+            for src in tgv_sources:
+                compile_jobs.append((src, sm100_flags, tgv_extra, tgv_vinfo))
+            sm100_modules.append(tgv_vinfo)
+        print(f"  SM100 TGV GEMM: 2 dtypes × {len(tgv_cta_configs)+1} sources each")
+
+        # gen_gemm_sm100_module: groupwise GEMM + binding
+        _add_sm100_module("fi_gemm_sm100",
+                          ["gemm_groupwise_sm100.cu"], "gemm_sm100_binding.cu",
+                          ["gemm_fp8_nt_groupwise"])
+        # gen_gemm_sm100_module_cutlass_fp4: FP4 GEMM
         _add_sm100_module("fi_fp4_gemm_sm100",
                           ["fp4_gemm_cutlass.cu"], None,
                           ["fp4_gemm", "fp4_gemm_tactic_num"])
-        # MXFP8 GEMM (SM100+)
+        # gen_gemm_sm100_module_cutlass_mxfp8: MXFP8 GEMM
         _add_sm100_module("fi_mxfp8_gemm",
                           ["mxfp8_gemm_cutlass.cu"], None,
                           ["mxfp8_gemm", "mxfp8_gemm_tactic_num"])
-        # Groupwise GEMM SM100 (FP8)
-        _add_sm100_module("fi_gemm_groupwise_sm100",
-                          ["gemm_groupwise_sm100.cu"], "gemm_sm100_binding.cu",
-                          ["gemm_fp8_nt_groupwise"])
         # Group GEMM SM100 (FP8 + MXFP4)
         _add_sm100_module("fi_group_gemm_sm100",
                           ["group_gemm_fp8_groupwise_sm100.cu",
                            "group_gemm_mxfp4_groupwise_sm100.cu"],
                           "group_gemm_sm100_binding.cu",
                           ["group_gemm_fp8_nt_groupwise", "group_gemm_mxfp4_nt_groupwise"])
-        # FP4 GEMM SM103
-        fp4_103 = csrc / "fp4_gemm_cutlass_sm103.cu"
-        if fp4_103.exists():
-            sm103_flags = ["-gencode", "arch=compute_100a,code=sm_100a"]
-            _add_sm100_module("fi_fp4_gemm_sm103",
-                              ["fp4_gemm_cutlass_sm103.cu"], None,
-                              ["fp4_gemm", "fp4_gemm_tactic_num"])
 
         for vinfo in sm100_modules:
             utility_variants.append(([], [], vinfo))
-        print(f"  SM100 GEMM: {len(sm100_modules)} modules")
+        print(f"  SM100: {len(sm100_modules)} modules total")
 
     # ── SM120 conditional modules ─────────────────────────────────────
     has_sm120 = any(a >= 120 for a in archs)

@@ -306,25 +306,12 @@ fn new_utility_kernel_lookup() {
     assert!(reg.get_utility("flashinfer_moe_permute_bf16").is_some(), "moe_permute_bf16 not found");
     assert!(reg.get_utility("flashinfer_moe_sort").is_some(), "moe_sort not found");
 
-    // GEMM: BF16
-    assert!(reg.get_utility("bf16_gemm").is_some(), "bf16_gemm not found");
-    assert!(reg.get_utility("bf16_gemm_tactic_num").is_some(), "bf16_gemm_tactic_num not found");
-
-    // GEMM: FP8 — only compiled for SM100+, skip on SM80/SM90
-
-    // GEMM: Segment
+    // GEMM: Segment (base, all archs)
     assert!(reg.get_utility("cutlass_segment_gemm").is_some(), "cutlass_segment_gemm not found");
     assert!(reg.get_utility("bmm_fp8").is_some(), "bmm_fp8 not found");
 
-    // GEMM: TGV (low-latency decode)
-    assert!(reg.get_utility("tgv_gemm").is_some(), "tgv_gemm not found");
-
     // DSv3 router
     assert!(reg.get_utility("dsv3_router_gemm_op").is_some(), "dsv3_router_gemm_op not found");
-
-    // TRT-LLM comm
-    assert!(reg.get_utility("trtllm_custom_all_reduce").is_some(), "trtllm_custom_all_reduce not found");
-    assert!(reg.get_utility("trtllm_allreduce_fusion").is_some(), "trtllm_allreduce_fusion not found");
 
     // CUTLASS MLA
     assert!(reg.get_utility("cutlass_mla_paged_attention").is_some(), "cutlass_mla_paged_attention not found");
@@ -345,12 +332,18 @@ fn sm90_module_lookup() {
         return;
     }
 
-    // GDN (Gated Delta Net) — TODO: needs template instantiation codegen
-    // assert!(reg.get_utility("gdn_prefill").is_some(), "gdn_prefill not found");
+    // GDN (Gated Delta Net — Qwen3.5 DeltaNet)
+    assert!(reg.get_utility("gdn_prefill").is_some(), "gdn_prefill not found (SM90 required)");
 
     // Segment GEMM SM90
     assert!(reg.get_utility("cutlass_segment_gemm_sm90").is_some(),
             "cutlass_segment_gemm_sm90 not found (SM90 required)");
+
+    // TRT-LLM Comm (SM90+)
+    assert!(reg.get_utility("trtllm_custom_all_reduce").is_some(),
+            "trtllm_custom_all_reduce not found (SM90 required)");
+    assert!(reg.get_utility("trtllm_allreduce_fusion").is_some(),
+            "trtllm_allreduce_fusion not found (SM90 required)");
 }
 
 #[test]
@@ -361,8 +354,12 @@ fn sm100_module_lookup() {
         return;
     }
 
-    // FP8 GEMM
+    // FP8 GEMM (SM100 jinja instantiation)
     assert!(reg.get_utility("fp8_gemm").is_some(), "fp8_gemm not found (SM100 required)");
+
+    // TGV GEMM (SM100 decode optimization)
+    assert!(reg.get_utility("tgv_gemm").is_some(), "tgv_gemm not found (SM100 required)");
+    assert!(reg.get_utility("bf16_gemm").is_some(), "bf16_gemm not found (SM100 required)");
 
     // FP4 GEMM
     assert!(reg.get_utility("fp4_gemm").is_some(), "fp4_gemm not found (SM100 required)");
@@ -610,19 +607,12 @@ fn concat_mla_k_correctness() {
 fn comm_module_lookup() {
     let reg = KernelRegistry::new();
 
-    // TRT-LLM AllReduce
-    assert!(reg.get_utility("trtllm_lamport_initialize").is_some(), "trtllm_lamport_initialize not found");
-    assert!(reg.get_utility("trtllm_custom_all_reduce").is_some(), "trtllm_custom_all_reduce not found");
-    assert!(reg.get_utility("trtllm_allreduce_fusion").is_some(), "trtllm_allreduce_fusion not found");
-
-    // TRT-LLM MOE AllReduce
-    assert!(reg.get_utility("trtllm_moe_allreduce_fusion").is_some(), "trtllm_moe_allreduce_fusion not found");
-
-    // vLLM AllReduce
+    // vLLM AllReduce (all archs)
     assert!(reg.get_utility("init_custom_ar").is_some(), "init_custom_ar not found");
     assert!(reg.get_utility("all_reduce").is_some(), "vllm all_reduce not found");
 
-    println!("comm_module_lookup: PASS (all 6 symbols found)");
+    // TRT-LLM comm is SM90+, tested in sm90_module_lookup
+    println!("comm_module_lookup: PASS");
 }
 
 // ── FP8 GEMM correctness ───────────────────────────────────────────
