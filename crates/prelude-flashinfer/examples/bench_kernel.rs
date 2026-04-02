@@ -745,7 +745,7 @@ fn bench_utilities(reg: &KernelRegistry) {
         let batch = 64i64;
         let vocab = 32000i64;
         let n = (batch * vocab) as usize;
-        let logits = gpu_alloc(n * 2);  // BF16
+        let logits = gpu_alloc(n * 4);  // FP32 (upstream requires float input)
         let out = gpu_alloc(n * 4);     // FP32
         let ws_buf = gpu_alloc(64 * 1024 * 1024);
 
@@ -754,7 +754,7 @@ fn bench_utilities(reg: &KernelRegistry) {
         let out_s = s; let out_st = strides(&out_s);
 
         let dl_ws = gpu_dl(ws_buf, U8_DT, &ws_s, &ws_st);
-        let dl_in = gpu_dl(logits, BF16_DT, &s, &st);
+        let dl_in = gpu_dl(logits, FP32_DT, &s, &st);
         let dl_out = gpu_dl(out, FP32_DT, &out_s, &out_st);
 
         unsafe { reg.set_stream(0, std::ptr::null_mut()); }
@@ -768,7 +768,7 @@ fn bench_utilities(reg: &KernelRegistry) {
         let ms = cuda_bench(5, 100, || {
             unsafe { reg.call(softmax, &args).unwrap(); }
         });
-        let gb = (n * 2 + n * 4) as f64 / 1e9;
+        let gb = (n * 4 + n * 4) as f64 / 1e9;  // FP32 input + FP32 output
         let bw = gb / (ms as f64 * 1e-3);
         println!("  softmax     ({batch}×{vocab}): {ms:.3} ms, {bw:.1} GB/s");
 
