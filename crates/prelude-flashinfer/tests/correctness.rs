@@ -763,6 +763,142 @@ fn bf16_gemm_correctness() {
     unsafe { cudaFree(a_ptr); cudaFree(b_ptr); cudaFree(c_ptr); cudaFree(ws_ptr); }
 }
 
+// ── GDN (Gated Delta Net) prefill smoke test ────────────────────────
+
+#[test]
+fn gdn_prefill_smoke() {
+    let reg = KernelRegistry::new();
+    if reg.arch() < 90 {
+        println!("SM{} < SM90, skipping GDN test", reg.arch());
+        return;
+    }
+    let gdn = match reg.get_utility("gdn_prefill") {
+        Some(f) => f,
+        None => { println!("gdn_prefill not compiled, skipping"); return; }
+    };
+
+    // Use upstream test dimensions: head_size=128, GQA (4 q heads, 1 kv head)
+    // With alpha=true, beta=true (upstream skips alpha=false,beta=false due to
+    // "output value amplitude explosion along token dimension")
+    let num_seqs = 1i64;
+    let seq_len = 64i64;
+    let num_q_heads = 4i64;
+    let num_k_heads = 1i64;
+    let num_v_heads = 1i64;
+    let head_dim = 128i64;
+    let packed_seq = seq_len;
+    let num_sab_heads = num_q_heads.max(num_v_heads); // = 4
+
+    // Q: [packed_seq, num_q_heads, head_dim] BF16
+    let q_elems = (packed_seq * num_q_heads * head_dim) as usize;
+    let q_bf16: Vec<u16> = (0..q_elems).map(|i| f32_to_bf16(0.01 * ((i as f32) % 13.0 - 6.0))).collect();
+
+    // K: [packed_seq, num_k_heads, head_dim] BF16 — L2 normalized per upstream
+    let k_elems = (packed_seq * num_k_heads * head_dim) as usize;
+    let mut k_f32: Vec<f32> = (0..k_elems).map(|i| 0.1 * ((i as f32) % 7.0 - 3.0)).collect();
+    // L2 normalize each [head_dim] vector
+    for row in k_f32.chunks_mut(head_dim as usize) {
+        let norm: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-12);
+        for v in row.iter_mut() { *v /= norm; }
+    }
+    let k_bf16: Vec<u16> = k_f32.iter().map(|v| f32_to_bf16(*v)).collect();
+
+    // V: [packed_seq, num_v_heads, head_dim] BF16
+    let v_elems = (packed_seq * num_v_heads * head_dim) as usize;
+    let v_bf16: Vec<u16> = (0..v_elems).map(|i| f32_to_bf16(0.005 * ((i as f32) % 11.0 - 5.0))).collect();
+
+    // Output: [packed_seq, num_sab_heads, head_dim] BF16
+    let o_elems = (packed_seq * num_sab_heads * head_dim) as usize;
+
+    // Output state: [num_seqs, num_sab_heads, head_dim, head_dim] FP32
+    let state_elems = (num_seqs * num_sab_heads * head_dim * head_dim) as usize;
+
+    // Alpha, Beta: [packed_seq, num_sab_heads] FP32
+    let ab_elems = (packed_seq * num_sab_heads) as usize;
+    let alpha_f32: Vec<f32> = (0..ab_elems).map(|i| 0.5 + 0.01 * (i as f32 % 10.0)).collect();
+    let beta_f32: Vec<f32> = (0..ab_elems).map(|i| 0.3 + 0.01 * (i as f32 % 8.0)).collect();
+
+    // cu_seqlens: [num_seqs + 1] I64
+    let cu_seqlens: Vec<i64> = vec![0, seq_len];
+
+    let q_ptr = gpu_upload(&q_bf16);
+    let k_ptr = gpu_upload(&k_bf16);
+    let v_ptr = gpu_upload(&v_bf16);
+    let o_ptr = gpu_alloc(o_elems * 2);
+    let state_ptr = gpu_alloc(state_elems * 4);
+    let alpha_ptr = gpu_upload(&alpha_f32);
+    let beta_ptr = gpu_upload(&beta_f32);
+    let cu_ptr = gpu_upload(&cu_seqlens);
+    let ws_ptr = gpu_alloc(128 * 1024 * 1024);
+
+    let q_s = [packed_seq, num_q_heads, head_dim]; let q_st = contiguous_strides(&q_s);
+    let k_s = [packed_seq, num_k_heads, head_dim]; let k_st = contiguous_strides(&k_s);
+    let v_s = [packed_seq, num_v_heads, head_dim]; let v_st = contiguous_strides(&v_s);
+    let o_s = [packed_seq, num_sab_heads, head_dim]; let o_st = contiguous_strides(&o_s);
+    let state_s = [num_seqs, num_sab_heads, head_dim, head_dim];
+    let state_st = contiguous_strides(&state_s);
+    let ab_s = [packed_seq, num_sab_heads]; let ab_st = contiguous_strides(&ab_s);
+    let cu_s = [num_seqs + 1]; let cu_st = [1i64];
+    let ws_s = [128 * 1024 * 1024i64]; let ws_st = [1i64];
+
+    let i64_dt = DLDataType { code: KDLINT, bits: 64, lanes: 1 };
+
+    let dl_o = gpu_dl(o_ptr, BF16_DT, &o_s, &o_st);
+    let dl_state = gpu_dl(state_ptr, FP32_DT, &state_s, &state_st);
+    let dl_q = gpu_dl(q_ptr, BF16_DT, &q_s, &q_st);
+    let dl_k = gpu_dl(k_ptr, BF16_DT, &k_s, &k_st);
+    let dl_v = gpu_dl(v_ptr, BF16_DT, &v_s, &v_st);
+    let dl_cu = gpu_dl(cu_ptr, i64_dt, &cu_s, &cu_st);
+    let dl_alpha = gpu_dl(alpha_ptr, FP32_DT, &ab_s, &ab_st);
+    let dl_beta = gpu_dl(beta_ptr, FP32_DT, &ab_s, &ab_st);
+    let dl_ws = gpu_dl(ws_ptr, U8_DT, &ws_s, &ws_st);
+
+    unsafe {
+        reg.set_stream(0, std::ptr::null_mut());
+        // gdn_prefill(output, output_state, q, k, v, cu_seqlens,
+        //             input_state?, alpha?, beta?, scale, workspace)
+        let args = [
+            TVMFFIAny::dltensor(&dl_o),
+            TVMFFIAny::dltensor(&dl_state),
+            TVMFFIAny::dltensor(&dl_q),
+            TVMFFIAny::dltensor(&dl_k),
+            TVMFFIAny::dltensor(&dl_v),
+            TVMFFIAny::dltensor(&dl_cu),
+            TVMFFIAny::none(),              // input_state (None = zero init)
+            TVMFFIAny::dltensor(&dl_alpha), // alpha
+            TVMFFIAny::dltensor(&dl_beta),  // beta
+            TVMFFIAny::float64(0.0),        // scale (0 = auto: 1/sqrt(head_dim))
+            TVMFFIAny::dltensor(&dl_ws),
+        ];
+        reg.call(gdn, &args).expect("gdn_prefill call failed");
+        cudaDeviceSynchronize();
+    }
+
+    let out_bf16 = gpu_download::<u16>(o_ptr, o_elems);
+    let out_f32: Vec<f32> = out_bf16.iter().map(|v| bf16_to_f32(*v)).collect();
+    let finite = out_f32.iter().filter(|v| v.is_finite()).count();
+    let nonzero = out_f32.iter().filter(|v| v.abs() > 1e-10).count();
+
+    println!("gdn_prefill [seq={seq_len}, q_heads={num_q_heads}, kv_heads={num_k_heads}, d={head_dim}]: \
+              {finite}/{o_elems} finite, {nonzero}/{o_elems} nonzero");
+    assert_eq!(finite, o_elems, "GDN output has NaN/Inf");
+    assert!(nonzero > o_elems / 2, "GDN output is mostly zeros ({nonzero}/{o_elems})");
+
+    // Also verify state is populated
+    let state_f32 = gpu_download::<f32>(state_ptr, state_elems);
+    let state_finite = state_f32.iter().filter(|v| v.is_finite()).count();
+    let state_nonzero = state_f32.iter().filter(|v| v.abs() > 1e-10).count();
+    println!("  output_state: {state_finite}/{state_elems} finite, {state_nonzero}/{state_elems} nonzero");
+    assert_eq!(state_finite, state_elems, "GDN state has NaN/Inf");
+
+    unsafe {
+        cudaFree(q_ptr); cudaFree(k_ptr); cudaFree(v_ptr);
+        cudaFree(o_ptr); cudaFree(state_ptr);
+        cudaFree(alpha_ptr); cudaFree(beta_ptr);
+        cudaFree(cu_ptr); cudaFree(ws_ptr);
+    }
+}
+
 // POD is excluded from AOT (archive size > 2GB). Infrastructure is in place
 // for future JIT compilation. See generate_batch_pod_sources() in compile_kernels.py.
 
