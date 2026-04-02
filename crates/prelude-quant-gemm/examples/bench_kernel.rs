@@ -138,13 +138,15 @@ const MMVQ_FORMATS: &[(GgmlType, &str)] = &[
     (GgmlType::Q4_0,  "Q4_0"), (GgmlType::Q4K,  "Q4_K"), (GgmlType::Q6K,  "Q6_K"),
     (GgmlType::Q8_0,  "Q8_0"), (GgmlType::IQ4XS, "IQ4X"), (GgmlType::IQ3S, "IQ3S"),
     (GgmlType::IQ2XS, "IQ2X"), (GgmlType::IQ1M,  "IQ1M"), (GgmlType::MXFP4,"MXF4"),
+    (GgmlType::NVFP4, "NVF4"),
 ];
 
-// Formats with MMQ template instantiation (excludes MXFP4/IQ1_M/NVFP4).
+// All formats with MMQ template instantiation (excludes IQ1_M which has no MMQ upstream).
 const MMQ_FORMATS: &[(GgmlType, &str)] = &[
     (GgmlType::Q4_0,  "Q4_0"), (GgmlType::Q4K,  "Q4_K"), (GgmlType::Q6K,  "Q6_K"),
     (GgmlType::Q8_0,  "Q8_0"), (GgmlType::IQ4XS, "IQ4X"), (GgmlType::IQ3S, "IQ3S"),
-    (GgmlType::IQ2XS, "IQ2X"), (GgmlType::IQ1S,  "IQ1S"),
+    (GgmlType::IQ2XS, "IQ2X"), (GgmlType::IQ1S,  "IQ1S"), (GgmlType::MXFP4,"MXF4"),
+    (GgmlType::NVFP4, "NVF4"),
 ];
 
 // ── MMVQ helper ─────────────────────────────────────────────────────────

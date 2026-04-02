@@ -93,6 +93,7 @@ template void mul_mat_q_case<GGML_TYPE_IQ3_S>(ggml_backend_cuda_context &, const
 template void mul_mat_q_case<GGML_TYPE_IQ1_S>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
 template void mul_mat_q_case<GGML_TYPE_IQ4_NL>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
 template void mul_mat_q_case<GGML_TYPE_IQ4_XS>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
+template void mul_mat_q_case<GGML_TYPE_NVFP4>(ggml_backend_cuda_context &, const mmq_args &, cudaStream_t);
 
 #include <cuda_bf16.h>
 
@@ -244,6 +245,7 @@ extern "C" void llama_mmq_mul_mat(
         case GGML_TYPE_IQ1_S:   launch_mmq_typed<GGML_TYPE_IQ1_S>  (W, x_q8, y, M, N, K, stream); break;
         case GGML_TYPE_IQ4_NL:  launch_mmq_typed<GGML_TYPE_IQ4_NL> (W, x_q8, y, M, N, K, stream); break;
         case GGML_TYPE_IQ4_XS:  launch_mmq_typed<GGML_TYPE_IQ4_XS> (W, x_q8, y, M, N, K, stream); break;
+        case GGML_TYPE_NVFP4:   launch_mmq_typed<GGML_TYPE_NVFP4>  (W, x_q8, y, M, N, K, stream); break;
         default: break;
     }
 }

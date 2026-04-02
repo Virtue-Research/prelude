@@ -22,6 +22,7 @@ crates/
 │       │   ├── conv.rs                            # trait ConvOps (conv1d, conv2d, conv_transpose1d)
 │       │   ├── comm.rs                            # trait CommOps (all_reduce, all_gather, all_to_all, send/recv)
 │       │   ├── fused.rs                           # trait FusedOps — all methods default { None }
+│       │   ├── sampling.rs                        # trait SamplingOps (softmax, top_k, top_p, min_p, multinomial)
 │       │   └── session.rs                         # trait OpsSession (begin/end_forward, precompute_paged_plan)
 │       │
 │       ├── modules/                               # Shared modules — fusion/fallback logic lives here
@@ -44,10 +45,10 @@ crates/
 │       │   │   ├── proposer.rs                    # trait DraftProposer (EAGLE/DraftModel/Ngram/Medusa)
 │       │   │   ├── rejection.rs                   # Rejection sampling (strict, probabilistic)
 │       │   │   └── tree.rs                        # Tree attention mask construction
-│       │   └── sampling/                          # Sampling pipeline — see scheduler/constrained_decoding.md
-│       │       ├── mod.rs                         # Sampler: logits → token IDs
+│       │   └── sampling/                          # Sampling orchestration — see scheduler/constrained_decoding.md
+│       │       ├── mod.rs                         # Sampler: penalties → grammar → ops.sampling → token IDs
 │       │       ├── grammar.rs                     # GrammarManager: async compile + bitmask fill
-│       │       └── logits_processor.rs            # LogitsProcessor trait (grammar is one impl)
+│       │       └── logits_processor.rs            # LogitsProcessor trait (penalties, grammar are impls)
 │       │
 │       ├── scheduler/                             # Scheduling decisions (pure CPU, no GPU)
 │       │   ├── mod.rs                             # re-exports
@@ -117,6 +118,7 @@ crates/
 │   │   ├── activation.rs                      # impl ActivationOps
 │   │   ├── conv.rs                            # impl ConvOps: CUTLASS conv
 │   │   ├── comm.rs                            # impl CommOps: NCCL + UCCL-EP fused dispatch
+│   │   ├── sampling.rs                        # impl SamplingOps: FlashInfer GPU sampling kernels
 │   │   ├── fused.rs                           # impl FusedOps: all overrides return Some
 │   │   ├── session.rs                         # impl OpsSession: FlashInfer plan cache
 │   │   └── graph.rs                           # CudaOps::allocate_graph_buffers, precompute_paged_plan_graphed
@@ -136,6 +138,7 @@ crates/
 │   │   ├── attention.rs                       # impl AttentionOps: aiter → CK flash attn fallback
 │   │   ├── gemm.rs                            # impl GemmOps: CK GEMM, FP8 FNUZ/E4M3 auto-select
 │   │   ├── comm.rs                            # impl CommOps: RCCL + UCCL-EP fused dispatch
+│   │   ├── sampling.rs                        # impl SamplingOps: CK-based or scalar fallback
 │   │   ├── fused.rs                           # impl FusedOps: fused_add_rmsnorm (HIP kernel)
 │   │   └── ...                                # norm, activation, conv, session, graph (HIP graphs)
 │   │
@@ -150,6 +153,7 @@ crates/
 │   │   ├── metal_ops.rs                       # struct MetalOps (unified memory, simdgroup mm)
 │   │   ├── attention.rs                       # impl AttentionOps: MSL flash attn (varlen only)
 │   │   ├── gemm.rs                            # impl GemmOps: simdgroup matmul + in-shader Q4K dequant
+│   │   ├── sampling.rs                        # impl SamplingOps: MSL compute shader
 │   │   ├── fused.rs                           # impl FusedOps: fused_add_rmsnorm, fused_silu_mul
 │   │   └── ...                                # norm, activation, conv
 │   └── shaders/                               # MSL compute shaders (*.metal)
@@ -160,6 +164,7 @@ crates/
 │   │   ├── vulkan_ops.rs                      # struct VulkanOps (cooperative_matrix, subgroup_size)
 │   │   ├── attention.rs                       # impl AttentionOps: GLSL flash attn (scalar + coopmat)
 │   │   ├── gemm.rs                            # impl GemmOps: tiled / coopmat + in-shader Q4 dequant
+│   │   ├── sampling.rs                        # impl SamplingOps: GLSL compute shader
 │   │   └── ...                                # norm, activation, conv
 │   └── shaders/                               # GLSL → SPIR-V compute shaders
 │
@@ -169,6 +174,7 @@ crates/
 │       ├── tpu_ops.rs                         # struct TpuOps (PjrtClient, compiled_cache)
 │       ├── attention.rs                       # impl AttentionOps: Pallas flash attn + ragged_paged
 │       ├── gemm.rs                            # impl GemmOps: XLA dot_general (MXU)
+│       ├── sampling.rs                        # impl SamplingOps: XLA top_k + multinomial
 │       ├── session.rs                         # impl OpsSession: XLA trace begin/end + compile cache
 │       └── ...                                # FusedOps: all None (XLA auto-fuses)
 │
@@ -178,6 +184,7 @@ crates/
     │   ├── cpu_ops.rs                         # struct CpuOps
     │   ├── attention.rs                       # impl AttentionOps: matmul-based SDPA (no paged)
     │   ├── gemm.rs                            # impl GemmOps: OneDNN GEMM + dequant fallback
+    │   ├── sampling.rs                        # impl SamplingOps: quickselect top-k + vectorized softmax
     │   ├── fused.rs                           # impl FusedOps: fused_add_rmsnorm (vectorized)
     │   └── ...                                # norm, activation, conv
     │
@@ -287,7 +294,7 @@ that use it benefit automatically.** This is how one kernel optimization reaches
 | **TTS Scheduler** | [scheduler/tts.md](scheduler/tts.md) |
 | **OneShot Scheduler** | [scheduler/oneshot.md](scheduler/oneshot.md) |
 | **Speculative Decoding** | [scheduler/speculative.md](scheduler/speculative.md) |
-| **Constrained Decoding** | [scheduler/constrained_decoding.md](scheduler/constrained_decoding.md) |
+| **Sampling & Constrained Decoding** | [scheduler/constrained_decoding.md](scheduler/constrained_decoding.md) |
 | **Disaggregated Serving** | [scheduler/disaggregated.md](scheduler/disaggregated.md) |
 | **Design Comparisons** | [scheduler/design-comparisons.md](scheduler/design-comparisons.md) |
 | **Examples** | [scheduler/examples.md](scheduler/examples.md) |
@@ -356,14 +363,14 @@ let engine = Engine::new(ops, grammar, &config);
 
 Metal and CUDA/ROCm cannot coexist in one binary (macOS SDK vs Linux GPU toolchains).
 
-## Layering
+## Dependency Summary
 
 ```
 prelude-server            →  composition root: detect GPU, create_ops, Engine::new
 plugins/prelude-xgrammar  →  impl GrammarBackend (device-agnostic C++ FFI)
 prelude-core/models       →  device-agnostic model code, calls modules + Ops
 prelude-core/modules      →  shared layers (Linear, residual_norm, moe_layer), fusion fallback
-prelude-core/ops          →  trait definitions (AttentionOps, GemmOps, FusedOps, ...)
+prelude-core/ops          →  trait definitions (AttentionOps, GemmOps, SamplingOps, FusedOps, ...)
 prelude-core/engine       →  Engine, ModelRunner, SpecDecodeRunner, Sampler, GrammarManager
 prelude-core/scheduler    →  ArScheduler, DllmScheduler, BlockAllocator, PrefixCache
 prelude-{device}/         →  device impl (CudaOps, RocmOps, ...), kernel sub-crates

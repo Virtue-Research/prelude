@@ -75,7 +75,7 @@ impl DiffusionScheduler {
 ### Model Runner for Diffusion
 
 ```rust
-// engine/run.rs (diffusion 部分)
+// engine/run.rs (diffusion section)
 
 fn execute_diffusion(plan: &DiffusionScheduledBatch, dit: &FluxDiT, ops: &Ops) -> Vec<DiffusionStepResult> {
     ops.session.begin_forward();

@@ -6,24 +6,24 @@
 crates/prelude-core/src/
 ├── lib.rs                                 # pub use engine::Engine;
 │
-├── engine/                                # Engine — 对外的最小可用单元
+├── engine/                                # Engine — the public API, minimal external surface
 │   ├── mod.rs                             # pub struct Engine: new(), serve(), generate(), embed()
 │   ├── config.rs                          # EngineConfig — mode, device, scheduler params
-│   ├── run.rs                             # run::ar(), run::dllm(), ... 各模式主循环
+│   ├── run.rs                             # run::ar(), run::dllm(), ... main loop per mode
 │   ├── model_runner/                      # ScheduledBatch → tensors → model.forward() → sample
-│   │   ├── mod.rs                         # ModelRunner 核心逻辑
+│   │   ├── mod.rs                         # ModelRunner core logic
 │   │   └── cuda_graph.rs                  # Graph capture/replay (CUDA/HIP)
 │   ├── speculative/                       # Speculative decoding — see speculative.md
 │   │   ├── mod.rs                         # SpecDecodeRunner: draft → verify → accept loop
 │   │   ├── proposer.rs                    # trait DraftProposer (EAGLE/DraftModel/Ngram/Medusa)
 │   │   ├── rejection.rs                   # Rejection sampling (strict, probabilistic)
 │   │   └── tree.rs                        # Tree attention mask construction
-│   └── sampling/                          # Sampling pipeline — see constrained_decoding.md
-│       ├── mod.rs                         # Sampler: logits → token IDs
+│   └── sampling/                          # Sampling orchestration — see constrained_decoding.md
+│       ├── mod.rs                         # Sampler: penalties → grammar → ops.sampling → token IDs
 │       ├── grammar.rs                     # GrammarManager: async compile + bitmask fill
-│       └── logits_processor.rs            # LogitsProcessor trait (grammar is one impl)
+│       └── logits_processor.rs            # LogitsProcessor trait (penalties, grammar are impls)
 │
-├── scheduler/                             # 调度决策（纯 CPU，不碰 GPU）
+├── scheduler/                             # Scheduling decisions (pure CPU, no GPU)
 │   ├── mod.rs                             # re-exports
 │   ├── ar.rs                              # ArScheduler — continuous batching for AR LLMs
 │   ├── dllm.rs                            # DllmScheduler — block-level demasking for diffusion LLMs
@@ -31,17 +31,17 @@ crates/prelude-core/src/
 │   ├── oneshot.rs                         # OneShotScheduler — embed, classify, prefill-only
 │   ├── tts.rs                             # TtsPipelineScheduler — multi-stage TTS streaming
 │   ├── types.rs                           # ScheduledBatch, ScheduledRequest, StepResult, etc.
-│   └── components/                        # 可选组件，scheduler 按需使用
+│   └── components/                        # Optional components, used by schedulers as needed
 │       ├── block_allocator.rs             # BlockAllocator — paged KV cache block management
 │       ├── prefix_cache.rs                # PrefixCache — radix tree for KV prefix sharing
 │       └── request_queue.rs               # RequestQueue — FCFS / priority / cache-aware ordering
 │
-├── disaggregated/                         # 多实例部署（单机用户跳过此目录）
-│   ├── pd/                                # Prefill/Decode 分离
-│   │   ├── coordinator.rs                 # 跨 worker 请求路由、prefix-aware placement
-│   │   └── kv_transfer.rs                 # KV cache 跨 worker 传输协议
-│   └── afd/                               # Attention-FFN 分离
-│       └── ffn_follower.rs                # 被动 FFN 进程（Engine::run_as_ffn_follower 的实现）
+├── disaggregated/                         # Multi-instance deployment (skip for single-machine)
+│   ├── pd/                                # Prefill/Decode separation
+│   │   ├── coordinator.rs                 # Cross-worker request routing, prefix-aware placement
+│   │   └── kv_transfer.rs                 # KV cache cross-worker transfer protocol
+│   └── afd/                               # Attention-FFN separation
+│       └── ffn_follower.rs                # Passive FFN process (Engine::run_as_ffn_follower impl)
 ```
 
 **Reading guide:**
@@ -361,7 +361,7 @@ The scheduler **never** calls `AttentionOps`, `GemmOps`, `NormOps`, etc.
 It only manages metadata: block tables, sequence lengths, token IDs.
 
 ```rust
-// engine/model_runner/mod.rs — model_runner 内部调用 ops 的完整接口
+// engine/model_runner/mod.rs — full ops interface called by model_runner
 
 ops.session.begin_forward();
 ops.session.precompute_paged_plan(&block_tables, &cu_seqlens_k, block_size);

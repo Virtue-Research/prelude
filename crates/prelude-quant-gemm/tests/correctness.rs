@@ -476,7 +476,7 @@ fn tiled_mmq_correctness() {
         None => { eprintln!("No CUDA device, skipping"); return; }
     };
 
-    // All formats with MMQ template instantiation (excludes MXFP4/IQ1_M/NVFP4).
+    // All formats with MMQ template instantiation (excludes IQ1_M which has no MMQ upstream).
     let formats: &[(GgmlType, &str)] = &[
         (GgmlType::Q4_0,   "Q4_0"),   (GgmlType::Q4_1,   "Q4_1"),
         (GgmlType::Q5_0,   "Q5_0"),   (GgmlType::Q5_1,   "Q5_1"),
@@ -487,6 +487,7 @@ fn tiled_mmq_correctness() {
         (GgmlType::IQ3S,   "IQ3S"),   (GgmlType::IQ3XXS, "IQ3XX"),
         (GgmlType::IQ2S,   "IQ2S"),   (GgmlType::IQ2XS,  "IQ2XS"),
         (GgmlType::IQ2XXS, "IQ2XX"),  (GgmlType::IQ1S,   "IQ1S"),
+        (GgmlType::MXFP4,  "MXFP4"),  (GgmlType::NVFP4,  "NVFP4"),
     ];
 
     println!("\n=== Tiled MMQ Correctness (GPU vs CPU dequant+matmul) ===\n");
