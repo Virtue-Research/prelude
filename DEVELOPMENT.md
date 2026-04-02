@@ -73,6 +73,7 @@ cargo test -p prelude-cutlass-gemm --release
 cargo test -p prelude-deepgemm --release
 cargo test -p prelude-flashinfer --release
 cargo test -p prelude-flash-attn-v4 --release
+cargo test -p prelude-quant-gemm --release
 ```
 
 ### Benchmark
@@ -88,6 +89,9 @@ cargo run -p prelude-cutlass-gemm --bin bench_kernel --release
 cargo run -p prelude-deepgemm --bin bench_kernel --release
 cargo run -p prelude-flashinfer --bin bench_kernel --release
 cargo run -p prelude-flash-attn-v4 --bin bench_kernel --release
+
+# Quant
+cargo run -p prelude-quant-gemm --bin bench_kernel --release
 ```
 
 ## Feature flags
