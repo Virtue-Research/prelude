@@ -1556,7 +1556,9 @@ fn main() {
     let ws = Workspace::new();
     bench_prefill(&reg, &ws);
     bench_decode(&reg, &ws);
-    bench_pod(&reg, &ws);
+    if reg.arch() < 90 {
+        bench_pod(&reg, &ws);
+    }
 
     println!("\nDone.");
 }
