@@ -534,14 +534,15 @@ fn concat_mla_k_correctness() {
         None => { println!("concat_mla_k not compiled, skipping"); return; }
     };
 
-    let tokens = 8i64;
-    let num_heads = 4i64;
+    // DeepSeek MLA specific: num_heads=128, nope_dim=128, rope_dim=64 (hardcoded in kernel)
+    let tokens = 4i64;
+    let num_heads = 128i64;
     let nope_dim = 128i64;
     let rope_dim = 64i64;
     let full_dim = nope_dim + rope_dim;
 
     let nope_elems = (tokens * num_heads * nope_dim) as usize;
-    // k_rope must have num_heads=1 (broadcast across all heads)
+    // k_rope: num_heads=1, broadcast across all 128 heads
     let rope_elems = (tokens * 1 * rope_dim) as usize;
     let full_elems = (tokens * num_heads * full_dim) as usize;
 
