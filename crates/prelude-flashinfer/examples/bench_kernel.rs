@@ -1100,6 +1100,109 @@ fn bench_topk(reg: &KernelRegistry) {
     }
 }
 
+// ── GDN (Gated Delta Net) benchmark ──────────────────────────────────
+
+fn bench_gdn(reg: &KernelRegistry) {
+    let gdn = match reg.get_utility("gdn_prefill") {
+        Some(f) => f,
+        None => {
+            println!("\n{:=<80}", "= GDN Benchmark: SKIPPED (SM90+ required) ");
+            return;
+        }
+    };
+
+    println!("\n{:=<80}", "= GDN Prefill (Gated Delta Net) ");
+
+    // Qwen3.5 DeltaNet configs
+    let head_dim = 128i64;
+    let configs: &[(i64, i64, i64, &str)] = &[
+        // (seq_len, num_q_heads, num_kv_heads, label)
+        (128,  4, 1, "GQA 4:1"),
+        (256,  4, 1, "GQA 4:1"),
+        (512,  4, 1, "GQA 4:1"),
+        (1024, 4, 1, "GQA 4:1"),
+        (128, 16, 16, "MHA 16"),
+        (512, 16, 16, "MHA 16"),
+    ];
+
+    for &(seq_len, num_q_heads, num_kv_heads, label) in configs {
+        let num_seqs = 1i64;
+        let packed_seq = seq_len;
+        let num_sab_heads = num_q_heads.max(num_kv_heads);
+
+        let q_elems = (packed_seq * num_q_heads * head_dim) as usize;
+        let k_elems = (packed_seq * num_kv_heads * head_dim) as usize;
+        let v_elems = k_elems;
+        let o_elems = (packed_seq * num_sab_heads * head_dim) as usize;
+        let state_elems = (num_seqs * num_sab_heads * head_dim * head_dim) as usize;
+        let ab_elems = (packed_seq * num_sab_heads) as usize;
+
+        let q_ptr = gpu_alloc(q_elems * 2);
+        let k_ptr = gpu_alloc(k_elems * 2);
+        let v_ptr = gpu_alloc(v_elems * 2);
+        let o_ptr = gpu_alloc(o_elems * 2);
+        let state_ptr = gpu_alloc(state_elems * 4);
+        let alpha_ptr = gpu_alloc(ab_elems * 4);
+        let beta_ptr = gpu_alloc(ab_elems * 4);
+        let ws_ptr = gpu_alloc(128 * 1024 * 1024);
+
+        let cu_seqlens: Vec<i64> = vec![0, seq_len];
+        let cu_ptr = gpu_upload(&cu_seqlens);
+
+        let q_s = [packed_seq, num_q_heads, head_dim]; let q_st = strides(&q_s);
+        let k_s = [packed_seq, num_kv_heads, head_dim]; let k_st = strides(&k_s);
+        let v_s = [packed_seq, num_kv_heads, head_dim]; let v_st = strides(&v_s);
+        let o_s = [packed_seq, num_sab_heads, head_dim]; let o_st = strides(&o_s);
+        let state_s = [num_seqs, num_sab_heads, head_dim, head_dim];
+        let state_st = strides(&state_s);
+        let ab_s = [packed_seq, num_sab_heads]; let ab_st = strides(&ab_s);
+        let cu_s = [num_seqs + 1]; let cu_st = [1i64];
+        let ws_s = [128 * 1024 * 1024i64]; let ws_st = [1i64];
+
+        let i64_dt = DLDataType { code: KDLINT, bits: 64, lanes: 1 };
+
+        let dl_o = gpu_dl(o_ptr, BF16_DT, &o_s, &o_st);
+        let dl_state = gpu_dl(state_ptr, FP32_DT, &state_s, &state_st);
+        let dl_q = gpu_dl(q_ptr, BF16_DT, &q_s, &q_st);
+        let dl_k = gpu_dl(k_ptr, BF16_DT, &k_s, &k_st);
+        let dl_v = gpu_dl(v_ptr, BF16_DT, &v_s, &v_st);
+        let dl_cu = gpu_dl(cu_ptr, i64_dt, &cu_s, &cu_st);
+        let dl_alpha = gpu_dl(alpha_ptr, FP32_DT, &ab_s, &ab_st);
+        let dl_beta = gpu_dl(beta_ptr, FP32_DT, &ab_s, &ab_st);
+        let dl_ws = gpu_dl(ws_ptr, U8_DT, &ws_s, &ws_st);
+
+        unsafe {
+            reg.set_stream(0, std::ptr::null_mut());
+            let args = [
+                TVMFFIAny::dltensor(&dl_o), TVMFFIAny::dltensor(&dl_state),
+                TVMFFIAny::dltensor(&dl_q), TVMFFIAny::dltensor(&dl_k),
+                TVMFFIAny::dltensor(&dl_v), TVMFFIAny::dltensor(&dl_cu),
+                TVMFFIAny::none(),              // input_state
+                TVMFFIAny::dltensor(&dl_alpha),
+                TVMFFIAny::dltensor(&dl_beta),
+                TVMFFIAny::float64(0.0),        // auto scale
+                TVMFFIAny::dltensor(&dl_ws),
+            ];
+
+            let ms = cuda_bench(5, 50, || {
+                reg.call(gdn, &args).unwrap();
+            });
+
+            // Memory: read Q+K+V+alpha+beta+state, write O+state
+            let read_bytes = (q_elems + k_elems + v_elems) * 2 + ab_elems * 4 * 2 + state_elems * 4;
+            let write_bytes = o_elems * 2 + state_elems * 4;
+            let gb = (read_bytes + write_bytes) as f64 / 1e9;
+            let bw = gb / (ms as f64 * 1e-3);
+            println!("  gdn_prefill {label} (seq={seq_len}, d={head_dim}): {ms:.3} ms, {bw:.1} GB/s");
+
+            cudaFree(q_ptr); cudaFree(k_ptr); cudaFree(v_ptr);
+            cudaFree(o_ptr); cudaFree(state_ptr);
+            cudaFree(alpha_ptr); cudaFree(beta_ptr);
+            cudaFree(cu_ptr); cudaFree(ws_ptr);
+        }
+    }
+}
+
 // ── POD (Prefill-On-Decode) benchmark ──────────────────────────────────
 // Compare POD single kernel launch vs separate paged prefill + decode.
 
@@ -1440,6 +1543,7 @@ fn main() {
     println!("GPU: SM{}, backend: {:?}", reg.arch(), reg.default_backend());
 
     bench_utilities(&reg);
+    bench_gdn(&reg);
     bench_gemm(&reg);
     bench_topk(&reg);
 
