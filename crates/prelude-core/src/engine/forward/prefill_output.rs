@@ -25,7 +25,7 @@ pub(crate) fn materialize_prefill_output_rows(
     let item_seq_counts = result.item_seq_counts;
     let output_f32 = result
         .output
-        .to_dtype(candle_core::DType::F32)
+        .to_dtype(crate::tensor::DType::F32)
         .map_err(candle_err)?;
     let output_rows = output_f32.to_vec2().map_err(candle_err)?;
 

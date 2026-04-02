@@ -1,3 +1,4 @@
+pub mod tensor;
 pub mod cache;
 pub mod config;
 pub mod constants;

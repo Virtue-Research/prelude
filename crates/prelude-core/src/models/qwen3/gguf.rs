@@ -3,8 +3,8 @@
 //! Thin wrapper around `candle_transformers::models::quantized_qwen3::ModelWeights`
 //! to integrate with the `ModelForward` trait dispatch system.
 
-use candle_core::quantized::gguf_file;
-use candle_core::{Device, Result, Tensor};
+use crate::tensor::quantized::gguf_file;
+use crate::tensor::{Device, Result, Tensor};
 use candle_transformers::models::quantized_qwen3::ModelWeights;
 use std::io::{Read, Seek};
 
@@ -53,7 +53,7 @@ impl Qwen3GgufModel {
         _packed_input: &Tensor,
         _ctx: &mut crate::models::common::BatchAttnContext,
     ) -> Result<Tensor> {
-        candle_core::bail!("GGUF model does not support varlen forward")
+        crate::tensor::bail!("GGUF model does not support varlen forward")
     }
 }
 
@@ -62,8 +62,8 @@ impl crate::models::ModelForward for Qwen3GgufModel {
         &mut self,
         _packed_input: &Tensor,
         _ctx: &mut crate::models::common::BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
-        candle_core::bail!("GGUF model does not support varlen forward")
+    ) -> crate::tensor::Result<Tensor> {
+        crate::tensor::bail!("GGUF model does not support varlen forward")
     }
 
     fn clear_kv_cache(&mut self) {
@@ -78,14 +78,14 @@ fn parse_gguf_config(ct: &gguf_file::Content) -> Result<Qwen3GgufConfig> {
 
     let get_u32 = |key: &str| -> Result<usize> {
         md.get(key)
-            .ok_or_else(|| candle_core::Error::Msg(format!("missing GGUF metadata: {key}")))?
+            .ok_or_else(|| crate::tensor::Error::Msg(format!("missing GGUF metadata: {key}")))?
             .to_u32()
             .map(|v| v as usize)
     };
 
     let get_f32 = |key: &str| -> Result<f64> {
         md.get(key)
-            .ok_or_else(|| candle_core::Error::Msg(format!("missing GGUF metadata: {key}")))?
+            .ok_or_else(|| crate::tensor::Error::Msg(format!("missing GGUF metadata: {key}")))?
             .to_f32()
             .map(|v| v as f64)
     };

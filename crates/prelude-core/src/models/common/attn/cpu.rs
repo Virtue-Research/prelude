@@ -2,7 +2,7 @@
 //!
 //! Used when no GPU attention backend is compiled or when running on CPU.
 
-use candle_core::{Result, Tensor};
+use crate::tensor::{Result, Tensor};
 
 /// Causal varlen attention on CPU.
 /// BF16: optimized tiled kernel. F32: matmul SDPA with causal mask.
@@ -18,7 +18,7 @@ pub fn varlen_causal(
     let head_dim = q.dim(2)?;
 
     // BF16: optimized tiled attention kernel
-    if q.dtype() == candle_core::DType::BF16 {
+    if q.dtype() == crate::tensor::DType::BF16 {
         return crate::ops::cpu::cpu_prefill_attention(
             q, k, v, &seq_lens, num_heads, num_kv_heads, head_dim, softmax_scale as f64,
         );
@@ -364,7 +364,7 @@ fn matmul_sdpa_candle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{Device, Tensor};
+    use crate::tensor::{Device, Tensor};
 
     fn deterministic_f32_tensor(shape: &[usize], seed: u64) -> Tensor {
         let n: usize = shape.iter().product();

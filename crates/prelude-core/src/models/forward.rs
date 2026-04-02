@@ -1,4 +1,4 @@
-use candle_core::Tensor;
+use crate::tensor::Tensor;
 
 use crate::models::common::BatchAttnContext;
 
@@ -13,11 +13,11 @@ pub trait LogitsSplitModel: Send {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor>;
+    ) -> crate::tensor::Result<Tensor>;
 
     /// Apply lm_head (and any post-processing like softcapping) to hidden states.
     /// Can be called on chunks: `compute_logits(chunk)` → `(chunk_size, vocab_size)`.
-    fn compute_logits(&self, hidden: &Tensor) -> candle_core::Result<Tensor>;
+    fn compute_logits(&self, hidden: &Tensor) -> crate::tensor::Result<Tensor>;
 }
 
 /// Models with internal KV cache for CPU sequential decode.
@@ -30,7 +30,7 @@ pub trait KvCacheModel: Send {
         &mut self,
         input_ids: &Tensor,
         position_offset: usize,
-    ) -> candle_core::Result<Tensor>;
+    ) -> crate::tensor::Result<Tensor>;
 }
 
 /// Classifier model metadata.
@@ -66,7 +66,7 @@ pub trait ModelForward: Send {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor>;
+    ) -> crate::tensor::Result<Tensor>;
 
     /// Clear all KV caches.
     fn clear_kv_cache(&mut self);
@@ -93,7 +93,7 @@ pub trait ModelForward: Send {
         &mut self,
         _prompt_tokens: &[u32],
         _max_new: usize,
-    ) -> candle_core::Result<Option<(Vec<u32>, Vec<f32>)>> {
+    ) -> crate::tensor::Result<Option<(Vec<u32>, Vec<f32>)>> {
         Ok(None)
     }
 }

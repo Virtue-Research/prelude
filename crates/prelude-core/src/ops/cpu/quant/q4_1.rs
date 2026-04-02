@@ -133,8 +133,8 @@ pub fn quantized_matmul_q4_1(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::quantized::{GgmlDType, QTensor};
-    use candle_core::{Device, Tensor};
+    use crate::tensor::quantized::{GgmlDType, QTensor};
+    use crate::tensor::{Device, Tensor};
 
     fn make_test_blocks(values: &[f32]) -> Vec<BlockQ4_1> {
         assert!(values.len() % 32 == 0);

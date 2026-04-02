@@ -1,4 +1,4 @@
-use candle_core::{Result, Tensor};
+use crate::tensor::{Result, Tensor};
 
 pub trait ConvOps: Send + Sync {
     fn conv1d(

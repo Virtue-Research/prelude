@@ -13,7 +13,7 @@
 
 pub(crate) mod meta;
 
-use candle_core::{DType, Device, Module, Result, Tensor, D};
+use crate::tensor::{DType, Device, Module, Result, Tensor, D};
 use crate::nn_ops::{CandleLinear, Embedding};
 use crate::loading::var_builder::VarBuilder;
 
@@ -1067,7 +1067,7 @@ impl Qwen3NextDecoderLayer {
                     deltanet_varlen_pooled(gdn, h, seq_lens, pool, slot_ids, dn_layer_idx)
                 }
                 TokenMixer::FullAttention(_) => {
-                    candle_core::bail!("forward_with_paged_prefix_pooled called on FullAttention layer")
+                    crate::tensor::bail!("forward_with_paged_prefix_pooled called on FullAttention layer")
                 }
             },
             |x_res, h2| fast_add(ops, x_res, &moe.forward(ops, h2)?),
@@ -1266,11 +1266,11 @@ impl crate::models::LogitsSplitModel for Qwen3NextForCausalLM {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
+    ) -> crate::tensor::Result<Tensor> {
         self.model.forward(packed_input, ctx)
     }
 
-    fn compute_logits(&self, hidden: &Tensor) -> candle_core::Result<Tensor> {
+    fn compute_logits(&self, hidden: &Tensor) -> crate::tensor::Result<Tensor> {
         hidden.apply(&self.lm_head)
     }
 }
@@ -1280,7 +1280,7 @@ impl crate::models::ModelForward for Qwen3NextForCausalLM {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
+    ) -> crate::tensor::Result<Tensor> {
         self.forward(packed_input, ctx)
     }
 

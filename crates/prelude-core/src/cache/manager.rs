@@ -1,8 +1,8 @@
 use std::sync::Mutex;
 
 #[cfg(feature = "cuda")]
-use candle_core::Tensor;
-use candle_core::{DType, Device};
+use crate::tensor::Tensor;
+use crate::tensor::{DType, Device};
 use tracing::info;
 
 use crate::cache::deltanet_pool::{DeltaNetPool, DeltaNetPoolConfig};

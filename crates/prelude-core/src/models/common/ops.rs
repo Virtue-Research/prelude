@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use candle_core::{DType, Module, Result, Tensor};
+use crate::tensor::{DType, Module, Result, Tensor};
 
 use super::linear::RmsNorm;
 
@@ -96,7 +96,7 @@ pub(crate) fn fast_add(ops: &crate::ops::Ops, a: &Tensor, b: &Tensor) -> Result<
             return result;
         }
     }
-    if a.device().is_cpu() && a.dtype() == candle_core::DType::F32 {
+    if a.device().is_cpu() && a.dtype() == crate::tensor::DType::F32 {
         return cpu_add_f32(a, b);
     }
     a + b

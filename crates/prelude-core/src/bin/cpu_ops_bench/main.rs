@@ -16,8 +16,8 @@ mod rmsnorm;
 mod rope;
 mod silu_mul;
 
-use candle_core::Result;
-use candle_core::{DType, Tensor};
+use prelude_core::tensor::Result;
+use prelude_core::tensor::{DType, Tensor};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();

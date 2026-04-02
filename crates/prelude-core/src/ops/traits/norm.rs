@@ -1,4 +1,4 @@
-use candle_core::{Result, Tensor};
+use crate::tensor::{Result, Tensor};
 
 pub trait NormOps: Send + Sync {
     fn rms_norm(&self, x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor>;

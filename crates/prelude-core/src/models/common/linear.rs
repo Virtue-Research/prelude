@@ -6,7 +6,7 @@
 
 use crate::loading::var_builder::VarBuilder;
 use crate::nn_ops::{CandleLinear, CandleRmsNorm};
-use candle_core::{Module, Result, Tensor};
+use crate::tensor::{Module, Result, Tensor};
 use std::any::Any;
 use std::sync::Arc;
 
@@ -56,8 +56,8 @@ impl Clone for Box<dyn LinearBackend> {
 /// to find a handler for the given GGML dtype.
 pub trait QuantFormat: Send + Sync {
     fn name(&self) -> &str;
-    fn can_handle(&self, dtype: candle_core::quantized::GgmlDType) -> bool;
-    fn load(&self, qtensor: Arc<candle_core::quantized::QTensor>) -> Result<Box<dyn LinearBackend>>;
+    fn can_handle(&self, dtype: crate::tensor::quantized::GgmlDType) -> bool;
+    fn load(&self, qtensor: Arc<crate::tensor::quantized::QTensor>) -> Result<Box<dyn LinearBackend>>;
 }
 
 /// Wrapper for `inventory` auto-registration.
@@ -75,7 +75,7 @@ inventory::collect!(QuantFormatEntry);
 
 /// Find a registered QuantFormat that can handle the given dtype.
 fn find_quant_format(
-    dtype: candle_core::quantized::GgmlDType,
+    dtype: crate::tensor::quantized::GgmlDType,
 ) -> Option<&'static dyn QuantFormat> {
     inventory::iter::<QuantFormatEntry>()
         .find(|entry| entry.format.can_handle(dtype))
@@ -132,13 +132,13 @@ impl Linear {
     ///
     /// Looks up registered `QuantFormat` backends to find one that handles
     /// the given quantization type. Returns error if no backend supports it.
-    pub fn from_qtensor(qtensor: Arc<candle_core::quantized::QTensor>) -> Result<Self> {
+    pub fn from_qtensor(qtensor: Arc<crate::tensor::quantized::QTensor>) -> Result<Self> {
         let dtype = qtensor.dtype();
         match find_quant_format(dtype) {
             Some(fmt) => Ok(Self {
                 inner: fmt.load(qtensor)?,
             }),
-            None => candle_core::bail!(
+            None => crate::tensor::bail!(
                 "Linear::from_qtensor: no registered backend for {:?}",
                 dtype
             ),
@@ -216,14 +216,14 @@ struct QuantizedWeight {
 impl Module for QuantizedWeight {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         use crate::ops::cpu::quant::quantized_matmul_f32;
-        use candle_core::{DType, Device};
+        use crate::tensor::{DType, Device};
 
         let x = x.to_dtype(DType::F32)?;
         let x_dims = x.shape().dims();
         let m: usize = x_dims[..x_dims.len() - 1].iter().product();
         let x_k = *x_dims.last().unwrap();
         if x_k != self.k {
-            candle_core::bail!(
+            crate::tensor::bail!(
                 "quantized matmul: x inner dim {x_k} != weight dim {}",
                 self.k
             );
@@ -232,8 +232,8 @@ impl Module for QuantizedWeight {
         let x_cont = x.flatten_all()?;
         let x_storage = x_cont.storage_and_layout().0;
         let x_slice = match &*x_storage {
-            candle_core::Storage::Cpu(cpu) => cpu.as_slice::<f32>()?,
-            _ => candle_core::bail!("quantized matmul: expected CPU tensor"),
+            crate::tensor::backend::Storage::Cpu(cpu) => cpu.as_slice::<f32>()?,
+            _ => crate::tensor::bail!("quantized matmul: expected CPU tensor"),
         };
 
         let mut out = vec![0.0f32; m * self.n];
@@ -267,10 +267,10 @@ impl QuantFormat for Q4_0Format {
     fn name(&self) -> &str {
         "Q4_0"
     }
-    fn can_handle(&self, dtype: candle_core::quantized::GgmlDType) -> bool {
-        dtype == candle_core::quantized::GgmlDType::Q4_0
+    fn can_handle(&self, dtype: crate::tensor::quantized::GgmlDType) -> bool {
+        dtype == crate::tensor::quantized::GgmlDType::Q4_0
     }
-    fn load(&self, qtensor: Arc<candle_core::quantized::QTensor>) -> Result<Box<dyn LinearBackend>> {
+    fn load(&self, qtensor: Arc<crate::tensor::quantized::QTensor>) -> Result<Box<dyn LinearBackend>> {
         let shape = qtensor.shape();
         let dims = shape.dims();
         let n = dims[0];
@@ -296,14 +296,14 @@ struct QuantizedWeightQ4K {
 impl Module for QuantizedWeightQ4K {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         use crate::ops::cpu::quant::q4_k::quantized_matmul_q4k;
-        use candle_core::{DType, Device};
+        use crate::tensor::{DType, Device};
 
         let x = x.to_dtype(DType::F32)?;
         let x_dims = x.shape().dims();
         let m: usize = x_dims[..x_dims.len() - 1].iter().product();
         let x_k = *x_dims.last().unwrap();
         if x_k != self.k {
-            candle_core::bail!(
+            crate::tensor::bail!(
                 "Q4_K matmul: x inner dim {x_k} != weight dim {}",
                 self.k
             );
@@ -312,8 +312,8 @@ impl Module for QuantizedWeightQ4K {
         let x_cont = x.flatten_all()?;
         let x_storage = x_cont.storage_and_layout().0;
         let x_slice = match &*x_storage {
-            candle_core::Storage::Cpu(cpu) => cpu.as_slice::<f32>()?,
-            _ => candle_core::bail!("Q4_K matmul: expected CPU tensor"),
+            crate::tensor::backend::Storage::Cpu(cpu) => cpu.as_slice::<f32>()?,
+            _ => crate::tensor::bail!("Q4_K matmul: expected CPU tensor"),
         };
 
         let mut out = vec![0.0f32; m * self.n];
@@ -336,10 +336,10 @@ struct Q4KFormat;
 
 impl QuantFormat for Q4KFormat {
     fn name(&self) -> &str { "Q4_K" }
-    fn can_handle(&self, dtype: candle_core::quantized::GgmlDType) -> bool {
-        dtype == candle_core::quantized::GgmlDType::Q4K
+    fn can_handle(&self, dtype: crate::tensor::quantized::GgmlDType) -> bool {
+        dtype == crate::tensor::quantized::GgmlDType::Q4K
     }
-    fn load(&self, qtensor: Arc<candle_core::quantized::QTensor>) -> Result<Box<dyn LinearBackend>> {
+    fn load(&self, qtensor: Arc<crate::tensor::quantized::QTensor>) -> Result<Box<dyn LinearBackend>> {
         let shape = qtensor.shape();
         let dims = shape.dims();
         let n = dims[0];
@@ -358,8 +358,8 @@ inventory::submit!(QuantFormatEntry::new(&Q4KFormat));
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::quantized::{GgmlDType, QTensor};
-    use candle_core::{DType, Device};
+    use crate::tensor::quantized::{GgmlDType, QTensor};
+    use crate::tensor::{DType, Device};
 
     #[test]
     fn q4_0_linear_forward_matches_candle() {

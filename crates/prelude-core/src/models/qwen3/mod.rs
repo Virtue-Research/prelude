@@ -5,7 +5,7 @@ pub(crate) mod meta;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use candle_core::{DType, Module, Result, Tensor};
+use crate::tensor::{DType, Module, Result, Tensor};
 use crate::loading::var_builder::VarBuilder;
 use crate::nn_ops::{Embedding, Qwen3Config};
 use serde::Deserialize;
@@ -64,7 +64,7 @@ impl Qwen3Attention {
         vb: VarBuilder,
     ) -> Result<Self> {
         if cfg.use_sliding_window {
-            candle_core::bail!("sliding window is not supported yet");
+            crate::tensor::bail!("sliding window is not supported yet");
         }
 
         let head_dim = cfg.head_dim;
@@ -184,7 +184,7 @@ impl Qwen3Attention {
             let total_q = x.dim(0)?;
 
             // ── Raw CPU BF16 fast path: bypass Tensor intermediates ──────
-            if !self.is_cuda && x.dtype() == candle_core::DType::BF16 && ctx.paged_kv.is_none() {
+            if !self.is_cuda && x.dtype() == crate::tensor::DType::BF16 && ctx.paged_kv.is_none() {
                 if let Some(ref qkv_proj) = self.qkv_proj {
                     if let (Some(qkv_brg), Some(oproj_brg)) =
                         (qkv_proj.brgemm_weight(), self.o_proj.brgemm_weight())
@@ -201,7 +201,7 @@ impl Qwen3Attention {
             }
 
             // ── Raw CPU F32 fast path: bypass Tensor intermediates ──────
-            if !self.is_cuda && x.dtype() == candle_core::DType::F32 && ctx.paged_kv.is_none() {
+            if !self.is_cuda && x.dtype() == crate::tensor::DType::F32 && ctx.paged_kv.is_none() {
                 if let Some(ref qkv_proj) = self.qkv_proj {
                     if let (Some(qkv_pw), Some(oproj_pw)) =
                         (qkv_proj.f32_packed_weight(), self.o_proj.f32_packed_weight())
@@ -589,12 +589,12 @@ impl DecoderLayer {
 
     #[inline]
     fn residual_mlp(&self, ops: &crate::ops::Ops, x_res: &Tensor, h2: &Tensor) -> Result<Tensor> {
-        if h2.device().is_cpu() && h2.dtype() == candle_core::DType::BF16 {
+        if h2.device().is_cpu() && h2.dtype() == crate::tensor::DType::BF16 {
             if self.mlp.gate_up_brgemm_weight().is_some() {
                 return self.residual_mlp_raw(x_res, h2);
             }
         }
-        if h2.device().is_cpu() && h2.dtype() == candle_core::DType::F32 {
+        if h2.device().is_cpu() && h2.dtype() == crate::tensor::DType::F32 {
             if self.mlp.gate_up_f32_packed_weight().is_some() {
                 return self.residual_mlp_raw_f32(x_res, h2);
             }
@@ -885,11 +885,11 @@ impl LogitsSplitModel for Qwen3ModelForCausalLM {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
+    ) -> crate::tensor::Result<Tensor> {
         self.base.forward(packed_input, ctx)
     }
 
-    fn compute_logits(&self, hidden: &Tensor) -> candle_core::Result<Tensor> {
+    fn compute_logits(&self, hidden: &Tensor) -> crate::tensor::Result<Tensor> {
         hidden.apply(&self.lm_head)
     }
 }
@@ -899,7 +899,7 @@ impl KvCacheModel for Qwen3ModelForCausalLM {
         &mut self,
         input_ids: &Tensor,
         position_offset: usize,
-    ) -> candle_core::Result<Tensor> {
+    ) -> crate::tensor::Result<Tensor> {
         Qwen3ModelForCausalLM::forward_with_cache(self, crate::ops::cpu_ops(), input_ids, position_offset)
     }
 }
@@ -909,7 +909,7 @@ impl ModelForward for Qwen3ModelForCausalLM {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
+    ) -> crate::tensor::Result<Tensor> {
         self.forward(packed_input, ctx)
     }
 
@@ -945,7 +945,7 @@ impl ModelForward for Qwen3ForSequenceClassification {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
+    ) -> crate::tensor::Result<Tensor> {
         Qwen3ForSequenceClassification::forward(self, packed_input, ctx)
     }
 
@@ -969,7 +969,7 @@ impl ModelForward for Qwen3ForEmbedding {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
+    ) -> crate::tensor::Result<Tensor> {
         Qwen3ForEmbedding::forward(self, packed_input, ctx)
     }
 
@@ -989,7 +989,7 @@ impl ModelForward for Qwen3ForEmbedding {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
+    use crate::tensor::Device;
     use crate::loading::var_builder::VarBuilder;
     use crate::models::common::BatchAttnContext;
 
@@ -1221,7 +1221,7 @@ mod tests {
     #[ignore]
     fn bench_decode_stages() {
         use std::time::Instant;
-        use candle_core::Module;
+        use crate::tensor::Module;
 
         let hidden = 1024usize;
         let intermediate = 3072usize;

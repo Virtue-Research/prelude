@@ -2,8 +2,8 @@
 //!
 //! Reference: llama.cpp `src/models/qwen35.cpp` + `src/models/delta-net-base.cpp`.
 
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device, Result, Tensor};
+use crate::tensor::quantized::gguf_file;
+use crate::tensor::{DType, Device, Result, Tensor};
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
@@ -420,7 +420,7 @@ fn parse_gguf_config(ct: &gguf_file::Content) -> Result<Qwen3_5GgufConfig> {
 
     let get_u32 = |key: &str| -> Result<usize> {
         md.get(key)
-            .ok_or_else(|| candle_core::Error::Msg(format!("missing GGUF metadata: {key}")))?
+            .ok_or_else(|| crate::tensor::Error::Msg(format!("missing GGUF metadata: {key}")))?
             .to_u32()
             .map(|v| v as usize)
     };
@@ -439,7 +439,7 @@ fn parse_gguf_config(ct: &gguf_file::Content) -> Result<Qwen3_5GgufConfig> {
 
     let get_f32 = |key: &str| -> Result<f64> {
         md.get(key)
-            .ok_or_else(|| candle_core::Error::Msg(format!("missing GGUF metadata: {key}")))?
+            .ok_or_else(|| crate::tensor::Error::Msg(format!("missing GGUF metadata: {key}")))?
             .to_f32()
             .map(|v| v as f64)
     };

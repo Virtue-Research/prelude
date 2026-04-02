@@ -7,7 +7,7 @@
 mod backend;
 pub(crate) mod cpu;
 
-use candle_core::{Result, Tensor};
+use crate::tensor::{Result, Tensor};
 use crate::ops::{MaskType, VarlenParams, PagedParams};
 use super::PagedKvContext;
 

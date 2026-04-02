@@ -396,7 +396,7 @@ impl Engine {
         &self,
         items: Vec<PreparedGenerateRequest>,
     ) -> Result<Vec<GenerateResult>, EngineError> {
-        use candle_core::{DType, Tensor};
+        use crate::tensor::{DType, Tensor};
 
         self.ensure_task_supported(TaskKind::Generate)?;
 
@@ -607,7 +607,7 @@ impl Engine {
         tokenizer: &Tokenizer,
     ) -> Result<TokenLogprobInfo, EngineError> {
         let logits_f32 = logits
-            .to_dtype(candle_core::DType::F32)
+            .to_dtype(crate::tensor::DType::F32)
             .map_err(candle_err)?;
         let logits_vec: Vec<f32> = logits_f32.to_vec1().map_err(candle_err)?;
         let vocab_size = logits_vec.len();
@@ -741,7 +741,7 @@ pub(crate) fn generate_postprocess(
     let argmax_start = Instant::now();
     let logits_2d = logits.squeeze(1).map_err(candle_err)?;
     let all_tokens = logits_2d
-        .argmax(candle_core::D::Minus1)
+        .argmax(crate::tensor::D::Minus1)
         .map_err(candle_err)?
         .to_vec1::<u32>()
         .map_err(candle_err)?;
@@ -898,13 +898,13 @@ pub(crate) fn extract_prompt_logprobs_from_hidden_offset(
             flat_next_tokens[start..end].to_vec(), (chunk_len, 1), &device,
         )
         .map_err(candle_err)?
-        .to_dtype(candle_core::DType::U32)
+        .to_dtype(crate::tensor::DType::U32)
         .map_err(candle_err)?;
 
         let chunk_gathered = chunk_log_probs
             .gather(&chunk_token_ids, 1).map_err(candle_err)?
             .squeeze(1).map_err(candle_err)?
-            .to_dtype(candle_core::DType::F32).map_err(candle_err)?;
+            .to_dtype(crate::tensor::DType::F32).map_err(candle_err)?;
         logprobs_cpu.extend(chunk_gathered.to_vec1::<f32>().map_err(candle_err)?);
         // chunk_log_probs freed here
     }

@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use candle_core::{Result, Tensor};
+use crate::tensor::{Result, Tensor};
 use crate::cache::prefix_index::PrefixMatchIndex;
 
 // ---------------------------------------------------------------------------
@@ -296,7 +296,7 @@ impl PrefixKvCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{DType, Device};
+    use crate::tensor::{DType, Device};
 
     fn make_kv(block_size: usize, num_layers: usize) -> Vec<(Tensor, Tensor)> {
         (0..num_layers)

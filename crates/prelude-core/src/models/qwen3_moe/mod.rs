@@ -2,7 +2,7 @@ pub(crate) mod meta;
 
 use std::sync::Arc;
 
-use candle_core::{DType, Device, Module, Result, Tensor, D};
+use crate::tensor::{DType, Device, Module, Result, Tensor, D};
 use crate::loading::var_builder::VarBuilder;
 use crate::nn_ops::{Activation, CandleLinear, Embedding, Qwen3Config};
 
@@ -493,11 +493,11 @@ impl crate::models::LogitsSplitModel for Qwen3MoeModelForCausalLM {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
+    ) -> crate::tensor::Result<Tensor> {
         self.base.forward(packed_input, ctx)
     }
 
-    fn compute_logits(&self, hidden: &Tensor) -> candle_core::Result<Tensor> {
+    fn compute_logits(&self, hidden: &Tensor) -> crate::tensor::Result<Tensor> {
         hidden.apply(&self.lm_head)
     }
 }
@@ -507,7 +507,7 @@ impl crate::models::ModelForward for Qwen3MoeModelForCausalLM {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
+    ) -> crate::tensor::Result<Tensor> {
         self.forward(packed_input, ctx)
     }
 

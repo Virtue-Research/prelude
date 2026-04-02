@@ -16,7 +16,7 @@ pub mod rope;
 pub mod silu_mul;
 pub mod softmax;
 
-use candle_core::{Device, Result, Tensor};
+use crate::tensor::{Device, Result, Tensor};
 
 // ── Re-exports: Tensor-level kernel API ─────────────────────────────────
 
@@ -97,7 +97,7 @@ pub fn tensor_as_u16_slice_pub(tensor: &Tensor) -> Result<&[u16]> {
 /// Tensor must be contiguous.
 pub(crate) fn tensor_as_u16_slice(tensor: &Tensor) -> Result<&[u16]> {
     if !tensor.is_contiguous() {
-        candle_core::bail!(
+        crate::tensor::bail!(
             "tensor_as_u16_slice: tensor is not contiguous (shape={:?}, stride={:?}). \
              Call .contiguous()? first and keep the result alive.",
             tensor.dims(), tensor.stride()
@@ -107,12 +107,12 @@ pub(crate) fn tensor_as_u16_slice(tensor: &Tensor) -> Result<&[u16]> {
     let offset = layout.start_offset();
     let n = layout.shape().elem_count();
     match &*storage {
-        candle_core::Storage::Cpu(cpu) => {
+        crate::tensor::backend::Storage::Cpu(cpu) => {
             let slice = cpu.as_slice::<half::bf16>()?;
             let data = &slice[offset..offset + n];
             Ok(unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u16, data.len()) })
         }
-        _ => candle_core::bail!("cpu_ops: expected CPU storage"),
+        _ => crate::tensor::bail!("cpu_ops: expected CPU storage"),
     }
 }
 
@@ -124,7 +124,7 @@ pub(crate) fn tensor_as_u16_slice(tensor: &Tensor) -> Result<&[u16]> {
 /// valid as long as the originating `Tensor` is alive.
 pub(crate) fn tensor_as_f32_slice(tensor: &Tensor) -> Result<&[f32]> {
     if !tensor.is_contiguous() {
-        candle_core::bail!(
+        crate::tensor::bail!(
             "tensor_as_f32_slice: tensor is not contiguous (shape={:?}, stride={:?})",
             tensor.dims(), tensor.stride()
         );
@@ -133,12 +133,12 @@ pub(crate) fn tensor_as_f32_slice(tensor: &Tensor) -> Result<&[f32]> {
     let offset = layout.start_offset();
     let n = layout.shape().elem_count();
     match &*storage {
-        candle_core::Storage::Cpu(cpu) => {
+        crate::tensor::backend::Storage::Cpu(cpu) => {
             let slice = cpu.as_slice::<f32>()?;
             let data = &slice[offset..offset + n];
             Ok(unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) })
         }
-        _ => candle_core::bail!("tensor_as_f32_slice: expected CPU storage"),
+        _ => crate::tensor::bail!("tensor_as_f32_slice: expected CPU storage"),
     }
 }
 
@@ -147,16 +147,16 @@ pub(crate) fn tensor_as_f32_slice(tensor: &Tensor) -> Result<&[f32]> {
 /// # Safety
 /// Caller must guarantee exclusive access to the storage region `[offset..offset+n]`.
 pub(crate) unsafe fn extract_bf16_mut_u16(
-    storage: &mut candle_core::Storage,
+    storage: &mut crate::tensor::backend::Storage,
     offset: usize,
     n: usize,
 ) -> Result<&mut [u16]> {
     match storage {
-        candle_core::Storage::Cpu(candle_core::CpuStorage::BF16(data)) => {
+        crate::tensor::backend::Storage::Cpu(crate::tensor::backend::CpuStorage::BF16(data)) => {
             let ptr = unsafe { data.as_mut_ptr().add(offset) as *mut u16 };
             Ok(unsafe { std::slice::from_raw_parts_mut(ptr, n) })
         }
-        _ => candle_core::bail!("cpu_ops: expected CPU BF16 storage"),
+        _ => crate::tensor::bail!("cpu_ops: expected CPU BF16 storage"),
     }
 }
 
@@ -165,16 +165,16 @@ pub(crate) unsafe fn extract_bf16_mut_u16(
 /// # Safety
 /// Caller must guarantee exclusive access to the storage region `[offset..offset+n]`.
 pub(crate) unsafe fn extract_f32_mut(
-    storage: &mut candle_core::Storage,
+    storage: &mut crate::tensor::backend::Storage,
     offset: usize,
     n: usize,
 ) -> Result<&mut [f32]> {
     match storage {
-        candle_core::Storage::Cpu(candle_core::CpuStorage::F32(data)) => {
+        crate::tensor::backend::Storage::Cpu(crate::tensor::backend::CpuStorage::F32(data)) => {
             let ptr = unsafe { data.as_mut_ptr().add(offset) };
             Ok(unsafe { std::slice::from_raw_parts_mut(ptr, n) })
         }
-        _ => candle_core::bail!("cpu_ops: expected CPU F32 storage"),
+        _ => crate::tensor::bail!("cpu_ops: expected CPU F32 storage"),
     }
 }
 
@@ -228,7 +228,7 @@ pub(crate) fn u16_vec_to_bf16_tensor(buf: Vec<u16>, shape: &[usize], device: &De
 // ── Attention Tensor wrapper (BF16 only) ────────────────────────────────
 
 mod attention_tensor {
-    use candle_core::{Result, Tensor};
+    use crate::tensor::{Result, Tensor};
 
     /// Prefill attention using optimized BF16 CPU kernels.
     /// For F32, use matmul SDPA via `cpu_varlen_attention` in layers/ops.rs.
@@ -237,7 +237,7 @@ mod attention_tensor {
         seq_lens: &[usize], num_heads: usize, num_kv_heads: usize,
         head_dim: usize, sm_scale: f64,
     ) -> Result<Tensor> {
-        debug_assert_eq!(q.dtype(), candle_core::DType::BF16, "cpu_prefill_attention requires BF16");
+        debug_assert_eq!(q.dtype(), crate::tensor::DType::BF16, "cpu_prefill_attention requires BF16");
         let total_tokens = q.dims()[0];
 
         let q_cont = q.contiguous()?;
@@ -265,7 +265,7 @@ mod attention_tensor {
         context_len: usize, num_heads: usize, num_kv_heads: usize,
         head_dim: usize, sm_scale: f32,
     ) -> Result<Tensor> {
-        debug_assert_eq!(q.dtype(), candle_core::DType::BF16, "cpu_decode_attention requires BF16");
+        debug_assert_eq!(q.dtype(), crate::tensor::DType::BF16, "cpu_decode_attention requires BF16");
 
         let q_cont = q.contiguous()?;
         let k_cont = k_cache.contiguous()?;
@@ -297,7 +297,7 @@ mod attention_tensor {
         context_len: usize, num_heads: usize, num_kv_heads: usize,
         head_dim: usize, sm_scale: f32,
     ) -> Result<Tensor> {
-        debug_assert_eq!(q.dtype(), candle_core::DType::F32, "cpu_decode_attention_f32 requires F32");
+        debug_assert_eq!(q.dtype(), crate::tensor::DType::F32, "cpu_decode_attention_f32 requires F32");
 
         let q_cont = q.contiguous()?;
         let k_cont = k_cache.contiguous()?;
@@ -323,7 +323,7 @@ mod attention_tensor {
 // ── RoPE Tensor wrappers ────────────────────────────────────────────────
 
 mod rope_tensor {
-    use candle_core::{Result, Tensor};
+    use crate::tensor::{Result, Tensor};
 
     /// Apply NeoX-style RoPE in-place to Q and K tensors (BF16).
     pub fn cpu_rotary_embedding(

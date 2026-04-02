@@ -7,8 +7,8 @@
 //!
 //! Throughput: dot product and matmul at typical LLM dimensions.
 
-use candle_core::{Device, Result, Tensor};
-use candle_core::quantized::{GgmlDType, QTensor};
+use prelude_core::tensor::{Device, Result, Tensor};
+use prelude_core::tensor::quantized::{GgmlDType, QTensor};
 use std::time::Instant;
 
 use prelude_core::ops::cpu::quant::*;

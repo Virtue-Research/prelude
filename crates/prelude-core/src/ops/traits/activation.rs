@@ -1,4 +1,4 @@
-use candle_core::{Result, Tensor};
+use crate::tensor::{Result, Tensor};
 
 pub trait ActivationOps: Send + Sync {
     fn silu(&self, x: &Tensor) -> Result<Tensor>;

@@ -3,7 +3,7 @@
 //! These are composable helper functions, NOT a monolithic attention trait.
 //! Each architecture calls the helpers it needs in its own forward().
 
-use candle_core::{Module, Result, Tensor};
+use crate::tensor::{Module, Result, Tensor};
 
 use super::linear::Linear;
 

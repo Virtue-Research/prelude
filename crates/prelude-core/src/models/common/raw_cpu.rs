@@ -6,7 +6,7 @@
 
 use std::cell::RefCell;
 
-use candle_core::{Device, Result, Tensor};
+use crate::tensor::{Device, Result, Tensor};
 
 use crate::ops::cpu::buf_tensor::CpuTensor;
 use crate::ops::onednn::BrgemmPackedWeight;
@@ -84,7 +84,7 @@ pub(crate) fn extract_u16_slice(tensor: &Tensor) -> Result<&[u16]> {
 /// Extract position_ids as Vec<i64> (one allocation, reusable across layers).
 pub(crate) fn extract_positions(pos_ids: &Tensor) -> Result<Vec<i64>> {
     pos_ids
-        .to_dtype(candle_core::DType::I64)?
+        .to_dtype(crate::tensor::DType::I64)?
         .to_vec1::<i64>()
 }
 

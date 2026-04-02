@@ -1,4 +1,4 @@
-use candle_core::{Result, Tensor};
+use crate::tensor::{Result, Tensor};
 
 /// Quantization scheme for quantized_matmul dispatch.
 pub enum QuantScheme {

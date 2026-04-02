@@ -5,7 +5,7 @@
 //! Input layout: `[num_tokens, 2 * dim]` where first half is gate, second half is up.
 //! Output: `[num_tokens, dim]`.
 
-use candle_core::{DType, Result, Tensor};
+use crate::tensor::{DType, Result, Tensor};
 use super::bf16_utils::{bf16_to_f32, f32_to_bf16};
 #[cfg(target_arch = "x86_64")]
 use super::bf16_utils::{bf16x16_load_as_f32, f32x16_store_as_bf16};
@@ -19,7 +19,7 @@ use super::cpu_float::CpuFloat;
 pub fn cpu_silu_and_mul(input: &Tensor) -> Result<Tensor> {
     let (n, d2) = input.dims2()?;
     if d2 % 2 != 0 {
-        candle_core::bail!("cpu_silu_and_mul: last dim must be even, got {d2}");
+        crate::tensor::bail!("cpu_silu_and_mul: last dim must be even, got {d2}");
     }
     let dim = d2 / 2;
 
@@ -51,7 +51,7 @@ fn cpu_silu_and_mul_typed<T: CpuFloat>(
 pub fn cpu_silu_and_mul_inplace(input: Tensor) -> Result<Tensor> {
     let (n, d2) = input.dims2()?;
     if d2 % 2 != 0 {
-        candle_core::bail!("cpu_silu_and_mul_inplace: last dim must be even, got {d2}");
+        crate::tensor::bail!("cpu_silu_and_mul_inplace: last dim must be even, got {d2}");
     }
     let dim = d2 / 2;
 

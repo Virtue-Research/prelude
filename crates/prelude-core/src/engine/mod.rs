@@ -11,7 +11,7 @@ pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use std::sync::Mutex;
 pub(crate) use std::time::Instant;
 
-pub(crate) use candle_core::{DType, Device, Tensor};
+pub(crate) use crate::tensor::{DType, Device, Tensor};
 pub(crate) use crate::loading::var_builder::VarBuilder;
 pub(crate) use crate::nn_ops::generation::{LogitsProcessor, Sampling};
 pub(crate) use fastokens::Tokenizer;

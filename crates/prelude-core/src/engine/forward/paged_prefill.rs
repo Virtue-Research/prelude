@@ -223,7 +223,7 @@ impl Engine {
         // Fast path: all greedy → batch GPU argmax (avoids F32 conversion + CPU transfer)
         if prefill_plan.all_greedy {
             let all_tokens = logits_2d
-                .argmax(candle_core::D::Minus1)
+                .argmax(crate::tensor::D::Minus1)
                 .map_err(candle_err)?
                 .to_vec1::<u32>()
                 .map_err(candle_err)?;

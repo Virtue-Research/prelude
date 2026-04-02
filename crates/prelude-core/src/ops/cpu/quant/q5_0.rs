@@ -161,8 +161,8 @@ pub fn quantized_matmul_q5_0(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::quantized::{GgmlDType, QTensor};
-    use candle_core::{Device, Tensor};
+    use crate::tensor::quantized::{GgmlDType, QTensor};
+    use crate::tensor::{Device, Tensor};
 
     fn make_test_blocks(values: &[f32]) -> Vec<BlockQ5_0> {
         let t = Tensor::from_vec(values.to_vec(), (values.len(),), &Device::Cpu).unwrap();

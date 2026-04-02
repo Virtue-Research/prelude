@@ -1,4 +1,4 @@
-use candle_core::{DType, Result, Tensor};
+use crate::tensor::{DType, Result, Tensor};
 
 /// Cache slot layout descriptor.
 pub struct CacheSlotSpec {

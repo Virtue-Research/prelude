@@ -1,4 +1,4 @@
-use candle_core::{Result, Tensor};
+use crate::tensor::{Result, Tensor};
 
 pub trait CommOps: Send + Sync {
     fn world_size(&self) -> usize;
@@ -15,11 +15,11 @@ pub trait CommOps: Send + Sync {
     ) -> Result<Tensor>;
 
     fn send(&self, _x: &Tensor, _dst: usize) -> Result<()> {
-        candle_core::bail!("point-to-point send not supported on this device")
+        crate::tensor::bail!("point-to-point send not supported on this device")
     }
 
     fn recv(&self, _src: usize) -> Result<Tensor> {
-        candle_core::bail!("point-to-point recv not supported on this device")
+        crate::tensor::bail!("point-to-point recv not supported on this device")
     }
 
     fn ep_dispatch_fused(

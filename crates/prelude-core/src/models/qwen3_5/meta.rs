@@ -89,7 +89,7 @@ impl ArchSpec for Qwen3_5ArchSpec {
         &self,
         task: TaskKind,
         backend: WeightsBackend,
-        device: &candle_core::Device,
+        device: &crate::tensor::Device,
     ) -> RuntimeCaps {
         let is_safetensors = backend == WeightsBackend::Safetensors;
         let _is_generate = task == TaskKind::Generate;

@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use candle_core::{DType, Device};
+use crate::tensor::{DType, Device};
 use chrono::Utc;
 use fastokens::Tokenizer;
 
@@ -81,7 +81,7 @@ impl Engine {
         &self.model_id
     }
 
-    pub fn device(&self) -> &candle_core::Device {
+    pub fn device(&self) -> &crate::tensor::Device {
         &self.executor.device
     }
 

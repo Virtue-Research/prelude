@@ -1,4 +1,4 @@
-use candle_core::{Result, Tensor};
+use crate::tensor::{Result, Tensor};
 
 /// All methods default to `None` — devices only override what they support.
 pub trait FusedOps: Send + Sync {

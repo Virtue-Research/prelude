@@ -270,7 +270,7 @@ impl Engine {
 
                 let next_token = if request.sampling.temperature <= 1e-7 {
                     logits
-                        .argmax(candle_core::D::Minus1)
+                        .argmax(crate::tensor::D::Minus1)
                         .map_err(candle_err)?
                         .to_scalar::<u32>()
                         .map_err(candle_err)?
@@ -597,7 +597,7 @@ impl Engine {
                 .all(|&i| requests[i].sampling.temperature <= 1e-7);
             let next_tokens: Vec<u32> = if all_greedy {
                 match logits_2d
-                    .argmax(candle_core::D::Minus1)
+                    .argmax(crate::tensor::D::Minus1)
                     .and_then(|t| t.to_vec1::<u32>())
                 {
                     Ok(tokens) => tokens,
@@ -623,7 +623,7 @@ impl Engine {
                     };
                     let token = if requests[i].sampling.temperature <= 1e-7 {
                         match row
-                            .argmax(candle_core::D::Minus1)
+                            .argmax(crate::tensor::D::Minus1)
                             .and_then(|t| t.to_scalar::<u32>())
                         {
                             Ok(t) => t,

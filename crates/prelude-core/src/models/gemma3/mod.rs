@@ -3,7 +3,7 @@ pub(crate) mod meta;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use candle_core::{DType, Device, Module, Result, Tensor};
+use crate::tensor::{DType, Device, Module, Result, Tensor};
 use crate::nn_ops::{Activation, Embedding};
 use crate::loading::var_builder::VarBuilder;
 use serde::Deserialize;
@@ -572,7 +572,7 @@ impl crate::models::LogitsSplitModel for Gemma3ForCausalLM {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut crate::models::common::BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
+    ) -> crate::tensor::Result<Tensor> {
         self.base.forward(
             ctx.ops,
             packed_input,
@@ -582,7 +582,7 @@ impl crate::models::LogitsSplitModel for Gemma3ForCausalLM {
         )
     }
 
-    fn compute_logits(&self, hidden: &Tensor) -> candle_core::Result<Tensor> {
+    fn compute_logits(&self, hidden: &Tensor) -> crate::tensor::Result<Tensor> {
         let logits = hidden.apply(&self.lm_head)?;
         if let Some(cap) = self.final_logit_softcapping {
             let scaled = (&logits / cap)?;
@@ -599,7 +599,7 @@ impl crate::models::ModelForward for Gemma3ForCausalLM {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut crate::models::common::BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
+    ) -> crate::tensor::Result<Tensor> {
         self.forward(packed_input, ctx)
     }
 
@@ -789,7 +789,7 @@ impl crate::models::ModelForward for Gemma3ForSequenceClassification {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut crate::models::common::BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
+    ) -> crate::tensor::Result<Tensor> {
         self.forward(packed_input, ctx)
     }
 
@@ -813,7 +813,7 @@ impl crate::models::ModelForward for Gemma3ForEmbedding {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut crate::models::common::BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
+    ) -> crate::tensor::Result<Tensor> {
         Gemma3ForEmbedding::forward(self, packed_input, ctx)
     }
 

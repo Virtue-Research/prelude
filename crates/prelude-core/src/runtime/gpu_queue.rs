@@ -26,7 +26,7 @@ use crate::engine::{RawClassifyOutput, RawEmbedOutput};
 use crate::engine::RawGenerateOutput;
 
 #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
-use candle_core::Tensor;
+use crate::tensor::Tensor;
 #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
 use crate::engine::{BatchPrefillResult, OwnedBatchDecodeSeq, PrefillPlan};
 

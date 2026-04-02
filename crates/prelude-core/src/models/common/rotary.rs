@@ -2,7 +2,7 @@
 //
 // Supports standard [B, H, L, D], THD [B, L, H, D], and varlen [total, H, D] layouts.
 
-use candle_core::{DType, Device, Result, Tensor};
+use crate::tensor::{DType, Device, Result, Tensor};
 use crate::nn_ops::Qwen3Config;
 
 #[derive(Debug, Clone)]

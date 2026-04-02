@@ -396,8 +396,8 @@ pub fn quantized_matmul_q4k(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::quantized::{GgmlDType, QTensor};
-    use candle_core::{Device, Tensor};
+    use crate::tensor::quantized::{GgmlDType, QTensor};
+    use crate::tensor::{Device, Tensor};
 
     /// Use candle-core's own Q4_K quantization as ground truth for test data.
     /// This ensures our qs/scales layout matches exactly.

@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::loading::var_builder::VarBuilder;
-use candle_core::{DType, Device, Tensor};
+use crate::tensor::{DType, Device, Tensor};
 use fastokens::Tokenizer;
 
 use crate::cache::manager::CacheManager;
@@ -241,7 +241,7 @@ fn resolve_gguf_tokenizer_repo(
 
     // Try reading base_model from GGUF metadata
     if let Ok(mut file) = std::fs::File::open(gguf_path) {
-        if let Ok(ct) = candle_core::quantized::gguf_file::Content::read(&mut file) {
+        if let Ok(ct) = crate::tensor::quantized::gguf_file::Content::read(&mut file) {
             if let Some(val) = ct.metadata.get("general.base_model.0.repo_url") {
                 if let Ok(url) = val.to_string() {
                     // Extract "org/model" from "https://huggingface.co/org/model"
@@ -339,7 +339,7 @@ fn load_safetensor_parts(
 }
 
 /// Detect GGUF architecture from metadata.
-fn detect_gguf_arch(ct: &candle_core::quantized::gguf_file::Content) -> String {
+fn detect_gguf_arch(ct: &crate::tensor::quantized::gguf_file::Content) -> String {
     ct.metadata
         .get("general.architecture")
         .and_then(|v| v.to_string().ok().map(|s| s.to_string()))
@@ -367,7 +367,7 @@ fn load_gguf(
 
     let mut file = std::fs::File::open(gguf_path)
         .map_err(|e| EngineError::Internal(format!("failed to open GGUF: {e}")))?;
-    let ct = candle_core::quantized::gguf_file::Content::read(&mut file).map_err(candle_err)?;
+    let ct = crate::tensor::quantized::gguf_file::Content::read(&mut file).map_err(candle_err)?;
 
     let arch = detect_gguf_arch(&ct);
     tracing::info!(arch = %arch, "detected GGUF architecture");
@@ -410,7 +410,7 @@ fn load_gguf(
 
 /// Load Qwen3.5 (hybrid DeltaNet) from GGUF.
 fn load_gguf_qwen35(
-    ct: candle_core::quantized::gguf_file::Content,
+    ct: crate::tensor::quantized::gguf_file::Content,
     file: &mut std::fs::File,
     device: &Device,
     model_id: String,
@@ -479,7 +479,7 @@ fn load_gguf_qwen35(
 #[cfg(feature = "candle-baseline")]
 /// Load standard Qwen3 (and other dense architectures) from GGUF.
 fn load_gguf_qwen3(
-    ct: candle_core::quantized::gguf_file::Content,
+    ct: crate::tensor::quantized::gguf_file::Content,
     file: &mut std::fs::File,
     device: &Device,
     model_id: String,
@@ -726,7 +726,7 @@ fn dense_bias_from_config_or_weights(
 
     // Some sentence-transformers dense configs omit `bias`; use the safetensor
     // payload as the source of truth so we don't silently drop a present bias.
-    let weights = unsafe { candle_core::safetensors::MmapedSafetensors::new(weight_path) }
+    let weights = unsafe { crate::tensor::safetensors::MmapedSafetensors::new(weight_path) }
         .map_err(candle_err)?;
     Ok(weights
         .tensors()
@@ -879,7 +879,7 @@ pub(crate) fn build_model_variant(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::safetensors::save as save_safetensors;
+    use crate::tensor::safetensors::save as save_safetensors;
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;

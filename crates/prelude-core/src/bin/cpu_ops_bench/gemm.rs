@@ -1,4 +1,4 @@
-use candle_core::{DType, Device, Result, Tensor};
+use prelude_core::tensor::{DType, Device, Result, Tensor};
 use half::bf16;
 use std::time::Instant;
 
@@ -64,14 +64,14 @@ pub fn bench(m: usize, k: usize, n: usize, warmup: usize, repeats: usize) -> Res
         let in_storage = input.storage_and_layout();
         let w_storage = weight.storage_and_layout();
         let in_u16: &[u16] = match &*in_storage.0 {
-            candle_core::Storage::Cpu(s) => {
+            prelude_core::tensor::backend::Storage::Cpu(s) => {
                 let sl = s.as_slice::<bf16>().unwrap();
                 unsafe { std::slice::from_raw_parts(sl.as_ptr() as *const u16, sl.len()) }
             }
             _ => unreachable!(),
         };
         let w_u16: &[u16] = match &*w_storage.0 {
-            candle_core::Storage::Cpu(s) => {
+            prelude_core::tensor::backend::Storage::Cpu(s) => {
                 let sl = s.as_slice::<bf16>().unwrap();
                 unsafe { std::slice::from_raw_parts(sl.as_ptr() as *const u16, sl.len()) }
             }
@@ -249,12 +249,12 @@ pub fn bench_postops(m: usize, k: usize, n: usize, warmup: usize, repeats: usize
     // -- Separate: brgemm + manual bias + manual GELU --
     for _ in 0..warmup {
         let out = prelude_core::ops::onednn::brgemm_gemm_forward_pub(&input, &packed, m, k, n)?;
-        let _ = candle_core::Tensor::gelu(&out.broadcast_add(&bias)?)?;
+        let _ = prelude_core::tensor::Tensor::gelu(&out.broadcast_add(&bias)?)?;
     }
     let start = std::time::Instant::now();
     for _ in 0..repeats {
         let out = prelude_core::ops::onednn::brgemm_gemm_forward_pub(&input, &packed, m, k, n)?;
-        let _ = candle_core::Tensor::gelu(&out.broadcast_add(&bias)?)?;
+        let _ = prelude_core::tensor::Tensor::gelu(&out.broadcast_add(&bias)?)?;
     }
     let separate_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 

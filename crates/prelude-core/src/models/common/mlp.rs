@@ -2,7 +2,7 @@
 //
 // Used by Qwen3, Qwen3-MoE (dense layers), and other architectures.
 
-use candle_core::{DType, Module, Result, Tensor};
+use crate::tensor::{DType, Module, Result, Tensor};
 use crate::loading::var_builder::VarBuilder;
 use crate::nn_ops::Qwen3Config;
 

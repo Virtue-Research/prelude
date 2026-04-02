@@ -1,4 +1,4 @@
-use candle_core::{DType, Device, Result, Tensor};
+use prelude_core::tensor::{DType, Device, Result, Tensor};
 use half::bf16;
 use std::time::Instant;
 

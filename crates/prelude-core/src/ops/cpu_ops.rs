@@ -1,7 +1,7 @@
 //! CPU Ops — implements all 9 Ops traits using pure Rust AVX-512 kernels and oneDNN.
 
 use std::sync::Arc;
-use candle_core::{DType, Result, Tensor};
+use crate::tensor::{DType, Result, Tensor};
 use crate::ops::traits::*;
 
 /// CPU implementation of the Ops bundle.
@@ -64,7 +64,7 @@ impl AttentionOps for CpuOps {
         _key_cache: &Tensor, _value_cache: &Tensor,
         _params: &PagedParams,
     ) -> Result<Tensor> {
-        candle_core::bail!("paged_attention is not supported on CPU")
+        crate::tensor::bail!("paged_attention is not supported on CPU")
     }
 }
 
@@ -77,7 +77,7 @@ impl KvCacheOps for CpuOps {
         _key_cache: &Tensor, _value_cache: &Tensor,
         _slot_mapping: &Tensor,
     ) -> Result<()> {
-        candle_core::bail!("paged KV cache not supported on CPU")
+        crate::tensor::bail!("paged KV cache not supported on CPU")
     }
 }
 
@@ -94,7 +94,7 @@ impl GemmOps for CpuOps {
         _scale_a: Option<&Tensor>, _scale_b: Option<&Tensor>,
         _quant: QuantScheme,
     ) -> Result<Tensor> {
-        candle_core::bail!("quantized_matmul not supported on CPU (use LinearBackend)")
+        crate::tensor::bail!("quantized_matmul not supported on CPU (use LinearBackend)")
     }
 
     fn grouped_gemm(
@@ -103,7 +103,7 @@ impl GemmOps for CpuOps {
         _sorted_token_ids: &Tensor, _sorted_expert_ids: &Tensor,
         _num_tokens_per_expert: &Tensor,
     ) -> Result<Tensor> {
-        candle_core::bail!("grouped_gemm not supported on CPU")
+        crate::tensor::bail!("grouped_gemm not supported on CPU")
     }
 }
 
@@ -121,9 +121,9 @@ impl NormOps for CpuOps {
     ) -> Result<Tensor> {
         // Manual layer norm: y = (x - mean) / sqrt(var + eps) * weight + bias
         let x_f32 = x.to_dtype(DType::F32)?;
-        let mean = x_f32.mean_keepdim(candle_core::D::Minus1)?;
+        let mean = x_f32.mean_keepdim(crate::tensor::D::Minus1)?;
         let centered = x_f32.broadcast_sub(&mean)?;
-        let var = centered.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+        let var = centered.sqr()?.mean_keepdim(crate::tensor::D::Minus1)?;
         let normed = centered.broadcast_div(&(var + eps as f64)?.sqrt()?)?;
         let normed = normed.to_dtype(x.dtype())?;
         let result = normed.broadcast_mul(weight)?;
@@ -138,7 +138,7 @@ impl NormOps for CpuOps {
         _x: &Tensor, _weight: &Tensor, _bias: Option<&Tensor>,
         _num_groups: usize, _eps: f32,
     ) -> Result<Tensor> {
-        candle_core::bail!("group_norm not yet implemented on CPU")
+        crate::tensor::bail!("group_norm not yet implemented on CPU")
     }
 }
 

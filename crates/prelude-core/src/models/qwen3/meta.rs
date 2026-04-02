@@ -119,7 +119,7 @@ impl ArchSpec for Qwen3ArchSpec {
         &self,
         task: TaskKind,
         backend: WeightsBackend,
-        device: &candle_core::Device,
+        device: &crate::tensor::Device,
     ) -> RuntimeCaps {
         let is_safetensors = backend == WeightsBackend::Safetensors;
         let supports_cuda_varlen = (cfg!(feature = "cuda")

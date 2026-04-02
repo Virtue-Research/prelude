@@ -9,7 +9,7 @@
 // (DeltaNet attention), and any future model with the standard 2-norm pattern.
 // Gemma3 (4-norm) should continue using its own DecoderLayer.
 
-use candle_core::{Result, Tensor};
+use crate::tensor::{Result, Tensor};
 
 use super::linear::RmsNorm;
 use super::ops::{fast_rms_norm, fused_add_rmsnorm};

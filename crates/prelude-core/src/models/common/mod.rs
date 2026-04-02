@@ -9,7 +9,7 @@ pub(crate) mod raw_cpu;
 pub(crate) mod rotary;
 pub(crate) mod transformer_block;
 
-use candle_core::Tensor;
+use crate::tensor::Tensor;
 
 // ── Paged KV structs ────────────────────────────────────────────────────
 

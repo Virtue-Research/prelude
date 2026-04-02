@@ -50,7 +50,7 @@ fn test_decode_determinism() {
 #[test]
 fn test_rmsnorm_determinism() {
     use crate::ops::cpu::cpu_rmsnorm;
-    use candle_core::{DType, Device, Tensor};
+    use crate::tensor::{DType, Device, Tensor};
 
     let hidden = 1024;
     let batch = 16;
@@ -81,7 +81,7 @@ fn test_rmsnorm_determinism() {
 #[test]
 fn test_fused_add_rmsnorm_determinism() {
     use crate::ops::cpu::cpu_fused_add_rmsnorm;
-    use candle_core::{DType, Device, Tensor};
+    use crate::tensor::{DType, Device, Tensor};
 
     let hidden = 1024;
     let batch = 16;
@@ -123,7 +123,7 @@ fn test_fused_add_rmsnorm_determinism() {
 #[test]
 fn test_qwen_linear_determinism() {
     use crate::models::common::linear::Linear;
-    use candle_core::{DType, Device, Tensor};
+    use crate::tensor::{DType, Device, Tensor};
 
     if !crate::ops::onednn::brgemm_available() { return; }
 
@@ -145,8 +145,8 @@ fn test_qwen_linear_determinism() {
         Tensor::from_vec(vals, &[batch, in_dim], &Device::Cpu).unwrap()
     };
 
-    let out1 = candle_core::Module::forward(&linear, &make_input()).unwrap();
-    let out2 = candle_core::Module::forward(&linear, &make_input()).unwrap();
+    let out1 = crate::tensor::Module::forward(&linear, &make_input()).unwrap();
+    let out2 = crate::tensor::Module::forward(&linear, &make_input()).unwrap();
 
     let v1: Vec<f32> = out1.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
     let v2: Vec<f32> = out2.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
@@ -161,7 +161,7 @@ fn test_qwen_linear_determinism() {
 fn test_layer_chain_determinism() {
     use crate::ops::cpu::{cpu_rmsnorm, cpu_fused_add_rmsnorm};
     use crate::ops::onednn;
-    use candle_core::{DType, Device, Tensor};
+    use crate::tensor::{DType, Device, Tensor};
 
     if !onednn::brgemm_available() { return; }
 
@@ -260,7 +260,7 @@ fn test_layer_chain_determinism() {
 fn test_linear_chain_determinism() {
     use crate::ops::cpu::{cpu_rmsnorm, cpu_fused_add_rmsnorm};
     use crate::models::common::linear::Linear;
-    use candle_core::{DType, Device, Module, Tensor};
+    use crate::tensor::{DType, Device, Module, Tensor};
 
     if !crate::ops::onednn::brgemm_available() { return; }
 
@@ -325,7 +325,7 @@ fn test_linear_chain_determinism() {
 #[test]
 fn test_brgemm_interleaved_shapes_determinism() {
     use crate::ops::onednn;
-    use candle_core::{Device, Tensor};
+    use crate::tensor::{Device, Tensor};
 
     if !onednn::brgemm_available() { return; }
 
@@ -364,7 +364,7 @@ fn test_brgemm_interleaved_shapes_determinism() {
 #[test]
 fn test_brgemm_gemm_determinism() {
     use crate::ops::onednn;
-    use candle_core::{Device, Tensor};
+    use crate::tensor::{Device, Tensor};
 
     if !onednn::brgemm_available() { return; }
 
@@ -407,7 +407,7 @@ fn test_brgemm_gemm_determinism() {
 fn test_multi_layer_determinism() {
     use crate::ops::cpu::{cpu_rmsnorm, cpu_fused_add_rmsnorm, cpu_silu_and_mul};
     use crate::ops::onednn;
-    use candle_core::{DType, Device, Tensor};
+    use crate::tensor::{DType, Device, Tensor};
 
     if !onednn::brgemm_available() { return; }
 

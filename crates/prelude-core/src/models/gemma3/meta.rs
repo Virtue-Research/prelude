@@ -233,7 +233,7 @@ impl ArchSpec for Gemma3ArchSpec {
         &self,
         task: TaskKind,
         backend: WeightsBackend,
-        device: &candle_core::Device,
+        device: &crate::tensor::Device,
     ) -> RuntimeCaps {
         let is_safetensors = backend == WeightsBackend::Safetensors;
         let is_generate = task == TaskKind::Generate;
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn gemma3_embedding_defaults_to_last_token_without_modules_metadata() {
         let ctx = Gemma3ModelBuildContext {
-            main_vb: VarBuilder::zeros(candle_core::DType::F32, &candle_core::Device::Cpu),
+            main_vb: VarBuilder::zeros(crate::tensor::DType::F32, &crate::tensor::Device::Cpu),
             embedding: None,
             auxiliary: &[],
         };
@@ -287,7 +287,7 @@ mod tests {
             }],
         };
         let ctx = Gemma3ModelBuildContext {
-            main_vb: VarBuilder::zeros(candle_core::DType::F32, &candle_core::Device::Cpu),
+            main_vb: VarBuilder::zeros(crate::tensor::DType::F32, &crate::tensor::Device::Cpu),
             embedding: Some(&provided),
             auxiliary: &[],
         };

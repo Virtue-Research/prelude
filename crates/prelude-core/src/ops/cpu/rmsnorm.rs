@@ -7,7 +7,7 @@
 //! - `cpu_fused_add_rmsnorm()` — fused residual-add + RMSNorm
 //! - `CpuRmsNorm` — Module wrapper
 
-use candle_core::{DType, Module, Result, Tensor};
+use crate::tensor::{DType, Module, Result, Tensor};
 
 use super::bf16_utils::{bf16_to_f32, f32_to_bf16};
 #[cfg(target_arch = "x86_64")]
@@ -1073,29 +1073,29 @@ mod tests {
 
     /// Test cpu_fused_add_rmsnorm Tensor API across BF16, F16, and F32 dtypes.
     /// All three should produce consistent results against the F64 reference.
-    fn verify_fused_tensor_api(hidden: usize, batch: usize, dtype: candle_core::DType, label: &str) {
+    fn verify_fused_tensor_api(hidden: usize, batch: usize, dtype: crate::tensor::DType, label: &str) {
         let eps = 1e-6;
-        let device = candle_core::Device::Cpu;
+        let device = crate::tensor::Device::Cpu;
         let n = batch * hidden;
 
         let h_f32: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.013) - 0.3).cos()).collect();
         let res_f32: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.007) + 0.1).sin()).collect();
         let w_f32: Vec<f32> = (0..hidden).map(|i| 0.9 + (i as f32 * 0.002).sin() * 0.3).collect();
 
-        let h_t = candle_core::Tensor::from_vec(h_f32.clone(), (batch, hidden), &device).unwrap()
+        let h_t = crate::tensor::Tensor::from_vec(h_f32.clone(), (batch, hidden), &device).unwrap()
             .to_dtype(dtype).unwrap();
-        let r_t = candle_core::Tensor::from_vec(res_f32.clone(), (batch, hidden), &device).unwrap()
+        let r_t = crate::tensor::Tensor::from_vec(res_f32.clone(), (batch, hidden), &device).unwrap()
             .to_dtype(dtype).unwrap();
-        let w_t = candle_core::Tensor::from_vec(w_f32.clone(), (hidden,), &device).unwrap()
+        let w_t = crate::tensor::Tensor::from_vec(w_f32.clone(), (hidden,), &device).unwrap()
             .to_dtype(dtype).unwrap();
 
         let (res_out, norm_out) = super::cpu_fused_add_rmsnorm(&h_t, &r_t, &w_t, eps).unwrap();
         assert_eq!(res_out.dtype(), dtype);
         assert_eq!(norm_out.dtype(), dtype);
 
-        let res_out_f32 = res_out.to_dtype(candle_core::DType::F32).unwrap()
+        let res_out_f32 = res_out.to_dtype(crate::tensor::DType::F32).unwrap()
             .flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let norm_out_f32 = norm_out.to_dtype(candle_core::DType::F32).unwrap()
+        let norm_out_f32 = norm_out.to_dtype(crate::tensor::DType::F32).unwrap()
             .flatten_all().unwrap().to_vec1::<f32>().unwrap();
 
         for row in 0..batch {
@@ -1117,20 +1117,20 @@ mod tests {
 
     #[test]
     fn test_fused_tensor_api_bf16() {
-        verify_fused_tensor_api(128, 4, candle_core::DType::BF16, "BF16 128x4");
-        verify_fused_tensor_api(896, 1, candle_core::DType::BF16, "BF16 896x1");
+        verify_fused_tensor_api(128, 4, crate::tensor::DType::BF16, "BF16 128x4");
+        verify_fused_tensor_api(896, 1, crate::tensor::DType::BF16, "BF16 896x1");
     }
 
     #[test]
     fn test_fused_tensor_api_f16() {
-        verify_fused_tensor_api(128, 4, candle_core::DType::F16, "F16 128x4");
-        verify_fused_tensor_api(896, 1, candle_core::DType::F16, "F16 896x1");
+        verify_fused_tensor_api(128, 4, crate::tensor::DType::F16, "F16 128x4");
+        verify_fused_tensor_api(896, 1, crate::tensor::DType::F16, "F16 896x1");
     }
 
     #[test]
     fn test_fused_tensor_api_f32() {
-        verify_fused_tensor_api(128, 4, candle_core::DType::F32, "F32 128x4");
-        verify_fused_tensor_api(896, 1, candle_core::DType::F32, "F32 896x1");
+        verify_fused_tensor_api(128, 4, crate::tensor::DType::F32, "F32 128x4");
+        verify_fused_tensor_api(896, 1, crate::tensor::DType::F32, "F32 896x1");
     }
 
     /// Verify F32 AVX-512 kernel matches scalar within tolerance.

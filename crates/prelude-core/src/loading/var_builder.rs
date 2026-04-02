@@ -6,7 +6,7 @@
 //!
 //! Adapted from candle-nn 0.9.2.
 
-use candle_core::{DType, Device, Error, Result, Shape, Tensor};
+use crate::tensor::{DType, Device, Error, Result, Shape, Tensor};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -319,7 +319,7 @@ impl SimpleBackend for Zeros {
     }
 
     fn get_unchecked(&self, _name: &str, _dtype: DType, _dev: &Device) -> Result<Tensor> {
-        candle_core::bail!(
+        crate::tensor::bail!(
             "`Zeros` requires a shape for tensor retrieval, use `get` instead of `get_unchecked`"
         )
     }
@@ -348,7 +348,7 @@ impl SimpleBackend for HashMap<String, Tensor> {
             })?
             .clone();
         if tensor.shape() != &s {
-            Err(candle_core::Error::UnexpectedShape {
+            Err(crate::tensor::Error::UnexpectedShape {
                 msg: format!("shape mismatch for {name}"),
                 expected: s,
                 got: tensor.shape().clone(),
@@ -376,7 +376,7 @@ impl SimpleBackend for HashMap<String, Tensor> {
     }
 }
 
-impl SimpleBackend for candle_core::safetensors::MmapedSafetensors {
+impl SimpleBackend for crate::tensor::safetensors::MmapedSafetensors {
     fn get(
         &self,
         s: Shape,
@@ -387,7 +387,7 @@ impl SimpleBackend for candle_core::safetensors::MmapedSafetensors {
     ) -> Result<Tensor> {
         let tensor = self.load(name, dev)?.to_dtype(dtype)?;
         if tensor.shape() != &s {
-            Err(candle_core::Error::UnexpectedShape {
+            Err(crate::tensor::Error::UnexpectedShape {
                 msg: format!("shape mismatch for {name}"),
                 expected: s,
                 got: tensor.shape().clone(),
@@ -406,7 +406,7 @@ impl SimpleBackend for candle_core::safetensors::MmapedSafetensors {
     }
 }
 
-impl SimpleBackend for candle_core::safetensors::BufferedSafetensors {
+impl SimpleBackend for crate::tensor::safetensors::BufferedSafetensors {
     fn get(
         &self,
         s: Shape,
@@ -417,7 +417,7 @@ impl SimpleBackend for candle_core::safetensors::BufferedSafetensors {
     ) -> Result<Tensor> {
         let tensor = self.load(name, dev)?.to_dtype(dtype)?;
         if tensor.shape() != &s {
-            Err(candle_core::Error::UnexpectedShape {
+            Err(crate::tensor::Error::UnexpectedShape {
                 msg: format!("shape mismatch for {name}"),
                 expected: s,
                 got: tensor.shape().clone(),
@@ -486,13 +486,13 @@ impl<'a> VarBuilder<'a> {
         dtype: DType,
         dev: &Device,
     ) -> Result<Self> {
-        let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::multi(paths)? };
+        let tensors = unsafe { crate::tensor::safetensors::MmapedSafetensors::multi(paths)? };
         Ok(Self::from_backend(Box::new(tensors), dtype, dev.clone()))
     }
 
     /// Initializes a `VarBuilder` from a binary buffer in the safetensor format.
     pub fn from_buffered_safetensors(data: Vec<u8>, dtype: DType, dev: &Device) -> Result<Self> {
-        let tensors = candle_core::safetensors::BufferedSafetensors::new(data)?;
+        let tensors = crate::tensor::safetensors::BufferedSafetensors::new(data)?;
         Ok(Self::from_backend(Box::new(tensors), dtype, dev.clone()))
     }
 

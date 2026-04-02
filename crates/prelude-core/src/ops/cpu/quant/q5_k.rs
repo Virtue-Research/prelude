@@ -327,8 +327,8 @@ pub fn quantized_matmul_q5k(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::quantized::{GgmlDType, QTensor};
-    use candle_core::{Device, Tensor};
+    use crate::tensor::quantized::{GgmlDType, QTensor};
+    use crate::tensor::{Device, Tensor};
 
     fn make_test_q5k_blocks(values: &[f32]) -> Vec<BlockQ5K> {
         assert!(values.len() % QK_K == 0);

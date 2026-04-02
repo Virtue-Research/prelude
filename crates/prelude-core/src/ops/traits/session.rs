@@ -1,4 +1,4 @@
-use candle_core::{Result, Tensor};
+use crate::tensor::{Result, Tensor};
 
 pub trait OpsSession: Send + Sync {
     /// Initialize per-forward-pass state. Called before model.forward().

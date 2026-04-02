@@ -13,7 +13,7 @@
 //! - [`Qwen3Config`] — the Config struct from `candle_transformers::models::qwen3`
 //! - [`RmsNorm`] — wraps a weight tensor + eps, same semantics as `candle_nn::RmsNorm`
 
-use candle_core::{DType, Module, Result, Tensor, D};
+use crate::tensor::{DType, Module, Result, Tensor, D};
 
 // ═══════════════════════════════════════════════════════════════════════
 // Embedding
@@ -252,10 +252,10 @@ impl Module for CandleRmsNorm {
 // ═══════════════════════════════════════════════════════════════════════
 
 pub mod ops {
-    use candle_core::{Result, Tensor, D};
+    use crate::tensor::{Result, Tensor, D};
 
     /// Softmax along an arbitrary dimension.
-    pub fn softmax<Dim: candle_core::shape::Dim>(xs: &Tensor, dim: Dim) -> Result<Tensor> {
+    pub fn softmax<Dim: crate::tensor::shape::Dim>(xs: &Tensor, dim: Dim) -> Result<Tensor> {
         let dim = dim.to_index(xs.shape(), "softmax")?;
         let max = xs.max_keepdim(dim)?;
         let diff = xs.broadcast_sub(&max)?;
@@ -279,7 +279,7 @@ pub mod ops {
     }
 
     /// Log-softmax along a given dimension.
-    pub fn log_softmax<Dim: candle_core::shape::Dim>(xs: &Tensor, d: Dim) -> Result<Tensor> {
+    pub fn log_softmax<Dim: crate::tensor::shape::Dim>(xs: &Tensor, d: Dim) -> Result<Tensor> {
         let d = d.to_index(xs.shape(), "log-softmax")?;
         let max = xs.max_keepdim(d)?;
         let diff = xs.broadcast_sub(&max)?;
@@ -334,7 +334,7 @@ pub mod ops {
 // ═══════════════════════════════════════════════════════════════════════
 
 pub mod rotary_emb {
-    use candle_core::{Result, Tensor, D};
+    use crate::tensor::{Result, Tensor, D};
 
     /// Rotate-half helper: splits the last dim in two halves and returns
     /// `cat([-x2, x1], dim=-1)`.
@@ -383,7 +383,7 @@ pub mod rotary_emb {
 // ═══════════════════════════════════════════════════════════════════════
 
 pub mod moe {
-    use candle_core::{Result, Tensor};
+    use crate::tensor::{Result, Tensor};
 
     #[cfg(feature = "cuda")]
     pub fn moe_gemm(
@@ -395,14 +395,14 @@ pub mod moe {
         topk: usize,
         is_prefill: bool,
     ) -> Result<Tensor> {
-        use candle_core::cuda_backend::kernels::ffi;
-        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
-        use candle_core::DType;
+        use crate::tensor::backend::cuda_backend::kernels::ffi;
+        use crate::tensor::backend::cuda_backend::cudarc::driver::DevicePtr;
+        use crate::tensor::DType;
         use half::{bf16, f16};
 
         fn cuda_fwd<
-            T: candle_core::cuda_backend::CudaDType
-                + candle_core::cuda_backend::cudarc::driver::DeviceRepr,
+            T: crate::tensor::backend::cuda_backend::CudaDType
+                + crate::tensor::backend::cuda_backend::cudarc::driver::DeviceRepr,
         >(
             input: &Tensor,
             weights: &Tensor,
@@ -428,39 +428,39 @@ pub mod moe {
                 DType::F16 => 0,
                 DType::BF16 => 1,
                 _ => {
-                    candle_core::bail!("moe_gemm_wmma only accepts f16/bf16 inputs")
+                    crate::tensor::bail!("moe_gemm_wmma only accepts f16/bf16 inputs")
                 }
             };
 
             let (input, _) = input.storage_and_layout();
             let input = match &*input {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
-                _ => candle_core::bail!("input must be a cuda tensor"),
+                crate::tensor::backend::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+                _ => crate::tensor::bail!("input must be a cuda tensor"),
             };
 
             let (weights, _) = weights.storage_and_layout();
             let weights = match &*weights {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
-                _ => candle_core::bail!("weight must be a cuda tensor"),
+                crate::tensor::backend::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+                _ => crate::tensor::bail!("weight must be a cuda tensor"),
             };
 
             let (sorted_token_ids, _) = sorted_token_ids.storage_and_layout();
             let sorted_token_ids = match &*sorted_token_ids {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
-                _ => candle_core::bail!("sorted_token_ids must be a cuda tensor"),
+                crate::tensor::backend::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+                _ => crate::tensor::bail!("sorted_token_ids must be a cuda tensor"),
             };
 
             let (experts_ids, _) = experts_ids.storage_and_layout();
             let experts_ids = match &*experts_ids {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
-                _ => candle_core::bail!("experts_ids must be a cuda tensor"),
+                crate::tensor::backend::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+                _ => crate::tensor::bail!("experts_ids must be a cuda tensor"),
             };
 
             let topk_weights_ptr = if let Some(topk_weights) = &topk_weights {
                 let (topk_weights, _) = topk_weights.storage_and_layout();
                 let topk_weights = match &*topk_weights {
-                    candle_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-                    _ => candle_core::bail!("topk_weights must be a cuda tensor"),
+                    crate::tensor::backend::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+                    _ => crate::tensor::bail!("topk_weights must be a cuda tensor"),
                 };
                 topk_weights.device_ptr(topk_weights.stream()).0 as *const f32
             } else {
@@ -495,10 +495,10 @@ pub mod moe {
                 );
             }
 
-            use candle_core::op::BackpropOp;
-            let output = candle_core::CudaStorage::wrap_cuda_slice(output, dev.clone());
+            use crate::tensor::backend::BackpropOp;
+            let output = crate::tensor::backend::CudaStorage::wrap_cuda_slice(output, dev.clone());
             let output = Tensor::from_storage(
-                candle_core::Storage::Cuda(output),
+                crate::tensor::backend::Storage::Cuda(output),
                 (size_m, size_n),
                 BackpropOp::none(),
                 false,
@@ -527,7 +527,7 @@ pub mod moe {
                 is_prefill,
             ),
             _ => {
-                candle_core::bail!("moe_gemm only accepts f16/bf16 inputs")
+                crate::tensor::bail!("moe_gemm only accepts f16/bf16 inputs")
             }
         }
     }
@@ -542,7 +542,7 @@ pub mod moe {
         _: usize,
         _: bool,
     ) -> Result<Tensor> {
-        candle_core::bail!("moe_gemm is only implemented for the cuda backend")
+        crate::tensor::bail!("moe_gemm is only implemented for the cuda backend")
     }
 }
 
@@ -551,7 +551,7 @@ pub mod moe {
 // ═══════════════════════════════════════════════════════════════════════
 
 pub mod generation {
-    use candle_core::{DType, Error, Result, Tensor, D};
+    use crate::tensor::{DType, Error, Result, Tensor, D};
     use rand::{distr::Distribution, SeedableRng};
 
     #[derive(Clone, PartialEq, Debug)]

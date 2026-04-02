@@ -1,4 +1,4 @@
-use candle_core::Device;
+use crate::tensor::Device;
 use crate::loading::var_builder::VarBuilder;
 use serde::de::DeserializeOwned;
 
@@ -105,7 +105,7 @@ pub(crate) fn unsupported_task_error(arch_name: &str, task: TaskKind) -> EngineE
     ))
 }
 
-pub(crate) fn candle_model_err(e: candle_core::Error) -> EngineError {
+pub(crate) fn candle_model_err(e: crate::tensor::Error) -> EngineError {
     EngineError::Internal(format!("candle error: {e}"))
 }
 

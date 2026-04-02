@@ -49,7 +49,7 @@ use std::collections::{HashMap, HashSet};
 #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
 use std::time::Instant;
 #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
-use candle_core::{DType, Tensor};
+use crate::tensor::{DType, Tensor};
 #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
 use tokio::sync::mpsc::error::TryRecvError;
 #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
@@ -494,7 +494,7 @@ fn sample_batch(
     });
 
     if all_greedy {
-        match logits_2d.argmax(candle_core::D::Minus1).and_then(|t| t.to_vec1::<u32>()) {
+        match logits_2d.argmax(crate::tensor::D::Minus1).and_then(|t| t.to_vec1::<u32>()) {
             Ok(tokens) => Some(tokens),
             Err(error) => {
                 fail_all(engine, scheduler, states, active_ids,
@@ -594,7 +594,7 @@ fn process_sampled_tokens(
 #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
 fn sample_next_token(state: &mut RuntimeSequenceState, row: &Tensor) -> Result<u32, EngineError> {
     if state.prepared().is_greedy {
-        row.argmax(candle_core::D::Minus1)
+        row.argmax(crate::tensor::D::Minus1)
             .and_then(|t| t.to_scalar::<u32>())
             .map_err(|e| EngineError::Internal(format!("argmax failed: {e}")))
     } else {

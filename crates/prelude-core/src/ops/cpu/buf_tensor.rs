@@ -6,7 +6,7 @@
 
 use std::marker::PhantomData;
 
-use candle_core::{Device, Result, Tensor};
+use crate::tensor::{Device, Result, Tensor};
 
 /// Zero-overhead CPU BF16 tensor. Borrows data, carries shape.
 /// `reshape`/`narrow` are pointer arithmetic — no allocation.
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn from_candle_roundtrip() {
-        use candle_core::{DType, Device};
+        use crate::tensor::{DType, Device};
         let bf16_vals: Vec<half::bf16> = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]
             .iter()
             .map(|&v| half::bf16::from_f32(v))

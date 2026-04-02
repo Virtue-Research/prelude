@@ -4,7 +4,7 @@
 //! load (to_f32) and store (from_f32) conversions for each supported dtype.
 //! Adding a new dtype (e.g., FP16) requires only one `impl CpuFloat`.
 
-use candle_core::{DType, Device, Result, Tensor};
+use crate::tensor::{DType, Device, Result, Tensor};
 
 /// A floating-point type that can be used in CPU kernels.
 ///
@@ -54,8 +54,8 @@ impl CpuFloat for half::bf16 {
     fn tensor_to_vec(tensor: &Tensor) -> Result<Vec<Self>> {
         let (storage, layout) = tensor.storage_and_layout();
         let data = match &*storage {
-            candle_core::Storage::Cpu(s) => s.as_slice::<half::bf16>()?,
-            _ => candle_core::bail!("CpuFloat::tensor_to_vec: not a CPU tensor"),
+            crate::tensor::backend::Storage::Cpu(s) => s.as_slice::<half::bf16>()?,
+            _ => crate::tensor::bail!("CpuFloat::tensor_to_vec: not a CPU tensor"),
         };
         Ok(data[layout.start_offset()..].to_vec())
     }
@@ -88,8 +88,8 @@ impl CpuFloat for half::f16 {
     fn tensor_to_vec(tensor: &Tensor) -> Result<Vec<Self>> {
         let (storage, layout) = tensor.storage_and_layout();
         let data = match &*storage {
-            candle_core::Storage::Cpu(s) => s.as_slice::<half::f16>()?,
-            _ => candle_core::bail!("CpuFloat::tensor_to_vec: not a CPU tensor"),
+            crate::tensor::backend::Storage::Cpu(s) => s.as_slice::<half::f16>()?,
+            _ => crate::tensor::bail!("CpuFloat::tensor_to_vec: not a CPU tensor"),
         };
         Ok(data[layout.start_offset()..].to_vec())
     }
@@ -122,8 +122,8 @@ impl CpuFloat for f32 {
     fn tensor_to_vec(tensor: &Tensor) -> Result<Vec<Self>> {
         let (storage, layout) = tensor.storage_and_layout();
         let data = match &*storage {
-            candle_core::Storage::Cpu(s) => s.as_slice::<f32>()?,
-            _ => candle_core::bail!("CpuFloat::tensor_to_vec: not a CPU tensor"),
+            crate::tensor::backend::Storage::Cpu(s) => s.as_slice::<f32>()?,
+            _ => crate::tensor::bail!("CpuFloat::tensor_to_vec: not a CPU tensor"),
         };
         Ok(data[layout.start_offset()..].to_vec())
     }
