@@ -41,9 +41,6 @@ struct Variant {
     head_dim_kpe: Option<u64>,
 }
 
-const FLASHINFER_REPO: &str = "https://github.com/flashinfer-ai/flashinfer.git";
-const FLASHINFER_BRANCH: &str = "main";
-
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=scripts/compile_kernels.py");
     println!("cargo:rerun-if-env-changed=FLASHINFER_SRC");
@@ -58,7 +55,8 @@ fn main() -> Result<()> {
     let kernels_dir = out_dir.join("kernels");
 
     // Phase 1: Find FlashInfer source
-    let fi_src = find_flashinfer_source(&out_dir)?;
+    let fi_src = find_flashinfer_source(&manifest_dir)?;
+
 
     // Phase 2: Compile kernels (incremental — .o timestamp check inside python)
     ensure_kernels(&kernels_dir, &manifest_dir, &fi_src)?;
@@ -81,7 +79,8 @@ fn main() -> Result<()> {
 
 // ── FlashInfer source ────────────────────────────────────────────────
 
-fn find_flashinfer_source(out_dir: &Path) -> Result<PathBuf> {
+fn find_flashinfer_source(manifest_dir: &Path) -> Result<PathBuf> {
+    // Priority 1: FLASHINFER_SRC env var (for development overrides)
     if let Ok(src) = env::var("FLASHINFER_SRC") {
         let p = PathBuf::from(&src);
         if p.join("csrc").exists() {
@@ -91,39 +90,20 @@ fn find_flashinfer_source(out_dir: &Path) -> Result<PathBuf> {
         anyhow::bail!("FLASHINFER_SRC={src} does not contain csrc/");
     }
 
-    let fi_src = out_dir.join("flashinfer-src");
+    // Priority 2: third_party/flashinfer/ submodule (standard path)
+    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
+    let fi_src = workspace_root.join("third_party/flashinfer");
     if fi_src.join("csrc").exists() {
         return Ok(fi_src);
     }
 
-    println!("cargo:warning=FlashInfer: cloning {FLASHINFER_BRANCH}...");
-    if fi_src.exists() {
-        std::fs::remove_dir_all(&fi_src)?;
-    }
-
-    let status = Command::new("git")
-        .args([
-            "clone", "--depth", "1",
-            "--branch", FLASHINFER_BRANCH,
-            "--single-branch",
-            "--filter=blob:limit=1m",
-            FLASHINFER_REPO,
-        ])
-        .arg(&fi_src)
-        .status()
-        .context("git clone failed")?;
-    if !status.success() {
-        anyhow::bail!("git clone failed for {FLASHINFER_REPO}");
-    }
-
-    // Init submodules (tvm_ffi headers etc.)
-    let _ = Command::new("git")
-        .args(["submodule", "update", "--init", "--recursive", "--depth", "1"])
-        .current_dir(&fi_src)
-        .status();
-
-    Ok(fi_src)
+    anyhow::bail!(
+        "FlashInfer source not found. Either:\n\
+         1. Run: git submodule update --init --recursive third_party/flashinfer\n\
+         2. Set FLASHINFER_SRC=/path/to/flashinfer"
+    )
 }
+
 
 // ── Kernel compilation ───────────────────────────────────────────────
 
@@ -277,6 +257,7 @@ fn compile_tvm_ffi(manifest_dir: &Path) -> Result<()> {
         }
     }
     println!("cargo:rustc-link-lib=static=cudart_static");
+    println!("cargo:rustc-link-lib=dylib=cuda");  // CUDA Driver API (comes with GPU driver)
     println!("cargo:rustc-link-lib=dylib=rt");   // required by cudart_static
     println!("cargo:rustc-link-lib=dylib=dl");   // required by cudart_static
     println!("cargo:rustc-link-lib=dylib=stdc++");
@@ -446,7 +427,10 @@ fn generate_dispatch(kernels_dir: &Path, out_dir: &Path, has_kernels: bool) -> R
     writeln!(code, "pub(crate) fn lookup_utility(name: &str) -> Option<crate::loader::TVMSafeCallFn> {{")?;
     writeln!(code, "    match name {{")?;
     for v in &manifest.variants {
-        if !["page", "sampling", "norm", "rope", "cascade", "activation", "moe_routing", "fp4", "quantization", "fmha_sm100"].contains(&v.kind.as_str()) { continue; }
+        if !["page", "sampling", "norm", "rope", "cascade", "activation",
+             "moe_routing", "fp4", "quantization", "fmha_sm100",
+             "topk", "mla", "moe_utils", "moe", "gemm", "comm",
+             "gdn", "mamba"].contains(&v.kind.as_str()) { continue; }
         for (name, sym) in &v.symbols {
             writeln!(code, "        \"{name}\" => Some({sym}),")?;
         }

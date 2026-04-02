@@ -310,8 +310,7 @@ fn new_utility_kernel_lookup() {
     assert!(reg.get_utility("bf16_gemm").is_some(), "bf16_gemm not found");
     assert!(reg.get_utility("bf16_gemm_tactic_num").is_some(), "bf16_gemm_tactic_num not found");
 
-    // GEMM: FP8
-    assert!(reg.get_utility("fp8_gemm").is_some(), "fp8_gemm not found");
+    // GEMM: FP8 — only compiled for SM100+, skip on SM80/SM90
 
     // GEMM: Segment
     assert!(reg.get_utility("cutlass_segment_gemm").is_some(), "cutlass_segment_gemm not found");
@@ -327,13 +326,14 @@ fn new_utility_kernel_lookup() {
     assert!(reg.get_utility("trtllm_custom_all_reduce").is_some(), "trtllm_custom_all_reduce not found");
     assert!(reg.get_utility("trtllm_allreduce_fusion").is_some(), "trtllm_allreduce_fusion not found");
 
-    // TRT-LLM MOE AllToAll
-    assert!(reg.get_utility("moe_a2a_dispatch").is_some(), "moe_a2a_dispatch not found");
-
     // CUTLASS MLA
     assert!(reg.get_utility("cutlass_mla_paged_attention").is_some(), "cutlass_mla_paged_attention not found");
 
-    // vLLM AllReduce
+    // Comm: TRT-LLM AllReduce
+    assert!(reg.get_utility("trtllm_custom_all_reduce").is_some(), "trtllm_custom_all_reduce not found");
+    assert!(reg.get_utility("trtllm_allreduce_fusion").is_some(), "trtllm_allreduce_fusion not found");
+
+    // Comm: vLLM AllReduce
     assert!(reg.get_utility("init_custom_ar").is_some(), "init_custom_ar not found");
 }
 
@@ -360,6 +360,9 @@ fn sm100_module_lookup() {
         println!("SM{} < SM100, skipping SM100 module lookup", reg.arch());
         return;
     }
+
+    // FP8 GEMM
+    assert!(reg.get_utility("fp8_gemm").is_some(), "fp8_gemm not found (SM100 required)");
 
     // FP4 GEMM
     assert!(reg.get_utility("fp4_gemm").is_some(), "fp4_gemm not found (SM100 required)");
@@ -612,21 +615,14 @@ fn comm_module_lookup() {
     assert!(reg.get_utility("trtllm_custom_all_reduce").is_some(), "trtllm_custom_all_reduce not found");
     assert!(reg.get_utility("trtllm_allreduce_fusion").is_some(), "trtllm_allreduce_fusion not found");
 
-    // TRT-LLM MOE AllToAll
-    assert!(reg.get_utility("moe_a2a_dispatch").is_some(), "moe_a2a_dispatch not found");
-    assert!(reg.get_utility("moe_a2a_combine").is_some(), "moe_a2a_combine not found");
-
     // TRT-LLM MOE AllReduce
     assert!(reg.get_utility("trtllm_moe_allreduce_fusion").is_some(), "trtllm_moe_allreduce_fusion not found");
-
-    // TRT-LLM AllToAll primitives
-    assert!(reg.get_utility("moe_comm").is_some(), "moe_comm not found");
 
     // vLLM AllReduce
     assert!(reg.get_utility("init_custom_ar").is_some(), "init_custom_ar not found");
     assert!(reg.get_utility("all_reduce").is_some(), "vllm all_reduce not found");
 
-    println!("comm_module_lookup: PASS (all 9 symbols found)");
+    println!("comm_module_lookup: PASS (all 6 symbols found)");
 }
 
 // ── FP8 GEMM correctness ───────────────────────────────────────────

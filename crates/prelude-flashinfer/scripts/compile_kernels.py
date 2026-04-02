@@ -1113,16 +1113,12 @@ def generate_utility_sources(
         # Concat MLA K cache
         ("fi_concat_mla", ["concat_mla.cu"], None, "mla",
          ["concat_mla_k"]),
-        # MOE utilities — EXCLUDED: depends on RoutingKernel.h which needs
-        # batchedGemm::trtllm::gen namespace from trtllmGen_bmm_export/.
-        # ("fi_moe_utils", ["moe_utils_binding.cu"], None, "moe_utils", [...]),
         # GEMM: TGV + BF16 (tgv_gemm.cu re-exports bf16_gemm + bf16_gemm_tactic_num)
         ("fi_gemm_bf16", ["tgv_gemm.cu"], None, "gemm",
          ["tgv_gemm", "tgv_gemm_tactic_num", "bf16_gemm", "bf16_gemm_tactic_num"]),
-        # GEMM: FP8 — EXCLUDED: has SM100 template dispatch that needs separate
-        # SM100 instantiation files. Requires artifact download or SM100 conditional build.
-        # ("fi_gemm_fp8", ["fp8_gemm_cutlass.cu"], None, "gemm",
-        #  ["fp8_gemm", "fp8_gemm_tactic_num"]),
+        # GEMM: FP8 (SM80 dispatch + SM100 instantiation compiled separately)
+        ("fi_gemm_fp8", ["fp8_gemm_cutlass.cu"], None, "gemm",
+         ["fp8_gemm", "fp8_gemm_tactic_num"]),
         # GEMM: Segment/Group + BMM FP8 (SM80+)
         ("fi_gemm_segment", ["group_gemm.cu", "bmm_fp8.cu"],
          "flashinfer_gemm_binding.cu", "gemm",
@@ -1137,57 +1133,19 @@ def generate_utility_sources(
         # TRT-LLM AllReduce Fusion (fused allreduce + rmsnorm/bias)
         ("fi_trtllm_allreduce_fusion", ["trtllm_allreduce_fusion.cu"], None, "comm",
          ["trtllm_allreduce_fusion"]),
-        # TRT-LLM MOE AllToAll
-        ("fi_trtllm_moe_alltoall", ["trtllm_moe_alltoall.cu"], None, "comm",
-         ["moe_a2a_get_aux_data_size", "moe_a2a_initialize", "moe_a2a_dispatch",
-          "moe_a2a_combine", "moe_a2a_sanitize_expert_ids",
-          "moe_a2a_get_metainfo_index_pairs"]),
         # TRT-LLM MOE AllReduce Fusion
         ("fi_trtllm_moe_allreduce_fusion", ["trtllm_moe_allreduce_fusion.cu"], None, "comm",
          ["trtllm_moe_allreduce_fusion", "trtllm_moe_finalize_allreduce_fusion"]),
         # TRT-LLM MNNVL AllReduce
         ("fi_trtllm_mnnvl_allreduce", ["trtllm_mnnvl_allreduce.cu"], None, "comm",
          ["trtllm_mnnvl_allreduce_fusion"]),
-        # TRT-LLM AllToAll (MOE dispatch primitives)
-        ("fi_trtllm_alltoall", ["trtllm_alltoall.cu", "trtllm_alltoall_prepare.cu"],
-         None, "comm",
-         ["moe_comm_prepare_indices", "moe_local_gather", "moe_comm",
-          "set_moe_max_usable_sm_count", "get_moe_commworkspace_size_per_rank",
-          "get_moe_prepare_workspace_size_per_rank", "moe_prepare"]),
-        # vLLM Custom AllReduce
+        # vLLM Custom AllReduce (needs -lcuda for cuPointerGetAttribute)
         ("fi_vllm_allreduce", ["vllm_custom_all_reduce.cu"], None, "comm",
          ["get_graph_buffer_ipc_meta", "register_graph_buffers", "dispose",
           "meta_size", "register_buffer", "init_custom_ar", "all_reduce"]),
-        # TRT-LLM Fused MOE kernel launcher — EXCLUDED: requires GemmGatedActOptions.h
-        # from trtllmGen_bmm_export/ which is a TensorRT-LLM codegen artifact not
-        # available in the FlashInfer source tree. Use CUTLASS fused MOE instead.
-        # ("fi_trtllm_fused_moe", ["trtllm_fused_moe_kernel_launcher.cu"], None, "moe",
-        #  ["trtllm_bf16_moe", ...]),
-        # TRT-LLM Fused MOE runner — EXCLUDED: depends on trtllmGen_bmm_export/
-        # ("fi_trtllm_fused_moe_runner", ["trtllm_fused_moe_runner.cu"], None, "moe", []),
-        # TRT-LLM GEMM runner — EXCLUDED: needs CudaRunner.h from trtllmGen codegen
-        # ("fi_trtllm_gemm", ["trtllm_gemm_runner.cu"], None, "gemm",
-        #  ["trtllm_gemm", "trtllm_gemm_tactics"]),
-        # TRT-LLM Low-Latency GEMM runner — EXCLUDED: needs CudaRunner.h from trtllmGen codegen
-        # ("fi_trtllm_low_latency_gemm", ["trtllm_low_latency_gemm_runner.cu"], None, "gemm",
-        #  ["trtllm_low_latency_gemm", "trtllm_low_latency_gemm_tactics",
-        #   "get_workspace_size_in_bytes"]),
-        # TRT-LLM Batched GEMM runner — EXCLUDED: depends on trtllmGen_bmm_export/
-        # ("fi_trtllm_batched_gemm", ["trtllm_batched_gemm_runner.cu"], None, "gemm", []),
-        # Mamba: selective state update — EXCLUDED: requires per-(DIM, DSTATE)
-        # template instantiation with jinja codegen, similar to attention head_dim variants.
-        # Needs a dedicated generate_mamba_sources() function. TODO.
-        # ("fi_mamba", ["selective_state_update.cu", ...], "flashinfer_mamba_binding.cu", "mamba",
-        #  ["selective_state_update"]),
         # CUTLASS MLA paged attention
         ("fi_cutlass_mla", ["cutlass_mla.cu"], "flashinfer_mla_binding.cu", "mla",
          ["cutlass_mla_paged_attention"]),
-        # CUTLASS Fused MOE — EXCLUDED: undefined identifiers (use_fp8_input,
-        # ActivationParams) due to version mismatch between FlashInfer and nv_internal.
-        # ("fi_cutlass_fused_moe", [...], None, "moe", [...]),
-        # TRT-LLM Fused MOE routing backends — EXCLUDED: all go through
-        # RoutingKernel.cuh → DevKernel.h → trtllmGen_bmm_export/
-        # ("fi_trtllm_moe_routing_backends", [...], None, "moe", []),
     ]
 
     for dir_name, src_files, binding_file, kind, symbols in modules:
@@ -1488,10 +1446,6 @@ def compile_source(
     spdlog_include = fi_src / "3rdparty" / "spdlog" / "include"
     if spdlog_include.exists():
         include_dirs.append(str(spdlog_include))
-    # trtllmGen export headers (needed for TRT-LLM GEMM/MOE runners)
-    gemm_export = fi_src / "include" / "flashinfer" / "trtllm" / "gemm" / "trtllmGen_gemm_export"
-    if gemm_export.exists():
-        include_dirs.append(str(gemm_export))
     # CUTLASS headers (needed for SM90/Hopper kernels)
     cutlass_base = fi_src / "3rdparty" / "cutlass"
     for sub in ["include", "tools/util/include"]:
@@ -1817,11 +1771,6 @@ def main():
         for src in sources:
             compile_jobs.append((src, v["arch_flags"], extra, v))
 
-    # NOTE: trtllmGen_bmm_export/ is missing from the FlashInfer source tree.
-    # Modules that depend on it (moe_utils, trtllm_fused_moe, batched_gemm_runner)
-    # are excluded from AOT compilation. They use a `batchedGemm::trtllm::gen`
-    # namespace that differs from gemm_export's `gemm::trtllm::gen`.
-
     # Utility kernels (non-templated, compiled once)
     # Use sm_90a (arch-specific) to satisfy arch_condition.h check in CUDA 12.9+
     sm80_flags = ["-gencode", "arch=compute_80,code=compute_80",
@@ -1874,15 +1823,55 @@ def main():
             compile_jobs.append((src, sm100_flags, [], sm100_vinfo))
         print(f"  SM100 FMHA: {len(sm100_sources)} sources (requires CUDA 12.8+)")
 
-    # ── SM90 conditional modules ──────────────────────────────────────
+    # ── SM90: GDN (Gated Delta Net) template instantiation ─────────────
     has_sm90 = any(a >= 90 for a in archs)
     sm90_util_flags = ["-gencode", "arch=compute_90a,code=sm_90a"]
     if has_sm90:
         sm90_modules = []
-        # GDN prefill (Gated Delta Net — Qwen3.5 DeltaNet layers)
-        # EXCLUDED: requires 32 explicit template instantiations of
-        # launch_delta_rule_prefill_kernel_gbai<4 bools × 2 dtypes>.
-        # Needs a dedicated generate_gdn_sources() function with jinja codegen. TODO.
+
+        # GDN prefill: 32 explicit template instantiations (4 bools × 2 dtypes)
+        gdn_out = gen_dir / "fi_gdn"
+        gdn_out.mkdir(parents=True, exist_ok=True)
+        gdn_sources = []
+
+        # Copy launcher and kernel header
+        for sf in ["gdn_prefill_launcher.cu", "prefill_kernel_delta_rule_sm90.cu"]:
+            sp = fi_src / "csrc" / sf
+            if sp.exists():
+                shutil.copy2(sp, gdn_out / sf)
+                gdn_sources.append(gdn_out / sf)
+
+        # Generate explicit template instantiations
+        gdn_inst = []
+        gdn_inst.append('#include "flashinfer/flat/prefill/prefill_kernel_delta_rule_sm90.cuh"')
+        gdn_inst.append('#include <cuda_bf16.h>')
+        gdn_inst.append('#include <cuda_fp16.h>')
+        gdn_inst.append('#include "cutlass/arch/arch.h"')
+        gdn_inst.append('namespace flat {')
+        for is_gva in ["false", "true"]:
+            for nb in ["false", "true"]:
+                for na in ["false", "true"]:
+                    for init in ["false", "true"]:
+                        for ctype in ["half", "nv_bfloat16"]:
+                            gdn_inst.append(
+                                f'template void launch_delta_rule_prefill_kernel_gbai'
+                                f'<{is_gva}, {nb}, {na}, {init}, cutlass::arch::Sm90, {ctype}, {ctype}, float>'
+                                f'(cudaStream_t, {ctype}*, float*, {ctype} const*, {ctype} const*, {ctype} const*, '
+                                f'float const*, float const*, float const*, int64_t const*, uint8_t*, '
+                                f'int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);'
+                            )
+        gdn_inst.append('}  // namespace flat')
+        gdn_inst_path = gdn_out / "gdn_template_inst.cu"
+        gdn_inst_path.write_text('\n'.join(gdn_inst))
+        gdn_sources.append(gdn_inst_path)
+
+        gdn_vinfo = {"vid": "fi_gdn", "kind": "gdn",
+                      "symbols": {"gdn_prefill": "__tvm_ffi_gdn_prefill"}}
+        gdn_extra = ["-DFLAT_SM90A_ENABLED"]
+        for src in gdn_sources:
+            compile_jobs.append((src, sm90_util_flags, gdn_extra, gdn_vinfo))
+        sm90_modules.append(([], [], gdn_vinfo))
+        print(f"  SM90 GDN: {len(gdn_sources)} sources (32 template instantiations)")
 
         # Segment GEMM SM90
         seg90_out = gen_dir / "fi_gemm_segment_sm90"
@@ -1903,8 +1892,6 @@ def main():
             compile_jobs.append((src, sm90_util_flags, [], seg90_vinfo))
         sm90_modules.append(([], [], seg90_vinfo))
 
-        # FP8 block-scale GEMM SM90 — EXCLUDED: needs CutlassFp8BlockScaleGemmRunner
-        # template instantiation from TRT-LLM's nv_internal kernels.
 
         for _, _, vinfo in sm90_modules:
             utility_variants.append(([], [], vinfo))
@@ -1934,6 +1921,35 @@ def main():
             for src in mod_sources:
                 compile_jobs.append((src, sm100_util_flags, [], vinfo))
             sm100_modules.append(vinfo)
+
+        # FP8 GEMM SM100 template instantiation (12 files: 6 tile configs × 2 dtypes)
+        fp8_sm100_out = gen_dir / "fi_fp8_gemm_sm100_inst"
+        fp8_sm100_out.mkdir(parents=True, exist_ok=True)
+        fp8_sm100_sources = []
+        cta_configs = [(64,64,128), (64,128,128), (64,256,128), (128,64,128), (128,128,128), (128,256,128)]
+        for cta_m, cta_n, cta_k in cta_configs:
+            for dtype in ["__nv_bfloat16", "half"]:
+                fname = f"fp8_inst_{dtype}_{cta_m}_{cta_n}_{cta_k}.cu"
+                src_text = (
+                    '#include "flashinfer/gemm/fp8_gemm_template_sm100.h"\n\n'
+                    'namespace flashinfer {\n'
+                    'namespace gemm {\n'
+                    f'    INSTANCE_FP8_GEMM_TEMPLATE_SM100({dtype}, {cta_m}, {cta_n}, {cta_k}, 1, 1, 1, _1SM);\n'
+                    f'    INSTANCE_FP8_GEMM_TEMPLATE_SM100({dtype}, {cta_m}, {cta_n}, {cta_k}, 1, 2, 1, _1SM);\n'
+                    f'    INSTANCE_FP8_GEMM_TEMPLATE_SM100({dtype}, {cta_m}, {cta_n}, {cta_k}, 1, 4, 1, _1SM);\n'
+                    f'    INSTANCE_FP8_GEMM_TEMPLATE_SM100({dtype}, {cta_m}, {cta_n}, {cta_k}, 2, 1, 1, _2SM);\n'
+                    f'    INSTANCE_FP8_GEMM_TEMPLATE_SM100({dtype}, {cta_m}, {cta_n}, {cta_k}, 2, 2, 1, _2SM);\n'
+                    '}  // namespace gemm\n'
+                    '}  // namespace flashinfer\n'
+                )
+                fpath = fp8_sm100_out / fname
+                fpath.write_text(src_text)
+                fp8_sm100_sources.append(fpath)
+        fp8_sm100_vinfo = {"vid": "fi_fp8_gemm_sm100_inst", "kind": "gemm", "symbols": {}}
+        for src in fp8_sm100_sources:
+            compile_jobs.append((src, sm100_util_flags, [], fp8_sm100_vinfo))
+        sm100_modules.append(fp8_sm100_vinfo)
+        print(f"  SM100 FP8 GEMM: {len(fp8_sm100_sources)} instantiation files")
 
         # FP4 GEMM (SM100)
         _add_sm100_module("fi_fp4_gemm_sm100",
