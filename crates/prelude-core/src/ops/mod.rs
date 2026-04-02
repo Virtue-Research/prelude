@@ -1,10 +1,12 @@
-//! Kernel operations — all compute backends organized by device target.
+//! Kernel operations — trait definitions and compute backends.
 //!
+//! - `traits`: Op trait definitions (AttentionOps, GemmOps, NormOps, FusedOps, ...)
 //! - `cpu`: Pure Rust AVX-512 kernels (rmsnorm, attention, rope, silu_mul)
-//! - `gpu`: CUDA PTX kernels (fused ops loaded via cudarc)
 //! - `onednn`: Intel oneDNN integration (brgemm GEMM, VNNI packing)
 
+pub mod traits;
 pub mod cpu;
-#[cfg(feature = "cuda")]
-pub mod gpu;
 pub mod onednn;
+
+// Re-export the Ops bundle and all trait types at crate level for convenience.
+pub use traits::*;

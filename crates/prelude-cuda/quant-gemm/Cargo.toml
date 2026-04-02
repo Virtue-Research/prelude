@@ -10,5 +10,5 @@ cudarc = { version = "0.19.4", features = ["std", "cuda-version-from-build-syste
 half = "2.7.1"
 
 [dev-dependencies]
-candle-core = { path = "../candle-core", features = ["cuda"] }
+candle-core = { path = "../../candle-core", features = ["cuda"] }
 rand = "0.10.0"

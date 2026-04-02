@@ -1,0 +1,26 @@
+[package]
+name = "prelude-cuda"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+description = "CUDA device implementation for Prelude inference engine."
+license = "Apache-2.0"
+
+[lib]
+name = "prelude_cuda"
+path = "src/lib.rs"
+
+[features]
+default = ["cutlass-gemm"]
+deepgemm = ["dep:prelude-deepgemm"]
+cutlass-gemm = ["dep:prelude-cutlass-gemm"]
+flash-attn-v4 = ["dep:prelude-flash-attn-v4"]
+flashinfer = ["dep:prelude-flashinfer"]
+quant-gemm = ["dep:prelude-quant-gemm"]
+
+[dependencies]
+prelude-deepgemm = { path = "deepgemm", optional = true }
+prelude-cutlass-gemm = { path = "cutlass-gemm", optional = true }
+prelude-flash-attn-v4 = { path = "fa4", optional = true }
+prelude-flashinfer = { path = "flashinfer", optional = true }
+prelude-quant-gemm = { path = "quant-gemm", optional = true }
