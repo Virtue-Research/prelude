@@ -302,16 +302,15 @@ fn new_utility_kernel_lookup() {
     // Concat MLA
     assert!(reg.get_utility("concat_mla_k").is_some(), "concat_mla_k not found");
 
-    // MOE utilities
-    assert!(reg.get_utility("flashinfer_moe_permute_bf16").is_some(), "moe_permute_bf16 not found");
-    assert!(reg.get_utility("flashinfer_moe_sort").is_some(), "moe_sort not found");
-
-    // GEMM: Segment (base, all archs)
+    // add_moe: gen_gemm_module (segment GEMM + bmm_fp8)
     assert!(reg.get_utility("cutlass_segment_gemm").is_some(), "cutlass_segment_gemm not found");
     assert!(reg.get_utility("bmm_fp8").is_some(), "bmm_fp8 not found");
 
-    // DSv3 router
+    // add_moe: DSv3 router
     assert!(reg.get_utility("dsv3_router_gemm_op").is_some(), "dsv3_router_gemm_op not found");
+
+    // add_moe: MoE routing (NoAuxTc)
+    assert!(reg.get_utility("NoAuxTc").is_some(), "NoAuxTc not found");
 
     // CUTLASS MLA
     assert!(reg.get_utility("cutlass_mla_paged_attention").is_some(), "cutlass_mla_paged_attention not found");
@@ -542,7 +541,8 @@ fn concat_mla_k_correctness() {
     let full_dim = nope_dim + rope_dim;
 
     let nope_elems = (tokens * num_heads * nope_dim) as usize;
-    let rope_elems = (tokens * num_heads * rope_dim) as usize;
+    // k_rope must have num_heads=1 (broadcast across all heads)
+    let rope_elems = (tokens * 1 * rope_dim) as usize;
     let full_elems = (tokens * num_heads * full_dim) as usize;
 
     // Generate known patterns
@@ -555,7 +555,7 @@ fn concat_mla_k_correctness() {
 
     let k_s = [tokens, num_heads, full_dim]; let k_st = contiguous_strides(&k_s);
     let nope_s = [tokens, num_heads, nope_dim]; let nope_st = contiguous_strides(&nope_s);
-    let rope_s = [tokens, num_heads, rope_dim]; let rope_st = contiguous_strides(&rope_s);
+    let rope_s = [tokens, 1i64, rope_dim]; let rope_st = contiguous_strides(&rope_s);
 
     let dl_k = gpu_dl(k_ptr, BF16_DT, &k_s, &k_st);
     let dl_nope = gpu_dl(nope_ptr, BF16_DT, &nope_s, &nope_st);
@@ -575,7 +575,7 @@ fn concat_mla_k_correctness() {
 
     let k_bf16 = gpu_download::<u16>(k_ptr, full_elems);
 
-    // Verify: k[:, :, :nope_dim] == nope, k[:, :, nope_dim:] == rope
+    // Verify: k[:, h, :nope_dim] == nope[:, h, :], k[:, h, nope_dim:] == rope[:, 0, :] (broadcast)
     let mut mismatches = 0usize;
     for t in 0..tokens as usize {
         for h in 0..num_heads as usize {
@@ -586,7 +586,8 @@ fn concat_mla_k_correctness() {
                     let ni = t * (num_heads * nope_dim) as usize + h * nope_dim as usize + d;
                     nope_bf16[ni]
                 } else {
-                    let ri = t * (num_heads * rope_dim) as usize + h * rope_dim as usize + (d - nope_dim as usize);
+                    // rope has num_heads=1, broadcast to all heads
+                    let ri = t * (1 * rope_dim) as usize + 0 * rope_dim as usize + (d - nope_dim as usize);
                     rope_bf16[ri]
                 };
                 if got != expected { mismatches += 1; }
