@@ -1147,7 +1147,8 @@ fn bench_gdn(reg: &KernelRegistry) {
         let ws_ptr = gpu_alloc(128 * 1024 * 1024);
 
         let cu_seqlens: Vec<i64> = vec![0, seq_len];
-        let cu_ptr = gpu_upload(&cu_seqlens);
+        let cu_ptr = gpu_alloc(cu_seqlens.len() * 8);
+        unsafe { cudaMemcpy(cu_ptr, cu_seqlens.as_ptr() as *const c_void, cu_seqlens.len() * 8, 1); }
 
         let q_s = [packed_seq, num_q_heads, head_dim]; let q_st = strides(&q_s);
         let k_s = [packed_seq, num_kv_heads, head_dim]; let k_st = strides(&k_s);
