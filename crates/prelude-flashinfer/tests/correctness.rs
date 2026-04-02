@@ -1830,11 +1830,11 @@ fn softmax_utility() {
     let vocab = 128i64;
     let n = (batch * vocab) as usize;
 
-    // Generate logits
-    let logits_bf16: Vec<u16> = (0..n).map(|i| f32_to_bf16(0.1 * (i as f32 % 20.0) - 1.0)).collect();
+    // Generate logits (FP32 — upstream softmax kernel requires float input)
+    let logits_f32: Vec<f32> = (0..n).map(|i| 0.1 * (i as f32 % 20.0) - 1.0).collect();
 
     unsafe {
-        let logits_ptr = gpu_upload(&logits_bf16);
+        let logits_ptr = gpu_upload(&logits_f32);
         let output_ptr = gpu_alloc(n * 4); // FP32 output
         let ws_ptr = gpu_alloc(8 * 1024 * 1024); // workspace
 
@@ -1846,7 +1846,7 @@ fn softmax_utility() {
         let ws_st = [1i64];
 
         let dl_ws = gpu_dl(ws_ptr, U8_DT, &ws_s, &ws_st);
-        let dl_logits = gpu_dl(logits_ptr, BF16_DT, &logit_s, &logit_st);
+        let dl_logits = gpu_dl(logits_ptr, FP32_DT, &logit_s, &logit_st);
         let dl_out = gpu_dl(output_ptr, FP32_DT, &out_s, &out_st);
 
         reg.set_stream(0, std::ptr::null_mut());
