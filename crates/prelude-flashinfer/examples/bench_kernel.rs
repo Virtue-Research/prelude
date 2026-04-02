@@ -1498,7 +1498,7 @@ fn bench_pod(reg: &KernelRegistry, ws: &Workspace) {
             }
             cudaDeviceSynchronize();
 
-            let pod_ms = cuda_bench(10, 200, || {
+            let pod_ms = cuda_bench(3, 20, || {
                 reg.call(pod_variant.run, &pod_args).unwrap();
             });
 
@@ -1522,7 +1522,7 @@ fn bench_pod(reg: &KernelRegistry, ws: &Workspace) {
                 continue;
             }
 
-            let sep_ms = cuda_bench(10, 200, || {
+            let sep_ms = cuda_bench(3, 20, || {
                 reg.call(prefill_variant.paged_run, &sep_prefill_args).ok();
                 reg.call(decode_variant.run, &sep_decode_args).ok();
             });
