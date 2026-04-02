@@ -10,9 +10,18 @@ crates/prelude-core/src/
 │   ├── mod.rs                             # pub struct Engine: new(), serve(), generate(), embed()
 │   ├── config.rs                          # EngineConfig — mode, device, scheduler params
 │   ├── run.rs                             # run::ar(), run::dllm(), ... 各模式主循环
-│   └── model_runner/                      # ScheduledBatch → tensors → model.forward() → sample
-│       ├── mod.rs                         # ModelRunner 核心逻辑
-│       └── cuda_graph.rs                  # Graph capture/replay (CUDA/HIP)
+│   ├── model_runner/                      # ScheduledBatch → tensors → model.forward() → sample
+│   │   ├── mod.rs                         # ModelRunner 核心逻辑
+│   │   └── cuda_graph.rs                  # Graph capture/replay (CUDA/HIP)
+│   ├── speculative/                       # Speculative decoding — see speculative.md
+│   │   ├── mod.rs                         # SpecDecodeRunner: draft → verify → accept loop
+│   │   ├── proposer.rs                    # trait DraftProposer (EAGLE/DraftModel/Ngram/Medusa)
+│   │   ├── rejection.rs                   # Rejection sampling (strict, probabilistic)
+│   │   └── tree.rs                        # Tree attention mask construction
+│   └── sampling/                          # Sampling pipeline — see constrained_decoding.md
+│       ├── mod.rs                         # Sampler: logits → token IDs
+│       ├── grammar.rs                     # GrammarManager: async compile + bitmask fill
+│       └── logits_processor.rs            # LogitsProcessor trait (grammar is one impl)
 │
 ├── scheduler/                             # 调度决策（纯 CPU，不碰 GPU）
 │   ├── mod.rs                             # re-exports
@@ -383,6 +392,18 @@ attention-FFN disaggregation (FFN follower, AFD).
 Summary: Prefill and decode run on separate worker pools. Prefill workers are optimized for
 compute-heavy prefill (high FLOPS utilization). Decode workers are optimized for
 memory-bandwidth-bound decode (large batch sizes).
+
+## Speculative Decoding
+
+See [speculative.md](speculative.md) for the draft-then-verify framework:
+`DraftProposer` trait (EAGLE/DraftModel/Ngram/Medusa pluggable), modular rejection sampling
+(strict/probabilistic), tree attention via `MaskType::Custom`, no KV cache rollback.
+
+## Constrained Decoding (Structured Output)
+
+See [constrained_decoding.md](constrained_decoding.md) for grammar-based token filtering:
+`GrammarBackend` trait (xgrammar/outlines pluggable), async compilation overlapping with GPU,
+per-request bitmask, integration with sampling pipeline and speculative decoding.
 
 ## Examples
 
