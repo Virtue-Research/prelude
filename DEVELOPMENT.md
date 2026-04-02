@@ -85,13 +85,11 @@ cargo run -p prelude-core --bin cpu_ops_bench --release -- quant
 cargo run -p prelude-core --bin cpu_ops_bench --release -- gemm
 
 # GPU kernel benchmarks
-cargo run -p prelude-cutlass-gemm --bin bench_kernel --release
-cargo run -p prelude-deepgemm --bin bench_kernel --release
-cargo run -p prelude-flashinfer --bin bench_kernel --release
-cargo run -p prelude-flash-attn-v4 --bin bench_kernel --release
-
-# Quant
-cargo run -p prelude-quant-gemm --bin bench_kernel --release
+cargo run -p prelude-cutlass-gemm --example bench_kernel --release
+cargo run -p prelude-deepgemm --example bench_kernel --release
+cargo run -p prelude-flashinfer --example bench_kernel --release
+cargo run -p prelude-flash-attn-v4 --example bench_kernel --release
+cargo run -p prelude-quant-gemm --example bench_kernel --release
 ```
 
 ## Feature flags

@@ -846,7 +846,7 @@ __device__ __forceinline__ float e8m0_to_f32_deq(uint8_t x) {
 }
 
 __device__ __forceinline__ float ue4m3_to_f32_deq(uint8_t x) {
-    if (x == 0 || x == 0x7F) return 0.0f;
+    if (x == 0 || x == 0x7F || x == 0xFF) return 0.0f;
     int e = (x >> 3) & 0xF;
     int m = x & 0x7;
     float raw = (e == 0) ? ldexpf((float)m, -9) : ldexpf(1.0f + (float)m / 8.0f, e - 7);
@@ -975,8 +975,8 @@ extern "C" void llama_gpu_dequantize(
         case 23: launch_dequantize_iq4_xs_bf16(input, output, n, stream); break;
         case 19: launch_dequantize_iq1_s_bf16(input, output, n, stream); break;
         case 29: launch_dequantize_iq1_m_bf16(input, output, n, stream); break;
-        case 30: launch_dequantize_mxfp4_bf16(input, output, n, stream); break;
-        case 33: launch_dequantize_nvfp4_bf16(input, output, n, stream); break;
+        case 39: launch_dequantize_mxfp4_bf16(input, output, n, stream); break;
+        case 40: launch_dequantize_nvfp4_bf16(input, output, n, stream); break;
         default: break;
     }
 }

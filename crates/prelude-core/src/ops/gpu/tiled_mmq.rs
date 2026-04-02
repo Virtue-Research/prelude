@@ -73,10 +73,10 @@ pub fn tiled_mmq(
     let raw_stream = unsafe { stream.cu_stream() } as *const c_void;
 
     // Allocate Q8_1_MMQ buffer
-    // block_q8_1_mmq = 144 bytes, holds 128 values
-    // llama.cpp pads K to 512, allocate generously
+    // llama.cpp: nrows * GGML_PAD(K, 512) * 36/32 + mmq_x_max * sizeof(block_q8_1_mmq)
     let ne00_padded = ((k + 511) / 512) * 512;
-    let q8_buf_size = m * (ne00_padded / 128) * 144 + m * 144;
+    let mmq_x_max = 128; // SM75+ (Turing MMA); safe upper bound
+    let q8_buf_size = m * ne00_padded * 36 / 32 + mmq_x_max * 144;
     let q8_buffer = unsafe { dev.alloc::<u8>(q8_buf_size)? };
 
     // Get raw device pointers (use device stream for all)

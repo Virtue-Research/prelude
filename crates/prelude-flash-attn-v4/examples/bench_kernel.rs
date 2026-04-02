@@ -1,6 +1,6 @@
 //! FA4 kernel benchmark vs cuBLAS naive baseline.
 //!
-//! Run: cargo run -p prelude-flash-attn-v4 --bin bench_kernel --release
+//! Run: cargo run -p prelude-flash-attn-v4 --example bench_kernel --release
 //!
 //! cuBLAS baseline = two cublasGemmStridedBatchedEx calls (Q@K^T + S@V).
 //! No fused softmax, no causal mask skip. FA4 speedup grows with seq_len because:
@@ -176,7 +176,7 @@ const ITERS: usize = 20;
 // ── Bench: Non-paged varlen ─────────────────────────────────────────
 
 fn bench_varlen(registry: &KernelRegistry, cublas: &CuBlas, cublas_handle: cublasHandle_t) {
-    println!("\n=== FA4 Varlen (causal, BF16) vs cuBLAS ===");
+    println!("\n{:=<80}", "= FA4 Varlen (causal, BF16) vs cuBLAS ");
     println!("{:<14} {:>8} {:>10} {:>10} {:>10} {:>8}",
         "Config", "SeqLen", "FA4(ms)", "cuBLAS*", "TFLOPS", "speedup");
     println!("{}", "-".repeat(66));
@@ -310,7 +310,7 @@ fn bench_varlen(registry: &KernelRegistry, cublas: &CuBlas, cublas_handle: cubla
 // ── Bench: Paged KV ─────────────────────────────────────────────────
 
 fn bench_paged(registry: &KernelRegistry) {
-    println!("\n=== FA4 Paged KV (causal, BF16) ===");
+    println!("\n{:=<80}", "= FA4 Paged KV (causal, BF16) ");
     println!("{:<14} {:>8} {:>8} {:>10} {:>10}",
         "Config", "Q-len", "KV-len", "FA4(ms)", "TFLOPS");
     println!("{}", "-".repeat(56));
@@ -416,7 +416,7 @@ fn bench_paged(registry: &KernelRegistry) {
 
 fn main() {
     let registry = KernelRegistry::new();
-    println!("FA4 Benchmark — SM{}", registry.arch());
+    println!("{:=<80}", format!("= FA4 Benchmark — SM{} ", registry.arch()));
 
     let cublas = CuBlas::load().expect("failed to dlopen libcublas.so — is CUDA toolkit installed?");
     let mut cublas_handle: cublasHandle_t = std::ptr::null_mut();

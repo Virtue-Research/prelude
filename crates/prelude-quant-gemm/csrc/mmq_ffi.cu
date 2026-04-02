@@ -1,15 +1,28 @@
-// FFI entry points for vendored llama.cpp MMQ + MMVQ kernels.
+// FFI entry points for llama.cpp MMQ + MMVQ kernels.
 // Bridges Rust → C → C++ template dispatch.
+// Headers auto-cloned from llama.cpp main branch at build time.
 
 #include "mmq_ffi.h"
-#include "llama_mmq/common.cuh"
-#include "llama_mmq/mmq.cuh"
-#include "llama_mmq/vecdotq.cuh"
+#include "common.cuh"
+#include "mmq.cuh"
+#include "vecdotq.cuh"
 
 // Include quantize implementation directly (single translation unit).
-#include "llama_mmq/quantize.cu"
+#include "quantize.cu"
 
-// Provide symbols declared in common.cuh but defined in ggml-cuda.cu normally.
+// Provide symbols declared in ggml.h / common.cuh but defined in ggml.c / ggml-cuda.cu normally.
+
+#include <cstdarg>
+
+extern "C" void ggml_abort(const char * file, int line, const char * fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    fprintf(stderr, "GGML ABORT at %s:%d: ", file, line);
+    vfprintf(stderr, fmt, args);
+    fprintf(stderr, "\n");
+    va_end(args);
+    abort();
+}
 
 void ggml_cuda_error(
     const char * stmt, const char * func, const char * file,
@@ -172,7 +185,11 @@ static void launch_mmq_typed(
     args.stride_sample_dst = 0;
 
     args.ncols_max = M;
-    args.use_stream_k = false;
+
+    // Match upstream: use stream-k for NVIDIA Volta+ (like llama.cpp does).
+    const auto& dev = ggml_cuda_info().devices[0];
+    args.use_stream_k = GGML_CUDA_CC_IS_NVIDIA(dev.cc)
+        && ggml_cuda_highest_compiled_arch(dev.cc) >= GGML_CUDA_CC_VOLTA;
 
     ggml_backend_cuda_context ctx(0);
     ctx.streams[0][0] = stream;

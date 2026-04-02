@@ -1,6 +1,6 @@
 //! Benchmark FlashInfer attention kernels vs cuBLAS naive baseline.
 //!
-//! Run: cargo run -p prelude-flashinfer --bin bench_kernel --release
+//! Run: cargo run -p prelude-flashinfer --example bench_kernel --release
 //!
 //! cuBLAS baseline = two cublasGemmStridedBatchedEx calls (Q@K^T + S@V).
 //! This is what candle does without FlashInfer: no fused softmax, no causal
@@ -232,7 +232,7 @@ fn bench_prefill_backend(
     reg: &KernelRegistry, ws: &Workspace, cublas: &CuBlas, cublas_handle: cublasHandle_t,
     backend: Backend, label: &str,
 ) {
-    println!("\n=== Prefill {label} (causal, BF16) vs cuBLAS ===");
+    println!("\n{:=<80}", format!("= Prefill {label} (causal, BF16) vs cuBLAS "));
     println!("{:<10} {:<6} {:<6} {:>10} {:>10} {:>8}",
         "seq_len", "heads", "hdim", label, "cuBLAS*", "speedup");
 
@@ -399,7 +399,7 @@ fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
     if reg.arch() >= 90 {
         let key = FP8PrefillKey { head_dim: 128, sliding_window: false };
         if let Some(variant) = reg.get_fp8_prefill(&key) {
-            println!("\n=== Prefill FP8 E4M3 (causal, SM90) vs FA3 BF16 ===");
+            println!("\n{:=<80}", "= Prefill FP8 E4M3 (causal, SM90) vs FA3 BF16 ");
             println!("{:<10} {:<6} {:<6} {:>10} {:>10} {:>8}",
                 "seq_len", "heads", "hdim", "FP8", "FA3-BF16", "ratio");
 
@@ -562,7 +562,7 @@ fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
 // ── Bench: Decode ────────────────────────────────────────────────────
 
 fn bench_decode(reg: &KernelRegistry, ws: &Workspace) {
-    println!("\n=== Decode (paged, BF16) vs cuBLAS naive ===");
+    println!("\n{:=<80}", "= Decode (paged, BF16) vs cuBLAS naive ");
     println!("{:<8} {:<8} {:<6} {:<6} {:>10} {:>10} {:>8}",
         "batch", "kv_len", "heads", "hdim", "FlashInfer", "cuBLAS", "speedup");
 
@@ -736,7 +736,7 @@ fn bench_decode(reg: &KernelRegistry, ws: &Workspace) {
 // ── Bench: Utility kernels ───────────────────────────────────────────
 
 fn bench_utilities(reg: &KernelRegistry) {
-    println!("\n=== Utility Kernels ===");
+    println!("\n{:=<80}", "= Utility Kernels ");
     // Reset any lingering CUDA errors from previous benchmarks
     unsafe { cudaDeviceSynchronize(); }
 
@@ -1005,7 +1005,7 @@ fn bench_pod(reg: &KernelRegistry, ws: &Workspace) {
     let pod_variant = match reg.get_pod(&pod_key) {
         Some(v) => v,
         None => {
-            println!("\n=== POD Benchmark: SKIPPED (not compiled) ===");
+            println!("\n{:=<80}", "= POD Benchmark: SKIPPED (not compiled) ");
             return;
         }
     };
@@ -1018,7 +1018,7 @@ fn bench_pod(reg: &KernelRegistry, ws: &Workspace) {
         sliding_window: false, logits_soft_cap: false,
     }).unwrap();
 
-    println!("\n=== POD Benchmark (BF16 h128) ===");
+    println!("\n{:=<80}", "= POD Benchmark (BF16 h128) ");
     println!("{:<50} {:>10} {:>10} {:>8}",
         "Config", "POD(µs)", "Sep(µs)", "Speedup");
     println!("{}", "-".repeat(82));
@@ -1327,7 +1327,7 @@ fn bench_pod(reg: &KernelRegistry, ws: &Workspace) {
 }
 
 fn main() {
-    println!("=== FlashInfer Attention Benchmarks ===");
+    println!("{:=<80}", "= FlashInfer Attention Benchmarks ");
 
     let reg = KernelRegistry::new();
     println!("GPU: SM{}, backend: {:?}", reg.arch(), reg.default_backend());

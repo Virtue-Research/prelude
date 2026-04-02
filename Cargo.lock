@@ -2735,6 +2735,7 @@ name = "prelude-quant-gemm"
 version = "0.1.0"
 dependencies = [
  "candle-core",
+ "cudarc 0.19.4",
  "half",
  "rand 0.10.0",
 ]

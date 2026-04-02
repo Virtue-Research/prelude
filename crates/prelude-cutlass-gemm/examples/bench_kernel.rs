@@ -1,6 +1,6 @@
 //! CUTLASS GEMM performance benchmark — SM90 vs SM80 vs cuBLAS/cuBLASLt.
 //!
-//! Run:  cargo run -p prelude-cutlass-gemm --bin bench_kernel --release
+//! Run:  cargo run -p prelude-cutlass-gemm --example bench_kernel --release
 
 use std::ffi::c_void;
 use std::sync::Arc;
