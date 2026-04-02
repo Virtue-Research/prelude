@@ -1,6 +1,6 @@
 //! Build script for prelude-flashinfer.
 //!
-//! 1. Find FlashInfer source (FLASHINFER_SRC env var or auto-clone).
+//! 1. Find FlashInfer source (third_party/flashinfer/ or FLASHINFER_SRC env var).
 //! 2. Run scripts/compile_kernels.py to AOT-compile kernel variants.
 //! 3. Archive all .o files into libflashinfer_kernels.a.
 //! 4. Compile vendored tvm_ffi C++ (shared with FA4).

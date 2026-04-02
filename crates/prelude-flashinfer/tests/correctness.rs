@@ -765,9 +765,6 @@ fn bf16_gemm_correctness() {
     unsafe { cudaFree(a_ptr); cudaFree(b_ptr); cudaFree(c_ptr); cudaFree(ws_ptr); }
 }
 
-// GDN prefill smoke test — TODO: needs template instantiation codegen first
-// See compile_kernels.py SM90 conditional section for details.
-
 // POD is excluded from AOT (archive size > 2GB). Infrastructure is in place
 // for future JIT compilation. See generate_batch_pod_sources() in compile_kernels.py.
 

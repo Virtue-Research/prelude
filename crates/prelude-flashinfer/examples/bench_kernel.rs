@@ -1062,20 +1062,6 @@ fn bench_gemm(reg: &KernelRegistry) {
         println!("  tgv_gemm: not compiled");
     }
 
-    // TRT-LLM Low-Latency GEMM
-    if let Some(gemm) = reg.get_utility("trtllm_low_latency_gemm") {
-        println!("  trtllm_low_latency_gemm: compiled (benchmark requires workspace setup)");
-    }
-
-    // FP4 GEMM (SM100+)
-    if let Some(gemm) = reg.get_utility("fp4_gemm") {
-        println!("  fp4_gemm: compiled (SM100+ benchmark requires FP4 weight format)");
-    }
-
-    // MXFP8 GEMM (SM100+)
-    if let Some(gemm) = reg.get_utility("mxfp8_gemm") {
-        println!("  mxfp8_gemm: compiled (SM100+ benchmark requires MXFP8 format)");
-    }
 }
 
 fn bench_topk(reg: &KernelRegistry) {
