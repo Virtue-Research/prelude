@@ -60,8 +60,8 @@ fn tflops(m: usize, n: usize, k: usize, us: f64) -> f64 {
     2.0 * m as f64 * n as f64 * k as f64 / (us * 1e-6) / 1e12
 }
 
-fn ratio_marker(r: f64) -> &'static str {
-    if r <= 1.05 { " " } else if r <= 1.3 { "~" } else if r >= 2.0 { "!" } else { "" }
+fn speedup_marker(r: f64) -> &'static str {
+    if r >= 0.95 { " " } else if r >= 0.77 { "~" } else if r <= 0.5 { "!" } else { "" }
 }
 
 // ── Random data ─────────────────────────────────────────────────────────
@@ -271,11 +271,11 @@ fn bench_bf16_gemm(gpu: &Gpu) {
                 let cub_us = bench_us(|| cublas_gemm_bf16(&weight, &input, &mut out, m, *n, *k, &gpu), &gpu);
 
                 let tf = tflops(m, *n, *k, sm90_us);
-                let r = sm90_us / cub_us;
+                let r = cub_us / sm90_us;
 
                 print!("{tok_label:<10} {layer:<8} {sm90_us:>9.1}");
                 for t in &sm80_times { print!(" {t:>7.1}"); }
-                print!(" {cub_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T", r, ratio_marker(r));
+                print!(" {cub_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T", r, speedup_marker(r));
                 println!();
             }
         }
@@ -309,8 +309,8 @@ fn bench_fp16_gemm(gpu: &Gpu) {
                 let cub_us = bench_us(|| cublas_gemm_fp16(&weight, &input, &mut out, m, *n, *k, &gpu), &gpu);
 
                 let tf = tflops(m, *n, *k, sm90_us);
-                let r = sm90_us / cub_us;
-                println!("{tok_label:<10} {layer:<8} {sm90_us:>9.1} {cub_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T", r, ratio_marker(r));
+                let r = cub_us / sm90_us;
+                println!("{tok_label:<10} {layer:<8} {sm90_us:>9.1} {cub_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T", r, speedup_marker(r));
             }
         }
         println!();
@@ -343,8 +343,8 @@ fn bench_f32_gemm(gpu: &Gpu) {
                 let cub_us = bench_us(|| cublas_gemm_f32(&weight, &input, &mut out, m, *n, *k, &gpu), &gpu);
 
                 let tf = tflops(m, *n, *k, sm90_us);
-                let r = sm90_us / cub_us;
-                println!("{tok_label:<10} {layer:<8} {sm90_us:>9.1} {cub_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T", r, ratio_marker(r));
+                let r = cub_us / sm90_us;
+                println!("{tok_label:<10} {layer:<8} {sm90_us:>9.1} {cub_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T", r, speedup_marker(r));
             }
         }
         println!();
@@ -507,8 +507,8 @@ fn bench_fp8_gemm(gpu: &Gpu) {
                     let cub_us = bench_us(|| {
                         cublaslt_fp8_gemm(&weight, &input, &mut out_bf16, &scale_a_gpu, &scale_b_gpu, m, *n, *k, &gpu);
                     }, &gpu);
-                    let r = sm90_us / cub_us;
-                    println!("{tok_label:<10} {layer:<8} {sm90_us:>9.1} {cub_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T", r, ratio_marker(r));
+                    let r = cub_us / sm90_us;
+                    println!("{tok_label:<10} {layer:<8} {sm90_us:>9.1} {cub_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T", r, speedup_marker(r));
                 } else {
                     println!("{tok_label:<10} {layer:<8} {sm90_us:>9.1}       N/A         {tf:>6.1}T");
                 }
@@ -580,7 +580,7 @@ fn bench_batched_bf16(gpu: &Gpu) {
         }, &gpu);
 
         let tf = tflops(*batch * *m, *n, *k, sm90_us);
-        let r = sm90_us / cub_us;
-        println!("{batch:<8} {m:<6} {n:<6} {k:<6} {sm90_us:>9.1} {cub_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T", r, ratio_marker(r));
+        let r = cub_us / sm90_us;
+        println!("{batch:<8} {m:<6} {n:<6} {k:<6} {sm90_us:>9.1} {cub_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T", r, speedup_marker(r));
     }
 }

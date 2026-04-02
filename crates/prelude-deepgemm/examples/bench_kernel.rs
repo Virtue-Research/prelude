@@ -60,8 +60,8 @@ fn tflops(m: usize, n: usize, k: usize, us: f64) -> f64 {
     2.0 * m as f64 * n as f64 * k as f64 / (us * 1e-6) / 1e12
 }
 
-fn ratio_marker(r: f64) -> &'static str {
-    if r <= 1.05 { " " } else if r <= 1.3 { "~" } else if r >= 2.0 { "!" } else { "" }
+fn speedup_marker(r: f64) -> &'static str {
+    if r >= 0.95 { " " } else if r >= 0.77 { "~" } else if r <= 0.5 { "!" } else { "" }
 }
 
 // ── Random data ─────────────────────────────────────────────────────────
@@ -194,11 +194,11 @@ fn bench_bf16(gpu: &Gpu) {
                 );
 
                 let tf = tflops(m, *n, *k, dg_us);
-                let r = dg_us / cub_us;
+                let r = cub_us / dg_us;
                 let cfg_str = format!("{bm}x{bn}/s{stages}");
                 println!(
                     "{tok_label:<10} {layer:<8} {dg_us:>9.1} {cub_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T  {cfg_str:>16}",
-                    r, ratio_marker(r),
+                    r, speedup_marker(r),
                 );
             }
         }
@@ -424,12 +424,12 @@ fn bench_fp8_1d1d(gpu: &Gpu) {
             } else { f64::NAN };
 
             let tf = tflops(m, n, k, dg_us);
-            let r = dg_us / lt_us;
+            let r = lt_us / dg_us;
             if lt_us.is_nan() {
                 println!("{m:<6} {n:<5} {k:<5} {dg_us:>9.1} {:>9} {:>7} {tf:>6.1}T", "N/A", "N/A");
             } else {
                 println!("{m:<6} {n:<5} {k:<5} {dg_us:>9.1} {lt_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T",
-                    r, ratio_marker(r));
+                    r, speedup_marker(r));
             }
         }
     }
@@ -519,9 +519,9 @@ fn bench_fp8(gpu: &Gpu) {
                         cublaslt_fp8(&weight_cub, &input_cub, &mut out_bf16,
                             &scale_a_cub, &scale_b_cub, m, *n, *k, gpu);
                     }, gpu);
-                    let r = dg_us / cub_us;
+                    let r = cub_us / dg_us;
                     println!("{tok_label:<10} {layer:<8} {dg_us:>9.1} {cub_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T  {cfg_str:>16}",
-                        r, ratio_marker(r));
+                        r, speedup_marker(r));
                 } else {
                     println!("{tok_label:<10} {layer:<8} {dg_us:>9.1}       N/A         {tf:>6.1}T  {cfg_str:>16}");
                 }
@@ -616,10 +616,10 @@ fn bench_grouped(gpu: &Gpu) {
         }, gpu);
 
         let tf = tflops(total_m, n, k, grp_us);
-        let r = grp_us / sep_us;
+        let r = sep_us / grp_us;
         let cfg_str = format!("{bm}x{bn}/s{stages}");
         println!("{num_groups:<6} {m_per_group:<6} {n:<5} {k:<5} {grp_us:>9.1} {sep_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T  {cfg_str:>16}",
-            r, ratio_marker(r));
+            r, speedup_marker(r));
     }
     println!();
 }
@@ -723,9 +723,9 @@ fn bench_grouped_fp8(gpu: &Gpu) {
         }, gpu);
 
         let tf = tflops(total_m, n, k, grp_us);
-        let r = grp_us / sep_us;
+        let r = sep_us / grp_us;
         println!("{num_groups:<6} {m_per_group:<6} {n:<5} {k:<5} {grp_us:>9.1} {sep_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T",
-            r, ratio_marker(r));
+            r, speedup_marker(r));
     }
     println!();
 }
@@ -801,9 +801,9 @@ fn bench_masked(gpu: &Gpu) {
 
         let total_flops_m = num_groups * actual_m;
         let tf = tflops(total_flops_m, n, k, msk_us);
-        let r = msk_us / sep_us;
+        let r = sep_us / msk_us;
         println!("{num_groups:<6} {padded_m:<6} {actual_m:<6} {n:<5} {k:<5} {msk_us:>9.1} {sep_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T",
-            r, ratio_marker(r));
+            r, speedup_marker(r));
     }
     println!();
 }
@@ -878,9 +878,9 @@ fn bench_masked_fp8(gpu: &Gpu) {
 
         let total_flops_m = num_groups * actual_m;
         let tf = tflops(total_flops_m, n, k, msk_us);
-        let r = msk_us / sep_us;
+        let r = sep_us / msk_us;
         println!("{num_groups:<6} {padded_m:<6} {actual_m:<6} {n:<5} {k:<5} {msk_us:>9.1} {sep_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T",
-            r, ratio_marker(r));
+            r, speedup_marker(r));
     }
     println!();
 }
@@ -930,9 +930,9 @@ fn bench_acc(gpu: &Gpu) {
         }, gpu);
 
         let tf = tflops(m, n, k, acc_us);
-        let r = acc_us / cub_us;
+        let r = cub_us / acc_us;
         println!("{m:<6} {n:<5} {k:<5} {acc_us:>9.1} {cub_us:>9.1} {:>5.2}x{:<1} {tf:>6.1}T",
-            r, ratio_marker(r));
+            r, speedup_marker(r));
     }
     println!();
 }
@@ -1144,9 +1144,9 @@ fn bench_einsum(gpu: &Gpu) {
             }, &gpu);
 
             let tf = tflops(s * *m, *n, *k, dg_us);
-            let r = dg_us / cub_us;
+            let r = cub_us / dg_us;
             println!("{m:<4} {n:<4} {k:<4} {s:<6} {dg_us:>10.1} {cub_us:>10.1} {:>5.2}x{:<1} {tf:>6.1}T",
-                r, ratio_marker(r));
+                r, speedup_marker(r));
         }
     }
     println!();
