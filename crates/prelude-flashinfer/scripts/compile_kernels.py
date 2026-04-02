@@ -1105,6 +1105,89 @@ def generate_utility_sources(
             if f.suffix in (".cpp", ".cu")],
          None, "moe_routing",
          ["NoAuxTc"]),
+        # ── New modules ─────────────────────────────────────────────
+        # TopK (GPU radix topk for sampling / MOE expert selection)
+        ("fi_topk", ["topk.cu"], "flashinfer_topk_binding.cu", "topk",
+         ["radix_topk", "radix_topk_page_table_transform",
+          "radix_topk_ragged_transform", "can_implement_filtered_topk"]),
+        # Concat MLA K cache
+        ("fi_concat_mla", ["concat_mla.cu"], None, "mla",
+         ["concat_mla_k"]),
+        # MOE utilities — EXCLUDED: depends on RoutingKernel.h which needs
+        # batchedGemm::trtllm::gen namespace from trtllmGen_bmm_export/.
+        # ("fi_moe_utils", ["moe_utils_binding.cu"], None, "moe_utils", [...]),
+        # GEMM: TGV + BF16 (tgv_gemm.cu re-exports bf16_gemm + bf16_gemm_tactic_num)
+        ("fi_gemm_bf16", ["tgv_gemm.cu"], None, "gemm",
+         ["tgv_gemm", "tgv_gemm_tactic_num", "bf16_gemm", "bf16_gemm_tactic_num"]),
+        # GEMM: FP8 — EXCLUDED: has SM100 template dispatch that needs separate
+        # SM100 instantiation files. Requires artifact download or SM100 conditional build.
+        # ("fi_gemm_fp8", ["fp8_gemm_cutlass.cu"], None, "gemm",
+        #  ["fp8_gemm", "fp8_gemm_tactic_num"]),
+        # GEMM: Segment/Group + BMM FP8 (SM80+)
+        ("fi_gemm_segment", ["group_gemm.cu", "bmm_fp8.cu"],
+         "flashinfer_gemm_binding.cu", "gemm",
+         ["cutlass_segment_gemm", "bmm_fp8"]),
+        # DSv3 / ML3 router GEMM
+        ("fi_dsv3_router", ["dsv3_router_gemm.cu"], None, "moe",
+         ["dsv3_router_gemm_op", "ml3_router_gemm_op"]),
+        # TRT-LLM AllReduce (IPC-based custom all-reduce)
+        ("fi_trtllm_allreduce", ["trtllm_allreduce.cu"], None, "comm",
+         ["trtllm_lamport_initialize", "trtllm_lamport_initialize_all",
+          "trtllm_custom_all_reduce"]),
+        # TRT-LLM AllReduce Fusion (fused allreduce + rmsnorm/bias)
+        ("fi_trtllm_allreduce_fusion", ["trtllm_allreduce_fusion.cu"], None, "comm",
+         ["trtllm_allreduce_fusion"]),
+        # TRT-LLM MOE AllToAll
+        ("fi_trtllm_moe_alltoall", ["trtllm_moe_alltoall.cu"], None, "comm",
+         ["moe_a2a_get_aux_data_size", "moe_a2a_initialize", "moe_a2a_dispatch",
+          "moe_a2a_combine", "moe_a2a_sanitize_expert_ids",
+          "moe_a2a_get_metainfo_index_pairs"]),
+        # TRT-LLM MOE AllReduce Fusion
+        ("fi_trtllm_moe_allreduce_fusion", ["trtllm_moe_allreduce_fusion.cu"], None, "comm",
+         ["trtllm_moe_allreduce_fusion", "trtllm_moe_finalize_allreduce_fusion"]),
+        # TRT-LLM MNNVL AllReduce
+        ("fi_trtllm_mnnvl_allreduce", ["trtllm_mnnvl_allreduce.cu"], None, "comm",
+         ["trtllm_mnnvl_allreduce_fusion"]),
+        # TRT-LLM AllToAll (MOE dispatch primitives)
+        ("fi_trtllm_alltoall", ["trtllm_alltoall.cu", "trtllm_alltoall_prepare.cu"],
+         None, "comm",
+         ["moe_comm_prepare_indices", "moe_local_gather", "moe_comm",
+          "set_moe_max_usable_sm_count", "get_moe_commworkspace_size_per_rank",
+          "get_moe_prepare_workspace_size_per_rank", "moe_prepare"]),
+        # vLLM Custom AllReduce
+        ("fi_vllm_allreduce", ["vllm_custom_all_reduce.cu"], None, "comm",
+         ["get_graph_buffer_ipc_meta", "register_graph_buffers", "dispose",
+          "meta_size", "register_buffer", "init_custom_ar", "all_reduce"]),
+        # TRT-LLM Fused MOE kernel launcher — EXCLUDED: requires GemmGatedActOptions.h
+        # from trtllmGen_bmm_export/ which is a TensorRT-LLM codegen artifact not
+        # available in the FlashInfer source tree. Use CUTLASS fused MOE instead.
+        # ("fi_trtllm_fused_moe", ["trtllm_fused_moe_kernel_launcher.cu"], None, "moe",
+        #  ["trtllm_bf16_moe", ...]),
+        # TRT-LLM Fused MOE runner — EXCLUDED: depends on trtllmGen_bmm_export/
+        # ("fi_trtllm_fused_moe_runner", ["trtllm_fused_moe_runner.cu"], None, "moe", []),
+        # TRT-LLM GEMM runner — EXCLUDED: needs CudaRunner.h from trtllmGen codegen
+        # ("fi_trtllm_gemm", ["trtllm_gemm_runner.cu"], None, "gemm",
+        #  ["trtllm_gemm", "trtllm_gemm_tactics"]),
+        # TRT-LLM Low-Latency GEMM runner — EXCLUDED: needs CudaRunner.h from trtllmGen codegen
+        # ("fi_trtllm_low_latency_gemm", ["trtllm_low_latency_gemm_runner.cu"], None, "gemm",
+        #  ["trtllm_low_latency_gemm", "trtllm_low_latency_gemm_tactics",
+        #   "get_workspace_size_in_bytes"]),
+        # TRT-LLM Batched GEMM runner — EXCLUDED: depends on trtllmGen_bmm_export/
+        # ("fi_trtllm_batched_gemm", ["trtllm_batched_gemm_runner.cu"], None, "gemm", []),
+        # Mamba: selective state update — EXCLUDED: requires per-(DIM, DSTATE)
+        # template instantiation with jinja codegen, similar to attention head_dim variants.
+        # Needs a dedicated generate_mamba_sources() function. TODO.
+        # ("fi_mamba", ["selective_state_update.cu", ...], "flashinfer_mamba_binding.cu", "mamba",
+        #  ["selective_state_update"]),
+        # CUTLASS MLA paged attention
+        ("fi_cutlass_mla", ["cutlass_mla.cu"], "flashinfer_mla_binding.cu", "mla",
+         ["cutlass_mla_paged_attention"]),
+        # CUTLASS Fused MOE — EXCLUDED: undefined identifiers (use_fp8_input,
+        # ActivationParams) due to version mismatch between FlashInfer and nv_internal.
+        # ("fi_cutlass_fused_moe", [...], None, "moe", [...]),
+        # TRT-LLM Fused MOE routing backends — EXCLUDED: all go through
+        # RoutingKernel.cuh → DevKernel.h → trtllmGen_bmm_export/
+        # ("fi_trtllm_moe_routing_backends", [...], None, "moe", []),
     ]
 
     for dir_name, src_files, binding_file, kind, symbols in modules:
@@ -1394,9 +1477,21 @@ def compile_source(
         str(fi_src / "csrc"),
         str(fi_src / "csrc" / "nv_internal"),          # vendored TRT-LLM impl headers
         str(fi_src / "csrc" / "nv_internal" / "include"),  # vendored TRT-LLM public headers
+        str(fi_src / "csrc" / "nv_internal" / "tensorrt_llm" / "kernels" / "cutlass_kernels" / "include"),  # MOE GEMM headers
+        str(fi_src / "csrc" / "nv_internal" / "tensorrt_llm" / "cutlass_extensions" / "include"),  # CUTLASS extensions
         str(fi_src / "csrc" / "fused_moe"),            # MoE helper headers
+        str(fi_src / "csrc" / "fused_moe" / "cutlass_backend"),  # CUTLASS MOE kernels
+        str(fi_src / "csrc" / "fused_moe" / "trtllm_backend"),  # TRT-LLM MOE routing
         str(src.parent),  # for config .inc files
     ]
+    # spdlog headers (needed for comm modules)
+    spdlog_include = fi_src / "3rdparty" / "spdlog" / "include"
+    if spdlog_include.exists():
+        include_dirs.append(str(spdlog_include))
+    # trtllmGen export headers (needed for TRT-LLM GEMM/MOE runners)
+    gemm_export = fi_src / "include" / "flashinfer" / "trtllm" / "gemm" / "trtllmGen_gemm_export"
+    if gemm_export.exists():
+        include_dirs.append(str(gemm_export))
     # CUTLASS headers (needed for SM90/Hopper kernels)
     cutlass_base = fi_src / "3rdparty" / "cutlass"
     for sub in ["include", "tools/util/include"]:
@@ -1411,7 +1506,7 @@ def compile_source(
 
     cmd = [
         "nvcc", "-c", str(src), "-o", str(obj),
-        "-std=c++17", "--expt-relaxed-constexpr",
+        "-std=c++20", "--expt-relaxed-constexpr",
         "-DFLASHINFER_ENABLE_BF16", "-DFLASHINFER_ENABLE_F16", "-DFLASHINFER_ENABLE_FP8",
         "-DNDEBUG",
         "-O3", "--use_fast_math",
@@ -1722,6 +1817,11 @@ def main():
         for src in sources:
             compile_jobs.append((src, v["arch_flags"], extra, v))
 
+    # NOTE: trtllmGen_bmm_export/ is missing from the FlashInfer source tree.
+    # Modules that depend on it (moe_utils, trtllm_fused_moe, batched_gemm_runner)
+    # are excluded from AOT compilation. They use a `batchedGemm::trtllm::gen`
+    # namespace that differs from gemm_export's `gemm::trtllm::gen`.
+
     # Utility kernels (non-templated, compiled once)
     # Use sm_90a (arch-specific) to satisfy arch_condition.h check in CUDA 12.9+
     sm80_flags = ["-gencode", "arch=compute_80,code=compute_80",
@@ -1773,6 +1873,146 @@ def main():
         for src in sm100_sources:
             compile_jobs.append((src, sm100_flags, [], sm100_vinfo))
         print(f"  SM100 FMHA: {len(sm100_sources)} sources (requires CUDA 12.8+)")
+
+    # ── SM90 conditional modules ──────────────────────────────────────
+    has_sm90 = any(a >= 90 for a in archs)
+    sm90_util_flags = ["-gencode", "arch=compute_90a,code=sm_90a"]
+    if has_sm90:
+        sm90_modules = []
+        # GDN prefill (Gated Delta Net — Qwen3.5 DeltaNet layers)
+        # EXCLUDED: requires 32 explicit template instantiations of
+        # launch_delta_rule_prefill_kernel_gbai<4 bools × 2 dtypes>.
+        # Needs a dedicated generate_gdn_sources() function with jinja codegen. TODO.
+
+        # Segment GEMM SM90
+        seg90_out = gen_dir / "fi_gemm_segment_sm90"
+        seg90_out.mkdir(parents=True, exist_ok=True)
+        seg90_sources = []
+        for src_file in ["group_gemm_sm90.cu"]:
+            src_path = fi_src / "csrc" / src_file
+            if src_path.exists():
+                shutil.copy2(src_path, seg90_out / src_file)
+                seg90_sources.append(seg90_out / src_file)
+        seg90_binding = fi_src / "csrc" / "flashinfer_gemm_sm90_binding.cu"
+        if seg90_binding.exists():
+            shutil.copy2(seg90_binding, seg90_out / "flashinfer_gemm_sm90_binding.cu")
+            seg90_sources.append(seg90_out / "flashinfer_gemm_sm90_binding.cu")
+        seg90_vinfo = {"vid": "fi_gemm_segment_sm90", "kind": "gemm",
+                       "symbols": {"cutlass_segment_gemm_sm90": "__tvm_ffi_cutlass_segment_gemm_sm90"}}
+        for src in seg90_sources:
+            compile_jobs.append((src, sm90_util_flags, [], seg90_vinfo))
+        sm90_modules.append(([], [], seg90_vinfo))
+
+        # FP8 block-scale GEMM SM90 — EXCLUDED: needs CutlassFp8BlockScaleGemmRunner
+        # template instantiation from TRT-LLM's nv_internal kernels.
+
+        for _, _, vinfo in sm90_modules:
+            utility_variants.append(([], [], vinfo))
+
+    # ── SM100 conditional modules ─────────────────────────────────────
+    sm100_util_flags = ["-gencode", "arch=compute_100a,code=sm_100a"]
+    if has_sm100:
+        sm100_modules = []
+        csrc = fi_src / "csrc"
+
+        def _add_sm100_module(vid, src_files, binding_file, symbols):
+            mod_out = gen_dir / vid
+            mod_out.mkdir(parents=True, exist_ok=True)
+            mod_sources = []
+            for sf in src_files:
+                sp = csrc / sf
+                if sp.exists():
+                    shutil.copy2(sp, mod_out / Path(sf).name)
+                    mod_sources.append(mod_out / Path(sf).name)
+            if binding_file:
+                bp = csrc / binding_file
+                if bp.exists():
+                    shutil.copy2(bp, mod_out / binding_file)
+                    mod_sources.append(mod_out / binding_file)
+            vinfo = {"vid": vid, "kind": "gemm",
+                     "symbols": {s: f"__tvm_ffi_{s}" for s in symbols}}
+            for src in mod_sources:
+                compile_jobs.append((src, sm100_util_flags, [], vinfo))
+            sm100_modules.append(vinfo)
+
+        # FP4 GEMM (SM100)
+        _add_sm100_module("fi_fp4_gemm_sm100",
+                          ["fp4_gemm_cutlass.cu"], None,
+                          ["fp4_gemm", "fp4_gemm_tactic_num"])
+        # MXFP8 GEMM (SM100+)
+        _add_sm100_module("fi_mxfp8_gemm",
+                          ["mxfp8_gemm_cutlass.cu"], None,
+                          ["mxfp8_gemm", "mxfp8_gemm_tactic_num"])
+        # Groupwise GEMM SM100 (FP8)
+        _add_sm100_module("fi_gemm_groupwise_sm100",
+                          ["gemm_groupwise_sm100.cu"], "gemm_sm100_binding.cu",
+                          ["gemm_fp8_nt_groupwise"])
+        # Group GEMM SM100 (FP8 + MXFP4)
+        _add_sm100_module("fi_group_gemm_sm100",
+                          ["group_gemm_fp8_groupwise_sm100.cu",
+                           "group_gemm_mxfp4_groupwise_sm100.cu"],
+                          "group_gemm_sm100_binding.cu",
+                          ["group_gemm_fp8_nt_groupwise", "group_gemm_mxfp4_nt_groupwise"])
+        # FP4 GEMM SM103
+        fp4_103 = csrc / "fp4_gemm_cutlass_sm103.cu"
+        if fp4_103.exists():
+            sm103_flags = ["-gencode", "arch=compute_100a,code=sm_100a"]
+            _add_sm100_module("fi_fp4_gemm_sm103",
+                              ["fp4_gemm_cutlass_sm103.cu"], None,
+                              ["fp4_gemm", "fp4_gemm_tactic_num"])
+
+        for vinfo in sm100_modules:
+            utility_variants.append(([], [], vinfo))
+        print(f"  SM100 GEMM: {len(sm100_modules)} modules")
+
+    # ── SM120 conditional modules ─────────────────────────────────────
+    has_sm120 = any(a >= 120 for a in archs)
+    if has_sm120:
+        sm120_flags = ["-gencode", "arch=compute_120a,code=sm_120a"]
+        sm120_modules = []
+        csrc = fi_src / "csrc"
+
+        def _add_sm120_module(vid, src_files, binding_file, symbols):
+            mod_out = gen_dir / vid
+            mod_out.mkdir(parents=True, exist_ok=True)
+            mod_sources = []
+            for sf in src_files:
+                sp = csrc / sf
+                if sp.exists():
+                    shutil.copy2(sp, mod_out / Path(sf).name)
+                    mod_sources.append(mod_out / Path(sf).name)
+            if binding_file:
+                bp = csrc / binding_file
+                if bp.exists():
+                    shutil.copy2(bp, mod_out / binding_file)
+                    mod_sources.append(mod_out / binding_file)
+            vinfo = {"vid": vid, "kind": "gemm",
+                     "symbols": {s: f"__tvm_ffi_{s}" for s in symbols}}
+            for src in mod_sources:
+                compile_jobs.append((src, sm120_flags, [], vinfo))
+            sm120_modules.append(vinfo)
+
+        # FP4 GEMM SM120
+        _add_sm120_module("fi_fp4_gemm_sm120",
+                          ["fp4_gemm_cutlass_sm120.cu"], None,
+                          ["fp4_gemm", "fp4_gemm_tactic_num"])
+        # Groupwise GEMM SM120
+        _add_sm120_module("fi_gemm_groupwise_sm120",
+                          ["gemm_groupwise_sm120.cu"], "gemm_sm120_binding.cu",
+                          ["gemm_fp8_nt_groupwise"])
+        # Group GEMM SM120 (FP8 + NVFP4 + MXFP4)
+        _add_sm120_module("fi_group_gemm_sm120",
+                          ["group_gemm_fp8_groupwise_sm120.cu",
+                           "group_gemm_nvfp4_groupwise_sm120.cu",
+                           "group_gemm_mxfp4_groupwise_sm120.cu"],
+                          "group_gemm_sm120_binding.cu",
+                          ["group_gemm_fp8_nt_groupwise",
+                           "group_gemm_nvfp4_nt_groupwise",
+                           "group_gemm_mxfp4_nt_groupwise"])
+
+        for vinfo in sm120_modules:
+            utility_variants.append(([], [], vinfo))
+        print(f"  SM120 GEMM: {len(sm120_modules)} modules")
 
     for sources, extra, vinfo in utility_variants:
         for src in sources:

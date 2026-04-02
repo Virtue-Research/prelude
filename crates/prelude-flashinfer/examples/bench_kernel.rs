@@ -993,6 +993,127 @@ fn bench_utilities(reg: &KernelRegistry) {
     }
 }
 
+// ── New module benchmarks ─────────────────────────────────────────────
+
+fn bench_gemm(reg: &KernelRegistry) {
+    println!("\n{:=<80}", "= GEMM Kernels ");
+
+    // BF16 GEMM
+    if let Some(gemm) = reg.get_utility("bf16_gemm") {
+        for &(m, n, k) in &[(1i64, 4096, 4096), (32, 4096, 4096), (128, 4096, 11008), (512, 4096, 11008)] {
+            let a = gpu_alloc((m * k) as usize * 2);
+            let b = gpu_alloc((k * n) as usize * 2);
+            let d = gpu_alloc((m * n) as usize * 2);
+
+            let a_s = [m, k]; let a_st = strides(&a_s);
+            let b_s = [n, k]; let b_st = strides(&b_s);  // NT layout
+            let d_s = [m, n]; let d_st = strides(&d_s);
+
+            let dl_a = gpu_dl(a, BF16_DT, &a_s, &a_st);
+            let dl_b = gpu_dl(b, BF16_DT, &b_s, &b_st);
+            let dl_d = gpu_dl(d, BF16_DT, &d_s, &d_st);
+
+            unsafe { reg.set_stream(0, std::ptr::null_mut()); }
+
+            let args = [
+                TVMFFIAny::dltensor(&dl_a), TVMFFIAny::dltensor(&dl_b),
+                TVMFFIAny::dltensor(&dl_d), TVMFFIAny::int64(-1),
+            ];
+
+            let ms = cuda_bench(5, 50, || {
+                unsafe { reg.call(gemm, &args).unwrap(); }
+            });
+            let tflops = 2.0 * m as f64 * n as f64 * k as f64 / (ms as f64 * 1e-3) / 1e12;
+            println!("  bf16_gemm   ({m}×{n}×{k}): {ms:.3} ms, {tflops:.1} TFLOPS");
+
+            unsafe { cudaFree(a); cudaFree(b); cudaFree(d); }
+        }
+    }
+
+    // TGV GEMM (low-latency decode)
+    if let Some(gemm) = reg.get_utility("tgv_gemm") {
+        for &(m, n, k) in &[(1i64, 4096, 4096), (1, 4096, 11008), (1, 11008, 4096)] {
+            let a = gpu_alloc((m * k) as usize * 2);
+            let b = gpu_alloc((k * n) as usize * 2);
+            let d = gpu_alloc((m * n) as usize * 2);
+
+            let a_s = [m, k]; let a_st = strides(&a_s);
+            let b_s = [n, k]; let b_st = strides(&b_s);
+            let d_s = [m, n]; let d_st = strides(&d_s);
+
+            let dl_a = gpu_dl(a, BF16_DT, &a_s, &a_st);
+            let dl_b = gpu_dl(b, BF16_DT, &b_s, &b_st);
+            let dl_d = gpu_dl(d, BF16_DT, &d_s, &d_st);
+
+            let args = [
+                TVMFFIAny::dltensor(&dl_a), TVMFFIAny::dltensor(&dl_b),
+                TVMFFIAny::dltensor(&dl_d), TVMFFIAny::int64(-1),
+            ];
+
+            let ms = cuda_bench(5, 100, || {
+                unsafe { reg.call(gemm, &args).unwrap(); }
+            });
+            let tflops = 2.0 * m as f64 * n as f64 * k as f64 / (ms as f64 * 1e-3) / 1e12;
+            println!("  tgv_gemm    ({m}×{n}×{k}): {ms:.3} ms, {tflops:.1} TFLOPS");
+
+            unsafe { cudaFree(a); cudaFree(b); cudaFree(d); }
+        }
+    } else {
+        println!("  tgv_gemm: not compiled");
+    }
+
+    // TRT-LLM Low-Latency GEMM
+    if let Some(gemm) = reg.get_utility("trtllm_low_latency_gemm") {
+        println!("  trtllm_low_latency_gemm: compiled (benchmark requires workspace setup)");
+    }
+
+    // FP4 GEMM (SM100+)
+    if let Some(gemm) = reg.get_utility("fp4_gemm") {
+        println!("  fp4_gemm: compiled (SM100+ benchmark requires FP4 weight format)");
+    }
+
+    // MXFP8 GEMM (SM100+)
+    if let Some(gemm) = reg.get_utility("mxfp8_gemm") {
+        println!("  mxfp8_gemm: compiled (SM100+ benchmark requires MXFP8 format)");
+    }
+}
+
+fn bench_topk(reg: &KernelRegistry) {
+    if let Some(topk) = reg.get_utility("radix_topk") {
+        println!("\n{:=<80}", "= TopK ");
+        for &(batch, vocab, k) in &[(64i64, 32000i64, 8i64), (256, 151936, 8)] {
+            let n = (batch * vocab) as usize;
+            let input = gpu_alloc(n * 4);  // FP32 scores
+            let vals = gpu_alloc((batch * k) as usize * 4);
+            let idxs = gpu_alloc((batch * k) as usize * 4);
+
+            let in_s = [batch, vocab]; let in_st = strides(&in_s);
+            let out_s = [batch, k]; let out_st = strides(&out_s);
+
+            let dl_in = gpu_dl(input, FP32_DT, &in_s, &in_st);
+            let dl_vals = gpu_dl(vals, FP32_DT, &out_s, &out_st);
+            let dl_idxs = gpu_dl(idxs, I32_DT, &out_s, &out_st);
+
+            unsafe { reg.set_stream(0, std::ptr::null_mut()); }
+
+            let args = [
+                TVMFFIAny::dltensor(&dl_in),
+                TVMFFIAny::dltensor(&dl_vals),
+                TVMFFIAny::dltensor(&dl_idxs),
+            ];
+
+            let ms = cuda_bench(5, 100, || {
+                unsafe { reg.call(topk, &args).unwrap(); }
+            });
+            let gb = n as f64 * 4.0 / 1e9;
+            let bw = gb / (ms as f64 * 1e-3);
+            println!("  radix_topk  ({batch}×{vocab}, k={k}): {ms:.3} ms, {bw:.1} GB/s");
+
+            unsafe { cudaFree(input); cudaFree(vals); cudaFree(idxs); }
+        }
+    }
+}
+
 // ── POD (Prefill-On-Decode) benchmark ──────────────────────────────────
 // Compare POD single kernel launch vs separate paged prefill + decode.
 
@@ -1333,6 +1454,8 @@ fn main() {
     println!("GPU: SM{}, backend: {:?}", reg.arch(), reg.default_backend());
 
     bench_utilities(&reg);
+    bench_gemm(&reg);
+    bench_topk(&reg);
 
     let ws = Workspace::new();
     bench_prefill(&reg, &ws);

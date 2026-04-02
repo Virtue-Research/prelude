@@ -2706,6 +2706,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cc",
+ "half",
  "hex",
  "serde",
  "serde_json",
