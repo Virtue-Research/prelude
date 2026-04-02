@@ -1069,35 +1069,86 @@ def generate_utility_sources(
     csrc = fi_src / "csrc"
     results = []
 
-    # Each utility module: (dir_name, source_files, binding_file, kind, symbols)
+    # ── Module list ─────────────────────────────────────────────────
+    #
+    # Organized to match upstream flashinfer/aot.py gen_all_modules().
+    # Each comment references the upstream function and section.
+    #
+    # Format: (dir_name, source_files, binding_file, kind, symbols)
+    #   dir_name:     output subdirectory name
+    #   source_files: .cu files relative to csrc/
+    #   binding_file: TVM-FFI binding .cu (or None if exports are inline)
+    #   kind:         category for manifest (used by build.rs dispatch codegen)
+    #   symbols:      exported TVM-FFI function names
+    #
     modules = [
+        # ── add_misc: gen_page_module() ──────────────────────────────
         ("fi_page", ["page.cu"], "flashinfer_page_binding.cu", "page",
          ["append_paged_kv_cache", "append_paged_mla_kv_cache"]),
-        ("fi_sampling", ["sampling.cu", "renorm.cu"], "flashinfer_sampling_binding.cu", "sampling",
+
+        # ── add_misc: gen_sampling_module() ──────────────────────────
+        ("fi_sampling", ["sampling.cu", "renorm.cu"],
+         "flashinfer_sampling_binding.cu", "sampling",
          ["softmax", "sampling_from_probs", "sampling_from_logits",
           "top_k_sampling_from_probs", "top_p_sampling_from_probs",
           "min_p_sampling_from_probs", "top_k_top_p_sampling_from_probs",
           "top_k_renorm_probs", "top_p_renorm_probs", "top_k_mask_logits",
           "chain_speculative_sampling"]),
+
+        # ── add_misc: gen_norm_module() ──────────────────────────────
         ("fi_norm", ["norm.cu"], "flashinfer_norm_binding.cu", "norm",
          ["rmsnorm", "fused_add_rmsnorm", "gemma_rmsnorm", "gemma_fused_add_rmsnorm",
           "rmsnorm_quant", "fused_add_rmsnorm_quant"]),
+
+        # ── add_misc: gen_rope_module() ──────────────────────────────
         ("fi_rope", ["rope.cu"], "flashinfer_rope_binding.cu", "rope",
          ["apply_rope", "apply_llama31_rope", "apply_rope_pos_ids",
           "apply_llama31_rope_pos_ids", "apply_rope_pos_ids_cos_sin_cache",
           "rope_quantize", "rope_quantize_append_paged_kv_cache"]),
+
+        # ── add_misc: gen_cascade_module() ───────────────────────────
         ("fi_cascade", ["cascade.cu"], "flashinfer_cascade_binding.cu", "cascade",
          ["merge_state", "merge_state_in_place", "merge_states"]),
-        # FP4 KV cache dequantization (SM80+, LUT-based)
+
+        # ── add_misc: gen_quantization_module() ──────────────────────
+        ("fi_quantization", ["quantization.cu"],
+         "flashinfer_quantization_binding.cu", "quantization",
+         ["packbits", "segment_packbits"]),
+
+        # ── add_misc: gen_topk_module() ──────────────────────────────
+        ("fi_topk", ["topk.cu"], "flashinfer_topk_binding.cu", "topk",
+         ["radix_topk", "radix_topk_page_table_transform",
+          "radix_topk_ragged_transform", "can_implement_filtered_topk"]),
+
+        # ── add_misc: gen_fp4_kv_dequantization_module() ─────────────
         ("fi_fp4_dequant", ["fp4_kv_dequantization.cu"], None, "fp4",
          ["nvfp4_kv_dequant"]),
-        # FP4 KV cache quantization (SM100+ for HW path, software fallback for SM80+)
+
+        # ── add_misc: gen_fp4_kv_quantization_module() ───────────────
+        # SM100+ for HW path, software fallback for SM80+.
         ("fi_fp4_quant", ["fp4_kv_quantization.cu"], None, "fp4",
          ["nvfp4_kv_quant"]),
-        # Quantization utilities: packbits / segment_packbits (GPU kernels for sparse mask packing)
-        ("fi_quantization", ["quantization.cu"], "flashinfer_quantization_binding.cu", "quantization",
-         ["packbits", "segment_packbits"]),
-        # MoE routing kernel + all TRT-LLM common utilities (auto-discovered)
+
+        # ── add_misc: concat_mla (no upstream aot.py entry) ─────────
+        ("fi_concat_mla", ["concat_mla.cu"], None, "mla",
+         ["concat_mla_k"]),
+
+        # ── add_misc: CUTLASS MLA paged attention ────────────────────
+        ("fi_cutlass_mla", ["cutlass_mla.cu"], "flashinfer_mla_binding.cu", "mla",
+         ["cutlass_mla_paged_attention"]),
+
+        # ── add_moe: gen_gemm_module() ───────────────────────────────
+        # Base GEMM: segment GEMM + BMM FP8. All archs.
+        # Upstream links -lcublas -lcublasLt (bmm_fp8 calls cuBLAS).
+        ("fi_gemm", ["group_gemm.cu", "bmm_fp8.cu"],
+         "flashinfer_gemm_binding.cu", "gemm",
+         ["cutlass_segment_gemm", "bmm_fp8"]),
+
+        # ── add_moe: DSv3 / ML3 router GEMM ─────────────────────────
+        ("fi_dsv3_router", ["dsv3_router_gemm.cu"], None, "moe",
+         ["dsv3_router_gemm_op", "ml3_router_gemm_op"]),
+
+        # ── add_moe: MoE routing kernel (NoAuxTc) + nv_internal utils ─
         ("fi_moe_routing",
          ["fused_moe/noAuxTcKernels.cu"]
          + [f"nv_internal/cpp/common/{f.name}"
@@ -1105,27 +1156,12 @@ def generate_utility_sources(
             if f.suffix in (".cpp", ".cu")],
          None, "moe_routing",
          ["NoAuxTc"]),
-        # ── New modules (matching upstream aot.py gen_all_modules) ──
-        # add_misc: topk, concat_mla
-        ("fi_topk", ["topk.cu"], "flashinfer_topk_binding.cu", "topk",
-         ["radix_topk", "radix_topk_page_table_transform",
-          "radix_topk_ragged_transform", "can_implement_filtered_topk"]),
-        ("fi_concat_mla", ["concat_mla.cu"], None, "mla",
-         ["concat_mla_k"]),
-        # add_moe: gen_gemm_module() — base GEMM (all archs, needs -lcublas -lcublasLt)
-        ("fi_gemm", ["group_gemm.cu", "bmm_fp8.cu"],
-         "flashinfer_gemm_binding.cu", "gemm",
-         ["cutlass_segment_gemm", "bmm_fp8"]),
-        # add_moe: DSv3 / ML3 router GEMM
-        ("fi_dsv3_router", ["dsv3_router_gemm.cu"], None, "moe",
-         ["dsv3_router_gemm_op", "ml3_router_gemm_op"]),
-        # add_comm: gen_vllm_comm_module() — all archs, needs -lcuda
+
+        # ── add_comm: gen_vllm_comm_module() ─────────────────────────
+        # All archs. Needs -lcuda (CUDA Driver API, comes with driver).
         ("fi_vllm_allreduce", ["vllm_custom_all_reduce.cu"], None, "comm",
          ["get_graph_buffer_ipc_meta", "register_graph_buffers", "dispose",
           "meta_size", "register_buffer", "init_custom_ar", "all_reduce"]),
-        # add_misc: CUTLASS MLA paged attention
-        ("fi_cutlass_mla", ["cutlass_mla.cu"], "flashinfer_mla_binding.cu", "mla",
-         ["cutlass_mla_paged_attention"]),
     ]
 
     for dir_name, src_files, binding_file, kind, symbols in modules:
@@ -1888,36 +1924,6 @@ def main():
         )
         print(f"  SM90 GEMM: {n} sources (6 dtype pair instantiations)")
 
-        # gen_trtllm_comm_module: SM90+ comm (allreduce + fusion)
-        comm_out = gen_dir / "fi_trtllm_comm"
-        comm_out.mkdir(parents=True, exist_ok=True)
-        comm_sources = []
-        for sf in ["trtllm_allreduce.cu", "trtllm_allreduce_fusion.cu",
-                    "trtllm_moe_allreduce_fusion.cu"]:
-            sp = csrc / sf
-            if sp.exists():
-                shutil.copy2(sp, comm_out / sf)
-                comm_sources.append(comm_out / sf)
-        comm_vinfo = {"vid": "fi_trtllm_comm", "kind": "comm",
-                      "symbols": {s: f"__tvm_ffi_{s}" for s in [
-                          "trtllm_lamport_initialize", "trtllm_lamport_initialize_all",
-                          "trtllm_custom_all_reduce", "trtllm_allreduce_fusion",
-                          "trtllm_moe_allreduce_fusion", "trtllm_moe_finalize_allreduce_fusion"]}}
-        for src in comm_sources:
-            compile_jobs.append((src, sm90_flags, [], comm_vinfo))
-        sm90_modules.append(comm_vinfo)
-
-        # gen_trtllm_mnnvl_comm_module: SM90+ MNNVL allreduce
-        mnnvl_out = gen_dir / "fi_trtllm_mnnvl"
-        mnnvl_out.mkdir(parents=True, exist_ok=True)
-        sp = csrc / "trtllm_mnnvl_allreduce.cu"
-        if sp.exists():
-            shutil.copy2(sp, mnnvl_out / "trtllm_mnnvl_allreduce.cu")
-            mnnvl_vinfo = {"vid": "fi_trtllm_mnnvl", "kind": "comm",
-                           "symbols": {"trtllm_mnnvl_allreduce_fusion": "__tvm_ffi_trtllm_mnnvl_allreduce_fusion"}}
-            compile_jobs.append((mnnvl_out / "trtllm_mnnvl_allreduce.cu", sm90_flags, [], mnnvl_vinfo))
-            sm90_modules.append(mnnvl_vinfo)
-
         for vinfo in sm90_modules:
             utility_variants.append(([], [], vinfo))
 
@@ -2034,6 +2040,23 @@ def main():
                            "group_gemm_mxfp4_groupwise_sm100.cu"],
                           "group_gemm_sm100_binding.cu",
                           ["group_gemm_fp8_nt_groupwise", "group_gemm_mxfp4_nt_groupwise"])
+
+        # ── add_comm: gen_trtllm_comm_module() — SM100+ ──────────────
+        # Upstream: if has_sm100: jit_specs.append(gen_trtllm_comm_module())
+        _add_sm100_module("fi_trtllm_comm",
+                          ["trtllm_allreduce.cu", "trtllm_allreduce_fusion.cu",
+                           "trtllm_moe_allreduce_fusion.cu"], None,
+                          ["trtllm_lamport_initialize", "trtllm_lamport_initialize_all",
+                           "trtllm_custom_all_reduce", "trtllm_allreduce_fusion",
+                           "trtllm_moe_allreduce_fusion", "trtllm_moe_finalize_allreduce_fusion"],
+                          kind="comm")
+
+        # ── add_comm: gen_trtllm_mnnvl_comm_module() — SM100+ ───────
+        # Upstream: if has_sm100: jit_specs.append(gen_trtllm_mnnvl_comm_module())
+        _add_sm100_module("fi_trtllm_mnnvl",
+                          ["trtllm_mnnvl_allreduce.cu"], None,
+                          ["trtllm_mnnvl_allreduce_fusion"],
+                          kind="comm")
 
         for vinfo in sm100_modules:
             utility_variants.append(([], [], vinfo))

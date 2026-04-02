@@ -332,18 +332,12 @@ fn sm90_module_lookup() {
         return;
     }
 
-    // GDN (Gated Delta Net — Qwen3.5 DeltaNet)
+    // add_misc: gen_gdn_prefill_sm90_module
     assert!(reg.get_utility("gdn_prefill").is_some(), "gdn_prefill not found (SM90 required)");
 
-    // Segment GEMM SM90
+    // add_moe: gen_gemm_sm90_module
     assert!(reg.get_utility("cutlass_segment_gemm_sm90").is_some(),
             "cutlass_segment_gemm_sm90 not found (SM90 required)");
-
-    // TRT-LLM Comm (SM90+)
-    assert!(reg.get_utility("trtllm_custom_all_reduce").is_some(),
-            "trtllm_custom_all_reduce not found (SM90 required)");
-    assert!(reg.get_utility("trtllm_allreduce_fusion").is_some(),
-            "trtllm_allreduce_fusion not found (SM90 required)");
 }
 
 #[test]
@@ -354,14 +348,18 @@ fn sm100_module_lookup() {
         return;
     }
 
-    // FP8 GEMM (SM100 jinja instantiation)
+    // add_moe: gen_gemm_sm100_module_cutlass_fp8
     assert!(reg.get_utility("fp8_gemm").is_some(), "fp8_gemm not found (SM100 required)");
 
-    // TGV GEMM (SM100 decode optimization)
+    // add_moe: gen_tgv_gemm_sm10x_module
     assert!(reg.get_utility("tgv_gemm").is_some(), "tgv_gemm not found (SM100 required)");
     assert!(reg.get_utility("bf16_gemm").is_some(), "bf16_gemm not found (SM100 required)");
 
-    // FP4 GEMM
+    // add_comm: gen_trtllm_comm_module (SM100+)
+    assert!(reg.get_utility("trtllm_custom_all_reduce").is_some(),
+            "trtllm_custom_all_reduce not found (SM100 required)");
+
+    // add_moe: gen_gemm_sm100_module_cutlass_fp4
     assert!(reg.get_utility("fp4_gemm").is_some(), "fp4_gemm not found (SM100 required)");
 
     // MXFP8 GEMM
@@ -607,11 +605,11 @@ fn concat_mla_k_correctness() {
 fn comm_module_lookup() {
     let reg = KernelRegistry::new();
 
-    // vLLM AllReduce (all archs)
+    // add_comm: gen_vllm_comm_module (all archs)
     assert!(reg.get_utility("init_custom_ar").is_some(), "init_custom_ar not found");
     assert!(reg.get_utility("all_reduce").is_some(), "vllm all_reduce not found");
 
-    // TRT-LLM comm is SM90+, tested in sm90_module_lookup
+    // TRT-LLM comm is SM100+, tested in sm100_module_lookup
     println!("comm_module_lookup: PASS");
 }
 
