@@ -1,5 +1,5 @@
 use candle_core::backend::BackendStorage;
-use super::{MOD_QKNORM_ROPE, PTX_QKNORM_ROPE};
+use crate::{MOD_QKNORM_ROPE, PTX_QKNORM_ROPE};
 use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
 use candle_core::cuda_backend::WrapErr;
 use candle_core::{DType, Result, Tensor};

@@ -247,6 +247,7 @@ impl Engine {
                                 max_seqlen_k,
                             };
                             let mut ctx = BatchAttnContext {
+                                ops: self.executor.ops,
                                 cu_seqlens_q: &cu_seqlens_q_t,
                                 max_seqlen_q: max_seqlen,
                                 position_ids: &position_ids_t,
@@ -255,8 +256,7 @@ impl Engine {
                                 deltanet_pool: None,
                                 deltanet_slots: None,
                             };
-                            #[cfg(feature = "flashinfer")]
-                            crate::models::common::fi_begin_forward();
+                            self.executor.ops.session.begin_forward();
                             let result = if need_hidden_states {
                                 let lm = model.as_logits_model_mut()
                                     .expect("hidden states requested but model doesn't support LogitsSplitModel");
@@ -269,14 +269,14 @@ impl Engine {
                             } else {
                                 Ok((model.forward(&packed_input, &mut ctx).map_err(candle_err)?, None))
                             };
-                            #[cfg(feature = "flashinfer")]
-                            crate::models::common::fi_end_forward();
+                            self.executor.ops.session.end_forward();
                             return result;
                         }
                     }
 
                     // No paged path — plain varlen.
                     let mut ctx = BatchAttnContext {
+                        ops: self.executor.ops,
                         cu_seqlens_q: &cu_seqlens_q_t,
                         max_seqlen_q: max_seqlen,
                         position_ids: &position_ids_t,
@@ -285,8 +285,7 @@ impl Engine {
                         deltanet_pool: None,
                         deltanet_slots: None,
                     };
-                    #[cfg(feature = "flashinfer")]
-                    crate::models::common::fi_begin_forward();
+                    self.executor.ops.session.begin_forward();
                     let result = if need_hidden_states {
                         let lm = model.as_logits_model_mut()
                             .expect("hidden states requested but model doesn't support LogitsSplitModel");
@@ -299,8 +298,7 @@ impl Engine {
                     } else {
                         Ok((model.forward(&packed_input, &mut ctx).map_err(candle_err)?, None))
                     };
-                    #[cfg(feature = "flashinfer")]
-                    crate::models::common::fi_end_forward();
+                    self.executor.ops.session.end_forward();
                     result
                 })();
 

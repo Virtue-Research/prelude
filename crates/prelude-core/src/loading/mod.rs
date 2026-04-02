@@ -294,6 +294,7 @@ fn load_safetensor_parts(
 
     let executor = ModelExecutor {
         model: Mutex::new(built.model),
+        ops: crate::ops::cpu_ops(),
         device,
         dtype,
         config: common_config,
@@ -448,6 +449,7 @@ fn load_gguf_qwen35(
 
     let executor = ModelExecutor {
         model: Mutex::new(Box::new(model)),
+        ops: crate::ops::cpu_ops(),
         device: device.clone(),
         dtype: DType::F32,
         config: common_config,
@@ -517,6 +519,7 @@ fn load_gguf_qwen3(
 
     let executor = ModelExecutor {
         model: Mutex::new(Box::new(model)),
+        ops: crate::ops::cpu_ops(),
         device: device.clone(),
         dtype: DType::F32,
         config: common_config,

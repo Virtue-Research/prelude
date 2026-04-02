@@ -2,14 +2,11 @@
 //!
 //! Requires:
 //! - CUDA Toolkit with nvcc (SM80+ support)
-//! - CUTLASS headers (auto-cloned from GitHub)
+//! - CUTLASS headers (third_party/cutlass submodule)
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-const CUTLASS_REPO: &str = "https://github.com/NVIDIA/cutlass.git";
-const CUTLASS_BRANCH: &str = "main";
 
 fn main() {
     println!("cargo:rerun-if-changed=src/cutlass_wrapper.cu");
@@ -17,8 +14,15 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
-    // 1. Ensure CUTLASS headers
-    let cutlass_dir = ensure_cutlass(&out_dir);
+    // 1. Ensure CUTLASS headers (third_party/cutlass submodule)
+    let workspace_root = PathBuf::from(&manifest_dir).join("../../..");
+    let cutlass_dir = workspace_root.join("third_party/cutlass");
+    if !cutlass_dir.join("include/cutlass/cutlass.h").exists() {
+        panic!(
+            "third_party/cutlass submodule not found or incomplete.\n\
+             Run: git submodule update --init third_party/cutlass"
+        );
+    }
     let cutlass_include = cutlass_dir.join("include");
 
     // 2. Find CUDA toolkit
@@ -100,53 +104,6 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=rt");  // required by cudart_static
     println!("cargo:rustc-link-lib=dylib=dl");  // required by cudart_static
     println!("cargo:rustc-link-lib=dylib=stdc++");
-}
-
-fn ensure_cutlass(out_dir: &Path) -> PathBuf {
-    let cutlass_dir = out_dir.join("cutlass");
-
-    if cutlass_dir.join("include/cutlass/cutlass.h").exists() {
-        return cutlass_dir;
-    }
-
-    println!("cargo:warning=Cloning CUTLASS main branch (headers only)...");
-
-    if cutlass_dir.exists() {
-        std::fs::remove_dir_all(&cutlass_dir).ok();
-    }
-
-    let status = Command::new("git")
-        .args([
-            "clone", "--depth", "1", "--branch", CUTLASS_BRANCH,
-            "--single-branch", "--no-checkout", CUTLASS_REPO,
-        ])
-        .arg(&cutlass_dir)
-        .status()
-        .expect("git clone failed");
-
-    if !status.success() {
-        panic!("Failed to clone CUTLASS repo");
-    }
-
-    Command::new("git")
-        .args(["sparse-checkout", "init", "--cone"])
-        .current_dir(&cutlass_dir)
-        .status().ok();
-    Command::new("git")
-        .args(["sparse-checkout", "set", "include", "tools/util/include"])
-        .current_dir(&cutlass_dir)
-        .status().ok();
-    Command::new("git")
-        .args(["checkout"])
-        .current_dir(&cutlass_dir)
-        .status().ok();
-
-    if !cutlass_dir.join("include/cutlass/cutlass.h").exists() {
-        panic!("CUTLASS headers not found after clone");
-    }
-
-    println!("cargo:warning=CUTLASS headers ready");
-    cutlass_dir
 }
 
 fn nvcc_supports_sm100(nvcc: &Path) -> bool {

@@ -424,6 +424,7 @@ impl Engine {
             let seq_lens_vec = vec![seq_len];
 
             let mut ctx = crate::models::common::BatchAttnContext {
+                ops: crate::ops::cpu_ops(),
                 cu_seqlens_q: &cu_seqlens,
                 max_seqlen_q: seq_len,
                 position_ids: &position_ids,

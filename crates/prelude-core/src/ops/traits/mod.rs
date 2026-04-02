@@ -15,7 +15,7 @@ mod norm;
 mod session;
 
 pub use activation::ActivationOps;
-pub use attention::{AttentionOps, MaskType, PagedParams, VarlenParams};
+pub use attention::{AttentionOps, MaskType, VarlenParams, PagedParams};
 pub use bundle::Ops;
 pub use comm::CommOps;
 pub use conv::ConvOps;

@@ -110,12 +110,10 @@ impl GpuLinear {
     }
 }
 
-impl crate::models::common::linear::LinearBackend for GpuLinear {
-    fn name(&self) -> &str { "gpu/cutlass" }
-    fn weight(&self) -> Option<&Tensor> { Some(&self.weight) }
-    fn clone_box(&self) -> Box<dyn crate::models::common::linear::LinearBackend> { Box::new(self.clone()) }
-    fn as_any(&self) -> &dyn std::any::Any { self }
-}
+// GpuLinear is a standalone CUDA linear layer used by CudaOps and benchmarks.
+// It does NOT implement LinearBackend (which lives in prelude-core).
+// prelude-core's Linear::from_candle() uses CandleLinear for CUDA,
+// relying on register_gpu_gemm() to route matmul through CUTLASS.
 
 impl Module for GpuLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {

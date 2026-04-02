@@ -88,12 +88,13 @@ pub(crate) fn debug_disable_flash_attn_path() -> bool {
 
 // ── Shared utility functions ───────────────────────────────────────────
 
-/// Vectorized add: CUDA uses custom kernel, CPU F32 uses in-place add,
+/// Vectorized add: tries Ops fused kernel first, CPU F32 uses in-place add,
 /// everything else falls back to candle's default add.
-pub(crate) fn fast_add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    #[cfg(feature = "cuda")]
-    if a.device().is_cuda() && !debug_disable_vectorized_add() {
-        return crate::ops::gpu::vectorized_add(a, b);
+pub(crate) fn fast_add(ops: &crate::ops::Ops, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    if let Some(result) = ops.fused.fused_add(a, b) {
+        if !debug_disable_vectorized_add() {
+            return result;
+        }
     }
     if a.device().is_cpu() && a.dtype() == candle_core::DType::F32 {
         return cpu_add_f32(a, b);
@@ -130,16 +131,18 @@ fn cpu_add_f32(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     Tensor::from_vec(out, a.dims(), a.device())
 }
 
-/// Custom fast RMSNorm: CUDA fused kernel, CPU custom kernel, fallback candle.
+/// Custom fast RMSNorm: tries Ops norm kernel, CPU custom kernel, fallback candle.
 pub(crate) fn fast_rms_norm(
+    ops: &crate::ops::Ops,
     x: &Tensor,
     norm: &RmsNorm,
     weight: &Tensor,
     eps: f64,
 ) -> Result<Tensor> {
-    #[cfg(feature = "cuda")]
-    if x.device().is_cuda() && !debug_disable_fast_rmsnorm() {
-        return crate::ops::gpu::fast_rmsnorm(x, weight, eps);
+    if !debug_disable_fast_rmsnorm() {
+        if let Ok(result) = ops.norm.rms_norm(x, weight, eps as f32) {
+            return Ok(result);
+        }
     }
     if x.device().is_cpu() {
         return crate::ops::cpu::cpu_rmsnorm(x, weight, eps);
@@ -183,27 +186,29 @@ pub(crate) fn first_token_select(hidden: &Tensor, seq_lens: &[usize]) -> Result<
     hidden.index_select(&indices, 0)
 }
 
-/// Fused residual add + RMSNorm: CUDA fused kernel or cpu_ops BF16.
-#[allow(unused_variables)]
+/// Fused residual add + RMSNorm: tries Ops fused kernel, falls back to cpu_ops.
 pub(crate) fn fused_add_rmsnorm(
+    ops: &crate::ops::Ops,
     residual: &Tensor,
     h: &Tensor,
     norm: &RmsNorm,
     weight: &Tensor,
     eps: f64,
 ) -> Result<(Tensor, Tensor)> {
-    #[cfg(feature = "cuda")]
-    if residual.device().is_cuda() && !debug_disable_fused_add_rmsnorm() {
-        return crate::ops::gpu::fused_add_rmsnorm(residual, h, weight, eps);
+    if let Some(result) = ops.fused.fused_add_rmsnorm(residual, h, weight, eps as f32) {
+        if !debug_disable_fused_add_rmsnorm() {
+            return result;
+        }
     }
     crate::ops::cpu::cpu_fused_add_rmsnorm(h, residual, weight, eps)
 }
 
-/// Fused SiLU × Mul: CUDA fused kernel or cpu_ops (BF16/F32).
-pub(crate) fn fast_silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
-    #[cfg(feature = "cuda")]
-    if gate.device().is_cuda() && !debug_disable_fused_silu_mul() {
-        return crate::ops::gpu::fused_silu_mul(gate, up);
+/// Fused SiLU × Mul: tries Ops fused kernel, falls back to cpu_ops (BF16/F32).
+pub(crate) fn fast_silu_mul(ops: &crate::ops::Ops, gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    if let Some(result) = ops.fused.fused_silu_mul(gate, up) {
+        if !debug_disable_fused_silu_mul() {
+            return result;
+        }
     }
     let gate_up = Tensor::cat(&[gate, up], gate.dims().len() - 1)?;
     crate::ops::cpu::cpu_silu_and_mul(&gate_up)
@@ -213,11 +218,12 @@ pub(crate) fn fast_silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
 
 /// QK-Norm + RoPE for varlen layout `[total, H, D]`.
 ///
-/// CUDA: fused qknorm_rope kernel.
+/// Ops fused: fused qknorm_rope kernel.
 /// CPU BF16: cpu_ops rmsnorm + cpu_ops rotary_embedding.
 /// Fallback: fast_rms_norm + rotary_emb.apply_varlen.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qknorm_rope_varlen(
+    ops: &crate::ops::Ops,
     q: &Tensor,
     k: &Tensor,
     q_norm_weight: &Tensor,
@@ -232,16 +238,15 @@ pub(crate) fn qknorm_rope_varlen(
     head_dim: usize,
     rms_norm_eps: f64,
 ) -> Result<(Tensor, Tensor)> {
-    // ── CUDA: fused QK-norm + RoPE kernel ──
-    #[cfg(feature = "cuda")]
-    if q.device().is_cuda() && !debug_disable_fused_qknorm_rope() {
-        let q = crate::ops::gpu::fused_qknorm_rope_varlen(
-            q, q_norm_weight, &rotary_emb.cos, &rotary_emb.sin, position_ids, rms_norm_eps,
-        )?;
-        let k = crate::ops::gpu::fused_qknorm_rope_varlen(
-            k, k_norm_weight, &rotary_emb.cos, &rotary_emb.sin, position_ids, rms_norm_eps,
-        )?;
-        return Ok((q, k));
+    // ── Fused QK-norm + RoPE kernel via Ops trait ──
+    if let Some(result) = ops.fused.fused_qknorm_rope(
+        q, k, q_norm_weight, k_norm_weight,
+        &rotary_emb.cos, &rotary_emb.sin,
+        position_ids, rms_norm_eps as f32,
+    ) {
+        if !debug_disable_fused_qknorm_rope() {
+            return result;
+        }
     }
 
     // ── CPU: cpu_ops rmsnorm + rotary_embedding (BF16 and F32) ──
@@ -275,10 +280,9 @@ pub(crate) fn qknorm_rope_varlen(
     }
 
     // ── Generic fallback ──
-    let q = fast_rms_norm(&q.flatten(0, 1)?, q_norm, q_norm_weight, rms_norm_eps)?
+    let q = fast_rms_norm(ops, &q.flatten(0, 1)?, q_norm, q_norm_weight, rms_norm_eps)?
         .reshape((total, num_heads, head_dim))?;
-    let k = fast_rms_norm(&k.flatten(0, 1)?, k_norm, k_norm_weight, rms_norm_eps)?
+    let k = fast_rms_norm(ops, &k.flatten(0, 1)?, k_norm, k_norm_weight, rms_norm_eps)?
         .reshape((total, num_kv_heads, head_dim))?;
     rotary_emb.apply_varlen(&q, &k, position_ids)
 }
-

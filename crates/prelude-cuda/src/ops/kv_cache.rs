@@ -1,6 +1,6 @@
 use candle_core::backend::BackendStorage;
-use super::{MOD_KNORM_ROPE_KV_WRITE, PTX_KNORM_ROPE_KV_WRITE};
-use super::{MOD_SCATTER_KV_CACHE, PTX_SCATTER_KV_CACHE};
+use crate::{MOD_KNORM_ROPE_KV_WRITE, PTX_KNORM_ROPE_KV_WRITE};
+use crate::{MOD_SCATTER_KV_CACHE, PTX_SCATTER_KV_CACHE};
 use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
 use candle_core::cuda_backend::WrapErr;
 use candle_core::{DType, Result, Tensor};
@@ -9,7 +9,7 @@ use candle_core::{DType, Result, Tensor};
 
 /// Returns true if the fused KV cache write kernel is enabled.
 pub fn fused_kv_cache_write_enabled() -> bool {
-    crate::config::global_runtime()
+    prelude_core::config::global_runtime()
         .map(|r| r.fused_kv_cache_write)
         .unwrap_or(false)
 }
@@ -26,7 +26,6 @@ pub fn fused_kv_cache_write_enabled() -> bool {
 /// - `key_cache`: `[num_blocks, num_kv_heads, head_size/x, block_size, x]` BF16
 /// - `value_cache`: `[num_blocks, num_kv_heads, head_size, block_size]` BF16
 /// - `slot_mapping`: `[B]` I64
-#[cfg(feature = "cuda")]
 pub fn fused_knorm_rope_kv_cache_write_thd(
     k: &Tensor,             // [B * num_kv_heads, head_dim]
     v: &Tensor,             // [B * num_kv_heads, head_dim]
@@ -181,7 +180,6 @@ pub fn fused_knorm_rope_kv_cache_write_thd(
 /// - `key_cache`: `[num_blocks, block_size, num_kv_heads, head_dim]` BF16
 /// - `value_cache`: `[num_blocks, block_size, num_kv_heads, head_dim]` BF16
 /// - `slot_mapping`: `[total_tokens]` I64
-#[cfg(feature = "cuda")]
 pub fn fused_knorm_rope_kv_cache_write_varlen(
     k: &Tensor,             // [total_tokens, num_kv_heads, head_dim]
     v: &Tensor,             // [total_tokens, num_kv_heads, head_dim]
@@ -342,7 +340,6 @@ pub fn fused_knorm_rope_kv_cache_write_varlen(
 /// - `key_cache`: `[num_blocks, block_size, num_heads, head_size]` BF16
 /// - `value_cache`: `[num_blocks, block_size, num_heads, head_size]` BF16
 /// - `slot_mapping`: `[num_tokens]` I64
-#[cfg(feature = "cuda")]
 pub fn scatter_kv_cache_flash(
     key: &Tensor,
     value: &Tensor,

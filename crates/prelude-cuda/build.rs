@@ -4,7 +4,7 @@ fn main() {
     use std::process::Command;
 
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let kernels_dir = PathBuf::from(&manifest_dir).join("src/kernels");
+    let kernels_dir = PathBuf::from(&manifest_dir).join("src/kernels/kernels_src");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
     // Find nvcc

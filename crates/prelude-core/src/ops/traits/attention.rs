@@ -5,6 +5,8 @@ pub enum MaskType {
     Causal,
     Bidirectional,
     SlidingWindow { left: usize, right: usize },
+    /// Custom mask tensor (e.g., speculative decoding tree attention).
+    /// Shape: [max_seqlen_q, max_seqlen_k], values 0.0 (attend) or -inf (mask).
     Custom(Tensor),
 }
 
@@ -12,8 +14,8 @@ pub enum MaskType {
 pub struct VarlenParams<'a> {
     pub cu_seqlens_q: &'a Tensor,
     pub cu_seqlens_k: &'a Tensor,
-    pub max_seqlen_q: u32,
-    pub max_seqlen_k: u32,
+    pub max_seqlen_q: usize,
+    pub max_seqlen_k: usize,
     pub scale: f32,
     pub mask: MaskType,
     pub softcap: Option<f32>,
@@ -22,18 +24,23 @@ pub struct VarlenParams<'a> {
 /// Parameters for paged KV cache attention.
 pub struct PagedParams<'a> {
     pub block_tables: &'a Tensor,
-    pub num_seqs: u32,
-    pub max_blocks_per_seq: u32,
     pub cu_seqlens_q: &'a Tensor,
     pub cu_seqlens_k: &'a Tensor,
-    pub max_seqlen_q: u32,
-    pub max_seqlen_k: u32,
+    pub max_seqlen_q: usize,
+    pub max_seqlen_k: usize,
     pub scale: f32,
     pub mask: MaskType,
     pub softcap: Option<f32>,
 }
 
+/// Unified attention backend.
+///
+/// Two methods, not four — mask variant is encoded in `MaskType`.
+/// `reshape_and_cache` is on `KvCacheOps`, not here.
 pub trait AttentionOps: Send + Sync {
+    /// Human-readable backend name (e.g., "flash-attn-v4", "cpu").
+    fn name(&self) -> &str;
+
     /// Variable-length attention over contiguous Q, K, V.
     fn varlen_attention(
         &self,
@@ -51,4 +58,7 @@ pub trait AttentionOps: Send + Sync {
         value_cache: &Tensor,
         params: &PagedParams,
     ) -> Result<Tensor>;
+
+    /// Whether this backend supports paged attention for prefill (Q > 1).
+    fn supports_paged_prefill(&self) -> bool { true }
 }

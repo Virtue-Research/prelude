@@ -261,6 +261,7 @@ impl Gemma3Attention {
 
     fn forward(
         &mut self,
+        ops: &crate::ops::Ops,
         packed_input: &Tensor,
         cu_seqlens: &Tensor,
         max_seqlen: usize,
@@ -282,16 +283,19 @@ impl Gemma3Attention {
 
         let attn_out = match self.attention_mode {
             Gemma3AttentionMode::FullCausal => varlen_attention(
+                ops,
                 &q, &k, &v,
                 cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
                 self.softmax_scale, None,
             )?,
             Gemma3AttentionMode::FullBidirectional => varlen_attention_bidirectional(
+                ops,
                 &q, &k, &v,
                 cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
                 self.softmax_scale,
             )?,
             Gemma3AttentionMode::SlidingCausal { window_size } => varlen_attention_windowed(
+                ops,
                 &q, &k, &v,
                 cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
                 self.softmax_scale,
@@ -299,6 +303,7 @@ impl Gemma3Attention {
                 Some(0),
             )?,
             Gemma3AttentionMode::SlidingBidirectional { window_size } => varlen_attention_windowed(
+                ops,
                 &q, &k, &v,
                 cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
                 self.softmax_scale,
@@ -365,6 +370,7 @@ impl Gemma3DecoderLayer {
 
     fn forward(
         &mut self,
+        ops: &crate::ops::Ops,
         xs: &Tensor,
         cu_seqlens: &Tensor,
         max_seqlen: usize,
@@ -373,16 +379,16 @@ impl Gemma3DecoderLayer {
         let normed = self.input_layernorm.forward(xs)?;
         let attn_output =
             self.self_attn
-                .forward(&normed, cu_seqlens, max_seqlen, position_ids)?;
+                .forward(ops, &normed, cu_seqlens, max_seqlen, position_ids)?;
 
         let post_attn_normed = self.post_attention_layernorm.forward(&attn_output)?;
-        let xs = crate::models::common::fast_add(&post_attn_normed, xs)?;
+        let xs = crate::models::common::fast_add(ops, &post_attn_normed, xs)?;
 
         let pre_ffn_normed = self.pre_feedforward_layernorm.forward(&xs)?;
         let mlp_output = self.mlp.forward(&pre_ffn_normed)?;
 
         let post_ffn_normed = self.post_feedforward_layernorm.forward(&mlp_output)?;
-        crate::models::common::fast_add(&post_ffn_normed, &xs)
+        crate::models::common::fast_add(ops, &post_ffn_normed, &xs)
     }
 
     fn clear_kv_cache(&mut self) {
@@ -456,6 +462,7 @@ impl Gemma3Model {
 
     fn forward(
         &mut self,
+        ops: &crate::ops::Ops,
         packed_input: &Tensor,
         cu_seqlens: &Tensor,
         max_seqlen: usize,
@@ -465,7 +472,7 @@ impl Gemma3Model {
         let mut xs = (self.embed_tokens.forward(packed_input)? * embed_scale)?;
 
         for layer in &mut self.layers {
-            xs = layer.forward(&xs, cu_seqlens, max_seqlen, position_ids)?;
+            xs = layer.forward(ops, &xs, cu_seqlens, max_seqlen, position_ids)?;
         }
 
         self.norm.forward(&xs)
@@ -535,6 +542,7 @@ impl Gemma3ForCausalLM {
         ctx: &mut crate::models::common::BatchAttnContext,
     ) -> Result<Tensor> {
         let hidden = self.base.forward(
+            ctx.ops,
             packed_input,
             ctx.cu_seqlens_q,
             ctx.max_seqlen_q,
@@ -566,6 +574,7 @@ impl crate::models::LogitsSplitModel for Gemma3ForCausalLM {
         ctx: &mut crate::models::common::BatchAttnContext,
     ) -> candle_core::Result<Tensor> {
         self.base.forward(
+            ctx.ops,
             packed_input,
             ctx.cu_seqlens_q,
             ctx.max_seqlen_q,
@@ -653,6 +662,7 @@ impl Gemma3ForSequenceClassification {
         ctx: &mut crate::models::common::BatchAttnContext,
     ) -> Result<Tensor> {
         let hidden_states = self.base.forward(
+            ctx.ops,
             packed_input,
             ctx.cu_seqlens_q,
             ctx.max_seqlen_q,
@@ -729,6 +739,7 @@ impl Gemma3ForEmbedding {
         ctx: &mut crate::models::common::BatchAttnContext,
     ) -> Result<Tensor> {
         let hidden_states = self.base.forward(
+            ctx.ops,
             packed_input,
             ctx.cu_seqlens_q,
             ctx.max_seqlen_q,

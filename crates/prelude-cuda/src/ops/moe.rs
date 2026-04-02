@@ -1,5 +1,5 @@
 use candle_core::backend::BackendStorage;
-use super::{MOD_MOE_ROUTING, PTX_MOE_ROUTING};
+use crate::{MOD_MOE_ROUTING, PTX_MOE_ROUTING};
 use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
 use candle_core::cuda_backend::WrapErr;
 use candle_core::{DType, Result, Tensor};

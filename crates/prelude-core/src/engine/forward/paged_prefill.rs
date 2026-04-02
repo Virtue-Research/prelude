@@ -145,6 +145,7 @@ impl Engine {
             max_seqlen_k,
         };
         let mut ctx = BatchAttnContext {
+            ops: self.executor.ops,
             cu_seqlens_q: &cu_seqlens_q_t,
             max_seqlen_q,
             position_ids: &position_ids_t,
@@ -156,8 +157,7 @@ impl Engine {
         };
         let needs_prompt_logprobs = items.iter().any(|item| item.request.prompt_logprobs.is_some());
 
-        #[cfg(feature = "flashinfer")]
-        crate::models::common::fi_begin_forward();
+        self.executor.ops.session.begin_forward();
 
         // When prompt logprobs needed: get hidden states, apply compute_logits in chunks.
         // This avoids materializing the full (total_tokens, vocab_size) logits tensor.
@@ -180,8 +180,7 @@ impl Engine {
         } else {
             (model.forward(&packed_input, &mut ctx).map_err(candle_err)?, None)
         };
-        #[cfg(feature = "flashinfer")]
-        crate::models::common::fi_end_forward();
+        self.executor.ops.session.end_forward();
         drop(dn_pool_guard);
         drop(model);
 

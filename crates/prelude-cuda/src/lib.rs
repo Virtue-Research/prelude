@@ -2,10 +2,9 @@
 //!
 //! This crate owns:
 //! - PTX kernel compilation (build.rs) and runtime loading constants
+//! - GPU kernel wrappers (ops/) and attention backends (attn/)
+//! - CudaOps: implements all Ops traits from prelude-core
 //! - Feature-gated re-exports of kernel sub-crates (deepgemm, cutlass-gemm, etc.)
-//!
-//! The full CudaOps dispatch layer will be implemented here once the Ops trait
-//! system in prelude-core is complete.
 
 // ── PTX modules compiled from src/kernels/ ──────────────────────────
 
@@ -36,6 +35,14 @@ pub const MOD_MOE_DOWN: &str = "moe_down";
 pub const MOD_KV_APPEND: &str = "kvcache_kv_append";
 pub const MOD_KNORM_ROPE_KV_WRITE: &str = "kvcache_knorm_rope_kv_write";
 pub const MOD_SCATTER_KV_CACHE: &str = "kvcache_scatter_kv_cache";
+
+// ── GPU kernel modules ──────────────────────────────────────────────
+
+pub(crate) mod ops;
+pub(crate) mod attn;
+mod cuda_ops;
+
+pub use cuda_ops::create_cuda_ops;
 
 // ── Sub-crate re-exports ────────────────────────────────────────────
 

@@ -16,7 +16,6 @@ use crate::models::common::{
     GatedMlp, Linear, RmsNorm, RotaryEmbedding, TransformerBlock,
     fast_add, fast_rms_norm, fused_add_rmsnorm, last_token_select, qknorm_rope_varlen,
 };
-#[cfg(feature = "cuda")]
 use crate::models::common::debug_disable_fused_qknorm_rope;
 use crate::profiling::{nvtx_push, nvtx_pop};
 
@@ -162,13 +161,14 @@ impl Qwen3Attention {
     /// QK-norm + RoPE for varlen layout `[total, H, D]`.
     fn norm_rope_varlen(
         &self,
+        ops: &crate::ops::Ops,
         q: &Tensor,
         k: &Tensor,
         total: usize,
         position_ids: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
         qknorm_rope_varlen(
-            q, k,
+            ops, q, k,
             &self.q_norm_weight, &self.k_norm_weight,
             &self.q_norm, &self.k_norm,
             &self.rotary_emb, position_ids,
@@ -219,113 +219,70 @@ impl Qwen3Attention {
 
             let (q, k, v) = self.fused_qkv_projection(x, total_q)?;
 
-            // Fused CUDA path: norm + rope + optional fused KV cache write
-            #[cfg(feature = "cuda")]
-            if self.is_cuda && !debug_disable_fused_qknorm_rope() {
-                let q = crate::ops::gpu::fused_qknorm_rope_varlen(
-                    &q,
-                    &self.q_norm_weight,
-                    &self.rotary_emb.cos,
-                    &self.rotary_emb.sin,
-                    ctx.position_ids,
-                    self.rms_norm_eps,
-                )?;
-                if let Some(kv) = ctx.paged_kv {
-                    #[cfg(any(feature = "flash-attn-v3", feature = "flashinfer"))]
-                    let used_fused_kv_write = if crate::ops::gpu::fused_kv_cache_write_enabled() {
-                        let bs = kv.key_cache.shape().dims()[1];
-                        crate::ops::gpu::fused_knorm_rope_kv_cache_write_varlen(
-                            &k,
-                            &v,
-                            &self.k_norm_weight,
-                            &self.rotary_emb.cos,
-                            &self.rotary_emb.sin,
-                            ctx.position_ids,
-                            kv.key_cache,
-                            kv.value_cache,
-                            kv.slot_mapping,
-                            self.num_kv_heads,
-                            self.head_dim,
-                            bs,
-                            self.rms_norm_eps,
+            // Fused path: try fused Q+K norm+rope via Ops trait
+            if !debug_disable_fused_qknorm_rope() {
+                if let Some(result) = ctx.ops.fused.fused_qknorm_rope(
+                    &q, &k, &self.q_norm_weight, &self.k_norm_weight,
+                    &self.rotary_emb.cos, &self.rotary_emb.sin,
+                    ctx.position_ids, self.rms_norm_eps as f32,
+                ) {
+                    let (q, k) = result?;
+                    if let Some(kv) = ctx.paged_kv {
+                        // Try fused K-norm + RoPE + KV cache write
+                        let used_fused_kv_write = if let Some(fused_result) =
+                            ctx.ops.fused.fused_knorm_rope_cache_write(
+                                &k, &v, &self.k_norm_weight,
+                                &self.rotary_emb.cos, &self.rotary_emb.sin,
+                                ctx.position_ids,
+                                kv.key_cache, kv.value_cache, kv.slot_mapping,
+                                self.rms_norm_eps as f32,
+                            )
+                        {
+                            fused_result?;
+                            true
+                        } else {
+                            false
+                        };
+                        if !used_fused_kv_write {
+                            crate::models::common::reshape_and_cache(
+                                ctx.ops, &k, &v,
+                                kv.key_cache, kv.value_cache, kv.slot_mapping,
+                            )?;
+                        }
+                        let attn = crate::models::common::varlen_attention_paged(
+                            ctx.ops, &q,
+                            kv.key_cache, kv.value_cache, kv.block_tables,
+                            ctx.cu_seqlens_q, kv.cu_seqlens_k,
+                            ctx.max_seqlen_q, kv.max_seqlen_k,
+                            self.softmax_scale,
                         )?;
-                        true
-                    } else {
-                        false
-                    };
-                    #[cfg(not(any(feature = "flash-attn-v3", feature = "flashinfer")))]
-                    let used_fused_kv_write = false;
-
-                    if !used_fused_kv_write {
-                        let k = crate::ops::gpu::fused_qknorm_rope_varlen(
-                            &k,
-                            &self.k_norm_weight,
-                            &self.rotary_emb.cos,
-                            &self.rotary_emb.sin,
-                            ctx.position_ids,
-                            self.rms_norm_eps,
-                        )?;
-                        crate::models::common::reshape_and_cache(
-                            &k,
-                            &v,
-                            kv.key_cache,
-                            kv.value_cache,
-                            kv.slot_mapping,
-                        )?;
+                        return attn
+                            .reshape((total_q, self.hidden_size))?
+                            .apply(&self.o_proj);
                     }
-                    let attn = crate::models::common::varlen_attention_paged(
-                        &q,
-                        kv.key_cache,
-                        kv.value_cache,
-                        kv.block_tables,
-                        ctx.cu_seqlens_q,
-                        kv.cu_seqlens_k,
-                        ctx.max_seqlen_q,
-                        kv.max_seqlen_k,
-                        self.softmax_scale,
-                    )?;
-                    return attn
-                        .reshape((total_q, self.hidden_size))?
-                        .apply(&self.o_proj);
+                    return varlen_attention(
+                        ctx.ops, &q, &k, &v,
+                        ctx.cu_seqlens_q, ctx.cu_seqlens_q,
+                        ctx.max_seqlen_q, ctx.max_seqlen_q,
+                        self.softmax_scale, None,
+                    )?
+                    .reshape((total_q, self.hidden_size))?
+                    .apply(&self.o_proj);
                 }
-                let k = crate::ops::gpu::fused_qknorm_rope_varlen(
-                    &k,
-                    &self.k_norm_weight,
-                    &self.rotary_emb.cos,
-                    &self.rotary_emb.sin,
-                    ctx.position_ids,
-                    self.rms_norm_eps,
-                )?;
-                return varlen_attention(
-                    &q,
-                    &k,
-                    &v,
-                    ctx.cu_seqlens_q,
-                    ctx.cu_seqlens_q,
-                    ctx.max_seqlen_q,
-                    ctx.max_seqlen_q,
-                    self.softmax_scale,
-                    None,
-                )?
-                .reshape((total_q, self.hidden_size))?
-                .apply(&self.o_proj);
             }
 
             // Non-fused path: norm + rope then varlen attention (GPU flash-attn or CPU matmul)
-            let (q, k) = self.norm_rope_varlen(&q, &k, total_q, ctx.position_ids)?;
+            let (q, k) = self.norm_rope_varlen(ctx.ops, &q, &k, total_q, ctx.position_ids)?;
 
             let (cu_seqlens_k, max_seqlen_k) = match ctx.paged_kv {
                 Some(kv) => (kv.cu_seqlens_k, kv.max_seqlen_k),
                 None => (ctx.cu_seqlens_q, ctx.max_seqlen_q),
             };
             let attn_out = varlen_attention(
-                &q,
-                &k,
-                &v,
-                ctx.cu_seqlens_q,
-                cu_seqlens_k,
-                ctx.max_seqlen_q,
-                max_seqlen_k,
+                ctx.ops,
+                &q, &k, &v,
+                ctx.cu_seqlens_q, cu_seqlens_k,
+                ctx.max_seqlen_q, max_seqlen_k,
                 self.softmax_scale,
                 ctx.paged_kv,
             )?;
@@ -467,7 +424,7 @@ impl Qwen3Attention {
         let position_ids: Vec<u32> =
             (0..seq_len).map(|i| (position_offset + i) as u32).collect();
         let position_ids = Tensor::from_vec(position_ids, (seq_len,), x.device())?;
-        let (q, k) = self.norm_rope_varlen(&q, &k, seq_len, &position_ids)?;
+        let (q, k) = self.norm_rope_varlen(crate::ops::cpu_ops(), &q, &k, seq_len, &position_ids)?;
 
         self.k_cache.append(&k)?;
         self.v_cache.append(&v)?;
@@ -631,7 +588,7 @@ impl DecoderLayer {
     }
 
     #[inline]
-    fn residual_mlp(&self, x_res: &Tensor, h2: &Tensor) -> Result<Tensor> {
+    fn residual_mlp(&self, ops: &crate::ops::Ops, x_res: &Tensor, h2: &Tensor) -> Result<Tensor> {
         if h2.device().is_cpu() && h2.dtype() == candle_core::DType::BF16 {
             if self.mlp.gate_up_brgemm_weight().is_some() {
                 return self.residual_mlp_raw(x_res, h2);
@@ -642,7 +599,7 @@ impl DecoderLayer {
                 return self.residual_mlp_raw_f32(x_res, h2);
             }
         }
-        fast_add(x_res, &self.mlp.forward(h2)?)
+        fast_add(ops, x_res, &self.mlp.forward(ops, h2)?)
     }
 
     fn residual_mlp_raw(&self, x_res: &Tensor, h2: &Tensor) -> Result<Tensor> {
@@ -673,11 +630,11 @@ impl DecoderLayer {
         Ok(x_res.clone())
     }
 
-    fn forward_with_cache(&mut self, x: &Tensor, position_offset: usize) -> Result<Tensor> {
-        let h = fast_rms_norm(x, &self.block.ln1, &self.block.ln1_weight, self.block.rms_norm_eps)?;
+    fn forward_with_cache(&mut self, ops: &crate::ops::Ops, x: &Tensor, position_offset: usize) -> Result<Tensor> {
+        let h = fast_rms_norm(ops, x, &self.block.ln1, &self.block.ln1_weight, self.block.rms_norm_eps)?;
         let h = self.self_attn.forward_with_cache(&h, position_offset)?;
-        let (x_res, h2) = fused_add_rmsnorm(x, &h, &self.block.ln2, &self.block.ln2_weight, self.block.rms_norm_eps)?;
-        self.residual_mlp(&x_res, &h2)
+        let (x_res, h2) = fused_add_rmsnorm(ops, x, &h, &self.block.ln2, &self.block.ln2_weight, self.block.rms_norm_eps)?;
+        self.residual_mlp(ops, &x_res, &h2)
     }
 
     fn reset_kv_cache(&mut self) {
@@ -685,9 +642,9 @@ impl DecoderLayer {
     }
 
     fn forward(&self, x: &Tensor, ctx: &LayerAttnContext) -> Result<Tensor> {
-        self.block.forward(x,
+        self.block.forward(ctx.ops, x,
             |h| self.self_attn.forward(h, ctx),
-            |x_res, h2| self.residual_mlp(x_res, h2),
+            |x_res, h2| self.residual_mlp(ctx.ops, x_res, h2),
         )
     }
 }
@@ -754,16 +711,17 @@ impl Model {
 
     fn forward_with_cache(
         &mut self,
+        ops: &crate::ops::Ops,
         input_ids: &Tensor,
         position_offset: usize,
     ) -> Result<Tensor> {
         let mut h = self.embed_tokens.forward(input_ids)?;
         for (i, layer) in self.layers.iter_mut().enumerate() {
             nvtx_push!("layer[{}]", i);
-            h = layer.forward_with_cache(&h, position_offset)?;
+            h = layer.forward_with_cache(ops, &h, position_offset)?;
             nvtx_pop!();
         }
-        fast_rms_norm(&h, &self.norm, &self.norm_weight, self.rms_norm_eps)
+        fast_rms_norm(ops, &h, &self.norm, &self.norm_weight, self.rms_norm_eps)
     }
 
     fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> Result<Tensor> {
@@ -772,6 +730,7 @@ impl Model {
             nvtx_push!("layer[{}]", i);
             let layer_kv = ctx.paged_kv.map(|kv| kv.layer(i));
             let layer_ctx = LayerAttnContext {
+                ops: ctx.ops,
                 cu_seqlens_q: ctx.cu_seqlens_q,
                 max_seqlen_q: ctx.max_seqlen_q,
                 position_ids: ctx.position_ids,
@@ -780,7 +739,7 @@ impl Model {
             h = layer.forward(&h, &layer_ctx)?;
             nvtx_pop!();
         }
-        fast_rms_norm(&h, &self.norm, &self.norm_weight, self.rms_norm_eps)
+        fast_rms_norm(ctx.ops, &h, &self.norm, &self.norm_weight, self.rms_norm_eps)
     }
 }
 
@@ -820,10 +779,11 @@ impl Qwen3ModelForCausalLM {
     /// Cached forward: returns logits `[L, vocab_size]` for all input tokens.
     pub fn forward_with_cache(
         &mut self,
+        ops: &crate::ops::Ops,
         input_ids: &Tensor,
         position_offset: usize,
     ) -> Result<Tensor> {
-        let hidden = self.base.forward_with_cache(input_ids, position_offset)?;
+        let hidden = self.base.forward_with_cache(ops, input_ids, position_offset)?;
         hidden.apply(&self.lm_head)
     }
 
@@ -940,7 +900,7 @@ impl KvCacheModel for Qwen3ModelForCausalLM {
         input_ids: &Tensor,
         position_offset: usize,
     ) -> candle_core::Result<Tensor> {
-        Qwen3ModelForCausalLM::forward_with_cache(self, input_ids, position_offset)
+        Qwen3ModelForCausalLM::forward_with_cache(self, crate::ops::cpu_ops(), input_ids, position_offset)
     }
 }
 
@@ -1076,7 +1036,9 @@ mod tests {
         )
         .unwrap();
         let seq_lens = vec![seq_len];
+        let ops = crate::ops::cpu_ops();
         let mut ctx = BatchAttnContext {
+            ops,
             cu_seqlens_q: &cu,
             max_seqlen_q: seq_len,
             position_ids: &pos,
@@ -1105,7 +1067,7 @@ mod tests {
 
         // Cached forward → [seq_len, vocab]
         let input = Tensor::from_vec(tokens, (seq_len,), &device).unwrap();
-        let cached_logits = model.forward_with_cache(&input, 0).unwrap();
+        let cached_logits = model.forward_with_cache(crate::ops::cpu_ops(), &input, 0).unwrap();
         model.clear_kv_cache();
 
         let std_flat: Vec<f32> = std_logits.flatten_all().unwrap().to_vec1().unwrap();
@@ -1144,10 +1106,10 @@ mod tests {
         // Cached: prefill prompt, then decode one new token
         let prompt_input =
             Tensor::from_vec(prompt.clone(), (prompt.len(),), &device).unwrap();
-        let _prefill = model.forward_with_cache(&prompt_input, 0).unwrap();
+        let _prefill = model.forward_with_cache(crate::ops::cpu_ops(), &prompt_input, 0).unwrap();
 
         let decode_input = Tensor::from_vec(vec![20u32], (1,), &device).unwrap();
-        let decode_logits = model.forward_with_cache(&decode_input, prompt.len()).unwrap();
+        let decode_logits = model.forward_with_cache(crate::ops::cpu_ops(), &decode_input, prompt.len()).unwrap();
         model.clear_kv_cache();
 
         let decode_flat: Vec<f32> = decode_logits.get(0).unwrap().to_vec1().unwrap();
@@ -1174,10 +1136,10 @@ mod tests {
         let tokens = vec![1u32, 5, 10];
         let input = Tensor::from_vec(tokens, (3,), &device).unwrap();
 
-        let logits1 = model.forward_with_cache(&input, 0).unwrap();
+        let logits1 = model.forward_with_cache(crate::ops::cpu_ops(), &input, 0).unwrap();
         model.clear_kv_cache();
 
-        let logits2 = model.forward_with_cache(&input, 0).unwrap();
+        let logits2 = model.forward_with_cache(crate::ops::cpu_ops(), &input, 0).unwrap();
         model.clear_kv_cache();
 
         let v1: Vec<f32> = logits1.flatten_all().unwrap().to_vec1().unwrap();
@@ -1206,7 +1168,7 @@ mod tests {
         // Cached decode: prefill → 3 decode steps
         let prompt_input =
             Tensor::from_vec(prompt.clone(), (prompt.len(),), &device).unwrap();
-        let prefill_logits = model.forward_with_cache(&prompt_input, 0).unwrap();
+        let prefill_logits = model.forward_with_cache(crate::ops::cpu_ops(), &prompt_input, 0).unwrap();
         let mut generated = vec![
             prefill_logits
                 .get(prompt.len() - 1)
@@ -1221,7 +1183,7 @@ mod tests {
             let offset = prompt.len() + step;
             let tok = *generated.last().unwrap();
             let input = Tensor::from_vec(vec![tok], (1,), &device).unwrap();
-            let logits = model.forward_with_cache(&input, offset).unwrap();
+            let logits = model.forward_with_cache(crate::ops::cpu_ops(), &input, offset).unwrap();
             let next = logits
                 .get(0)
                 .unwrap()

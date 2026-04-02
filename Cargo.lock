@@ -2641,9 +2641,6 @@ dependencies = [
  "bc-mimalloc",
  "bytemuck",
  "candle-core",
- "candle-flash-attn",
- "candle-flash-attn-v3",
- "candle-paged-attn",
  "candle-transformers",
  "chrono",
  "fastokens",
@@ -2651,11 +2648,6 @@ dependencies = [
  "hf-hub",
  "inventory",
  "nix",
- "prelude-cutlass-gemm",
- "prelude-deepgemm",
- "prelude-flash-attn-v4",
- "prelude-flashinfer",
- "prelude-quant-gemm",
  "rand 0.10.0",
  "rayon",
  "serde",
@@ -2663,6 +2655,25 @@ dependencies = [
  "thiserror 2.0.18",
  "tokenizers",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "prelude-cuda"
+version = "0.1.0"
+dependencies = [
+ "bc-mimalloc",
+ "candle-core",
+ "candle-flash-attn",
+ "candle-flash-attn-v3",
+ "candle-paged-attn",
+ "half",
+ "prelude-core",
+ "prelude-cutlass-gemm",
+ "prelude-deepgemm",
+ "prelude-flash-attn-v4",
+ "prelude-flashinfer",
+ "prelude-quant-gemm",
  "tracing",
 ]
 
@@ -2760,6 +2771,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "prelude-core",
+ "prelude-cuda",
  "reqwest 0.13.2",
  "serde",
  "serde_json",

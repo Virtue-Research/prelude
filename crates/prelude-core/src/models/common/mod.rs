@@ -55,6 +55,7 @@ impl<'a> PagedKvBatchContext<'a> {
 /// Layer-level attention context: packs all per-forward-call metadata that
 /// threads through Attention → DecoderLayer → Model.
 pub struct LayerAttnContext<'a> {
+    pub ops: &'a crate::ops::Ops,
     pub cu_seqlens_q: &'a Tensor,
     pub max_seqlen_q: usize,
     pub position_ids: &'a Tensor,
@@ -64,6 +65,7 @@ pub struct LayerAttnContext<'a> {
 /// Batch-level attention context: packs all per-forward-call metadata that
 /// threads through CausalLM → Model (and from task callers / ModelVariant).
 pub struct BatchAttnContext<'a> {
+    pub ops: &'a crate::ops::Ops,
     pub cu_seqlens_q: &'a Tensor,
     pub max_seqlen_q: usize,
     pub position_ids: &'a Tensor,
@@ -79,12 +81,6 @@ pub(crate) use mlp::GatedMlp;
 pub(crate) use attn::{
     reshape_and_cache, varlen_attention, varlen_attention_bidirectional, varlen_attention_paged,
     varlen_attention_windowed,
-};
-pub(crate) use attn::{AttentionBackend, select_backend};
-#[cfg(feature = "flashinfer")]
-pub(crate) use attn::{
-    allocate_fi_graph_meta, fi_begin_forward, fi_end_forward, fi_precompute_paged_plan,
-    fi_precompute_paged_plan_graphed,
 };
 pub(crate) use ops::{
     debug_disable_fused_add_rmsnorm, debug_disable_fused_qknorm_rope, fast_add, fast_rms_norm,

@@ -16,7 +16,7 @@ pub fn reshape_and_cache_flash(
     key_cache: &Tensor, value_cache: &Tensor,
     slot_mapping: &Tensor,
 ) -> Result<()> {
-    crate::ops::gpu::scatter_kv_cache_flash(key, value, key_cache, value_cache, slot_mapping)
+    crate::ops::kv_cache::scatter_kv_cache_flash(key, value, key_cache, value_cache, slot_mapping)
 }
 
 /// Write K/V to paged cache using v1 layout.

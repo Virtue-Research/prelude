@@ -14,18 +14,15 @@ keywords = ["llm", "inference", "serving", "scheduler", "rust"]
 
 [features]
 default = []
-cuda = ["candle-core/cuda", "candle-transformers?/cuda", "dep:prelude-cuda", "cutlass-gemm"]
+cuda = ["candle-core/cuda", "candle-transformers?/cuda"]
 candle-baseline = ["dep:candle-transformers"]
-flash-attn = ["cuda", "paged-attn", "candle-flash-attn"]
-flash-attn-v3 = ["cuda", "candle-flash-attn-v3"]
-flash-attn-v4 = ["cuda", "prelude-cuda/flash-attn-v4"]
-deepgemm = ["cuda", "prelude-cuda/deepgemm"]
-cutlass-gemm = ["cuda", "prelude-cuda/cutlass-gemm"]
-flashinfer = ["cuda", "prelude-cuda/flashinfer"]
-flashinfer-v4 = ["flashinfer", "flash-attn-v4"]
-quant-gemm = ["cuda", "prelude-cuda/quant-gemm"]
-paged-attn = ["dep:candle-paged-attn"]
-full = ["flashinfer-v4", "deepgemm", "quant-gemm"]
+# Marker features — no deps, just compile-time cfg gates for cache/scheduler tuning.
+# Enabled by prelude-server when the corresponding prelude-cuda feature is active.
+flash-attn = ["cuda"]
+flash-attn-v3 = ["cuda"]
+flash-attn-v4 = ["cuda"]
+flashinfer = ["cuda"]
+paged-attn = ["cuda"]
 hf_tokenizer = ["dep:tokenizers"]
 nvtx = []
 
@@ -45,10 +42,6 @@ fastokens.workspace = true
 hf-hub.workspace = true
 half = { version = "2.7.1", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["extern_crate_alloc", "derive"] }
-candle-flash-attn = { workspace = true, optional = true }
-candle-flash-attn-v3 = { workspace = true, optional = true }
-candle-paged-attn = { workspace = true, optional = true }
-prelude-cuda = { workspace = true, optional = true }
 inventory = "0.3"
 rayon = "1.11.0"
 nix = { version = "0.31", features = ["sched"] }
@@ -60,27 +53,6 @@ name = "cpu_ops_bench"
 path = "src/bin/cpu_ops_bench/main.rs"
 
 [[bin]]
-name = "gpu_ops_bench"
-path = "src/bin/gpu_ops_bench/main.rs"
-required-features = ["cuda"]
-
-[[bin]]
 name = "tokenizer_bench"
 path = "src/bin/tokenizer_bench.rs"
 required-features = ["hf_tokenizer"]
-
-[[bin]]
-name = "qwen3_bench"
-path = "src/bin/qwen3_bench.rs"
-required-features = ["cuda"]
-# Add "candle-baseline" to required-features for baseline comparison mode
-
-[[bin]]
-name = "fused_ops_test"
-path = "src/bin/fused_ops_test.rs"
-required-features = ["cuda"]
-
-[[bin]]
-name = "gemma3_test"
-path = "src/bin/gemma3_test.rs"
-required-features = ["cuda"]

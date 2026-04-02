@@ -26,6 +26,7 @@ pub(crate) struct ModelExecutor {
     pub(crate) dtype: DType,
     pub(crate) config: CommonModelConfig,
     pub(crate) runtime_caps: RuntimeCaps,
+    pub(crate) ops: &'static crate::ops::Ops,
 }
 
 pub struct Engine {

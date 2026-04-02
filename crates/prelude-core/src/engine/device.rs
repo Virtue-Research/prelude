@@ -16,10 +16,8 @@ pub(crate) fn init_runtime(device: &Device, runtime: &crate::config::RuntimeConf
         tracing::info!(numa_report, "cpu_ops NUMA rayon pool initialized");
     }
 
-    #[cfg(feature = "cuda")]
-    if device.is_cuda() {
-        crate::ops::gpu::gemm::register_gpu_gemm();
-    }
+    // GPU GEMM registration is now handled by CudaOps::create() in prelude-cuda.
+    // No need to call register_gpu_gemm() here.
 }
 
 pub(crate) fn select_device(

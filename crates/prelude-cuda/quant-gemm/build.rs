@@ -1,13 +1,10 @@
 //! Build script: compile llama.cpp MMQ/MMVQ/dequantize kernels.
 //!
-//! Auto-clones llama.cpp main branch for kernel headers (same pattern as prelude-cutlass-gemm).
+//! Uses third_party/llama.cpp submodule for kernel headers.
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-const LLAMA_CPP_REPO: &str = "https://github.com/ggml-org/llama.cpp.git";
-const LLAMA_CPP_BRANCH: &str = "master";
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -21,8 +18,15 @@ fn main() {
     println!("cargo:rerun-if-changed=csrc/dequantize_gpu.cu");
     println!("cargo:rerun-if-changed=csrc/iq_tables.cuh");
 
-    // 1. Ensure llama.cpp headers
-    let llama_dir = ensure_llama_cpp(&out_dir);
+    // 1. Ensure llama.cpp headers (third_party/llama.cpp submodule)
+    let workspace_root = PathBuf::from(&manifest_dir).join("../../..");
+    let llama_dir = workspace_root.join("third_party/llama.cpp");
+    if !llama_dir.join("ggml/src/ggml-cuda/common.cuh").exists() {
+        panic!(
+            "third_party/llama.cpp submodule not found or incomplete.\n\
+             Run: git submodule update --init third_party/llama.cpp"
+        );
+    }
     let ggml_include = llama_dir.join("ggml/include");
     let ggml_src = llama_dir.join("ggml/src");
     let ggml_cuda = ggml_src.join("ggml-cuda");
@@ -148,55 +152,6 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=rt");
     println!("cargo:rustc-link-lib=dylib=dl");
     println!("cargo:rustc-link-lib=dylib=stdc++");
-}
-
-fn ensure_llama_cpp(out_dir: &Path) -> PathBuf {
-    let llama_dir = out_dir.join("llama.cpp");
-
-    // Check if already cloned with kernel headers
-    if llama_dir.join("ggml/src/ggml-cuda/common.cuh").exists() {
-        return llama_dir;
-    }
-
-    println!("cargo:warning=Cloning llama.cpp main branch (CUDA kernels only)...");
-
-    if llama_dir.exists() {
-        std::fs::remove_dir_all(&llama_dir).ok();
-    }
-
-    let status = Command::new("git")
-        .args([
-            "clone", "--depth", "1", "--branch", LLAMA_CPP_BRANCH,
-            "--single-branch", "--no-checkout", LLAMA_CPP_REPO,
-        ])
-        .arg(&llama_dir)
-        .status()
-        .expect("git clone failed");
-
-    if !status.success() {
-        panic!("Failed to clone llama.cpp repo");
-    }
-
-    // Sparse checkout: only ggml headers + CUDA kernel sources
-    Command::new("git")
-        .args(["sparse-checkout", "init", "--cone"])
-        .current_dir(&llama_dir)
-        .status().ok();
-    Command::new("git")
-        .args(["sparse-checkout", "set", "ggml/include", "ggml/src/ggml-common.h", "ggml/src/ggml-impl.h", "ggml/src/ggml-cuda"])
-        .current_dir(&llama_dir)
-        .status().ok();
-    Command::new("git")
-        .args(["checkout"])
-        .current_dir(&llama_dir)
-        .status().ok();
-
-    if !llama_dir.join("ggml/src/ggml-cuda/common.cuh").exists() {
-        panic!("llama.cpp CUDA headers not found after clone");
-    }
-
-    println!("cargo:warning=llama.cpp CUDA kernel headers ready");
-    llama_dir
 }
 
 fn find_cuda() -> PathBuf {

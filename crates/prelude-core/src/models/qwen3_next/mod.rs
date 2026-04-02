@@ -667,6 +667,7 @@ impl Qwen3NextAttention {
         let v = v.reshape((total_tokens, self.num_kv_heads, self.head_dim))?;
 
         let q = fast_rms_norm(
+            ctx.ops,
             &q.reshape((total_tokens * self.num_heads, self.head_dim))?,
             &self.q_norm,
             &self.q_norm_weight,
@@ -674,6 +675,7 @@ impl Qwen3NextAttention {
         )?
         .reshape((total_tokens, self.num_heads, self.head_dim))?;
         let k = fast_rms_norm(
+            ctx.ops,
             &k.reshape((total_tokens * self.num_kv_heads, self.head_dim))?,
             &self.k_norm,
             &self.k_norm_weight,
@@ -690,6 +692,7 @@ impl Qwen3NextAttention {
             None => (ctx.cu_seqlens_q, ctx.max_seqlen_q),
         };
         let attn_output = varlen_attention(
+            ctx.ops,
             &q,
             &k,
             &v,
@@ -724,10 +727,10 @@ impl ExpertMlp {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, ops: &crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        crate::models::common::fast_silu_mul(&gate, &up)?.apply(&self.down_proj)
+        crate::models::common::fast_silu_mul(ops, &gate, &up)?.apply(&self.down_proj)
     }
 }
 
@@ -738,13 +741,10 @@ struct Qwen3NextSparseMoeBlock {
     experts: Vec<ExpertMlp>,
     shared_expert: ExpertMlp,
     shared_expert_gate: CandleLinear,
-    // Stacked weights for fused MoE GEMM
-    #[cfg(feature = "cuda")]
-    gate_w: Tensor,
-    #[cfg(feature = "cuda")]
-    up_w: Tensor,
-    #[cfg(feature = "cuda")]
-    down_w: Tensor,
+    // Stacked weights for fused MoE GEMM (GPU only)
+    gate_w: Option<Tensor>,
+    up_w: Option<Tensor>,
+    down_w: Option<Tensor>,
     norm_topk_prob: bool,
     num_experts_per_tok: usize,
     num_experts: usize,
@@ -779,9 +779,8 @@ impl Qwen3NextSparseMoeBlock {
             CandleLinear::new(w, None)
         };
 
-        // Stack expert weights for fused GEMM
-        #[cfg(feature = "cuda")]
-        let (gate_w, up_w, down_w) = {
+        // Stack expert weights for fused GEMM (GPU only)
+        let (gate_w, up_w, down_w) = if experts.first().map_or(false, |e| e.gate_proj.weight().device().is_cuda()) {
             let gate_ws: Vec<Tensor> = experts
                 .iter()
                 .map(|e| e.gate_proj.weight().clone())
@@ -792,10 +791,12 @@ impl Qwen3NextSparseMoeBlock {
                 .map(|e| e.down_proj.weight().clone())
                 .collect();
             (
-                Tensor::stack(&gate_ws, 0)?.contiguous()?,
-                Tensor::stack(&up_ws, 0)?.contiguous()?,
-                Tensor::stack(&down_ws, 0)?.contiguous()?,
+                Some(Tensor::stack(&gate_ws, 0)?.contiguous()?),
+                Some(Tensor::stack(&up_ws, 0)?.contiguous()?),
+                Some(Tensor::stack(&down_ws, 0)?.contiguous()?),
             )
+        } else {
+            (None, None, None)
         };
 
         Ok(Self {
@@ -803,11 +804,8 @@ impl Qwen3NextSparseMoeBlock {
             experts,
             shared_expert,
             shared_expert_gate,
-            #[cfg(feature = "cuda")]
             gate_w,
-            #[cfg(feature = "cuda")]
             up_w,
-            #[cfg(feature = "cuda")]
             down_w,
             norm_topk_prob: cfg.norm_topk_prob,
             num_experts_per_tok: cfg.num_experts_per_tok,
@@ -815,12 +813,12 @@ impl Qwen3NextSparseMoeBlock {
         })
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    fn forward(&self, ops: &crate::ops::Ops, xs: &Tensor) -> Result<Tensor> {
         let (b, seq_len, hidden_dim) = xs.dims3()?;
         let xs_2d = xs.reshape(((), hidden_dim))?;
 
         // Shared expert (always active)
-        let shared_out = self.shared_expert.forward(&xs_2d)?;
+        let shared_out = self.shared_expert.forward(ops, &xs_2d)?;
         let shared_gate_logit = xs_2d.apply(&self.shared_expert_gate)?;
         let shared_gate = crate::nn_ops::ops::sigmoid(&shared_gate_logit)?;
         let shared_contribution = shared_out.broadcast_mul(&shared_gate)?;
@@ -842,9 +840,9 @@ impl Qwen3NextSparseMoeBlock {
         }
 
         // Routed expert computation
-        #[cfg(feature = "cuda")]
-        if xs.device().is_cuda() {
+        if xs.device().is_cuda() && self.gate_w.is_some() {
             let routed = self.forward_fused(
+                ops,
                 &xs_2d,
                 &topk_weights,
                 &experts_per_tok,
@@ -856,14 +854,14 @@ impl Qwen3NextSparseMoeBlock {
         }
 
         let routed =
-            self.forward_sequential(&xs_2d, &topk_weights, &experts_per_tok, hidden_dim)?;
+            self.forward_sequential(ops, &xs_2d, &topk_weights, &experts_per_tok, hidden_dim)?;
 
         (routed + shared_contribution)?.reshape((b, seq_len, hidden_dim))
     }
 
-    #[cfg(feature = "cuda")]
     fn forward_fused(
         &self,
+        ops: &crate::ops::Ops,
         xs: &Tensor,
         topk_weights: &Tensor,
         experts_per_tok: &Tensor,
@@ -871,6 +869,9 @@ impl Qwen3NextSparseMoeBlock {
         seq_len: usize,
         hidden_dim: usize,
     ) -> Result<Tensor> {
+        let gate_w = self.gate_w.as_ref().unwrap();
+        let up_w = self.up_w.as_ref().unwrap();
+        let down_w = self.down_w.as_ref().unwrap();
         let (sorted_expert_ids, sorted_token_ids) =
             sort_expert_assignments(experts_per_tok, xs.device(), self.num_experts)?;
 
@@ -878,7 +879,7 @@ impl Qwen3NextSparseMoeBlock {
 
         let gate = crate::nn_ops::moe::moe_gemm(
             xs,
-            &self.gate_w,
+            gate_w,
             &None,
             &sorted_token_ids,
             &sorted_expert_ids,
@@ -887,17 +888,17 @@ impl Qwen3NextSparseMoeBlock {
         )?;
         let up = crate::nn_ops::moe::moe_gemm(
             xs,
-            &self.up_w,
+            up_w,
             &None,
             &sorted_token_ids,
             &sorted_expert_ids,
             self.num_experts_per_tok,
             is_prefill,
         )?;
-        let down_input = crate::models::common::fast_silu_mul(&gate, &up)?;
+        let down_input = crate::models::common::fast_silu_mul(ops, &gate, &up)?;
         let ys = crate::nn_ops::moe::moe_gemm(
             &down_input,
-            &self.down_w,
+            down_w,
             &Some(topk_weights.clone()),
             &sorted_token_ids,
             &sorted_expert_ids,
@@ -912,6 +913,7 @@ impl Qwen3NextSparseMoeBlock {
 
     fn forward_sequential(
         &self,
+        ops: &crate::ops::Ops,
         xs: &Tensor,
         topk_weights: &Tensor,
         experts_per_tok: &Tensor,
@@ -934,7 +936,7 @@ impl Qwen3NextSparseMoeBlock {
             }
             let idx = Tensor::from_vec(token_ids.clone(), (token_ids.len(),), xs.device())?;
             let x_subset = xs.index_select(&idx, 0)?;
-            let expert_out = self.experts[expert_id].forward(&x_subset)?;
+            let expert_out = self.experts[expert_id].forward(ops, &x_subset)?;
 
             // Gather routing weights for this expert
             let weights: Vec<f32> = token_ids
@@ -954,7 +956,6 @@ impl Qwen3NextSparseMoeBlock {
     }
 }
 
-#[cfg(feature = "cuda")]
 fn sort_expert_assignments(
     experts_per_tok: &Tensor,
     device: &Device,
@@ -1035,18 +1036,19 @@ impl Qwen3NextDecoderLayer {
         seq_lens: &[usize],
     ) -> Result<Tensor> {
         let Self { block, token_mixer, moe, .. } = self;
-        block.forward(x,
+        block.forward(ctx.ops, x,
             |h| match token_mixer {
                 TokenMixer::FullAttention(attn) => attn.forward(h, ctx),
                 TokenMixer::LinearAttention(gdn) => deltanet_varlen(gdn, h, seq_lens),
             },
-            |x_res, h2| fast_add(x_res, &moe.forward(h2)?),
+            |x_res, h2| fast_add(ctx.ops, x_res, &moe.forward(ctx.ops, h2)?),
         )
     }
 
     /// Varlen prefill for DeltaNet layers using pool — scatters state per-sequence.
     fn forward_with_paged_prefix_pooled(
         &mut self,
+        ops: &crate::ops::Ops,
         x: &Tensor,
         _cu_seqlens_q: &Tensor,
         _cu_seqlens_k: &Tensor,
@@ -1059,7 +1061,7 @@ impl Qwen3NextDecoderLayer {
         dn_layer_idx: usize,
     ) -> Result<Tensor> {
         let Self { block, token_mixer, moe, .. } = self;
-        block.forward(x,
+        block.forward(ops, x,
             |h| match token_mixer {
                 TokenMixer::LinearAttention(gdn) => {
                     deltanet_varlen_pooled(gdn, h, seq_lens, pool, slot_ids, dn_layer_idx)
@@ -1068,7 +1070,7 @@ impl Qwen3NextDecoderLayer {
                     candle_core::bail!("forward_with_paged_prefix_pooled called on FullAttention layer")
                 }
             },
-            |x_res, h2| fast_add(x_res, &moe.forward(h2)?),
+            |x_res, h2| fast_add(ops, x_res, &moe.forward(ops, h2)?),
         )
     }
 
@@ -1183,6 +1185,7 @@ impl Qwen3NextModel {
                 TokenMixer::FullAttention(_) => {
                     let layer_kv = ctx.paged_kv.map(|kv| kv.layer(attn_layer_idx));
                     let layer_ctx = LayerAttnContext {
+                        ops: ctx.ops,
                         cu_seqlens_q: ctx.cu_seqlens_q,
                         max_seqlen_q: ctx.max_seqlen_q,
                         position_ids: ctx.position_ids,
@@ -1196,6 +1199,7 @@ impl Qwen3NextModel {
                         (ctx.deltanet_pool.as_deref_mut(), ctx.deltanet_slots)
                     {
                         h = layer.forward_with_paged_prefix_pooled(
+                            ctx.ops,
                             &h,
                             ctx.cu_seqlens_q,
                             ctx.cu_seqlens_q,
@@ -1209,6 +1213,7 @@ impl Qwen3NextModel {
                         )?;
                     } else {
                         let layer_ctx = LayerAttnContext {
+                            ops: ctx.ops,
                             cu_seqlens_q: ctx.cu_seqlens_q,
                             max_seqlen_q: ctx.max_seqlen_q,
                             position_ids: ctx.position_ids,
@@ -1220,7 +1225,7 @@ impl Qwen3NextModel {
                 }
             }
         }
-        fast_rms_norm(&h, &self.norm, &self.norm_weight, self.rms_norm_eps)
+        fast_rms_norm(ctx.ops, &h, &self.norm, &self.norm_weight, self.rms_norm_eps)
     }
 
     fn clear_cache(&mut self) {

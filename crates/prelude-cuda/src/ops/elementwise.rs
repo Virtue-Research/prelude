@@ -1,4 +1,4 @@
-use super::{MOD_ADD, MOD_SILU_MUL, PTX_ADD, PTX_SILU_MUL};
+use crate::{MOD_ADD, MOD_SILU_MUL, PTX_ADD, PTX_SILU_MUL};
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
 use candle_core::cuda_backend::WrapErr;

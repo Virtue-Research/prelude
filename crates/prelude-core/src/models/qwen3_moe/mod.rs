@@ -94,10 +94,10 @@ impl Qwen3MoeExpert {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, ops: &crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        crate::models::common::fast_silu_mul(&gate, &up)?.apply(&self.down_proj)
+        crate::models::common::fast_silu_mul(ops, &gate, &up)?.apply(&self.down_proj)
     }
 }
 
@@ -108,12 +108,9 @@ struct Qwen3SparseMoeBlock {
     gate: CandleLinear,
     experts: Vec<Qwen3MoeExpert>,
     // Stacked expert weights for fused GEMM [num_experts, N, K]
-    #[cfg(feature = "cuda")]
-    gate_w: Tensor,
-    #[cfg(feature = "cuda")]
-    up_w: Tensor,
-    #[cfg(feature = "cuda")]
-    down_w: Tensor,
+    gate_w: Option<Tensor>,
+    up_w: Option<Tensor>,
+    down_w: Option<Tensor>,
     norm_topk_prob: bool,
     num_experts_per_tok: usize,
 }
@@ -131,9 +128,8 @@ impl Qwen3SparseMoeBlock {
             experts.push(Qwen3MoeExpert::new(cfg, vb_e.pp(idx))?);
         }
 
-        // Stack expert weights for fused MoE GEMM
-        #[cfg(feature = "cuda")]
-        let (gate_w, up_w, down_w) = {
+        // Stack expert weights for fused MoE GEMM (GPU only)
+        let (gate_w, up_w, down_w) = if experts.first().map_or(false, |e| e.gate_proj.weight().device().is_cuda()) {
             let gate_ws: Vec<Tensor> = experts
                 .iter()
                 .map(|e| e.gate_proj.weight().clone())
@@ -144,20 +140,19 @@ impl Qwen3SparseMoeBlock {
                 .map(|e| e.down_proj.weight().clone())
                 .collect();
             (
-                Tensor::stack(&gate_ws, 0)?.contiguous()?,
-                Tensor::stack(&up_ws, 0)?.contiguous()?,
-                Tensor::stack(&down_ws, 0)?.contiguous()?,
+                Some(Tensor::stack(&gate_ws, 0)?.contiguous()?),
+                Some(Tensor::stack(&up_ws, 0)?.contiguous()?),
+                Some(Tensor::stack(&down_ws, 0)?.contiguous()?),
             )
+        } else {
+            (None, None, None)
         };
 
         Ok(Self {
             gate,
             experts,
-            #[cfg(feature = "cuda")]
             gate_w,
-            #[cfg(feature = "cuda")]
             up_w,
-            #[cfg(feature = "cuda")]
             down_w,
             norm_topk_prob: cfg.norm_topk_prob,
             num_experts_per_tok: cfg.num_experts_per_tok,
@@ -217,14 +212,17 @@ impl Qwen3SparseMoeBlock {
     }
 
     /// Fused MoE forward for varlen (2D) input.
-    #[cfg(feature = "cuda")]
     fn forward_fused_varlen(
         &self,
+        ops: &crate::ops::Ops,
         xs: &Tensor,
         topk_weights: &Tensor,
         experts_per_tok: &Tensor,
         hidden_dim: usize,
     ) -> Result<Tensor> {
+        let gate_w = self.gate_w.as_ref().unwrap();
+        let up_w = self.up_w.as_ref().unwrap();
+        let down_w = self.down_w.as_ref().unwrap();
         let (total_tokens, _) = xs.dims2()?;
         let (sorted_expert_ids, sorted_token_ids) =
             self.sort_expert_assignments(experts_per_tok, xs.device())?;
@@ -233,7 +231,7 @@ impl Qwen3SparseMoeBlock {
 
         let gate = crate::nn_ops::moe::moe_gemm(
             xs,
-            &self.gate_w,
+            gate_w,
             &None,
             &sorted_token_ids,
             &sorted_expert_ids,
@@ -243,7 +241,7 @@ impl Qwen3SparseMoeBlock {
 
         let up = crate::nn_ops::moe::moe_gemm(
             xs,
-            &self.up_w,
+            up_w,
             &None,
             &sorted_token_ids,
             &sorted_expert_ids,
@@ -251,11 +249,11 @@ impl Qwen3SparseMoeBlock {
             is_prefill,
         )?;
 
-        let down_input = crate::models::common::fast_silu_mul(&gate, &up)?;
+        let down_input = crate::models::common::fast_silu_mul(ops, &gate, &up)?;
 
         let ys = crate::nn_ops::moe::moe_gemm(
             &down_input,
-            &self.down_w,
+            down_w,
             &Some(topk_weights.clone()),
             &sorted_token_ids,
             &sorted_expert_ids,
@@ -270,6 +268,7 @@ impl Qwen3SparseMoeBlock {
     /// Sequential per-expert dispatch (CPU fallback).
     fn forward_sequential(
         &self,
+        ops: &crate::ops::Ops,
         xs: &Tensor,
         topk_weights: &Tensor,
         experts_per_tok: &Tensor,
@@ -303,7 +302,7 @@ impl Qwen3SparseMoeBlock {
                 .to_dtype(xs.dtype())?;
 
             let current_state = xs.index_select(&top_x_t, 0)?.reshape(((), hidden_dim))?;
-            let current_hidden = expert_layer.forward(&current_state)?;
+            let current_hidden = expert_layer.forward(ops, &current_state)?;
             let current_hidden = current_hidden.broadcast_mul(&weights_t)?;
             ys = ys.index_add(&top_x_t, &current_hidden, 0)?;
         }
@@ -312,15 +311,14 @@ impl Qwen3SparseMoeBlock {
     }
 
     /// Forward for varlen packed sequences: xs is (total_tokens, hidden_dim).
-    fn forward_varlen(&self, xs: &Tensor) -> Result<Tensor> {
+    fn forward_varlen(&self, ops: &crate::ops::Ops, xs: &Tensor) -> Result<Tensor> {
         let (topk_weights, experts_per_tok, hidden_dim) = self.compute_routing_2d(xs)?;
 
-        #[cfg(feature = "cuda")]
-        if xs.device().is_cuda() {
-            return self.forward_fused_varlen(xs, &topk_weights, &experts_per_tok, hidden_dim);
+        if xs.device().is_cuda() && self.gate_w.is_some() {
+            return self.forward_fused_varlen(ops, xs, &topk_weights, &experts_per_tok, hidden_dim);
         }
 
-        self.forward_sequential(xs, &topk_weights, &experts_per_tok, hidden_dim)
+        self.forward_sequential(ops, xs, &topk_weights, &experts_per_tok, hidden_dim)
     }
 
 }
@@ -334,10 +332,10 @@ enum MoeFeedForward {
 }
 
 impl MoeFeedForward {
-    fn forward_2d(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward_2d(&self, ops: &crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Mlp(mlp) => mlp.forward(x),
-            Self::SparseMoe(moe) => moe.forward_varlen(x),
+            Self::Mlp(mlp) => mlp.forward(ops, x),
+            Self::SparseMoe(moe) => moe.forward_varlen(ops, x),
         }
     }
 }
@@ -388,9 +386,9 @@ impl MoeDecoderLayer {
     }
 
     fn forward(&self, x: &Tensor, ctx: &LayerAttnContext) -> Result<Tensor> {
-        self.block.forward(x,
+        self.block.forward(ctx.ops, x,
             |h| self.self_attn.forward(h, ctx),
-            |x_res, h2| fast_add(x_res, &self.feed_forward.forward_2d(h2)?),
+            |x_res, h2| fast_add(ctx.ops, x_res, &self.feed_forward.forward_2d(ctx.ops, h2)?),
         )
     }
 }
@@ -445,6 +443,7 @@ impl MoeModel {
         for (i, layer) in self.layers.iter_mut().enumerate() {
             let layer_kv = ctx.paged_kv.map(|kv| kv.layer(i));
             let layer_ctx = LayerAttnContext {
+                ops: ctx.ops,
                 cu_seqlens_q: ctx.cu_seqlens_q,
                 max_seqlen_q: ctx.max_seqlen_q,
                 position_ids: ctx.position_ids,
@@ -452,7 +451,7 @@ impl MoeModel {
             };
             h = layer.forward(&h, &layer_ctx)?;
         }
-        fast_rms_norm(&h, &self.norm, &self.norm_weight, self.rms_norm_eps)
+        fast_rms_norm(ctx.ops, &h, &self.norm, &self.norm_weight, self.rms_norm_eps)
     }
 }
 

@@ -1,6 +1,6 @@
 //! Build script for prelude-flash-attn-v4.
 //!
-//! 1. Auto-clone flash-attention main branch (FA4 CuTeDSL Python source).
+//! 1. Find flash-attention source (third_party/flash-attention submodule).
 //! 2. If pre-compiled kernel .o files exist in `kernels/`, use them.
 //!    Otherwise, run `scripts/compile_kernels.py` to AOT-compile.
 //! 3. Create a static archive (libfa4_kernels.a) from all kernel .o files.
@@ -13,9 +13,6 @@ use std::env;
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-const FA4_REPO: &str = "https://github.com/Dao-AILab/flash-attention.git";
-const FA4_BRANCH: &str = "main";
 
 /// Recursively search for a file by name under a directory.
 fn find_file_recursive(dir: &Path, name: &str) -> Option<PathBuf> {
@@ -360,40 +357,16 @@ fn walkdir(dir: &Path, ext: &str) -> Vec<PathBuf> {
     result
 }
 
-fn ensure_fa4_source(out_dir: &Path) -> Result<PathBuf> {
-    let fa4_src = out_dir.join("fa4-src");
-
-    if fa4_src.join("flash_attn/cute/__init__.py").exists() {
-        return Ok(fa4_src);
-    }
-
-    println!("cargo:warning=Cloning flash-attention main branch...");
-
-    if fa4_src.exists() {
-        std::fs::remove_dir_all(&fa4_src)?;
-    }
-
-    let status = Command::new("git")
-        .args([
-            "clone",
-            "--depth",
-            "1",
-            "--branch",
-            FA4_BRANCH,
-            "--single-branch",
-            "--filter=blob:limit=1m",
-            FA4_REPO,
-        ])
-        .arg(&fa4_src)
-        .status()
-        .context("Failed to clone flash-attention repo")?;
-
-    if !status.success() {
-        anyhow::bail!("git clone failed for {FA4_REPO}");
-    }
+fn ensure_fa4_source(_out_dir: &Path) -> Result<PathBuf> {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
+    let workspace_root = manifest_dir.join("../../..");
+    let fa4_src = workspace_root.join("third_party/flash-attention");
 
     if !fa4_src.join("flash_attn/cute/__init__.py").exists() {
-        anyhow::bail!("flash_attn/cute/ not found in cloned repo");
+        anyhow::bail!(
+            "third_party/flash-attention submodule not found or incomplete.\n\
+             Run: git submodule update --init third_party/flash-attention"
+        );
     }
 
     Ok(fa4_src)

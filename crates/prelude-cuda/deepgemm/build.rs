@@ -2,18 +2,12 @@
 //!
 //! Requires:
 //! - CUDA Toolkit with nvcc (sm_90a support; sm_100a for Blackwell)
-//! - CUTLASS headers (auto-cloned from GitHub)
-//! - DeepGEMM headers (auto-cloned from GitHub)
+//! - CUTLASS headers (third_party/cutlass submodule)
+//! - DeepGEMM headers (third_party/DeepGEMM submodule)
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-const CUTLASS_REPO: &str = "https://github.com/NVIDIA/cutlass.git";
-const CUTLASS_BRANCH: &str = "main";
-
-const DEEPGEMM_REPO: &str = "https://github.com/deepseek-ai/DeepGEMM.git";
-const DEEPGEMM_BRANCH: &str = "main";
 
 fn main() {
     println!("cargo:rerun-if-changed=src/deepgemm_wrapper.cu");
@@ -29,12 +23,19 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
-    // 1. Ensure CUTLASS headers
-    let cutlass_dir = ensure_cutlass(&out_dir);
+    // 1. Ensure CUTLASS headers (third_party/cutlass submodule)
+    let workspace_root = PathBuf::from(&manifest_dir).join("../../..");
+    let cutlass_dir = workspace_root.join("third_party/cutlass");
+    if !cutlass_dir.join("include/cutlass/cutlass.h").exists() {
+        panic!(
+            "third_party/cutlass submodule not found or incomplete.\n\
+             Run: git submodule update --init third_party/cutlass"
+        );
+    }
     let cutlass_include = cutlass_dir.join("include");
 
-    // 2. Ensure DeepGEMM headers (cloned from upstream, patched for fat binary)
-    let deepgemm_dir = ensure_deepgemm(&out_dir);
+    // 2. Ensure DeepGEMM headers (third_party/DeepGEMM submodule, patched for fat binary)
+    let deepgemm_dir = ensure_deepgemm(&out_dir, &workspace_root);
     let deepgemm_include = deepgemm_dir.join("deep_gemm/include");
 
     // 3. Find CUDA toolkit
@@ -125,93 +126,33 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=stdc++");
 }
 
-fn ensure_cutlass(out_dir: &Path) -> PathBuf {
-    let cutlass_dir = out_dir.join("cutlass");
-
-    if cutlass_dir.join("include/cutlass/cutlass.h").exists() {
-        return cutlass_dir;
-    }
-
-    println!("cargo:warning=Cloning CUTLASS main branch (headers only)...");
-
-    if cutlass_dir.exists() {
-        std::fs::remove_dir_all(&cutlass_dir).ok();
-    }
-
-    let status = Command::new("git")
-        .args([
-            "clone", "--depth", "1", "--branch", CUTLASS_BRANCH,
-            "--single-branch", "--no-checkout", CUTLASS_REPO,
-        ])
-        .arg(&cutlass_dir)
-        .status()
-        .expect("git clone failed");
-
-    if !status.success() {
-        panic!("Failed to clone CUTLASS repo");
-    }
-
-    Command::new("git")
-        .args(["sparse-checkout", "init", "--cone"])
-        .current_dir(&cutlass_dir)
-        .status().ok();
-    Command::new("git")
-        .args(["sparse-checkout", "set", "include"])
-        .current_dir(&cutlass_dir)
-        .status().ok();
-    Command::new("git")
-        .args(["checkout"])
-        .current_dir(&cutlass_dir)
-        .status().ok();
-
-    if !cutlass_dir.join("include/cutlass/cutlass.h").exists() {
-        panic!("CUTLASS headers not found after clone");
-    }
-
-    println!("cargo:warning=CUTLASS headers ready");
-    cutlass_dir
-}
-
-fn ensure_deepgemm(out_dir: &Path) -> PathBuf {
+fn ensure_deepgemm(out_dir: &Path, workspace_root: &Path) -> PathBuf {
     let dg_dir = out_dir.join("deepgemm");
 
     if dg_dir.join("deep_gemm/include/deep_gemm/impls/sm90_bf16_gemm.cuh").exists() {
         return dg_dir;
     }
 
-    println!("cargo:warning=Cloning DeepGEMM (headers only)...");
+    // Use third_party/DeepGEMM submodule as source
+    let submodule_path = workspace_root.join("third_party/DeepGEMM");
+    if !submodule_path.join("deep_gemm/include/deep_gemm/impls/sm90_bf16_gemm.cuh").exists() {
+        panic!(
+            "third_party/DeepGEMM submodule not found or incomplete.\n\
+             Run: git submodule update --init third_party/DeepGEMM"
+        );
+    }
 
+    // Copy submodule to OUT_DIR so we can apply patches without modifying the submodule
+    println!("cargo:warning=Copying DeepGEMM from third_party/ submodule...");
     if dg_dir.exists() {
         std::fs::remove_dir_all(&dg_dir).ok();
     }
-
-    let status = Command::new("git")
-        .args([
-            "clone", "--depth", "1", "--branch", DEEPGEMM_BRANCH,
-            "--single-branch", "--no-checkout", DEEPGEMM_REPO,
-        ])
-        .arg(&dg_dir)
+    let status = Command::new("cp")
+        .args(["-r", submodule_path.to_str().unwrap(), dg_dir.to_str().unwrap()])
         .status()
-        .expect("git clone failed");
+        .expect("Failed to copy DeepGEMM submodule");
     if !status.success() {
-        panic!("Failed to clone DeepGEMM repo");
-    }
-
-    Command::new("git")
-        .args(["sparse-checkout", "init", "--cone"])
-        .current_dir(&dg_dir)
-        .status().ok();
-    Command::new("git")
-        .args(["sparse-checkout", "set", "deep_gemm/include"])
-        .current_dir(&dg_dir)
-        .status().ok();
-    Command::new("git")
-        .args(["checkout"])
-        .current_dir(&dg_dir)
-        .status().ok();
-
-    if !dg_dir.join("deep_gemm/include/deep_gemm/impls/sm90_bf16_gemm.cuh").exists() {
-        panic!("DeepGEMM headers not found after clone");
+        panic!("Failed to copy DeepGEMM submodule to OUT_DIR");
     }
 
     // Patch SM90 kernel arch guards for fat binary (SM90a + SM100a) compilation.

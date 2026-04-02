@@ -24,9 +24,9 @@ use crate::profiling::{nvtx_push, nvtx_pop};
 ///
 /// ```ignore
 /// // In DecoderLayer::forward:
-/// self.block.forward(x,
+/// self.block.forward(ctx.ops, x,
 ///     |h| self.self_attn.forward(h, ctx),
-///     |x_res, h2| fast_add(x_res, &self.mlp.forward(&h2)?),
+///     |x_res, h2| fast_add(ctx.ops, x_res, &self.mlp.forward(&h2)?),
 /// )
 /// ```
 #[derive(Debug, Clone)]
@@ -75,6 +75,7 @@ impl TransformerBlock {
     /// models with raw CPU paths do in-place residual add.
     pub(crate) fn forward<A, M>(
         &self,
+        ops: &crate::ops::Ops,
         x: &Tensor,
         attn_fn: A,
         residual_mlp_fn: M,
@@ -83,12 +84,12 @@ impl TransformerBlock {
         A: FnOnce(&Tensor) -> Result<Tensor>,
         M: FnOnce(&Tensor, &Tensor) -> Result<Tensor>,
     {
-        let h = fast_rms_norm(x, &self.ln1, &self.ln1_weight, self.rms_norm_eps)?;
+        let h = fast_rms_norm(ops, x, &self.ln1, &self.ln1_weight, self.rms_norm_eps)?;
         nvtx_push!("attention");
         let h = attn_fn(&h)?;
         nvtx_pop!();
         let (x_res, h2) = fused_add_rmsnorm(
-            x, &h, &self.ln2, &self.ln2_weight, self.rms_norm_eps,
+            ops, x, &h, &self.ln2, &self.ln2_weight, self.rms_norm_eps,
         )?;
         nvtx_push!("mlp");
         let result = residual_mlp_fn(&x_res, &h2);

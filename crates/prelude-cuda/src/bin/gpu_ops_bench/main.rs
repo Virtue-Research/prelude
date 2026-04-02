@@ -56,9 +56,9 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Register our GEMM dispatch
+    // Initialize CUDA ops (registers GEMM dispatch)
     #[cfg(any(feature = "cutlass-gemm", feature = "deepgemm"))]
-    prelude_core::ops::gpu::gemm::register_gpu_gemm();
+    let _ops = prelude_cuda::create_cuda_ops();
 
     // Shared cuBLAS handle
     #[cfg(feature = "bench-cublas")]

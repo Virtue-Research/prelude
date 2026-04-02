@@ -54,7 +54,7 @@ impl GatedMlp {
         self.gate_up_proj.as_ref()?.brgemm_weight()
     }
 
-    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, ops: &crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
         // Fused gate_up GEMM path (CPU BF16)
         if let Some(ref gup) = self.gate_up_proj {
             // Fused GEMM+SiLU path: gate_up GEMM + SiLU×Mul in one pass,
@@ -103,7 +103,7 @@ impl GatedMlp {
         // gate_up_proj is always Some on CPU BF16 — this path is for CUDA only
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        super::ops::fast_silu_mul(&gate, &up)?.apply(&self.down_proj)
+        super::ops::fast_silu_mul(ops, &gate, &up)?.apply(&self.down_proj)
     }
 
     /// Raw MLP forward: operates on CpuTensor with caller-provided scratch buffers.

@@ -437,6 +437,7 @@ impl DecodeGraphCache {
                     max_seqlen_k: buffers.max_seqlen_k,
                 };
                 let mut ctx = BatchAttnContext {
+                    ops: engine.executor.ops,
                     cu_seqlens_q: &buffers.cu_seqlens_q,
                     max_seqlen_q: 1,
                     position_ids: &buffers.position_ids,
@@ -445,13 +446,11 @@ impl DecodeGraphCache {
                     deltanet_pool: None,
                     deltanet_slots: None,
                 };
-                #[cfg(feature = "flashinfer")]
-                if $manage { crate::models::common::fi_begin_forward(); }
+                if $manage { engine.executor.ops.session.begin_forward(); }
                 let result = $model
                     .forward(&buffers.packed_input, &mut ctx)
                     .map_err(candle_err);
-                #[cfg(feature = "flashinfer")]
-                if $manage { crate::models::common::fi_end_forward(); }
+                if $manage { engine.executor.ops.session.end_forward(); }
                 result
             }};
         }

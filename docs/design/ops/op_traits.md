@@ -29,31 +29,29 @@ trait AttentionOps: Send + Sync {
     ) -> Result<Tensor>;
 }
 
-/// Scheduling metadata uses plain `&[u32]`, not `Tensor`.
-/// These are small integer arrays describing batch structure (not model data).
-/// Device implementations handle GPU upload internally:
-///   - CUDA/ROCm: pre-allocated GPU buffer, memcpy before kernel launch.
-///   - Metal: unified memory, zero-copy wrap.
-///   - TPU: included in XLA trace as constants.
-///   - CPU/Vulkan: used directly.
+/// Scheduling metadata uses `&Tensor`, not `&[u32]`.
+///
+/// Rationale: cu_seqlens and block_tables may live on any device. Using Tensor
+/// lets the backend read them wherever they are. When we replace candle_core
+/// with our own minimal Tensor, the type changes but the trait signatures don't.
+/// Our minimal Tensor will be a zero-cost wrapper over host slices for CPU data,
+/// so there's no overhead vs `&[u32]` for the CPU case.
 struct VarlenParams<'a> {
-    pub cu_seqlens_q: &'a [u32],  // [batch+1], cumulative sequence offsets
-    pub cu_seqlens_k: &'a [u32],  // [batch+1], may differ from cu_seqlens_q (cross-attention)
-    pub max_seqlen_q: u32,
-    pub max_seqlen_k: u32,
+    pub cu_seqlens_q: &'a Tensor,  // [batch+1], cumulative sequence offsets
+    pub cu_seqlens_k: &'a Tensor,  // [batch+1], may differ from cu_seqlens_q (cross-attention)
+    pub max_seqlen_q: usize,
+    pub max_seqlen_k: usize,
     pub scale: f32,
     pub mask: MaskType,
     pub softcap: Option<f32>,     // Gemma2/3 logit capping
 }
 
 struct PagedParams<'a> {
-    pub block_tables: &'a [u32],  // [batch * max_blocks_per_seq], flattened block indices
-    pub num_seqs: u32,
-    pub max_blocks_per_seq: u32,
-    pub cu_seqlens_q: &'a [u32],  // [batch+1]
-    pub cu_seqlens_k: &'a [u32],  // [batch+1]
-    pub max_seqlen_q: u32,
-    pub max_seqlen_k: u32,
+    pub block_tables: &'a Tensor,  // [batch * max_blocks_per_seq], flattened block indices
+    pub cu_seqlens_q: &'a Tensor,  // [batch+1]
+    pub cu_seqlens_k: &'a Tensor,  // [batch+1]
+    pub max_seqlen_q: usize,
+    pub max_seqlen_k: usize,
     pub scale: f32,
     pub mask: MaskType,
     pub softcap: Option<f32>,     // Gemma2/3 logit capping (same as VarlenParams)
@@ -112,7 +110,7 @@ trait KvCacheOps: Send + Sync {
         &self,
         key: &Tensor, value: &Tensor,
         key_cache: &Tensor, value_cache: &Tensor,
-        slot_mapping: &[u32],   // scheduling metadata, same as cu_seqlens
+        slot_mapping: &Tensor,   // scheduling metadata, same rationale as VarlenParams
     ) -> Result<()>;
 }
 
@@ -351,7 +349,7 @@ trait FusedOps: Send + Sync {
         cos: &Tensor, sin: &Tensor,
         position_ids: &Tensor,
         key_cache: &Tensor, value_cache: &Tensor,
-        slot_mapping: &[u32], eps: f32,   // scheduling metadata, same &[u32] as reshape_and_cache
+        slot_mapping: &Tensor, eps: f32,   // scheduling metadata, same rationale as VarlenParams
     ) -> Option<Result<()>> { None }
 
     /// Fused Adaptive Layer Norm (AdaLN-Zero).

@@ -104,6 +104,7 @@ impl Engine {
             max_seqlen_k,
         };
         let mut ctx = BatchAttnContext {
+            ops: self.executor.ops,
             cu_seqlens_q: &cu_seqlens_q_t,
             max_seqlen_q: 1,
             position_ids: &position_ids_t,
@@ -113,11 +114,9 @@ impl Engine {
             deltanet_pool: dn_pool_ref,
             deltanet_slots: deltanet_slots.as_deref(),
         };
-        #[cfg(feature = "flashinfer")]
-        crate::models::common::fi_begin_forward();
+        self.executor.ops.session.begin_forward();
         let logits = model.forward(&packed_input, &mut ctx).map_err(candle_err)?;
-        #[cfg(feature = "flashinfer")]
-        crate::models::common::fi_end_forward();
+        self.executor.ops.session.end_forward();
         drop(dn_pool_guard);
         drop(model);
 
@@ -247,6 +246,7 @@ impl Engine {
                     max_seqlen_k: context_len as usize,
                 };
                 let mut ctx = BatchAttnContext {
+                    ops: self.executor.ops,
                     cu_seqlens_q: &cu_q,
                     max_seqlen_q: 1,
                     position_ids: &pos_ids,
@@ -256,11 +256,9 @@ impl Engine {
                     deltanet_pool: dn_pool_ref,
                     deltanet_slots: dn_slots.as_deref(),
                 };
-                #[cfg(feature = "flashinfer")]
-                crate::models::common::fi_begin_forward();
+                self.executor.ops.session.begin_forward();
                 let logits = model.forward(&input_t, &mut ctx).map_err(candle_err)?;
-                #[cfg(feature = "flashinfer")]
-                crate::models::common::fi_end_forward();
+                self.executor.ops.session.end_forward();
                 drop(dn_pool_guard);
                 drop(model);
 

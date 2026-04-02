@@ -112,22 +112,20 @@ impl Linear {
     }
 
     /// Wrap an existing `CandleLinear`, selecting the best backend by device.
+    ///
+    /// CUDA: uses `CandleLinear` — `Tensor::matmul()` routes through the registered
+    /// CUTLASS/DeepGEMM dispatch (set up by `CudaOps::create()`).
+    /// CPU: uses `OnednnLinear` for BF16/F32 brgemm acceleration.
     pub fn from_candle(linear: CandleLinear) -> Result<Self> {
-        #[cfg(feature = "cuda")]
-        {
-            if linear.weight().device().is_cuda() {
-                return Ok(Self {
-                    inner: Box::new(crate::ops::gpu::gemm::GpuLinear::new(
-                        linear.weight().clone(),
-                        linear.bias().cloned(),
-                    )?),
-                });
-            }
+        if linear.weight().device().is_cpu() {
+            Ok(Self {
+                inner: Box::new(crate::ops::onednn::OnednnLinear::new(linear)?),
+            })
+        } else {
+            Ok(Self {
+                inner: Box::new(CandleLinearBackend(linear)),
+            })
         }
-
-        Ok(Self {
-            inner: Box::new(crate::ops::onednn::OnednnLinear::new(linear)?),
-        })
     }
 
     /// Construct from a quantized QTensor (GGUF).
@@ -181,6 +179,27 @@ impl Module for Linear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.inner.forward(x)
     }
+}
+
+// ── CandleLinear backend (CUDA via registered dispatch) ─────────────────
+
+/// Simple wrapper around `CandleLinear` for CUDA devices.
+/// `Tensor::matmul()` is intercepted by the registered GEMM dispatch
+/// (CUTLASS/DeepGEMM), so no direct FFI needed here.
+#[derive(Debug, Clone)]
+struct CandleLinearBackend(CandleLinear);
+
+impl Module for CandleLinearBackend {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.0.forward(x)
+    }
+}
+
+impl LinearBackend for CandleLinearBackend {
+    fn name(&self) -> &str { "gpu/candle" }
+    fn weight(&self) -> Option<&Tensor> { Some(self.0.weight()) }
+    fn clone_box(&self) -> Box<dyn LinearBackend> { Box::new(self.clone()) }
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 // ── Q4_0 quantized backend ───────────────────────────────────────────────
