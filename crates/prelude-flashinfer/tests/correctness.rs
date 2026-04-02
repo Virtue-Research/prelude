@@ -315,12 +315,10 @@ fn new_utility_kernel_lookup() {
     // CUTLASS MLA
     assert!(reg.get_utility("cutlass_mla_paged_attention").is_some(), "cutlass_mla_paged_attention not found");
 
-    // Comm: TRT-LLM AllReduce
-    assert!(reg.get_utility("trtllm_custom_all_reduce").is_some(), "trtllm_custom_all_reduce not found");
-    assert!(reg.get_utility("trtllm_allreduce_fusion").is_some(), "trtllm_allreduce_fusion not found");
-
-    // Comm: vLLM AllReduce
+    // Comm: vLLM AllReduce (all archs)
     assert!(reg.get_utility("init_custom_ar").is_some(), "init_custom_ar not found");
+
+    // TRT-LLM comm is SM100+, tested in sm100_module_lookup
 }
 
 #[test]
