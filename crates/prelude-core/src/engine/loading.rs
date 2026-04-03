@@ -1,15 +1,12 @@
-//! Model loading: local path, HF Hub, safetensors, GGUF.
+//! Engine construction: local path, HF Hub, safetensors, GGUF.
 //!
 //! All factory functions return a fully assembled `Engine`.
-
-pub mod var_builder;
-pub(crate) mod weights;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::loading::var_builder::VarBuilder;
+use super::weight_loader::VarBuilder;
 use crate::tensor::{DType, Device, Tensor};
 use fastokens::Tokenizer;
 

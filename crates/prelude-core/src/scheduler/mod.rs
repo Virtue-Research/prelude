@@ -9,12 +9,13 @@ mod admission;
 mod preemption;
 mod state;
 pub(crate) mod adaptive;
+pub mod components;
 
 #[cfg(test)]
 mod tests;
 
-pub use crate::cache::block_manager::BlockManager;
-pub use crate::cache::prefix_index::{PrefixInsertPlan, PrefixMatch, PrefixMatchIndex};
+pub use components::cache::block_manager::BlockManager;
+pub use components::cache::prefix_index::{PrefixInsertPlan, PrefixMatch, PrefixMatchIndex};
 pub use state::{
     FinishReason, ForwardMode, SamplingParams, SchedulePolicy, Scheduler, SchedulerConfig,
     SchedulerOutput, SchedulerStep, SeqFinishReason, Sequence, SequenceStatus,

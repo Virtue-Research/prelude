@@ -41,6 +41,7 @@ pub const MOD_SCATTER_KV_CACHE: &str = "kvcache_scatter_kv_cache";
 #[ctor::ctor]
 fn _register_gpu_ops() {
     prelude_core::ops::register_gpu_ops(cuda_ops::cuda_ops);
+    prelude_core::engine::executor::register_executor(|| Box::new(executor::CudaExecutor::new()));
 }
 
 // ── GPU kernel modules ──────────────────────────────────────────────
@@ -48,6 +49,7 @@ fn _register_gpu_ops() {
 pub(crate) mod ops;
 pub(crate) mod attn;
 mod cuda_ops;
+pub mod executor;
 
 pub use cuda_ops::{create_cuda_ops, cuda_ops};
 

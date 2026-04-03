@@ -12,7 +12,7 @@ pub(crate) use std::sync::Mutex;
 pub(crate) use std::time::Instant;
 
 pub(crate) use crate::tensor::{DType, Device, Tensor};
-pub(crate) use crate::loading::var_builder::VarBuilder;
+pub(crate) use self::weight_loader::VarBuilder;
 pub(crate) use crate::nn_ops::generation::{LogitsProcessor, Sampling};
 pub(crate) use fastokens::Tokenizer;
 pub(crate) use tracing::info;
@@ -22,7 +22,12 @@ pub(crate) use crate::constants::DEFAULT_SEED;
 mod config;
 mod device;
 mod engine;
-pub(crate) mod forward;
+pub mod executor;
+pub(crate) mod loading;
+pub(crate) mod model_runner;
+pub mod run;
+pub mod weight_loader;
+pub mod weights;
 
 mod types;
 pub(crate) mod planner;
@@ -50,18 +55,18 @@ pub(crate) use self::types::{
 
 // ── Re-exports: forward (task-specific execution + postprocessing) ──
 // Classify/Embed: always available (stubs return errors when flash-attn-v3 absent).
-pub(crate) use self::forward::{
+pub(crate) use self::model_runner::{
     RawClassifyOutput, classify_postprocess,
     RawEmbedOutput, embed_postprocess,
 };
 #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
-pub(crate) use self::forward::{RawGenerateOutput, generate_postprocess};
+pub(crate) use self::model_runner::{RawGenerateOutput, generate_postprocess};
 
 // ── Re-exports: helpers (config, device, weights, tokenizer) ──
 pub(crate) use self::config::*;
 pub(crate) use self::device::*;
 pub(crate) use self::tokenizer::tokenize_batch_inputs;
-pub(crate) use crate::loading::weights::*;
+pub(crate) use self::weights::*;
 
 pub use self::pseudo::PseudoEngine;
 pub use self::scheduled::ScheduledEngine;

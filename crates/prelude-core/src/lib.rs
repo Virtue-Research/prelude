@@ -1,9 +1,7 @@
 pub mod tensor;
-pub mod cache;
 pub mod config;
 pub mod constants;
 pub mod engine;
-pub mod loading;
 pub mod models;
 pub mod modules;
 pub mod nn_ops;
@@ -12,6 +10,15 @@ pub mod profiling;
 pub mod runtime;
 pub mod scheduler;
 pub mod types;
+
+/// Backward-compatible re-export: `cache` now lives at `scheduler::components::cache`.
+pub use scheduler::components::cache;
+
+/// Backward-compatible re-export: `loading` now lives under `engine`.
+pub mod loading {
+    pub use crate::engine::weight_loader as var_builder;
+    pub use crate::engine::weights;
+}
 
 pub use cache::deltanet_pool;
 pub use cache::prefix_cache;

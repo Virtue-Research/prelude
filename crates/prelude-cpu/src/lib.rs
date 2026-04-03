@@ -11,6 +11,7 @@
 #[ctor::ctor]
 fn _register_cpu_ops() {
     prelude_core::ops::register_cpu_ops(cpu_ops::cpu_ops);
+    prelude_core::engine::executor::register_executor(|| Box::new(executor::CpuExecutor::new()));
 }
 
 // ── CPU kernel modules ─────────────────────────────────────────────
@@ -23,4 +24,5 @@ pub mod raw_cpu;
 pub mod attn_cpu;
 
 pub use cpu_ops::cpu_ops;
+pub mod executor;
 mod linear_backends;

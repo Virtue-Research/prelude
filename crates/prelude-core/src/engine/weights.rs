@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::tensor::{DType, Device};
-use crate::loading::var_builder::VarBuilder;
+use super::weight_loader::VarBuilder;
 
 use crate::engine::{candle_err, EngineError};
 

@@ -58,11 +58,11 @@ impl GatedMlp {
             let dim = dims[dims.len() - 1] / 2;
             let gate = gate_up.narrow(dims.len() - 1, 0, dim)?;
             let up = gate_up.narrow(dims.len() - 1, dim, dim)?;
-            return super::ops::fast_silu_mul(ops, &gate, &up)?.apply(&self.down_proj);
+            return super::norm::fast_silu_mul(ops, &gate, &up)?.apply(&self.down_proj);
         }
 
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        super::ops::fast_silu_mul(ops, &gate, &up)?.apply(&self.down_proj)
+        super::norm::fast_silu_mul(ops, &gate, &up)?.apply(&self.down_proj)
     }
 }

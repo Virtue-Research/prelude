@@ -12,7 +12,7 @@
 use crate::tensor::{Result, Tensor};
 
 use super::linear::RmsNorm;
-use super::ops::{fast_rms_norm, fused_add_rmsnorm};
+use super::norm::{fast_rms_norm, fused_add_rmsnorm};
 use crate::profiling::{nvtx_push, nvtx_pop};
 
 /// A generic pre-norm transformer decoder block.

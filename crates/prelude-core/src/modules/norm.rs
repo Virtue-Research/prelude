@@ -1,13 +1,11 @@
-// Shared fused/debug ops used across all model architectures.
-//
-// Extracted from qwen3/mod.rs to be reusable.
+// Shared norm, fusion, and debug ops used across all model architectures.
 
 // Debug setters are public API for runtime bisection; not called within the crate.
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::tensor::{DType, Module, Result, Tensor};
+use crate::tensor::{Module, Result, Tensor};
 
 use super::linear::RmsNorm;
 
@@ -182,45 +180,3 @@ pub(crate) fn fast_silu_mul(ops: &crate::ops::Ops, gate: &Tensor, up: &Tensor) -
     &silu_gate * up
 }
 
-// ── QK-Norm + RoPE dispatch ─────────────────────────────────────────
-
-/// QK-Norm + RoPE for varlen layout `[total, H, D]`.
-///
-/// Ops fused: fused qknorm_rope kernel.
-/// CPU BF16: cpu_ops rmsnorm + cpu_ops rotary_embedding.
-/// Fallback: fast_rms_norm + rotary_emb.apply_varlen.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn qknorm_rope_varlen(
-    ops: &crate::ops::Ops,
-    q: &Tensor,
-    k: &Tensor,
-    q_norm_weight: &Tensor,
-    k_norm_weight: &Tensor,
-    q_norm: &RmsNorm,
-    k_norm: &RmsNorm,
-    rotary_emb: &super::rotary::RotaryEmbedding,
-    position_ids: &Tensor,
-    total: usize,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    rms_norm_eps: f64,
-) -> Result<(Tensor, Tensor)> {
-    // ── Fused QK-norm + RoPE kernel via Ops trait ──
-    if let Some(result) = ops.fused.fused_qknorm_rope(
-        q, k, q_norm_weight, k_norm_weight,
-        &rotary_emb.cos, &rotary_emb.sin,
-        position_ids, rms_norm_eps as f32,
-    ) {
-        if !debug_disable_fused_qknorm_rope() {
-            return result;
-        }
-    }
-
-    // ── Generic fallback (CpuOps handles CPU-specific kernels via Ops trait) ──
-    let q = fast_rms_norm(ops, &q.flatten(0, 1)?, q_norm, q_norm_weight, rms_norm_eps)?
-        .reshape((total, num_heads, head_dim))?;
-    let k = fast_rms_norm(ops, &k.flatten(0, 1)?, k_norm, k_norm_weight, rms_norm_eps)?
-        .reshape((total, num_kv_heads, head_dim))?;
-    rotary_emb.apply_varlen(&q, &k, position_ids)
-}

@@ -1,11 +1,9 @@
 // Shared layer primitives reusable across all model architectures.
 
-pub mod attn;
-pub(crate) mod attention;
+pub(crate) mod attn_utils;
 pub mod linear;
 pub(crate) mod mlp;
-pub(crate) mod ops;
-pub(crate) mod rotary;
+pub(crate) mod norm;
 pub(crate) mod transformer_block;
 
 use crate::tensor::Tensor;
@@ -77,19 +75,18 @@ pub struct BatchAttnContext<'a> {
 // Re-exports for convenient use.
 pub(crate) use linear::{Linear, RmsNorm};
 pub(crate) use mlp::GatedMlp;
-pub(crate) use attn::{
+pub(crate) use attn_utils::{
     reshape_and_cache, varlen_attention, varlen_attention_bidirectional, varlen_attention_paged,
-    varlen_attention_windowed,
+    varlen_attention_windowed, fused_qkv_projection, qknorm_rope_varlen, RotaryEmbedding,
 };
-pub(crate) use ops::{
+pub(crate) use norm::{
     debug_disable_fused_add_rmsnorm, debug_disable_fused_qknorm_rope, fast_add, fast_rms_norm,
-    fast_silu_mul, first_token_select, fused_add_rmsnorm, last_token_select, qknorm_rope_varlen,
+    fast_silu_mul, first_token_select, fused_add_rmsnorm, last_token_select,
 };
-pub(crate) use rotary::RotaryEmbedding;
 pub(crate) use transformer_block::TransformerBlock;
 
 // Debug setters re-exported for public API (server CLI, benchmarks, qwen3 re-export).
-pub use ops::{
+pub use norm::{
     set_debug_disable_fast_rmsnorm, set_debug_disable_flash_attn_path,
     set_debug_disable_fused_add_rmsnorm, set_debug_disable_fused_qknorm_rope,
     set_debug_disable_fused_silu_mul, set_debug_disable_vectorized_add,
