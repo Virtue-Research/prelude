@@ -17,12 +17,8 @@ default = []
 cuda = ["candle-core/cuda", "candle-transformers?/cuda"]
 candle-baseline = ["dep:candle-transformers"]
 # Marker features — no deps, just compile-time cfg gates for cache/scheduler tuning.
-# Enabled by prelude-server when the corresponding prelude-cuda feature is active.
-flash-attn = ["cuda"]
-flash-attn-v3 = ["cuda"]
 flash-attn-v4 = ["cuda"]
 flashinfer = ["cuda"]
-paged-attn = ["cuda"]
 hf_tokenizer = ["dep:tokenizers"]
 nvtx = []
 

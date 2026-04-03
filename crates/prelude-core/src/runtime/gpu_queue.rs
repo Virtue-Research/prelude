@@ -22,21 +22,21 @@ use tokio::sync::{mpsc, oneshot};
 use crate::engine::{Engine, EngineError, PreTokenizedClassifyItem, PreTokenizedEmbedItem, PreparedGenerateRequest};
 use crate::engine::{RawClassifyOutput, RawEmbedOutput};
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 use crate::engine::RawGenerateOutput;
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 use crate::tensor::Tensor;
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 use crate::engine::{BatchPrefillResult, OwnedBatchDecodeSeq, PrefillPlan};
 
 // ---------------------------------------------------------------------------
 // GPU result type alias (cfg-gated, matches batch_runtime::GenGpuResult)
 // ---------------------------------------------------------------------------
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 type GenGpuResult = RawGenerateOutput;
-#[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
+#[cfg(not(any(feature = "flash-attn-v4", feature = "flashinfer")))]
 type GenGpuResult = Vec<crate::types::GenerateResult>;
 
 // ---------------------------------------------------------------------------
@@ -61,7 +61,7 @@ pub(crate) enum GpuPacket {
 
     /// Paged prefill: varlen forward + write KV to paged cache.
     /// Used by the continuous runtime for multi-token generation prefill.
-    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+    #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
     PrefillPaged {
         items: Vec<PreparedGenerateRequest>,
         prefill_plan: PrefillPlan,
@@ -72,7 +72,7 @@ pub(crate) enum GpuPacket {
 
     /// Batched paged decode: Q=1 per sequence, read/write paged KV cache.
     /// Used by the continuous runtime for autoregressive decode steps.
-    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+    #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
     DecodePaged {
         seqs: Vec<OwnedBatchDecodeSeq>,
         result_tx: oneshot::Sender<Result<Tensor, EngineError>>,
@@ -121,7 +121,7 @@ async fn gpu_worker_loop(
     engine: Arc<Engine>,
 ) {
     // CUDA graph cache — owned by this thread, no synchronization needed.
-    #[cfg(all(feature = "cuda", any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
+    #[cfg(all(feature = "cuda", any(feature = "flash-attn-v4", feature = "flashinfer")))]
     let mut graph_cache = {
         let block_size = engine
             .cache
@@ -138,15 +138,15 @@ async fn gpu_worker_loop(
     };
 
     // Eager CUDA graph warmup — capture all graphs before accepting requests.
-    #[cfg(all(feature = "cuda", any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
+    #[cfg(all(feature = "cuda", any(feature = "flash-attn-v4", feature = "flashinfer")))]
     graph_cache.warmup_all(&engine);
 
     tracing::info!("GPU worker started");
 
     while let Some(packet) = rx.recv().await {
-        #[cfg(all(feature = "cuda", any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
+        #[cfg(all(feature = "cuda", any(feature = "flash-attn-v4", feature = "flashinfer")))]
         execute_gpu_packet(&engine, packet, &mut graph_cache);
-        #[cfg(not(all(feature = "cuda", any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))))]
+        #[cfg(not(all(feature = "cuda", any(feature = "flash-attn-v4", feature = "flashinfer"))))]
         execute_gpu_packet(&engine, packet);
     }
 
@@ -163,7 +163,7 @@ async fn gpu_worker_loop(
 fn execute_gpu_packet(
     engine: &Engine,
     packet: GpuPacket,
-    #[cfg(all(feature = "cuda", any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
+    #[cfg(all(feature = "cuda", any(feature = "flash-attn-v4", feature = "flashinfer")))]
     graph_cache: &mut super::cuda_graph::DecodeGraphCache,
 ) {
     match packet {
@@ -172,15 +172,15 @@ fn execute_gpu_packet(
             result_tx,
         } => {
             let result = engine.plan_generate_batch(prepared_requests).and_then(|planned| {
-                #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+                #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
                 { engine.prefill_forward_only(planned.items) }
-                #[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
+                #[cfg(not(any(feature = "flash-attn-v4", feature = "flashinfer")))]
                 { engine.generate_prepared_batch(planned) }
             });
             let _ = result_tx.send(result);
         }
 
-        #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+        #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
         GpuPacket::PrefillPaged {
             mut items,
             prefill_plan,
@@ -192,7 +192,7 @@ fn execute_gpu_packet(
             let _ = result_tx.send(result);
         }
 
-        #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+        #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
         GpuPacket::DecodePaged { seqs, result_tx } => {
             // Try CUDA graph replay first; fall back to eager if not applicable.
             #[cfg(feature = "cuda")]
@@ -269,7 +269,7 @@ pub(crate) fn submit_embed_batch(
 }
 
 /// Sends a `PrefillPaged` packet — awaited directly (no JoinHandle).
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 pub(crate) async fn submit_prefill_paged(
     gpu_tx: &GpuQueueTx,
     items: Vec<PreparedGenerateRequest>,
@@ -287,7 +287,7 @@ pub(crate) async fn submit_prefill_paged(
 }
 
 /// Sends a `DecodePaged` packet — awaited directly (no JoinHandle).
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 pub(crate) async fn submit_decode_paged(
     gpu_tx: &GpuQueueTx,
     seqs: Vec<OwnedBatchDecodeSeq>,

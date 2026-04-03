@@ -94,7 +94,7 @@ impl CacheManager {
         let block_size = cache_config.prefix_block_size;
         // flash layout: [B, L, H, D] → concat dim 1; standard: [B, H, L, D] → concat dim 2
         let is_flash =
-            device.is_cuda() && (cfg!(feature = "flash-attn") || cfg!(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")));
+            device.is_cuda() && cfg!(any(feature = "flash-attn-v4", feature = "flashinfer"));
         let concat_dim = if is_flash { 1 } else { 2 };
         info!(
             max_blocks = max_blocks,

@@ -22,9 +22,3 @@ hex = "0.4"
 
 [dev-dependencies]
 half = "2"
-candle-flash-attn-v3 = { path = "../../candle-flash-attn-v3" }
-candle-paged-attn = { path = "../../candle-paged-attn" }
-
-[[bench]]
-name = "fa4_vs_fa3"
-harness = false

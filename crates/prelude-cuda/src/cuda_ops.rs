@@ -316,20 +316,8 @@ fn select_attention_backend() -> Arc<dyn AttentionOps + 'static> {
         return Arc::new(FlashInferOps);
     }
 
-    #[cfg(feature = "flash-attn-v3")]
-    {
-        tracing::info!(backend = "flash-attn-v3", "attention backend selected");
-        return Arc::new(FlashAttnV3Ops);
-    }
-
-    #[cfg(feature = "flash-attn")]
-    {
-        tracing::info!(backend = "flash-attn-v2", "attention backend selected");
-        return Arc::new(FlashAttnV2Ops);
-    }
-
     #[allow(unreachable_code)]
-    panic!("no GPU attention backend compiled — enable at least one of: flash-attn, flash-attn-v3, flash-attn-v4, flashinfer")
+    panic!("no GPU attention backend compiled — enable flash-attn-v4 or flashinfer")
 }
 
 // ── Shared dispatch helper ──────────────────────────────────────────
@@ -410,58 +398,3 @@ impl AttentionOps for FlashInferOps {
     }
 }
 
-// ── FA3 ─────────────────────────────────────────────────────────────
-
-#[cfg(feature = "flash-attn-v3")]
-struct FlashAttnV3Ops;
-
-#[cfg(feature = "flash-attn-v3")]
-impl AttentionOps for FlashAttnV3Ops {
-    fn name(&self) -> &str { "flash-attn-v3" }
-
-    fn varlen_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, params: &VarlenParams) -> Result<Tensor> {
-        dispatch_varlen!(crate::attn::flash_v3, q, k, v, params)
-    }
-
-    fn paged_attention(&self, q: &Tensor, key_cache: &Tensor, value_cache: &Tensor, params: &PagedParams) -> Result<Tensor> {
-        crate::attn::flash_v3::varlen_paged(
-            q, key_cache, value_cache, params.block_tables,
-            params.cu_seqlens_q, params.cu_seqlens_k, params.max_seqlen_q, params.max_seqlen_k,
-            params.scale,
-        )
-    }
-}
-
-// ── FA2 ─────────────────────────────────────────────────────────────
-
-#[cfg(feature = "flash-attn")]
-struct FlashAttnV2Ops;
-
-#[cfg(feature = "flash-attn")]
-impl AttentionOps for FlashAttnV2Ops {
-    fn name(&self) -> &str { "flash-attn-v2" }
-
-    fn varlen_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, params: &VarlenParams) -> Result<Tensor> {
-        dispatch_varlen!(crate::attn::flash_v2, q, k, v, params)
-    }
-
-    fn paged_attention(&self, q: &Tensor, key_cache: &Tensor, value_cache: &Tensor, params: &PagedParams) -> Result<Tensor> {
-        // FA2 paged: decode-only (Q=1) via vLLM paged_attention kernel.
-        let context_lens = cu_seqlens_to_lens(params.cu_seqlens_k)?;
-        crate::attn::paged::decode_attention(
-            q, key_cache, value_cache, params.block_tables,
-            &context_lens, params.max_seqlen_k, params.scale,
-        )
-    }
-
-    fn supports_paged_prefill(&self) -> bool { false }
-}
-
-// ── Helpers ─────────────────────────────────────────────────────────
-
-fn cu_seqlens_to_lens(cu_seqlens: &Tensor) -> Result<Tensor> {
-    let n = cu_seqlens.dim(0)? - 1;
-    let hi = cu_seqlens.narrow(0, 1, n)?;
-    let lo = cu_seqlens.narrow(0, 0, n)?;
-    hi.sub(&lo)
-}

@@ -18,9 +18,6 @@ flash-attn-v4 = ["dep:prelude-flash-attn-v4"]
 flashinfer = ["dep:prelude-flashinfer"]
 quant-gemm = ["dep:prelude-quant-gemm"]
 cula = ["dep:prelude-cula"]
-flash-attn = ["dep:candle-flash-attn"]
-flash-attn-v3 = ["dep:candle-flash-attn-v3"]
-paged-attn = ["dep:candle-paged-attn"]
 
 [dependencies]
 prelude-core = { path = "../prelude-core" }
@@ -36,9 +33,6 @@ prelude-flash-attn-v4 = { path = "fa4", optional = true }
 prelude-flashinfer = { path = "flashinfer", optional = true }
 prelude-quant-gemm = { path = "quant-gemm", optional = true }
 prelude-cula = { path = "cula", optional = true }
-candle-flash-attn = { workspace = true, optional = true }
-candle-flash-attn-v3 = { workspace = true, optional = true }
-candle-paged-attn = { workspace = true, optional = true }
 
 [[bin]]
 name = "gpu_ops_bench"
