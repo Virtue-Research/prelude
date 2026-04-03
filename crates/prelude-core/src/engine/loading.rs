@@ -21,9 +21,6 @@ use crate::engine::{
     parse_model_config_for_source, select_device,
 };
 use crate::models::gemma3::meta::{Gemma3ModelBuildContext, build_gemma3_model_with_context};
-#[cfg(feature = "candle-baseline")]
-use crate::models::qwen3::gguf::Qwen3GgufModel;
-use crate::models::qwen3_5::gguf::Qwen3_5GgufModel;
 use crate::models::registry::AuxiliaryVarBuilder;
 
 #[derive(Debug, serde::Deserialize)]
@@ -378,65 +375,24 @@ fn load_gguf(
         download_tokenizer(&model_id)?
     };
 
-    match arch.as_str() {
-        "qwen35" | "qwen35moe" => load_gguf_qwen35(
-            ct,
-            &mut file,
-            &device,
-            model_id,
-            engine_config,
-            load_start,
-            tokenizer,
-        ),
-        #[cfg(feature = "candle-baseline")]
-        _ => load_gguf_qwen3(
-            ct,
-            &mut file,
-            &device,
-            model_id,
-            engine_config,
-            load_start,
-            tokenizer,
-        ),
-        #[cfg(not(feature = "candle-baseline"))]
-        _ => Err(EngineError::InvalidRequest(
-            format!("GGUF architecture '{arch}' requires the 'candle-baseline' feature").into(),
-        )),
-    }
-}
+    // Look up architecture in the registry (inventory-based, no hardcoded model imports)
+    let arch_spec = crate::models::registry::find_arch_spec_by_gguf_arch(&arch)
+        .ok_or_else(|| EngineError::InvalidRequest(
+            format!("unsupported GGUF architecture '{arch}'")
+        ))?;
+    let result = arch_spec.load_gguf(ct, &mut file, &device)?;
 
-/// Load Qwen3.5 (hybrid DeltaNet) from GGUF.
-fn load_gguf_qwen35(
-    ct: crate::tensor::quantized::gguf_file::Content,
-    file: &mut std::fs::File,
-    device: &Device,
-    model_id: String,
-    engine_config: EngineConfig,
-    load_start: Instant,
-    tokenizer: Tokenizer,
-) -> Result<Engine, EngineError> {
-    let (model, gguf_config) = Qwen3_5GgufModel::from_gguf(ct, file, device).map_err(candle_err)?;
-
-    let eos_token_ids = if gguf_config.eos_token_ids.is_empty() {
+    let eos_token_ids = if result.eos_token_ids.is_empty() {
         return Err(EngineError::InvalidRequest(
             "GGUF metadata missing `tokenizer.ggml.eos_token_id`".into(),
         ));
     } else {
-        gguf_config.eos_token_ids.clone()
-    };
-
-    let common_config = CommonModelConfig {
-        vocab_size: gguf_config.vocab_size,
-        num_hidden_layers: gguf_config.num_hidden_layers,
-        max_position_embeddings: gguf_config.max_position_embeddings,
-        num_attention_heads: gguf_config.num_attention_heads,
-        num_key_value_heads: gguf_config.num_key_value_heads,
-        head_dim: gguf_config.head_dim,
+        result.eos_token_ids
     };
 
     let descriptor = ModelDescriptor {
         task: TaskKind::Generate,
-        arch_name: "qwen3_5_gguf",
+        arch_name: arch_spec.name(),
         backend: WeightsBackend::Gguf,
     };
     let runtime_caps = RuntimeCaps {
@@ -445,93 +401,20 @@ fn load_gguf_qwen35(
     };
 
     let executor = ModelExecutor {
-        model: Mutex::new(Box::new(model)),
-        ops: crate::ops::select_ops(device),
+        model: Mutex::new(result.model),
+        ops: crate::ops::select_ops(&device),
         device: device.clone(),
-        dtype: DType::F32,
-        config: common_config,
+        dtype,
+        config: result.common,
         runtime_caps,
     };
 
     tracing::info!(
         elapsed_ms = load_start.elapsed().as_millis() as u64,
-        arch = descriptor.arch_name,
+        arch = arch_spec.name(),
         layers = executor.config.num_hidden_layers,
         vocab = executor.config.vocab_size,
-        "Qwen3.5 GGUF model loaded"
-    );
-
-    Ok(Engine {
-        executor,
-        cache: CacheManager::none(),
-        tokenizer,
-        model_id,
-        embedding_semantics: EmbeddingSemantics::default(),
-        eos_token_ids,
-        descriptor,
-        engine_config,
-    })
-}
-
-#[cfg(feature = "candle-baseline")]
-/// Load standard Qwen3 (and other dense architectures) from GGUF.
-fn load_gguf_qwen3(
-    ct: crate::tensor::quantized::gguf_file::Content,
-    file: &mut std::fs::File,
-    device: &Device,
-    model_id: String,
-    engine_config: EngineConfig,
-    load_start: Instant,
-    tokenizer: Tokenizer,
-) -> Result<Engine, EngineError> {
-    let (model, gguf_config) = Qwen3GgufModel::from_gguf(ct, file, device).map_err(candle_err)?;
-
-    let eos_token_ids = if gguf_config.eos_token_ids.is_empty() {
-        return Err(EngineError::InvalidRequest(
-            "generation GGUF metadata is missing required field `tokenizer.ggml.eos_token_id`"
-                .into(),
-        ));
-    } else {
-        gguf_config.eos_token_ids.clone()
-    };
-
-    let common_config = CommonModelConfig {
-        vocab_size: gguf_config.vocab_size,
-        num_hidden_layers: gguf_config.num_hidden_layers,
-        max_position_embeddings: gguf_config.max_position_embeddings,
-        num_attention_heads: gguf_config.num_attention_heads,
-        num_key_value_heads: gguf_config.num_key_value_heads,
-        head_dim: gguf_config.head_dim,
-    };
-
-    let descriptor = ModelDescriptor {
-        task: TaskKind::Generate,
-        arch_name: "qwen3_gguf",
-        backend: WeightsBackend::Gguf,
-    };
-    let runtime_caps = RuntimeCaps {
-        supports_kv_cache: true,
-        ..RuntimeCaps::default()
-    };
-
-    let executor = ModelExecutor {
-        model: Mutex::new(Box::new(model)),
-        ops: crate::ops::select_ops(device),
-        device: device.clone(),
-        dtype: DType::F32,
-        config: common_config,
-        runtime_caps,
-    };
-
-    tracing::info!(
-        elapsed_ms = load_start.elapsed().as_millis() as u64,
-        task = ?descriptor.task,
-        arch = descriptor.arch_name,
-        backend = ?descriptor.backend,
-        runtime_caps = ?executor.runtime_caps,
-        layers = executor.config.num_hidden_layers,
-        vocab = executor.config.vocab_size,
-        "GGUF model loaded"
+        "GGUF model loaded via registry"
     );
 
     Ok(Engine {

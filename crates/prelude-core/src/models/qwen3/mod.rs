@@ -1011,5 +1011,34 @@ mod meta {
                 supports_cuda_graph: supports_cuda_varlen && task == TaskKind::Generate,
             }
         }
+
+        fn gguf_aliases(&self) -> &'static [&'static str] {
+            &["qwen3"]
+        }
+
+        #[cfg(feature = "candle-baseline")]
+        fn load_gguf(
+            &self,
+            ct: crate::tensor::quantized::gguf_file::Content,
+            reader: &mut std::fs::File,
+            device: &crate::tensor::Device,
+        ) -> Result<crate::models::registry::GgufLoadResult, EngineError> {
+            let (model, cfg) = super::gguf::Qwen3GgufModel::from_gguf(ct, reader, device)
+                .map_err(candle_model_err)?;
+            let common = CommonModelConfig {
+                vocab_size: cfg.vocab_size,
+                num_hidden_layers: cfg.num_hidden_layers,
+                max_position_embeddings: cfg.max_position_embeddings,
+                num_attention_heads: cfg.num_attention_heads,
+                num_key_value_heads: cfg.num_key_value_heads,
+                head_dim: cfg.head_dim,
+            };
+            Ok(crate::models::registry::GgufLoadResult {
+                model: Box::new(model),
+                common,
+                deltanet: None,
+                eos_token_ids: cfg.eos_token_ids,
+            })
+        }
     }
 }

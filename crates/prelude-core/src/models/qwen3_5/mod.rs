@@ -1706,5 +1706,44 @@ pub(crate) mod meta {
                 supports_cuda_graph: false,
             }
         }
+
+        fn gguf_aliases(&self) -> &'static [&'static str] {
+            &["qwen35", "qwen35moe"]
+        }
+
+        fn load_gguf(
+            &self,
+            ct: crate::tensor::quantized::gguf_file::Content,
+            reader: &mut std::fs::File,
+            device: &crate::tensor::Device,
+        ) -> Result<crate::models::registry::GgufLoadResult, EngineError> {
+            let (model, cfg) = super::gguf::Qwen3_5GgufModel::from_gguf(ct, reader, device)
+                .map_err(candle_model_err)?;
+            let common = CommonModelConfig {
+                vocab_size: cfg.vocab_size,
+                num_hidden_layers: cfg.num_hidden_layers,
+                max_position_embeddings: cfg.max_position_embeddings,
+                num_attention_heads: cfg.num_attention_heads,
+                num_key_value_heads: cfg.num_key_value_heads,
+                head_dim: cfg.head_dim,
+            };
+            let deltanet = Some(DeltaNetPoolConfig {
+                num_deltanet_layers: (0..cfg.num_hidden_layers)
+                    .filter(|i| (i + 1) % cfg.full_attention_interval != 0)
+                    .count(),
+                num_v_heads: cfg.linear_num_value_heads,
+                head_k_dim: cfg.linear_key_head_dim,
+                head_v_dim: cfg.linear_value_head_dim,
+                conv_dim: cfg.linear_num_key_heads * cfg.linear_key_head_dim * 2
+                    + cfg.linear_num_value_heads * cfg.linear_value_head_dim,
+                conv_kernel: cfg.linear_conv_kernel_dim,
+            });
+            Ok(crate::models::registry::GgufLoadResult {
+                model: Box::new(model),
+                common,
+                deltanet,
+                eos_token_ids: cfg.eos_token_ids,
+            })
+        }
     }
 }

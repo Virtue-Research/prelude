@@ -45,6 +45,35 @@ pub(crate) trait ArchSpec: Sync {
     fn supports_task(&self, task: TaskKind) -> bool {
         self.supported_tasks().contains(&task)
     }
+
+    /// GGUF architecture aliases (e.g. `["qwen3"]`, `["qwen35", "qwen35moe"]`).
+    /// Default: empty (model does not support GGUF loading).
+    fn gguf_aliases(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Build a model from GGUF content. Returns the model, common config,
+    /// and EOS token IDs extracted from GGUF metadata.
+    ///
+    /// Default: returns an error (model does not support GGUF).
+    fn load_gguf(
+        &self,
+        _ct: crate::tensor::quantized::gguf_file::Content,
+        _reader: &mut std::fs::File,
+        _device: &Device,
+    ) -> Result<GgufLoadResult, EngineError> {
+        Err(EngineError::Unavailable(format!(
+            "GGUF loading not supported for architecture '{}'", self.name()
+        )))
+    }
+}
+
+/// Result of loading a model from GGUF format via `ArchSpec::load_gguf()`.
+pub(crate) struct GgufLoadResult {
+    pub model: Box<dyn crate::models::ModelForward>,
+    pub common: CommonModelConfig,
+    pub deltanet: Option<DeltaNetPoolConfig>,
+    pub eos_token_ids: Vec<u32>,
 }
 
 pub(crate) fn resolve_architecture_name(name: &str) -> Option<(&'static dyn ArchSpec, TaskKind)> {
@@ -60,6 +89,13 @@ pub(crate) fn find_arch_spec_by_architecture_prefix(prefix: &str) -> Option<&'st
         .iter()
         .copied()
         .find(|spec| matches_any_alias(prefix, spec.architecture_aliases()))
+}
+
+pub(crate) fn find_arch_spec_by_gguf_arch(arch: &str) -> Option<&'static dyn ArchSpec> {
+    all_arch_specs()
+        .iter()
+        .copied()
+        .find(|spec| matches_any_alias(arch, spec.gguf_aliases()))
 }
 
 pub(crate) fn find_arch_spec_by_model_type(model_type: &str) -> Option<&'static dyn ArchSpec> {
