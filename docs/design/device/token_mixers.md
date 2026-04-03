@@ -41,7 +41,7 @@ use conv_state + ssm_state (fixed size per request, no paging).
 ### CacheSpec Per Layer
 
 ```rust
-// prelude-core/src/ops/kv_cache.rs
+// prelude-core/src/ops/traits/kv_cache.rs
 
 /// Declares what cache a layer needs. Models return one spec per layer.
 /// The engine groups layers by spec and allocates accordingly.
@@ -71,7 +71,7 @@ trait Model {
 ### Engine Cache Allocation
 
 ```rust
-// prelude-core/src/engine/model_runner/mod.rs
+// prelude-core/src/engine/executor.rs
 
 /// Group layers by cache spec, allocate one pool per group.
 fn allocate_cache(model: &dyn Model, ops: &Ops, config: &CacheConfig) -> Cache {

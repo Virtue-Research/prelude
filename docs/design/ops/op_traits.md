@@ -3,7 +3,7 @@
 ### Attention
 
 ```rust
-// prelude-core/src/ops/attention.rs
+// prelude-core/src/ops/traits/attention.rs
 
 trait AttentionOps: Send + Sync {
     /// Varlen attention over contiguous Q, K, V.
@@ -84,7 +84,7 @@ enum MaskType {
 ### KV Cache
 
 ```rust
-// prelude-core/src/ops/kv_cache.rs
+// prelude-core/src/ops/traits/kv_cache.rs
 
 trait KvCacheOps: Send + Sync {
     /// Query per-head cache slot layout for KV cache allocation.
@@ -135,7 +135,7 @@ Separate from `AttentionOps` because:
 ### GEMM
 
 ```rust
-// prelude-core/src/ops/gemm.rs
+// prelude-core/src/ops/traits/gemm.rs
 
 trait GemmOps: Send + Sync {
     /// Matrix multiply. Dispatch: DeepGEMM > CUTLASS > CK > XLA > CPU BLAS.
@@ -186,7 +186,7 @@ enum QuantScheme {
 ### Normalization
 
 ```rust
-// prelude-core/src/ops/norm.rs
+// prelude-core/src/ops/traits/norm.rs
 
 trait NormOps: Send + Sync {
     fn rms_norm(&self, x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor>;
@@ -204,7 +204,7 @@ trait NormOps: Send + Sync {
 ### Activation
 
 ```rust
-// prelude-core/src/ops/activation.rs
+// prelude-core/src/ops/traits/activation.rs
 
 trait ActivationOps: Send + Sync {
     fn silu(&self, x: &Tensor) -> Result<Tensor>;
@@ -217,7 +217,7 @@ trait ActivationOps: Send + Sync {
 ### Convolution
 
 ```rust
-// prelude-core/src/ops/conv.rs
+// prelude-core/src/ops/traits/conv.rs
 
 trait ConvOps: Send + Sync {
     fn conv1d(&self, input: &Tensor, weight: &Tensor, bias: Option<&Tensor>,
@@ -236,7 +236,7 @@ trait ConvOps: Send + Sync {
 ### Communication (Distributed)
 
 ```rust
-// prelude-core/src/ops/comm.rs
+// prelude-core/src/ops/traits/comm.rs
 
 trait CommOps: Send + Sync {
     /// Number of ranks in the communication group.
@@ -317,7 +317,7 @@ match self.tp {
 Fused kernels are **separate ops that return `Option`**. `None` = not supported on this device, model falls back to separate ops. This is not a hint system — the model explicitly checks the return value.
 
 ```rust
-// prelude-core/src/ops/fused.rs
+// prelude-core/src/ops/traits/fused.rs
 
 /// All methods have default `{ None }` — devices only override what they support.
 /// Adding a new fusion method requires NO changes to existing device implementations.

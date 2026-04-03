@@ -7,12 +7,15 @@ crates/prelude-core/src/
 ├── lib.rs                                 # pub use engine::Engine;
 │
 ├── engine/                                # Engine — the public API, minimal external surface
-│   ├── mod.rs                             # pub struct Engine: new(), serve(), generate(), embed()
-│   ├── config.rs                          # EngineConfig — mode, device, scheduler params
-│   ├── run.rs                             # run::ar(), run::dllm(), ... main loop per mode
-│   ├── model_runner/                      # ScheduledBatch → tensors → model.forward() → sample
-│   │   ├── mod.rs                         # ModelRunner core logic
-│   │   └── cuda_graph.rs                  # Graph capture/replay (CUDA/HIP)
+│   ├── mod.rs                             # pub struct Engine, trait InferenceEngine
+│   ├── config.rs                          # EngineConfig
+│   ├── weight_loader.rs                   # WeightLoader
+│   ├── executor.rs                        # trait Executor { submit(batch) -> Handle, collect(Handle) -> Output }
+│   ├── run/                               # Scheduling-paradigm loops
+│   │   ├── ar.rs
+│   │   ├── dllm.rs
+│   │   ├── diffusion.rs
+│   │   └── tts.rs
 │   ├── speculative/                       # Speculative decoding — see speculative.md
 │   │   ├── mod.rs                         # SpecDecodeRunner: draft → verify → accept loop
 │   │   ├── proposer.rs                    # trait DraftProposer (EAGLE/DraftModel/Ngram/Medusa)
@@ -32,8 +35,13 @@ crates/prelude-core/src/
 │   ├── tts.rs                             # TtsPipelineScheduler — multi-stage TTS streaming
 │   ├── types.rs                           # ScheduledBatch, ScheduledRequest, StepResult, etc.
 │   └── components/                        # Optional components, used by schedulers as needed
-│       ├── block_allocator.rs             # BlockAllocator — paged KV cache block management
-│       ├── prefix_cache.rs                # PrefixCache — radix tree for KV prefix sharing
+│       ├── cache/
+│       │   ├── mod.rs
+│       │   ├── block_manager.rs           # BlockManager (was BlockAllocator)
+│       │   ├── prefix_cache.rs
+│       │   ├── prefix_index.rs
+│       │   ├── kv_buf.rs
+│       │   └── deltanet_pool.rs
 │       └── request_queue.rs               # RequestQueue — FCFS / priority / cache-aware ordering
 │
 ├── disaggregated/                         # Multi-instance deployment (skip for single-machine)
@@ -49,13 +57,13 @@ crates/prelude-core/src/
   `Engine`. Everything else is `pub(crate)`.
 - **`scheduler/`** — pure scheduling logic, no GPU dependency. Each scheduler file (`ar.rs`,
   `dllm.rs`, etc.) is self-contained and independent. Read only the one for your workload.
-- **`scheduler/components/`** — optional building blocks. `BlockAllocator` and `PrefixCache`
+- **`scheduler/components/`** — optional reusable components. `BlockAllocator` and `PrefixCache`
   are used by AR and DLLM schedulers. `RequestQueue` is used by all. Schedulers that don't
   need KV cache (diffusion, oneshot) ignore this directory entirely.
-- **`engine/run.rs`** — the main loop for each mode (`run::ar()`, `run::dllm()`, etc.).
-  Wires scheduler to model runner: `scheduler.step() → runner.execute() → scheduler.update()`.
-- **`engine/model_runner/`** — translates `ScheduledBatch` into tensors, calls
-  `model.forward()`, samples tokens. Shared by all modes.
+- **`engine/run/`** — the main loop for each scheduling paradigm (`run::ar()`, `run::dllm()`, etc.).
+  Wires scheduler to executor: `scheduler.step() → executor.submit(batch) → executor.collect() → scheduler.update()`.
+- **`engine/executor.rs`** — trait `Executor`: `submit(batch) -> Handle`, `collect(Handle) -> Output`.
+  Translates `ScheduledBatch` into tensors, calls `model.forward()`, samples tokens. Shared by all modes.
 - **`disaggregated/`** — multi-instance deployment. Single-machine users skip this entirely.
   `pd/` for prefill/decode separation, `afd/` for attention-FFN separation.
 
@@ -128,7 +136,7 @@ ScheduledBatch                      ← scheduler's decision (CPU-side metadata)
   total_tokens: usize
     │
     ▼
-ModelRunner.execute(&scheduled_batch)
+Executor.execute(&scheduled_batch)
     │  1. Build input tensors from ScheduledBatch:
     │       input_ids:    [total_tokens]           ← concat all entries' token_ids
     │       cu_seqlens_q: [num_requests + 1]       ← cumulative token offsets
@@ -164,7 +172,7 @@ can be tested without a GPU.
 
 ## Components (`scheduler/components/`)
 
-Optional building blocks that schedulers can pick up if they need them. Each is self-contained
+Optional reusable components that schedulers can pick up if they need them. Each is self-contained
 with clear semantics. No scheduler is required to use any of them.
 
 | Component | Used by | Not used by |
@@ -348,34 +356,40 @@ Each scheduler is independent. Read only the one for your workload.
 | **Coordinator** | — | — | yes | — | — | — |
 | **FFN Follower** | — | — | AFD only | — | — | — |
 
-## Scheduler ↔ Ops Interface (`engine/model_runner/`)
+## Scheduler ↔ Ops Interface (`engine/executor.rs`)
 
-The scheduler interacts with the ops layer through exactly two paths:
+The scheduler interacts with the ops layer through the Executor trait:
 
 ```
-Scheduler → ScheduledBatch → ModelRunner → Ops (via model.forward)
-                                    → OpsSession (begin/end_forward, precompute_paged_plan)
+Scheduler → ScheduledBatch → Executor::submit(batch) → model.forward(ops) → Executor::collect() → StepResult
 ```
 
 The scheduler **never** calls `AttentionOps`, `GemmOps`, `NormOps`, etc.
 It only manages metadata: block tables, sequence lengths, token IDs.
 
 ```rust
-// engine/model_runner/mod.rs — full ops interface called by model_runner
+// engine/executor.rs — Executor translates ScheduledBatch into model calls
 
+let handle = executor.submit(scheduled_batch);
+// ... scheduler can prepare next batch concurrently ...
+let step_result = executor.collect(handle);
+```
+
+Inside `Executor::submit`, the implementation calls:
+```rust
 ops.session.begin_forward();
 ops.session.precompute_paged_plan(&block_tables, &cu_seqlens_k, block_size);
 model.forward(&input_ids, &ops, &paged_ctx);
 ops.session.end_forward();
 ```
 
-For CUDA graphs, the model runner (not scheduler) downcasts to `CudaOps`:
+For CUDA graphs, the executor (not scheduler) downcasts to `CudaOps`:
 ```rust
 let cuda_ops: &CudaOps = ops.downcast();
 cuda_ops.precompute_paged_plan_graphed(&block_tables, &cu_seqlens_k, block_size, &graph_bufs);
 ```
 
-The scheduler doesn't know about CUDA graphs. The model runner decides whether to use
+The scheduler doesn't know about CUDA graphs. The executor decides whether to use
 graph capture/replay based on batch shape stability.
 
 ## Design Comparisons
@@ -432,6 +446,6 @@ diffusion, P/D disaggregation, adding a new scheduler) with file references.
 | TTS streaming | `TtsPipelineScheduler`: chain `ArScheduler` stages with `StreamBuffer` |
 | Embedding / prefill-only | `OneShotScheduler`: one forward per request, no KV cache, no decode loop |
 | P/D disaggregation | Coordinator above per-worker ArSchedulers. `FinishReason::Transferred` + `preloaded_blocks` + `import_blocks()`. ArScheduler core loop unchanged |
-| A/F disaggregation (AFD) | FFN follower loop (separate from ArScheduler). ArScheduler unchanged — AFD hidden inside `blocks::moe_layer` |
+| A/F disaggregation (AFD) | FFN follower loop (separate from ArScheduler). ArScheduler unchanged — AFD hidden inside `modules::moe_layer` |
 | Scheduler ↔ Ops | `OpsSession::begin/end_forward` + `precompute_paged_plan`. Nothing else |
 | Model code | Unchanged. Models see `Ops`, not schedulers |

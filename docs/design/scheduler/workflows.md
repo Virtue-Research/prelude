@@ -25,7 +25,7 @@ A request arrives, gets prefilled, decoded, and returned.
    │        └─ BlockAllocator::allocate()            │
    │    → produces ScheduledBatch                    │  # scheduler/types.rs
    │                                                 │
-   │ b. ModelRunner::execute(&batch)                 │  # engine/model_runner/mod.rs
+   │ b. Executor::execute(&batch)                 │  # engine/executor/mod.rs
    │    ├─ build tensors (input_ids, cu_seqlens,     │
    │    │   block_tables, slot_mapping)              │
    │    ├─ ops.session.begin_forward()               │  # (ops dispatch layer)
@@ -74,7 +74,7 @@ One demasking block resolved through multiple iterations.
 
 2. Demasking iterations (inside run::dllm):             # engine/run.rs
    ┌──────────────────────────────────────────────┐
-   │ a. ModelRunner::execute()                    │     # engine/model_runner/mod.rs
+   │ a. Executor::execute()                    │     # engine/executor/mod.rs
    │    ├─ prefix KV from cache (no recompute)    │
    │    └─ block tokens: full prefill (32 tokens) │
    │                                              │
@@ -99,7 +99,7 @@ One demasking block resolved through multiple iterations.
 
 2. run::diffusion():                                    # engine/run.rs
    ┌──────────────────────────────────────────────┐
-   │ ModelRunner executes DiT forward:            │     # engine/model_runner/mod.rs
+   │ Executor executes DiT forward:            │     # engine/executor/mod.rs
    │  ├─ CFG: duplicate latents (2x batch)        │
    │  ├─ dit.forward(latents, text_embeds, temb)  │     # (model code, ops dispatch layer)
    │  ├─ CFG: guided = uncond + scale*(cond-uncond)│
@@ -122,7 +122,7 @@ One demasking block resolved through multiple iterations.
 
 2. Prefill Worker (normal ArScheduler):                 # scheduler/ar.rs + engine/run.rs
    ├─ ArScheduler::step() → prefill
-   ├─ ModelRunner::execute() → forward
+   ├─ Executor::execute() → forward
    ├─ ArScheduler::update() → FinishReason::Transferred
    └─ KvTransfer::send(block_ids) → decode worker      # disaggregated/pd/kv_transfer.rs
 
@@ -155,6 +155,6 @@ Example: adding a `VideoScheduler` for video generation.
 
 Files touched: 3 (video.rs, run.rs, config.rs)
 Files NOT touched: ar.rs, dllm.rs, diffusion.rs, oneshot.rs, tts.rs,
-                   model_runner/, components/, any model code
+                   executor/, components/, any model code
 ```
 

@@ -13,7 +13,7 @@ crates/
 │       ├── lib.rs                                 # pub use engine::Engine;
 │       │
 │       ├── ops/                                   # Op trait definitions + built-in fallback
-│       │   ├── mod.rs                             # register_cpu_ops/gpu_ops, select_ops(&device)
+│       │   ├── mod.rs                             # register_backend(), select_backend() — priority-based probe
 │       │   ├── traits/                            # Trait definitions — the shared contract
 │       │   │   ├── mod.rs                         # re-exports all traits
 │       │   │   ├── bundle.rs                      # Ops bundle struct (all 9 Arc<dyn Trait> fields)
@@ -207,11 +207,11 @@ crates/
 
 - **`prelude-server/`** — binary crate, composition root. Has zero device-specific code.
   Device crates auto-register their `Ops` + `Executor` via `ctor` at link time.
-  Server just creates `Engine::new(config)` — engine calls `select_ops(&device)` internally.
+  Server just creates `Engine::new(config)` — engine calls `select_backend()` internally.
 
 - **`prelude-core/src/ops/`** — the shared contract. Trait definitions live in `ops/traits/`,
   with `naive_ops.rs` as the built-in fallback (matmul-based attention, candle ops).
-  Device crates register optimized implementations via `register_cpu_ops()` / `register_gpu_ops()`.
+  Device crates register optimized implementations via `register_backend()` with priority + probe.
   `tensor.rs` provides the candle_core abstraction layer. **No dependency on any device crate.**
 
 - **`prelude-core/src/engine/executor.rs`** — trait `Executor` defines how scheduled batches are
@@ -252,7 +252,7 @@ crates/
 
 2. **Kernel optimization reach:** When a kernel optimization is added, as many models as possible
    should benefit automatically without per-model code changes. This is achieved via shared
-   modules — optimize one building block, all models that use it benefit. O(1) change → O(N) benefit.
+   modules — optimize one module, all models that use it benefit. O(1) change → O(N) benefit.
 
 ## Goals
 
@@ -288,7 +288,7 @@ Device ops          dispatches to     Kernel libraries (FA4, FlashInfer, DeepGEM
 
 **Modules** are shared layer implementations (e.g., `TransformerBlock`, `GatedMlp`, `Linear`).
 They contain the `FusedOps` match/fallback logic. Models compose modules instead of calling
-raw ops. **When a new fused kernel is added, the building block is updated once, and all models
+raw ops. **When a new fused kernel is added, the module is updated once, and all models
 that use it benefit automatically.** This is how one kernel optimization reaches many models.
 
 ## Document Index
@@ -372,7 +372,8 @@ third_party/                          (git submodules, source only — not Cargo
 **Key rules:**
 - `prelude-core` depends on NO device crate and compiles NO C++ (pure Rust leaf).
 - Device crates auto-register `Ops` + `Executor` via `ctor` at link time — no explicit init in server.
-- Engine calls `select_ops(&device)` internally to pick the best registered implementation.
+- Engine calls `select_backend()` internally — picks highest-priority backend whose `probe()` returns true.
+- `prelude-core` has NO device types (`DeviceType` enum, `has_nvidia_gpu()` etc.) — zero device knowledge.
 - Device features are **additive**, not exclusive — `--features cuda,rocm` builds both.
 - NCCL/RCCL are **dlopen'd** at runtime (not statically linked), avoiding symbol conflicts.
 - Cross-device libraries (UCCL-EP) have separate sub-crates per device with shared

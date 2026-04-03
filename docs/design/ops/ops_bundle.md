@@ -3,7 +3,7 @@
 Models receive a single struct:
 
 ```rust
-// prelude-core/src/ops/mod.rs
+// prelude-core/src/ops/traits/bundle.rs
 
 struct Ops {
     pub attn: Arc<dyn AttentionOps>,

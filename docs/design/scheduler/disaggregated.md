@@ -174,12 +174,12 @@ GPU pools. Primarily useful for large MoE models (DeepSeek-V3, Qwen3-MoE) where 
 dominate GPU memory. Moving experts to dedicated FFN GPUs frees attention GPUs' memory for
 KV cache → larger batch sizes → higher throughput.
 
-See ops dispatch doc for the building block changes (`MoeMode::Disaggregated`,
+See ops dispatch doc for the module changes (`MoeMode::Disaggregated`,
 `CommOps::send/recv`). Here we cover the scheduler impact.
 
 **The attention side's ArScheduler is completely unchanged.** It runs `step()` → `ScheduledBatch` →
 `execute()` → `update()` as normal. The attention-FFN communication happens inside
-`blocks::moe_layer` during model forward — invisible to the scheduler.
+`modules::moe_layer` during model forward — invisible to the scheduler.
 
 **The FFN side needs a passive follower loop**, because the FFN process doesn't make scheduling
 decisions — it just executes FFN layers when the attention side sends hidden states.
@@ -189,14 +189,14 @@ decisions — it just executes FFN layers when the attention side sends hidden s
 
 /// Runs on FFN workers in attention-FFN disaggregated mode.
 /// No scheduler, no request management, no block allocation.
-fn run_ffn_follower(model_runner: &ModelRunner, sync: &AfdSync) {
+fn run_ffn_follower(executor: &Executor, sync: &AfdSync) {
     loop {
         // Wait for attention side to signal "run one forward pass"
         match sync.recv() {
             AfdSignal::Forward => {
                 // Run FFN-only forward: iterate MoE layers, recv/compute/send for each.
-                // Hidden states arrive via CommOps::recv inside blocks::moe_layer.
-                model_runner.execute_ffn_only();
+                // Hidden states arrive via CommOps::recv inside modules::moe_layer.
+                executor.execute_ffn_only();
             }
             AfdSignal::Shutdown => break,
         }
@@ -205,11 +205,11 @@ fn run_ffn_follower(model_runner: &ModelRunner, sync: &AfdSync) {
 
 /// Attention side sends a sync signal before each model.forward().
 /// This is called inside the model runner, not the scheduler.
-fn execute_with_afd(model_runner: &ModelRunner, plan: &ScheduledBatch, sync: &AfdSync) -> StepResult {
+fn execute_with_afd(executor: &Executor, plan: &ScheduledBatch, sync: &AfdSync) -> StepResult {
     // Signal FFN workers to start their forward pass
     sync.send(AfdSignal::Forward);
-    // Normal model forward — blocks::moe_layer handles send/recv internally
-    model_runner.execute(plan)
+    // Normal model forward — modules::moe_layer handles send/recv internally
+    executor.execute(plan)
 }
 ```
 
@@ -217,14 +217,14 @@ fn execute_with_afd(model_runner: &ModelRunner, plan: &ScheduledBatch, sync: &Af
 
 | Concern | SGLang | Prelude |
 |---------|--------|---------|
-| MoE layer | Replace class (`AFDATTNMoE` / `AFDFFNMoE`) | `blocks::moe_layer` absorbs AFD internally |
+| MoE layer | Replace class (`AFDATTNMoE` / `AFDFFNMoE`) | `modules::moe_layer` absorbs AFD internally |
 | Model code | Must swap MoE class per model | Zero changes |
 | FFN scheduler | Modified `event_loop_afd_ffn_normal` in main scheduler | Separate `run_ffn_follower` loop, not part of ArScheduler |
 | Sync mechanism | ZMQ IPC socket, custom `AFSyncReq` | `AfdSync` abstraction, transport-agnostic |
 | Communication | StepMesh (push-pull, tensor caching) | `CommOps::send/recv` (device impl chooses transport) |
-| Model support | Qwen3MoE only, hardcoded check | Any MoE model using `blocks::moe_layer` |
+| Model support | Qwen3MoE only, hardcoded check | Any MoE model using `modules::moe_layer` |
 
 **The FFN follower is not an ArScheduler mode.** It's a separate, simpler loop that doesn't
 manage requests, blocks, or queues. Keeping it separate from ArScheduler avoids polluting the
 core scheduler with AFD concerns. The ArScheduler has no knowledge of AFD — it just calls
-`model.forward()`, and the building block handles the rest.
+`model.forward()`, and the module handles the rest.

@@ -227,41 +227,26 @@ struct ScheduledRequest {
 - **`token_ids` is explicit.** The scheduler resolves what tokens to compute. The model runner
   doesn't need to know about prompt vs output vs draft — it just processes `token_ids`.
 
-### Model Runner (`engine/model_runner/`)
+### Executor (`engine/executor.rs`)
 
-Translates `ScheduledBatch` into `model.forward()` calls. Stateless — receives a plan, produces output.
+Device-specific execution strategy. Receives `ScheduledBatch`, runs model forward on
+the device, returns output. Implemented by each device crate (CudaExecutor, CpuExecutor, etc.).
 
 ```rust
-// engine/model_runner/mod.rs
+// prelude-core/src/engine/executor.rs
 
-struct ModelRunner {
-    model: Box<dyn Model>,
-    ops: Ops,
+trait Executor: Send + Sync {
+    /// Submit a batch for execution. Non-blocking on GPU (queues work),
+    /// blocking on CPU (runs inline). Returns a handle for collection.
+    fn submit(&self, batch: &ScheduledBatch) -> ExecutorHandle;
+
+    /// Collect results from a submitted batch. Blocks until complete.
+    fn collect(&self, handle: ExecutorHandle) -> StepResult;
 }
+```
 
-impl ModelRunner {
-    fn execute(&self, plan: &ScheduledBatch) -> StepResult {
-        // 1. Build input tensors from plan
-        let (input_ids, cu_seqlens_q, cu_seqlens_k, block_tables, slot_mapping) =
-            self.build_inputs(plan);
-
-        // 2. Precompute paged attention plan (FlashInfer indptr/indices)
-        self.ops.session.begin_forward();
-        self.ops.session.precompute_paged_plan(
-            &block_tables, &cu_seqlens_k, self.block_size,
-        );
-
-        // 3. Model forward
-        let logits = self.model.forward(&input_ids, &self.ops, &paged_ctx);
-
-        self.ops.session.end_forward();
-
-        // 4. Sample next tokens
-        let sampled = self.sample(&logits, plan);
-
-        StepResult { sampled }
-    }
-}
+The run loop uses submit/collect to naturally get double-buffering on GPU
+(prepare batch N+1 while device runs batch N) and sequential execution on CPU.
 
 struct StepResult {
     /// Per-request: sampled token IDs.
@@ -382,7 +367,7 @@ handles it as a special case within the same loop.
 // scheduler/ar.rs
 
 impl ArScheduler {
-    fn step_with_speculation(&mut self, draft_model: &ModelRunner) -> ScheduledBatch {
+    fn step_with_speculation(&mut self, draft_model: &Executor) -> ScheduledBatch {
         // 1. Draft phase: generate N draft tokens for each decode request
         for &req_id in &self.running {
             let req = &mut self.requests[req_id];
@@ -424,7 +409,7 @@ Step N:
 ```rust
 // engine/run.rs
 
-fn run_loop(scheduler: &mut ArScheduler, runner: &ModelRunner) {
+fn run_loop(scheduler: &mut ArScheduler, runner: &Executor) {
     let mut plan = scheduler.step();
     loop {
         // Launch GPU execution (non-blocking with async ops)

@@ -31,7 +31,7 @@ GrammarManager.compile(constraint)             # async, overlaps with prior step
 Scheduler schedules request normally
     │
     ▼
-ModelRunner: model.forward() → logits          # GPU compute
+Executor: model.forward() → logits          # GPU compute
     │
     ▼
 GrammarManager.fill_bitmask(logits, batch)     # CPU: per-request bitmask of allowed tokens
@@ -185,9 +185,9 @@ impl GrammarManager {
 ## Integration with Sampling Pipeline
 
 ```
-// prelude-core/src/engine/model_runner/mod.rs
+// prelude-core/src/engine/executor/mod.rs
 
-ModelRunner::execute(&batch)
+Executor::execute(&batch)
     │
     ├── ops.session.begin_forward()
     ├── model.forward() → logits             # GPU

@@ -1,5 +1,11 @@
 ## Device Implementations
 
+Each device crate provides two things:
+1. **`Ops`** — implements all 9 op traits (AttentionOps, GemmOps, ...) with optimized kernels
+2. **`Executor`** — implements `Executor` trait (submit/collect) with device-specific execution strategy
+
+Both are auto-registered via `ctor` at link time. See [construction.md](construction.md).
+
 ### CUDA
 
 ```rust

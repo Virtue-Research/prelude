@@ -16,8 +16,8 @@ prelude-core/src/
 │   │   ├── proposer.rs                        # trait DraftProposer + concrete implementations
 │   │   ├── rejection.rs                       # Rejection sampling (strict, probabilistic)
 │   │   └── tree.rs                            # Tree attention mask construction (EAGLE/Medusa)
-│   └── model_runner/
-│       └── mod.rs                             # ModelRunner::execute — handles spec decode batches
+│   └── executor/
+│       └── mod.rs                             # Executor::execute — handles spec decode batches
 ```
 
 ## Architecture
@@ -276,7 +276,7 @@ ArScheduler.step()
     → ScheduledBatch (same as non-spec decode)
         → SpecDecodeRunner.execute(batch)
             → proposer.propose()          # draft N tokens
-            → model_runner.execute()       # verify all N+1 positions
+            → executor.execute()       # verify all N+1 positions
             → rejection_sample()           # accept k ≤ N
             → StepResult (k+1 tokens per request)
         → ArScheduler.update(result)

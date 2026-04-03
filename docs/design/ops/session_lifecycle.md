@@ -6,7 +6,7 @@ Some devices have per-forward-pass state that must be managed:
 - **CUDA/HIP graphs**: pre-allocated buffers with fixed GPU addresses
 
 ```rust
-// prelude-core/src/ops/session.rs
+// prelude-core/src/ops/traits/session.rs
 
 trait OpsSession: Send + Sync {
     /// Initialize per-forward-pass state. Called before model.forward().

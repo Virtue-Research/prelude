@@ -332,7 +332,7 @@ fn forward(x: &Tensor, ops: &Ops) -> Result<Tensor> {
 ```
 
 Key points:
-- **Same model code** as CUDA. The only difference is `create_ops(DeviceType::Metal, ..)`.
+- **Same model code** as CUDA. The only difference is which device crate is linked.
 - **Unified memory**: no CPU→GPU transfers. Tensors allocated once, visible to both.
 - **Q4_K quantized matmul**: Metal MSL shader dequantizes in-register during compute. No separate dequant kernel — more memory-efficient than CUDA's approach for small batch.
 - **No paged attention**: Metal uses `varlen_attention` with contiguous KV. Acceptable for single-user on-device inference (no batching needed).
@@ -1102,7 +1102,7 @@ Shows how the engine uses `OpsSession` + CUDA-specific graph capture.
 This is engine code, not model code.
 
 ```rust
-// prelude-core/src/engine/model_runner/cuda_graph.rs
+// prelude-core/src/engine/executor.rs
 fn setup_cuda_graph(
     model: &dyn Model,
     ops: &Ops,
@@ -1263,7 +1263,7 @@ impl AttentionOps for CudaOps {
 ```
 
 ```rust
-// prelude-core/src/engine/model_runner/mod.rs — engine cache allocation
+// prelude-core/src/engine/weight_loader.rs — engine cache allocation
 fn allocate_kv_cache(ops: &Ops, num_blocks: usize, block_size: usize,
                      num_kv_heads: usize, head_dim: usize, dtype: DType) -> (Tensor, Tensor) {
     let spec = ops.kv_cache.cache_slot_spec(head_dim, dtype);
@@ -1384,7 +1384,7 @@ Scenario: kernel dev adds `fused_geglu` (GELU-gated MLP fusion) to CudaOps.
 Shows the minimal change set.
 
 ```rust
-// Step 1: prelude-core/src/ops/fused.rs — add method with default { None }
+// Step 1: prelude-core/src/ops/traits/fused.rs — add method with default { None }
 trait FusedOps {
     // ... existing methods ...
     fn fused_geglu(&self, gate: &Tensor, up: &Tensor) -> Option<Result<Tensor>> { None }

@@ -1,10 +1,10 @@
-## Shared Building Blocks
+## Shared Modules
 
 Modules are **shared layer implementations** that contain fusion/fallback logic.
 Models compose them instead of calling raw ops. This is how one kernel optimization
 reaches all models automatically.
 
-### Why Building Blocks
+### Why Modules
 
 **Problem:** Without modules, every model must write its own fusion fallback:
 
@@ -39,7 +39,7 @@ pub fn residual_norm(
 Now the model just writes `modules::residual_norm(&residual, &h, &w, eps, ops)?`.
 When the kernel dev adds `fused_add_rmsnorm` to CudaOps, all 20 models benefit with zero changes.
 
-### Building Block Catalog
+### Module Catalog
 
 ```rust
 // prelude-core/src/modules/
@@ -107,6 +107,23 @@ impl Linear {
 /// Fuses to BGMV/Punica on CUDA, per-adapter fallback elsewhere.
 fn apply_lora(base_out, x, lora, adapter_ids, ops) -> Tensor;
 
+// ── transformer_block.rs ────────────────────────────────────────
+
+/// Standard pre-norm transformer decoder block.
+/// Covers 90% of dense LLM layers: residual_norm → attention → fused_add_norm → gated_mlp.
+/// Models that need custom patterns (Flux double-stream, Whisper cross-attention)
+/// compose modules directly instead of using TransformerBlock.
+pub struct TransformerBlock {
+    ln1: Tensor, ln2: Tensor,
+    qkv_proj: Linear, o_proj: Linear,
+    gate_proj: Linear, up_proj: Linear, down_proj: Linear,
+    q_norm: Option<Tensor>, k_norm: Option<Tensor>,
+}
+
+impl TransformerBlock {
+    fn forward(&self, x: &Tensor, batch: &BatchState, ops: &Ops, kv: &PagedKvCtx) -> Result<Tensor>;
+}
+
 // ── moe.rs ──────────────────────────────────────────────────────
 
 /// MoE layer: route → dispatch → grouped GEMM → combine.
@@ -116,6 +133,20 @@ pub fn moe_layer(x, gate, expert_weights, moe_config, ops) -> Tensor;
 ```
 
 ### How Models Use Modules
+
+Most LLMs just stack `Vec<TransformerBlock>`:
+
+```rust
+// Most LLMs: just stack TransformerBlock
+struct LlamaModel {
+    embed: Embedding,
+    blocks: Vec<TransformerBlock>,
+    final_norm: Tensor,
+    lm_head: Linear,
+}
+```
+
+Models that need custom layer patterns compose modules directly:
 
 ```rust
 // prelude-core/src/models/qwen3.rs — using modules, no fusion logic visible

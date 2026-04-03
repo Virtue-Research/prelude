@@ -4,10 +4,12 @@
 
 ```
 prelude-core/src/
+├── engine/
+│   ├── weight_loader.rs                       # WeightLoader: safetensors/GGUF → model struct
+│   └── ...
 ├── models/
 │   ├── mod.rs                                 # trait Model, re-exports
 │   ├── registry.rs                            # ModelRegistry: arch name → model constructor
-│   ├── weight_loader.rs                       # WeightLoader: safetensors/GGUF → model struct
 │   ├── config.rs                              # ModelConfig: parsed from HF config.json
 │   ├── qwen3.rs                               # impl Model for Qwen3
 │   ├── llama.rs                               # impl Model for Llama (also serves Phi3, InternLM3)
@@ -163,7 +165,7 @@ impl ModelConfig {
 ## Weight Loading
 
 ```rust
-// prelude-core/src/models/weight_loader.rs
+// prelude-core/src/engine/weight_loader.rs
 
 /// Load model weights from safetensors/GGUF files.
 /// Maps HF tensor names to model struct fields.
@@ -271,24 +273,12 @@ This is per-model-family — kept in the model file alongside `stacked_params`.
 ## Engine Integration
 
 ```rust
-// prelude-server/src/main.rs — model loading flow
-
-fn load_model(model_path: &Path, ops: &Ops) -> Result<Box<dyn Model>> {
-    // 1. Parse config
-    let config = ModelConfig::from_hf_config(&model_path.join("config.json"))?;
-    
-    // 2. Resolve model class
-    let arch = &config.architectures[0];
-    let registration = resolve_model(arch)
-        .ok_or_else(|| anyhow!("unsupported architecture: {arch}"))?;
-    
-    // 3. Construct model
-    let mut model = (registration.create)(&config, ops)?;
-    
-    // 4. Load weights
-    let mut weights = WeightIterator::open(model_path)?;
-    model.load_weights(&mut weights, ops)?;
-    
+// prelude-core/src/engine/mod.rs
+fn load_model(config: &ModelConfig, device: &Device) -> Result<Box<dyn Model>> {
+    let registration = resolve_model(&config.architectures[0])?;
+    let mut model = (registration.create)(config)?;
+    let mut weights = WeightIterator::open(&config.model_path)?;
+    model.load_weights(&mut weights)?;
     Ok(model)
 }
 ```
