@@ -463,10 +463,6 @@ pub mod backend {
     pub use candle_core::CpuStorage;
     pub use candle_core::op::BackpropOp;
     pub use candle_core::Layout;
-    #[cfg(feature = "cuda")]
-    pub use candle_core::CudaStorage;
-    #[cfg(feature = "cuda")]
-    pub use candle_core::cuda_backend;
 }
 
 pub mod shape {
