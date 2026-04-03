@@ -12,18 +12,25 @@ crates/
 │   └── src/
 │       ├── lib.rs                                 # pub use engine::Engine;
 │       │
-│       ├── ops/                                   # Op trait definitions — the shared contract
+│       ├── ops/                                   # Op trait definitions + CPU impl
 │       │   ├── mod.rs                             # pub struct Ops { attn, kv_cache, gemm, norm, ... }
-│       │   ├── attention.rs                       # trait AttentionOps, VarlenParams, PagedParams, MaskType
-│       │   ├── kv_cache.rs                        # trait KvCacheOps, CacheSlotSpec, LayerCacheSpec
-│       │   ├── gemm.rs                            # trait GemmOps, QuantScheme
-│       │   ├── norm.rs                            # trait NormOps (rms_norm, layer_norm, group_norm)
-│       │   ├── activation.rs                      # trait ActivationOps (silu, gelu, softmax)
-│       │   ├── conv.rs                            # trait ConvOps (conv1d, conv2d, conv_transpose1d)
-│       │   ├── comm.rs                            # trait CommOps (all_reduce, all_gather, all_to_all, send/recv)
-│       │   ├── fused.rs                           # trait FusedOps — all methods default { None }
-│       │   ├── sampling.rs                        # trait SamplingOps (softmax, top_k, top_p, min_p, multinomial)
-│       │   └── session.rs                         # trait OpsSession (begin/end_forward, precompute_paged_plan)
+│       │   ├── traits/                            # Trait definitions — the shared contract
+│       │   │   ├── mod.rs                         # re-exports all traits
+│       │   │   ├── bundle.rs                      # Ops bundle struct
+│       │   │   ├── attention.rs                   # trait AttentionOps, VarlenParams, PagedParams, MaskType
+│       │   │   ├── kv_cache.rs                    # trait KvCacheOps, CacheSlotSpec, LayerCacheSpec
+│       │   │   ├── gemm.rs                        # trait GemmOps, QuantScheme
+│       │   │   ├── norm.rs                        # trait NormOps (rms_norm, layer_norm, group_norm)
+│       │   │   ├── activation.rs                  # trait ActivationOps (silu, gelu, softmax)
+│       │   │   ├── conv.rs                        # trait ConvOps (conv1d, conv2d, conv_transpose1d)
+│       │   │   ├── comm.rs                        # trait CommOps (all_reduce, all_gather, all_to_all, send/recv)
+│       │   │   ├── fused.rs                       # trait FusedOps — all methods default { None }
+│       │   │   └── session.rs                     # trait OpsSession (begin/end_forward, precompute_paged_plan)
+│       │   ├── cpu_ops.rs                         # CpuOps implementation
+│       │   ├── cpu/                               # CPU kernel implementations (attention, GEMM, quant, etc.)
+│       │   └── onednn/                            # OneDNN FFI bindings
+│       │
+│       ├── tensor.rs                              # candle_core abstraction layer (re-exports Tensor, Device, etc.)
 │       │
 │       ├── modules/                               # Shared modules — fusion/fallback logic lives here
 │       │   ├── mod.rs                             # re-exports
@@ -110,18 +117,25 @@ crates/
 ├── prelude-cuda/                              # CUDA device impl
 │   ├── src/                                   # CudaOps — dispatch layer
 │   │   ├── lib.rs                             # pub fn create_ops(config) -> Ops
-│   │   ├── cuda_ops.rs                        # struct CudaOps — holds all kernel handles
-│   │   ├── attention.rs                       # impl AttentionOps: FA4 → FlashInfer fallback
-│   │   ├── kv_cache.rs                        # impl KvCacheOps: cache_slot_spec + TurboQuant encode
-│   │   ├── gemm.rs                            # impl GemmOps: DeepGEMM → CUTLASS fallback
-│   │   ├── norm.rs                            # impl NormOps: fused CUDA kernels
-│   │   ├── activation.rs                      # impl ActivationOps
-│   │   ├── conv.rs                            # impl ConvOps: CUTLASS conv
-│   │   ├── comm.rs                            # impl CommOps: NCCL + UCCL-EP fused dispatch
-│   │   ├── sampling.rs                        # impl SamplingOps: FlashInfer GPU sampling kernels
-│   │   ├── fused.rs                           # impl FusedOps: all overrides return Some
-│   │   ├── session.rs                         # impl OpsSession: FlashInfer plan cache
-│   │   └── graph.rs                           # CudaOps::allocate_graph_buffers, precompute_paged_plan_graphed
+│   │   ├── cuda_ops.rs                        # struct CudaOps, select_attention_backend(), trait impls
+│   │   ├── ops/                               # Kernel wrapper modules
+│   │   │   ├── mod.rs                         # PTX loading, module exports
+│   │   │   ├── elementwise.rs                 # vectorized_add, fast_silu_mul
+│   │   │   ├── rmsnorm.rs                     # fast_rmsnorm, fused_add_rmsnorm
+│   │   │   ├── rope.rs                        # fused_qknorm_rope_varlen
+│   │   │   ├── kv_cache.rs                    # fused_knorm_rope_kv_cache_write
+│   │   │   ├── moe.rs                         # MoE routing ops
+│   │   │   ├── gemm.rs                        # GEMM wrappers
+│   │   │   ├── quant.rs                       # quantization ops
+│   │   │   └── tiled_mmq.rs                   # tiled MMQ kernels (GGUF quantized GEMM)
+│   │   ├── attn/                              # Attention backends (impl AttentionOps)
+│   │   │   ├── mod.rs                         # module exports
+│   │   │   ├── flash_v4.rs                    # FA4 CuTeDSL wrappers
+│   │   │   ├── flash_v3.rs                    # FA3 Hopper wrappers
+│   │   │   ├── flash_v2.rs                    # FA2 Ampere+ wrappers
+│   │   │   ├── flashinfer.rs                  # FlashInfer wrappers
+│   │   │   └── paged.rs                       # paged cache ops
+│   │   └── kernels/kernels_src/               # .cu source files (organized by subdirectory)
 │   │
 │   ├── fa4/                                   # build.rs compiles third_party/flash-attention/
 │   ├── flashinfer/                            # build.rs compiles third_party/flashinfer/
@@ -138,7 +152,6 @@ crates/
 │   │   ├── attention.rs                       # impl AttentionOps: aiter → CK flash attn fallback
 │   │   ├── gemm.rs                            # impl GemmOps: CK GEMM, FP8 FNUZ/E4M3 auto-select
 │   │   ├── comm.rs                            # impl CommOps: RCCL + UCCL-EP fused dispatch
-│   │   ├── sampling.rs                        # impl SamplingOps: CK-based or scalar fallback
 │   │   ├── fused.rs                           # impl FusedOps: fused_add_rmsnorm (HIP kernel)
 │   │   └── ...                                # norm, activation, conv, session, graph (HIP graphs)
 │   │
@@ -153,7 +166,6 @@ crates/
 │   │   ├── metal_ops.rs                       # struct MetalOps (unified memory, simdgroup mm)
 │   │   ├── attention.rs                       # impl AttentionOps: MSL flash attn (varlen only)
 │   │   ├── gemm.rs                            # impl GemmOps: simdgroup matmul + in-shader Q4K dequant
-│   │   ├── sampling.rs                        # impl SamplingOps: MSL compute shader
 │   │   ├── fused.rs                           # impl FusedOps: fused_add_rmsnorm, fused_silu_mul
 │   │   └── ...                                # norm, activation, conv
 │   └── shaders/                               # MSL compute shaders (*.metal)
@@ -164,7 +176,6 @@ crates/
 │   │   ├── vulkan_ops.rs                      # struct VulkanOps (cooperative_matrix, subgroup_size)
 │   │   ├── attention.rs                       # impl AttentionOps: GLSL flash attn (scalar + coopmat)
 │   │   ├── gemm.rs                            # impl GemmOps: tiled / coopmat + in-shader Q4 dequant
-│   │   ├── sampling.rs                        # impl SamplingOps: GLSL compute shader
 │   │   └── ...                                # norm, activation, conv
 │   └── shaders/                               # GLSL → SPIR-V compute shaders
 │
@@ -174,7 +185,6 @@ crates/
 │       ├── tpu_ops.rs                         # struct TpuOps (PjrtClient, compiled_cache)
 │       ├── attention.rs                       # impl AttentionOps: Pallas flash attn + ragged_paged
 │       ├── gemm.rs                            # impl GemmOps: XLA dot_general (MXU)
-│       ├── sampling.rs                        # impl SamplingOps: XLA top_k + multinomial
 │       ├── session.rs                         # impl OpsSession: XLA trace begin/end + compile cache
 │       └── ...                                # FusedOps: all None (XLA auto-fuses)
 │
@@ -184,7 +194,6 @@ crates/
     │   ├── cpu_ops.rs                         # struct CpuOps
     │   ├── attention.rs                       # impl AttentionOps: matmul-based SDPA (no paged)
     │   ├── gemm.rs                            # impl GemmOps: OneDNN GEMM + dequant fallback
-    │   ├── sampling.rs                        # impl SamplingOps: quickselect top-k + vectorized softmax
     │   ├── fused.rs                           # impl FusedOps: fused_add_rmsnorm (vectorized)
     │   └── ...                                # norm, activation, conv
     │
@@ -197,9 +206,10 @@ crates/
   the device backend, calls `prelude_cuda::create_ops()` (or rocm/metal/...) and passes
   `Ops` + `GrammarBackend` to `Engine::new()`. Everything else is device-agnostic.
 
-- **`prelude-core/src/ops/`** — the shared contract. Every subsystem reads these trait
-  signatures. Model devs, module devs, device impl devs all start here.
-  `mod.rs` defines the `Ops` bundle struct. **No dependency on any device crate.**
+- **`prelude-core/src/ops/`** — the shared contract. Trait definitions live in `ops/traits/`,
+  with `CpuOps` implementation in `ops/cpu_ops.rs` and CPU kernels in `ops/cpu/`.
+  Model devs, module devs, device impl devs all start with the trait signatures.
+  `tensor.rs` provides the candle_core abstraction layer. **No dependency on any device crate.**
 
 - **`prelude-core/src/modules/`** — shared modules. Contain fusion/fallback logic
   (`FusedOps` match + `None` fallback). Models compose these instead of calling raw ops.
@@ -370,7 +380,7 @@ prelude-server            →  composition root: detect GPU, create_ops, Engine:
 plugins/prelude-xgrammar  →  impl GrammarBackend (device-agnostic C++ FFI)
 prelude-core/models       →  device-agnostic model code, calls modules + Ops
 prelude-core/modules      →  shared layers (Linear, residual_norm, moe_layer), fusion fallback
-prelude-core/ops          →  trait definitions (AttentionOps, GemmOps, SamplingOps, FusedOps, ...)
+prelude-core/ops          →  trait definitions in ops/traits/ (AttentionOps, GemmOps, FusedOps, ...) + CpuOps impl
 prelude-core/engine       →  Engine, ModelRunner, SpecDecodeRunner, Sampler, GrammarManager
 prelude-core/scheduler    →  ArScheduler, DllmScheduler, BlockAllocator, PrefixCache
 prelude-{device}/         →  device impl (CudaOps, RocmOps, ...), kernel sub-crates
