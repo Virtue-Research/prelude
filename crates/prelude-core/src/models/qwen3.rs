@@ -998,12 +998,12 @@ mod meta {
 
         fn runtime_caps(&self, task: TaskKind, backend: WeightsBackend, device: &crate::tensor::Device) -> RuntimeCaps {
             let is_safetensors = backend == WeightsBackend::Safetensors;
-            let supports_cuda_varlen = (cfg!(feature = "cuda") || cfg!(feature = "flash-attn-v4") || cfg!(feature = "flashinfer"))
-                && device.is_cuda() && is_safetensors;
+            let is_cuda = device.is_cuda();
+            let supports_cuda_varlen = is_cuda && is_safetensors;
             RuntimeCaps {
                 supports_kv_cache: is_safetensors && task == TaskKind::Generate,
-                supports_prefix_cache: is_safetensors && cfg!(feature = "cuda") && device.is_cuda(),
-                supports_paged_attn: cfg!(feature = "cuda") && device.is_cuda() && is_safetensors,
+                supports_prefix_cache: is_safetensors && is_cuda,
+                supports_paged_attn: is_cuda && is_safetensors,
                 supports_varlen: supports_cuda_varlen,
                 supports_deltanet: false,
                 supports_cuda_graph: supports_cuda_varlen && task == TaskKind::Generate,

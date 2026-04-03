@@ -1388,10 +1388,8 @@ mod meta {
             RuntimeCaps {
                 supports_kv_cache: false,
                 supports_prefix_cache: false,
-                supports_paged_attn: cfg!(feature = "cuda")
-                    && device.is_cuda()
-                    && is_safetensors,
-                supports_varlen: cfg!(feature = "cuda") && device.is_cuda() && is_safetensors,
+                supports_paged_attn: device.is_cuda() && is_safetensors,
+                supports_varlen: device.is_cuda() && is_safetensors,
                 supports_deltanet: true,
                 supports_cuda_graph: false,
             }

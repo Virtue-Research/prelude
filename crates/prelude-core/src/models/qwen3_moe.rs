@@ -594,15 +594,12 @@ mod meta {
             let is_safetensors = backend == WeightsBackend::Safetensors;
             let is_generate = task == TaskKind::Generate;
 
+            let is_cuda = device.is_cuda();
             RuntimeCaps {
                 supports_kv_cache: is_safetensors && is_generate,
-                supports_prefix_cache: is_safetensors
-                    && cfg!(feature = "cuda")
-                    && device.is_cuda(),
-                supports_paged_attn: cfg!(feature = "cuda")
-                    && device.is_cuda()
-                    && is_safetensors,
-                supports_varlen: cfg!(feature = "cuda") && device.is_cuda() && is_safetensors,
+                supports_prefix_cache: is_safetensors && is_cuda,
+                supports_paged_attn: is_cuda && is_safetensors,
+                supports_varlen: is_cuda && is_safetensors,
                 supports_deltanet: false,
                 supports_cuda_graph: false,
             }
