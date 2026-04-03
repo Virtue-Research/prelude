@@ -47,7 +47,7 @@ tower = { version = "0.5.3", features = ["util"] }
 
 [features]
 default = []
-cuda = ["prelude-core/cuda", "dep:prelude-cuda"]
+cuda = ["dep:prelude-cuda"]
 flash-attn-v4 = ["cuda", "prelude-cuda/flash-attn-v4"]
 flashinfer = ["cuda", "prelude-cuda/flashinfer"]
 flashinfer-v4 = ["flashinfer", "flash-attn-v4"]
