@@ -1,4 +1,4 @@
-use candle_core::{Device, Result, Tensor};
+use prelude_core::tensor::{Device, Result, Tensor};
 use half::bf16;
 use std::time::Instant;
 
@@ -39,11 +39,11 @@ fn bench(report: &mut BenchReport, hidden: usize, batch: usize, warmup: usize, r
     let weight = Tensor::from_vec(weight_data, (hidden,), &device)?;
 
     for _ in 0..warmup {
-        let _ = prelude_core::ops::cpu::cpu_rmsnorm(&input, &weight, 1e-6)?;
+        let _ = prelude_cpu::ops::cpu_rmsnorm(&input, &weight, 1e-6)?;
     }
     let start = Instant::now();
     for _ in 0..repeats {
-        let _ = prelude_core::ops::cpu::cpu_rmsnorm(&input, &weight, 1e-6)?;
+        let _ = prelude_cpu::ops::cpu_rmsnorm(&input, &weight, 1e-6)?;
     }
     let us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 
@@ -73,13 +73,13 @@ fn bench_fused(report: &mut BenchReport, hidden: usize, batch: usize, warmup: us
     for _ in 0..warmup {
         let h = Tensor::from_vec(h_data.clone(), (batch, hidden), &device)?;
         let r = Tensor::from_vec(res_data.clone(), (batch, hidden), &device)?;
-        let _ = prelude_core::ops::cpu::cpu_fused_add_rmsnorm(&h, &r, &weight, 1e-6)?;
+        let _ = prelude_cpu::ops::cpu_fused_add_rmsnorm(&h, &r, &weight, 1e-6)?;
     }
     let start = Instant::now();
     for _ in 0..repeats {
         let h = Tensor::from_vec(h_data.clone(), (batch, hidden), &device)?;
         let r = Tensor::from_vec(res_data.clone(), (batch, hidden), &device)?;
-        let _ = prelude_core::ops::cpu::cpu_fused_add_rmsnorm(&h, &r, &weight, 1e-6)?;
+        let _ = prelude_cpu::ops::cpu_fused_add_rmsnorm(&h, &r, &weight, 1e-6)?;
     }
     let us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 

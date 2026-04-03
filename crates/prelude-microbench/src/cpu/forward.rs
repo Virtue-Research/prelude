@@ -3,7 +3,7 @@
 //! Loads Qwen3-0.6B and runs forward passes, reporting prefill tok/s and decode tok/s.
 //! Optionally compares against llama.cpp via `llama-bench`.
 
-use candle_core::{DType, Device, Result, Tensor, D};
+use prelude_core::tensor::{DType, Device, Result, Tensor, D};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -278,13 +278,15 @@ pub fn bench_forward(
     // ── Run our forward pass ──
     println!("\n  Prelude forward:");
 
+    let ops = prelude_cpu::cpu_ops();
+
     for &prompt_len in &prompt_lens {
         let tokens: Vec<i64> = (0..prompt_len).map(|i| (i as i64 % 1000) + 100).collect();
 
         // Warmup
         model.clear_kv_cache();
         let input = Tensor::from_vec(tokens.clone(), (prompt_len,), &device)?;
-        let _ = model.forward_with_cache(&input, 0)?;
+        let _ = model.forward_with_cache(ops, &input, 0)?;
 
         // Prefill benchmark
         let mut prefill_ms = 0.0;
@@ -292,7 +294,7 @@ pub fn bench_forward(
             model.clear_kv_cache();
             let input = Tensor::from_vec(tokens.clone(), (prompt_len,), &device)?;
             let t0 = Instant::now();
-            let _ = model.forward_with_cache(&input, 0)?;
+            let _ = model.forward_with_cache(ops, &input, 0)?;
             prefill_ms += t0.elapsed().as_secs_f64() * 1000.0;
         }
         prefill_ms /= repeats as f64;
@@ -301,7 +303,7 @@ pub fn bench_forward(
         // Decode benchmark
         model.clear_kv_cache();
         let input = Tensor::from_vec(tokens.clone(), (prompt_len,), &device)?;
-        let logits = model.forward_with_cache(&input, 0)?;
+        let logits = model.forward_with_cache(ops, &input, 0)?;
         // Take last token's logits: [seq_len, vocab] -> [vocab]
         let last_logits = logits.get(logits.dim(0)? - 1)?;
         let mut next_token = last_logits.argmax(D::Minus1)?.to_vec0::<u32>()?;
@@ -311,7 +313,7 @@ pub fn bench_forward(
         for step in 0..decode_steps {
             let next_input = Tensor::from_vec(vec![next_token as i64], (1,), &device)?;
             let t0 = Instant::now();
-            let logits = model.forward_with_cache(&next_input, offset_start + step)?;
+            let logits = model.forward_with_cache(ops, &next_input, offset_start + step)?;
             decode_ms += t0.elapsed().as_secs_f64() * 1000.0;
             // logits is [1, vocab] for single token — get [vocab] then argmax
             let last = logits.get(logits.dim(0)? - 1)?;

@@ -2742,6 +2742,7 @@ dependencies = [
  "half",
  "nix",
  "prelude-core",
+ "prelude-cpu",
  "rayon",
  "serde",
  "serde_json",

@@ -1,4 +1,4 @@
-use candle_core::{Device, Result, Tensor};
+use prelude_core::tensor::{Device, Result, Tensor};
 use half::bf16;
 use std::time::Instant;
 
@@ -62,13 +62,13 @@ fn bench(
     for _ in 0..warmup {
         let q = Tensor::from_vec(q_data.clone(), (batch, seq_len, num_heads, head_dim), &device)?;
         let k = Tensor::from_vec(k_data.clone(), (batch, seq_len, num_kv_heads, head_dim), &device)?;
-        let _ = prelude_core::ops::cpu::cpu_rotary_embedding(&q, &k, &cos_sin_cache, offset, num_heads, num_kv_heads)?;
+        let _ = prelude_cpu::ops::cpu_rotary_embedding(&q, &k, &cos_sin_cache, offset, num_heads, num_kv_heads)?;
     }
     let start = Instant::now();
     for _ in 0..repeats {
         let q = Tensor::from_vec(q_data.clone(), (batch, seq_len, num_heads, head_dim), &device)?;
         let k = Tensor::from_vec(k_data.clone(), (batch, seq_len, num_kv_heads, head_dim), &device)?;
-        let _ = prelude_core::ops::cpu::cpu_rotary_embedding(&q, &k, &cos_sin_cache, offset, num_heads, num_kv_heads)?;
+        let _ = prelude_cpu::ops::cpu_rotary_embedding(&q, &k, &cos_sin_cache, offset, num_heads, num_kv_heads)?;
     }
     let cpu_ops_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 

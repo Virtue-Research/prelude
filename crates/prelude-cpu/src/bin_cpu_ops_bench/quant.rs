@@ -57,7 +57,7 @@ fn check_dot_error(
     assert_eq!(k % 256, 0);
 
     let a_t = Tensor::from_vec(a.to_vec(), (k,), &Device::Cpu)?;
-    let qt_a = QTensor::quantize_onto(&a_t, dtype, &Device::Cpu)?;
+    let qt_a = QTensor::quantize_onto(a_t.inner(), dtype, &Device::Cpu)?;
     let raw = qt_a.data()?;
     let b_q8k = quantize_row_q8k(b);
 
@@ -111,7 +111,7 @@ pub fn verify_dot_precision() -> Result<()> {
     // Q4_0 dot product
     {
         let a_t = Tensor::from_vec(a.clone(), (GGML_TEST_SIZE,), &Device::Cpu)?;
-        let qt_a = QTensor::quantize_onto(&a_t, GgmlDType::Q4_0, &Device::Cpu)?;
+        let qt_a = QTensor::quantize_onto(a_t.inner(), GgmlDType::Q4_0, &Device::Cpu)?;
         let a_blocks: Vec<BlockQ4_0> = bytemuck::cast_slice(&qt_a.data()?).to_vec();
         let b_q8 = quantize_row_q8_0(&b);
 
@@ -148,7 +148,7 @@ pub fn verify_dot_precision() -> Result<()> {
 
     {
         let a_t = Tensor::from_vec(a2.clone(), (GGML_TEST_SIZE,), &Device::Cpu)?;
-        let qt_a = QTensor::quantize_onto(&a_t, GgmlDType::Q4_0, &Device::Cpu)?;
+        let qt_a = QTensor::quantize_onto(a_t.inner(), GgmlDType::Q4_0, &Device::Cpu)?;
         let a_blocks: Vec<BlockQ4_0> = bytemuck::cast_slice(&qt_a.data()?).to_vec();
         let b_q8 = quantize_row_q8_0(&b2);
         let quant_dot = vec_dot_q4_0_q8_0(&a_blocks, &b_q8);
@@ -183,7 +183,7 @@ pub fn bench_dot(k: usize, warmup: usize, repeats: usize) -> Result<()> {
     // Q4_0
     let q4_0_us = {
         let a_t = Tensor::from_vec(a_data.clone(), (k,), &Device::Cpu)?;
-        let qt = QTensor::quantize_onto(&a_t, GgmlDType::Q4_0, &Device::Cpu)?;
+        let qt = QTensor::quantize_onto(a_t.inner(), GgmlDType::Q4_0, &Device::Cpu)?;
         let w_blocks: Vec<BlockQ4_0> = bytemuck::cast_slice(&qt.data()?).to_vec();
         let x_q8 = quantize_row_q8_0(&b_data);
 
@@ -213,7 +213,7 @@ pub fn bench_dot(k: usize, warmup: usize, repeats: usize) -> Result<()> {
             continue;
         }
         let a_t = Tensor::from_vec(a_data.clone(), (k,), &Device::Cpu)?;
-        let qt = QTensor::quantize_onto(&a_t, dtype, &Device::Cpu)?;
+        let qt = QTensor::quantize_onto(a_t.inner(), dtype, &Device::Cpu)?;
         let raw = qt.data()?;
 
         let us = match dtype {
@@ -287,7 +287,7 @@ pub fn bench_matmul(m: usize, k: usize, n: usize, warmup: usize, repeats: usize)
     // Q4_0
     let q4_0_us = {
         let w_tensor = Tensor::from_vec(w_data.clone(), (n, k), &Device::Cpu)?;
-        let qt = QTensor::quantize_onto(&w_tensor, GgmlDType::Q4_0, &Device::Cpu)?;
+        let qt = QTensor::quantize_onto(w_tensor.inner(), GgmlDType::Q4_0, &Device::Cpu)?;
         let blocks: Vec<BlockQ4_0> = bytemuck::cast_slice(&qt.data()?).to_vec();
         let mut out = vec![0.0f32; m * n];
         for _ in 0..warmup {
@@ -347,7 +347,7 @@ fn bench_matmul_kquant<B: bytemuck::Pod>(
     for j in 0..n {
         let row = &w_data[j * k..(j + 1) * k];
         let t = Tensor::from_vec(row.to_vec(), (k,), &Device::Cpu)?;
-        let qt = QTensor::quantize_onto(&t, dtype, &Device::Cpu)?;
+        let qt = QTensor::quantize_onto(t.inner(), dtype, &Device::Cpu)?;
         let blocks: Vec<B> = bytemuck::cast_slice(&qt.data()?).to_vec();
         w_blocks.extend(blocks);
     }

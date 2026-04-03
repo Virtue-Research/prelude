@@ -4,9 +4,9 @@ static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
 // Quick correctness and performance test for fused CUDA kernels.
 // Usage: cargo run --bin fused_ops_test -p prelude-cuda --release
 
-use candle_core::{DType, Device, Module, Tensor};
+use prelude_core::tensor::{DType, Device, Module, Result, Tensor};
 
-fn main() -> candle_core::Result<()> {
+fn main() -> Result<()> {
     let dev = Device::new_cuda(0)?;
     let ops = prelude_cuda::create_cuda_ops();
     let n = 1024 * 3072; // typical intermediate_size * seq
@@ -18,11 +18,11 @@ fn main() -> candle_core::Result<()> {
     );
 
     // ── Test fused_silu_mul ─────────────────────────────────────
-    let gate = Tensor::randn(0f32, 1.0, n, &dev)?.to_dtype(DType::BF16)?;
-    let up = Tensor::randn(0f32, 1.0, n, &dev)?.to_dtype(DType::BF16)?;
+    let gate = Tensor::randn(0f64, 1.0, n, &dev)?.to_dtype(DType::BF16)?;
+    let up = Tensor::randn(0f64, 1.0, n, &dev)?.to_dtype(DType::BF16)?;
 
     // Reference: silu(gate) * up
-    let silu_gate = prelude_core::nn_ops::Activation::Silu.forward(&gate)?;
+    let silu_gate = gate.apply(&prelude_core::nn_ops::Activation::Silu)?;
     let ref_result = (&silu_gate * &up)?;
 
     // Fused
@@ -30,15 +30,15 @@ fn main() -> candle_core::Result<()> {
         .expect("CudaOps must support fused_silu_mul")?;
 
     // Compare
-    let ref_f32 = ref_result.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-    let fused_f32 = fused_result.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    let ref_f32: Vec<f32> = ref_result.to_dtype(DType::F32)?.to_vec1()?;
+    let fused_f32: Vec<f32> = fused_result.to_dtype(DType::F32)?.to_vec1()?;
 
-    let max_diff = ref_f32
+    let max_diff: f32 = ref_f32
         .iter()
         .zip(fused_f32.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    let mean_abs = ref_f32.iter().map(|x| x.abs()).sum::<f32>() / ref_f32.len() as f32;
+    let mean_abs: f32 = ref_f32.iter().map(|x: &f32| x.abs()).sum::<f32>() / ref_f32.len() as f32;
     println!(
         "fused_silu_mul: max_diff={:.6}, mean_abs={:.4}, relative={:.6}",
         max_diff,
@@ -47,22 +47,22 @@ fn main() -> candle_core::Result<()> {
     );
 
     // ── Test vectorized_add ─────────────────────────────────────
-    let a = Tensor::randn(0f32, 1.0, n, &dev)?.to_dtype(DType::BF16)?;
-    let b = Tensor::randn(0f32, 1.0, n, &dev)?.to_dtype(DType::BF16)?;
+    let a = Tensor::randn(0f64, 1.0, n, &dev)?.to_dtype(DType::BF16)?;
+    let b = Tensor::randn(0f64, 1.0, n, &dev)?.to_dtype(DType::BF16)?;
 
     let ref_add = (&a + &b)?;
     let fused_add = ops.fused.fused_add(&a, &b)
         .expect("CudaOps must support fused_add")?;
 
-    let ref_f32 = ref_add.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-    let fused_f32 = fused_add.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    let ref_f32: Vec<f32> = ref_add.to_dtype(DType::F32)?.to_vec1()?;
+    let fused_f32: Vec<f32> = fused_add.to_dtype(DType::F32)?.to_vec1()?;
 
-    let max_diff = ref_f32
+    let max_diff: f32 = ref_f32
         .iter()
         .zip(fused_f32.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    let mean_abs = ref_f32.iter().map(|x| x.abs()).sum::<f32>() / ref_f32.len() as f32;
+    let mean_abs: f32 = ref_f32.iter().map(|x: &f32| x.abs()).sum::<f32>() / ref_f32.len() as f32;
     println!(
         "vectorized_add: max_diff={:.6}, mean_abs={:.4}, relative={:.6}",
         max_diff,
@@ -91,7 +91,7 @@ fn main() -> candle_core::Result<()> {
     // Reference silu*mul perf
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
-        let s = prelude_core::nn_ops::Activation::Silu.forward(&gate)?;
+        let s = gate.apply(&prelude_core::nn_ops::Activation::Silu)?;
         let _ = (&s * &up)?;
     }
     dev.synchronize()?;

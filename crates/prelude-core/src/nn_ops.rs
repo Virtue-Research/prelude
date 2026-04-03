@@ -313,13 +313,16 @@ pub mod ops {
 
     /// Mish: `x * tanh(softplus(x))` = `x * tanh(ln(1 + exp(x)))`.
     pub fn mish(xs: &Tensor) -> Result<Tensor> {
-        xs * (1.0 + xs.exp()?)?.log()?.tanh()
+        let softplus = (xs.exp()? + 1.0)?.log()?;
+        xs * softplus.tanh()?
     }
 
     /// Leaky ReLU.
     pub fn leaky_relu(xs: &Tensor, negative_slope: f64) -> Result<Tensor> {
         let zeros = xs.zeros_like()?;
-        xs.maximum(&zeros)? + xs.minimum(&zeros)? * negative_slope
+        let pos = xs.maximum(&zeros)?;
+        let neg = (xs.minimum(&zeros)? * negative_slope)?;
+        pos + neg
     }
 
     /// SwiGLU: split last dim in half, silu(first) * second.
@@ -342,15 +345,12 @@ pub mod rotary_emb {
         let last_dim = xs.dim(D::Minus1)?;
         let xs1 = xs.narrow(D::Minus1, 0, last_dim / 2)?;
         let xs2 = xs.narrow(D::Minus1, last_dim / 2, last_dim - last_dim / 2)?;
-        Tensor::cat(&[&xs2.neg()?, &xs1], D::Minus1)
+        let neg_xs2 = xs2.neg()?;
+        Tensor::cat(&[&neg_xs2, &xs1], D::Minus1)
     }
 
     /// Standard RoPE for tensors shaped `(B, H, T, D)` with cos/sin shaped
     /// `(T, D/2)` or `(B, T, D/2)`.
-    ///
-    /// This is the "slow" (but portable) path.  The candle-nn version uses a
-    /// custom op with hand-written CUDA/CPU kernels for speed; we fall back to
-    /// the mathematical definition which candle-core can still dispatch.
     pub fn rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         let (_b_sz, _h, seq_len, _n_embd) = x.dims4()?;
         let cos = Tensor::cat(&[cos, cos], D::Minus1)?;
@@ -359,22 +359,21 @@ pub mod rotary_emb {
         let sin = sin.narrow(0, 0, seq_len)?;
         let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
         let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
-        x.broadcast_mul(&cos)? + rotate_half(x)?.broadcast_mul(&sin)?
+        let rot = rotate_half(x)?;
+        x.broadcast_mul(&cos)?.broadcast_add(&rot.broadcast_mul(&sin)?)
     }
 
     /// T-H-D contiguous variant of RoPE for tensors shaped `(B, T, H, D)`.
-    ///
-    /// cos/sin are `(T, D/2)` or `(B, T, D/2)`.
     pub fn rope_thd(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         let (_b_sz, seq_len, _n_head, _n_embd) = x.dims4()?;
         let cos = Tensor::cat(&[cos, cos], D::Minus1)?;
         let sin = Tensor::cat(&[sin, sin], D::Minus1)?;
         let cos = cos.narrow(0, 0, seq_len)?;
         let sin = sin.narrow(0, 0, seq_len)?;
-        // cos/sin: (T, D) → (1, T, 1, D)
         let cos = cos.unsqueeze(0)?.unsqueeze(2)?;
         let sin = sin.unsqueeze(0)?.unsqueeze(2)?;
-        x.broadcast_mul(&cos)? + rotate_half(x)?.broadcast_mul(&sin)?
+        let rot = rotate_half(x)?;
+        x.broadcast_mul(&cos)?.broadcast_add(&rot.broadcast_mul(&sin)?)
     }
 }
 

@@ -76,14 +76,14 @@ fn bench_extend(
     let mut out = vec![0u16; total_tokens * num_heads * head_dim];
 
     for _ in 0..warmup {
-        prelude_core::ops::cpu::attention::prefill_attention_bf16(
+        prelude_cpu::ops::attention::prefill_attention_bf16(
             &mut out, &q_u16, &k_u16, &v_u16, &seq_lens,
             num_heads, num_kv_heads, head_dim, sm_scale as f32,
         );
     }
     let start = Instant::now();
     for _ in 0..repeats {
-        prelude_core::ops::cpu::attention::prefill_attention_bf16(
+        prelude_cpu::ops::attention::prefill_attention_bf16(
             &mut out, &q_u16, &k_u16, &v_u16, &seq_lens,
             num_heads, num_kv_heads, head_dim, sm_scale as f32,
         );
@@ -137,7 +137,7 @@ fn bench_decode(
     let mut output = vec![0u16; num_seqs * num_heads * head_dim];
 
     for _ in 0..warmup {
-        prelude_core::ops::cpu::attention::decode_attention_bf16(
+        prelude_cpu::ops::attention::decode_attention_bf16(
             &mut output, &q_data, &k_cache, &v_cache,
             &req_to_token, &seq_lens, num_seqs, max_context_len,
             num_heads, num_kv_heads, head_dim, sm_scale,
@@ -145,7 +145,7 @@ fn bench_decode(
     }
     let start = Instant::now();
     for _ in 0..repeats {
-        prelude_core::ops::cpu::attention::decode_attention_bf16(
+        prelude_cpu::ops::attention::decode_attention_bf16(
             &mut output, &q_data, &k_cache, &v_cache,
             &req_to_token, &seq_lens, num_seqs, max_context_len,
             num_heads, num_kv_heads, head_dim, sm_scale,

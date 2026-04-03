@@ -48,10 +48,10 @@ fn main() -> candle_core::Result<()> {
     let cli = Cli::parse();
 
     // Initialize NUMA-pinned rayon pool
-    let numa_report = prelude_core::ops::cpu::numa::init_numa_rayon_pool();
+    let numa_report = prelude_cpu::ops::numa::init_numa_rayon_pool();
 
     // Initialize oneDNN
-    prelude_core::ops::onednn::init();
+    prelude_cpu::onednn::init();
 
     // Detect hardware
     let hw = hardware::HardwareInfo::detect();

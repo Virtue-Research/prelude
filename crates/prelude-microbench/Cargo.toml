@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 prelude-core = { path = "../prelude-core" }
+prelude-cpu = { path = "../prelude-cpu" }
 candle-core.workspace = true
 half = { version = "2.7.1", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["extern_crate_alloc", "derive"] }

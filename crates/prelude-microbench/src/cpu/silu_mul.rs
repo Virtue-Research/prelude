@@ -1,4 +1,4 @@
-use candle_core::{Device, Result, Tensor};
+use prelude_core::tensor::{Device, Result, Tensor};
 use half::bf16;
 use std::time::Instant;
 
@@ -27,11 +27,11 @@ fn bench(report: &mut BenchReport, dim: usize, batch: usize, warmup: usize, repe
     let input = Tensor::from_vec(input_data, (batch, 2 * dim), &device)?;
 
     for _ in 0..warmup {
-        let _ = prelude_core::ops::cpu::cpu_silu_and_mul(&input)?;
+        let _ = prelude_cpu::ops::cpu_silu_and_mul(&input)?;
     }
     let start = Instant::now();
     for _ in 0..repeats {
-        let _ = prelude_core::ops::cpu::cpu_silu_and_mul(&input)?;
+        let _ = prelude_cpu::ops::cpu_silu_and_mul(&input)?;
     }
     let us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 

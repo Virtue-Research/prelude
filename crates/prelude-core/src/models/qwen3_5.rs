@@ -287,14 +287,9 @@ pub(super) fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result
     let half = x.dim(D::Minus1)? / 2;
     let x1 = x.narrow(D::Minus1, 0, half)?;
     let x2 = x.narrow(D::Minus1, half, half)?;
-    let rotated = Tensor::cat(
-        &[
-            (x1.broadcast_mul(cos)? - x2.broadcast_mul(sin)?)?,
-            (x2.broadcast_mul(cos)? + x1.broadcast_mul(sin)?)?,
-        ],
-        D::Minus1,
-    )?;
-    Ok(rotated)
+    let part1 = (x1.broadcast_mul(cos)? - x2.broadcast_mul(sin)?)?;
+    let part2 = (x2.broadcast_mul(cos)? + x1.broadcast_mul(sin)?)?;
+    Tensor::cat(&[&part1, &part2], D::Minus1)
 }
 
 // ── RMSNormGated ────────────────────────────────────────────────────────
@@ -1155,7 +1150,7 @@ impl Qwen3_5SparseMoeBlock {
                 let expert_out = self
                     .expert_forward(expert_idx, &x_t)?
                     .to_dtype(DType::F32)?;
-                acc = (acc + expert_out * weight as f64)?;
+                acc = (acc + (expert_out * weight as f64)?)?;
             }
             let acc = acc.to_dtype(xs.dtype())?;
             routed_out = routed_out.slice_assign(&[t..t + 1, 0..hidden_dim], &acc)?;
@@ -1836,7 +1831,7 @@ pub mod gguf {
             device: &Device,
         ) -> Result<Tensor> {
             let qtensor = ct.tensor(reader, name, device)?;
-            qtensor.dequantize(device)
+            qtensor.dequantize(device).map(Tensor::from_candle)
         }
     
         pub fn from_gguf<R: Read + Seek>(

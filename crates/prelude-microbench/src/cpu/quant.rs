@@ -11,7 +11,7 @@ use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{Device, Result, Tensor};
 use std::time::Instant;
 
-use prelude_core::ops::cpu::quant::*;
+use prelude_cpu::ops::quant::*;
 
 use crate::report::{self, BenchEntry, BenchReport};
 
@@ -321,7 +321,7 @@ pub fn bench_matmul(report: &mut BenchReport, warmup: usize, repeats: usize) -> 
             let ours = {
                 let mut out = vec![0.0f32; m * n];
                 bench_fn(warmup, repeats, || {
-                    prelude_core::ops::cpu::quant::q4_k::quantized_matmul_q4k(
+                    prelude_cpu::ops::quant::q4_k::quantized_matmul_q4k(
                         &x_data, &w_blocks, &mut out, m, n, k,
                     );
                 })

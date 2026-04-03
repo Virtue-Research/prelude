@@ -385,7 +385,7 @@ impl SimpleBackend for crate::tensor::safetensors::MmapedSafetensors {
         dtype: DType,
         dev: &Device,
     ) -> Result<Tensor> {
-        let tensor = self.load(name, dev)?.to_dtype(dtype)?;
+        let tensor = Tensor::from_candle(self.load(name, dev)?.to_dtype(dtype)?);
         if tensor.shape() != &s {
             Err(crate::tensor::Error::UnexpectedShape {
                 msg: format!("shape mismatch for {name}"),
@@ -398,7 +398,7 @@ impl SimpleBackend for crate::tensor::safetensors::MmapedSafetensors {
     }
 
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
-        self.load(name, dev)?.to_dtype(dtype)
+        Ok(Tensor::from_candle(self.load(name, dev)?.to_dtype(dtype)?))
     }
 
     fn contains_tensor(&self, name: &str) -> bool {
@@ -415,7 +415,7 @@ impl SimpleBackend for crate::tensor::safetensors::BufferedSafetensors {
         dtype: DType,
         dev: &Device,
     ) -> Result<Tensor> {
-        let tensor = self.load(name, dev)?.to_dtype(dtype)?;
+        let tensor = Tensor::from_candle(self.load(name, dev)?.to_dtype(dtype)?);
         if tensor.shape() != &s {
             Err(crate::tensor::Error::UnexpectedShape {
                 msg: format!("shape mismatch for {name}"),
@@ -428,7 +428,7 @@ impl SimpleBackend for crate::tensor::safetensors::BufferedSafetensors {
     }
 
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
-        self.load(name, dev)?.to_dtype(dtype)
+        Ok(Tensor::from_candle(self.load(name, dev)?.to_dtype(dtype)?))
     }
 
     fn contains_tensor(&self, name: &str) -> bool {

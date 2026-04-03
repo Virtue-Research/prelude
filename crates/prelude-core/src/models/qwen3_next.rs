@@ -589,8 +589,9 @@ fn softplus(x: &Tensor) -> Result<Tensor> {
     let safe = x.clamp(f64::NEG_INFINITY, 20.0)?;
     let sp = (safe.exp()? + 1.0)?.log()?;
     // Where x >= 20, use x directly (sp would overflow); else use sp
-    let mask = x.ge(20.0)?.to_dtype(x.dtype())?;
-    (&mask * x)? + ((1.0 - &mask)? * &sp)?
+    let mask = x.ge(20.0f64)?.to_dtype(x.dtype())?;
+    let inv_mask = (mask.affine(-1.0, 1.0))?; // 1 - mask
+    mask.broadcast_mul(x)?.broadcast_add(&inv_mask.broadcast_mul(&sp)?)
 }
 
 // ── Gated Attention (Standard Softmax) ──────────────────────────────────

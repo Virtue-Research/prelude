@@ -5,7 +5,7 @@
 //! in `crate::attn::*`, exposing them through the Ops trait interface.
 
 use std::sync::Arc;
-use candle_core::{DType, Result, Tensor};
+use prelude_core::tensor::{bail, DType, Result, Tensor};
 use prelude_core::ops::traits::*;
 
 /// Return a static reference to the CUDA Ops bundle (created once on first call).
@@ -40,6 +40,24 @@ pub fn create_cuda_ops() -> Ops {
 
 pub struct CudaOps;
 
+/// Unwrap &Tensor to &candle_core::Tensor for internal CUDA functions.
+fn i(t: &Tensor) -> &candle_core::Tensor { t.inner() }
+
+/// Wrap a candle_core::Tensor result into our Tensor.
+fn w(r: candle_core::Result<candle_core::Tensor>) -> Result<Tensor> {
+    r.map(Tensor::from_candle)
+}
+
+/// Wrap a candle_core::Tensor pair result into our Tensor pair.
+fn w2(r: candle_core::Result<(candle_core::Tensor, candle_core::Tensor)>) -> Result<(Tensor, Tensor)> {
+    r.map(|(a, b)| (Tensor::from_candle(a), Tensor::from_candle(b)))
+}
+
+/// Wrap a 4-tuple result.
+fn w4(r: candle_core::Result<(candle_core::Tensor, candle_core::Tensor, candle_core::Tensor, candle_core::Tensor)>) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+    r.map(|(a, b, c, d)| (Tensor::from_candle(a), Tensor::from_candle(b), Tensor::from_candle(c), Tensor::from_candle(d)))
+}
+
 // ── GemmOps ─────────────────────────────────────────────────────────
 
 impl GemmOps for CudaOps {
@@ -54,7 +72,7 @@ impl GemmOps for CudaOps {
         _scale_a: Option<&Tensor>, _scale_b: Option<&Tensor>,
         _quant: QuantScheme,
     ) -> Result<Tensor> {
-        candle_core::bail!("quantized_matmul not yet implemented in CudaOps")
+        bail!("quantized_matmul not yet implemented in CudaOps")
     }
 
     fn grouped_gemm(
@@ -63,7 +81,7 @@ impl GemmOps for CudaOps {
         _sorted_token_ids: &Tensor, _sorted_expert_ids: &Tensor,
         _num_tokens_per_expert: &Tensor,
     ) -> Result<Tensor> {
-        candle_core::bail!("grouped_gemm not yet implemented in CudaOps")
+        bail!("grouped_gemm not yet implemented in CudaOps")
     }
 }
 
@@ -76,7 +94,7 @@ impl KvCacheOps for CudaOps {
         key_cache: &Tensor, value_cache: &Tensor,
         slot_mapping: &Tensor,
     ) -> Result<()> {
-        crate::ops::kv_cache::scatter_kv_cache_flash(key, value, key_cache, value_cache, slot_mapping)
+        crate::ops::kv_cache::scatter_kv_cache_flash(i(key), i(value), i(key_cache), i(value_cache), i(slot_mapping))
     }
 }
 
@@ -84,7 +102,7 @@ impl KvCacheOps for CudaOps {
 
 impl NormOps for CudaOps {
     fn rms_norm(&self, x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
-        crate::ops::rmsnorm::fast_rmsnorm(x, weight, eps as f64)
+        w(crate::ops::rmsnorm::fast_rmsnorm(i(x), i(weight), eps as f64))
     }
 
     fn layer_norm(
@@ -92,11 +110,10 @@ impl NormOps for CudaOps {
         x: &Tensor, weight: &Tensor, bias: Option<&Tensor>,
         eps: f32,
     ) -> Result<Tensor> {
-        // Manual layer norm (candle_nn is not a dep here)
         let x_f32 = x.to_dtype(DType::F32)?;
-        let mean = x_f32.mean_keepdim(candle_core::D::Minus1)?;
+        let mean = x_f32.mean_keepdim(prelude_core::tensor::D::Minus1)?;
         let centered = x_f32.broadcast_sub(&mean)?;
-        let var = centered.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+        let var = centered.sqr()?.mean_keepdim(prelude_core::tensor::D::Minus1)?;
         let normed = centered.broadcast_div(&(var + eps as f64)?.sqrt()?)?;
         let normed = normed.to_dtype(x.dtype())?;
         let result = normed.broadcast_mul(weight)?;
@@ -111,7 +128,7 @@ impl NormOps for CudaOps {
         _x: &Tensor, _weight: &Tensor, _bias: Option<&Tensor>,
         _num_groups: usize, _eps: f32,
     ) -> Result<Tensor> {
-        candle_core::bail!("group_norm not yet implemented on CUDA")
+        bail!("group_norm not yet implemented on CUDA")
     }
 }
 
@@ -119,9 +136,7 @@ impl NormOps for CudaOps {
 
 impl ActivationOps for CudaOps {
     fn silu(&self, x: &Tensor) -> Result<Tensor> {
-        // SiLU: x * sigmoid(x)
-        let sigmoid = (x.neg()?.exp()? + 1.0)?.recip()?;
-        x.mul(&sigmoid)
+        x.silu()
     }
 
     fn gelu(&self, x: &Tensor) -> Result<Tensor> {
@@ -133,11 +148,7 @@ impl ActivationOps for CudaOps {
     }
 
     fn softmax(&self, x: &Tensor, dim: usize) -> Result<Tensor> {
-        let max = x.max_keepdim(dim)?;
-        let shifted = x.broadcast_sub(&max)?;
-        let exp = shifted.exp()?;
-        let sum = exp.sum_keepdim(dim)?;
-        exp.broadcast_div(&sum)
+        x.softmax(dim)
     }
 }
 
@@ -171,7 +182,7 @@ impl ConvOps for CudaOps {
         stride: [usize; 2], padding: [usize; 2],
     ) -> Result<Tensor> {
         if stride[0] != stride[1] || padding[0] != padding[1] {
-            candle_core::bail!(
+            bail!(
                 "conv2d: asymmetric stride/padding not supported (stride={stride:?}, padding={padding:?})"
             );
         }
@@ -201,15 +212,15 @@ impl FusedOps for CudaOps {
     fn fused_add_rmsnorm(
         &self, residual: &Tensor, x: &Tensor, weight: &Tensor, eps: f32,
     ) -> Option<Result<(Tensor, Tensor)>> {
-        Some(crate::ops::rmsnorm::fused_add_rmsnorm(x, residual, weight, eps as f64))
+        Some(w2(crate::ops::rmsnorm::fused_add_rmsnorm(i(x), i(residual), i(weight), eps as f64)))
     }
 
     fn fused_silu_mul(&self, gate: &Tensor, up: &Tensor) -> Option<Result<Tensor>> {
-        Some(crate::ops::elementwise::fused_silu_mul(gate, up))
+        Some(w(crate::ops::elementwise::fused_silu_mul(i(gate), i(up))))
     }
 
     fn fused_add(&self, a: &Tensor, b: &Tensor) -> Option<Result<Tensor>> {
-        Some(crate::ops::elementwise::vectorized_add(a, b))
+        Some(w(crate::ops::elementwise::vectorized_add(i(a), i(b))))
     }
 
     fn fused_qknorm_rope(
@@ -221,15 +232,15 @@ impl FusedOps for CudaOps {
         eps: f32,
     ) -> Option<Result<(Tensor, Tensor)>> {
         let q_out = match crate::ops::rope::fused_qknorm_rope_varlen(
-            q, q_weight, cos, sin, position_ids, eps as f64,
+            i(q), i(q_weight), i(cos), i(sin), i(position_ids), eps as f64,
         ) {
-            Ok(t) => t,
+            Ok(t) => Tensor::from_candle(t),
             Err(e) => return Some(Err(e)),
         };
         let k_out = match crate::ops::rope::fused_qknorm_rope_varlen(
-            k, k_weight, cos, sin, position_ids, eps as f64,
+            i(k), i(k_weight), i(cos), i(sin), i(position_ids), eps as f64,
         ) {
-            Ok(t) => t,
+            Ok(t) => Tensor::from_candle(t),
             Err(e) => return Some(Err(e)),
         };
         Some(Ok((q_out, k_out)))
@@ -248,15 +259,14 @@ impl FusedOps for CudaOps {
         if !crate::ops::kv_cache::fused_kv_cache_write_enabled() {
             return None;
         }
-        // Extract dims from tensors
         let k_dims = k.dims();
         let kc_dims = key_cache.dims();
         let num_kv_heads = if k_dims.len() == 3 { k_dims[1] } else { return None };
         let head_dim = if k_dims.len() == 3 { k_dims[2] } else { return None };
         let block_size = if kc_dims.len() == 4 { kc_dims[1] } else { return None };
         Some(crate::ops::kv_cache::fused_knorm_rope_kv_cache_write_varlen(
-            k, v, k_weight, cos, sin, position_ids,
-            key_cache, value_cache, slot_mapping,
+            i(k), i(v), i(k_weight), i(cos), i(sin), i(position_ids),
+            i(key_cache), i(value_cache), i(slot_mapping),
             num_kv_heads, head_dim, block_size,
             eps as f64,
         ))
@@ -267,7 +277,7 @@ impl FusedOps for CudaOps {
         gate_logits: &Tensor,
         top_k: usize,
     ) -> Option<Result<(Tensor, Tensor, Tensor, Tensor)>> {
-        Some(crate::ops::moe::fused_moe_routing(gate_logits, top_k, true))
+        Some(w4(crate::ops::moe::fused_moe_routing(i(gate_logits), top_k, true)))
     }
 }
 
@@ -294,7 +304,7 @@ impl OpsSession for CudaSession {
     ) -> Result<()> {
         #[cfg(feature = "flashinfer")]
         crate::attn::flashinfer::precompute_paged_plan(
-            _block_tables, _cu_seqlens_k, _block_size,
+            i(_block_tables), i(_cu_seqlens_k), _block_size,
         )?;
         Ok(())
     }
@@ -302,7 +312,6 @@ impl OpsSession for CudaSession {
 
 // ── Attention backend selection ─────────────────────────────────────
 
-/// Select the best GPU attention backend based on compiled features.
 fn select_attention_backend() -> Arc<dyn AttentionOps + 'static> {
     #[cfg(feature = "flash-attn-v4")]
     {
@@ -322,32 +331,30 @@ fn select_attention_backend() -> Arc<dyn AttentionOps + 'static> {
 
 // ── Shared dispatch helper ──────────────────────────────────────────
 
-/// Dispatch varlen_attention based on MaskType for backends that have
-/// separate causal/windowed/bidirectional entry points.
 macro_rules! dispatch_varlen {
-    ($mod:path, $q:expr, $k:expr, $v:expr, $p:expr) => {
+    ($mod:path, $q:expr, $k:expr, $v:expr, $p:expr, dispatch) => {
         match &$p.mask {
             MaskType::Causal => {
-                $mod::varlen_causal(
-                    $q, $k, $v, $p.cu_seqlens_q, $p.cu_seqlens_k,
+                w($mod::varlen_causal(
+                    i($q), i($k), i($v), i($p.cu_seqlens_q), i($p.cu_seqlens_k),
                     $p.max_seqlen_q, $p.max_seqlen_k, $p.scale,
-                )
+                ))
             }
             MaskType::Bidirectional => {
-                $mod::varlen_bidirectional(
-                    $q, $k, $v, $p.cu_seqlens_q, $p.cu_seqlens_k,
+                w($mod::varlen_bidirectional(
+                    i($q), i($k), i($v), i($p.cu_seqlens_q), i($p.cu_seqlens_k),
                     $p.max_seqlen_q, $p.max_seqlen_k, $p.scale,
-                )
+                ))
             }
             MaskType::SlidingWindow { left, right } => {
-                $mod::varlen_windowed(
-                    $q, $k, $v, $p.cu_seqlens_q, $p.cu_seqlens_k,
+                w($mod::varlen_windowed(
+                    i($q), i($k), i($v), i($p.cu_seqlens_q), i($p.cu_seqlens_k),
                     $p.max_seqlen_q, $p.max_seqlen_k, $p.scale,
                     Some(*left), Some(*right),
-                )
+                ))
             }
             MaskType::Custom(_) => {
-                candle_core::bail!("custom mask not yet supported by {}", stringify!($mod))
+                bail!("custom mask not yet supported by {}", stringify!($mod))
             }
         }
     };
@@ -363,16 +370,16 @@ impl AttentionOps for FlashAttnV4Ops {
     fn name(&self) -> &str { "flash-attn-v4" }
 
     fn varlen_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, params: &VarlenParams) -> Result<Tensor> {
-        dispatch_varlen!(crate::attn::flash_v4, q, k, v, params)
+        dispatch_varlen!(crate::attn::flash_v4, q, k, v, params, dispatch)
     }
 
     fn paged_attention(&self, q: &Tensor, key_cache: &Tensor, value_cache: &Tensor, params: &PagedParams) -> Result<Tensor> {
         let seqused_k = cu_seqlens_to_lens(params.cu_seqlens_k)?;
-        crate::attn::flash_v4::varlen_paged(
-            q, key_cache, value_cache, params.block_tables,
-            params.cu_seqlens_q, &seqused_k, params.max_seqlen_q, params.max_seqlen_k,
+        w(crate::attn::flash_v4::varlen_paged(
+            i(q), i(key_cache), i(value_cache), i(params.block_tables),
+            i(params.cu_seqlens_q), seqused_k.inner(), params.max_seqlen_q, params.max_seqlen_k,
             params.scale,
-        )
+        ))
     }
 }
 
@@ -386,15 +393,21 @@ impl AttentionOps for FlashInferOps {
     fn name(&self) -> &str { "flashinfer" }
 
     fn varlen_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, params: &VarlenParams) -> Result<Tensor> {
-        dispatch_varlen!(crate::attn::flashinfer, q, k, v, params)
+        dispatch_varlen!(crate::attn::flashinfer, q, k, v, params, dispatch)
     }
 
     fn paged_attention(&self, q: &Tensor, key_cache: &Tensor, value_cache: &Tensor, params: &PagedParams) -> Result<Tensor> {
-        crate::attn::flashinfer::varlen_paged(
-            q, key_cache, value_cache, params.block_tables,
-            params.cu_seqlens_q, params.cu_seqlens_k, params.max_seqlen_q, params.max_seqlen_k,
+        w(crate::attn::flashinfer::varlen_paged(
+            i(q), i(key_cache), i(value_cache), i(params.block_tables),
+            i(params.cu_seqlens_q), i(params.cu_seqlens_k), params.max_seqlen_q, params.max_seqlen_k,
             params.scale,
-        )
+        ))
     }
 }
 
+/// Convert cu_seqlens → per-sequence lengths (for FA4 paged API).
+fn cu_seqlens_to_lens(cu_seqlens: &Tensor) -> Result<Tensor> {
+    let v: Vec<u32> = cu_seqlens.to_vec1()?;
+    let lens: Vec<u32> = v.windows(2).map(|w| w[1] - w[0]).collect();
+    Tensor::from_vec(lens, (v.len() - 1,), cu_seqlens.device())
+}

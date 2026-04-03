@@ -66,28 +66,30 @@ fn bench(report: &mut BenchReport, m: usize, k: usize, n: usize, warmup: usize, 
         };
         let mut out_buf = vec![0u16; m * n];
         for _ in 0..warmup {
-            prelude_core::ops::cpu::gemm::bf16_gemm_small_m(&mut out_buf, in_u16, w_u16, m, k, n);
+            prelude_cpu::ops::gemm::bf16_gemm_small_m(&mut out_buf, in_u16, w_u16, m, k, n);
         }
         let start = Instant::now();
         for _ in 0..repeats {
-            prelude_core::ops::cpu::gemm::bf16_gemm_small_m(&mut out_buf, in_u16, w_u16, m, k, n);
+            prelude_cpu::ops::gemm::bf16_gemm_small_m(&mut out_buf, in_u16, w_u16, m, k, n);
         }
         start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0
     };
 
     // brgemm BF16 GEMM (oneDNN micro-kernel)
     let brgemm_us = {
-        use prelude_core::ops::onednn::{brgemm_available, BrgemmPackedWeight};
+        use prelude_cpu::onednn::{brgemm_available, BrgemmPackedWeight};
         if brgemm_available() {
-            match BrgemmPackedWeight::pack(&weight)? {
+            let weight_p: prelude_core::tensor::Tensor = weight.clone().into();
+            let input_p: prelude_core::tensor::Tensor = input.clone().into();
+            match BrgemmPackedWeight::pack(&weight_p)? {
                 Some(brg_packed) => {
                     let brg = std::sync::Arc::new(brg_packed);
                     for _ in 0..warmup {
-                        let _ = prelude_core::ops::onednn::brgemm_gemm_forward_pub(&input, &brg, m, k, n)?;
+                        let _ = prelude_cpu::onednn::brgemm_gemm_forward_pub(&input_p, &brg, m, k, n)?;
                     }
                     let start = Instant::now();
                     for _ in 0..repeats {
-                        let _ = prelude_core::ops::onednn::brgemm_gemm_forward_pub(&input, &brg, m, k, n)?;
+                        let _ = prelude_cpu::onednn::brgemm_gemm_forward_pub(&input_p, &brg, m, k, n)?;
                     }
                     Some(start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0)
                 }
