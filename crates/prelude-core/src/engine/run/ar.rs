@@ -458,3 +458,155 @@ fn seq_finish_reason(reason: &FinishReason) -> SeqFinishReason {
         FinishReason::Cancelled => SeqFinishReason::Abort("cancelled".into()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::executor::ExecutionHandle;
+    use crate::tensor::Device;
+
+    fn make_prepared(request_id: &str, max_new: usize) -> PreparedGenerateRequest {
+        use crate::nn_ops::generation::{LogitsProcessor, Sampling};
+        PreparedGenerateRequest {
+            request_idx: 0,
+            request: crate::types::GenerateRequest {
+                request_id: request_id.to_string(),
+                model: String::new(),
+                input: crate::types::PromptInput::Text(String::new()),
+                sampling: SamplingParams::default(),
+                max_new_tokens: max_new as u32,
+                stop: Default::default(),
+                seed: None,
+                deadline_ms: None,
+                logprobs: None,
+                prompt_logprobs: None,
+            },
+            prompt_tokens: vec![1, 2, 3],
+            max_new,
+            is_greedy: true,
+            logits_processor: LogitsProcessor::from_sampling(42, Sampling::ArgMax),
+        }
+    }
+
+    // ── handle_message tests ───────────────────────────────────────
+
+    #[test]
+    fn handle_new_request_adds_to_scheduler() {
+        let mut scheduler = Scheduler::new(SchedulerConfig::default());
+        let mut states = HashMap::new();
+
+        let prepared = make_prepared("r1", 10);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        handle_message(
+            ArMessage::NewRequest {
+                prepared,
+                response: ResponseChannel::Complete(tx),
+            },
+            &mut scheduler,
+            &mut states,
+        );
+
+        assert_eq!(scheduler.num_waiting(), 1);
+        assert!(states.contains_key("r1"));
+    }
+
+    #[test]
+    fn handle_abort_removes_from_scheduler() {
+        let mut scheduler = Scheduler::new(SchedulerConfig::default());
+        let mut states = HashMap::new();
+
+        let prepared = make_prepared("r1", 10);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        handle_message(
+            ArMessage::NewRequest {
+                prepared,
+                response: ResponseChannel::Complete(tx),
+            },
+            &mut scheduler,
+            &mut states,
+        );
+        assert_eq!(scheduler.num_waiting(), 1);
+
+        handle_message(
+            ArMessage::Abort("r1".into()),
+            &mut scheduler,
+            &mut states,
+        );
+        assert!(states.is_empty());
+    }
+
+    // ── sample_batch tests ─────────────────────────────────────────
+
+    #[test]
+    fn sample_batch_greedy_argmax() {
+        let states: HashMap<String, ArSequenceState> = HashMap::new();
+        // Empty states → all_greedy = true (default)
+        // Logits: 2 rows, vocab=4. Row 0: max at idx 2, Row 1: max at idx 0
+        let logits = Tensor::from_vec(
+            vec![0.1f32, 0.2, 0.9, 0.1, 0.8, 0.1, 0.05, 0.05],
+            (2, 4),
+            &Device::Cpu,
+        ).unwrap();
+
+        // Need states entries for the IDs
+        let mut states_with_entries = HashMap::new();
+        states_with_entries.insert("a".to_string(), ArSequenceState {
+            request_id: "a".to_string(),
+            prepared: Some(make_prepared("a", 10)),
+            response: ResponseChannel::Complete(tokio::sync::oneshot::channel().0),
+            gen_start: Instant::now(), prefill_ms: 0.0, started_sent: false,
+            sent_text_len: 0, prompt_len: 3, next_decode_position: 3,
+            pending_token: None, output_tokens: vec![], token_logprobs: vec![],
+            prompt_token_logprobs: None, block_table: vec![], deltanet_slot: None,
+        });
+        states_with_entries.insert("b".to_string(), ArSequenceState {
+            request_id: "b".to_string(),
+            prepared: Some(make_prepared("b", 10)),
+            response: ResponseChannel::Complete(tokio::sync::oneshot::channel().0),
+            gen_start: Instant::now(), prefill_ms: 0.0, started_sent: false,
+            sent_text_len: 0, prompt_len: 3, next_decode_position: 3,
+            pending_token: None, output_tokens: vec![], token_logprobs: vec![],
+            prompt_token_logprobs: None, block_table: vec![], deltanet_slot: None,
+        });
+
+        let ids = vec!["a".to_string(), "b".to_string()];
+        let tokens = sample_batch(&states_with_entries, &ids, &logits).unwrap();
+
+        assert_eq!(tokens, vec![2, 0]); // argmax of each row
+    }
+
+    // ── fail_step tests ────────────────────────────────────────────
+
+    #[test]
+    fn fail_step_aborts_all_ids() {
+        let mut scheduler = Scheduler::new(SchedulerConfig::default());
+
+        // Add two requests
+        for id in &["r1", "r2"] {
+            let seq = Sequence::new(
+                id.to_string(), vec![1, 2, 3],
+                SamplingParams::default(), 10, vec![], vec![], None,
+            );
+            scheduler.add_request(seq);
+        }
+        assert_eq!(scheduler.num_waiting(), 2);
+
+        let step = SchedulerStep::prefill(vec!["r1".into(), "r2".into()]);
+
+        // We can't call fail_step without Engine, but we can test the scheduler abort part
+        for id in step.prefill_request_ids.iter().chain(step.decode_request_ids.iter()) {
+            let _ = scheduler.abort_request(id);
+        }
+        assert_eq!(scheduler.num_waiting(), 0);
+    }
+
+    // ── seq_finish_reason mapping ──────────────────────────────────
+
+    #[test]
+    fn finish_reason_mapping() {
+        assert!(matches!(seq_finish_reason(&FinishReason::Eos), SeqFinishReason::Eos));
+        assert!(matches!(seq_finish_reason(&FinishReason::Stop), SeqFinishReason::Stop));
+        assert!(matches!(seq_finish_reason(&FinishReason::Length), SeqFinishReason::Length));
+        assert!(matches!(seq_finish_reason(&FinishReason::Cancelled), SeqFinishReason::Abort(_)));
+    }
+}

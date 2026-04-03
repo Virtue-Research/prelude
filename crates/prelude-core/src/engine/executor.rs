@@ -61,6 +61,7 @@ impl ExecutionHandle {
 ///
 /// Contains the raw logits tensor. Sampling and postprocessing
 /// happen in the scheduling loop (core), not in the Executor.
+#[derive(Debug)]
 pub struct ModelOutput {
     /// Raw logits: `[batch_size, vocab_size]` (for decode)
     /// or `[total_tokens, vocab_size]` (for prefill).
@@ -116,4 +117,106 @@ pub fn register_executor(factory: ExecutorFactory) {
 /// registered one.
 pub fn create_executor() -> Option<Box<dyn Executor>> {
     EXECUTOR_FACTORY.get().map(|f| f())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scheduler::{SchedulerStep, ForwardMode};
+
+    /// Mock result stored in the handle.
+    struct MockResult(Tensor);
+
+    /// A test executor that returns a fixed logits tensor.
+    struct TestExecutor {
+        vocab_size: usize,
+    }
+
+    impl Executor for TestExecutor {
+        fn submit(
+            &self,
+            step: &SchedulerStep,
+        ) -> Result<ExecutionHandle, EngineError> {
+            let batch_size = step.prefill_request_ids.len() + step.decode_request_ids.len();
+            let logits = Tensor::zeros(
+                (batch_size, self.vocab_size),
+                crate::tensor::DType::F32,
+                &crate::tensor::Device::Cpu,
+            ).map_err(|e| EngineError::Internal(format!("{e}")))?;
+            Ok(ExecutionHandle::new(MockResult(logits)))
+        }
+
+        fn collect(
+            &self,
+            handle: ExecutionHandle,
+        ) -> Result<ModelOutput, EngineError> {
+            let result = handle.downcast::<MockResult>()
+                .ok_or_else(|| EngineError::Internal("wrong handle type".into()))?;
+            Ok(ModelOutput { logits: result.0 })
+        }
+    }
+
+    #[test]
+    fn submit_collect_roundtrip() {
+        let executor = TestExecutor { vocab_size: 100 };
+        let step = SchedulerStep::prefill(vec!["r1".into(), "r2".into()]);
+
+        let handle = executor.submit(&step).unwrap();
+        let output = executor.collect(handle).unwrap();
+
+        assert_eq!(output.logits.dims(), &[2, 100]);
+    }
+
+    #[test]
+    fn submit_decode_step() {
+        let executor = TestExecutor { vocab_size: 50 };
+        let step = SchedulerStep::decode(vec!["r1".into(), "r2".into(), "r3".into()]);
+
+        let handle = executor.submit(&step).unwrap();
+        let output = executor.collect(handle).unwrap();
+
+        assert_eq!(output.logits.dims(), &[3, 50]);
+    }
+
+    #[test]
+    fn submit_mixed_step() {
+        let executor = TestExecutor { vocab_size: 32 };
+        let step = SchedulerStep::mixed(
+            vec!["p1".into()],
+            vec!["d1".into(), "d2".into()],
+        );
+
+        let handle = executor.submit(&step).unwrap();
+        let output = executor.collect(handle).unwrap();
+
+        // 1 prefill + 2 decode = 3 total
+        assert_eq!(output.logits.dims(), &[3, 32]);
+    }
+
+    #[test]
+    fn collect_wrong_handle_type() {
+        let executor = TestExecutor { vocab_size: 10 };
+
+        // Create a handle with the wrong inner type
+        let bad_handle = ExecutionHandle::new(42u32);
+        let result = executor.collect(bad_handle);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("wrong handle type"));
+    }
+
+    #[test]
+    fn handle_downcast_success() {
+        let handle = ExecutionHandle::new(String::from("hello"));
+        let value = handle.downcast::<String>();
+        assert_eq!(value, Some(String::from("hello")));
+    }
+
+    #[test]
+    fn handle_downcast_wrong_type() {
+        let handle = ExecutionHandle::new(42u32);
+        let value = handle.downcast::<String>();
+        assert!(value.is_none());
+    }
 }

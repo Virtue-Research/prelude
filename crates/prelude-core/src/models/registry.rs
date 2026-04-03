@@ -193,3 +193,92 @@ fn normalize_identifier(input: &str) -> String {
         .flat_map(|ch| ch.to_lowercase())
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Registry lookup tests ──────────────────────────────────────
+
+    #[test]
+    fn find_gguf_arch_qwen3() {
+        let spec = find_arch_spec_by_gguf_arch("qwen3");
+        assert!(spec.is_some(), "qwen3 should be registered as a GGUF arch");
+        assert_eq!(spec.unwrap().name(), "qwen3");
+    }
+
+    #[test]
+    fn find_gguf_arch_qwen35() {
+        let spec = find_arch_spec_by_gguf_arch("qwen35");
+        assert!(spec.is_some(), "qwen35 should be registered as a GGUF arch");
+        assert_eq!(spec.unwrap().name(), "qwen3_5");
+    }
+
+    #[test]
+    fn find_gguf_arch_qwen35moe() {
+        let spec = find_arch_spec_by_gguf_arch("qwen35moe");
+        assert!(spec.is_some(), "qwen35moe should be registered as a GGUF arch");
+        assert_eq!(spec.unwrap().name(), "qwen3_5");
+    }
+
+    #[test]
+    fn find_gguf_arch_unknown() {
+        let spec = find_arch_spec_by_gguf_arch("unknown_arch_xyz");
+        assert!(spec.is_none(), "unknown arch should not match");
+    }
+
+    // ── Architecture alias tests ───────────────────────────────────
+
+    #[test]
+    fn find_arch_by_prefix_qwen3() {
+        let spec = find_arch_spec_by_architecture_prefix("Qwen3");
+        assert!(spec.is_some());
+        assert_eq!(spec.unwrap().name(), "qwen3");
+    }
+
+    #[test]
+    fn find_arch_by_model_type_qwen3() {
+        let spec = find_arch_spec_by_model_type("qwen3");
+        assert!(spec.is_some());
+        assert_eq!(spec.unwrap().name(), "qwen3");
+    }
+
+    #[test]
+    fn find_arch_by_model_type_unknown() {
+        let spec = find_arch_spec_by_model_type("nonexistent_model_type");
+        assert!(spec.is_none());
+    }
+
+    // ── Resolution tests ───────────────────────────────────────────
+
+    #[test]
+    fn resolve_qwen3_for_causal_lm() {
+        let result = resolve_architecture_name("Qwen3ForCausalLM");
+        assert!(result.is_some());
+        let (spec, task) = result.unwrap();
+        assert_eq!(spec.name(), "qwen3");
+        assert_eq!(task, TaskKind::Generate);
+    }
+
+    #[test]
+    fn resolve_qwen3_for_classification() {
+        let result = resolve_architecture_name("Qwen3ForSequenceClassification");
+        assert!(result.is_some());
+        let (spec, task) = result.unwrap();
+        assert_eq!(spec.name(), "qwen3");
+        assert_eq!(task, TaskKind::Classify);
+    }
+
+    // ── Normalize identifier tests ─────────────────────────────────
+
+    #[test]
+    fn normalize_strips_underscores() {
+        assert_eq!(normalize_identifier("Qwen3_5"), "qwen35");
+    }
+
+    #[test]
+    fn normalize_case_insensitive() {
+        assert_eq!(normalize_identifier("QWEN3"), "qwen3");
+        assert_eq!(normalize_identifier("qwen3"), "qwen3");
+    }
+}
