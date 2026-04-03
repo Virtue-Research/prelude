@@ -7,7 +7,7 @@ use crate::loading::var_builder::VarBuilder;
 use crate::nn_ops::{Activation, CandleLinear, Embedding, Qwen3Config};
 
 // Shared layer primitives (extracted from qwen3 into reusable modules)
-use crate::models::common::{
+use crate::modules::{
     fast_add, fast_rms_norm, fused_add_rmsnorm, last_token_select,
     BatchAttnContext, LayerAttnContext, GatedMlp, RotaryEmbedding, Linear, RmsNorm,
     TransformerBlock,
@@ -97,7 +97,7 @@ impl Qwen3MoeExpert {
     fn forward(&self, ops: &crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        crate::models::common::fast_silu_mul(ops, &gate, &up)?.apply(&self.down_proj)
+        crate::modules::fast_silu_mul(ops, &gate, &up)?.apply(&self.down_proj)
     }
 }
 
@@ -249,7 +249,7 @@ impl Qwen3SparseMoeBlock {
             is_prefill,
         )?;
 
-        let down_input = crate::models::common::fast_silu_mul(ops, &gate, &up)?;
+        let down_input = crate::modules::fast_silu_mul(ops, &gate, &up)?;
 
         let ys = crate::nn_ops::moe::moe_gemm(
             &down_input,

@@ -58,19 +58,22 @@ fn main() -> Result<()> {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
+    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap().parent().unwrap();
     let kernels_dir = manifest_dir.join("kernels");
+    // Stable venv location — survives `cargo clean -p`
+    let venv_dir = workspace_root.join("target/fa4-venv");
 
     // Phase 1: Ensure FA4 Python source is available
     let fa4_src = ensure_fa4_source(&out_dir)?;
 
     // Phase 2: Ensure kernel .o files exist (auto-creates Python venv if needed)
-    ensure_kernels(&kernels_dir, &manifest_dir, &fa4_src, &out_dir)?;
+    ensure_kernels(&kernels_dir, &manifest_dir, &fa4_src, &out_dir, &venv_dir)?;
 
     // Phase 3: Create static archive from kernel .o files + generate dispatch table
     let has_kernels = link_kernel_objects(&kernels_dir, &out_dir)?;
 
     // Phase 4: Compile vendored tvm_ffi + link cuda_dialect_runtime
-    compile_tvm_ffi_static(&manifest_dir, &out_dir)?;
+    compile_tvm_ffi_static(&manifest_dir, &out_dir, &venv_dir)?;
 
     // Phase 5: Generate Rust dispatch code
     generate_dispatch_code(&kernels_dir, &out_dir, has_kernels)?;
@@ -236,26 +239,26 @@ fn generate_dispatch_code(
 /// Kernel .o files reference TVM FFI symbols (TVMFFIEnvGetStream, etc.)
 /// that need to be resolved at link time.
 /// Also links vendored libcuda_dialect_runtime_static.a.
-fn compile_tvm_ffi_static(manifest_dir: &Path, out_dir: &Path) -> Result<()> {
-    let vendor_dir = manifest_dir.join("vendor");
-    let tvm_src = vendor_dir.join("tvm_ffi/src");
-    let tvm_include = vendor_dir.join("tvm_ffi/include");
-    let dlpack_include = vendor_dir.join("tvm_ffi/3rdparty/dlpack/include");
+fn compile_tvm_ffi_static(manifest_dir: &Path, out_dir: &Path, venv_dir: &Path) -> Result<()> {
+    // tvm-ffi lives in workspace third_party/
+    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap().parent().unwrap();
+    let tvm_ffi_dir = workspace_root.join("third_party/tvm-ffi");
+    let tvm_src = tvm_ffi_dir.join("src");
+    let tvm_include = tvm_ffi_dir.join("include");
+    let dlpack_include = tvm_ffi_dir.join("3rdparty/dlpack/include");
 
     if !tvm_src.exists() {
-        println!("cargo:warning=vendor/tvm_ffi/src not found, skipping tvm_ffi static build");
-        return Ok(());
+        anyhow::bail!(
+            "third_party/tvm-ffi not found. Run: git submodule update --init third_party/tvm-ffi"
+        );
     }
 
-    // Collect all .cc files (skip Windows-only backtrace_win.cc and testing)
+    // Collect all .cc files (skip Windows-only and testing)
     let cc_files: Vec<PathBuf> = walkdir(&tvm_src, "cc")
         .into_iter()
         .filter(|p| {
             let name = p.file_name().unwrap().to_str().unwrap_or("");
-            !name.contains("win")
-                && !name.contains("testing")
-                && name != "backtrace.cc"
-                && name != "backtrace_win.cc"
+            !name.contains("win") && !name.contains("testing")
         })
         .collect();
 
@@ -286,6 +289,9 @@ fn compile_tvm_ffi_static(manifest_dir: &Path, out_dir: &Path) -> Result<()> {
         build.file(&error_helper);
     }
 
+    // Compile libbacktrace (backtrace.cc references it)
+    compile_libbacktrace(&tvm_ffi_dir)?;
+
     // Use +whole-archive so kernel .o files can resolve TVM symbols at link time.
     build.link_lib_modifier("+whole-archive");
     build
@@ -294,16 +300,9 @@ fn compile_tvm_ffi_static(manifest_dir: &Path, out_dir: &Path) -> Result<()> {
 
     // Link libcuda_dialect_runtime_static.a with +whole-archive.
     // Kernel .o host code calls _cudaLibraryLoadData etc. from this library.
-    // Check vendor dir first, then the cutlass-dsl Python package in the build venv.
     let cuda_dialect_lib = "libcuda_dialect_runtime_static.a";
-    let vendor_path = vendor_dir.join("cuda_dialect").join(cuda_dialect_lib);
-    let cuda_dialect_dir = if vendor_path.exists() {
-        Some(vendor_dir.join("cuda_dialect"))
-    } else {
-        // Search in the FA4 venv (cutlass-dsl installs it)
-        find_file_recursive(&out_dir.join("fa4-venv"), cuda_dialect_lib)
-            .map(|p| p.parent().unwrap().to_path_buf())
-    };
+    let cuda_dialect_dir = find_file_recursive(venv_dir, cuda_dialect_lib)
+        .map(|p| p.parent().unwrap().to_path_buf());
     if let Some(dir) = cuda_dialect_dir {
         println!("cargo:rustc-link-search=native={}", dir.display());
         println!("cargo:rustc-link-lib=static:+whole-archive=cuda_dialect_runtime_static");
@@ -337,6 +336,83 @@ fn compile_tvm_ffi_static(manifest_dir: &Path, out_dir: &Path) -> Result<()> {
 
     // NOTE: --export-dynamic is NOT needed. Kernel symbols are statically linked,
     // not loaded via dlopen. Removing this reduces the dynamic symbol table size.
+
+    Ok(())
+}
+
+/// Compile libbacktrace from third_party/tvm-ffi/3rdparty/libbacktrace.
+fn compile_libbacktrace(tvm_ffi_dir: &Path) -> Result<()> {
+    let bt_dir = tvm_ffi_dir.join("3rdparty/libbacktrace");
+    if !bt_dir.exists() {
+        anyhow::bail!(
+            "libbacktrace not found. Run: git submodule update --init --recursive third_party/tvm-ffi"
+        );
+    }
+
+    let out = PathBuf::from(env::var("OUT_DIR")?);
+    let config_dir = out.join("libbacktrace");
+    std::fs::create_dir_all(&config_dir)?;
+
+    let config_h = if cfg!(target_os = "linux") {
+        r#"
+#define BACKTRACE_ELF_SIZE 64
+#define HAVE_ATOMIC_FUNCTIONS 1
+#define HAVE_DL_ITERATE_PHDR 1
+#define HAVE_DLFCN_H 1
+#define HAVE_FCNTL 1
+#define HAVE_LINK_H 1
+#define HAVE_LSTAT 1
+#define HAVE_READLINK 1
+#define HAVE_SYS_MMAN_H 1
+#define HAVE_DECL_STRNLEN 1
+#define HAVE_DECL_GETPAGESIZE 0
+"#
+    } else if cfg!(target_os = "macos") {
+        r#"
+#define BACKTRACE_ELF_SIZE 64
+#define HAVE_ATOMIC_FUNCTIONS 1
+#define HAVE_DLFCN_H 1
+#define HAVE_FCNTL 1
+#define HAVE_MACH_O_DYLD_H 1
+#define HAVE_SYS_MMAN_H 1
+#define HAVE_DECL_STRNLEN 1
+#define HAVE_DECL_GETPAGESIZE 0
+"#
+    } else {
+        r#"
+#define HAVE_ATOMIC_FUNCTIONS 1
+#define HAVE_DECL_STRNLEN 1
+#define HAVE_DECL_GETPAGESIZE 0
+"#
+    };
+    std::fs::write(config_dir.join("config.h"), config_h)?;
+
+    let core_files = ["backtrace.c", "dwarf.c", "fileline.c", "posix.c",
+                      "sort.c", "state.c", "alloc.c", "read.c", "mmapio.c", "mmap.c"];
+    let format_file = if cfg!(target_os = "macos") { "macho.c" } else { "elf.c" };
+
+    let mut build = cc::Build::new();
+    build
+        .opt_level(2)
+        .pic(true)
+        .include(&bt_dir)
+        .include(&config_dir)
+        .define("_GNU_SOURCE", None)
+        .warnings(false);
+
+    for name in &core_files {
+        let f = bt_dir.join(name);
+        if f.exists() {
+            build.file(&f);
+        }
+    }
+    let fmt = bt_dir.join(format_file);
+    if fmt.exists() {
+        build.file(&fmt);
+    }
+
+    build.try_compile("backtrace")
+        .context("Failed to compile libbacktrace")?;
 
     Ok(())
 }
@@ -380,7 +456,7 @@ fn file_hash(path: &Path) -> Option<String> {
     Some(hex::encode(hash)[..16].to_string())
 }
 
-fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_dir: &Path) -> Result<()> {
+fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_dir: &Path, venv_dir: &Path) -> Result<()> {
     let script = manifest_dir.join("scripts/compile_kernels.py");
     let current_hash = file_hash(&script).unwrap_or_default();
 
@@ -432,7 +508,7 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_d
         );
     }
 
-    let python = ensure_python_env(out_dir)?;
+    let python = ensure_python_env(venv_dir)?;
 
     // Collect target archs: local GPU + PRELUDE_FA4_ARCHS env var
     let mut archs = Vec::new();
@@ -498,7 +574,7 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_d
 /// Ensure a Python environment with CuTeDSL deps is available.
 /// Uses an existing venv python if cutlass is importable, otherwise creates
 /// a venv in OUT_DIR and installs dependencies automatically.
-fn ensure_python_env(out_dir: &Path) -> Result<String> {
+fn ensure_python_env(venv_dir: &Path) -> Result<String> {
     // 1. Check if system/venv python already has cutlass
     for candidate in ["python3", "python"] {
         if check_cutlass(candidate) {
@@ -507,8 +583,7 @@ fn ensure_python_env(out_dir: &Path) -> Result<String> {
         }
     }
 
-    // 2. Create venv in OUT_DIR and install deps
-    let venv_dir = out_dir.join("fa4-venv");
+    // 2. Create venv and install deps (stable location, survives cargo clean)
     let venv_python = venv_dir.join("bin/python3");
 
     if check_cutlass(venv_python.to_str().unwrap_or("")) {

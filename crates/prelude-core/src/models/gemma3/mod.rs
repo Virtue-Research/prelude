@@ -8,7 +8,7 @@ use crate::nn_ops::{Activation, Embedding};
 use crate::loading::var_builder::VarBuilder;
 use serde::Deserialize;
 
-use crate::models::common::{
+use crate::modules::{
     Linear, RmsNorm,
     varlen_attention, varlen_attention_bidirectional, varlen_attention_windowed,
 };
@@ -382,13 +382,13 @@ impl Gemma3DecoderLayer {
                 .forward(ops, &normed, cu_seqlens, max_seqlen, position_ids)?;
 
         let post_attn_normed = self.post_attention_layernorm.forward(&attn_output)?;
-        let xs = crate::models::common::fast_add(ops, &post_attn_normed, xs)?;
+        let xs = crate::modules::fast_add(ops, &post_attn_normed, xs)?;
 
         let pre_ffn_normed = self.pre_feedforward_layernorm.forward(&xs)?;
         let mlp_output = self.mlp.forward(&pre_ffn_normed)?;
 
         let post_ffn_normed = self.post_feedforward_layernorm.forward(&mlp_output)?;
-        crate::models::common::fast_add(ops, &post_ffn_normed, &xs)
+        crate::modules::fast_add(ops, &post_ffn_normed, &xs)
     }
 
     fn clear_kv_cache(&mut self) {
@@ -539,7 +539,7 @@ impl Gemma3ForCausalLM {
     pub fn forward(
         &mut self,
         packed_input: &Tensor,
-        ctx: &mut crate::models::common::BatchAttnContext,
+        ctx: &mut crate::modules::BatchAttnContext,
     ) -> Result<Tensor> {
         let hidden = self.base.forward(
             ctx.ops,
@@ -549,7 +549,7 @@ impl Gemma3ForCausalLM {
             ctx.position_ids,
         )?;
         let last_hidden =
-            crate::models::common::last_token_select(&hidden, ctx.seq_lens)?.contiguous()?;
+            crate::modules::last_token_select(&hidden, ctx.seq_lens)?.contiguous()?;
 
         let logits = last_hidden.unsqueeze(1)?.apply(&self.lm_head)?;
 
@@ -571,7 +571,7 @@ impl crate::models::LogitsSplitModel for Gemma3ForCausalLM {
     fn forward_hidden_states(
         &mut self,
         packed_input: &Tensor,
-        ctx: &mut crate::models::common::BatchAttnContext,
+        ctx: &mut crate::modules::BatchAttnContext,
     ) -> crate::tensor::Result<Tensor> {
         self.base.forward(
             ctx.ops,
@@ -598,7 +598,7 @@ impl crate::models::ModelForward for Gemma3ForCausalLM {
     fn forward(
         &mut self,
         packed_input: &Tensor,
-        ctx: &mut crate::models::common::BatchAttnContext,
+        ctx: &mut crate::modules::BatchAttnContext,
     ) -> crate::tensor::Result<Tensor> {
         self.forward(packed_input, ctx)
     }
@@ -659,7 +659,7 @@ impl Gemma3ForSequenceClassification {
     pub fn forward(
         &mut self,
         packed_input: &Tensor,
-        ctx: &mut crate::models::common::BatchAttnContext,
+        ctx: &mut crate::modules::BatchAttnContext,
     ) -> Result<Tensor> {
         let hidden_states = self.base.forward(
             ctx.ops,
@@ -668,7 +668,7 @@ impl Gemma3ForSequenceClassification {
             ctx.max_seqlen_q,
             ctx.position_ids,
         )?;
-        let last_hidden = crate::models::common::last_token_select(&hidden_states, ctx.seq_lens)?;
+        let last_hidden = crate::modules::last_token_select(&hidden_states, ctx.seq_lens)?;
         last_hidden.apply(&self.score)
     }
 
@@ -736,7 +736,7 @@ impl Gemma3ForEmbedding {
     pub fn forward(
         &mut self,
         packed_input: &Tensor,
-        ctx: &mut crate::models::common::BatchAttnContext,
+        ctx: &mut crate::modules::BatchAttnContext,
     ) -> Result<Tensor> {
         let hidden_states = self.base.forward(
             ctx.ops,
@@ -748,13 +748,13 @@ impl Gemma3ForEmbedding {
         let hidden_states = hidden_states.to_dtype(DType::F32)?;
         let mut pooled = match self.pooling {
             crate::engine::EmbeddingPooling::LastToken => {
-                crate::models::common::last_token_select(&hidden_states, ctx.seq_lens)?
+                crate::modules::last_token_select(&hidden_states, ctx.seq_lens)?
             }
             crate::engine::EmbeddingPooling::Mean => {
                 pool_mean_varlen(&hidden_states, ctx.seq_lens)?
             }
             crate::engine::EmbeddingPooling::Cls => {
-                crate::models::common::first_token_select(&hidden_states, ctx.seq_lens)?
+                crate::modules::first_token_select(&hidden_states, ctx.seq_lens)?
             }
         };
 
@@ -788,7 +788,7 @@ impl crate::models::ModelForward for Gemma3ForSequenceClassification {
     fn forward(
         &mut self,
         packed_input: &Tensor,
-        ctx: &mut crate::models::common::BatchAttnContext,
+        ctx: &mut crate::modules::BatchAttnContext,
     ) -> crate::tensor::Result<Tensor> {
         self.forward(packed_input, ctx)
     }
@@ -812,7 +812,7 @@ impl crate::models::ModelForward for Gemma3ForEmbedding {
     fn forward(
         &mut self,
         packed_input: &Tensor,
-        ctx: &mut crate::models::common::BatchAttnContext,
+        ctx: &mut crate::modules::BatchAttnContext,
     ) -> crate::tensor::Result<Tensor> {
         Gemma3ForEmbedding::forward(self, packed_input, ctx)
     }

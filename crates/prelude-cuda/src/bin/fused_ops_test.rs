@@ -2,23 +2,13 @@
 static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
 
 // Quick correctness and performance test for fused CUDA kernels.
-// Requires `--features cuda` to build and run.
+// Usage: cargo run --bin fused_ops_test -p prelude-cuda --release
 
-#[cfg(not(feature = "cuda"))]
-fn main() {
-    eprintln!("fused_ops_test requires --features cuda");
-    std::process::exit(1);
-}
+use candle_core::{DType, Device, Module, Tensor};
 
-#[cfg(feature = "cuda")]
 fn main() -> candle_core::Result<()> {
-    fused_ops_test()
-}
-
-#[cfg(feature = "cuda")]
-fn fused_ops_test() -> candle_core::Result<()> {
-    use candle_core::{DType, Device, Module, Tensor};
     let dev = Device::new_cuda(0)?;
+    let ops = prelude_cuda::create_cuda_ops();
     let n = 1024 * 3072; // typical intermediate_size * seq
 
     println!(
@@ -36,7 +26,8 @@ fn fused_ops_test() -> candle_core::Result<()> {
     let ref_result = (&silu_gate * &up)?;
 
     // Fused
-    let fused_result = prelude_core::ops::gpu::fused_silu_mul(&gate, &up)?;
+    let fused_result = ops.fused.fused_silu_mul(&gate, &up)
+        .expect("CudaOps must support fused_silu_mul")?;
 
     // Compare
     let ref_f32 = ref_result.to_dtype(DType::F32)?.to_vec1::<f32>()?;
@@ -60,7 +51,8 @@ fn fused_ops_test() -> candle_core::Result<()> {
     let b = Tensor::randn(0f32, 1.0, n, &dev)?.to_dtype(DType::BF16)?;
 
     let ref_add = (&a + &b)?;
-    let fused_add = prelude_core::ops::gpu::vectorized_add(&a, &b)?;
+    let fused_add = ops.fused.fused_add(&a, &b)
+        .expect("CudaOps must support fused_add")?;
 
     let ref_f32 = ref_add.to_dtype(DType::F32)?.to_vec1::<f32>()?;
     let fused_f32 = fused_add.to_dtype(DType::F32)?.to_vec1::<f32>()?;
@@ -81,8 +73,8 @@ fn fused_ops_test() -> candle_core::Result<()> {
     // ── Performance test ─────────────────────────────────────
     // Warmup
     for _ in 0..5 {
-        let _ = prelude_core::ops::gpu::fused_silu_mul(&gate, &up)?;
-        let _ = prelude_core::ops::gpu::vectorized_add(&a, &b)?;
+        let _ = ops.fused.fused_silu_mul(&gate, &up);
+        let _ = ops.fused.fused_add(&a, &b);
     }
     dev.synchronize()?;
 
@@ -91,7 +83,7 @@ fn fused_ops_test() -> candle_core::Result<()> {
     // fused_silu_mul perf
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
-        let _ = prelude_core::ops::gpu::fused_silu_mul(&gate, &up)?;
+        let _ = ops.fused.fused_silu_mul(&gate, &up);
     }
     dev.synchronize()?;
     let fused_silu_us = t0.elapsed().as_micros() as f64 / iters as f64;
@@ -108,7 +100,7 @@ fn fused_ops_test() -> candle_core::Result<()> {
     // vectorized_add perf
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
-        let _ = prelude_core::ops::gpu::vectorized_add(&a, &b)?;
+        let _ = ops.fused.fused_add(&a, &b);
     }
     dev.synchronize()?;
     let fused_add_us = t0.elapsed().as_micros() as f64 / iters as f64;

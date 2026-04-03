@@ -192,26 +192,27 @@ fn archive_objects(kernels_dir: &Path, out_dir: &Path) -> Result<bool> {
 // ── TVM FFI ──────────────────────────────────────────────────────────
 
 fn compile_tvm_ffi(manifest_dir: &Path) -> Result<()> {
-    let fa4_vendor = manifest_dir
-        .parent().unwrap()
-        .join("prelude-flash-attn-v4/vendor/tvm_ffi");
+    // tvm-ffi lives in workspace third_party/
+    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap().parent().unwrap();
+    let tvm_ffi_dir = workspace_root.join("third_party/tvm-ffi");
 
-    let (tvm_src, tvm_include, dlpack_include) = if fa4_vendor.join("src").exists() {
+    let (tvm_src, tvm_include, dlpack_include) = if tvm_ffi_dir.join("src").exists() {
         (
-            fa4_vendor.join("src"),
-            fa4_vendor.join("include"),
-            fa4_vendor.join("3rdparty/dlpack/include"),
+            tvm_ffi_dir.join("src"),
+            tvm_ffi_dir.join("include"),
+            tvm_ffi_dir.join("3rdparty/dlpack/include"),
         )
     } else {
-        println!("cargo:warning=tvm_ffi vendor not found (FA4 crate needed)");
-        return Ok(());
+        anyhow::bail!(
+            "third_party/tvm-ffi not found. Run: git submodule update --init third_party/tvm-ffi"
+        );
     };
 
     let cc_files: Vec<PathBuf> = walkdir_ext(&tvm_src, "cc")
         .into_iter()
         .filter(|p| {
             let name = p.file_name().unwrap().to_str().unwrap_or("");
-            !name.contains("win") && !name.contains("testing") && name != "backtrace.cc"
+            !name.contains("win") && !name.contains("testing")
         })
         .collect();
 
@@ -235,15 +236,18 @@ fn compile_tvm_ffi(manifest_dir: &Path) -> Result<()> {
     let tvm_error_helper = manifest_dir.join("src/tvm_error_helper.cc");
     build.file(&tvm_error_helper);
 
+    // Compile libbacktrace (backtrace.cc references it)
+    compile_libbacktrace(&tvm_ffi_dir)?;
+
     build.link_lib_modifier("+whole-archive");
     build.try_compile("tvm_ffi_fi_static")
         .context("Failed to compile tvm_ffi")?;
 
-    let cuda_dialect = manifest_dir
-        .parent().unwrap()
-        .join("prelude-flash-attn-v4/vendor/cuda_dialect");
-    if cuda_dialect.join("libcuda_dialect_runtime_static.a").exists() {
-        println!("cargo:rustc-link-search=native={}", cuda_dialect.display());
+    // cuda_dialect_runtime_static.a — installed by cutlass-dsl in fa4-venv
+    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap().parent().unwrap();
+    let venv_dir = workspace_root.join("target/fa4-venv");
+    if let Some(p) = find_file_recursive(&venv_dir, "libcuda_dialect_runtime_static.a") {
+        println!("cargo:rustc-link-search=native={}", p.parent().unwrap().display());
         println!("cargo:rustc-link-lib=static:+whole-archive=cuda_dialect_runtime_static");
     }
 
@@ -262,6 +266,87 @@ fn compile_tvm_ffi(manifest_dir: &Path) -> Result<()> {
     println!("cargo:rustc-link-lib=dylib=rt");   // required by cudart_static
     println!("cargo:rustc-link-lib=dylib=dl");   // required by cudart_static
     println!("cargo:rustc-link-lib=dylib=stdc++");
+
+    Ok(())
+}
+
+// ── libbacktrace (required by tvm_ffi backtrace.cc) ────────────────
+
+fn compile_libbacktrace(tvm_ffi_dir: &Path) -> Result<()> {
+    let bt_dir = tvm_ffi_dir.join("3rdparty/libbacktrace");
+    if !bt_dir.exists() {
+        anyhow::bail!(
+            "libbacktrace not found. Run: git submodule update --init --recursive third_party/tvm-ffi"
+        );
+    }
+
+    // Generate config.h for the target platform
+    let out = PathBuf::from(env::var("OUT_DIR")?);
+    let config_dir = out.join("libbacktrace");
+    std::fs::create_dir_all(&config_dir)?;
+
+    let config_h = if cfg!(target_os = "linux") {
+        r#"
+#define BACKTRACE_ELF_SIZE 64
+#define HAVE_ATOMIC_FUNCTIONS 1
+#define HAVE_DL_ITERATE_PHDR 1
+#define HAVE_DLFCN_H 1
+#define HAVE_FCNTL 1
+#define HAVE_LINK_H 1
+#define HAVE_LSTAT 1
+#define HAVE_READLINK 1
+#define HAVE_SYS_MMAN_H 1
+#define HAVE_DECL_STRNLEN 1
+#define HAVE_DECL_GETPAGESIZE 0
+"#
+    } else if cfg!(target_os = "macos") {
+        r#"
+#define BACKTRACE_ELF_SIZE 64
+#define HAVE_ATOMIC_FUNCTIONS 1
+#define HAVE_DLFCN_H 1
+#define HAVE_FCNTL 1
+#define HAVE_MACH_O_DYLD_H 1
+#define HAVE_SYS_MMAN_H 1
+#define HAVE_DECL_STRNLEN 1
+#define HAVE_DECL_GETPAGESIZE 0
+"#
+    } else {
+        // Windows or unknown — minimal config
+        r#"
+#define HAVE_ATOMIC_FUNCTIONS 1
+#define HAVE_DECL_STRNLEN 1
+#define HAVE_DECL_GETPAGESIZE 0
+"#
+    };
+    std::fs::write(config_dir.join("config.h"), config_h)?;
+
+    // Select platform-specific source files
+    let core_files = ["backtrace.c", "dwarf.c", "fileline.c", "posix.c",
+                      "sort.c", "state.c", "alloc.c", "read.c", "mmapio.c", "mmap.c"];
+    let format_file = if cfg!(target_os = "macos") { "macho.c" } else { "elf.c" };
+
+    let mut build = cc::Build::new();
+    build
+        .opt_level(2)
+        .pic(true)
+        .include(&bt_dir)
+        .include(&config_dir)  // for generated config.h
+        .define("_GNU_SOURCE", None)
+        .warnings(false);
+
+    for name in &core_files {
+        let f = bt_dir.join(name);
+        if f.exists() {
+            build.file(&f);
+        }
+    }
+    let fmt = bt_dir.join(format_file);
+    if fmt.exists() {
+        build.file(&fmt);
+    }
+
+    build.try_compile("backtrace")
+        .context("Failed to compile libbacktrace")?;
 
     Ok(())
 }
@@ -472,4 +557,20 @@ fn find_python() -> Result<PathBuf> {
         }
     }
     anyhow::bail!("Python 3 not found")
+}
+
+fn find_file_recursive(dir: &Path, name: &str) -> Option<PathBuf> {
+    if !dir.exists() { return None; }
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.file_name().is_some_and(|n| n == name) {
+            return Some(path);
+        }
+        if path.is_dir() {
+            if let Some(found) = find_file_recursive(&path, name) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }

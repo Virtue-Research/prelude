@@ -17,9 +17,9 @@ use crate::tensor::{DType, Device, Module, Result, Tensor, D};
 use crate::nn_ops::{CandleLinear, Embedding};
 use crate::loading::var_builder::VarBuilder;
 
-use crate::models::common::varlen_attention;
+use crate::modules::varlen_attention;
 
-use crate::models::common::{
+use crate::modules::{
     fast_add, fast_rms_norm, last_token_select, BatchAttnContext,
     LayerAttnContext, Linear, RmsNorm, TransformerBlock,
 };
@@ -730,7 +730,7 @@ impl ExpertMlp {
     fn forward(&self, ops: &crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        crate::models::common::fast_silu_mul(ops, &gate, &up)?.apply(&self.down_proj)
+        crate::modules::fast_silu_mul(ops, &gate, &up)?.apply(&self.down_proj)
     }
 }
 
@@ -895,7 +895,7 @@ impl Qwen3NextSparseMoeBlock {
             self.num_experts_per_tok,
             is_prefill,
         )?;
-        let down_input = crate::models::common::fast_silu_mul(ops, &gate, &up)?;
+        let down_input = crate::modules::fast_silu_mul(ops, &gate, &up)?;
         let ys = crate::nn_ops::moe::moe_gemm(
             &down_input,
             down_w,

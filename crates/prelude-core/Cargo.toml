@@ -44,13 +44,9 @@ half = { version = "2.7.1", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["extern_crate_alloc", "derive"] }
 inventory = "0.3"
 rayon = "1.11.0"
-nix = { version = "0.31", features = ["sched"] }
 tokenizers = { workspace = true, optional = true }
 bc-mimalloc.workspace = true
 
-[[bin]]
-name = "cpu_ops_bench"
-path = "src/bin/cpu_ops_bench/main.rs"
 
 [[bin]]
 name = "tokenizer_bench"

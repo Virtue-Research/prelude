@@ -4,20 +4,9 @@ pub(crate) fn candle_err(e: crate::tensor::Error) -> EngineError {
     EngineError::Internal(format!("candle error: {e}"))
 }
 
-pub(crate) fn init_runtime(device: &Device, runtime: &crate::config::RuntimeConfig) {
-    if device.is_cpu() {
-        let _ = runtime;
-        // oneDNN uses THREADPOOL runtime (rayon-backed). No OpenMP, no contention.
-        crate::ops::onednn::init();
-        tracing::info!("oneDNN initialized (THREADPOOL runtime, rayon-backed)");
-
-        // NUMA-aware rayon pool for cpu_ops kernels
-        let numa_report = crate::ops::cpu::numa::init_numa_rayon_pool();
-        tracing::info!(numa_report, "cpu_ops NUMA rayon pool initialized");
-    }
-
-    // GPU GEMM registration is now handled by CudaOps::create() in prelude-cuda.
-    // No need to call register_gpu_gemm() here.
+pub(crate) fn init_runtime(_device: &Device, _runtime: &crate::config::RuntimeConfig) {
+    // Device-specific initialization (oneDNN, NUMA pool, GPU GEMM registration)
+    // is handled by device crates (prelude-cpu, prelude-cuda) in their ops factories.
 }
 
 pub(crate) fn select_device(

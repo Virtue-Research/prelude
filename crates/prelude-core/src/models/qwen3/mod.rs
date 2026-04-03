@@ -10,17 +10,17 @@ use crate::loading::var_builder::VarBuilder;
 use crate::nn_ops::{Embedding, Qwen3Config};
 use serde::Deserialize;
 
-use crate::models::common::varlen_attention;
-use crate::models::common::{BatchAttnContext, LayerAttnContext};
-use crate::models::common::{
+use crate::modules::varlen_attention;
+use crate::modules::{BatchAttnContext, LayerAttnContext};
+use crate::modules::{
     GatedMlp, Linear, RmsNorm, RotaryEmbedding, TransformerBlock,
     fast_add, fast_rms_norm, fused_add_rmsnorm, last_token_select, qknorm_rope_varlen,
 };
-use crate::models::common::debug_disable_fused_qknorm_rope;
+use crate::modules::debug_disable_fused_qknorm_rope;
 use crate::profiling::{nvtx_push, nvtx_pop};
 
 // Re-export public debug setters so existing callers (`use qwen3::set_debug_*`) still compile.
-pub use crate::models::common::{
+pub use crate::modules::{
     set_debug_disable_fast_rmsnorm, set_debug_disable_flash_attn_path,
     set_debug_disable_fused_add_rmsnorm, set_debug_disable_fused_qknorm_rope,
     set_debug_disable_fused_silu_mul, set_debug_disable_vectorized_add,
@@ -150,7 +150,7 @@ impl Qwen3Attention {
     /// Project Q, K, V and reshape to `[total_tokens, H, D]` (varlen layout).
     #[inline]
     fn fused_qkv_projection(&self, x: &Tensor, total: usize) -> Result<(Tensor, Tensor, Tensor)> {
-        crate::models::common::attention::fused_qkv_projection(
+        crate::modules::attention::fused_qkv_projection(
             x,
             &self.q_proj, &self.k_proj, &self.v_proj,
             self.qkv_proj.as_ref(),
@@ -183,39 +183,8 @@ impl Qwen3Attention {
         {
             let total_q = x.dim(0)?;
 
-            // ── Raw CPU BF16 fast path: bypass Tensor intermediates ──────
-            if !self.is_cuda && x.dtype() == crate::tensor::DType::BF16 && ctx.paged_kv.is_none() {
-                if let Some(ref qkv_proj) = self.qkv_proj {
-                    if let (Some(qkv_brg), Some(oproj_brg)) =
-                        (qkv_proj.brgemm_weight(), self.o_proj.brgemm_weight())
-                    {
-                        if let Some(ref cos_sin_cache) = self.rotary_emb.cos_sin_cache {
-                            let result = self.forward_raw_cpu_bf16(
-                                x, ctx,
-                                qkv_brg, oproj_brg, cos_sin_cache,
-                            )?;
-                            return Ok(result);
-                        }
-                    }
-                }
-            }
-
-            // ── Raw CPU F32 fast path: bypass Tensor intermediates ──────
-            if !self.is_cuda && x.dtype() == crate::tensor::DType::F32 && ctx.paged_kv.is_none() {
-                if let Some(ref qkv_proj) = self.qkv_proj {
-                    if let (Some(qkv_pw), Some(oproj_pw)) =
-                        (qkv_proj.f32_packed_weight(), self.o_proj.f32_packed_weight())
-                    {
-                        if let Some(ref cos_sin_cache) = self.rotary_emb.cos_sin_cache {
-                            let result = self.forward_raw_cpu_f32(
-                                x, ctx,
-                                qkv_pw, oproj_pw, cos_sin_cache,
-                            )?;
-                            return Ok(result);
-                        }
-                    }
-                }
-            }
+            // Raw CPU fast paths (brgemm, raw_f32) are in prelude-cpu.
+            // The generic path below handles both GPU and CPU via Ops traits.
 
             let (q, k, v) = self.fused_qkv_projection(x, total_q)?;
 
@@ -244,12 +213,12 @@ impl Qwen3Attention {
                             false
                         };
                         if !used_fused_kv_write {
-                            crate::models::common::reshape_and_cache(
+                            crate::modules::reshape_and_cache(
                                 ctx.ops, &k, &v,
                                 kv.key_cache, kv.value_cache, kv.slot_mapping,
                             )?;
                         }
-                        let attn = crate::models::common::varlen_attention_paged(
+                        let attn = crate::modules::varlen_attention_paged(
                             ctx.ops, &q,
                             kv.key_cache, kv.value_cache, kv.block_tables,
                             ctx.cu_seqlens_q, kv.cu_seqlens_k,
@@ -293,228 +262,35 @@ impl Qwen3Attention {
         }
     }
 
-    /// Raw CPU BF16 attention forward: all intermediate operations use raw &[u16]
-    /// slices instead of Tensor, eliminating ~8 Tensor alloc/drop per layer.
-    ///
-    /// Flow: input Tensor → CpuTensor → QKV GEMM → split → QK norm → RoPE
-    ///       → attention → O_proj GEMM → CpuTensor → output Tensor
-    fn forward_raw_cpu_bf16(
-        &self,
-        x: &Tensor,
-        ctx: &LayerAttnContext,
-        qkv_brg: &crate::ops::onednn::BrgemmPackedWeight,
-        oproj_brg: &crate::ops::onednn::BrgemmPackedWeight,
-        cos_sin_cache: &Tensor,
-    ) -> Result<Tensor> {
-        use crate::models::common::raw_cpu;
-        use crate::ops::cpu::buf_tensor::CpuTensor;
-
-        let device = x.device();
-        let x_buf = CpuTensor::from_candle(x)?;
-        let q_norm_w = CpuTensor::from_candle(&self.q_norm_weight)?;
-        let k_norm_w = CpuTensor::from_candle(&self.k_norm_weight)?;
-        let cache_buf = CpuTensor::from_candle(cos_sin_cache)?;
-        let positions = raw_cpu::extract_positions(ctx.position_ids)?;
-        let seq_lens = raw_cpu::extract_seq_lens(ctx.cu_seqlens_q)?;
-
-        // Full raw attention pipeline via shared infrastructure
-        raw_cpu::with_scratch(|scratch| {
-            let out = unsafe {
-                raw_cpu::raw_attention_forward(
-                    scratch,
-                    &x_buf,
-                    qkv_brg,
-                    oproj_brg,
-                    &q_norm_w,
-                    &k_norm_w,
-                    &cache_buf,
-                    &positions,
-                    &seq_lens,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.rms_norm_eps as f32,
-                    self.softmax_scale,
-                )
-            };
-            out.to_candle(device)
-        })
-    }
-
-    /// Raw CPU F32 attention forward: mirrors forward_raw_cpu_bf16 but for F32.
-    /// All intermediate operations use raw &[f32] slices via OnednnF32PackedWeight.
-    fn forward_raw_cpu_f32(
-        &self,
-        x: &Tensor,
-        ctx: &LayerAttnContext,
-        qkv_pw: &crate::ops::onednn::OnednnF32PackedWeight,
-        oproj_pw: &crate::ops::onednn::OnednnF32PackedWeight,
-        cos_sin_cache: &Tensor,
-    ) -> Result<Tensor> {
-        use crate::models::common::raw_cpu;
-        use crate::ops::cpu::buf_tensor::CpuTensorF32;
-
-        let device = x.device();
-        let x_buf = CpuTensorF32::from_candle(x)?;
-        let q_norm_w = crate::ops::cpu::tensor_as_f32_slice(&self.q_norm_weight)?;
-        let k_norm_w = crate::ops::cpu::tensor_as_f32_slice(&self.k_norm_weight)?;
-        let cache_slice = crate::ops::cpu::tensor_as_f32_slice(cos_sin_cache)?;
-        let rotary_dim = cos_sin_cache.dims()[1];
-        let positions = raw_cpu::extract_positions(ctx.position_ids)?;
-        let seq_lens = raw_cpu::extract_seq_lens(ctx.cu_seqlens_q)?;
-
-        raw_cpu::with_scratch_f32(|scratch| {
-            let out = unsafe {
-                raw_cpu::raw_attention_forward_f32(
-                    scratch,
-                    &x_buf,
-                    qkv_pw,
-                    oproj_pw,
-                    q_norm_w,
-                    k_norm_w,
-                    cache_slice,
-                    rotary_dim,
-                    &positions,
-                    &seq_lens,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                    self.rms_norm_eps as f32,
-                    self.softmax_scale,
-                )
-            };
-            raw_cpu::wrap_output_f32(out.as_slice(), out.dims(), device)
-        })
-    }
-
     /// Cached forward for CPU decode: handles both prefill (L=prompt_len) and
     /// decode (L=1). KV cache accumulates across calls; call `reset_kv_cache`
     /// between requests.
     ///
     /// KV cache is stored in varlen format `[total, H_kv, D]`.
-    /// - Prefill (offset=0, BF16+oneDNN): raw BF16 path (zero Tensor allocs) + cache K,V
-    /// - Prefill (offset=0, BF16 no-oneDNN): Tensor path + cpu_prefill_attention
-    /// - Decode (seq_len=1, BF16): decode_attention_bf16 kernel
-    /// - F32: matmul SDPA fallback
+    /// Uses matmul-based SDPA as a universal fallback.
     fn forward_with_cache(&mut self, x: &Tensor, position_offset: usize) -> Result<Tensor> {
         let seq_len = x.dim(0)?;
 
-        // ── BF16 + oneDNN raw prefill: fused QKV+norm+RoPE+attn+O_proj, save K,V ──
-        if position_offset == 0 && !self.is_cuda && x.dtype() == DType::BF16 {
-            // Clone Arc refs to avoid borrowing self immutably while calling &mut self
-            let qkv_proj = self.qkv_proj.clone();
-            let o_proj_ref = self.o_proj.brgemm_weight().map(|w| w as *const _);
-            let cos_sin = self.rotary_emb.cos_sin_cache.clone();
-            if let Some(ref qkv) = qkv_proj {
-                if let (Some(qkv_brg), Some(oproj_ptr)) =
-                    (qkv.brgemm_weight(), o_proj_ref)
-                {
-                    if let Some(ref cos_sin_cache) = cos_sin {
-                        // Safety: oproj_brg points into self.o_proj which lives for &mut self
-                        let oproj_brg = unsafe { &*oproj_ptr };
-                        return self.forward_raw_prefill_and_cache(
-                            x, seq_len, qkv_brg, oproj_brg, cos_sin_cache,
-                        );
-                    }
-                }
-            }
-        }
-
-        // ── Tensor-based path (BF16 without oneDNN, F32, or decode) ──
+        // ── Tensor-based path ──
         let (q, k, v) = self.fused_qkv_projection(x, seq_len)?;
         let position_ids: Vec<u32> =
             (0..seq_len).map(|i| (position_offset + i) as u32).collect();
         let position_ids = Tensor::from_vec(position_ids, (seq_len,), x.device())?;
-        let (q, k) = self.norm_rope_varlen(crate::ops::cpu_ops(), &q, &k, seq_len, &position_ids)?;
+        let ops = crate::ops::select_ops(x.device());
+        let (q, k) = self.norm_rope_varlen(ops, &q, &k, seq_len, &position_ids)?;
 
         self.k_cache.append(&k)?;
         self.v_cache.append(&v)?;
         let k_full = self.k_cache.view()?;
         let v_full = self.v_cache.view()?;
-        let total_kv_len = k_full.dim(0)?;
 
-        let attn_out = if x.dtype() == DType::BF16 {
-            if position_offset == 0 {
-                crate::ops::cpu::cpu_prefill_attention(
-                    &q, &k, &v,
-                    &[seq_len], self.num_heads, self.num_kv_heads,
-                    self.head_dim, self.softmax_scale as f64,
-                )?
-            } else {
-                crate::ops::cpu::cpu_decode_attention(
-                    &q, &k_full, &v_full,
-                    total_kv_len, self.num_heads, self.num_kv_heads,
-                    self.head_dim, self.softmax_scale,
-                )?
-            }
-        } else if position_offset > 0 {
-            crate::ops::cpu::cpu_decode_attention_f32(
-                &q, &k_full, &v_full,
-                total_kv_len, self.num_heads, self.num_kv_heads,
-                self.head_dim, self.softmax_scale,
-            )?
-        } else {
-            self.matmul_cross_attention(
-                &q, &k_full, &v_full, seq_len, position_offset,
-            )?
-        };
+        let attn_out = self.matmul_cross_attention(
+            &q, &k_full, &v_full, seq_len, position_offset,
+        )?;
 
         attn_out
             .reshape((seq_len, self.hidden_size))?
             .apply(&self.o_proj)
-    }
-
-    /// Raw BF16 prefill: runs the fully fused raw path (zero Tensor allocs)
-    /// and saves K,V to KvBuf as a side effect.
-    fn forward_raw_prefill_and_cache(
-        &mut self,
-        x: &Tensor,
-        seq_len: usize,
-        qkv_brg: &crate::ops::onednn::BrgemmPackedWeight,
-        oproj_brg: &crate::ops::onednn::BrgemmPackedWeight,
-        cos_sin_cache: &Tensor,
-    ) -> Result<Tensor> {
-        use crate::models::common::raw_cpu;
-        use crate::ops::cpu::buf_tensor::CpuTensor;
-
-        let device = x.device();
-        let kv_size = self.num_kv_heads * self.head_dim;
-        let x_buf = CpuTensor::from_candle(x)?;
-        let q_norm_w = CpuTensor::from_candle(&self.q_norm_weight)?;
-        let k_norm_w = CpuTensor::from_candle(&self.k_norm_weight)?;
-        let cache_buf = CpuTensor::from_candle(cos_sin_cache)?;
-        let positions: Vec<i64> = (0..seq_len as i64).collect();
-        let seq_lens = vec![seq_len];
-
-        raw_cpu::with_scratch(|scratch| {
-            // raw_attention_forward borrows scratch mutably; the returned CpuTensor
-            // borrows scratch.proj_out. Convert to owned Tensor first, then read K,V.
-            let out = unsafe {
-                raw_cpu::raw_attention_forward(
-                    scratch, &x_buf, qkv_brg, oproj_brg,
-                    &q_norm_w, &k_norm_w, &cache_buf,
-                    &positions, &seq_lens,
-                    self.num_heads, self.num_kv_heads,
-                    self.rms_norm_eps as f32, self.softmax_scale,
-                )
-            };
-            let attn_result = out.to_candle(device)?;
-
-            // Save K,V from scratch to KvBuf (small memcpy: seq_len * kv_size * 2 bytes)
-            let k_tensor = crate::ops::cpu::u16_vec_to_bf16_tensor(
-                scratch.k_normed[..seq_len * kv_size].to_vec(),
-                &[seq_len, self.num_kv_heads, self.head_dim],
-                device,
-            )?;
-            let v_tensor = crate::ops::cpu::u16_vec_to_bf16_tensor(
-                scratch.v[..seq_len * kv_size].to_vec(),
-                &[seq_len, self.num_kv_heads, self.head_dim],
-                device,
-            )?;
-            self.k_cache.append(&k_tensor)?;
-            self.v_cache.append(&v_tensor)?;
-
-            Ok(attn_result)
-        })
     }
 
     /// Matmul-based cross-attention for decode: Q attends to full KV cache.
@@ -529,21 +305,76 @@ impl Qwen3Attention {
         position_offset: usize,
     ) -> Result<Tensor> {
         let total_kv_len = k_full.dim(0)?;
+        let num_kv_groups = self.num_heads / self.num_kv_heads;
         let causal = seq_len > 1;
+
+        // Convert to F32 for numeric stability
         let q_f32 = q.to_dtype(DType::F32)?;
         let k_f32 = k_full.to_dtype(DType::F32)?;
         let v_f32 = v_full.to_dtype(DType::F32)?;
 
-        {
-            let out = crate::models::common::attn::cpu::cross_attention_f32_onednn(
-                &q_f32, &k_f32, &v_f32,
-                seq_len, total_kv_len,
-                self.num_heads, self.num_kv_heads, self.head_dim,
-                self.softmax_scale, causal, position_offset,
-            )?;
-            return out.to_dtype(v_full.dtype());
-        }
+        // Reshape to [H, seq_len, D] and [H_kv, total_kv, D]
+        let q3 = q_f32
+            .reshape((seq_len, self.num_heads, self.head_dim))?
+            .transpose(0, 1)?
+            .contiguous()?;
+        let k3 = k_f32
+            .reshape((total_kv_len, self.num_kv_heads, self.head_dim))?
+            .transpose(0, 1)?
+            .contiguous()?;
+        let v3 = v_f32
+            .reshape((total_kv_len, self.num_kv_heads, self.head_dim))?
+            .transpose(0, 1)?
+            .contiguous()?;
 
+        // Expand K,V for GQA: [H_kv, T, D] -> [H, T, D]
+        let k3 = if num_kv_groups > 1 {
+            k3.unsqueeze(1)?
+                .expand((self.num_kv_heads, num_kv_groups, total_kv_len, self.head_dim))?
+                .reshape((self.num_heads, total_kv_len, self.head_dim))?
+                .contiguous()?
+        } else {
+            k3
+        };
+        let v3 = if num_kv_groups > 1 {
+            v3.unsqueeze(1)?
+                .expand((self.num_kv_heads, num_kv_groups, total_kv_len, self.head_dim))?
+                .reshape((self.num_heads, total_kv_len, self.head_dim))?
+                .contiguous()?
+        } else {
+            v3
+        };
+
+        // scores = Q @ K^T * scale  → [H, seq_len, total_kv]
+        let scores = q3.matmul(&k3.transpose(1, 2)?)?;
+        let scores = (scores * (self.softmax_scale as f64))?;
+
+        // Apply causal mask if needed
+        let scores = if causal {
+            // Build lower-triangular causal mask with position_offset
+            let mask_data: Vec<f32> = (0..seq_len)
+                .flat_map(|qi| {
+                    let qi_abs = position_offset + qi;
+                    (0..total_kv_len).map(move |ki| {
+                        if ki <= qi_abs { 0.0f32 } else { f32::NEG_INFINITY }
+                    })
+                })
+                .collect();
+            let mask = Tensor::from_vec(mask_data, (seq_len, total_kv_len), q.device())?;
+            scores.broadcast_add(&mask)?
+        } else {
+            scores
+        };
+
+        // Softmax over last dim
+        let attn_weights = crate::nn_ops::ops::softmax_last_dim(&scores)?;
+
+        // output = attn_weights @ V → [H, seq_len, D]
+        let out = attn_weights.matmul(&v3)?;
+
+        // Transpose back: [H, seq_len, D] -> [seq_len, H, D]
+        let out = out.transpose(0, 1)?.contiguous()?;
+        out.to_dtype(v_full.dtype())
     }
 
     fn reset_kv_cache(&mut self) {
@@ -589,45 +420,7 @@ impl DecoderLayer {
 
     #[inline]
     fn residual_mlp(&self, ops: &crate::ops::Ops, x_res: &Tensor, h2: &Tensor) -> Result<Tensor> {
-        if h2.device().is_cpu() && h2.dtype() == crate::tensor::DType::BF16 {
-            if self.mlp.gate_up_brgemm_weight().is_some() {
-                return self.residual_mlp_raw(x_res, h2);
-            }
-        }
-        if h2.device().is_cpu() && h2.dtype() == crate::tensor::DType::F32 {
-            if self.mlp.gate_up_f32_packed_weight().is_some() {
-                return self.residual_mlp_raw_f32(x_res, h2);
-            }
-        }
         fast_add(ops, x_res, &self.mlp.forward(ops, h2)?)
-    }
-
-    fn residual_mlp_raw(&self, x_res: &Tensor, h2: &Tensor) -> Result<Tensor> {
-        use crate::models::common::raw_cpu;
-        use crate::ops::cpu::buf_tensor::CpuTensor;
-        let h2_buf = CpuTensor::from_candle(h2)?;
-        let needed = h2_buf.len();
-        raw_cpu::with_scratch(|scratch| {
-            raw_cpu::ensure_len(&mut scratch.mlp_out, needed);
-            let mlp_out_ptr = scratch.mlp_out.as_mut_ptr();
-            unsafe { self.mlp.forward_raw(scratch, &h2_buf, mlp_out_ptr) }
-            crate::ops::cpu::inplace_add_bf16(x_res, &scratch.mlp_out[..needed]).unwrap();
-        });
-        Ok(x_res.clone())
-    }
-
-    fn residual_mlp_raw_f32(&self, x_res: &Tensor, h2: &Tensor) -> Result<Tensor> {
-        use crate::models::common::raw_cpu;
-        let h2_slice = crate::ops::cpu::tensor_as_f32_slice(h2)?;
-        let (total, hidden_size) = (h2.dim(0)?, h2.dim(1)?);
-        let needed = total * hidden_size;
-        raw_cpu::with_scratch_f32(|scratch| {
-            raw_cpu::ensure_len_f32(&mut scratch.mlp_out, needed);
-            let mlp_out_ptr = scratch.mlp_out.as_mut_ptr();
-            unsafe { self.mlp.forward_raw_f32(scratch, h2_slice.as_ptr(), total, hidden_size, mlp_out_ptr) }
-            crate::ops::cpu::inplace_add_f32(x_res, &scratch.mlp_out[..needed]).unwrap();
-        });
-        Ok(x_res.clone())
     }
 
     fn forward_with_cache(&mut self, ops: &crate::ops::Ops, x: &Tensor, position_offset: usize) -> Result<Tensor> {
@@ -900,7 +693,7 @@ impl KvCacheModel for Qwen3ModelForCausalLM {
         input_ids: &Tensor,
         position_offset: usize,
     ) -> crate::tensor::Result<Tensor> {
-        Qwen3ModelForCausalLM::forward_with_cache(self, crate::ops::cpu_ops(), input_ids, position_offset)
+        Qwen3ModelForCausalLM::forward_with_cache(self, crate::ops::select_ops(input_ids.device()), input_ids, position_offset)
     }
 }
 
@@ -991,7 +784,7 @@ mod tests {
     use super::*;
     use crate::tensor::Device;
     use crate::loading::var_builder::VarBuilder;
-    use crate::models::common::BatchAttnContext;
+    use crate::modules::BatchAttnContext;
 
     fn tiny_config() -> Qwen3Config {
         serde_json::from_value(serde_json::json!({
@@ -1020,7 +813,6 @@ mod tests {
         Qwen3ModelForCausalLM::new(cfg, vb).expect("model construction failed")
     }
 
-    /// Helper: run standard varlen forward on a single sequence.
     fn forward_standard(
         model: &mut Qwen3ModelForCausalLM,
         tokens: &[u32],
@@ -1029,31 +821,18 @@ mod tests {
         let seq_len = tokens.len();
         let input = Tensor::from_vec(tokens.to_vec(), (seq_len,), device).unwrap();
         let cu = Tensor::from_vec(vec![0u32, seq_len as u32], (2,), device).unwrap();
-        let pos = Tensor::from_vec(
-            (0..seq_len as u32).collect::<Vec<_>>(),
-            (seq_len,),
-            device,
-        )
-        .unwrap();
+        let pos = Tensor::from_vec((0..seq_len as u32).collect::<Vec<_>>(), (seq_len,), device).unwrap();
         let seq_lens = vec![seq_len];
-        let ops = crate::ops::cpu_ops();
+        let ops = crate::ops::select_ops(device);
         let mut ctx = BatchAttnContext {
-            ops,
-            cu_seqlens_q: &cu,
-            max_seqlen_q: seq_len,
-            position_ids: &pos,
-            seq_lens: &seq_lens,
-            paged_kv: None,
-            deltanet_pool: None,
-            deltanet_slots: None,
+            ops, cu_seqlens_q: &cu, max_seqlen_q: seq_len, position_ids: &pos,
+            seq_lens: &seq_lens, paged_kv: None, deltanet_pool: None, deltanet_slots: None,
         };
         let logits = model.forward(&input, &mut ctx).unwrap();
         model.clear_kv_cache();
         logits
     }
 
-    /// Prefill via `forward_with_cache` should produce the same last-token logits
-    /// as the standard varlen forward path.
     #[test]
     fn test_kv_cache_prefill_matches_standard() {
         let cfg = tiny_config();
@@ -1061,36 +840,17 @@ mod tests {
         let device = Device::Cpu;
         let tokens = vec![1u32, 5, 10, 20, 3];
         let seq_len = tokens.len();
-
-        // Standard forward → [1, 1, vocab]
         let std_logits = forward_standard(&mut model, &tokens, &device);
-
-        // Cached forward → [seq_len, vocab]
         let input = Tensor::from_vec(tokens, (seq_len,), &device).unwrap();
-        let cached_logits = model.forward_with_cache(crate::ops::cpu_ops(), &input, 0).unwrap();
+        let cached_logits = model.forward_with_cache(crate::ops::select_ops(&device), &input, 0).unwrap();
         model.clear_kv_cache();
-
         let std_flat: Vec<f32> = std_logits.flatten_all().unwrap().to_vec1().unwrap();
-        let cached_last: Vec<f32> = cached_logits
-            .get(seq_len - 1)
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-
+        let cached_last: Vec<f32> = cached_logits.get(seq_len - 1).unwrap().to_vec1().unwrap();
         assert_eq!(std_flat.len(), cached_last.len(), "vocab size mismatch");
-        let max_diff = std_flat
-            .iter()
-            .zip(cached_last.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            max_diff < 1e-4,
-            "prefill logits max diff = {max_diff} (threshold 1e-4)"
-        );
+        let max_diff = std_flat.iter().zip(cached_last.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-4, "prefill logits max diff = {max_diff} (threshold 1e-4)");
     }
 
-    /// Cached prefill + decode should produce the same last-token logits
-    /// as forwarding the full sequence in one shot.
     #[test]
     fn test_kv_cache_decode_matches_full_forward() {
         let cfg = tiny_config();
@@ -1098,36 +858,19 @@ mod tests {
         let device = Device::Cpu;
         let prompt = vec![1u32, 5, 10];
         let full_seq = vec![1u32, 5, 10, 20];
-
-        // Reference: standard varlen forward on full sequence → last-token logits
         let ref_logits = forward_standard(&mut model, &full_seq, &device);
         let ref_flat: Vec<f32> = ref_logits.flatten_all().unwrap().to_vec1().unwrap();
-
-        // Cached: prefill prompt, then decode one new token
-        let prompt_input =
-            Tensor::from_vec(prompt.clone(), (prompt.len(),), &device).unwrap();
-        let _prefill = model.forward_with_cache(crate::ops::cpu_ops(), &prompt_input, 0).unwrap();
-
+        let prompt_input = Tensor::from_vec(prompt.clone(), (prompt.len(),), &device).unwrap();
+        let _prefill = model.forward_with_cache(crate::ops::select_ops(&device), &prompt_input, 0).unwrap();
         let decode_input = Tensor::from_vec(vec![20u32], (1,), &device).unwrap();
-        let decode_logits = model.forward_with_cache(crate::ops::cpu_ops(), &decode_input, prompt.len()).unwrap();
+        let decode_logits = model.forward_with_cache(crate::ops::select_ops(&device), &decode_input, prompt.len()).unwrap();
         model.clear_kv_cache();
-
         let decode_flat: Vec<f32> = decode_logits.get(0).unwrap().to_vec1().unwrap();
-
         assert_eq!(ref_flat.len(), decode_flat.len(), "vocab size mismatch");
-        let max_diff = ref_flat
-            .iter()
-            .zip(decode_flat.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            max_diff < 1e-4,
-            "decode logits max diff = {max_diff} (threshold 1e-4)"
-        );
+        let max_diff = ref_flat.iter().zip(decode_flat.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-4, "decode logits max diff = {max_diff} (threshold 1e-4)");
     }
 
-    /// After `clear_kv_cache`, re-running the same input should produce
-    /// identical output (cache doesn't leak between requests).
     #[test]
     fn test_kv_cache_clear_determinism() {
         let cfg = tiny_config();
@@ -1135,269 +878,45 @@ mod tests {
         let device = Device::Cpu;
         let tokens = vec![1u32, 5, 10];
         let input = Tensor::from_vec(tokens, (3,), &device).unwrap();
-
-        let logits1 = model.forward_with_cache(crate::ops::cpu_ops(), &input, 0).unwrap();
+        let logits1 = model.forward_with_cache(crate::ops::select_ops(&device), &input, 0).unwrap();
         model.clear_kv_cache();
-
-        let logits2 = model.forward_with_cache(crate::ops::cpu_ops(), &input, 0).unwrap();
+        let logits2 = model.forward_with_cache(crate::ops::select_ops(&device), &input, 0).unwrap();
         model.clear_kv_cache();
-
         let v1: Vec<f32> = logits1.flatten_all().unwrap().to_vec1().unwrap();
         let v2: Vec<f32> = logits2.flatten_all().unwrap().to_vec1().unwrap();
         assert_eq!(v1.len(), v2.len());
-        let max_diff = v1
-            .iter()
-            .zip(v2.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            max_diff < 1e-6,
-            "cache clear determinism failed: max diff = {max_diff}"
-        );
+        let max_diff = v1.iter().zip(v2.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-6, "cache clear determinism failed: max diff = {max_diff}");
     }
 
-    /// Multi-step decode: generate 3 tokens with cache, compare against
-    /// re-forwarding the full sequence at each step.
     #[test]
     fn test_kv_cache_multi_step_decode() {
         let cfg = tiny_config();
         let mut model = build_model(&cfg);
         let device = Device::Cpu;
         let prompt = vec![1u32, 5, 10];
-
-        // Cached decode: prefill → 3 decode steps
-        let prompt_input =
-            Tensor::from_vec(prompt.clone(), (prompt.len(),), &device).unwrap();
-        let prefill_logits = model.forward_with_cache(crate::ops::cpu_ops(), &prompt_input, 0).unwrap();
+        let prompt_input = Tensor::from_vec(prompt.clone(), (prompt.len(),), &device).unwrap();
+        let prefill_logits = model.forward_with_cache(crate::ops::select_ops(&device), &prompt_input, 0).unwrap();
         let mut generated = vec![
-            prefill_logits
-                .get(prompt.len() - 1)
-                .unwrap()
-                .argmax(0)
-                .unwrap()
-                .to_vec0::<u32>()
-                .unwrap(),
+            prefill_logits.get(prompt.len() - 1).unwrap().argmax(0).unwrap().to_vec0::<u32>().unwrap(),
         ];
-
         for step in 0..2 {
             let offset = prompt.len() + step;
             let tok = *generated.last().unwrap();
             let input = Tensor::from_vec(vec![tok], (1,), &device).unwrap();
-            let logits = model.forward_with_cache(crate::ops::cpu_ops(), &input, offset).unwrap();
-            let next = logits
-                .get(0)
-                .unwrap()
-                .argmax(0)
-                .unwrap()
-                .to_vec0::<u32>()
-                .unwrap();
-            generated.push(next);
+            let logits = model.forward_with_cache(crate::ops::select_ops(&device), &input, offset).unwrap();
+            generated.push(logits.get(0).unwrap().argmax(0).unwrap().to_vec0::<u32>().unwrap());
         }
         model.clear_kv_cache();
-
-        // Reference: re-forward full sequence at each step
         let mut ref_generated = Vec::new();
         let mut full_seq = prompt.clone();
         for _step in 0..3 {
             let ref_logits = forward_standard(&mut model, &full_seq, &device);
-            // forward_standard returns [1, 1, vocab] — flatten and use Tensor argmax
-            let next = ref_logits
-                .flatten_all().unwrap()
-                .argmax(0).unwrap()
-                .to_vec0::<u32>().unwrap();
+            let next = ref_logits.flatten_all().unwrap().argmax(0).unwrap().to_vec0::<u32>().unwrap();
             ref_generated.push(next);
             full_seq.push(next);
         }
-
-        assert_eq!(
-            generated, ref_generated,
-            "multi-step decode mismatch: cached={generated:?} vs reforward={ref_generated:?}"
-        );
-    }
-
-    /// Microbenchmark: measure each stage of a single decode step for Qwen3-0.6B-sized tensors.
-    /// cargo test -p prelude-core --lib --release --features onednn -- qwen3::tests::bench_decode_stages --nocapture --ignored
-    #[test]
-    #[ignore]
-    fn bench_decode_stages() {
-        use std::time::Instant;
-        use crate::tensor::Module;
-
-        let hidden = 1024usize;
-        let intermediate = 3072usize;
-        let num_heads = 16usize;
-        let num_kv_heads = 8usize;
-        let head_dim = 128usize;
-        let context_len = 40usize;
-        let device = Device::Cpu;
-
-        let warmup = 5;
-        let iters = 20;
-
-        // 1. RMSNorm
-        let rmsnorm_us = {
-            let x = Tensor::randn(0.0f32, 1.0, (1, hidden), &device).unwrap();
-            let norm = crate::nn_ops::CandleRmsNorm::new(
-                Tensor::ones((hidden,), DType::F32, &device).unwrap(), 1e-6,
-            );
-            for _ in 0..warmup { let _ = norm.forward(&x); }
-            let t = Instant::now();
-            for _ in 0..iters { let _ = norm.forward(&x); }
-            t.elapsed().as_micros() as f64 / iters as f64
-        };
-        eprintln!("[1] RMSNorm          (1×{hidden}):             {rmsnorm_us:.1} µs");
-
-        // 2. Linear QKV via OnednnLinear
-        let qkv_us = {
-            let qkv_dim = (num_heads + 2 * num_kv_heads) * head_dim;
-            let x = Tensor::randn(0.0f32, 1.0, (1, hidden), &device).unwrap();
-            let w = Tensor::randn(0.0f32, 1.0, (qkv_dim, hidden), &device).unwrap();
-            let linear = crate::ops::onednn::OnednnLinear::new(
-                crate::nn_ops::CandleLinear::new(w, None),
-            ).unwrap();
-            for _ in 0..warmup { let _ = linear.forward(&x); }
-            let t = Instant::now();
-            for _ in 0..iters { let _ = linear.forward(&x); }
-            t.elapsed().as_micros() as f64 / iters as f64
-        };
-        let qkv_dim = (num_heads + 2 * num_kv_heads) * head_dim;
-        eprintln!("[2] Linear QKV       (1×{hidden} → 1×{qkv_dim}):  {qkv_us:.1} µs");
-
-        // 3. Attention candle: reshape+transpose+matmul+softmax+matmul
-        let attn_candle_us = {
-            let q = Tensor::randn(0.0f32, 1.0, (1, 1, num_heads, head_dim), &device).unwrap()
-                .transpose(1, 2).unwrap().contiguous().unwrap();
-            let k = Tensor::randn(0.0f32, 1.0, (1, context_len, num_heads, head_dim), &device).unwrap()
-                .transpose(1, 2).unwrap().contiguous().unwrap();
-            let v = k.clone();
-            for _ in 0..warmup {
-                let s = q.matmul(&k.transpose(2, 3).unwrap()).unwrap();
-                let s = crate::nn_ops::ops::softmax_last_dim(&s).unwrap();
-                let _ = s.matmul(&v).unwrap();
-            }
-            let t = Instant::now();
-            for _ in 0..iters {
-                let s = q.matmul(&k.transpose(2, 3).unwrap()).unwrap();
-                let s = crate::nn_ops::ops::softmax_last_dim(&s).unwrap();
-                let _ = s.matmul(&v).unwrap();
-            }
-            t.elapsed().as_micros() as f64 / iters as f64
-        };
-        eprintln!("[3] Attn candle      (1q×{context_len}kv, {num_heads}H):     {attn_candle_us:.1} µs");
-
-        // 4. Attention oneDNN cross_attention
-        let attn_onednn_us = {
-            let q = Tensor::randn(0.0f32, 1.0, (1, num_heads, head_dim), &device).unwrap();
-            let k = Tensor::randn(0.0f32, 1.0, (context_len, num_kv_heads, head_dim), &device).unwrap();
-            let v = Tensor::randn(0.0f32, 1.0, (context_len, num_kv_heads, head_dim), &device).unwrap();
-            for _ in 0..warmup {
-                let _ = crate::models::common::attn::cpu::cross_attention_f32_onednn(
-                    &q, &k, &v, 1, context_len,
-                    num_heads, num_kv_heads, head_dim, 0.088, false, 0,
-                );
-            }
-            let t = Instant::now();
-            for _ in 0..iters {
-                let _ = crate::models::common::attn::cpu::cross_attention_f32_onednn(
-                    &q, &k, &v, 1, context_len,
-                    num_heads, num_kv_heads, head_dim, 0.088, false, 0,
-                );
-            }
-            t.elapsed().as_micros() as f64 / iters as f64
-        };
-        eprintln!("[4] Attn oneDNN      (1q×{context_len}kv, {num_heads}H):     {attn_onednn_us:.1} µs");
-
-        // 4b. Attention native F32 decode kernel
-        let attn_native_f32_us = {
-            let q = Tensor::randn(0.0f32, 1.0, (1, num_heads, head_dim), &device).unwrap();
-            let k = Tensor::randn(0.0f32, 1.0, (context_len, num_kv_heads, head_dim), &device).unwrap();
-            let v = Tensor::randn(0.0f32, 1.0, (context_len, num_kv_heads, head_dim), &device).unwrap();
-            for _ in 0..warmup {
-                let _ = crate::ops::cpu::cpu_decode_attention_f32(
-                    &q, &k, &v, context_len,
-                    num_heads, num_kv_heads, head_dim, 0.088,
-                );
-            }
-            let t = Instant::now();
-            for _ in 0..iters {
-                let _ = crate::ops::cpu::cpu_decode_attention_f32(
-                    &q, &k, &v, context_len,
-                    num_heads, num_kv_heads, head_dim, 0.088,
-                );
-            }
-            t.elapsed().as_micros() as f64 / iters as f64
-        };
-        eprintln!("[4b] Attn native F32 (1q×{context_len}kv, {num_heads}H):    {attn_native_f32_us:.1} µs");
-
-        // 5. Linear O_proj
-        let oproj_us = {
-            let proj_in = num_heads * head_dim;
-            let x = Tensor::randn(0.0f32, 1.0, (1, proj_in), &device).unwrap();
-            let w = Tensor::randn(0.0f32, 1.0, (hidden, proj_in), &device).unwrap();
-            let linear = crate::ops::onednn::OnednnLinear::new(
-                crate::nn_ops::CandleLinear::new(w, None),
-            ).unwrap();
-            for _ in 0..warmup { let _ = linear.forward(&x); }
-            let t = Instant::now();
-            for _ in 0..iters { let _ = linear.forward(&x); }
-            t.elapsed().as_micros() as f64 / iters as f64
-        };
-        eprintln!("[5] Linear O_proj    (1×{} → 1×{hidden}):  {oproj_us:.1} µs", num_heads*head_dim);
-
-        // 6. MLP: gate_up + silu_mul + down
-        let mlp_us = {
-            let x = Tensor::randn(0.0f32, 1.0, (1, hidden), &device).unwrap();
-            let w_gu = Tensor::randn(0.0f32, 1.0, (2 * intermediate, hidden), &device).unwrap();
-            let w_down = Tensor::randn(0.0f32, 1.0, (hidden, intermediate), &device).unwrap();
-            let lin_gu = crate::ops::onednn::OnednnLinear::new(
-                crate::nn_ops::CandleLinear::new(w_gu, None),
-            ).unwrap();
-            let lin_down = crate::ops::onednn::OnednnLinear::new(
-                crate::nn_ops::CandleLinear::new(w_down, None),
-            ).unwrap();
-            for _ in 0..warmup {
-                let h = lin_gu.forward(&x).unwrap();
-                let chunks: Vec<_> = h.chunk(2, 1).unwrap();
-                let _ = lin_down.forward(
-                    &(crate::nn_ops::ops::silu(&chunks[0]).unwrap() * &chunks[1]).unwrap()
-                );
-            }
-            let t = Instant::now();
-            for _ in 0..iters {
-                let h = lin_gu.forward(&x).unwrap();
-                let chunks: Vec<_> = h.chunk(2, 1).unwrap();
-                let _ = lin_down.forward(
-                    &(crate::nn_ops::ops::silu(&chunks[0]).unwrap() * &chunks[1]).unwrap()
-                );
-            }
-            t.elapsed().as_micros() as f64 / iters as f64
-        };
-        eprintln!("[6] MLP gate+silu+dn (1×{hidden}→1×{}→1×{hidden}): {mlp_us:.1} µs", 2*intermediate);
-
-        // 7. Residual add
-        let add_us = {
-            let a = Tensor::randn(0.0f32, 1.0, (1, hidden), &device).unwrap();
-            let b = Tensor::randn(0.0f32, 1.0, (1, hidden), &device).unwrap();
-            for _ in 0..warmup { let _ = (&a + &b).unwrap(); }
-            let t = Instant::now();
-            for _ in 0..iters { let _ = (&a + &b).unwrap(); }
-            t.elapsed().as_micros() as f64 / iters as f64
-        };
-        eprintln!("[7] Residual add     (1×{hidden}):             {add_us:.1} µs");
-
-        // Summary
-        let linear_total = qkv_us + oproj_us + mlp_us;
-        let non_linear = rmsnorm_us * 2.0 + attn_candle_us + add_us * 2.0;
-        let layer_total = linear_total + non_linear;
-        eprintln!("\n════════════════════════════════════════════════");
-        eprintln!("Per-layer breakdown (context_len={context_len}):");
-        eprintln!("  Linear (QKV+O+MLP):  {linear_total:.0} µs  ({:.1}%)", linear_total/layer_total*100.0);
-        eprintln!("  Non-linear:          {non_linear:.0} µs  ({:.1}%)", non_linear/layer_total*100.0);
-        eprintln!("    RMSNorm ×2:        {:.0} µs", rmsnorm_us*2.0);
-        eprintln!("    Attn (candle):     {attn_candle_us:.0} µs");
-        eprintln!("    Residual add ×2:   {:.0} µs", add_us*2.0);
-        eprintln!("  Per-layer total:     {layer_total:.0} µs");
-        eprintln!("  28 layers total:     {:.1} ms", layer_total * 28.0 / 1000.0);
-        eprintln!("════════════════════════════════════════════════");
+        assert_eq!(generated, ref_generated,
+            "multi-step decode mismatch: cached={generated:?} vs reforward={ref_generated:?}");
     }
 }

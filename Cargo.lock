@@ -2678,7 +2678,6 @@ dependencies = [
  "half",
  "hf-hub",
  "inventory",
- "nix",
  "rand 0.10.0",
  "rayon",
  "serde",
@@ -2686,6 +2685,22 @@ dependencies = [
  "thiserror 2.0.18",
  "tokenizers",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "prelude-cpu"
+version = "0.1.0"
+dependencies = [
+ "bc-mimalloc",
+ "bytemuck",
+ "candle-core",
+ "ctor",
+ "half",
+ "inventory",
+ "nix",
+ "prelude-core",
+ "rayon",
  "tracing",
 ]
 

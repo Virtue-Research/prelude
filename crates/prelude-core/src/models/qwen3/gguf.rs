@@ -51,7 +51,7 @@ impl Qwen3GgufModel {
     pub fn forward(
         &mut self,
         _packed_input: &Tensor,
-        _ctx: &mut crate::models::common::BatchAttnContext,
+        _ctx: &mut crate::modules::BatchAttnContext,
     ) -> Result<Tensor> {
         crate::tensor::bail!("GGUF model does not support varlen forward")
     }
@@ -61,7 +61,7 @@ impl crate::models::ModelForward for Qwen3GgufModel {
     fn forward(
         &mut self,
         _packed_input: &Tensor,
-        _ctx: &mut crate::models::common::BatchAttnContext,
+        _ctx: &mut crate::modules::BatchAttnContext,
     ) -> crate::tensor::Result<Tensor> {
         crate::tensor::bail!("GGUF model does not support varlen forward")
     }

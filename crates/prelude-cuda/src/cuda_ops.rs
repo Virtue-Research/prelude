@@ -8,10 +8,17 @@ use std::sync::Arc;
 use candle_core::{DType, Result, Tensor};
 use prelude_core::ops::traits::*;
 
-/// Factory: create the full Ops bundle for CUDA devices.
+/// Return a static reference to the CUDA Ops bundle (created once on first call).
 ///
 /// Called by the composition root (prelude-server) at startup.
 /// Also registers the GPU GEMM dispatch with candle-core.
+pub fn cuda_ops() -> &'static Ops {
+    use std::sync::LazyLock;
+    static OPS: LazyLock<Ops> = LazyLock::new(create_cuda_ops);
+    &OPS
+}
+
+/// Factory: create the full Ops bundle for CUDA devices.
 pub fn create_cuda_ops() -> Ops {
     // Register GPU GEMM dispatch so Tensor::matmul() routes through CUTLASS/DeepGEMM.
     crate::ops::gemm::register_gpu_gemm();
@@ -317,10 +324,7 @@ fn select_attention_backend() -> Arc<dyn AttentionOps + 'static> {
     }
 
     #[allow(unreachable_code)]
-    {
-        tracing::warn!("no GPU attention backend compiled, falling back to CPU attn ops");
-        Arc::new(prelude_core::ops::CpuOps)
-    }
+    panic!("no GPU attention backend compiled — enable at least one of: flash-attn, flash-attn-v3, flash-attn-v4, flashinfer")
 }
 
 // ── Shared dispatch helper ──────────────────────────────────────────

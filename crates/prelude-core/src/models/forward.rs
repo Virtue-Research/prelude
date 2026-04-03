@@ -1,6 +1,6 @@
 use crate::tensor::Tensor;
 
-use crate::models::common::BatchAttnContext;
+use crate::modules::BatchAttnContext;
 
 // ── Sub-traits ──────────────────────────────────────────────────────────
 

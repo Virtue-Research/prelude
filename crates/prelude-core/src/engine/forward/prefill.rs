@@ -89,7 +89,7 @@ impl Engine {
         token_groups: &[&[Vec<u32>]],
         need_hidden_states: bool,
     ) -> Result<Option<PrefillForwardResult>, EngineError> {
-        use crate::models::common::BatchAttnContext;
+        use crate::modules::BatchAttnContext;
 
         // ── Step 1: Prefix cache lookup ──
         let common_prefix = find_common_prefix_from_groups(token_groups);
@@ -166,7 +166,7 @@ impl Engine {
                 let run = (|| -> Result<(crate::tensor::Tensor, Option<crate::tensor::Tensor>), EngineError> {
                     if use_paged_forward {
                         if let Some(pool) = &self.cache.paged_pool {
-                            use crate::models::common::PagedKvBatchContext;
+                            use crate::modules::PagedKvBatchContext;
 
                             paged_block_size = pool.block_size;
 
@@ -261,7 +261,7 @@ impl Engine {
                                 let lm = model.as_logits_model_mut()
                                     .expect("hidden states requested but model doesn't support LogitsSplitModel");
                                 let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
-                                let last = crate::models::common::last_token_select(&hidden, &seq_lens)
+                                let last = crate::modules::last_token_select(&hidden, &seq_lens)
                                     .map_err(candle_err)?;
                                 let logits = lm.compute_logits(&last).map_err(candle_err)?
                                     .unsqueeze(1).map_err(candle_err)?;
@@ -290,7 +290,7 @@ impl Engine {
                         let lm = model.as_logits_model_mut()
                             .expect("hidden states requested but model doesn't support LogitsSplitModel");
                         let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
-                        let last = crate::models::common::last_token_select(&hidden, &seq_lens)
+                        let last = crate::modules::last_token_select(&hidden, &seq_lens)
                             .map_err(candle_err)?;
                         let logits = lm.compute_logits(&last).map_err(candle_err)?
                             .unsqueeze(1).map_err(candle_err)?;

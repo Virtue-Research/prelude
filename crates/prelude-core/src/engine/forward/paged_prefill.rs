@@ -1,8 +1,8 @@
 use crate::engine::*;
 #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
-use crate::models::common::BatchAttnContext;
+use crate::modules::BatchAttnContext;
 #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
-use crate::models::common::PagedKvBatchContext;
+use crate::modules::PagedKvBatchContext;
 
 impl Engine {
     /// Batch prefill multiple requests using varlen paged attention.
@@ -165,7 +165,7 @@ impl Engine {
             let lm = model.as_logits_model_mut()
                 .expect("prompt logprobs requested but model doesn't support LogitsSplitModel");
             let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
-            let last_hidden = crate::models::common::last_token_select(&hidden, &q_seq_lens)
+            let last_hidden = crate::modules::last_token_select(&hidden, &q_seq_lens)
                 .map_err(candle_err)?;
             let last_logits = lm.compute_logits(&last_hidden).map_err(candle_err)?
                 .unsqueeze(1).map_err(candle_err)?;

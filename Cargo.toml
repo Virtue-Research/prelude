@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/prelude-core",
+    "crates/prelude-cpu",
     "crates/prelude-server",
     "crates/prelude-microbench",
     "crates/prelude-cuda",

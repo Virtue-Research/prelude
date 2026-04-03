@@ -141,7 +141,7 @@ impl CacheManager {
             // Use shared tile_n calculation. head_dim_v defaults to head_dim
             // (correct for all current models; DeepSeek MLA would need head_dim_v
             // added to CommonModelConfig for the 192/128 case).
-            let tile_n = crate::models::common::attn::fa4_tile_n(head_dim, head_dim);
+            let tile_n = crate::modules::attn::fa4_tile_n(head_dim, head_dim);
             if paged_block_size != tile_n {
                 let old = paged_block_size;
                 paged_block_size = tile_n;

@@ -72,26 +72,13 @@ fn main() {
     }
 
     // ── Phase 3: TVM FFI ─────────────────────────────────────────────
-    // Reuse FA4's vendored tvm_ffi. If FA4 isn't available, check for a local copy.
     if has_dsl_kernels {
-        let fa4_vendor = manifest_dir.join("../fa4/vendor");
-        let local_vendor = manifest_dir.join("vendor");
-        let vendor_dir = if fa4_vendor.join("tvm_ffi/src").exists() {
-            fa4_vendor
-        } else if local_vendor.join("tvm_ffi/src").exists() {
-            local_vendor
-        } else {
-            println!(
-                "cargo:warning=cuLA DSL: no TVM FFI vendor found, DSL kernels will not link.\n\
-                 Copy or symlink fa4/vendor to cula/vendor."
-            );
-            // Still generate empty dispatch
-            generate_dispatch_code(&kernels_dir, &out_dir, false);
-            link_cuda_runtime(&cuda_path);
-            return;
-        };
-
-        compile_tvm_ffi_static(&vendor_dir, &manifest_dir, &out_dir, &cuda_path);
+        let workspace_root = manifest_dir.parent().unwrap().parent().unwrap().parent().unwrap();
+        let tvm_ffi_dir = workspace_root.join("third_party/tvm-ffi");
+        if !tvm_ffi_dir.join("src").exists() {
+            panic!("third_party/tvm-ffi not found. Run: git submodule update --init --recursive third_party/tvm-ffi");
+        }
+        compile_tvm_ffi_static(&tvm_ffi_dir, &manifest_dir, &out_dir, &cuda_path);
     }
 
     // ── Phase 4: Generate dispatch code ──────────────────────────────
@@ -311,27 +298,19 @@ fn link_dsl_kernel_objects(kernels_dir: &Path, out_dir: &Path) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Phase 3: TVM FFI (reuse FA4's vendored copy)
+// Phase 3: TVM FFI (from third_party/tvm-ffi)
 // ─────────────────────────────────────────────────────────────────────
 
-fn compile_tvm_ffi_static(vendor_dir: &Path, manifest_dir: &Path, out_dir: &Path, _cuda_path: &Path) {
-    let tvm_src = vendor_dir.join("tvm_ffi/src");
-    let tvm_include = vendor_dir.join("tvm_ffi/include");
-    let dlpack_include = vendor_dir.join("tvm_ffi/3rdparty/dlpack/include");
-
-    if !tvm_src.exists() {
-        println!("cargo:warning=cuLA: TVM FFI source not found, DSL kernels may fail to link");
-        return;
-    }
+fn compile_tvm_ffi_static(tvm_ffi_dir: &Path, manifest_dir: &Path, out_dir: &Path, _cuda_path: &Path) {
+    let tvm_src = tvm_ffi_dir.join("src");
+    let tvm_include = tvm_ffi_dir.join("include");
+    let dlpack_include = tvm_ffi_dir.join("3rdparty/dlpack/include");
 
     let cc_files: Vec<PathBuf> = walkdir(&tvm_src, "cc")
         .into_iter()
         .filter(|p| {
             let name = p.file_name().unwrap().to_str().unwrap_or("");
-            !name.contains("win")
-                && !name.contains("testing")
-                && name != "backtrace.cc"
-                && name != "backtrace_win.cc"
+            !name.contains("win") && !name.contains("testing")
         })
         .collect();
 
@@ -363,21 +342,61 @@ fn compile_tvm_ffi_static(vendor_dir: &Path, manifest_dir: &Path, out_dir: &Path
     build.try_compile("cula_tvm_ffi_static")
         .expect("Failed to compile TVM FFI for cuLA");
 
-    // cuda_dialect_runtime_static.a
+    // Compile libbacktrace (backtrace.cc references it)
+    compile_libbacktrace(tvm_ffi_dir, out_dir);
+
+    // cuda_dialect_runtime_static.a — from fa4-venv or cula-venv
+    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap().parent().unwrap();
     let cuda_dialect_lib = "libcuda_dialect_runtime_static.a";
-    let vendor_path = vendor_dir.join("cuda_dialect").join(cuda_dialect_lib);
-    let cuda_dialect_dir = if vendor_path.exists() {
-        Some(vendor_dir.join("cuda_dialect"))
-    } else {
-        find_file_recursive(&out_dir.join("cula-venv"), cuda_dialect_lib)
-            .map(|p| p.parent().unwrap().to_path_buf())
-    };
+    let cuda_dialect_dir = find_file_recursive(&workspace_root.join("target/fa4-venv"), cuda_dialect_lib)
+        .or_else(|| find_file_recursive(&out_dir.join("cula-venv"), cuda_dialect_lib))
+        .map(|p| p.parent().unwrap().to_path_buf());
     if let Some(dir) = cuda_dialect_dir {
         println!("cargo:rustc-link-search=native={}", dir.display());
         println!("cargo:rustc-link-lib=static:+whole-archive=cuda_dialect_runtime_static");
     } else {
         println!("cargo:warning=cuLA: cuda_dialect_runtime_static.a not found");
     }
+}
+
+fn compile_libbacktrace(tvm_ffi_dir: &Path, out_dir: &Path) {
+    let bt_dir = tvm_ffi_dir.join("3rdparty/libbacktrace");
+    if !bt_dir.exists() {
+        panic!("libbacktrace not found. Run: git submodule update --init --recursive third_party/tvm-ffi");
+    }
+
+    let config_dir = out_dir.join("libbacktrace");
+    std::fs::create_dir_all(&config_dir).unwrap();
+
+    let config_h = if cfg!(target_os = "linux") {
+        "#define BACKTRACE_ELF_SIZE 64\n#define HAVE_ATOMIC_FUNCTIONS 1\n#define HAVE_DL_ITERATE_PHDR 1\n\
+         #define HAVE_DLFCN_H 1\n#define HAVE_FCNTL 1\n#define HAVE_LINK_H 1\n#define HAVE_LSTAT 1\n\
+         #define HAVE_READLINK 1\n#define HAVE_SYS_MMAN_H 1\n#define HAVE_DECL_STRNLEN 1\n#define HAVE_DECL_GETPAGESIZE 0\n"
+    } else if cfg!(target_os = "macos") {
+        "#define BACKTRACE_ELF_SIZE 64\n#define HAVE_ATOMIC_FUNCTIONS 1\n#define HAVE_DLFCN_H 1\n\
+         #define HAVE_FCNTL 1\n#define HAVE_MACH_O_DYLD_H 1\n#define HAVE_SYS_MMAN_H 1\n\
+         #define HAVE_DECL_STRNLEN 1\n#define HAVE_DECL_GETPAGESIZE 0\n"
+    } else {
+        "#define HAVE_ATOMIC_FUNCTIONS 1\n#define HAVE_DECL_STRNLEN 1\n#define HAVE_DECL_GETPAGESIZE 0\n"
+    };
+    std::fs::write(config_dir.join("config.h"), config_h).unwrap();
+
+    let core_files = ["backtrace.c", "dwarf.c", "fileline.c", "posix.c",
+                      "sort.c", "state.c", "alloc.c", "read.c", "mmapio.c", "mmap.c"];
+    let format_file = if cfg!(target_os = "macos") { "macho.c" } else { "elf.c" };
+
+    let mut build = cc::Build::new();
+    build.opt_level(2).pic(true).include(&bt_dir).include(&config_dir)
+        .define("_GNU_SOURCE", None).warnings(false);
+
+    for name in &core_files {
+        let f = bt_dir.join(name);
+        if f.exists() { build.file(&f); }
+    }
+    let fmt = bt_dir.join(format_file);
+    if fmt.exists() { build.file(&fmt); }
+
+    build.try_compile("cula_backtrace").expect("Failed to compile libbacktrace for cuLA");
 }
 
 // ─────────────────────────────────────────────────────────────────────

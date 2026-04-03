@@ -19,9 +19,9 @@ use crate::tensor::{DType, Device, Module, Result, Tensor, D};
 use crate::nn_ops::{CandleLinear, Embedding};
 use crate::loading::var_builder::VarBuilder;
 
-use crate::models::common::varlen_attention;
+use crate::modules::varlen_attention;
 
-use crate::models::common::{
+use crate::modules::{
     fast_add, fast_rms_norm, last_token_select, BatchAttnContext,
     LayerAttnContext, Linear, RmsNorm, TransformerBlock,
 };
@@ -1003,7 +1003,7 @@ impl Qwen3_5Mlp {
     fn forward(&self, ops: &crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        crate::models::common::fast_silu_mul(ops, &gate, &up)?.apply(&self.down_proj)
+        crate::modules::fast_silu_mul(ops, &gate, &up)?.apply(&self.down_proj)
     }
 }
 
@@ -1096,8 +1096,8 @@ impl Qwen3_5SparseMoeBlock {
         let down_w = self.experts_down.get(expert_idx)?; // [hidden, inter]
         let inter = self.moe_intermediate_size;
 
-        if x.device().is_cpu() && x.dtype() == DType::F32 {
-            return self.expert_forward_onednn(x, &gate_up_w, &down_w, inter);
+        if x.device().is_cpu() {
+            return self.expert_forward_matmul(x, &gate_up_w, &down_w, inter);
         }
 
         let gate_up = x.matmul(&gate_up_w.t()?)?;
@@ -1108,64 +1108,18 @@ impl Qwen3_5SparseMoeBlock {
         hidden.matmul(&down_w.t()?)
     }
 
-    fn expert_forward_onednn(
+    fn expert_forward_matmul(
         &self, x: &Tensor, gate_up_w: &Tensor, down_w: &Tensor, inter: usize,
     ) -> Result<Tensor> {
-        crate::ops::onednn::init();
-        let x_cont = x.contiguous()?;
-        let x_slice = crate::ops::cpu::tensor_as_f32_slice(&x_cont)?;
-        let gate_up_cont = gate_up_w.contiguous()?;
-        let gate_up_slice = crate::ops::cpu::tensor_as_f32_slice(&gate_up_cont)?;
-        let down_cont = down_w.contiguous()?;
-        let down_slice = crate::ops::cpu::tensor_as_f32_slice(&down_cont)?;
-
-        let x_dims = x_cont.dims();
-        let m = if x_dims.len() == 1 { 1 } else { x_dims[0] };
-        let k_in = *x_dims.last().unwrap();
-        let n_gate_up = 2 * inter;
-        let hidden_out = down_w.dim(0)?;
-
-        let mut gate_up_buf = vec![0.0f32; m * n_gate_up];
-        unsafe {
-            crate::ops::onednn::ffi::onednn_f32_linear(
-                x_slice.as_ptr() as *const _,
-                gate_up_slice.as_ptr() as *const _,
-                gate_up_buf.as_mut_ptr() as *mut _,
-                m as i64, k_in as i64, n_gate_up as i64,
-            );
-        }
-
+        // gate_up GEMM: x @ gate_up_w^T
+        let gate_up = x.matmul(&gate_up_w.t()?)?;
+        let gate = gate_up.narrow(gate_up.dims().len() - 1, 0, inter)?;
+        let up = gate_up.narrow(gate_up.dims().len() - 1, inter, inter)?;
         // SiLU(gate) * up
-        let mut hidden_buf = vec![0.0f32; m * inter];
-        for row in 0..m {
-            let base = row * n_gate_up;
-            let dst = row * inter;
-            for i in 0..inter {
-                let gate_val = gate_up_buf[base + i];
-                let silu = gate_val / (1.0 + (-gate_val).exp());
-                hidden_buf[dst + i] = silu * gate_up_buf[base + inter + i];
-            }
-        }
-
-        // hidden @ down_w^T: [m, inter] @ [hidden_out, inter]^T → [m, hidden_out]
-        let mut out_buf = vec![0.0f32; m * hidden_out];
-        unsafe {
-            crate::ops::onednn::ffi::onednn_f32_linear(
-                hidden_buf.as_ptr() as *const _,
-                down_slice.as_ptr() as *const _,
-                out_buf.as_mut_ptr() as *mut _,
-                m as i64, inter as i64, hidden_out as i64,
-            );
-        }
-
-        let out_shape: Vec<usize> = if x_dims.len() == 1 {
-            vec![hidden_out]
-        } else {
-            let mut s = x_dims[..x_dims.len() - 1].to_vec();
-            s.push(hidden_out);
-            s
-        };
-        Tensor::from_vec(out_buf, out_shape.as_slice(), x.device())
+        let silu_gate = crate::nn_ops::Activation::Silu.forward(&gate)?;
+        let hidden = (&silu_gate * &up)?;
+        // down GEMM: hidden @ down_w^T
+        hidden.matmul(&down_w.t()?)
     }
 
     fn forward_2d(&self, ops: &crate::ops::Ops, xs: &Tensor) -> Result<Tensor> {
@@ -1536,7 +1490,7 @@ impl Qwen3_5Model {
     }
 
     pub(super) fn forward_with_cache(&mut self, input_ids: &Tensor, position_offset: usize) -> Result<Tensor> {
-        let ops = crate::ops::cpu_ops();
+        let ops = crate::ops::select_ops(input_ids.device());
         let mut h = self.embed_tokens.forward(input_ids)?;
         for layer in self.layers.iter_mut() {
             h = layer.forward_with_cache(ops, &h, position_offset)?;

@@ -67,7 +67,7 @@ pub fn embedding(vocab_size: usize, hidden_size: usize, vb: VarBuilder) -> Resul
 
 /// A linear layer: `y = x @ weight.T + bias`.
 ///
-/// This replaces `candle_nn::Linear`. The project's own `crate::models::common::Linear`
+/// This replaces `candle_nn::Linear`. The project's own `crate::modules::Linear`
 /// wraps *this* struct (or the oneDNN variant) and should be preferred in model code.
 #[derive(Clone, Debug)]
 pub struct CandleLinear {

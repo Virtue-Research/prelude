@@ -8,7 +8,7 @@ use std::io::{Read, Seek};
 use std::sync::Arc;
 
 use crate::constants::GGUF_INTERMEDIATE_SIZE_MULTIPLIER;
-use crate::models::common::{Linear, RmsNorm, TransformerBlock};
+use crate::modules::{Linear, RmsNorm, TransformerBlock};
 use crate::nn_ops::Embedding;
 
 // ── Config ──────────────────────────────────────────────────────────────
@@ -379,7 +379,7 @@ impl Qwen3_5GgufModel {
     pub fn forward(
         &mut self,
         packed_input: &Tensor,
-        ctx: &mut crate::models::common::BatchAttnContext,
+        ctx: &mut crate::modules::BatchAttnContext,
     ) -> Result<Tensor> {
         self.inner.forward(packed_input, ctx)
     }
@@ -399,7 +399,7 @@ impl crate::models::ModelForward for Qwen3_5GgufModel {
     fn forward(
         &mut self,
         packed_input: &Tensor,
-        ctx: &mut crate::models::common::BatchAttnContext,
+        ctx: &mut crate::modules::BatchAttnContext,
     ) -> Result<Tensor> {
         self.inner.forward(packed_input, ctx)
     }

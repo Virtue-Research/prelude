@@ -1,8 +1,8 @@
 use crate::engine::*;
 #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
-use crate::models::common::BatchAttnContext;
+use crate::modules::BatchAttnContext;
 #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
-use crate::models::common::PagedKvBatchContext;
+use crate::modules::PagedKvBatchContext;
 
 impl Engine {
     /// Batched decode step: N sequences, each with Q=1 (one new token),

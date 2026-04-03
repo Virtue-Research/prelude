@@ -1469,10 +1469,13 @@ def compile_source(
         if p.exists():
             include_dirs.append(str(p))
 
-    # Find TVM FFI headers
+    # Find TVM FFI headers (+ dlpack sub-dependency)
     tvm_ffi_include = _find_tvm_ffi_include(fi_src)
     if tvm_ffi_include:
         include_dirs.append(str(tvm_ffi_include))
+        dlpack_include = tvm_ffi_include.parent / "3rdparty" / "dlpack" / "include"
+        if dlpack_include.exists():
+            include_dirs.append(str(dlpack_include))
 
     cmd = [
         "nvcc", "-c", str(src), "-o", str(obj),
@@ -1497,25 +1500,12 @@ def compile_source(
 
 
 def _find_tvm_ffi_include(fi_src: Path) -> Optional[Path]:
-    """Find TVM FFI include directory."""
-    # Check if flashinfer has 3rdparty/tvm_ffi
-    p = fi_src / "3rdparty" / "tvm_ffi" / "include"
+    """Find TVM FFI include directory from third_party/tvm-ffi."""
+    script_dir = Path(__file__).resolve().parent.parent  # prelude-flashinfer crate
+    workspace_root = script_dir.parent.parent.parent  # crates/prelude-cuda/flashinfer -> workspace
+    p = workspace_root / "third_party" / "tvm-ffi" / "include"
     if p.exists():
         return p
-    # Check FA4's vendored copy (same workspace)
-    script_dir = Path(__file__).resolve().parent.parent  # prelude-flashinfer crate
-    fa4_vendor = script_dir.parent / "prelude-flash-attn-v4" / "vendor" / "tvm_ffi" / "include"
-    if fa4_vendor.exists():
-        return fa4_vendor
-    # Check installed tvm_ffi package
-    try:
-        import tvm_ffi
-        pkg_dir = Path(tvm_ffi.__file__).parent
-        inc = pkg_dir / "include"
-        if inc.exists():
-            return inc
-    except ImportError:
-        pass
     return None
 
 
