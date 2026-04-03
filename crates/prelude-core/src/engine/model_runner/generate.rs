@@ -148,7 +148,7 @@ impl Engine {
         self.generate_prepared_batch(batch)
     }
 
-    pub(crate) fn plan_generate_batch(
+    pub fn plan_generate_batch(
         &self,
         items: Vec<PreparedGenerateRequest>,
     ) -> Result<PreparedGenerateBatch, EngineError> {
@@ -174,7 +174,7 @@ impl Engine {
         Ok(PreparedGenerateBatch { plan, items })
     }
 
-    pub(crate) fn generate_prepared_batch(
+    pub fn generate_prepared_batch(
         &self,
         batch: PreparedGenerateBatch,
     ) -> Result<Vec<GenerateResult>, EngineError> {

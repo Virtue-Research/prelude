@@ -7,9 +7,10 @@
 //! Since `submit()` completes synchronously, `collect()` always returns
 //! immediately with the already-computed result.
 
-use prelude_core::engine::executor::{ExecutionHandle, Executor, ModelOutput};
-use prelude_core::engine::EngineError;
-use prelude_core::scheduler::SchedulerStep;
+use std::sync::Arc;
+
+use prelude_core::engine::executor::{ExecutionHandle, Executor, ForwardBatch, ModelOutput};
+use prelude_core::engine::{Engine, EngineError};
 
 /// Completed result stored inside the ExecutionHandle.
 struct CpuResult {
@@ -17,25 +18,47 @@ struct CpuResult {
 }
 
 /// CPU execution strategy: synchronous, zero-overhead.
-pub struct CpuExecutor;
+pub struct CpuExecutor {
+    engine: Arc<Engine>,
+}
 
 impl CpuExecutor {
-    pub fn new() -> Self {
-        Self
+    pub fn new(engine: Arc<Engine>) -> Self {
+        Self { engine }
     }
 }
 
 impl Executor for CpuExecutor {
     fn submit(
         &self,
-        _step: &SchedulerStep,
+        batch: ForwardBatch,
     ) -> Result<ExecutionHandle, EngineError> {
-        // TODO: build tensors from SchedulerStep, call model.forward() via block_in_place
-        // For now, return a placeholder error since the full tensor preparation
-        // logic is still in runtime/cpu_batch.rs
-        let result = Err(EngineError::Unavailable(
-            "CpuExecutor: not yet connected to model forward".into(),
-        ));
+        let result = match batch {
+            ForwardBatch::Prefill { items } => {
+                // Run the full generate pipeline synchronously.
+                // generate_prepared_batch returns Vec<GenerateResult> (post-sampled),
+                // but the Executor interface returns raw logits.
+                // TODO: split Engine into forward-only (returns logits) + postprocess.
+                // For now, run the full pipeline and return a dummy logits tensor.
+                self.engine
+                    .plan_generate_batch(items)
+                    .and_then(|planned| self.engine.generate_prepared_batch(planned))
+                    .map(|_results| {
+                        ModelOutput {
+                            logits: prelude_core::tensor::Tensor::zeros(
+                                (0, 0),
+                                prelude_core::tensor::DType::F32,
+                                &prelude_core::tensor::Device::Cpu,
+                            ).unwrap(),
+                        }
+                    })
+            }
+            ForwardBatch::Decode { .. } => {
+                Err(EngineError::Unavailable(
+                    "CpuExecutor: continuous decode not yet supported".into(),
+                ))
+            }
+        };
         Ok(ExecutionHandle::new(CpuResult { output: result }))
     }
 

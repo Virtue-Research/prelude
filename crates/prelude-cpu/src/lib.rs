@@ -11,7 +11,7 @@
 #[ctor::ctor]
 fn _register_cpu_ops() {
     prelude_core::ops::register_cpu_ops(cpu_ops::cpu_ops);
-    prelude_core::engine::executor::register_executor(|| Box::new(executor::CpuExecutor::new()));
+    prelude_core::engine::executor::register_executor(|engine| Box::new(executor::CpuExecutor::new(engine)));
 }
 
 // ── CPU kernel modules ─────────────────────────────────────────────

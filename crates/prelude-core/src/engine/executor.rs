@@ -1,6 +1,6 @@
 //! Device execution trait.
 //!
-//! `Executor` defines how scheduled batches are submitted to and collected from
+//! `Executor` defines how forward passes are submitted to and collected from
 //! a device. Device crates (prelude-cuda, prelude-cpu, ...) implement this trait
 //! with device-specific optimizations:
 //!
@@ -68,12 +68,31 @@ pub struct ModelOutput {
     pub logits: Tensor,
 }
 
+// ── Forward batch ──────────────────────────────────────────────────
+
+/// What the Executor should run. Built by the scheduling loop from
+/// `ArSequenceState` + `SchedulerStep`, then passed to `submit()`.
+pub enum ForwardBatch {
+    /// Prefill: process full prompt sequences.
+    /// Contains prepared requests with token IDs, sampling params, etc.
+    Prefill {
+        items: Vec<super::PreparedGenerateRequest>,
+    },
+    /// Decode: generate one token per active sequence.
+    /// Each entry is (pending_token, position, block_table).
+    Decode {
+        tokens: Vec<u32>,
+        positions: Vec<usize>,
+        block_tables: Vec<Vec<u32>>,
+    },
+}
+
 // ── Executor trait ─────────────────────────────────────────────────
 
 /// Device execution strategy.
 ///
 /// Implementors handle:
-/// - Converting `ScheduledBatch` (logical) → device tensors (physical)
+/// - Building device-specific tensors from `ForwardBatch`
 /// - Running `model.forward()` on the device
 /// - Device-specific optimizations (GPU queue, CUDA graph, HIP graph, ...)
 ///
@@ -87,7 +106,7 @@ pub trait Executor: Send + Sync + 'static {
     /// - **CPU**: runs `model.forward()` synchronously, returns a completed handle.
     fn submit(
         &self,
-        step: &crate::scheduler::SchedulerStep,
+        batch: ForwardBatch,
     ) -> Result<ExecutionHandle, EngineError>;
 
     /// Await completion of a submitted forward pass and retrieve output.
@@ -102,7 +121,10 @@ pub trait Executor: Send + Sync + 'static {
 
 // ── Registration ───────────────────────────────────────────────────
 
-type ExecutorFactory = fn() -> Box<dyn Executor>;
+/// Factory function signature: takes shared engine state, returns a device executor.
+/// The factory is registered at link time (ctor), but called at runtime when
+/// Engine is ready.
+pub type ExecutorFactory = fn(engine: std::sync::Arc<super::engine::Engine>) -> Box<dyn Executor>;
 
 static EXECUTOR_FACTORY: OnceLock<ExecutorFactory> = OnceLock::new();
 
@@ -113,16 +135,16 @@ pub fn register_executor(factory: ExecutorFactory) {
     EXECUTOR_FACTORY.set(factory).ok();
 }
 
-/// Create the registered executor, or return `None` if no device crate
-/// registered one.
-pub fn create_executor() -> Option<Box<dyn Executor>> {
-    EXECUTOR_FACTORY.get().map(|f| f())
+/// Create the registered executor with the given engine, or return `None`
+/// if no device crate registered one.
+pub fn create_executor(engine: std::sync::Arc<super::engine::Engine>) -> Option<Box<dyn Executor>> {
+    EXECUTOR_FACTORY.get().map(|f| f(engine))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::{SchedulerStep, ForwardMode};
+    use crate::scheduler::SchedulerStep;
 
     /// Mock result stored in the handle.
     struct MockResult(Tensor);
@@ -135,9 +157,12 @@ mod tests {
     impl Executor for TestExecutor {
         fn submit(
             &self,
-            step: &SchedulerStep,
+            batch: ForwardBatch,
         ) -> Result<ExecutionHandle, EngineError> {
-            let batch_size = step.prefill_request_ids.len() + step.decode_request_ids.len();
+            let batch_size = match &batch {
+                ForwardBatch::Prefill { items } => items.len(),
+                ForwardBatch::Decode { tokens, .. } => tokens.len(),
+            };
             let logits = Tensor::zeros(
                 (batch_size, self.vocab_size),
                 crate::tensor::DType::F32,
@@ -157,53 +182,37 @@ mod tests {
     }
 
     #[test]
-    fn submit_collect_roundtrip() {
+    fn submit_collect_prefill() {
         let executor = TestExecutor { vocab_size: 100 };
-        let step = SchedulerStep::prefill(vec!["r1".into(), "r2".into()]);
+        let batch = ForwardBatch::Prefill { items: vec![] };
 
-        let handle = executor.submit(&step).unwrap();
+        let handle = executor.submit(batch).unwrap();
         let output = executor.collect(handle).unwrap();
-
-        assert_eq!(output.logits.dims(), &[2, 100]);
+        assert_eq!(output.logits.dims(), &[0, 100]);
     }
 
     #[test]
-    fn submit_decode_step() {
+    fn submit_collect_decode() {
         let executor = TestExecutor { vocab_size: 50 };
-        let step = SchedulerStep::decode(vec!["r1".into(), "r2".into(), "r3".into()]);
+        let batch = ForwardBatch::Decode {
+            tokens: vec![1, 2, 3],
+            positions: vec![10, 20, 30],
+            block_tables: vec![vec![0, 1], vec![0, 2], vec![0, 3]],
+        };
 
-        let handle = executor.submit(&step).unwrap();
+        let handle = executor.submit(batch).unwrap();
         let output = executor.collect(handle).unwrap();
-
         assert_eq!(output.logits.dims(), &[3, 50]);
-    }
-
-    #[test]
-    fn submit_mixed_step() {
-        let executor = TestExecutor { vocab_size: 32 };
-        let step = SchedulerStep::mixed(
-            vec!["p1".into()],
-            vec!["d1".into(), "d2".into()],
-        );
-
-        let handle = executor.submit(&step).unwrap();
-        let output = executor.collect(handle).unwrap();
-
-        // 1 prefill + 2 decode = 3 total
-        assert_eq!(output.logits.dims(), &[3, 32]);
     }
 
     #[test]
     fn collect_wrong_handle_type() {
         let executor = TestExecutor { vocab_size: 10 };
-
-        // Create a handle with the wrong inner type
         let bad_handle = ExecutionHandle::new(42u32);
         let result = executor.collect(bad_handle);
 
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("wrong handle type"));
+        assert!(result.unwrap_err().to_string().contains("wrong handle type"));
     }
 
     #[test]

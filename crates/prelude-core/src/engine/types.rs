@@ -152,13 +152,13 @@ pub(crate) enum ExecutionKind {
 ///
 /// The scheduler constructs these once so the engine hot path can avoid
 /// repeated tokenization and request normalization.
-pub(crate) struct PreparedGenerateRequest {
-    pub(crate) request_idx: usize,
-    pub(crate) request: GenerateRequest,
-    pub(crate) prompt_tokens: Vec<u32>,
-    pub(crate) max_new: usize,
-    pub(crate) is_greedy: bool,
-    pub(crate) logits_processor: LogitsProcessor,
+pub struct PreparedGenerateRequest {
+    pub request_idx: usize,
+    pub request: GenerateRequest,
+    pub prompt_tokens: Vec<u32>,
+    pub max_new: usize,
+    pub is_greedy: bool,
+    pub logits_processor: LogitsProcessor,
 }
 
 /// Logical prefix reuse candidate discovered during queue-side planning.
@@ -217,15 +217,15 @@ pub(crate) struct DecodePlan {
 
 /// A prepared generation batch plan produced before execution.
 #[derive(Clone, Debug)]
-pub(crate) enum GenerateBatchPlan {
+pub enum GenerateBatchPlan {
     Prefill(PrefillPlan),
     Decode(DecodePlan),
 }
 
 /// A prepared generation batch plus its queue-side logical plan.
-pub(crate) struct PreparedGenerateBatch {
-    pub(crate) plan: GenerateBatchPlan,
-    pub(crate) items: Vec<PreparedGenerateRequest>,
+pub struct PreparedGenerateBatch {
+    pub plan: GenerateBatchPlan,
+    pub items: Vec<PreparedGenerateRequest>,
 }
 
 // ── Batch item types ────────────────────────────────────────────────────

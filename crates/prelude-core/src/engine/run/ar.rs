@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use crate::engine::{
     DecodeMetrics, EngineError, Engine, PreparedGenerateRequest, TokenLogprobInfo, Usage,
 };
-use crate::engine::executor::{Executor, ModelOutput};
+use crate::engine::executor::{Executor, ForwardBatch, ModelOutput};
 use crate::scheduler::{
     FinishReason, Scheduler, SchedulerConfig, SchedulerStep, SeqFinishReason, Sequence,
     SamplingParams,
@@ -166,8 +166,9 @@ pub async fn ar_loop(
             continue;
         };
 
-        // ── Phase 4: Submit to device via Executor ─────────────────
-        let handle = match executor.submit(&step) {
+        // ── Phase 4: Build ForwardBatch and submit to Executor ──────
+        let batch = build_forward_batch(&mut states, &step);
+        let handle = match executor.submit(batch) {
             Ok(h) => h,
             Err(error) => {
                 fail_step(&engine, &mut scheduler, &mut states, &step, error);
@@ -242,6 +243,36 @@ fn handle_message(
     }
 }
 
+// ── Batch construction ─────────────────────────────────────────────
+
+fn build_forward_batch(
+    states: &mut HashMap<String, ArSequenceState>,
+    step: &SchedulerStep,
+) -> ForwardBatch {
+    if !step.prefill_request_ids.is_empty() {
+        // Prefill: extract PreparedGenerateRequests from states
+        let items: Vec<_> = step.prefill_request_ids.iter()
+            .filter_map(|id| {
+                states.get_mut(id).and_then(|s| s.prepared.take())
+            })
+            .collect();
+        ForwardBatch::Prefill { items }
+    } else {
+        // Decode: collect (token, position, block_table) per sequence
+        let mut tokens = Vec::with_capacity(step.decode_request_ids.len());
+        let mut positions = Vec::with_capacity(step.decode_request_ids.len());
+        let mut block_tables = Vec::with_capacity(step.decode_request_ids.len());
+        for id in &step.decode_request_ids {
+            if let Some(state) = states.get(id) {
+                tokens.push(state.pending_token.unwrap_or(0));
+                positions.push(state.next_decode_position);
+                block_tables.push(state.block_table.clone());
+            }
+        }
+        ForwardBatch::Decode { tokens, positions, block_tables }
+    }
+}
+
 // ── Output processing (sampling + stop conditions + delivery) ──────
 
 fn process_output(
@@ -257,7 +288,7 @@ fn process_output(
         .cloned()
         .collect();
 
-    // Sample tokens
+    // Sample tokens (needs &mut states for non-greedy LogitsProcessor::sample)
     let sampled = match sample_batch(states, &all_ids, logits) {
         Ok(tokens) => tokens,
         Err(error) => {
@@ -328,7 +359,7 @@ fn process_output(
 }
 
 fn sample_batch(
-    states: &HashMap<String, ArSequenceState>,
+    states: &mut HashMap<String, ArSequenceState>,
     ids: &[String],
     logits: &Tensor,
 ) -> Result<Vec<u32>, EngineError> {
@@ -345,7 +376,7 @@ fn sample_batch(
         for (row_idx, id) in ids.iter().enumerate() {
             let row = logits.get(row_idx)
                 .map_err(|e| EngineError::Internal(format!("get logits row failed: {e}")))?;
-            let Some(state) = states.get(id) else { tokens.push(0); continue; };
+            let Some(state) = states.get_mut(id) else { tokens.push(0); continue; };
             if state.is_greedy() {
                 let t = row.argmax(crate::tensor::D::Minus1)
                     .and_then(|t| t.to_scalar::<u32>())
@@ -354,13 +385,10 @@ fn sample_batch(
             } else {
                 let row_f32 = row.to_dtype(DType::F32)
                     .map_err(|e| EngineError::Internal(format!("to_dtype failed: {e}")))?;
-                // LogitsProcessor::sample takes &mut self
-                // We need mutable access, but states is borrowed immutably here.
-                // For now, use argmax as fallback for non-greedy (proper fix needs
-                // mutable state access or separating the logits processor).
-                let t = row_f32.argmax(crate::tensor::D::Minus1)
-                    .and_then(|t| t.to_scalar::<u32>())
-                    .map_err(|e| EngineError::Internal(format!("sample fallback failed: {e}")))?;
+                let t = state.prepared.as_mut()
+                    .ok_or_else(|| EngineError::Internal("missing prepared request".into()))?
+                    .logits_processor.sample(&row_f32)
+                    .map_err(|e| EngineError::Internal(format!("sample failed: {e}")))?;
                 tokens.push(t);
             }
         }
@@ -570,7 +598,7 @@ mod tests {
         });
 
         let ids = vec!["a".to_string(), "b".to_string()];
-        let tokens = sample_batch(&states_with_entries, &ids, &logits).unwrap();
+        let tokens = sample_batch(&mut states_with_entries, &ids, &logits).unwrap();
 
         assert_eq!(tokens, vec![2, 0]); // argmax of each row
     }
