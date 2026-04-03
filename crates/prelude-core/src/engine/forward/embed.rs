@@ -68,7 +68,9 @@ impl Engine {
             .model
             .lock()
             .map_err(|e| EngineError::Internal(format!("model lock poisoned: {e}")))?;
-        let dimensions = model.embedding_dim().unwrap_or(0);
+        let dimensions = model.as_embedding()
+            .map(|e| e.embedding_dim())
+            .unwrap_or(0);
         drop(model);
 
         Ok(RawEmbedOutput {

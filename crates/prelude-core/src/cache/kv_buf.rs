@@ -10,7 +10,7 @@
 //! 3. In `reset_kv_cache`: call `k_cache.reset()` (keeps buffer allocated)
 //! 4. Implement `ModelForward::forward_with_cache` and `supports_kv_cache`
 
-use candle_core::{Result, Tensor};
+use crate::tensor::{Result, Tensor};
 
 /// Pre-allocated KV cache buffer for a single K or V tensor.
 ///
@@ -72,7 +72,7 @@ impl KvBuf {
     pub fn view(&self) -> Result<Tensor> {
         match &self.buf {
             Some(buf) => buf.narrow(0, 0, self.len),
-            None => candle_core::bail!("KvBuf not initialized"),
+            None => crate::tensor::bail!("KvBuf not initialized"),
         }
     }
 

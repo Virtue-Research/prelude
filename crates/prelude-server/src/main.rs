@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -115,10 +118,13 @@ struct Cli {
 
     #[arg(
         long,
-        default_value_t = false,
-        help = "Enable CUDA graph capture for decode steps (reduces kernel launch overhead)"
+        default_value_t = true,
+        help = "CUDA graph capture for decode steps (default: true)"
     )]
     cuda_graph: bool,
+
+    #[arg(long, default_value = "auto", help = "Device: auto, cpu, cuda, cuda:N")]
+    device: String,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -192,13 +198,12 @@ fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
 
     let mut engine_config =
         EngineConfig::from_env().map_err(|e| anyhow::anyhow!("invalid engine config: {e}"))?;
+    engine_config.runtime.device = cli.device.clone();
     if let Some(ref dtype) = cli.dtype {
         engine_config.runtime.dtype = Some(dtype.clone());
     }
     engine_config.cache.gpu_memory_utilization = cli.gpu_memory_utilization;
-    if cli.cuda_graph {
-        engine_config.runtime.cuda_graph = true;
-    }
+    engine_config.runtime.cuda_graph = cli.cuda_graph;
     info!(?engine_config, "engine config loaded");
 
     let base_engine = if let Some(ref path) = cli.model_path {

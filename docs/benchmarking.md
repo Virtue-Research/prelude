@@ -84,3 +84,32 @@ python benchmark/benchmark.py complete \
 ```
 
 See `benchmark/README.md` for the full CLI reference.
+
+## Micro-Benchmarks (Kernel-Level)
+
+Low-level operator benchmarks live as binary targets in `prelude-core`.
+Each requires specific feature flags:
+
+```bash
+# CPU operator benchmarks (GEMM, attention, RMSNorm, RoPE, SiLU) — no special features needed
+cargo run --release --bin cpu_ops_bench -p prelude-core
+
+# GPU operator benchmarks (GEMM dispatch, elementwise, etc.) — requires CUDA
+cargo run --release --bin gpu_ops_bench -p prelude-core --features cuda
+
+# Tokenizer benchmark (fastokens vs HuggingFace tokenizers comparison)
+cargo run --release --bin tokenizer_bench -p prelude-core --features hf_tokenizer -- \
+  --model-path /path/to/model
+
+# Qwen3 end-to-end single-model benchmark — requires CUDA
+cargo run --release --bin qwen3_bench -p prelude-core --features cuda
+
+# Fused ops correctness test — requires CUDA
+cargo run --release --bin fused_ops_test -p prelude-core --features cuda
+
+# Gemma3 model test — requires CUDA
+cargo run --release --bin gemma3_test -p prelude-core --features cuda
+```
+
+These binaries use `required-features` in `Cargo.toml`, so `cargo check` will
+skip them when the needed features are not enabled.

@@ -18,7 +18,7 @@ pub(crate) struct PackedSequenceBatch {
 pub(crate) struct PrefillForwardResult {
     /// Raw model output tensor (not converted to F32 — callers decide dtype).
     /// Shape: (batch_size, vocab_size) — last token logits per sequence.
-    pub output: candle_core::Tensor,
+    pub output: crate::tensor::Tensor,
     /// Number of sequences per input item (for classify/embed grouping).
     pub item_seq_counts: Vec<usize>,
     /// Per-sequence query lengths (suffix lengths after prefix cache skip).
@@ -26,7 +26,7 @@ pub(crate) struct PrefillForwardResult {
     /// Hidden states before lm_head (total_tokens, hidden_dim).
     /// Only populated when prompt_logprobs requested. Much smaller than
     /// full logits (hidden_dim vs vocab_size), safe to pass across threads.
-    pub hidden_states: Option<candle_core::Tensor>,
+    pub hidden_states: Option<crate::tensor::Tensor>,
 }
 
 /// Find the longest common prefix across all token sequences in the groups.
@@ -89,7 +89,7 @@ impl Engine {
         token_groups: &[&[Vec<u32>]],
         need_hidden_states: bool,
     ) -> Result<Option<PrefillForwardResult>, EngineError> {
-        use crate::models::layers::BatchAttnContext;
+        use crate::modules::BatchAttnContext;
 
         // ── Step 1: Prefix cache lookup ──
         let common_prefix = find_common_prefix_from_groups(token_groups);
@@ -121,11 +121,11 @@ impl Engine {
         }
 
         let device = &self.executor.device;
-        let packed_input = candle_core::Tensor::from_vec(flat_tokens, (total_tokens,), device)
+        let packed_input = crate::tensor::Tensor::from_vec(flat_tokens, (total_tokens,), device)
             .map_err(candle_err)?;
-        let cu_seqlens_q_t = candle_core::Tensor::from_vec(cu_seqlens, (batch_size + 1,), device)
+        let cu_seqlens_q_t = crate::tensor::Tensor::from_vec(cu_seqlens, (batch_size + 1,), device)
             .map_err(candle_err)?;
-        let position_ids_t = candle_core::Tensor::from_vec(position_ids, (total_tokens,), device)
+        let position_ids_t = crate::tensor::Tensor::from_vec(position_ids, (total_tokens,), device)
             .map_err(candle_err)?;
 
         // ── Step 3: Varlen forward ──
@@ -163,10 +163,10 @@ impl Engine {
                     .iter()
                     .map(|&q| prefix_reuse.cached_len + q)
                     .collect();
-                let run = (|| -> Result<(candle_core::Tensor, Option<candle_core::Tensor>), EngineError> {
+                let run = (|| -> Result<(crate::tensor::Tensor, Option<crate::tensor::Tensor>), EngineError> {
                     if use_paged_forward {
                         if let Some(pool) = &self.cache.paged_pool {
-                            use crate::models::layers::PagedKvBatchContext;
+                            use crate::modules::PagedKvBatchContext;
 
                             paged_block_size = pool.block_size;
 
@@ -187,13 +187,13 @@ impl Engine {
                                     flat_bt.push(0);
                                 }
                             }
-                            let block_tables_t = candle_core::Tensor::from_vec(
+                            let block_tables_t = crate::tensor::Tensor::from_vec(
                                 flat_bt,
                                 (batch_size, max_blocks),
                                 device,
                             )
                             .map_err(candle_err)?
-                            .to_dtype(candle_core::DType::U32)
+                            .to_dtype(crate::tensor::DType::U32)
                             .map_err(candle_err)?;
 
                             // Slot mapping for suffix tokens being written to paged cache.
@@ -208,7 +208,7 @@ impl Engine {
                                     ));
                                 }
                             }
-                            let slot_mapping_t = candle_core::Tensor::new(slots.as_slice(), device)
+                            let slot_mapping_t = crate::tensor::Tensor::new(slots.as_slice(), device)
                                 .map_err(candle_err)?;
 
                             // cu_seqlens_k: cumulative full seq lengths (cached + suffix).
@@ -220,7 +220,7 @@ impl Engine {
                                 cu_seqlens_k.push(cu_seqlens_k.last().unwrap_or(&0) + k_len as u32);
                                 max_seqlen_k = max_seqlen_k.max(k_len);
                             }
-                            let cu_seqlens_k_t = candle_core::Tensor::from_vec(
+                            let cu_seqlens_k_t = crate::tensor::Tensor::from_vec(
                                 cu_seqlens_k,
                                 (batch_size + 1,),
                                 device,
@@ -247,6 +247,7 @@ impl Engine {
                                 max_seqlen_k,
                             };
                             let mut ctx = BatchAttnContext {
+                                ops: self.executor.ops,
                                 cu_seqlens_q: &cu_seqlens_q_t,
                                 max_seqlen_q: max_seqlen,
                                 position_ids: &position_ids_t,
@@ -255,26 +256,27 @@ impl Engine {
                                 deltanet_pool: None,
                                 deltanet_slots: None,
                             };
-                            #[cfg(feature = "flashinfer")]
-                            crate::models::layers::fi_begin_forward();
+                            self.executor.ops.session.begin_forward();
                             let result = if need_hidden_states {
-                                let hidden = model.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
-                                let last = crate::models::layers::last_token_select(&hidden, &seq_lens)
+                                let lm = model.as_logits_model_mut()
+                                    .expect("hidden states requested but model doesn't support LogitsSplitModel");
+                                let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
+                                let last = crate::modules::last_token_select(&hidden, &seq_lens)
                                     .map_err(candle_err)?;
-                                let logits = model.compute_logits(&last).map_err(candle_err)?
+                                let logits = lm.compute_logits(&last).map_err(candle_err)?
                                     .unsqueeze(1).map_err(candle_err)?;
                                 Ok((logits, Some(hidden)))
                             } else {
                                 Ok((model.forward(&packed_input, &mut ctx).map_err(candle_err)?, None))
                             };
-                            #[cfg(feature = "flashinfer")]
-                            crate::models::layers::fi_end_forward();
+                            self.executor.ops.session.end_forward();
                             return result;
                         }
                     }
 
                     // No paged path — plain varlen.
                     let mut ctx = BatchAttnContext {
+                        ops: self.executor.ops,
                         cu_seqlens_q: &cu_seqlens_q_t,
                         max_seqlen_q: max_seqlen,
                         position_ids: &position_ids_t,
@@ -283,20 +285,20 @@ impl Engine {
                         deltanet_pool: None,
                         deltanet_slots: None,
                     };
-                    #[cfg(feature = "flashinfer")]
-                    crate::models::layers::fi_begin_forward();
+                    self.executor.ops.session.begin_forward();
                     let result = if need_hidden_states {
-                        let hidden = model.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
-                        let last = crate::models::layers::last_token_select(&hidden, &seq_lens)
+                        let lm = model.as_logits_model_mut()
+                            .expect("hidden states requested but model doesn't support LogitsSplitModel");
+                        let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
+                        let last = crate::modules::last_token_select(&hidden, &seq_lens)
                             .map_err(candle_err)?;
-                        let logits = model.compute_logits(&last).map_err(candle_err)?
+                        let logits = lm.compute_logits(&last).map_err(candle_err)?
                             .unsqueeze(1).map_err(candle_err)?;
                         Ok((logits, Some(hidden)))
                     } else {
                         Ok((model.forward(&packed_input, &mut ctx).map_err(candle_err)?, None))
                     };
-                    #[cfg(feature = "flashinfer")]
-                    crate::models::layers::fi_end_forward();
+                    self.executor.ops.session.end_forward();
                     result
                 })();
 

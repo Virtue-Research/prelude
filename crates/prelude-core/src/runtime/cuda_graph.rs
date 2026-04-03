@@ -15,16 +15,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use candle_core::cuda_backend::cudarc::driver::CudaStream;
-use candle_core::cuda_backend::CudaDType;
-use candle_core::{DType, Device, Storage, Tensor};
+use crate::tensor::backend::cuda_backend::cudarc::driver::CudaStream;
+use crate::tensor::backend::cuda_backend::CudaDType;
+use crate::tensor::backend::Storage;
+use crate::tensor::{DType, Device, Tensor};
 
 use crate::cache::block_manager::BlockManager;
 use crate::config::EngineConfig;
 use crate::engine::{Engine, EngineError, OwnedBatchDecodeSeq};
-use crate::models::layers::{BatchAttnContext, PagedKvBatchContext};
+use crate::modules::{BatchAttnContext, PagedKvBatchContext};
 
-fn candle_err(e: candle_core::Error) -> EngineError {
+fn candle_err(e: crate::tensor::Error) -> EngineError {
     EngineError::Internal(format!("candle: {e}"))
 }
 
@@ -80,7 +81,7 @@ impl DecodeGraphBuffers {
         #[cfg(feature = "flashinfer")]
         let (fi_indptr, fi_indices, fi_last_page_len) = {
             let max_total_pages = batch_size * max_blocks;
-            crate::models::layers::allocate_fi_graph_meta(batch_size, max_total_pages, device)
+            crate::modules::allocate_fi_graph_meta(batch_size, max_total_pages, device)
                 .map_err(candle_err)?
         };
 
@@ -108,7 +109,7 @@ impl DecodeGraphBuffers {
 }
 
 /// Write host data into a pre-allocated GPU tensor without new allocation.
-unsafe fn update_tensor<T: CudaDType + candle_core::cuda_backend::cudarc::driver::DeviceRepr>(
+unsafe fn update_tensor<T: CudaDType + crate::tensor::backend::cuda_backend::cudarc::driver::DeviceRepr>(
     tensor: &Tensor,
     data: &[T],
     stream: &Arc<CudaStream>,
@@ -185,7 +186,7 @@ fn update_buffers(
 
 /// One captured CUDA graph plus its pre-allocated I/O buffers.
 struct CapturedGraph {
-    graph: candle_core::cuda_backend::cudarc::driver::CudaGraph,
+    graph: crate::tensor::backend::cuda_backend::cudarc::driver::CudaGraph,
     buffers: DecodeGraphBuffers,
     /// Output tensor — points to GPU memory written by the graph.
     /// On replay, the graph writes to the same address.
@@ -370,7 +371,7 @@ impl DecodeGraphCache {
             let num_qo_heads = engine.executor.config.num_attention_heads;
             let head_dim = engine.executor.config.head_dim;
 
-            if let Err(e) = crate::models::layers::fi_precompute_paged_plan_graphed(
+            if let Err(e) = crate::modules::fi_precompute_paged_plan_graphed(
                 (bs, num_qo_heads, head_dim),
                 &key_caches[0],
                 &captured.buffers.cu_seqlens_q,
@@ -437,6 +438,7 @@ impl DecodeGraphCache {
                     max_seqlen_k: buffers.max_seqlen_k,
                 };
                 let mut ctx = BatchAttnContext {
+                    ops: engine.executor.ops,
                     cu_seqlens_q: &buffers.cu_seqlens_q,
                     max_seqlen_q: 1,
                     position_ids: &buffers.position_ids,
@@ -445,13 +447,11 @@ impl DecodeGraphCache {
                     deltanet_pool: None,
                     deltanet_slots: None,
                 };
-                #[cfg(feature = "flashinfer")]
-                if $manage { crate::models::layers::fi_begin_forward(); }
+                if $manage { engine.executor.ops.session.begin_forward(); }
                 let result = $model
                     .forward(&buffers.packed_input, &mut ctx)
                     .map_err(candle_err);
-                #[cfg(feature = "flashinfer")]
-                if $manage { crate::models::layers::fi_end_forward(); }
+                if $manage { engine.executor.ops.session.end_forward(); }
                 result
             }};
         }
@@ -472,7 +472,7 @@ impl DecodeGraphCache {
         {
             let num_qo_heads = engine.executor.config.num_attention_heads;
             let head_dim = engine.executor.config.head_dim;
-            crate::models::layers::fi_precompute_paged_plan_graphed(
+            crate::modules::fi_precompute_paged_plan_graphed(
                 (batch_size, num_qo_heads, head_dim),
                 &key_caches[0],
                 &buffers.cu_seqlens_q,
@@ -489,7 +489,7 @@ impl DecodeGraphCache {
         // ── Capture ──
         stream
             .begin_capture(
-                candle_core::cuda_backend::cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+                crate::tensor::backend::cuda_backend::cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
             )
             .map_err(|e| EngineError::Internal(format!("begin_capture: {e}")))?;
 
@@ -500,7 +500,7 @@ impl DecodeGraphCache {
 
         let graph = stream
             .end_capture(
-                candle_core::cuda_backend::cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+                crate::tensor::backend::cuda_backend::cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
             )
             .map_err(|e| EngineError::Internal(format!("end_capture: {e}")))?
             .ok_or_else(|| EngineError::Internal("end_capture returned None".into()))?;

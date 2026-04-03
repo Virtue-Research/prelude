@@ -1,0 +1,26 @@
+[package]
+name = "prelude-cula"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+license = "Apache-2.0"
+description = "cuLA linear attention kernels (CUTLASS 3.x + CuTe DSL) for Prelude."
+
+[lib]
+name = "prelude_cula"
+path = "src/lib.rs"
+
+[dependencies]
+tracing = "0.1"
+
+[dev-dependencies]
+cudarc = { version = "0.19.4", features = ["std", "cuda-version-from-build-system", "f16"] }
+half = "2.7.1"
+rand = "0.10.0"
+
+[build-dependencies]
+anyhow = "1"
+serde_json = "1"
+cc = "1"
+sha2 = "0.10"
+hex = "0.4"

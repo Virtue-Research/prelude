@@ -6,125 +6,129 @@ This guide walks through adding a new attention backend (e.g., FlashInfer, custo
 
 Adding a backend requires **3 changes**:
 
-1. Create `attn/<name>.rs` -- wrapper functions for your attention kernels
-2. Add dispatch branches in `attn/mod.rs`
-3. Add a feature flag in `Cargo.toml`
+1. Create `attn/<name>.rs` in `crates/prelude-cuda/src/attn/` -- wrapper functions for your attention kernels
+2. Implement the `AttentionOps` trait (defined in `prelude-core/src/ops/traits/attention.rs`)
+3. Register your backend in `select_attention_backend()` in `crates/prelude-cuda/src/cuda_ops.rs`
 
-No model code, no engine code, no scheduler code needs to change. Attention dispatch is the **only** place with backend-specific `#[cfg]` gates.
+No model code, no engine code, no scheduler code needs to change. Backend selection is centralized in `cuda_ops.rs`.
 
 ## Architecture
 
-All attention dispatch lives in one directory:
+Attention backends live in the device crate, implementing the `AttentionOps` trait defined in prelude-core:
 
 ```
-crates/prelude-core/src/models/layers/attn/
-  mod.rs       -- dispatch functions (the ONLY file with #[cfg] gates)
-  flash_v4.rs  -- FA4 CuTeDSL wrappers
-  flash_v3.rs  -- FA3 Hopper wrappers (varlen + paged)
-  flash_v2.rs  -- FA2 Ampere+ wrappers
-  paged.rs     -- paged cache ops (reshape_and_cache, decode_attention)
-  cpu.rs       -- CPU matmul SDPA + BF16 tiled attention
+crates/prelude-core/src/ops/traits/
+  attention.rs      -- trait AttentionOps, VarlenParams, PagedParams, MaskType
+
+crates/prelude-cuda/src/attn/
+  mod.rs            -- module exports
+  flash_v4.rs       -- FA4 CuTeDSL wrappers
+  flash_v3.rs       -- FA3 Hopper wrappers (varlen + paged)
+  flash_v2.rs       -- FA2 Ampere+ wrappers
+  flashinfer.rs     -- FlashInfer wrappers
+  paged.rs          -- paged cache ops (reshape_and_cache, decode_attention)
+
+crates/prelude-cuda/src/
+  cuda_ops.rs       -- select_attention_backend() picks best backend at runtime
 ```
 
-Model architectures call dispatch functions from `mod.rs`. They never import a specific backend.
+Model architectures call methods on `ops.attn` (an `AttentionOps` trait object). They never import a specific backend.
 
-## Dispatch Functions
+## The AttentionOps Trait
 
-Your backend needs to implement some or all of these entry points:
-
-| Function | Purpose | Required |
-|----------|---------|----------|
-| `varlen_attention()` | Causal variable-length attention + optional paged KV | Yes |
-| `varlen_attention_bidirectional()` | Non-causal attention (for embeddings, classification) | Recommended |
-| `varlen_attention_windowed()` | Sliding window attention (Gemma3) | Optional |
-| `reshape_and_cache()` | Write K/V tensors to paged cache blocks | Yes (if paged) |
-| `varlen_attention_paged()` | Read-only paged attention (for fused KV write paths) | Optional |
-
-### Function Signatures
-
-The key function is `varlen_attention`:
+Your backend implements the `AttentionOps` trait, which has two required methods. The `MaskType` enum handles causal/bidirectional/windowed dispatch -- you don't need separate functions for each mask variant:
 
 ```rust
-pub fn varlen_attention(
-    q: &Tensor,                           // [total_tokens, num_heads, head_dim]
-    k: &Tensor,                           // [total_tokens, num_kv_heads, head_dim]
-    v: &Tensor,                           // [total_tokens, num_kv_heads, head_dim]
-    cu_seqlens_q: &Tensor,                // [batch+1] cumulative sequence lengths
-    cu_seqlens_k: &Tensor,                // [batch+1]
-    max_seqlen_q: usize,
-    max_seqlen_k: usize,
-    softmax_scale: f32,
-    paged_kv: Option<&mut PagedKvBatchContext>,  // None = pure varlen, Some = write + read paged
-) -> candle_core::Result<Tensor>
+// Defined in prelude-core/src/ops/traits/attention.rs
+
+pub enum MaskType {
+    Causal,
+    Bidirectional,
+    SlidingWindow(usize),
+}
+
+pub struct VarlenParams {
+    pub mask: MaskType,
+    // cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, ...
+}
+
+pub struct PagedParams {
+    pub mask: MaskType,
+    // paged KV cache parameters, slot_mapping, block_table, ...
+}
+
+/// Two methods, not four -- mask variant is encoded in MaskType.
+pub trait AttentionOps: Send + Sync {
+    fn varlen_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, params: &VarlenParams) -> Result<Tensor>;
+    fn paged_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, params: &PagedParams) -> Result<Tensor>;
+}
 ```
 
 ## Step 1: Create the Backend Wrapper
 
-Create `attn/mybackend.rs`:
+Create `crates/prelude-cuda/src/attn/mybackend.rs`:
 
 ```rust
 use candle_core::{Result, Tensor};
+use prelude_core::ops::traits::attention::{AttentionOps, VarlenParams, PagedParams, MaskType};
 
-pub fn varlen_causal(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    cu_seqlens_q: &Tensor,
-    cu_seqlens_k: &Tensor,
-    max_seqlen_q: usize,
-    max_seqlen_k: usize,
-    softmax_scale: f32,
-) -> Result<Tensor> {
-    // Call your attention kernel here
-    todo!()
+pub struct MyBackendOps {
+    // hold any handles or state your backend needs
 }
 
-pub fn varlen_bidirectional(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    cu_seqlens_q: &Tensor,
-    cu_seqlens_k: &Tensor,
-    max_seqlen_q: usize,
-    max_seqlen_k: usize,
-    softmax_scale: f32,
-) -> Result<Tensor> {
-    todo!()
+impl AttentionOps for MyBackendOps {
+    fn varlen_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, params: &VarlenParams) -> Result<Tensor> {
+        match params.mask {
+            MaskType::Causal => {
+                // Call your causal attention kernel
+                todo!()
+            }
+            MaskType::Bidirectional => {
+                // Call your bidirectional attention kernel
+                todo!()
+            }
+            MaskType::SlidingWindow(window_size) => {
+                // Call your windowed attention kernel
+                todo!()
+            }
+        }
+    }
+
+    fn paged_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, params: &PagedParams) -> Result<Tensor> {
+        todo!()
+    }
 }
 ```
 
-## Step 2: Add Dispatch Branches
+## Step 2: Register in Backend Selection
 
-In `attn/mod.rs`, add your backend to the dispatch chain. Priority order is checked top-to-bottom:
+In `crates/prelude-cuda/src/cuda_ops.rs`, add your backend to `select_attention_backend()`. Priority order is checked top-to-bottom:
 
 ```rust
-#[cfg(feature = "my-backend")]
-mod mybackend;
-
-pub fn varlen_attention(/* ... */) -> Result<Tensor> {
-    // ... existing paged path ...
-
-    // Non-paged path -- add your backend:
+fn select_attention_backend() -> Arc<dyn AttentionOps + 'static> {
+    // FA4 (SM90+ only)
     #[cfg(feature = "flash-attn-v4")]
-    { return flash_v4::varlen_causal(q, k, v, ...); }
+    if sm_version >= 90 { return Arc::new(FlashAttnV4Ops::new()); }
 
-    #[cfg(feature = "my-backend")]                    // <-- add here
-    { return mybackend::varlen_causal(q, k, v, ...); }
+    // Your backend -- add here
+    #[cfg(feature = "my-backend")]
+    { return Arc::new(MyBackendOps::new()); }
 
-    #[cfg(feature = "flash-attn-v3")]
-    { return flash_v3::varlen_causal(q, k, v, ...); }
+    // FlashInfer fallback
+    #[cfg(feature = "flashinfer")]
+    { return Arc::new(FlashInferOps::new()); }
 
-    // ... FA2, CPU fallback ...
+    // ... FA3, FA2 fallbacks ...
 }
 ```
 
 ## Step 3: Add Feature Flag
 
-In `crates/prelude-core/Cargo.toml`:
+In `crates/prelude-cuda/Cargo.toml` (NOT prelude-core -- feature flags for device backends live in the device crate):
 
 ```toml
 [features]
-my-backend = ["cuda", "dep:my-backend-crate"]
+my-backend = ["dep:my-backend-crate"]
 ```
 
 ## Testing
@@ -158,9 +162,13 @@ python benchmark/benchmark.py --config benchmark/presets/complete_prefill.toml \
 
 ## Existing Backends Reference
 
+All CUDA backends are in `crates/prelude-cuda/src/attn/` and implement `AttentionOps`:
+
 | Backend | File | Key Characteristics |
 |---------|------|--------------------|
 | FA4 | `flash_v4.rs` | CuTeDSL AOT, SM80+, prefill only, no paged KV, statically linked |
+| FlashInfer | `flashinfer.rs` | SM80/SM90, varlen + paged, prefix cache capable |
 | FA3 | `flash_v3.rs` | Hopper SM90, full varlen_paged support, prefix cache capable, GQA packing |
 | FA2 | `flash_v2.rs` | Ampere+ SM80, GQA native, v1 cache layout, no varlen_paged (no prefix cache) |
-| CPU | `cpu.rs` | Matmul SDPA + BF16 tiled attention (AVX-512), runtime feature detection |
+
+CPU attention is in `crates/prelude-core/src/ops/cpu/attention/` (matmul SDPA + BF16 tiled attention with AVX-512).

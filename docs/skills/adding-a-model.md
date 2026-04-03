@@ -21,17 +21,17 @@ This guide walks through adding a new model architecture to Prelude.
 
 Adding a model requires **4 steps**:
 
-1. Create `models/architectures/<name>/mod.rs` — config struct, model struct, `ModelForward` impl
-2. Create `models/architectures/<name>/meta.rs` — `ArchSpec` impl with static instance
-3. Add `pub mod <name>;` in `models/architectures/mod.rs`
-4. Add one line in `all_arch_specs()` in `models/architectures/meta.rs`
+1. Create `models/<name>/mod.rs` — config struct, model struct, `ModelForward` impl
+2. Create `models/<name>/meta.rs` — `ArchSpec` impl with static instance
+3. Add `pub mod <name>;` in `models/mod.rs`
+4. Add one line in `ALL_ARCH_SPECS` in `models/registry.rs`
 
 No enum variants, no match arms, no macro changes — just implement two traits and register.
 
 ## File Structure
 
 ```
-crates/prelude-core/src/models/architectures/
+crates/prelude-core/src/models/
   mymodel/
     mod.rs    # Config struct, model struct, forward logic, ModelForward impl
     meta.rs   # ArchSpec impl, static registration
@@ -200,7 +200,7 @@ Create `meta.rs` to handle model discovery, config parsing, and construction:
 use super::*;
 use crate::engine::{CommonModelConfig, RuntimeCaps, TaskKind, WeightsBackend};
 use crate::engine::EngineError;
-use crate::models::architectures::meta::{
+use crate::models::registry::{
     parse_json, candle_model_err, ArchSpec, ParsedModelConfig,
 };
 
@@ -350,7 +350,7 @@ Only **2 lines** needed in existing files:
 
 ### 5a. Export the module
 
-In `crates/prelude-core/src/models/architectures/mod.rs`:
+In `crates/prelude-core/src/models/mod.rs`:
 
 ```rust
 pub mod mymodel;   // <-- add
@@ -358,7 +358,7 @@ pub mod mymodel;   // <-- add
 
 ### 5b. Register in `all_arch_specs()`
 
-In `crates/prelude-core/src/models/architectures/meta.rs`:
+In `crates/prelude-core/src/models/registry.rs`:
 
 ```rust
 static ALL_ARCH_SPECS: &[&dyn ArchSpec] = &[
@@ -376,8 +376,8 @@ No array size to bump — it's a static slice.
 - [ ] Model struct with `new()` and `forward()`
 - [ ] `impl ModelForward` with required + relevant optional methods
 - [ ] `meta.rs` with `ArchSpec` impl and static instance
-- [ ] Module exported in `architectures/mod.rs`
-- [ ] Registered in `all_arch_specs()` static slice
+- [ ] Module exported in `models/mod.rs`
+- [ ] Registered in `ALL_ARCH_SPECS` in `models/registry.rs`
 - [ ] `cargo build` passes
 - [ ] `cargo test` passes
 - [ ] Server loads model and serves requests

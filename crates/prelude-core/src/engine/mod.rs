@@ -11,9 +11,9 @@ pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use std::sync::Mutex;
 pub(crate) use std::time::Instant;
 
-pub(crate) use candle_core::{DType, Device, Tensor};
-pub(crate) use candle_nn::VarBuilder;
-pub(crate) use candle_transformers::generation::{LogitsProcessor, Sampling};
+pub(crate) use crate::tensor::{DType, Device, Tensor};
+pub(crate) use crate::loading::var_builder::VarBuilder;
+pub(crate) use crate::nn_ops::generation::{LogitsProcessor, Sampling};
 pub(crate) use fastokens::Tokenizer;
 pub(crate) use tracing::info;
 
@@ -21,18 +21,19 @@ pub(crate) use crate::constants::DEFAULT_SEED;
 
 mod config;
 mod device;
-mod engine_struct;
+mod engine;
 pub(crate) mod forward;
-mod load;
+
 mod types;
 pub(crate) mod planner;
 mod pseudo;
-mod tokenize;
-mod weights;
+pub mod scheduled;
+mod tokenizer;
+
 
 // ── Re-exports: plan types + engine struct ──
-pub use self::engine_struct::Engine;
-pub(crate) use self::engine_struct::{ModelExecutor, ModelVariant};
+pub use self::engine::Engine;
+pub(crate) use self::engine::{ModelExecutor, ModelVariant};
 #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
 pub(crate) use self::types::OwnedBatchDecodeSeq;
 #[cfg(feature = "cuda")]
@@ -53,16 +54,17 @@ pub(crate) use self::forward::{
     RawClassifyOutput, classify_postprocess,
     RawEmbedOutput, embed_postprocess,
 };
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
 pub(crate) use self::forward::{RawGenerateOutput, generate_postprocess};
 
 // ── Re-exports: helpers (config, device, weights, tokenizer) ──
 pub(crate) use self::config::*;
 pub(crate) use self::device::*;
-pub(crate) use self::tokenize::tokenize_batch_inputs;
-pub(crate) use self::weights::*;
+pub(crate) use self::tokenizer::tokenize_batch_inputs;
+pub(crate) use crate::loading::weights::*;
 
 pub use self::pseudo::PseudoEngine;
+pub use self::scheduled::ScheduledEngine;
 pub use crate::cache::manager::CacheManager;
 
 #[derive(Debug, Clone, Error)]

@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 /// - `lda`, `ldb`, `ldd`: leading dimensions
 /// - `stride_a`, `stride_b`, `stride_d`: batch strides (0 if batch==1)
 /// - `transa`, `transb`: 0 = no transpose, 1 = transpose
-/// - `dtype`: 0 = BF16, 1 = F16, 2 = F32, 3 = F64
+/// - `dtype`: 0 = BF16, 1 = F16, 2 = F32, 3 = F8E4M3
 /// - `stream`: CUDA stream pointer
 ///
 /// Returns 0 on success, nonzero on error.

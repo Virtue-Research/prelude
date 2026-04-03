@@ -32,6 +32,9 @@ uuid.workspace = true
 hf-hub.workspace = true
 
 prelude-core = { path = "../prelude-core", default-features = false }
+prelude-cpu = { path = "../prelude-cpu" }
+prelude-cuda = { path = "../prelude-cuda", optional = true }
+bc-mimalloc.workspace = true
 base64 = "0.22.1"
 minijinja = "2.18.0"
 minijinja-contrib = { version = "2.18.0", features = ["pycompat"] }
@@ -43,15 +46,16 @@ reqwest = { version = "0.13.2", default-features = false, features = ["blocking"
 tower = { version = "0.5.3", features = ["util"] }
 
 [features]
-default = ["onednn"]
-cuda = ["prelude-core/cuda"]
-flash-attn = ["prelude-core/flash-attn"]
-flash-attn-v3 = ["prelude-core/flash-attn-v3"]
-flash-attn-v4 = ["prelude-core/flash-attn-v4"]
-flashinfer = ["prelude-core/flashinfer"]
-flashinfer-v4 = ["prelude-core/flashinfer-v4"]
-deepgemm = ["prelude-core/deepgemm"]
-paged-attn = ["prelude-core/paged-attn"]
-onednn = ["prelude-core/onednn"]
-ggml-quants = ["prelude-core/ggml-quants"]
+default = []
+cuda = ["prelude-core/cuda", "dep:prelude-cuda"]
+flash-attn = ["cuda", "prelude-core/flash-attn", "prelude-core/paged-attn", "prelude-cuda/flash-attn", "prelude-cuda/paged-attn"]
+flash-attn-v3 = ["cuda", "prelude-core/flash-attn-v3", "prelude-cuda/flash-attn-v3"]
+flash-attn-v4 = ["cuda", "prelude-core/flash-attn-v4", "prelude-cuda/flash-attn-v4"]
+flashinfer = ["cuda", "prelude-core/flashinfer", "prelude-cuda/flashinfer"]
+flashinfer-v4 = ["flashinfer", "flash-attn-v4"]
+deepgemm = ["cuda", "prelude-cuda/deepgemm"]
+quant-gemm = ["cuda", "prelude-cuda/quant-gemm"]
+cula = ["cuda", "prelude-cuda/cula"]
+paged-attn = ["cuda", "prelude-core/paged-attn"]
 hf_tokenizer = ["prelude-core/hf_tokenizer"]
+full = ["flashinfer-v4", "deepgemm", "quant-gemm", "cula"]

@@ -1,28 +1,12 @@
 use super::*;
 
-pub(crate) fn candle_err(e: candle_core::Error) -> EngineError {
+pub(crate) fn candle_err(e: crate::tensor::Error) -> EngineError {
     EngineError::Internal(format!("candle error: {e}"))
 }
 
-pub(crate) fn init_cpu_runtime_if_needed(device: &Device, runtime: &crate::config::RuntimeConfig) {
-    if !device.is_cpu() {
-        let _ = runtime;
-        return;
-    }
-
-    // Initialize oneDNN (for BF16 GEMM).
-    // oneDNN uses THREADPOOL runtime (rayon-backed). No OpenMP, no contention.
-    #[cfg(feature = "onednn")]
-    {
-        crate::ops::onednn::init();
-        tracing::info!("oneDNN initialized (THREADPOOL runtime, rayon-backed)");
-    }
-
-    // Initialize NUMA-aware rayon pool for cpu_ops kernels
-    {
-        let numa_report = crate::ops::cpu::numa::init_numa_rayon_pool();
-        tracing::info!(numa_report, "cpu_ops NUMA rayon pool initialized");
-    }
+pub(crate) fn init_runtime(_device: &Device, _runtime: &crate::config::RuntimeConfig) {
+    // Device-specific initialization (oneDNN, NUMA pool, GPU GEMM registration)
+    // is handled by device crates (prelude-cpu, prelude-cuda) in their ops factories.
 }
 
 pub(crate) fn select_device(
@@ -56,11 +40,8 @@ pub(crate) fn select_device(
         _ if device.is_cuda() => {
             if device.supports_bf16() { DType::BF16 } else { DType::F32 }
         }
-        // CPU: auto-select BF16 when a BF16 GEMM backend is available.
-        #[cfg(feature = "onednn")]
+        // CPU: BF16 with oneDNN BRGeMM backend
         _ => DType::BF16,
-        #[cfg(not(feature = "onednn"))]
-        _ => DType::F32,
     };
     info!(requested_device = %requested, is_cuda = device.is_cuda(), dtype = ?dtype, "selected device");
     Ok((device, dtype))

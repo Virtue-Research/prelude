@@ -31,5 +31,7 @@ fn main() {
 
     println!("cargo:rustc-link-search={}", build_dir.display());
     println!("cargo:rustc-link-lib=pagedattention");
-    println!("cargo:rustc-link-lib=dylib=cudart");
+    println!("cargo:rustc-link-lib=static=cudart_static");
+    println!("cargo:rustc-link-lib=dylib=rt");   // required by cudart_static
+    println!("cargo:rustc-link-lib=dylib=dl");   // required by cudart_static
 }

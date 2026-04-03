@@ -295,7 +295,9 @@ fn main() -> Result<()> {
     println!("cargo:rustc-link-lib=static=flashattentionv3");
 
     // Link required system libs
-    println!("cargo:rustc-link-lib=dylib=cudart");
+    println!("cargo:rustc-link-lib=static=cudart_static");
+    println!("cargo:rustc-link-lib=dylib=rt");   // required by cudart_static
+    println!("cargo:rustc-link-lib=dylib=dl");   // required by cudart_static
     println!("cargo:rustc-link-lib=dylib=stdc++");
 
     Ok(())

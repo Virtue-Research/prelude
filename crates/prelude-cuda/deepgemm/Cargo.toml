@@ -1,0 +1,18 @@
+[package]
+name = "prelude-deepgemm"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+description = "DeepGEMM BF16 GEMM for Prelude inference engine. Based on deepseek-ai/DeepGEMM."
+
+[lib]
+name = "prelude_deepgemm"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+cudarc = { version = "0.19.4", features = ["std", "cuda-version-from-build-system", "f16", "cublas", "cublaslt"] }
+half = "2.7.1"
+rand = "0.10.0"
+

@@ -7,7 +7,7 @@
 // (Qwen3.5, Qwen3-Next). Each request is assigned a pool slot during prefill and
 // reads/writes state from that slot during decode, removing the batch_size=1 limitation.
 
-use candle_core::{DType, Device, Result, Tensor};
+use crate::tensor::{DType, Device, Result, Tensor};
 use std::collections::VecDeque;
 
 /// Configuration for DeltaNet state dimensions, extracted from model config.

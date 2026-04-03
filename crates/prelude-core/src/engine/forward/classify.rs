@@ -59,8 +59,10 @@ impl Engine {
             .model
             .lock()
             .map_err(|e| EngineError::Internal(format!("model lock poisoned: {e}")))?;
-        let num_labels = model.num_labels().unwrap_or(2);
-        let label_map = (0..num_labels).map(|i| model.get_label(i)).collect();
+        let classifier = model.as_classifier()
+            .expect("classify called on model without ClassifierModel");
+        let num_labels = classifier.num_labels();
+        let label_map = (0..num_labels).map(|i| classifier.get_label(i)).collect();
         drop(model);
 
         Ok(RawClassifyOutput {

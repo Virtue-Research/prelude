@@ -1,8 +1,8 @@
 use crate::engine::*;
 #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
-use crate::models::layers::BatchAttnContext;
+use crate::modules::BatchAttnContext;
 #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
-use crate::models::layers::PagedKvBatchContext;
+use crate::modules::PagedKvBatchContext;
 
 impl Engine {
     /// Batch prefill multiple requests using varlen paged attention.
@@ -145,6 +145,7 @@ impl Engine {
             max_seqlen_k,
         };
         let mut ctx = BatchAttnContext {
+            ops: self.executor.ops,
             cu_seqlens_q: &cu_seqlens_q_t,
             max_seqlen_q,
             position_ids: &position_ids_t,
@@ -156,30 +157,30 @@ impl Engine {
         };
         let needs_prompt_logprobs = items.iter().any(|item| item.request.prompt_logprobs.is_some());
 
-        #[cfg(feature = "flashinfer")]
-        crate::models::layers::fi_begin_forward();
+        self.executor.ops.session.begin_forward();
 
         // When prompt logprobs needed: get hidden states, apply compute_logits in chunks.
         // This avoids materializing the full (total_tokens, vocab_size) logits tensor.
         let (logits, prompt_logprobs_cpu) = if needs_prompt_logprobs {
-            let hidden = model.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
-            let last_hidden = crate::models::layers::last_token_select(&hidden, &q_seq_lens)
+            let lm = model.as_logits_model_mut()
+                .expect("prompt logprobs requested but model doesn't support LogitsSplitModel");
+            let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
+            let last_hidden = crate::modules::last_token_select(&hidden, &q_seq_lens)
                 .map_err(candle_err)?;
-            let last_logits = model.compute_logits(&last_hidden).map_err(candle_err)?
+            let last_logits = lm.compute_logits(&last_hidden).map_err(candle_err)?
                 .unsqueeze(1).map_err(candle_err)?;
 
             // Chunked prompt logprobs extraction while model lock is still held.
             // Uses the shared extract function (avoids duplicating chunk logic).
             let logprobs_cpu = super::generate::extract_prompt_logprobs_from_hidden_offset(
-                &hidden, &**model, items, &q_seq_lens, cached_len,
+                &hidden, lm, items, &q_seq_lens, cached_len,
             )?;
             drop(hidden);
             (last_logits, Some(logprobs_cpu))
         } else {
             (model.forward(&packed_input, &mut ctx).map_err(candle_err)?, None)
         };
-        #[cfg(feature = "flashinfer")]
-        crate::models::layers::fi_end_forward();
+        self.executor.ops.session.end_forward();
         drop(dn_pool_guard);
         drop(model);
 
@@ -222,7 +223,7 @@ impl Engine {
         // Fast path: all greedy → batch GPU argmax (avoids F32 conversion + CPU transfer)
         if prefill_plan.all_greedy {
             let all_tokens = logits_2d
-                .argmax(candle_core::D::Minus1)
+                .argmax(crate::tensor::D::Minus1)
                 .map_err(candle_err)?
                 .to_vec1::<u32>()
                 .map_err(candle_err)?;

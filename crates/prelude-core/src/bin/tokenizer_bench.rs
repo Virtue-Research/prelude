@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
+
 //! Benchmark: HuggingFace `tokenizers` vs `fastokens` — encode/decode speed + correctness.
 //!
 //! Usage:

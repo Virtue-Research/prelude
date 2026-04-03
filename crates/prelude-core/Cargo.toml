@@ -8,24 +8,23 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 description = "Core inference engine, scheduler, and model runtime for Prelude"
+autobins = false
 readme = "../../README.md"
 keywords = ["llm", "inference", "serving", "scheduler", "rust"]
 
 [features]
-default = ["onednn"]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-flash-attn = ["cuda", "paged-attn", "candle-flash-attn"]
-flash-attn-v3 = ["cuda", "candle-flash-attn-v3"]
-flash-attn-v4 = ["cuda", "prelude-flash-attn-v4"]
-deepgemm = ["cuda", "prelude-deepgemm"]
-cutlass-gemm = ["cuda", "prelude-cutlass-gemm"]
-flashinfer = ["cuda", "prelude-flashinfer"]
-## FlashInfer + FA4 combined: FlashInfer skips tvm_ffi compilation (FA4 provides it).
-flashinfer-v4 = ["flashinfer", "flash-attn-v4", "prelude-flashinfer/skip-tvm-ffi"]
-paged-attn = ["dep:candle-paged-attn"]
-onednn = []
-ggml-quants = ["dep:prelude-ggml-quants"]
+default = []
+cuda = ["candle-core/cuda", "candle-transformers?/cuda"]
+candle-baseline = ["dep:candle-transformers"]
+# Marker features — no deps, just compile-time cfg gates for cache/scheduler tuning.
+# Enabled by prelude-server when the corresponding prelude-cuda feature is active.
+flash-attn = ["cuda"]
+flash-attn-v3 = ["cuda"]
+flash-attn-v4 = ["cuda"]
+flashinfer = ["cuda"]
+paged-attn = ["cuda"]
 hf_tokenizer = ["dep:tokenizers"]
+nvtx = []
 
 [dependencies]
 async-trait.workspace = true
@@ -37,19 +36,19 @@ tokio.workspace = true
 tracing.workspace = true
 
 candle-core.workspace = true
-candle-nn.workspace = true
-candle-transformers.workspace = true
+candle-transformers = { workspace = true, optional = true }
+rand.workspace = true
 fastokens.workspace = true
 hf-hub.workspace = true
-half = "2.7.1"
-candle-flash-attn = { workspace = true, optional = true }
-candle-flash-attn-v3 = { workspace = true, optional = true }
-candle-paged-attn = { workspace = true, optional = true }
-prelude-flash-attn-v4 = { workspace = true, optional = true }
-prelude-deepgemm = { workspace = true, optional = true }
-prelude-cutlass-gemm = { workspace = true, optional = true }
-prelude-flashinfer = { workspace = true, optional = true }
-prelude-ggml-quants = { path = "../prelude-ggml-quants", optional = true }
+half = { version = "2.7.1", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["extern_crate_alloc", "derive"] }
+inventory = "0.3"
 rayon = "1.11.0"
-libc = "1.0.0-alpha.3"
 tokenizers = { workspace = true, optional = true }
+bc-mimalloc.workspace = true
+
+
+[[bin]]
+name = "tokenizer_bench"
+path = "src/bin/tokenizer_bench.rs"
+required-features = ["hf_tokenizer"]
