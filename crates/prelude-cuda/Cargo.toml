@@ -17,6 +17,7 @@ cutlass-gemm = ["dep:prelude-cutlass-gemm"]
 flash-attn-v4 = ["dep:prelude-flash-attn-v4"]
 flashinfer = ["dep:prelude-flashinfer"]
 quant-gemm = ["dep:prelude-quant-gemm"]
+cula = ["dep:prelude-cula"]
 flash-attn = ["dep:candle-flash-attn"]
 flash-attn-v3 = ["dep:candle-flash-attn-v3"]
 paged-attn = ["dep:candle-paged-attn"]
@@ -27,12 +28,14 @@ candle-core = { workspace = true, features = ["cuda"] }
 half = { version = "2.7.1", features = ["bytemuck"] }
 tracing.workspace = true
 bc-mimalloc.workspace = true
+ctor = "0.8"
 
 prelude-deepgemm = { path = "deepgemm", optional = true }
 prelude-cutlass-gemm = { path = "cutlass-gemm", optional = true }
 prelude-flash-attn-v4 = { path = "fa4", optional = true }
 prelude-flashinfer = { path = "flashinfer", optional = true }
 prelude-quant-gemm = { path = "quant-gemm", optional = true }
+prelude-cula = { path = "cula", optional = true }
 candle-flash-attn = { workspace = true, optional = true }
 candle-flash-attn-v3 = { workspace = true, optional = true }
 candle-paged-attn = { workspace = true, optional = true }

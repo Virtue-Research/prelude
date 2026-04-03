@@ -91,7 +91,8 @@ fn find_flashinfer_source(manifest_dir: &Path) -> Result<PathBuf> {
     }
 
     // Priority 2: third_party/flashinfer/ submodule (standard path)
-    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
+    // flashinfer crate is at crates/prelude-cuda/flashinfer/ → 3 levels up to workspace root
+    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap().parent().unwrap();
     let fi_src = workspace_root.join("third_party/flashinfer");
     if fi_src.join("csrc").exists() {
         return Ok(fi_src);

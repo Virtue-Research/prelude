@@ -9,6 +9,7 @@ members = [
     "crates/prelude-cuda/flashinfer",
     "crates/prelude-cuda/fa4",
     "crates/prelude-cuda/quant-gemm",
+    "crates/prelude-cuda/cula",
 ]
 exclude = ["crates/candle-core", "crates/candle-paged-attn", "crates/candle-flash-attn-v3"]
 resolver = "2"
@@ -57,6 +58,7 @@ prelude-deepgemm = { path = "crates/prelude-cuda/deepgemm" }
 prelude-cutlass-gemm = { path = "crates/prelude-cuda/cutlass-gemm" }
 prelude-flashinfer = { path = "crates/prelude-cuda/flashinfer" }
 prelude-quant-gemm = { path = "crates/prelude-cuda/quant-gemm" }
+prelude-cula = { path = "crates/prelude-cuda/cula" }
 
 # Tokenization & model loading
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }

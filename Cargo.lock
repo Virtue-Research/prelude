@@ -738,6 +738,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctor"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "352d39c2f7bef1d6ad73db6f5160efcaed66d94ef8c6c573a8410c00bf909a98"
+dependencies = [
+ "ctor-proc-macro",
+ "dtor",
+]
+
+[[package]]
+name = "ctor-proc-macro"
+version = "0.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
+
+[[package]]
 name = "cudarc"
 version = "0.17.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -908,6 +924,21 @@ checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
 dependencies = [
  "litrs",
 ]
+
+[[package]]
+name = "dtor"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1057d6c64987086ff8ed0fd3fbf377a6b7d205cc7715868cd401705f715cbe4"
+dependencies = [
+ "dtor-proc-macro",
+]
+
+[[package]]
+name = "dtor-proc-macro"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f678cf4a922c215c63e0de95eb1ff08a958a81d47e485cf9da1e27bf6305cfa5"
 
 [[package]]
 name = "dunce"
@@ -2667,13 +2698,30 @@ dependencies = [
  "candle-flash-attn",
  "candle-flash-attn-v3",
  "candle-paged-attn",
+ "ctor",
  "half",
  "prelude-core",
+ "prelude-cula",
  "prelude-cutlass-gemm",
  "prelude-deepgemm",
  "prelude-flash-attn-v4",
  "prelude-flashinfer",
  "prelude-quant-gemm",
+ "tracing",
+]
+
+[[package]]
+name = "prelude-cula"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "cudarc 0.19.4",
+ "half",
+ "hex",
+ "rand 0.10.0",
+ "serde_json",
+ "sha2",
  "tracing",
 ]
 

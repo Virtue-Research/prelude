@@ -36,13 +36,20 @@ pub const MOD_KV_APPEND: &str = "kvcache_kv_append";
 pub const MOD_KNORM_ROPE_KV_WRITE: &str = "kvcache_knorm_rope_kv_write";
 pub const MOD_SCATTER_KV_CACHE: &str = "kvcache_scatter_kv_cache";
 
+// ── Auto-register GPU ops at link time ──────────────────────────────
+
+#[ctor::ctor]
+fn _register_gpu_ops() {
+    prelude_core::ops::register_gpu_ops(cuda_ops::cuda_ops);
+}
+
 // ── GPU kernel modules ──────────────────────────────────────────────
 
 pub(crate) mod ops;
 pub(crate) mod attn;
 mod cuda_ops;
 
-pub use cuda_ops::create_cuda_ops;
+pub use cuda_ops::{create_cuda_ops, cuda_ops};
 
 // ── Sub-crate re-exports ────────────────────────────────────────────
 
@@ -60,3 +67,6 @@ pub use prelude_flashinfer;
 
 #[cfg(feature = "quant-gemm")]
 pub use prelude_quant_gemm;
+
+#[cfg(feature = "cula")]
+pub use prelude_cula;
