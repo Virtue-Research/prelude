@@ -16,4 +16,7 @@ pub trait OpsSession: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Query free GPU memory in bytes. Returns `None` if not on GPU.
+    fn gpu_free_memory(&self) -> Option<usize> { None }
 }

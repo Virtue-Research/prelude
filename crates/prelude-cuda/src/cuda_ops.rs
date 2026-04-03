@@ -314,6 +314,16 @@ impl OpsSession for CudaSession {
         )?;
         Ok(())
     }
+
+    fn gpu_free_memory(&self) -> Option<usize> {
+        unsafe extern "C" {
+            fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
+        }
+        let mut free = 0usize;
+        let mut total = 0usize;
+        let ret = unsafe { cudaMemGetInfo(&mut free, &mut total) };
+        if ret == 0 { Some(free) } else { None }
+    }
 }
 
 // ── Attention backend selection ─────────────────────────────────────

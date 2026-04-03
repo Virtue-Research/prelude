@@ -158,7 +158,7 @@ impl CacheManager {
             };
             let total_bytes_per_block = bytes_per_block_per_layer * num_layers;
 
-            let free_bytes = cuda_free_memory().unwrap_or(0);
+            let free_bytes = cuda_free_memory(device).unwrap_or(0);
             let utilization = cache_config.gpu_memory_utilization;
             let usable = (free_bytes as f64 * utilization as f64) as usize;
             let auto_blocks = if total_bytes_per_block > 0 {
@@ -261,19 +261,8 @@ impl CacheManager {
     }
 }
 
-/// Query free GPU memory via cudaMemGetInfo.
-/// Returns `None` on non-CUDA builds or if the call fails.
-fn cuda_free_memory() -> Option<usize> {
-    #[cfg(feature = "cuda")]
-    {
-        unsafe extern "C" {
-            fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
-        }
-        let mut free = 0usize;
-        let mut total = 0usize;
-        let ret = unsafe { cudaMemGetInfo(&mut free, &mut total) };
-        if ret == 0 { Some(free) } else { None }
-    }
-    #[cfg(not(feature = "cuda"))]
-    { None }
+/// Query free GPU memory via the registered ops session.
+fn cuda_free_memory(device: &Device) -> Option<usize> {
+    let ops = crate::ops::select_ops(device);
+    ops.session.gpu_free_memory()
 }
