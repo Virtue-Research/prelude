@@ -13,7 +13,7 @@ pub(crate) use std::time::Instant;
 
 pub(crate) use crate::tensor::{DType, Device, Tensor};
 pub(crate) use self::weight_loader::VarBuilder;
-pub(crate) use crate::nn_ops::generation::{LogitsProcessor, Sampling};
+pub(crate) use self::sampling::{LogitsProcessor, Sampling};
 pub(crate) use fastokens::Tokenizer;
 pub(crate) use tracing::info;
 
@@ -26,6 +26,8 @@ pub mod executor;
 pub(crate) mod loading;
 pub(crate) mod model_runner;
 pub mod run;
+pub mod sampling;
+mod speculative;
 pub mod weight_loader;
 pub mod weights;
 

@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use prelude_core::engine::executor::{ExecutionHandle, Executor, ForwardBatch, ModelOutput};
 use prelude_core::engine::{Engine, EngineError};
-use prelude_core::tensor::Tensor;
 
 // ── GPU work packet ────────────────────────────────────────────────
 
@@ -94,45 +93,10 @@ fn gpu_worker_loop(
 
     rt.block_on(async {
         while let Some(work) = rx.recv().await {
-            let result = execute_forward(&engine, work.batch);
+            let result = engine.forward_batch(work.batch);
             let _ = work.result_tx.send(result);
         }
     });
 
     tracing::info!("GPU executor worker exited");
-}
-
-fn execute_forward(
-    engine: &Engine,
-    batch: ForwardBatch,
-) -> Result<ModelOutput, EngineError> {
-    match batch {
-        ForwardBatch::Prefill { items } => {
-            // TODO: use engine.prefill_forward_only() for varlen prefill
-            // (returns raw logits, not post-sampled results).
-            // For now, use the same path as CpuExecutor.
-            engine
-                .plan_generate_batch(items)
-                .and_then(|planned| engine.generate_prepared_batch(planned))
-                .map(|_results| {
-                    // Placeholder: generate_prepared_batch returns GenerateResult,
-                    // not raw logits. Full integration needs Engine forward/postprocess split.
-                    ModelOutput {
-                        logits: Tensor::zeros(
-                            (0, 0),
-                            prelude_core::tensor::DType::F32,
-                            &prelude_core::tensor::Device::Cpu,
-                        ).unwrap(),
-                    }
-                })
-        }
-        ForwardBatch::Decode { tokens, positions, block_tables } => {
-            // TODO: build paged attention tensors (cu_seqlens, block_table tensor,
-            // slot_mapping) and call engine model.forward() with paged KV cache.
-            // Also: CUDA graph replay for eligible batch sizes.
-            Err(EngineError::Unavailable(format!(
-                "CudaExecutor: paged decode not yet connected ({} seqs)", tokens.len()
-            )))
-        }
-    }
 }

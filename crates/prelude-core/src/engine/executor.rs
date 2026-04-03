@@ -59,13 +59,16 @@ impl ExecutionHandle {
 
 /// Output from a single forward pass.
 ///
-/// Contains the raw logits tensor. Sampling and postprocessing
-/// happen in the scheduling loop (core), not in the Executor.
+/// Sampling and postprocessing happen in the scheduling loop (core),
+/// not in the Executor.
 #[derive(Debug)]
 pub struct ModelOutput {
-    /// Raw logits: `[batch_size, vocab_size]` (for decode)
-    /// or `[total_tokens, vocab_size]` (for prefill).
+    /// Raw logits: `[batch_size, vocab_size]` (for decode/prefill/classify)
+    /// or `[batch_size, hidden_dim]` (for embed).
     pub logits: Tensor,
+    /// Number of sequences per input item (for one-shot classify/embed grouping).
+    /// Empty for Prefill/Decode batches.
+    pub item_seq_counts: Vec<usize>,
 }
 
 // ── Forward batch ──────────────────────────────────────────────────
@@ -73,17 +76,26 @@ pub struct ModelOutput {
 /// What the Executor should run. Built by the scheduling loop from
 /// `ArSequenceState` + `SchedulerStep`, then passed to `submit()`.
 pub enum ForwardBatch {
-    /// Prefill: process full prompt sequences.
+    /// Prefill: process full prompt sequences (generation).
     /// Contains prepared requests with token IDs, sampling params, etc.
     Prefill {
         items: Vec<super::PreparedGenerateRequest>,
     },
-    /// Decode: generate one token per active sequence.
+    /// Decode: generate one token per active sequence (Q=1).
     /// Each entry is (pending_token, position, block_table).
     Decode {
         tokens: Vec<u32>,
         positions: Vec<usize>,
         block_tables: Vec<Vec<u32>>,
+        /// DeltaNet pool slots for hybrid models (None = non-hybrid).
+        deltanet_slots: Option<Vec<u32>>,
+    },
+    /// One-shot forward for classify/embed (no decode loop).
+    /// Groups of token sequences — each group is one input item which may
+    /// contain multiple segments (e.g., query + passage for reranking).
+    OneShot {
+        token_groups: Vec<Vec<Vec<u32>>>,
+        task: super::TaskKind,
     },
 }
 
@@ -147,7 +159,10 @@ mod tests {
     use crate::scheduler::SchedulerStep;
 
     /// Mock result stored in the handle.
-    struct MockResult(Tensor);
+    struct MockResult {
+        logits: Tensor,
+        item_seq_counts: Vec<usize>,
+    }
 
     /// A test executor that returns a fixed logits tensor.
     struct TestExecutor {
@@ -159,16 +174,21 @@ mod tests {
             &self,
             batch: ForwardBatch,
         ) -> Result<ExecutionHandle, EngineError> {
-            let batch_size = match &batch {
-                ForwardBatch::Prefill { items } => items.len(),
-                ForwardBatch::Decode { tokens, .. } => tokens.len(),
+            let (batch_size, item_seq_counts) = match &batch {
+                ForwardBatch::Prefill { items } => (items.len(), vec![]),
+                ForwardBatch::Decode { tokens, .. } => (tokens.len(), vec![]),
+                ForwardBatch::OneShot { token_groups, .. } => {
+                    let counts: Vec<usize> = token_groups.iter().map(|g| g.len()).collect();
+                    let total: usize = counts.iter().sum();
+                    (total, counts)
+                }
             };
             let logits = Tensor::zeros(
                 (batch_size, self.vocab_size),
                 crate::tensor::DType::F32,
                 &crate::tensor::Device::Cpu,
             ).map_err(|e| EngineError::Internal(format!("{e}")))?;
-            Ok(ExecutionHandle::new(MockResult(logits)))
+            Ok(ExecutionHandle::new(MockResult { logits, item_seq_counts }))
         }
 
         fn collect(
@@ -177,7 +197,7 @@ mod tests {
         ) -> Result<ModelOutput, EngineError> {
             let result = handle.downcast::<MockResult>()
                 .ok_or_else(|| EngineError::Internal("wrong handle type".into()))?;
-            Ok(ModelOutput { logits: result.0 })
+            Ok(ModelOutput { logits: result.logits, item_seq_counts: result.item_seq_counts })
         }
     }
 
@@ -198,11 +218,29 @@ mod tests {
             tokens: vec![1, 2, 3],
             positions: vec![10, 20, 30],
             block_tables: vec![vec![0, 1], vec![0, 2], vec![0, 3]],
+            deltanet_slots: None,
         };
 
         let handle = executor.submit(batch).unwrap();
         let output = executor.collect(handle).unwrap();
         assert_eq!(output.logits.dims(), &[3, 50]);
+    }
+
+    #[test]
+    fn submit_collect_oneshot() {
+        let executor = TestExecutor { vocab_size: 8 };
+        let batch = ForwardBatch::OneShot {
+            token_groups: vec![
+                vec![vec![1, 2, 3]],           // 1 sequence
+                vec![vec![4, 5], vec![6, 7]],  // 2 sequences
+            ],
+            task: crate::engine::TaskKind::Classify,
+        };
+
+        let handle = executor.submit(batch).unwrap();
+        let output = executor.collect(handle).unwrap();
+        assert_eq!(output.logits.dims(), &[3, 8]); // total 3 sequences
+        assert_eq!(output.item_seq_counts, vec![1, 2]);
     }
 
     #[test]
@@ -227,5 +265,51 @@ mod tests {
         let handle = ExecutionHandle::new(42u32);
         let value = handle.downcast::<String>();
         assert!(value.is_none());
+    }
+
+    #[test]
+    fn submit_collect_decode_with_deltanet_slots() {
+        let executor = TestExecutor { vocab_size: 32 };
+        let batch = ForwardBatch::Decode {
+            tokens: vec![10, 20],
+            positions: vec![5, 8],
+            block_tables: vec![vec![0], vec![1]],
+            deltanet_slots: Some(vec![0, 1]),
+        };
+
+        let handle = executor.submit(batch).unwrap();
+        let output = executor.collect(handle).unwrap();
+        assert_eq!(output.logits.dims(), &[2, 32]);
+        assert!(output.item_seq_counts.is_empty());
+    }
+
+    #[test]
+    fn submit_collect_oneshot_embed() {
+        let executor = TestExecutor { vocab_size: 64 };
+        let batch = ForwardBatch::OneShot {
+            token_groups: vec![
+                vec![vec![1, 2, 3, 4]],
+            ],
+            task: crate::engine::TaskKind::Embed,
+        };
+
+        let handle = executor.submit(batch).unwrap();
+        let output = executor.collect(handle).unwrap();
+        assert_eq!(output.logits.dims(), &[1, 64]);
+        assert_eq!(output.item_seq_counts, vec![1]);
+    }
+
+    #[test]
+    fn submit_collect_oneshot_empty() {
+        let executor = TestExecutor { vocab_size: 16 };
+        let batch = ForwardBatch::OneShot {
+            token_groups: vec![],
+            task: crate::engine::TaskKind::Classify,
+        };
+
+        let handle = executor.submit(batch).unwrap();
+        let output = executor.collect(handle).unwrap();
+        assert_eq!(output.logits.dims(), &[0, 16]);
+        assert!(output.item_seq_counts.is_empty());
     }
 }

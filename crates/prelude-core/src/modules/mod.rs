@@ -3,6 +3,7 @@
 pub(crate) mod attn_utils;
 pub mod linear;
 pub(crate) mod mlp;
+mod moe;
 pub(crate) mod norm;
 pub(crate) mod transformer_block;
 

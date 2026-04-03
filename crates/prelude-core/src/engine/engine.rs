@@ -114,6 +114,262 @@ impl Engine {
     pub(crate) fn engine_config(&self) -> &crate::config::EngineConfig {
         &self.engine_config
     }
+
+    /// Classify model metadata: (num_labels, label_map).
+    pub fn classify_metadata(&self) -> Result<(usize, Vec<Option<String>>), EngineError> {
+        self.ensure_task_supported(TaskKind::Classify)?;
+        let model = self.executor.model.lock()
+            .map_err(|e| EngineError::Internal(format!("model lock: {e}")))?;
+        let classifier = model.as_classifier()
+            .ok_or_else(|| EngineError::Unavailable("model has no ClassifierModel".into()))?;
+        let num_labels = classifier.num_labels();
+        let label_map = (0..num_labels).map(|i| classifier.get_label(i)).collect();
+        Ok((num_labels, label_map))
+    }
+
+    /// Embedding model metadata: (dimensions, normalization).
+    pub fn embed_metadata(&self) -> Result<(usize, super::types::EmbeddingNormalization), EngineError> {
+        self.ensure_task_supported(TaskKind::Embed)?;
+        let model = self.executor.model.lock()
+            .map_err(|e| EngineError::Internal(format!("model lock: {e}")))?;
+        let dimensions = model.as_embedding()
+            .map(|e| e.embedding_dim())
+            .unwrap_or(0);
+        Ok((dimensions, self.embedding_semantics.normalization))
+    }
+
+    // ── Executor-facing forward pass ────────────────────────────────────
+
+    /// Run a forward pass for the given batch and return raw model output.
+    ///
+    /// This is the method that `Executor` implementations call. It dispatches
+    /// to the appropriate internal pipeline based on the batch type:
+    ///
+    /// - **Prefill**: packs tokens → varlen forward → returns last-token logits
+    /// - **OneShot**: same forward as Prefill, for classify/embed (no decode loop)
+    /// - **Decode**: paged attention decode (not yet connected)
+    pub fn forward_batch(
+        &self,
+        batch: super::executor::ForwardBatch,
+    ) -> Result<super::executor::ModelOutput, EngineError> {
+        use super::executor::{ForwardBatch, ModelOutput};
+
+        match batch {
+            ForwardBatch::Prefill { items } => self.forward_prefill(items),
+            ForwardBatch::OneShot { token_groups, task } => {
+                self.forward_oneshot(token_groups, task)
+            }
+            ForwardBatch::Decode { tokens, positions, block_tables, deltanet_slots } => {
+                self.forward_decode(tokens, positions, block_tables, deltanet_slots)
+            }
+        }
+    }
+
+    /// Forward pass for generation prefill.
+    ///
+    /// Returns raw logits `[batch_size, vocab_size]` for the last token
+    /// of each sequence.
+    fn forward_prefill(
+        &self,
+        items: Vec<super::PreparedGenerateRequest>,
+    ) -> Result<super::executor::ModelOutput, EngineError> {
+        use super::executor::ModelOutput;
+
+        if items.is_empty() {
+            return Ok(ModelOutput {
+                logits: crate::tensor::Tensor::zeros(
+                    (0, 0), DType::F32, &Device::Cpu,
+                ).map_err(|e| EngineError::Internal(e.to_string()))?,
+                item_seq_counts: vec![],
+            });
+        }
+
+        // GPU path (flash attention available): use prefill_pipeline
+        #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
+        {
+            let token_groups: Vec<&[Vec<u32>]> = items
+                .iter()
+                .map(|item| std::slice::from_ref(&item.prompt_tokens))
+                .collect();
+
+            let forward_result = self.prefill_pipeline(&token_groups)?
+                .ok_or_else(|| EngineError::Internal("empty prefill batch".into()))?;
+
+            Ok(ModelOutput {
+                logits: forward_result.output,
+                item_seq_counts: forward_result.item_seq_counts,
+            })
+        }
+
+        // CPU path (no flash attention): inline forward
+        #[cfg(not(any(feature = "flash-attn-v4", feature = "flashinfer")))]
+        {
+            self.forward_prefill_cpu(items)
+        }
+    }
+
+    /// CPU-only prefill forward: constructs tensors inline and calls model.forward().
+    #[cfg(not(any(feature = "flash-attn-v4", feature = "flashinfer")))]
+    fn forward_prefill_cpu(
+        &self,
+        items: Vec<super::PreparedGenerateRequest>,
+    ) -> Result<super::executor::ModelOutput, EngineError> {
+        use super::executor::ModelOutput;
+        use crate::tensor::Tensor;
+
+        let device = &self.executor.device;
+        let mut model = self.executor.model.lock()
+            .map_err(|e| EngineError::Internal(format!("model lock: {e}")))?;
+
+        let mut all_logits: Vec<Tensor> = Vec::with_capacity(items.len());
+
+        for item in &items {
+            let seq_len = item.prompt_tokens.len();
+            let input = Tensor::from_vec(
+                item.prompt_tokens.clone(), (seq_len,), device,
+            ).map_err(|e| EngineError::Internal(e.to_string()))?;
+            let cu_seqlens = Tensor::from_vec(
+                vec![0u32, seq_len as u32], (2,), device,
+            ).map_err(|e| EngineError::Internal(e.to_string()))?;
+            let position_ids = Tensor::from_vec(
+                (0..seq_len as u32).collect::<Vec<_>>(), (seq_len,), device,
+            ).map_err(|e| EngineError::Internal(e.to_string()))?;
+            let seq_lens_vec = vec![seq_len];
+
+            let mut ctx = crate::modules::BatchAttnContext {
+                ops: crate::ops::select_ops(device),
+                cu_seqlens_q: &cu_seqlens,
+                max_seqlen_q: seq_len,
+                position_ids: &position_ids,
+                seq_lens: &seq_lens_vec,
+                paged_kv: None,
+                deltanet_pool: None,
+                deltanet_slots: None,
+            };
+
+            let logits = model.forward(&input, &mut ctx)
+                .map_err(|e| EngineError::Internal(e.to_string()))?;
+
+            // Extract last token logits
+            let last_logits = if logits.dims().len() == 2 {
+                logits.get(seq_len - 1)
+                    .map_err(|e| EngineError::Internal(e.to_string()))?
+            } else {
+                logits
+            };
+            all_logits.push(last_logits.unsqueeze(0)
+                .map_err(|e| EngineError::Internal(e.to_string()))?);
+        }
+
+        drop(model);
+
+        let logits = Tensor::cat(&all_logits, 0)
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+
+        Ok(ModelOutput {
+            logits,
+            item_seq_counts: vec![1; items.len()],
+        })
+    }
+
+    /// Forward pass for batched decode (one token per sequence, paged KV).
+    #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
+    fn forward_decode(
+        &self,
+        tokens: Vec<u32>,
+        positions: Vec<usize>,
+        block_tables: Vec<Vec<u32>>,
+        deltanet_slots: Option<Vec<u32>>,
+    ) -> Result<super::executor::ModelOutput, EngineError> {
+        use super::executor::ModelOutput;
+        use super::BatchDecodeSeq;
+
+        if tokens.is_empty() {
+            return Ok(ModelOutput {
+                logits: crate::tensor::Tensor::zeros(
+                    (0, 0), DType::F32, &Device::Cpu,
+                ).map_err(|e| EngineError::Internal(e.to_string()))?,
+                item_seq_counts: vec![],
+            });
+        }
+
+        let seqs: Vec<BatchDecodeSeq> = tokens.iter().enumerate().map(|(i, &token)| {
+            BatchDecodeSeq {
+                token,
+                position: positions[i],
+                context_len: positions[i] + 1,
+                block_table: &block_tables[i],
+                deltanet_slot: deltanet_slots.as_ref().and_then(|s| s.get(i).copied()),
+            }
+        }).collect();
+
+        let logits = self.batch_decode_paged(&seqs)?;
+
+        Ok(ModelOutput {
+            logits,
+            item_seq_counts: vec![],
+        })
+    }
+
+    #[cfg(not(any(feature = "flash-attn-v4", feature = "flashinfer")))]
+    fn forward_decode(
+        &self,
+        tokens: Vec<u32>,
+        _positions: Vec<usize>,
+        _block_tables: Vec<Vec<u32>>,
+        _deltanet_slots: Option<Vec<u32>>,
+    ) -> Result<super::executor::ModelOutput, EngineError> {
+        Err(EngineError::Unavailable(format!(
+            "paged decode requires flash attention features ({} seqs)",
+            tokens.len(),
+        )))
+    }
+
+    /// Forward pass for one-shot classify/embed.
+    ///
+    /// Uses the same varlen prefill pipeline, returns last-token output
+    /// per sequence with grouping metadata.
+    fn forward_oneshot(
+        &self,
+        token_groups: Vec<Vec<Vec<u32>>>,
+        task: TaskKind,
+    ) -> Result<super::executor::ModelOutput, EngineError> {
+        use super::executor::ModelOutput;
+
+        self.ensure_task_supported(task)?;
+
+        if token_groups.is_empty() {
+            return Ok(ModelOutput {
+                logits: crate::tensor::Tensor::zeros(
+                    (0, 0), DType::F32, &Device::Cpu,
+                ).map_err(|e| EngineError::Internal(e.to_string()))?,
+                item_seq_counts: vec![],
+            });
+        }
+
+        // Convert Vec<Vec<Vec<u32>>> → Vec<&[Vec<u32>]> for prefill_pipeline
+        let refs: Vec<&[Vec<u32>]> = token_groups.iter()
+            .map(|g| g.as_slice())
+            .collect();
+
+        #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
+        {
+            let forward_result = self.prefill_pipeline(&refs)?
+                .ok_or_else(|| EngineError::Internal("empty one-shot batch".into()))?;
+
+            Ok(ModelOutput {
+                logits: forward_result.output,
+                item_seq_counts: forward_result.item_seq_counts,
+            })
+        }
+
+        #[cfg(not(any(feature = "flash-attn-v4", feature = "flashinfer")))]
+        {
+            Err(EngineError::Unavailable(
+                "one-shot classify/embed requires flash attention features".into(),
+            ))
+        }
+    }
 }
 
 // ── InferenceEngine trait implementation ─────────────────────────────────

@@ -23,6 +23,7 @@ cula = ["dep:prelude-cula"]
 prelude-core = { path = "../prelude-core" }
 candle-core = { workspace = true, features = ["cuda"] }
 half = { version = "2.7.1", features = ["bytemuck"] }
+tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 bc-mimalloc.workspace = true
 ctor = "0.8"

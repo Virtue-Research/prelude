@@ -1,6 +1,6 @@
 use crate::types::{ClassifyRequest, EmbedRequest, GenerateRequest, TokenLogprobInfo};
 use crate::tensor::Tensor;
-use crate::nn_ops::generation::LogitsProcessor;
+use crate::engine::sampling::LogitsProcessor;
 
 // ── Model dispatch ──────────────────────────────────────────────────────
 

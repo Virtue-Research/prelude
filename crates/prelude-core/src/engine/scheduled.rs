@@ -7,6 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::engine::{Engine, EngineError, InferenceEngine, PreparedGenerateRequest};
 use crate::engine::executor::{self, Executor, ForwardBatch};
 use crate::engine::run::ar::{ArMessage, ResponseChannel, ar_loop};
+use crate::engine::types::TaskKind;
 use crate::scheduler::SchedulerConfig;
 use crate::types::{
     ClassifyRequest, ClassifyResult, EmbedRequest, EmbedResult, GenerateRequest, GenerateResult,
@@ -124,13 +125,133 @@ impl InferenceEngine for ScheduledEngine {
         Ok(true)
     }
 
-    async fn classify(&self, _request: ClassifyRequest) -> Result<ClassifyResult, EngineError> {
-        // TODO: tokenize → executor.submit(Prefill) → collect → postprocess
-        Err(EngineError::Unavailable("classify via Executor not yet wired".into()))
+    async fn classify(&self, request: ClassifyRequest) -> Result<ClassifyResult, EngineError> {
+        let engine = Arc::clone(&self.engine);
+        let executor = Arc::clone(&self.executor);
+        tokio::task::spawn_blocking(move || {
+            classify_via_executor(&engine, executor.as_ref(), request)
+        })
+        .await
+        .map_err(|e| EngineError::Internal(format!("classify task panicked: {e}")))?
     }
 
-    async fn embed(&self, _request: EmbedRequest) -> Result<EmbedResult, EngineError> {
-        // TODO: tokenize → executor.submit(Prefill) → collect → postprocess
-        Err(EngineError::Unavailable("embed via Executor not yet wired".into()))
+    async fn embed(&self, request: EmbedRequest) -> Result<EmbedResult, EngineError> {
+        let engine = Arc::clone(&self.engine);
+        let executor = Arc::clone(&self.executor);
+        tokio::task::spawn_blocking(move || {
+            embed_via_executor(&engine, executor.as_ref(), request)
+        })
+        .await
+        .map_err(|e| EngineError::Internal(format!("embed task panicked: {e}")))?
     }
+}
+
+// ---------------------------------------------------------------------------
+// One-shot classify/embed via Executor
+// ---------------------------------------------------------------------------
+
+fn classify_via_executor(
+    engine: &Engine,
+    executor: &dyn Executor,
+    request: ClassifyRequest,
+) -> Result<ClassifyResult, EngineError> {
+    use crate::engine::tokenize_batch_inputs;
+    use crate::tensor::DType;
+    use crate::types::{ClassificationResult, ClassificationInputs};
+
+    let (token_ids, total_tokens) = tokenize_batch_inputs(&engine.tokenizer, &request.inputs)?;
+
+    // Submit one-shot forward through Executor
+    let batch = ForwardBatch::OneShot {
+        token_groups: vec![token_ids],
+        task: TaskKind::Classify,
+    };
+    let handle = executor.submit(batch)?;
+    let output = executor.collect(handle)?;
+
+    // Get model metadata
+    let (num_labels, label_map) = engine.classify_metadata()?;
+
+    // Postprocess: logits → per-sequence class probabilities
+    let logits_f32 = output.logits
+        .to_dtype(DType::F32)
+        .map_err(|e| EngineError::Internal(format!("classify to_dtype: {e}")))?;
+    let rows: Vec<Vec<f32>> = logits_f32
+        .to_vec2()
+        .map_err(|e| EngineError::Internal(format!("classify to_vec2: {e}")))?;
+
+    let mut results = Vec::with_capacity(rows.len());
+    for (idx, probs) in rows.into_iter().enumerate() {
+        let (max_idx, _) = probs.iter().enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or((0, &0.0));
+        let label = label_map.get(max_idx).cloned().flatten()
+            .or_else(|| Some(format!("LABEL_{}", max_idx)));
+
+        results.push(ClassificationResult {
+            index: idx as u32,
+            label,
+            probs,
+            num_classes: num_labels as u32,
+        });
+    }
+
+    Ok(ClassifyResult {
+        model: request.model,
+        results,
+        prompt_tokens: total_tokens,
+    })
+}
+
+fn embed_via_executor(
+    engine: &Engine,
+    executor: &dyn Executor,
+    request: EmbedRequest,
+) -> Result<EmbedResult, EngineError> {
+    use crate::engine::tokenize_batch_inputs;
+    use crate::engine::types::EmbeddingNormalization;
+    use crate::tensor::DType;
+    use crate::types::EmbeddingData;
+
+    let (token_ids, total_tokens) = tokenize_batch_inputs(&engine.tokenizer, &request.inputs)?;
+
+    // Submit one-shot forward through Executor
+    let batch = ForwardBatch::OneShot {
+        token_groups: vec![token_ids],
+        task: TaskKind::Embed,
+    };
+    let handle = executor.submit(batch)?;
+    let output = executor.collect(handle)?;
+
+    // Get model metadata
+    let (dimensions, normalization) = engine.embed_metadata()?;
+
+    // Postprocess: output → per-sequence embeddings with optional L2 normalization
+    let output_f32 = output.logits
+        .to_dtype(DType::F32)
+        .map_err(|e| EngineError::Internal(format!("embed to_dtype: {e}")))?;
+    let rows: Vec<Vec<f32>> = output_f32
+        .to_vec2()
+        .map_err(|e| EngineError::Internal(format!("embed to_vec2: {e}")))?;
+
+    let mut data = Vec::with_capacity(rows.len());
+    for (idx, mut embedding) in rows.into_iter().enumerate() {
+        if normalization == EmbeddingNormalization::L2 {
+            let norm = embedding.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for v in &mut embedding { *v /= norm; }
+            }
+        }
+        data.push(EmbeddingData {
+            index: idx as u32,
+            embedding,
+        });
+    }
+
+    Ok(EmbedResult {
+        model: request.model,
+        data,
+        prompt_tokens: total_tokens,
+        dimensions,
+    })
 }

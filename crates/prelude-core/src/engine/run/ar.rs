@@ -259,17 +259,29 @@ fn build_forward_batch(
         ForwardBatch::Prefill { items }
     } else {
         // Decode: collect (token, position, block_table) per sequence
-        let mut tokens = Vec::with_capacity(step.decode_request_ids.len());
-        let mut positions = Vec::with_capacity(step.decode_request_ids.len());
-        let mut block_tables = Vec::with_capacity(step.decode_request_ids.len());
+        let cap = step.decode_request_ids.len();
+        let mut tokens = Vec::with_capacity(cap);
+        let mut positions = Vec::with_capacity(cap);
+        let mut block_tables = Vec::with_capacity(cap);
+        let mut dn_slots: Vec<u32> = Vec::new();
+        let mut has_dn = false;
         for id in &step.decode_request_ids {
             if let Some(state) = states.get(id) {
                 tokens.push(state.pending_token.unwrap_or(0));
                 positions.push(state.next_decode_position);
                 block_tables.push(state.block_table.clone());
+                if let Some(slot) = state.deltanet_slot {
+                    dn_slots.push(slot);
+                    has_dn = true;
+                }
             }
         }
-        ForwardBatch::Decode { tokens, positions, block_tables }
+        let deltanet_slots = if has_dn && dn_slots.len() == tokens.len() {
+            Some(dn_slots)
+        } else {
+            None
+        };
+        ForwardBatch::Decode { tokens, positions, block_tables, deltanet_slots }
     }
 }
 
@@ -494,7 +506,7 @@ mod tests {
     use crate::tensor::Device;
 
     fn make_prepared(request_id: &str, max_new: usize) -> PreparedGenerateRequest {
-        use crate::nn_ops::generation::{LogitsProcessor, Sampling};
+        use crate::engine::sampling::{LogitsProcessor, Sampling};
         PreparedGenerateRequest {
             request_idx: 0,
             request: crate::types::GenerateRequest {
@@ -636,5 +648,90 @@ mod tests {
         assert!(matches!(seq_finish_reason(&FinishReason::Stop), SeqFinishReason::Stop));
         assert!(matches!(seq_finish_reason(&FinishReason::Length), SeqFinishReason::Length));
         assert!(matches!(seq_finish_reason(&FinishReason::Cancelled), SeqFinishReason::Abort(_)));
+    }
+
+    // ── build_forward_batch tests ─────────────────────────────────
+
+    fn make_decode_state(id: &str, pending_token: u32, position: usize) -> ArSequenceState {
+        ArSequenceState {
+            request_id: id.to_string(),
+            prepared: Some(make_prepared(id, 10)),
+            response: ResponseChannel::Complete(tokio::sync::oneshot::channel().0),
+            gen_start: Instant::now(), prefill_ms: 0.0, started_sent: true,
+            sent_text_len: 0, prompt_len: 3, next_decode_position: position,
+            pending_token: Some(pending_token), output_tokens: vec![pending_token],
+            token_logprobs: vec![], prompt_token_logprobs: None,
+            block_table: vec![0, 1], deltanet_slot: None,
+        }
+    }
+
+    #[test]
+    fn build_decode_batch_basic() {
+        let mut states = HashMap::new();
+        states.insert("s1".to_string(), make_decode_state("s1", 42, 5));
+        states.insert("s2".to_string(), make_decode_state("s2", 99, 8));
+
+        let step = SchedulerStep::decode(vec!["s1".into(), "s2".into()]);
+        let batch = build_forward_batch(&mut states, &step);
+
+        match batch {
+            ForwardBatch::Decode { tokens, positions, block_tables, deltanet_slots } => {
+                assert_eq!(tokens, vec![42, 99]);
+                assert_eq!(positions, vec![5, 8]);
+                assert_eq!(block_tables.len(), 2);
+                assert!(deltanet_slots.is_none());
+            }
+            _ => panic!("expected Decode"),
+        }
+    }
+
+    #[test]
+    fn build_decode_batch_with_deltanet() {
+        let mut states = HashMap::new();
+        let mut s1 = make_decode_state("s1", 42, 5);
+        s1.deltanet_slot = Some(0);
+        let mut s2 = make_decode_state("s2", 99, 8);
+        s2.deltanet_slot = Some(1);
+        states.insert("s1".to_string(), s1);
+        states.insert("s2".to_string(), s2);
+
+        let step = SchedulerStep::decode(vec!["s1".into(), "s2".into()]);
+        let batch = build_forward_batch(&mut states, &step);
+
+        match batch {
+            ForwardBatch::Decode { deltanet_slots, .. } => {
+                assert_eq!(deltanet_slots, Some(vec![0, 1]));
+            }
+            _ => panic!("expected Decode"),
+        }
+    }
+
+    #[test]
+    fn build_prefill_batch_extracts_prepared() {
+        let mut states = HashMap::new();
+        let prepared = make_prepared("r1", 5);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        handle_message(
+            ArMessage::NewRequest { prepared, response: ResponseChannel::Complete(tx) },
+            &mut Scheduler::new(SchedulerConfig::default()),
+            &mut states,
+        );
+
+        // State should have prepared
+        assert!(states.get("r1").unwrap().prepared.is_some());
+
+        let step = SchedulerStep::prefill(vec!["r1".into()]);
+        let batch = build_forward_batch(&mut states, &step);
+
+        match batch {
+            ForwardBatch::Prefill { items } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].prompt_tokens, vec![1, 2, 3]);
+            }
+            _ => panic!("expected Prefill"),
+        }
+
+        // Prepared should be taken (None now)
+        assert!(states.get("r1").unwrap().prepared.is_none());
     }
 }

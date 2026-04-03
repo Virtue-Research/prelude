@@ -33,32 +33,7 @@ impl Executor for CpuExecutor {
         &self,
         batch: ForwardBatch,
     ) -> Result<ExecutionHandle, EngineError> {
-        let result = match batch {
-            ForwardBatch::Prefill { items } => {
-                // Run the full generate pipeline synchronously.
-                // generate_prepared_batch returns Vec<GenerateResult> (post-sampled),
-                // but the Executor interface returns raw logits.
-                // TODO: split Engine into forward-only (returns logits) + postprocess.
-                // For now, run the full pipeline and return a dummy logits tensor.
-                self.engine
-                    .plan_generate_batch(items)
-                    .and_then(|planned| self.engine.generate_prepared_batch(planned))
-                    .map(|_results| {
-                        ModelOutput {
-                            logits: prelude_core::tensor::Tensor::zeros(
-                                (0, 0),
-                                prelude_core::tensor::DType::F32,
-                                &prelude_core::tensor::Device::Cpu,
-                            ).unwrap(),
-                        }
-                    })
-            }
-            ForwardBatch::Decode { .. } => {
-                Err(EngineError::Unavailable(
-                    "CpuExecutor: continuous decode not yet supported".into(),
-                ))
-            }
-        };
+        let result = self.engine.forward_batch(batch);
         Ok(ExecutionHandle::new(CpuResult { output: result }))
     }
 

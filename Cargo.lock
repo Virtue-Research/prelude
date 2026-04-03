@@ -2666,6 +2666,7 @@ dependencies = [
  "prelude-flash-attn-v4",
  "prelude-flashinfer",
  "prelude-quant-gemm",
+ "tokio",
  "tracing",
 ]
 
