@@ -170,6 +170,11 @@ impl ConvOps for CudaOps {
         &self, input: &Tensor, weight: &Tensor, bias: Option<&Tensor>,
         stride: [usize; 2], padding: [usize; 2],
     ) -> Result<Tensor> {
+        if stride[0] != stride[1] || padding[0] != padding[1] {
+            candle_core::bail!(
+                "conv2d: asymmetric stride/padding not supported (stride={stride:?}, padding={padding:?})"
+            );
+        }
         let out = input.conv2d(weight, padding[0], stride[0], 1, 1)?;
         match bias {
             Some(b) => out.broadcast_add(&b.reshape((1, b.dim(0)?, 1, 1))?),

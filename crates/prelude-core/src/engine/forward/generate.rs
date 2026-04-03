@@ -439,7 +439,9 @@ impl Engine {
             // When prompt logprobs requested: get hidden states, apply lm_head separately.
             let (logits_flat, prompt_token_logprobs) = if needs_prompt_logprobs {
                 let logits_model = model.as_logits_model_mut()
-                    .expect("prompt logprobs requested but model doesn't support LogitsSplitModel");
+                    .ok_or_else(|| EngineError::InvalidRequest(
+                        "prompt_logprobs requested but model doesn't support LogitsSplitModel".into()
+                    ))?;
                 let hidden = logits_model.forward_hidden_states(&input, &mut ctx)
                     .map_err(|e| EngineError::Internal(e.to_string()))?;
                 let last_hidden = hidden.get(seq_len - 1)
