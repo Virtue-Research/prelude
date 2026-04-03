@@ -5,47 +5,29 @@ use chrono::Utc;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::engine::{Engine, EngineError, InferenceEngine, PreparedGenerateRequest};
-use crate::runtime::gpu_queue::spawn_gpu_worker;
-use crate::runtime::{
-    SchedulerConfig, batch_runtime_loop, continuous_generation_loop,
-    cpu_batch_runtime_loop, spawn_cpu_continuous_worker,
-};
+use crate::engine::executor::{self, Executor, ForwardBatch};
+use crate::engine::run::ar::{ArMessage, ResponseChannel, ar_loop};
+use crate::scheduler::SchedulerConfig;
 use crate::types::{
     ClassifyRequest, ClassifyResult, EmbedRequest, EmbedResult, GenerateRequest, GenerateResult,
     ModelInfo, StreamEvent,
 };
 
-pub(crate) use crate::runtime::request_state::{
-    ClassifyResponseChannel, ContinuousGenerationRequestState, ContinuousSchedulerMsg,
-    EmbedResponseChannel, GenerationRequestState, GenerationResponseChannel,
-    InFlightClassifyRequest, InFlightEmbedRequest, SchedulerMsg,
-};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GenerationSchedulerRoute {
-    Batch,
-    Continuous,
-}
 
 // ---------------------------------------------------------------------------
-// ScheduledEngine — public API
+// ScheduledEngine — Executor-based
 // ---------------------------------------------------------------------------
 
 pub struct ScheduledEngine {
-    batch_tx: mpsc::UnboundedSender<SchedulerMsg>,
-    continuous_tx: mpsc::UnboundedSender<ContinuousSchedulerMsg>,
+    ar_tx: mpsc::UnboundedSender<ArMessage>,
+    executor: Arc<dyn Executor>,
     model_info: ModelInfo,
-    #[allow(dead_code)]
     engine: Arc<Engine>,
-    _batch_loop_handle: tokio::task::JoinHandle<()>,
-    _continuous_loop_handle: Option<tokio::task::JoinHandle<()>>,
-    _cpu_continuous_handle: Option<std::thread::JoinHandle<()>>,
-    _gpu_worker_handle: Option<std::thread::JoinHandle<()>>,
+    _ar_loop_handle: tokio::task::JoinHandle<()>,
 }
 
 impl ScheduledEngine {
     pub fn new(engine: Engine, config: SchedulerConfig) -> Self {
-        let is_cpu = engine.device().is_cpu();
         let engine = Arc::new(engine);
         let model_info = ModelInfo {
             id: engine.model_id().to_string(),
@@ -53,265 +35,58 @@ impl ScheduledEngine {
             owned_by: "prelude".to_string(),
         };
 
-        if is_cpu {
-            return Self::new_cpu(engine, config, model_info);
-        }
-
-        let continuous_supported = engine.runtime_caps().supports_paged_attn;
-        tracing::info!(
-            classify_scheduler = "batch-runtime",
-            embed_scheduler = "batch-runtime",
-            prefill_only_generation_scheduler = "batch-runtime",
-            multi_token_generation_scheduler = if continuous_supported {
-                "continuous-runtime"
-            } else {
-                "unsupported"
-            },
-            "starting GPU scheduler runtimes"
+        // Create the device executor (registered by device crate via ctor).
+        let executor: Arc<dyn Executor> = Arc::from(
+            executor::create_executor(Arc::clone(&engine))
+                .unwrap_or_else(|| {
+                    tracing::warn!("no device executor registered, using stub");
+                    Box::new(StubExecutor)
+                })
         );
 
-        // GPU work queue — all generation GPU work is serialized through this.
-        let (gpu_tx, gpu_rx) = mpsc::unbounded_channel();
-        let gpu_worker_handle = spawn_gpu_worker(gpu_rx, Arc::clone(&engine));
+        // Spawn the unified AR scheduling loop.
+        let (ar_tx, ar_rx) = mpsc::unbounded_channel();
+        let loop_engine = Arc::clone(&engine);
+        let loop_executor = Arc::clone(&executor);
+        let ar_loop_handle = tokio::spawn(async move {
+            ar_loop(loop_engine, loop_executor.as_ref(), config, ar_rx).await;
+        });
 
-        let (batch_tx, batch_rx) = mpsc::unbounded_channel();
-        let batch_handle = tokio::spawn(batch_runtime_loop(
-            Arc::clone(&engine),
-            config.clone(),
-            batch_rx,
-            gpu_tx.clone(),
-        ));
-
-        let (continuous_tx, continuous_rx) = mpsc::unbounded_channel();
-        let continuous_handle = tokio::spawn(continuous_generation_loop(
-            Arc::clone(&engine),
-            config,
-            continuous_rx,
-            gpu_tx,
-        ));
+        tracing::info!("ScheduledEngine started (Executor-based)");
 
         Self {
-            batch_tx,
-            continuous_tx,
+            ar_tx,
+            executor,
             model_info,
             engine,
-            _batch_loop_handle: batch_handle,
-            _continuous_loop_handle: Some(continuous_handle),
-            _cpu_continuous_handle: None,
-            _gpu_worker_handle: Some(gpu_worker_handle),
+            _ar_loop_handle: ar_loop_handle,
         }
     }
 
-    /// CPU path: batch runtime for prefill-only + classify + embed,
-    /// continuous runtime for multi-token decode with per-token streaming.
-    fn new_cpu(engine: Arc<Engine>, config: SchedulerConfig, model_info: ModelInfo) -> Self {
-        let supports_kv_cache = engine.runtime_caps().supports_kv_cache;
-        tracing::info!(
-            batch = "cpu-batch-runtime",
-            continuous = if supports_kv_cache { "cpu-continuous-runtime" } else { "none" },
-            "starting CPU scheduler runtimes"
-        );
-
-        let (batch_tx, batch_rx) = mpsc::unbounded_channel();
-        let batch_handle = tokio::spawn(cpu_batch_runtime_loop(
-            Arc::clone(&engine),
-            config,
-            batch_rx,
-        ));
-
-        let (continuous_tx, continuous_rx) = mpsc::unbounded_channel();
-        let cpu_continuous_handle = if supports_kv_cache {
-            // Run on dedicated OS thread to avoid tokio worker pool expansion
-            // from block_in_place, which causes thread contention with OpenMP.
-            Some(spawn_cpu_continuous_worker(
-                Arc::clone(&engine),
-                continuous_rx,
-            ))
-        } else {
-            None
-        };
-
-        Self {
-            batch_tx,
-            continuous_tx,
-            model_info,
-            engine,
-            _batch_loop_handle: batch_handle,
-            _continuous_loop_handle: None,
-            _cpu_continuous_handle: cpu_continuous_handle,
-            _gpu_worker_handle: None,
-        }
-    }
-
-    fn prepare_generation_for_routing(
-        &self,
-        request: &GenerateRequest,
-    ) -> Result<PreparedGenerateRequest, EngineError> {
-        tokio::task::block_in_place(|| self.engine.prepare_generate_request(request, 0))
-    }
-
-    fn enqueue_request(
+    fn prepare_and_enqueue(
         &self,
         request: GenerateRequest,
-    ) -> Result<oneshot::Receiver<Result<GenerateResult, EngineError>>, EngineError> {
-        let (result_tx, result_rx) = oneshot::channel();
-        let max_new = request.max_new_tokens as usize;
-
-        if max_new <= 1 {
-            // Prefill-only: route to batch without tokenizing (batch runtime tokenizes)
-            let state = GenerationRequestState::new_complete(request, result_tx);
-            self.batch_tx
-                .send(SchedulerMsg::NewRequest(state))
-                .map_err(|_| EngineError::Unavailable("batch runtime loop stopped".into()))?;
-        } else {
-            // Multi-token: must tokenize to check decode plan
-            let prepared = self.prepare_generation_for_routing(&request)?;
-            match generation_scheduler_route(self.engine.as_ref(), &request, Some(&prepared)) {
-                Some(GenerationSchedulerRoute::Batch) => {
-                    let state = GenerationRequestState::new_complete(request, result_tx);
-                    self.batch_tx
-                        .send(SchedulerMsg::NewRequest(state))
-                        .map_err(|_| EngineError::Unavailable("batch runtime loop stopped".into()))?;
-                }
-                Some(GenerationSchedulerRoute::Continuous) => {
-                    let state = ContinuousGenerationRequestState::new_complete(prepared, result_tx);
-                    self.continuous_tx
-                        .send(ContinuousSchedulerMsg::NewRequest(state))
-                        .map_err(|_| {
-                            EngineError::Unavailable("continuous generation loop stopped".into())
-                        })?;
-                }
-                None => {
-                    return Err(EngineError::Unavailable(
-                        "multi-token generation requires paged attention support".into(),
-                    ));
-                }
-            }
-        }
-        Ok(result_rx)
-    }
-
-    fn enqueue_stream_request(
-        &self,
-        request: GenerateRequest,
-        tx: mpsc::UnboundedSender<StreamEvent>,
+        response: ResponseChannel,
     ) -> Result<(), EngineError> {
-        let max_new = request.max_new_tokens as usize;
-
-        if max_new <= 1 {
-            let state = GenerationRequestState::new_stream(request, tx);
-            self.batch_tx
-                .send(SchedulerMsg::NewRequest(state))
-                .map_err(|_| EngineError::Unavailable("batch runtime loop stopped".into()))?;
-        } else {
-            let prepared = self.prepare_generation_for_routing(&request)?;
-            match generation_scheduler_route(self.engine.as_ref(), &request, Some(&prepared)) {
-                Some(GenerationSchedulerRoute::Batch) => {
-                    let state = GenerationRequestState::new_stream(request, tx);
-                    self.batch_tx
-                        .send(SchedulerMsg::NewRequest(state))
-                        .map_err(|_| EngineError::Unavailable("batch runtime loop stopped".into()))?;
-                }
-                Some(GenerationSchedulerRoute::Continuous) => {
-                    let state = ContinuousGenerationRequestState::new_stream(prepared, tx);
-                    self.continuous_tx
-                        .send(ContinuousSchedulerMsg::NewRequest(state))
-                        .map_err(|_| {
-                            EngineError::Unavailable("continuous generation loop stopped".into())
-                        })?;
-                }
-                None => {
-                    return Err(EngineError::Unavailable(
-                        "multi-token generation requires paged attention support".into(),
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn enqueue_classify_request(
-        &self,
-        request: ClassifyRequest,
-    ) -> Result<oneshot::Receiver<Result<ClassifyResult, EngineError>>, EngineError> {
-        let (result_tx, result_rx) = oneshot::channel();
-        self.batch_tx
-            .send(SchedulerMsg::NewClassifyRequest(InFlightClassifyRequest {
-                request,
-                response: result_tx,
-            }))
-            .map_err(|_| EngineError::Unavailable("batch runtime loop stopped".into()))?;
-        Ok(result_rx)
-    }
-
-    fn enqueue_embed_request(
-        &self,
-        request: EmbedRequest,
-    ) -> Result<oneshot::Receiver<Result<EmbedResult, EngineError>>, EngineError> {
-        let (result_tx, result_rx) = oneshot::channel();
-        self.batch_tx
-            .send(SchedulerMsg::NewEmbedRequest(InFlightEmbedRequest {
-                request,
-                response: result_tx,
-            }))
-            .map_err(|_| EngineError::Unavailable("batch runtime loop stopped".into()))?;
-        Ok(result_rx)
+        let prepared = tokio::task::block_in_place(|| {
+            self.engine.prepare_generate_request(&request, 0)
+        })?;
+        self.ar_tx
+            .send(ArMessage::NewRequest { prepared, response })
+            .map_err(|_| EngineError::Unavailable("AR loop stopped".into()))
     }
 }
 
-fn select_generation_scheduler_route(
-    max_new: usize,
-    multi_token_decode_ready: bool,
-    supports_paged_attn: bool,
-) -> Option<GenerationSchedulerRoute> {
-    if max_new <= 1 {
-        return Some(GenerationSchedulerRoute::Batch);
-    }
-    if !multi_token_decode_ready {
-        return None;
-    }
-    if supports_paged_attn {
-        Some(GenerationSchedulerRoute::Continuous)
-    } else {
-        Some(GenerationSchedulerRoute::Batch)
-    }
-}
+/// Stub executor returned when no device crate registers one.
+struct StubExecutor;
 
-/// Route a generation request without tokenizing.
-///
-/// For `max_new_tokens <= 1` (prefill-only), routes to Batch immediately.
-/// For `max_new_tokens > 1`, the caller must tokenize first and pass the
-/// prepared request so we can check `build_decode_plan`.
-fn generation_scheduler_route(
-    engine: &Engine,
-    request: &GenerateRequest,
-    prepared: Option<&PreparedGenerateRequest>,
-) -> Option<GenerationSchedulerRoute> {
-    // CPU: max_new=1 → Batch, max_new>1 → Continuous (requires KV cache).
-    if engine.device().is_cpu() {
-        let max_new = request.max_new_tokens as usize;
-        if max_new <= 1 {
-            return Some(GenerationSchedulerRoute::Batch);
-        }
-        return if engine.runtime_caps().supports_kv_cache {
-            Some(GenerationSchedulerRoute::Continuous)
-        } else {
-            None // model doesn't support multi-token decode
-        };
+impl Executor for StubExecutor {
+    fn submit(&self, _batch: ForwardBatch) -> Result<executor::ExecutionHandle, EngineError> {
+        Err(EngineError::Unavailable("no device executor registered".into()))
     }
-    let max_new = request.max_new_tokens as usize;
-    if max_new <= 1 {
-        return Some(GenerationSchedulerRoute::Batch);
+    fn collect(&self, _handle: executor::ExecutionHandle) -> Result<executor::ModelOutput, EngineError> {
+        Err(EngineError::Unavailable("no device executor registered".into()))
     }
-    let multi_token_decode_ready = match prepared {
-        Some(p) => engine.build_decode_plan(std::slice::from_ref(p)).is_ok(),
-        None => false,
-    };
-    select_generation_scheduler_route(
-        max_new,
-        multi_token_decode_ready,
-        engine.runtime_caps().supports_paged_attn,
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -329,30 +104,11 @@ impl InferenceEngine for ScheduledEngine {
     }
 
     async fn generate(&self, request: GenerateRequest) -> Result<GenerateResult, EngineError> {
-        let result_rx = self.enqueue_request(request)?;
+        let (result_tx, result_rx) = oneshot::channel();
+        self.prepare_and_enqueue(request, ResponseChannel::Complete(result_tx))?;
         result_rx
             .await
-            .map_err(|_| EngineError::Internal("scheduler dropped result channel".into()))?
-    }
-
-    async fn generate_batch(
-        &self,
-        requests: Vec<GenerateRequest>,
-    ) -> Result<Vec<GenerateResult>, EngineError> {
-        let mut result_rxs = Vec::with_capacity(requests.len());
-        for request in requests {
-            result_rxs.push(self.enqueue_request(request)?);
-        }
-
-        let mut out = Vec::with_capacity(result_rxs.len());
-        for result_rx in result_rxs {
-            out.push(
-                result_rx.await.map_err(|_| {
-                    EngineError::Internal("scheduler dropped result channel".into())
-                })??,
-            );
-        }
-        Ok(out)
+            .map_err(|_| EngineError::Internal("AR loop dropped result channel".into()))?
     }
 
     async fn generate_stream(
@@ -360,98 +116,21 @@ impl InferenceEngine for ScheduledEngine {
         request: GenerateRequest,
         tx: mpsc::UnboundedSender<StreamEvent>,
     ) -> Result<(), EngineError> {
-        self.enqueue_stream_request(request, tx)
+        self.prepare_and_enqueue(request, ResponseChannel::Stream(tx))
     }
 
     async fn cancel(&self, request_id: &str) -> Result<bool, EngineError> {
-        let request_id = request_id.to_string();
-        let _ = self.batch_tx.send(SchedulerMsg::Abort(request_id.clone()));
-        let _ = self
-            .continuous_tx
-            .send(ContinuousSchedulerMsg::Abort(request_id));
+        let _ = self.ar_tx.send(ArMessage::Abort(request_id.to_string()));
         Ok(true)
     }
 
-    async fn classify(&self, request: ClassifyRequest) -> Result<ClassifyResult, EngineError> {
-        let result_rx = self.enqueue_classify_request(request)?;
-        result_rx
-            .await
-            .map_err(|_| EngineError::Internal("scheduler dropped result channel".into()))?
+    async fn classify(&self, _request: ClassifyRequest) -> Result<ClassifyResult, EngineError> {
+        // TODO: tokenize → executor.submit(Prefill) → collect → postprocess
+        Err(EngineError::Unavailable("classify via Executor not yet wired".into()))
     }
 
-    async fn embed(&self, request: EmbedRequest) -> Result<EmbedResult, EngineError> {
-        let result_rx = self.enqueue_embed_request(request)?;
-        result_rx
-            .await
-            .map_err(|_| EngineError::Internal("scheduler dropped result channel".into()))?
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::{PromptInput, SamplingParams, StopConfig};
-
-    fn make_generate_request(request_id: &str) -> GenerateRequest {
-        GenerateRequest {
-            request_id: request_id.to_string(),
-            model: "test-model".to_string(),
-            input: PromptInput::Text("hello".to_string()),
-            sampling: SamplingParams {
-                temperature: 0.0,
-                ..Default::default()
-            },
-            max_new_tokens: 16,
-            stop: StopConfig::default(),
-            seed: Some(42),
-            deadline_ms: None,
-            logprobs: None,
-            prompt_logprobs: None,
-        }
-    }
-
-    #[test]
-    fn generation_request_state_is_streaming() {
-        let req = make_generate_request("test-complete");
-        let state = GenerationRequestState::new_complete(req, oneshot::channel().0);
-        assert!(!state.is_streaming());
-
-        let req2 = make_generate_request("test-stream");
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let state2 = GenerationRequestState::new_stream(req2, tx);
-        assert!(state2.is_streaming());
-    }
-
-    #[test]
-    fn selects_batch_route_for_prefill_only_generation() {
-        assert_eq!(
-            select_generation_scheduler_route(1, false, false),
-            Some(GenerationSchedulerRoute::Batch)
-        );
-    }
-
-    #[test]
-    fn selects_continuous_route_for_paged_multi_token_generation() {
-        assert_eq!(
-            select_generation_scheduler_route(4, true, true),
-            Some(GenerationSchedulerRoute::Continuous)
-        );
-    }
-
-    #[test]
-    fn selects_batch_route_for_nonpaged_multi_token_fallback() {
-        assert_eq!(
-            select_generation_scheduler_route(4, true, false),
-            Some(GenerationSchedulerRoute::Batch)
-        );
-    }
-
-    #[test]
-    fn rejects_multi_token_generation_when_decode_is_unavailable() {
-        assert_eq!(select_generation_scheduler_route(4, false, false), None);
+    async fn embed(&self, _request: EmbedRequest) -> Result<EmbedResult, EngineError> {
+        // TODO: tokenize → executor.submit(Prefill) → collect → postprocess
+        Err(EngineError::Unavailable("embed via Executor not yet wired".into()))
     }
 }

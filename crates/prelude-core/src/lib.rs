@@ -7,7 +7,6 @@ pub mod modules;
 pub mod nn_ops;
 pub mod ops;
 pub mod profiling;
-pub mod runtime;
 pub mod scheduler;
 pub mod types;
 
