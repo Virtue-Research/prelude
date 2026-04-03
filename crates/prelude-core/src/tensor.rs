@@ -3,9 +3,83 @@
 //! All model code imports from here — never from candle_core directly.
 //! Each type wraps candle_core internally (temporary — will be replaced by DeviceBuffer).
 
-// ── Core types (re-export candle's for now, replace incrementally) ──
+// ── Core types ──────────────────────────────────────────────────────
 
-pub use candle_core::DType;
+/// Element data type.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum DType {
+    U8,
+    U32,
+    I16,
+    I32,
+    I64,
+    BF16,
+    F16,
+    F32,
+    F64,
+    F8E4M3,
+}
+
+impl DType {
+    pub fn size_in_bytes(&self) -> usize {
+        match self {
+            Self::U8 | Self::F8E4M3 => 1,
+            Self::I16 | Self::BF16 | Self::F16 => 2,
+            Self::U32 | Self::I32 | Self::F32 => 4,
+            Self::I64 | Self::F64 => 8,
+        }
+    }
+
+    pub fn is_float(&self) -> bool {
+        matches!(self, Self::BF16 | Self::F16 | Self::F32 | Self::F64 | Self::F8E4M3)
+    }
+
+    pub fn is_int(&self) -> bool {
+        !self.is_float()
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::U8 => "u8", Self::U32 => "u32", Self::I16 => "i16",
+            Self::I32 => "i32", Self::I64 => "i64", Self::BF16 => "bf16",
+            Self::F16 => "f16", Self::F32 => "f32", Self::F64 => "f64",
+            Self::F8E4M3 => "f8e4m3",
+        }
+    }
+}
+
+impl std::fmt::Display for DType {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<DType> for candle_core::DType {
+    fn from(d: DType) -> Self {
+        match d {
+            DType::U8 => Self::U8, DType::U32 => Self::U32,
+            DType::I16 => Self::I16, DType::I32 => Self::I32, DType::I64 => Self::I64,
+            DType::BF16 => Self::BF16, DType::F16 => Self::F16,
+            DType::F32 => Self::F32, DType::F64 => Self::F64,
+            DType::F8E4M3 => Self::F8E4M3,
+        }
+    }
+}
+
+impl From<candle_core::DType> for DType {
+    fn from(d: candle_core::DType) -> Self {
+        match d {
+            candle_core::DType::U8 => Self::U8, candle_core::DType::U32 => Self::U32,
+            candle_core::DType::I16 => Self::I16, candle_core::DType::I32 => Self::I32,
+            candle_core::DType::I64 => Self::I64,
+            candle_core::DType::BF16 => Self::BF16, candle_core::DType::F16 => Self::F16,
+            candle_core::DType::F32 => Self::F32, candle_core::DType::F64 => Self::F64,
+            candle_core::DType::F8E4M3 => Self::F8E4M3,
+            _ => panic!("unsupported candle DType: {:?}", d),
+        }
+    }
+}
+
 pub use candle_core::Device;
 pub use candle_core::Shape;
 pub use candle_core::D;
@@ -34,10 +108,10 @@ pub struct Tensor(candle_core::Tensor);
 
 impl Tensor {
     pub fn zeros<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
-        candle_core::Tensor::zeros(shape, dtype, device).map(Self)
+        candle_core::Tensor::zeros(shape, candle_core::DType::from(dtype), device).map(Self)
     }
     pub fn ones<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
-        candle_core::Tensor::ones(shape, dtype, device).map(Self)
+        candle_core::Tensor::ones(shape, candle_core::DType::from(dtype), device).map(Self)
     }
     pub fn zeros_like(&self) -> Result<Self> {
         self.0.zeros_like().map(Self)
@@ -89,7 +163,7 @@ impl Tensor {
     pub fn dims2(&self) -> Result<(usize, usize)> { self.0.dims2() }
     pub fn dims3(&self) -> Result<(usize, usize, usize)> { self.0.dims3() }
     pub fn dims4(&self) -> Result<(usize, usize, usize, usize)> { self.0.dims4() }
-    pub fn dtype(&self) -> DType { self.0.dtype() }
+    pub fn dtype(&self) -> DType { DType::from(self.0.dtype()) }
     pub fn device(&self) -> &Device { self.0.device() }
     pub fn rank(&self) -> usize { self.0.rank() }
     pub fn elem_count(&self) -> usize { self.0.elem_count() }
@@ -142,7 +216,7 @@ impl Tensor {
 
     // ── Conversion ──────────────────────────────────────────────────
 
-    pub fn to_dtype(&self, dtype: DType) -> Result<Self> { self.0.to_dtype(dtype).map(Self) }
+    pub fn to_dtype(&self, dtype: DType) -> Result<Self> { self.0.to_dtype(candle_core::DType::from(dtype)).map(Self) }
     pub fn to_device(&self, device: &Device) -> Result<Self> { self.0.to_device(device).map(Self) }
     pub fn to_vec0<T: candle_core::WithDType>(&self) -> Result<T> { self.0.to_vec0() }
     pub fn to_vec1<T: candle_core::WithDType>(&self) -> Result<Vec<T>> { self.0.to_vec1() }
