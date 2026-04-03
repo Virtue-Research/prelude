@@ -332,22 +332,27 @@ impl std::borrow::Borrow<candle_core::Tensor> for Tensor {
 
 // ── Operator overloads ──────────────────────────────────────────────
 
-// Tensor + Tensor
+// Tensor + Tensor — tries fused_add from current Ops context, falls back to candle.
 impl std::ops::Add for Tensor {
     type Output = Result<Self>;
-    fn add(self, rhs: Self) -> Result<Self> { (self.0 + rhs.0).map(Self) }
+    fn add(self, rhs: Self) -> Result<Self> { &self + &rhs }
 }
 impl std::ops::Add for &Tensor {
     type Output = Result<Tensor>;
-    fn add(self, rhs: &Tensor) -> Result<Tensor> { (&self.0 + &rhs.0).map(Tensor) }
+    fn add(self, rhs: &Tensor) -> Result<Tensor> {
+        if let Some(result) = crate::ops::current_ops().fused.fused_add(self, rhs) {
+            return result;
+        }
+        (&self.0 + &rhs.0).map(Tensor)
+    }
 }
 impl std::ops::Add<&Tensor> for Tensor {
     type Output = Result<Tensor>;
-    fn add(self, rhs: &Tensor) -> Result<Tensor> { (self.0 + &rhs.0).map(Tensor) }
+    fn add(self, rhs: &Tensor) -> Result<Tensor> { &self + rhs }
 }
 impl std::ops::Add<Tensor> for &Tensor {
     type Output = Result<Tensor>;
-    fn add(self, rhs: Tensor) -> Result<Tensor> { (&self.0 + rhs.0).map(Tensor) }
+    fn add(self, rhs: Tensor) -> Result<Tensor> { self + &rhs }
 }
 // Tensor + f64
 impl std::ops::Add<f64> for Tensor {

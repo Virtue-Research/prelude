@@ -85,6 +85,8 @@ impl Engine {
         need_hidden_states: bool,
     ) -> Result<Option<PrefillForwardResult>, EngineError> {
         use crate::modules::BatchAttnContext;
+        // Set thread-local ops for operator overload dispatch.
+        let _ops_guard = crate::ops::OpsGuard::new(self.executor.ops);
 
         // ── Step 1: Prefix cache lookup ──
         let common_prefix = find_common_prefix_from_groups(token_groups);

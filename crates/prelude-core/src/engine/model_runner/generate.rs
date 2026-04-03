@@ -331,6 +331,7 @@ impl Engine {
         item: PreparedGenerateRequest,
         tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
     ) -> Result<GenerateResult, EngineError> {
+        let _ops_guard = crate::ops::OpsGuard::new(self.executor.ops);
         self.ensure_multi_token_decode_ready()?;
         let gen_start = Instant::now();
         let mut items = vec![item];

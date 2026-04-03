@@ -9,6 +9,8 @@ impl Engine {
         &self,
         seqs: &[BatchDecodeSeq],
     ) -> Result<Tensor, EngineError> {
+        // Set thread-local ops for operator overload dispatch.
+        let _ops_guard = crate::ops::OpsGuard::new(self.executor.ops);
         let pool = self.cache.paged_pool.as_ref().ok_or_else(|| {
             EngineError::Internal("batch_decode_paged requires paged attention pool".into())
         })?;
