@@ -2834,6 +2834,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "prelude-core",
+ "prelude-cpu",
  "prelude-cuda",
  "reqwest 0.13.2",
  "serde",

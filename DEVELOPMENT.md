@@ -61,12 +61,11 @@ cargo check --workspace --all-targets
 ### Test
 
 ```bash
-# CPU library tests
+# Core library tests (uses built-in naive_ops, no device crate needed)
 cargo test -p prelude-core --lib
 
-# Specific module
-cargo test -p prelude-core --lib -- quant
-cargo test -p prelude-core --lib -- linear
+# CPU kernel tests (AVX-512, oneDNN, quantized)
+cargo test -p prelude-cpu --lib
 
 # GPU kernel correctness tests
 cargo test -p prelude-cutlass-gemm --release
@@ -80,9 +79,9 @@ cargo test -p prelude-quant-gemm --release
 
 ```bash
 # CPU kernel benchmarks (quantized, GEMM, attention, etc.)
-cargo run -p prelude-core --bin cpu_ops_bench --release
-cargo run -p prelude-core --bin cpu_ops_bench --release -- quant
-cargo run -p prelude-core --bin cpu_ops_bench --release -- gemm
+cargo run -p prelude-cpu --bin cpu_ops_bench --release
+cargo run -p prelude-cpu --bin cpu_ops_bench --release -- quant
+cargo run -p prelude-cpu --bin cpu_ops_bench --release -- gemm
 
 # GPU kernel benchmarks
 cargo run -p prelude-cutlass-gemm --example bench_kernel --release
