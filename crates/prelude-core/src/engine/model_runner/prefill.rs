@@ -1,7 +1,5 @@
-#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 use super::super::*;
 
-#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 pub(crate) struct PackedSequenceBatch {
     pub flat_tokens: Vec<u32>,
     pub cu_seqlens: Vec<u32>,
@@ -14,7 +12,6 @@ pub(crate) struct PackedSequenceBatch {
 }
 
 /// Result of a batched varlen forward pass, shared by classify, embed, and generation.
-#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 pub(crate) struct PrefillForwardResult {
     /// Raw model output tensor (not converted to F32 — callers decide dtype).
     /// Shape: (batch_size, vocab_size) — last token logits per sequence.
@@ -30,7 +27,6 @@ pub(crate) struct PrefillForwardResult {
 }
 
 /// Find the longest common prefix across all token sequences in the groups.
-#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 fn find_common_prefix_from_groups(token_groups: &[&[Vec<u32>]]) -> Vec<u32> {
     let all_seqs: Vec<&[u32]> = token_groups
         .iter()
@@ -57,7 +53,6 @@ fn find_common_prefix_from_groups(token_groups: &[&[Vec<u32>]]) -> Vec<u32> {
     first[..common_len].to_vec()
 }
 
-#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 impl Engine {
     /// Unified prefill pipeline for all task types (classify, embed, generate).
     ///
@@ -391,7 +386,6 @@ impl Engine {
 /// Pack token groups into varlen format, skipping the first `offset` tokens
 /// from each sequence (used when prefix cache provides the leading tokens).
 /// Position IDs account for the offset so the model sees correct positions.
-#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 fn pack_varlen_tokens(
     token_groups: &[&[Vec<u32>]],
     offset: usize,

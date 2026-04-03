@@ -41,7 +41,6 @@ mod tokenizer;
 // ── Re-exports: plan types + engine struct ──
 pub use self::engine::Engine;
 pub(crate) use self::engine::{ModelExecutor, ModelVariant};
-#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 pub(crate) use self::types::OwnedBatchDecodeSeq;
 pub(crate) use self::types::PagedKvPool;
 pub use self::types::TaskOverride;
@@ -60,7 +59,6 @@ pub(crate) use self::model_runner::{
     RawClassifyOutput, classify_postprocess,
     RawEmbedOutput, embed_postprocess,
 };
-#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 pub(crate) use self::model_runner::{RawGenerateOutput, generate_postprocess};
 
 // ── Re-exports: helpers (config, device, weights, tokenizer) ──

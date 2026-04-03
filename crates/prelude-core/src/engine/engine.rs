@@ -185,7 +185,6 @@ impl Engine {
         }
 
         // GPU path (flash attention available): use prefill_pipeline
-        #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
         {
             let token_groups: Vec<&[Vec<u32>]> = items
                 .iter()
@@ -201,79 +200,9 @@ impl Engine {
             })
         }
 
-        // CPU path (no flash attention): inline forward
-        #[cfg(not(any(feature = "flash-attn-v4", feature = "flashinfer")))]
-        {
-            self.forward_prefill_cpu(items)
-        }
-    }
-
-    /// CPU-only prefill forward: constructs tensors inline and calls model.forward().
-    #[cfg(not(any(feature = "flash-attn-v4", feature = "flashinfer")))]
-    fn forward_prefill_cpu(
-        &self,
-        items: Vec<super::PreparedGenerateRequest>,
-    ) -> Result<super::executor::ModelOutput, EngineError> {
-        use super::executor::ModelOutput;
-        use crate::tensor::Tensor;
-
-        let device = &self.executor.device;
-        let mut model = self.executor.model.lock()
-            .map_err(|e| EngineError::Internal(format!("model lock: {e}")))?;
-
-        let mut all_logits: Vec<Tensor> = Vec::with_capacity(items.len());
-
-        for item in &items {
-            let seq_len = item.prompt_tokens.len();
-            let input = Tensor::from_vec(
-                item.prompt_tokens.clone(), (seq_len,), device,
-            ).map_err(|e| EngineError::Internal(e.to_string()))?;
-            let cu_seqlens = Tensor::from_vec(
-                vec![0u32, seq_len as u32], (2,), device,
-            ).map_err(|e| EngineError::Internal(e.to_string()))?;
-            let position_ids = Tensor::from_vec(
-                (0..seq_len as u32).collect::<Vec<_>>(), (seq_len,), device,
-            ).map_err(|e| EngineError::Internal(e.to_string()))?;
-            let seq_lens_vec = vec![seq_len];
-
-            let mut ctx = crate::modules::BatchAttnContext {
-                ops: crate::ops::select_ops(device),
-                cu_seqlens_q: &cu_seqlens,
-                max_seqlen_q: seq_len,
-                position_ids: &position_ids,
-                seq_lens: &seq_lens_vec,
-                paged_kv: None,
-                deltanet_pool: None,
-                deltanet_slots: None,
-            };
-
-            let logits = model.forward(&input, &mut ctx)
-                .map_err(|e| EngineError::Internal(e.to_string()))?;
-
-            // Extract last token logits
-            let last_logits = if logits.dims().len() == 2 {
-                logits.get(seq_len - 1)
-                    .map_err(|e| EngineError::Internal(e.to_string()))?
-            } else {
-                logits
-            };
-            all_logits.push(last_logits.unsqueeze(0)
-                .map_err(|e| EngineError::Internal(e.to_string()))?);
-        }
-
-        drop(model);
-
-        let logits = Tensor::cat(&all_logits, 0)
-            .map_err(|e| EngineError::Internal(e.to_string()))?;
-
-        Ok(ModelOutput {
-            logits,
-            item_seq_counts: vec![1; items.len()],
-        })
     }
 
     /// Forward pass for batched decode (one token per sequence, paged KV).
-    #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
     fn forward_decode(
         &self,
         tokens: Vec<u32>,
@@ -311,19 +240,6 @@ impl Engine {
         })
     }
 
-    #[cfg(not(any(feature = "flash-attn-v4", feature = "flashinfer")))]
-    fn forward_decode(
-        &self,
-        tokens: Vec<u32>,
-        _positions: Vec<usize>,
-        _block_tables: Vec<Vec<u32>>,
-        _deltanet_slots: Option<Vec<u32>>,
-    ) -> Result<super::executor::ModelOutput, EngineError> {
-        Err(EngineError::Unavailable(format!(
-            "paged decode requires flash attention features ({} seqs)",
-            tokens.len(),
-        )))
-    }
 
     /// Forward pass for one-shot classify/embed.
     ///
@@ -352,7 +268,6 @@ impl Engine {
             .map(|g| g.as_slice())
             .collect();
 
-        #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
         {
             let forward_result = self.prefill_pipeline(&refs)?
                 .ok_or_else(|| EngineError::Internal("empty one-shot batch".into()))?;
@@ -363,12 +278,6 @@ impl Engine {
             })
         }
 
-        #[cfg(not(any(feature = "flash-attn-v4", feature = "flashinfer")))]
-        {
-            Err(EngineError::Unavailable(
-                "one-shot classify/embed requires flash attention features".into(),
-            ))
-        }
     }
 }
 

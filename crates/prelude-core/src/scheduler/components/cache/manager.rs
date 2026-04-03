@@ -79,8 +79,7 @@ impl CacheManager {
         }
         let block_size = cache_config.prefix_block_size;
         // flash layout: [B, L, H, D] → concat dim 1; standard: [B, H, L, D] → concat dim 2
-        let is_flash =
-            device.is_cuda() && cfg!(any(feature = "flash-attn-v4", feature = "flashinfer"));
+        let is_flash = device.is_cuda();
         let concat_dim = if is_flash { 1 } else { 2 };
         info!(
             max_blocks = max_blocks,
@@ -118,34 +117,28 @@ impl CacheManager {
         let num_kv_heads = config.num_key_value_heads;
         let head_dim = config.head_dim;
 
-        // FA4 TMA requires page_size == tile_n for optimal paged attention.
-        #[cfg(feature = "flash-attn-v4")]
-        if std::env::var("PRELUDE_PAGED_BLOCK_SIZE").is_err() {
-            let tile_n = crate::modules::attn_utils::fa4_tile_n(head_dim, head_dim);
-            if paged_block_size != tile_n {
-                let old = paged_block_size;
-                paged_block_size = tile_n;
-                info!(
-                    old_block_size = old,
-                    new_block_size = paged_block_size,
-                    head_dim,
-                    tile_n,
-                    "auto-adjusted paged_block_size to match FA4 tile_n for TMA"
-                );
-            }
-        }
-        #[cfg(all(feature = "flashinfer", not(feature = "flash-attn-v4")))]
-        {
-            let min_block = if head_dim == 256 { 64 } else { 128 };
-            if paged_block_size % min_block != 0 {
-                let old = paged_block_size;
-                paged_block_size = min_block;
-                info!(
-                    old_block_size = old,
-                    new_block_size = paged_block_size,
-                    head_dim,
-                    "auto-adjusted paged_block_size for FlashInfer kernel compatibility"
-                );
+        // Auto-adjust block size for attention backend compatibility.
+        // FA4 TMA requires page_size == tile_n; FlashInfer requires block alignment.
+        if device.is_cuda() && std::env::var("PRELUDE_PAGED_BLOCK_SIZE").is_err() {
+            // Check attention backend name to determine optimal block size.
+            let ops = crate::ops::select_ops(device);
+            let attn_name = ops.attn.name();
+            if attn_name.contains("flash-attn") || attn_name.contains("fa4") {
+                let tile_n = crate::modules::attn_utils::fa4_tile_n(head_dim, head_dim);
+                if paged_block_size != tile_n {
+                    let old = paged_block_size;
+                    paged_block_size = tile_n;
+                    info!(old_block_size = old, new_block_size = paged_block_size, head_dim, tile_n,
+                        "auto-adjusted paged_block_size to match FA4 tile_n for TMA");
+                }
+            } else if attn_name.contains("flashinfer") {
+                let min_block = if head_dim == 256 { 64 } else { 128 };
+                if paged_block_size % min_block != 0 {
+                    let old = paged_block_size;
+                    paged_block_size = min_block;
+                    info!(old_block_size = old, new_block_size = paged_block_size, head_dim,
+                        "auto-adjusted paged_block_size for FlashInfer kernel compatibility");
+                }
             }
         }
         let num_layers = config.num_hidden_layers;
@@ -158,10 +151,9 @@ impl CacheManager {
         } else {
             let bytes_per_block_per_layer = {
                 let v1 = 2 * num_kv_heads * head_dim * paged_block_size * dtype.size_in_bytes();
-                #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
-                let flash = 2 * num_kv_heads * head_dim * paged_block_size * dtype.size_in_bytes();
-                #[cfg(not(any(feature = "flash-attn-v4", feature = "flashinfer")))]
-                let flash = 0;
+                let flash = if device.is_cuda() {
+                    2 * num_kv_heads * head_dim * paged_block_size * dtype.size_in_bytes()
+                } else { 0 };
                 v1 + flash
             };
             let total_bytes_per_block = bytes_per_block_per_layer * num_layers;
@@ -188,9 +180,7 @@ impl CacheManager {
 
         let mut key_caches = Vec::with_capacity(num_layers);
         let mut value_caches = Vec::with_capacity(num_layers);
-        #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
         let mut key_caches_flash = Vec::with_capacity(num_layers);
-        #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
         let mut value_caches_flash = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
             key_caches.push(
@@ -206,7 +196,6 @@ impl CacheManager {
                 ).map_err(candle_err)?,
             );
 
-            #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
             {
                 key_caches_flash.push(
                     Tensor::zeros(
@@ -233,9 +222,7 @@ impl CacheManager {
         let pool = PagedKvPool {
             key_caches,
             value_caches,
-            #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
             key_caches_flash,
-            #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
             value_caches_flash,
             block_size: paged_block_size,
         };
