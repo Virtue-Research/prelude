@@ -820,7 +820,7 @@ mod tests {
                 Tensor::from_vec(vec![0f32; out_features], out_features, &Device::Cpu).unwrap();
             tensors.insert("linear.bias".to_string(), bias);
         }
-        let candle_tensors: HashMap<String, candle_core::Tensor> = tensors.into_iter().map(|(k, v)| (k, v.into_candle())).collect();
+        let candle_tensors: HashMap<String, _> = tensors.into_iter().map(|(k, v)| (k, v.into_candle())).collect();
         save_safetensors(&candle_tensors, path).unwrap();
     }
 
