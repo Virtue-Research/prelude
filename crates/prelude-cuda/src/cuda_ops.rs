@@ -75,13 +75,19 @@ impl GemmOps for CudaOps {
         bail!("quantized_matmul not yet implemented in CudaOps")
     }
 
-    fn grouped_gemm(
+    fn moe_gemm(
         &self,
-        _input: &Tensor, _weights: &Tensor,
-        _sorted_token_ids: &Tensor, _sorted_expert_ids: &Tensor,
-        _num_tokens_per_expert: &Tensor,
+        input: &Tensor, weights: &Tensor,
+        topk_weights: &Option<Tensor>,
+        sorted_token_ids: &Tensor, sorted_expert_ids: &Tensor,
+        topk: usize, is_prefill: bool,
     ) -> Result<Tensor> {
-        bail!("grouped_gemm not yet implemented in CudaOps")
+        let topk_inner = topk_weights.as_ref().map(|t| t.inner().clone());
+        w(crate::ops::moe::moe_gemm_wmma(
+            i(input), i(weights), &topk_inner,
+            i(sorted_token_ids), i(sorted_expert_ids),
+            topk, is_prefill,
+        ))
     }
 }
 

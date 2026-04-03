@@ -113,3 +113,131 @@ pub fn fused_moe_routing(
     Ok((tw_tensor, ti_tensor, se_tensor, st_tensor))
 }
 
+/// WMMA-based MoE GEMM kernel.
+///
+/// Dispatches tokens to experts using sorted indices and performs
+/// batched matrix multiply with optional topk_weights scaling.
+pub fn moe_gemm_wmma(
+    input: &Tensor,
+    weights: &Tensor,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+    is_prefill: bool,
+) -> Result<Tensor> {
+    use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+    use candle_core::cuda_backend::kernels::ffi;
+    use half::{bf16, f16};
+
+    fn cuda_fwd<
+        T: candle_core::cuda_backend::CudaDType
+            + candle_core::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        input: &Tensor,
+        weights: &Tensor,
+        topk_weights: &Option<Tensor>,
+        sorted_token_ids: &Tensor,
+        experts_ids: &Tensor,
+        topk: usize,
+        is_prefill: bool,
+    ) -> Result<Tensor> {
+        let (mut size_m, size_k1) = input.dims2()?;
+        if topk_weights.is_none() {
+            size_m *= topk;
+        }
+        let (num_experts, size_n, size_k) = weights.dims3()?;
+        assert!(
+            size_k == size_k1,
+            "input {:?} and weight {:?} last dim mismatch!",
+            size_k1,
+            size_k
+        );
+        let dev = input.device().as_cuda_device()?;
+        let data_type = match input.dtype() {
+            DType::F16 => 0,
+            DType::BF16 => 1,
+            _ => candle_core::bail!("moe_gemm_wmma only accepts f16/bf16 inputs"),
+        };
+
+        let (input_s, _) = input.storage_and_layout();
+        let input_s = match &*input_s {
+            candle_core::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle_core::bail!("input must be a cuda tensor"),
+        };
+
+        let (weights_s, _) = weights.storage_and_layout();
+        let weights_s = match &*weights_s {
+            candle_core::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle_core::bail!("weight must be a cuda tensor"),
+        };
+
+        let (sti, _) = sorted_token_ids.storage_and_layout();
+        let sti = match &*sti {
+            candle_core::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+            _ => candle_core::bail!("sorted_token_ids must be a cuda tensor"),
+        };
+
+        let (ei, _) = experts_ids.storage_and_layout();
+        let ei = match &*ei {
+            candle_core::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+            _ => candle_core::bail!("experts_ids must be a cuda tensor"),
+        };
+
+        let topk_weights_ptr = if let Some(tw) = topk_weights {
+            let (tw_s, _) = tw.storage_and_layout();
+            let tw_s = match &*tw_s {
+                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+                _ => candle_core::bail!("topk_weights must be a cuda tensor"),
+            };
+            tw_s.device_ptr(tw_s.stream()).0 as *const f32
+        } else {
+            std::ptr::null()
+        };
+
+        let output = unsafe { dev.alloc::<T>(size_m * size_n) }?;
+        let expert_counts = unsafe { dev.alloc::<u32>(num_experts) }?;
+        let expert_offsets = unsafe { dev.alloc::<u32>(num_experts + 1) }?;
+
+        let stream = dev.cuda_stream().cu_stream() as i64;
+        use core::ffi::c_void;
+
+        unsafe {
+            ffi::moe_gemm_wmma(
+                input_s.device_ptr(input_s.stream()).0 as *const c_void,
+                weights_s.device_ptr(weights_s.stream()).0 as *const c_void,
+                sti.device_ptr(sti.stream()).0 as *const i32,
+                ei.device_ptr(ei.stream()).0 as *const i32,
+                topk_weights_ptr,
+                output.device_ptr(output.stream()).0 as *mut c_void,
+                expert_counts.device_ptr(expert_counts.stream()).0 as *mut i32,
+                expert_offsets.device_ptr(expert_offsets.stream()).0 as *mut i32,
+                num_experts as i32,
+                topk as i32,
+                size_m as i32,
+                size_n as i32,
+                size_k as i32,
+                data_type as i32,
+                is_prefill,
+                stream,
+            );
+        }
+
+        use candle_core::op::BackpropOp;
+        let output = candle_core::CudaStorage::wrap_cuda_slice(output, dev.clone());
+        let output = Tensor::from_storage(
+            candle_core::Storage::Cuda(output),
+            (size_m, size_n),
+            BackpropOp::none(),
+            false,
+        );
+        Ok(output)
+    }
+
+    match input.dtype() {
+        DType::F16 => cuda_fwd::<f16>(input, weights, topk_weights, sorted_token_ids, experts_ids, topk, is_prefill),
+        DType::BF16 => cuda_fwd::<bf16>(input, weights, topk_weights, sorted_token_ids, experts_ids, topk, is_prefill),
+        _ => candle_core::bail!("moe_gemm only accepts f16/bf16 inputs"),
+    }
+}
+

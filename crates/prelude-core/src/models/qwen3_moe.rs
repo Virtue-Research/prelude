@@ -227,36 +227,24 @@ impl Qwen3SparseMoeBlock {
 
         let is_prefill = total_tokens > 1;
 
-        let gate = crate::nn_ops::moe::moe_gemm(
-            xs,
-            gate_w,
-            &None,
-            &sorted_token_ids,
-            &sorted_expert_ids,
-            self.num_experts_per_tok,
-            is_prefill,
+        let gate = ops.gemm.moe_gemm(
+            xs, gate_w, &None,
+            &sorted_token_ids, &sorted_expert_ids,
+            self.num_experts_per_tok, is_prefill,
         )?;
 
-        let up = crate::nn_ops::moe::moe_gemm(
-            xs,
-            up_w,
-            &None,
-            &sorted_token_ids,
-            &sorted_expert_ids,
-            self.num_experts_per_tok,
-            is_prefill,
+        let up = ops.gemm.moe_gemm(
+            xs, up_w, &None,
+            &sorted_token_ids, &sorted_expert_ids,
+            self.num_experts_per_tok, is_prefill,
         )?;
 
         let down_input = crate::modules::fast_silu_mul(ops, &gate, &up)?;
 
-        let ys = crate::nn_ops::moe::moe_gemm(
-            &down_input,
-            down_w,
-            &Some(topk_weights.clone()),
-            &sorted_token_ids,
-            &sorted_expert_ids,
-            self.num_experts_per_tok,
-            is_prefill,
+        let ys = ops.gemm.moe_gemm(
+            &down_input, down_w, &Some(topk_weights.clone()),
+            &sorted_token_ids, &sorted_expert_ids,
+            self.num_experts_per_tok, is_prefill,
         )?;
 
         ys.reshape((total_tokens, self.num_experts_per_tok, hidden_dim))?

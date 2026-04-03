@@ -97,13 +97,14 @@ impl GemmOps for CpuOps {
         prelude_core::tensor::bail!("quantized_matmul not supported on CPU (use LinearBackend)")
     }
 
-    fn grouped_gemm(
+    fn moe_gemm(
         &self,
         _input: &Tensor, _weights: &Tensor,
+        _topk_weights: &Option<Tensor>,
         _sorted_token_ids: &Tensor, _sorted_expert_ids: &Tensor,
-        _num_tokens_per_expert: &Tensor,
+        _topk: usize, _is_prefill: bool,
     ) -> Result<Tensor> {
-        prelude_core::tensor::bail!("grouped_gemm not supported on CPU")
+        prelude_core::tensor::bail!("moe_gemm not supported on CPU")
     }
 }
 

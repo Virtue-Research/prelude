@@ -109,8 +109,8 @@ impl GemmOps for NaiveOps {
     fn quantized_matmul(&self, _a: &Tensor, _b: &Tensor, _sa: Option<&Tensor>, _sb: Option<&Tensor>, _q: QuantScheme) -> Result<Tensor> {
         crate::tensor::bail!("quantized_matmul requires prelude-cpu or prelude-cuda")
     }
-    fn grouped_gemm(&self, _i: &Tensor, _w: &Tensor, _t: &Tensor, _e: &Tensor, _n: &Tensor) -> Result<Tensor> {
-        crate::tensor::bail!("grouped_gemm requires prelude-cuda")
+    fn moe_gemm(&self, _input: &Tensor, _weights: &Tensor, _topk_weights: &Option<Tensor>, _sorted_token_ids: &Tensor, _sorted_expert_ids: &Tensor, _topk: usize, _is_prefill: bool) -> Result<Tensor> {
+        crate::tensor::bail!("moe_gemm requires prelude-cuda")
     }
 }
 
