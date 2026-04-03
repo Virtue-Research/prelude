@@ -1,14 +1,14 @@
 use crate::engine::*;
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 use crate::modules::BatchAttnContext;
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 use crate::modules::PagedKvBatchContext;
 
 impl Engine {
     /// Batch prefill multiple requests using varlen paged attention.
     /// Returns first token + block table per request. Blocks are NOT freed —
     /// the caller must either call `stream_decode_with_blocks` or free them manually.
-    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+    #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
     pub(crate) fn batch_prefill_paged(
         &self,
         items: &mut [PreparedGenerateRequest],
@@ -150,7 +150,7 @@ impl Engine {
             max_seqlen_q,
             position_ids: &position_ids_t,
             seq_lens: &q_seq_lens,
-            #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+            #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
             paged_kv: Some(&paged_kv),
             deltanet_pool: dn_pool_ref,
             deltanet_slots: deltanet_slots.as_deref(),

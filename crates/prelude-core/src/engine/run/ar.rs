@@ -433,10 +433,6 @@ fn fail_step(
 }
 
 fn release_resources(engine: &Engine, state: &mut ArSequenceState) {
-    // TODO: block_manager is currently behind #[cfg(feature = "cuda")] in CacheManager.
-    // Once CacheManager's cfg gates are removed (it's always Option, None without CUDA),
-    // this cfg gate goes away too.
-    #[cfg(feature = "cuda")]
     if !state.block_table.is_empty() {
         if let Some(bm_mutex) = engine.cache.block_manager.as_ref() {
             if let Ok(mut bm) = bm_mutex.lock() {

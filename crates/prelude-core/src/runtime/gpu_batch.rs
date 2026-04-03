@@ -156,7 +156,7 @@ type GenGpuResult = Vec<GenerateResult>;
 /// ```text
 /// Generation:  tokenize → prepare_generate_request
 ///              submit   → submit_generate_batch
-///              postproc → generate_postprocess (flash-attn-v3) or passthrough
+///              postproc → generate_postprocess (FA4/FlashInfer) or passthrough
 ///
 /// Classify:    tokenize → tokenize_batch → PreTokenizedClassifyItem
 ///              submit   → submit_classify_batch

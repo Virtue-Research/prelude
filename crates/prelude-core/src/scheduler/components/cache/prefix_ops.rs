@@ -1,17 +1,16 @@
 use crate::cache::manager::CacheManager;
-#[cfg(feature = "cuda")]
-use crate::engine::candle_err;
-#[cfg(feature = "cuda")]
 use crate::engine::EngineError;
 use crate::engine::PreparedGenerateRequest;
-#[cfg(feature = "cuda")]
 use tracing::debug;
+
+fn candle_err(e: crate::tensor::Error) -> EngineError {
+    EngineError::Internal(format!("candle: {e}"))
+}
 
 impl CacheManager {
     /// Match prefix cache for paged-attention runs and return only block IDs.
     /// This avoids assembling per-layer KV tensors when the caller can consume
     /// paged blocks directly.
-    #[cfg(feature = "cuda")]
     pub(crate) fn try_prefix_cache_match_paged_only(
         &self,
         tokens: &[u32],
@@ -44,7 +43,6 @@ impl CacheManager {
     }
 
     /// Insert only paged block IDs into prefix cache (no KV tensor extraction).
-    #[cfg(feature = "cuda")]
     pub(crate) fn try_prefix_cache_insert_paged_only(
         &self,
         tokens: &[u32],

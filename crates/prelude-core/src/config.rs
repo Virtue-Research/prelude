@@ -105,7 +105,7 @@ impl CacheConfig {
         Self {
             paged_block_size: parse_env_usize(
                 "PRELUDE_PAGED_BLOCK_SIZE",
-                if cfg!(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")) { 128 } else { 16 },
+                if cfg!(any(feature = "flash-attn-v4", feature = "flashinfer")) { 128 } else { 16 },
             ),
             paged_attn_blocks: parse_env_usize("PRELUDE_PAGED_ATTN_BLOCKS", 0),
             gpu_memory_utilization: 0.4,

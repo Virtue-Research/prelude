@@ -1,7 +1,7 @@
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 use super::super::*;
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 pub(crate) struct PackedSequenceBatch {
     pub flat_tokens: Vec<u32>,
     pub cu_seqlens: Vec<u32>,
@@ -14,7 +14,7 @@ pub(crate) struct PackedSequenceBatch {
 }
 
 /// Result of a batched varlen forward pass, shared by classify, embed, and generation.
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 pub(crate) struct PrefillForwardResult {
     /// Raw model output tensor (not converted to F32 — callers decide dtype).
     /// Shape: (batch_size, vocab_size) — last token logits per sequence.
@@ -30,7 +30,7 @@ pub(crate) struct PrefillForwardResult {
 }
 
 /// Find the longest common prefix across all token sequences in the groups.
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 fn find_common_prefix_from_groups(token_groups: &[&[Vec<u32>]]) -> Vec<u32> {
     let all_seqs: Vec<&[u32]> = token_groups
         .iter()
@@ -57,7 +57,7 @@ fn find_common_prefix_from_groups(token_groups: &[&[Vec<u32>]]) -> Vec<u32> {
     first[..common_len].to_vec()
 }
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 impl Engine {
     /// Unified prefill pipeline for all task types (classify, embed, generate).
     ///
@@ -136,7 +136,7 @@ impl Engine {
             .map_err(|e| EngineError::Internal(format!("model lock poisoned: {e}")))?;
 
         // ── Determine paged forward strategy ──
-        // (flash-attn-v3 implies cuda implies paged-attn, so paged infra is always available here)
+        // (flash attention implies cuda implies paged-attn, so paged infra is always available here)
         use crate::engine::ResolvedPrefixReuse;
         let prefix_reuse = if cached_len > 0 && !cached_block_ids.is_empty() {
             ResolvedPrefixReuse {
@@ -354,7 +354,7 @@ impl Engine {
             return Ok((0, vec![]));
         }
 
-        // (flash-attn-v3 implies cuda, so paged infra is always available here)
+        // (flash attention implies cuda, so paged infra is always available here)
         {
             // Block-size alignment check: paged attention kernels require
             // block_size aligned to head_dim constraints.
@@ -391,7 +391,7 @@ impl Engine {
 /// Pack token groups into varlen format, skipping the first `offset` tokens
 /// from each sequence (used when prefix cache provides the leading tokens).
 /// Position IDs account for the offset so the model sees correct positions.
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 fn pack_varlen_tokens(
     token_groups: &[&[Vec<u32>]],
     offset: usize,

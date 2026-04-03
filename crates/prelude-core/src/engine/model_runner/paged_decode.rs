@@ -1,13 +1,13 @@
 use crate::engine::*;
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 use crate::modules::BatchAttnContext;
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 use crate::modules::PagedKvBatchContext;
 
 impl Engine {
     /// Batched decode step: N sequences, each with Q=1 (one new token),
     /// different context lengths. Returns logits (N, vocab_size).
-    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+    #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
     pub fn batch_decode_paged(
         &self,
         seqs: &[BatchDecodeSeq],
@@ -109,7 +109,7 @@ impl Engine {
             max_seqlen_q: 1,
             position_ids: &position_ids_t,
             seq_lens: &q_seq_lens,
-            #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+            #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
             paged_kv: Some(&paged_kv),
             deltanet_pool: dn_pool_ref,
             deltanet_slots: deltanet_slots.as_deref(),
@@ -128,7 +128,7 @@ impl Engine {
     /// Uses `forward` with paged KV and Q=1 for each decode step
     /// (same flash-layout KV caches as the batch prefill).
     /// Frees the block table when done.
-    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+    #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
     pub fn stream_decode_with_blocks(
         &self,
         request: &GenerateRequest,
@@ -251,7 +251,7 @@ impl Engine {
                     max_seqlen_q: 1,
                     position_ids: &pos_ids,
                     seq_lens: &[1usize],
-                    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+                    #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
                     paged_kv: Some(&paged_kv),
                     deltanet_pool: dn_pool_ref,
                     deltanet_slots: dn_slots.as_deref(),
@@ -410,7 +410,7 @@ impl Engine {
 
     /// Batched streaming decode: all sequences decode together, one token per iteration.
     /// Replaces the sequential per-request `stream_decode_with_blocks`.
-    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+    #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
     pub fn batched_stream_decode(
         &self,
         requests: &[&GenerateRequest],

@@ -1,6 +1,6 @@
 //! Continuous generation runtime (multi-token decode with paged attention).
 //!
-//! Requires `flash-attn-v3` feature (which implies cuda + paged-attn). Without it,
+//! Requires flash attention (flash-attn-v4 or flashinfer feature). Without it,
 //! the loop rejects all requests with an error.
 //!
 //! State flow per request:
@@ -19,8 +19,8 @@ use crate::runtime::SchedulerConfig;
 use crate::engine::scheduled::ContinuousSchedulerMsg;
 use super::gpu_queue::GpuQueueTx;
 
-/// Stub: rejects all requests when flash-attn-v3 is not available.
-#[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
+/// Stub: rejects all requests when flash attention is not available.
+#[cfg(not(any(feature = "flash-attn-v4", feature = "flashinfer")))]
 pub(crate) async fn continuous_generation_loop(
     _engine: Arc<Engine>,
     _config: SchedulerConfig,
@@ -31,7 +31,7 @@ pub(crate) async fn continuous_generation_loop(
         match msg {
             ContinuousSchedulerMsg::NewRequest(inflight) => {
                 inflight.fail(EngineError::Unavailable(
-                    "continuous generation requires flash-attn-v3 (cuda + paged attention)".into(),
+                    "continuous generation requires flash attention (flash-attn-v4 or flashinfer feature)".into(),
                 ));
             }
             ContinuousSchedulerMsg::Abort(_) => {}
@@ -41,38 +41,38 @@ pub(crate) async fn continuous_generation_loop(
 }
 
 // ===========================================================================
-// Real implementation (flash-attn-v3)
+// Real implementation (FA4/FlashInfer)
 // ===========================================================================
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 use std::collections::{HashMap, HashSet};
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 use std::time::Instant;
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 use crate::tensor::{DType, Tensor};
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 use tokio::sync::mpsc::error::TryRecvError;
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 use crate::engine::{
     DecodeMetrics, FinishReason, GenerateResult,
     OwnedBatchDecodeSeq, PreparedGenerateRequest, TokenLogprobInfo, Usage,
 };
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 use crate::runtime::{ForwardMode, Scheduler, SeqFinishReason, Sequence};
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 use crate::engine::scheduled::{
     ContinuousGenerationRequestState, GenerationResponseChannel,
 };
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 use super::gpu_queue::{submit_decode_paged, submit_prefill_paged};
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 use crate::types::StreamEvent;
 
 // ---------------------------------------------------------------------------
 // Per-request runtime state
 // ---------------------------------------------------------------------------
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 struct RuntimeSequenceState {
     request_id: String,
     prepared: Option<PreparedGenerateRequest>,
@@ -91,7 +91,7 @@ struct RuntimeSequenceState {
     deltanet_slot: Option<u32>,
 }
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 impl RuntimeSequenceState {
     fn new(inflight: ContinuousGenerationRequestState) -> Self {
         Self {
@@ -167,7 +167,7 @@ impl RuntimeSequenceState {
 // Main loop
 // ---------------------------------------------------------------------------
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 pub(crate) async fn continuous_generation_loop(
     engine: Arc<Engine>,
     config: SchedulerConfig,
@@ -237,7 +237,7 @@ pub(crate) async fn continuous_generation_loop(
 // Message handling
 // ---------------------------------------------------------------------------
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 fn handle_runtime_msg(
     msg: ContinuousSchedulerMsg,
     scheduler: &mut Scheduler,
@@ -273,7 +273,7 @@ fn handle_runtime_msg(
 // Prefill step
 // ---------------------------------------------------------------------------
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 fn fit_prefill_batch_to_resources(
     engine: &Engine,
     scheduler: &mut Scheduler,
@@ -314,7 +314,7 @@ fn fit_prefill_batch_to_resources(
     ready
 }
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 async fn execute_prefill_step(
     engine: &Engine,
     scheduler: &mut Scheduler,
@@ -399,7 +399,7 @@ async fn execute_prefill_step(
 // Decode step
 // ---------------------------------------------------------------------------
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 async fn execute_decode_step(
     engine: &Engine,
     scheduler: &mut Scheduler,
@@ -481,7 +481,7 @@ async fn execute_decode_step(
     process_sampled_tokens(engine, scheduler, states, &active_ids, &sampled_tokens, &logits_2d);
 }
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 fn sample_batch(
     engine: &Engine,
     scheduler: &mut Scheduler,
@@ -531,7 +531,7 @@ fn sample_batch(
     }
 }
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 fn process_sampled_tokens(
     engine: &Engine,
     scheduler: &mut Scheduler,
@@ -591,7 +591,7 @@ fn process_sampled_tokens(
 // Helpers
 // ---------------------------------------------------------------------------
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 fn sample_next_token(state: &mut RuntimeSequenceState, row: &Tensor) -> Result<u32, EngineError> {
     if state.prepared().is_greedy {
         row.argmax(crate::tensor::D::Minus1)
@@ -605,7 +605,7 @@ fn sample_next_token(state: &mut RuntimeSequenceState, row: &Tensor) -> Result<u
     }
 }
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 fn take_states(
     states: &mut HashMap<String, RuntimeSequenceState>,
     request_ids: &[String],
@@ -613,7 +613,7 @@ fn take_states(
     request_ids.iter().filter_map(|id| states.remove(id)).collect()
 }
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 fn fail_all(
     engine: &Engine,
     scheduler: &mut Scheduler,
@@ -629,7 +629,7 @@ fn fail_all(
     }
 }
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 fn finish_runtime_state(engine: &Engine, mut state: RuntimeSequenceState, finish_reason: FinishReason) {
     state.ensure_started();
     release_runtime_state_resources(engine, &mut state);
@@ -662,7 +662,7 @@ fn finish_runtime_state(engine: &Engine, mut state: RuntimeSequenceState, finish
     }
 }
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 fn fail_runtime_state(engine: &Engine, mut state: RuntimeSequenceState, error: EngineError) {
     release_runtime_state_resources(engine, &mut state);
     match state.response {
@@ -671,7 +671,7 @@ fn fail_runtime_state(engine: &Engine, mut state: RuntimeSequenceState, error: E
     }
 }
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 fn release_runtime_state_resources(engine: &Engine, state: &mut RuntimeSequenceState) {
     if !state.block_table.is_empty() {
         if let Some(bm_mutex) = engine.cache.block_manager.as_ref() {
@@ -686,7 +686,7 @@ fn release_runtime_state_resources(engine: &Engine, state: &mut RuntimeSequenceS
     }
 }
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 fn seq_finish_reason(reason: &FinishReason) -> SeqFinishReason {
     match reason {
         FinishReason::Stop => SeqFinishReason::Stop,

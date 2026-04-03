@@ -1,9 +1,9 @@
 use super::super::*;
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 use super::prefill::PrefillForwardResult;
 
 /// Raw GPU output for generation batches (before CPU post-processing).
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 pub(crate) struct RawGenerateOutput {
     pub items: Vec<PreparedGenerateRequest>,
     pub forward_result: PrefillForwardResult,
@@ -209,7 +209,7 @@ impl Engine {
     /// When prompt_logprobs is requested, extracts logprobs HERE on the GPU thread
     /// so the large (total_tokens, vocab_size) tensor is freed before the next request.
     /// This prevents cross-thread GPU memory accumulation.
-    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+    #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
     pub(crate) fn prefill_forward_only(
         &self,
         items: Vec<PreparedGenerateRequest>,
@@ -262,7 +262,7 @@ impl Engine {
         })
     }
 
-    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+    #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
     fn execute_cuda_prefill_only_batch(
         &self,
         items: Vec<PreparedGenerateRequest>,
@@ -272,14 +272,14 @@ impl Engine {
         generate_postprocess(raw, &self.tokenizer, &self.eos_token_ids)
     }
 
-    #[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
+    #[cfg(not(any(feature = "flash-attn-v4", feature = "flashinfer")))]
     fn ensure_multi_token_decode_ready(&self) -> Result<(), EngineError> {
         Err(EngineError::Unavailable(
-            "multi-token decode requires flash-attn-v3 (cuda + paged attention)".into(),
+            "multi-token decode requires flash attention (flash-attn-v4 or flashinfer feature)".into(),
         ))
     }
 
-    #[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
+    #[cfg(not(any(feature = "flash-attn-v4", feature = "flashinfer")))]
     fn execute_multi_token_batch(
         &self,
         _items: Vec<PreparedGenerateRequest>,
@@ -290,7 +290,7 @@ impl Engine {
         ))
     }
 
-    #[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
+    #[cfg(not(any(feature = "flash-attn-v4", feature = "flashinfer")))]
     fn generate_stream_paged(
         &self,
         _request: &GenerateRequest,
@@ -302,7 +302,7 @@ impl Engine {
         ))
     }
 
-    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+    #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
     fn ensure_multi_token_decode_ready(&self) -> Result<(), EngineError> {
         if self.cache.paged_pool.is_none() || self.cache.block_manager.is_none() {
             return Err(EngineError::Unavailable(
@@ -313,7 +313,7 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+    #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
     fn execute_multi_token_batch(
         &self,
         items: Vec<PreparedGenerateRequest>,
@@ -360,7 +360,7 @@ impl Engine {
         .collect()
     }
 
-    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+    #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
     pub(crate) fn generate_stream_paged(
         &self,
         request: &GenerateRequest,
@@ -723,7 +723,7 @@ impl Engine {
 /// Prompt logprobs arrive as pre-extracted CPU data (`raw.prompt_logprobs_cpu`),
 /// computed on the GPU thread in `prefill_forward_only`. No large GPU tensors cross
 /// the thread boundary.
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 pub(crate) fn generate_postprocess(
     raw: RawGenerateOutput,
     tokenizer: &Tokenizer,

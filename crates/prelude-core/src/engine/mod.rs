@@ -39,9 +39,8 @@ mod tokenizer;
 // ── Re-exports: plan types + engine struct ──
 pub use self::engine::Engine;
 pub(crate) use self::engine::{ModelExecutor, ModelVariant};
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 pub(crate) use self::types::OwnedBatchDecodeSeq;
-#[cfg(feature = "cuda")]
 pub(crate) use self::types::PagedKvPool;
 pub use self::types::TaskOverride;
 pub(crate) use self::types::{
@@ -54,12 +53,12 @@ pub(crate) use self::types::{
 };
 
 // ── Re-exports: forward (task-specific execution + postprocessing) ──
-// Classify/Embed: always available (stubs return errors when flash-attn-v3 absent).
+// Classify/Embed: always available (stubs return errors when flash-attn absent).
 pub(crate) use self::model_runner::{
     RawClassifyOutput, classify_postprocess,
     RawEmbedOutput, embed_postprocess,
 };
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 pub(crate) use self::model_runner::{RawGenerateOutput, generate_postprocess};
 
 // ── Re-exports: helpers (config, device, weights, tokenizer) ──

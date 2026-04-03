@@ -1,28 +1,19 @@
 use std::sync::Mutex;
 
-#[cfg(feature = "cuda")]
-use crate::tensor::Tensor;
-use crate::tensor::{DType, Device};
+use crate::tensor::{DType, Device, Tensor};
 use tracing::info;
 
 use crate::cache::deltanet_pool::{DeltaNetPool, DeltaNetPoolConfig};
 use crate::cache::prefix_cache::PrefixKvCache;
 use crate::config::CacheConfig;
-#[cfg(feature = "cuda")]
-use crate::engine::candle_err;
-use crate::engine::{CommonModelConfig, EngineError, RuntimeCaps};
-
-#[cfg(feature = "cuda")]
-use crate::engine::PagedKvPool;
+use crate::engine::{CommonModelConfig, EngineError, PagedKvPool, RuntimeCaps};
 
 /// Unified owner of all cache state: prefix cache, paged KV pool, block manager,
 /// and DeltaNet state pool. Extracted from Engine to separate cache concerns
 /// from model execution.
 pub struct CacheManager {
     pub(crate) prefix_cache: Option<Mutex<PrefixKvCache>>,
-    #[cfg(feature = "cuda")]
     pub(crate) paged_pool: Option<PagedKvPool>,
-    #[cfg(feature = "cuda")]
     pub(crate) block_manager: Option<Mutex<crate::cache::block_manager::BlockManager>>,
     pub(crate) deltanet_pool: Option<Mutex<DeltaNetPool>>,
 }
@@ -44,7 +35,6 @@ impl CacheManager {
             None
         };
 
-        #[cfg(feature = "cuda")]
         let (paged_pool, block_manager) = if runtime_caps.supports_paged_attn {
             Self::init_paged_pool(model_config, dtype, device, cache_config)?
         } else {
@@ -59,9 +49,7 @@ impl CacheManager {
 
         Ok(Self {
             prefix_cache,
-            #[cfg(feature = "cuda")]
             paged_pool,
-            #[cfg(feature = "cuda")]
             block_manager,
             deltanet_pool,
         })
@@ -71,9 +59,7 @@ impl CacheManager {
     pub(crate) fn none() -> Self {
         Self {
             prefix_cache: None,
-            #[cfg(feature = "cuda")]
             paged_pool: None,
-            #[cfg(feature = "cuda")]
             block_manager: None,
             deltanet_pool: None,
         }
@@ -111,7 +97,7 @@ impl CacheManager {
     /// Initialize paged KV cache pool from config.
     /// When `paged_attn_blocks == 0` (default), auto-sizes based on available GPU memory
     /// (similar to vLLM's gpu_memory_utilization approach).
-    #[cfg(feature = "cuda")]
+    /// Returns `(None, None)` for non-CUDA devices.
     fn init_paged_pool(
         config: &CommonModelConfig,
         dtype: DType,
@@ -133,14 +119,8 @@ impl CacheManager {
         let head_dim = config.head_dim;
 
         // FA4 TMA requires page_size == tile_n for optimal paged attention.
-        // tile_n depends on head_dim (SM90 _tile_size_fwd_sm90).
-        // FA3 requires page_block_size % kBlockN == 0.
-        // Auto-adjust if user didn't explicitly set PRELUDE_PAGED_BLOCK_SIZE.
         #[cfg(feature = "flash-attn-v4")]
         if std::env::var("PRELUDE_PAGED_BLOCK_SIZE").is_err() {
-            // Use shared tile_n calculation. head_dim_v defaults to head_dim
-            // (correct for all current models; DeepSeek MLA would need head_dim_v
-            // added to CommonModelConfig for the 192/128 case).
             let tile_n = crate::modules::attn_utils::fa4_tile_n(head_dim, head_dim);
             if paged_block_size != tile_n {
                 let old = paged_block_size;
@@ -154,7 +134,7 @@ impl CacheManager {
                 );
             }
         }
-        #[cfg(all(any(feature = "flash-attn-v3", feature = "flashinfer"), not(feature = "flash-attn-v4")))]
+        #[cfg(all(feature = "flashinfer", not(feature = "flash-attn-v4")))]
         {
             let min_block = if head_dim == 256 { 64 } else { 128 };
             if paged_block_size % min_block != 0 {
@@ -164,7 +144,7 @@ impl CacheManager {
                     old_block_size = old,
                     new_block_size = paged_block_size,
                     head_dim,
-                    "auto-adjusted paged_block_size for flash-attn-v3 kernel compatibility"
+                    "auto-adjusted paged_block_size for FlashInfer kernel compatibility"
                 );
             }
         }
@@ -178,9 +158,9 @@ impl CacheManager {
         } else {
             let bytes_per_block_per_layer = {
                 let v1 = 2 * num_kv_heads * head_dim * paged_block_size * dtype.size_in_bytes();
-                #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+                #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
                 let flash = 2 * num_kv_heads * head_dim * paged_block_size * dtype.size_in_bytes();
-                #[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
+                #[cfg(not(any(feature = "flash-attn-v4", feature = "flashinfer")))]
                 let flash = 0;
                 v1 + flash
             };
@@ -204,56 +184,41 @@ impl CacheManager {
             auto_blocks
         };
 
+        let candle_err = |e: crate::tensor::Error| EngineError::Internal(format!("candle: {e}"));
+
         let mut key_caches = Vec::with_capacity(num_layers);
         let mut value_caches = Vec::with_capacity(num_layers);
-        #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+        #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
         let mut key_caches_flash = Vec::with_capacity(num_layers);
-        #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+        #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
         let mut value_caches_flash = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
-            // key_cache: [num_blocks, num_kv_heads, head_dim/x, block_size, x]
             key_caches.push(
                 Tensor::zeros(
-                    (
-                        paged_blocks,
-                        num_kv_heads,
-                        head_dim / x,
-                        paged_block_size,
-                        x,
-                    ),
-                    dtype,
-                    device,
-                )
-                .map_err(candle_err)?,
+                    (paged_blocks, num_kv_heads, head_dim / x, paged_block_size, x),
+                    dtype, device,
+                ).map_err(candle_err)?,
             );
-            // value_cache: [num_blocks, num_kv_heads, head_dim, block_size]
             value_caches.push(
                 Tensor::zeros(
                     (paged_blocks, num_kv_heads, head_dim, paged_block_size),
-                    dtype,
-                    device,
-                )
-                .map_err(candle_err)?,
+                    dtype, device,
+                ).map_err(candle_err)?,
             );
 
-            #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+            #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
             {
-                // flash-friendly paged layout: [num_blocks, block_size, num_kv_heads, head_dim]
                 key_caches_flash.push(
                     Tensor::zeros(
                         (paged_blocks, paged_block_size, num_kv_heads, head_dim),
-                        dtype,
-                        device,
-                    )
-                    .map_err(candle_err)?,
+                        dtype, device,
+                    ).map_err(candle_err)?,
                 );
                 value_caches_flash.push(
                     Tensor::zeros(
                         (paged_blocks, paged_block_size, num_kv_heads, head_dim),
-                        dtype,
-                        device,
-                    )
-                    .map_err(candle_err)?,
+                        dtype, device,
+                    ).map_err(candle_err)?,
                 );
             }
         }
@@ -261,18 +226,16 @@ impl CacheManager {
         info!(
             num_blocks = paged_blocks,
             block_size = paged_block_size,
-            num_layers,
-            num_kv_heads,
-            head_dim,
+            num_layers, num_kv_heads, head_dim,
             "paged KV cache pool allocated"
         );
 
         let pool = PagedKvPool {
             key_caches,
             value_caches,
-            #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+            #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
             key_caches_flash,
-            #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+            #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
             value_caches_flash,
             block_size: paged_block_size,
         };
@@ -312,17 +275,18 @@ impl CacheManager {
 }
 
 /// Query free GPU memory via cudaMemGetInfo.
-#[cfg(feature = "cuda")]
+/// Returns `None` on non-CUDA builds or if the call fails.
 fn cuda_free_memory() -> Option<usize> {
-    unsafe extern "C" {
-        fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
+    #[cfg(feature = "cuda")]
+    {
+        unsafe extern "C" {
+            fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
+        }
+        let mut free = 0usize;
+        let mut total = 0usize;
+        let ret = unsafe { cudaMemGetInfo(&mut free, &mut total) };
+        if ret == 0 { Some(free) } else { None }
     }
-    let mut free = 0usize;
-    let mut total = 0usize;
-    let ret = unsafe { cudaMemGetInfo(&mut free, &mut total) };
-    if ret == 0 {
-        Some(free)
-    } else {
-        None
-    }
+    #[cfg(not(feature = "cuda"))]
+    { None }
 }

@@ -58,7 +58,6 @@ impl Engine {
         })
     }
 
-    #[cfg(feature = "cuda")]
     pub(crate) fn resolve_paged_prefix_reuse(
         &self,
         prefill_plan: &PrefillPlan,
@@ -93,7 +92,6 @@ impl Engine {
         })
     }
 
-    #[cfg(feature = "cuda")]
     pub(crate) fn build_cache_allocation_plan(
         &self,
         seq_lens: &[usize],
@@ -117,7 +115,6 @@ impl Engine {
         })
     }
 
-    #[cfg(feature = "cuda")]
     pub(crate) fn allocate_block_tables_from_plan(
         &self,
         allocation_plan: &CacheAllocationPlan,

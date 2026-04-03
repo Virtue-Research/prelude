@@ -1,5 +1,4 @@
 use crate::types::{ClassifyRequest, EmbedRequest, GenerateRequest, TokenLogprobInfo};
-#[cfg(feature = "cuda")]
 use crate::tensor::Tensor;
 use crate::nn_ops::generation::LogitsProcessor;
 
@@ -269,7 +268,7 @@ pub struct BatchDecodeSeq<'a> {
 }
 
 /// Owned version of [`BatchDecodeSeq`] for sending through the GPU queue.
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 pub struct OwnedBatchDecodeSeq {
     pub token: u32,
     pub position: usize,
@@ -278,7 +277,7 @@ pub struct OwnedBatchDecodeSeq {
     pub deltanet_slot: Option<u32>,
 }
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+#[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
 impl OwnedBatchDecodeSeq {
     pub fn as_borrowed(&self) -> BatchDecodeSeq<'_> {
         BatchDecodeSeq {
@@ -293,35 +292,33 @@ impl OwnedBatchDecodeSeq {
 
 // ── Paged KV pool ───────────────────────────────────────────────────────
 
-#[cfg(feature = "cuda")]
 #[allow(dead_code)]
 pub(crate) struct PagedKvPool {
     pub(crate) key_caches: Vec<Tensor>,
     pub(crate) value_caches: Vec<Tensor>,
-    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+    #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
     pub(crate) key_caches_flash: Vec<Tensor>,
-    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+    #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
     pub(crate) value_caches_flash: Vec<Tensor>,
     pub(crate) block_size: usize,
 }
 
-#[cfg(feature = "cuda")]
 impl PagedKvPool {
     /// Returns the active key caches for the compiled attention backend.
     /// FA3: flash layout `[blocks, block_sz, heads, dim]`.
     /// FA2/others: v1 layout `[blocks, heads, dim/x, block_sz, x]`.
     pub(crate) fn active_key_caches(&self) -> &[Tensor] {
-        #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+        #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
         return &self.key_caches_flash;
-        #[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
+        #[cfg(not(any(feature = "flash-attn-v4", feature = "flashinfer")))]
         return &self.key_caches;
     }
 
     /// Returns the active value caches for the compiled attention backend.
     pub(crate) fn active_value_caches(&self) -> &[Tensor] {
-        #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
+        #[cfg(any(feature = "flash-attn-v4", feature = "flashinfer"))]
         return &self.value_caches_flash;
-        #[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
+        #[cfg(not(any(feature = "flash-attn-v4", feature = "flashinfer")))]
         return &self.value_caches;
     }
 }
