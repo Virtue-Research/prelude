@@ -259,7 +259,9 @@ impl Engine {
                             self.executor.ops.session.begin_forward();
                             let result = if need_hidden_states {
                                 let lm = model.as_logits_model_mut()
-                                    .expect("hidden states requested but model doesn't support LogitsSplitModel");
+                                    .ok_or_else(|| EngineError::InvalidRequest(
+                                        "prompt_logprobs requested but model doesn't support LogitsSplitModel".into()
+                                    ))?;
                                 let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
                                 let last = crate::modules::last_token_select(&hidden, &seq_lens)
                                     .map_err(candle_err)?;
@@ -288,7 +290,9 @@ impl Engine {
                     self.executor.ops.session.begin_forward();
                     let result = if need_hidden_states {
                         let lm = model.as_logits_model_mut()
-                            .expect("hidden states requested but model doesn't support LogitsSplitModel");
+                            .ok_or_else(|| EngineError::InvalidRequest(
+                                        "prompt_logprobs requested but model doesn't support LogitsSplitModel".into()
+                                    ))?;
                         let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
                         let last = crate::modules::last_token_select(&hidden, &seq_lens)
                             .map_err(candle_err)?;

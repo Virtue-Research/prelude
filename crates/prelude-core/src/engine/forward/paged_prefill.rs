@@ -163,7 +163,9 @@ impl Engine {
         // This avoids materializing the full (total_tokens, vocab_size) logits tensor.
         let (logits, prompt_logprobs_cpu) = if needs_prompt_logprobs {
             let lm = model.as_logits_model_mut()
-                .expect("prompt logprobs requested but model doesn't support LogitsSplitModel");
+                .ok_or_else(|| EngineError::InvalidRequest(
+                    "prompt_logprobs requested but model doesn't support LogitsSplitModel".into()
+                ))?;
             let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
             let last_hidden = crate::modules::last_token_select(&hidden, &q_seq_lens)
                 .map_err(candle_err)?;
