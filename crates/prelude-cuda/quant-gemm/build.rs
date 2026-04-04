@@ -49,75 +49,69 @@ fn main() {
 
     build_log!("compiling tiled MMQ for sm_{compute_cap}");
 
-    // 4. Compile mmq_ffi.cu → mmq_ffi.o
-    //    Include paths match upstream llama.cpp CMake:
-    //      -I ggml/include       (ggml.h, ggml-backend.h, ggml-cuda.h)
-    //      -I ggml/src           (ggml-common.h, ggml-impl.h)
-    //      -I ggml/src/ggml-cuda (common.cuh, mmq.cuh, vecdotq.cuh, vendors/)
+    // 4-6. Compile all sources in parallel (3 independent compilations)
     let obj = out_dir.join("mmq_ffi.o");
-    let status = Command::new(&nvcc)
-        .args([
-            "-std=c++17",
-            "-O3",
-            "--use_fast_math",
-            "--expt-relaxed-constexpr",
-            "-Xcompiler", "-fPIC",
-            &gencode,
-            "-I", csrc.to_str().unwrap(),
-            "-I", ggml_include.to_str().unwrap(),
-            "-I", ggml_src.to_str().unwrap(),
-            "-I", ggml_cuda.to_str().unwrap(),
-            "-c",
-            csrc.join("mmq_ffi.cu").to_str().unwrap(),
-            "-o", obj.to_str().unwrap(),
-        ])
-        .status()
-        .expect("Failed to run nvcc");
-
-    if !status.success() {
-        panic!("nvcc compilation of mmq_ffi.cu failed");
-    }
-
-    // 5. Compile dequantize_ffi.c (pure CPU, for correctness testing)
     let deq_obj = out_dir.join("dequantize_ffi.o");
-    let cc = env::var("CC").unwrap_or_else(|_| "gcc".to_string());
-    let status = Command::new(&cc)
-        .args([
-            "-c", "-O2", "-fPIC",
-            "-I", csrc.to_str().unwrap(),
-            "-I", ggml_include.to_str().unwrap(),
-            "-I", ggml_src.to_str().unwrap(),
-            csrc.join("dequantize_ffi.c").to_str().unwrap(),
-            "-o", deq_obj.to_str().unwrap(),
-        ])
-        .status()
-        .expect("Failed to compile dequantize_ffi.c");
-
-    if !status.success() {
-        panic!("gcc compilation of dequantize_ffi.c failed");
-    }
-
-    // 6. Compile dequantize_gpu.cu → dequantize_gpu.o (GPU dequant kernels)
     let deq_gpu_obj = out_dir.join("dequantize_gpu.o");
-    let status = Command::new(&nvcc)
-        .args([
-            "-std=c++17",
-            "-O3",
-            "--use_fast_math",
-            "--expt-relaxed-constexpr",
-            "-Xcompiler", "-fPIC",
-            &gencode,
-            "-I", csrc.to_str().unwrap(),
-            "-c",
-            csrc.join("dequantize_gpu.cu").to_str().unwrap(),
-            "-o", deq_gpu_obj.to_str().unwrap(),
-        ])
-        .status()
-        .expect("Failed to run nvcc for dequantize_gpu.cu");
 
-    if !status.success() {
-        panic!("nvcc compilation of dequantize_gpu.cu failed");
-    }
+    let cc_compiler = env::var("CC").unwrap_or_else(|_| "gcc".to_string());
+
+    std::thread::scope(|s| {
+        // mmq_ffi.cu (CUDA)
+        let h1 = s.spawn(|| {
+            let status = Command::new(&nvcc)
+                .args([
+                    "-std=c++17", "-O3", "--use_fast_math",
+                    "--expt-relaxed-constexpr", "-Xcompiler", "-fPIC",
+                    &gencode,
+                    "-I", csrc.to_str().unwrap(),
+                    "-I", ggml_include.to_str().unwrap(),
+                    "-I", ggml_src.to_str().unwrap(),
+                    "-I", ggml_cuda.to_str().unwrap(),
+                    "-c", csrc.join("mmq_ffi.cu").to_str().unwrap(),
+                    "-o", obj.to_str().unwrap(),
+                ])
+                .status()
+                .expect("Failed to run nvcc");
+            assert!(status.success(), "nvcc compilation of mmq_ffi.cu failed");
+        });
+
+        // dequantize_ffi.c (pure CPU)
+        let h2 = s.spawn(|| {
+            let status = Command::new(&cc_compiler)
+                .args([
+                    "-c", "-O2", "-fPIC",
+                    "-I", csrc.to_str().unwrap(),
+                    "-I", ggml_include.to_str().unwrap(),
+                    "-I", ggml_src.to_str().unwrap(),
+                    csrc.join("dequantize_ffi.c").to_str().unwrap(),
+                    "-o", deq_obj.to_str().unwrap(),
+                ])
+                .status()
+                .expect("Failed to compile dequantize_ffi.c");
+            assert!(status.success(), "gcc compilation of dequantize_ffi.c failed");
+        });
+
+        // dequantize_gpu.cu (CUDA)
+        let h3 = s.spawn(|| {
+            let status = Command::new(&nvcc)
+                .args([
+                    "-std=c++17", "-O3", "--use_fast_math",
+                    "--expt-relaxed-constexpr", "-Xcompiler", "-fPIC",
+                    &gencode,
+                    "-I", csrc.to_str().unwrap(),
+                    "-c", csrc.join("dequantize_gpu.cu").to_str().unwrap(),
+                    "-o", deq_gpu_obj.to_str().unwrap(),
+                ])
+                .status()
+                .expect("Failed to run nvcc for dequantize_gpu.cu");
+            assert!(status.success(), "nvcc compilation of dequantize_gpu.cu failed");
+        });
+
+        h1.join().unwrap();
+        h2.join().unwrap();
+        h3.join().unwrap();
+    });
 
     // 7. Create static archive (CUDA + CPU objects)
     let lib = out_dir.join("libprelude_quant_gemm.a");

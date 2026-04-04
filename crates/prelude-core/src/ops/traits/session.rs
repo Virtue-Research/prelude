@@ -8,11 +8,17 @@ pub trait OpsSession: Send + Sync {
     fn end_forward(&self) {}
 
     /// Pre-compute paged attention scheduling for the current batch.
+    ///
+    /// FlashInfer uses this to build ragged indptr/indices metadata on GPU.
+    /// FA4 and other backends may use it for TMA descriptor precomputation.
     fn precompute_paged_plan(
         &self,
+        _q_shape: (usize, usize, usize), // (batch_size, num_qo_heads, head_dim)
+        _key_cache: &Tensor,
+        _cu_seqlens_q: &Tensor,
         _block_tables: &Tensor,
         _cu_seqlens_k: &Tensor,
-        _block_size: usize,
+        _softmax_scale: f32,
     ) -> Result<()> {
         Ok(())
     }

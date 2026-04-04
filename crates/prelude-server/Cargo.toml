@@ -46,13 +46,17 @@ reqwest = { version = "0.13.2", default-features = false, features = ["blocking"
 tower = { version = "0.5.3", features = ["util"] }
 
 [features]
-default = []
-cuda = ["dep:prelude-cuda"]
-flash-attn-v4 = ["cuda", "prelude-cuda/flash-attn-v4"]
-flashinfer = ["cuda", "prelude-cuda/flashinfer"]
-flashinfer-v4 = ["flashinfer", "flash-attn-v4"]
-deepgemm = ["cuda", "prelude-cuda/deepgemm"]
-quant-gemm = ["cuda", "prelude-cuda/quant-gemm"]
-cula = ["cuda", "prelude-cuda/cula"]
-hf_tokenizer = ["prelude-core/hf_tokenizer"]
-full = ["flashinfer-v4", "deepgemm", "quant-gemm", "cula"]
+default = ["cpu"]
+# CPU-only inference (oneDNN matmul, AVX-512 kernels)
+cpu = []
+# CUDA inference — all GPU backends (FlashInfer, FA4, CUTLASS, DeepGEMM, quant-gemm, cuLA)
+cuda = [
+    "dep:prelude-cuda",
+    "prelude-cuda/flash-attn-v4",
+    "prelude-cuda/flashinfer",
+    "prelude-cuda/deepgemm",
+    "prelude-cuda/quant-gemm",
+    "prelude-cuda/cula",
+]
+# Everything
+full = ["cpu", "cuda"]

@@ -56,13 +56,18 @@ fn main() {
 
     let kernels_dir = out_dir.join("dsl_kernels");
 
+    // Build target arch list: SM90 always, plus higher archs if nvcc supports them.
+    let mut dsl_archs = vec!["sm_90".to_string()];
+    if sm100 { dsl_archs.push("sm_100".to_string()); }
+    // Future: if sm120 { dsl_archs.push("sm_120".to_string()); }
+
     // Spawn Phase 2 in a background thread (it may take minutes for venv setup)
     let dsl_kernels_dir = kernels_dir.clone();
     let dsl_manifest_dir = manifest_dir.clone();
     let dsl_cula_dir = cula_dir.clone();
     let dsl_out_dir = out_dir.clone();
     let dsl_handle = std::thread::spawn(move || {
-        compile_dsl_kernels(&dsl_kernels_dir, &dsl_manifest_dir, &dsl_cula_dir, &dsl_out_dir)
+        compile_dsl_kernels(&dsl_kernels_dir, &dsl_manifest_dir, &dsl_cula_dir, &dsl_out_dir, &dsl_archs)
     });
 
     // Phase 1: C++ CUTLASS kernels (runs on main thread concurrently)
@@ -235,6 +240,7 @@ fn compile_dsl_kernels(
     manifest_dir: &Path,
     cula_dir: &Path,
     out_dir: &Path,
+    target_archs: &[String],
 ) -> bool {
     let script = manifest_dir.join("scripts/compile_kernels.py");
 
@@ -284,9 +290,7 @@ fn compile_dsl_kernels(
         }
     };
 
-    // Detect GPU arch
-    let arch = detect_gpu_arch().unwrap_or_else(|| "sm_90".to_string());
-    build_log!("[DSL] AOT compiling for {arch}...");
+    build_log!("[DSL] AOT compiling for {:?}...", target_archs);
 
     let workers = env::var("PRELUDE_CULA_WORKERS").unwrap_or_else(|_| {
         let n = std::thread::available_parallelism()
@@ -295,62 +299,88 @@ fn compile_dsl_kernels(
         n.min(8).to_string()
     });
 
-    let output = Command::new(&python)
-        .arg(&script)
-        .arg("--output-dir").arg(kernels_dir)
-        .args(["-j", &workers])
-        .env("PYTHONPATH", cula_dir)
-        .env("CUTE_DSL_ARCH", format!("{arch}a"))
-        .output();
+    // Monkey-patch assert_blackwell/assert_hopper so AOT cross-compilation works
+    // regardless of the host GPU. The target arch comes from CUTE_DSL_ARCH env var.
+    let bootstrap = r#"
+import sys, os
+arch = int(''.join(c for c in os.environ.get('CUTE_DSL_ARCH','sm_90a').split('_')[1] if c.isdigit()))
+major, minor = arch // 10, arch % 10
+import cula.utils
+cula.utils.get_device_sm_version = lambda device=None: (major, minor)
+cula.utils.assert_blackwell = lambda device=None: None
+cula.utils.assert_hopper = lambda device=None: None
+sys.argv = ['compile_kernels.py'] + sys.argv[1:]
+exec(open(sys.argv[0]).read())
+"#;
 
-    match output {
-        Ok(o) if o.status.success() => {
-            build_log!("[DSL] compilation succeeded");
-            has_obj_files(kernels_dir)
-        }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            build_log!("[DSL] compilation failed (exit code: {:?})", o.status.code());
-            // Print last ~10 lines of stderr for actionable diagnostics
-            for line in stderr.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev() {
-                build_log!("[DSL] {line}");
+    // Compile for each target arch
+    for arch in target_archs {
+        build_log!("[DSL] compiling for {arch}...");
+        let arch_dir = kernels_dir.join(arch);
+        let _ = std::fs::create_dir_all(&arch_dir);
+
+        let output = Command::new(&python)
+            .arg("-c").arg(bootstrap)
+            .arg(&script)
+            .arg("--output-dir").arg(&arch_dir)
+            .args(["-j", &workers])
+            .env("PYTHONPATH", cula_dir)
+            .env("CUTE_DSL_ARCH", format!("{arch}a"))
+            .output();
+
+        match &output {
+            Ok(o) if o.status.success() => {
+                build_log!("[DSL] {arch} succeeded");
             }
-            if !stdout.is_empty() {
-                for line in stdout.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev() {
-                    build_log!("[DSL] [stdout] {line}");
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                build_log!("[DSL] {arch} failed (exit code: {:?})", o.status.code());
+                for line in stderr.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev() {
+                    build_log!("[DSL]   {line}");
+                }
+                if !stdout.is_empty() {
+                    for line in stdout.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev() {
+                        build_log!("[DSL]   [stdout] {line}");
+                    }
                 }
             }
-            // Write fail marker so we don't retry every build
-            if let Some(hash) = file_hash(&script) {
-                let _ = std::fs::create_dir_all(kernels_dir);
-                let _ = std::fs::write(&fail_marker, &hash);
+            Err(e) => {
+                build_log!("[DSL] failed to run script: {e}");
             }
-            false
         }
-        Err(e) => {
-            build_log!("[DSL] failed to run script: {e}");
-            false
+    }
+
+    // Check if any arch produced kernel objects
+    let success = has_obj_files(kernels_dir);
+    if !success {
+        // Write fail marker so we don't retry every build
+        if let Some(hash) = file_hash(&script) {
+            let _ = std::fs::create_dir_all(kernels_dir);
+            let _ = std::fs::write(&fail_marker, &hash);
         }
+    }
+    success
+}
+
+fn collect_obj_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().is_some_and(|x| x == "o") { out.push(p); }
+        else if p.is_dir() { collect_obj_files(&p, out); }
     }
 }
 
 fn link_dsl_kernel_objects(kernels_dir: &Path, out_dir: &Path) {
-    let obj_files: Vec<PathBuf> = std::fs::read_dir(kernels_dir)
-        .ok().into_iter().flatten()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "o"))
-        .collect();
+    let mut obj_files = Vec::new();
+    collect_obj_files(kernels_dir, &mut obj_files);
 
     if obj_files.is_empty() {
         return;
     }
 
-    println!(
-        "cargo:warning=cuLA DSL: archiving {} kernel .o files",
-        obj_files.len()
-    );
+    build_log!("[DSL] archiving {} kernel .o files", obj_files.len());
 
     let archive_path = out_dir.join("libcula_dsl_kernels.a");
     let mut cmd = Command::new("ar");
@@ -590,8 +620,13 @@ fn file_hash(path: &Path) -> Option<String> {
 }
 
 fn has_obj_files(dir: &Path) -> bool {
-    std::fs::read_dir(dir).ok().into_iter().flatten()
-        .any(|e| e.ok().map(|e| e.path().extension().is_some_and(|x| x == "o")).unwrap_or(false))
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().is_some_and(|x| x == "o") { return true; }
+        if p.is_dir() && has_obj_files(&p) { return true; }
+    }
+    false
 }
 
 fn clear_obj_files(dir: &Path) {
@@ -637,23 +672,6 @@ fn find_file_recursive(dir: &Path, name: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-fn detect_gpu_arch() -> Option<String> {
-    let output = Command::new("nvidia-smi")
-        .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
-        .output().ok()?;
-    if !output.status.success() { return None; }
-    let cap = String::from_utf8_lossy(&output.stdout);
-    let cap = cap.trim().lines().next()?;
-    let parts: Vec<&str> = cap.split('.').collect();
-    if parts.len() == 2 {
-        let major: u32 = parts[0].parse().ok()?;
-        let minor: u32 = parts[1].parse().ok()?;
-        Some(format!("sm_{}{}", major, minor))
-    } else {
-        None
-    }
 }
 
 fn ensure_python_env(out_dir: &Path) -> Result<String, String> {

@@ -1,9 +1,8 @@
-include!("../../build_log.rs");
-
 fn main() {
     // ── Compile custom CUDA kernels to PTX (loaded at runtime via cudarc) ──
     use std::path::PathBuf;
     use std::process::Command;
+    use std::sync::Arc;
 
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let kernels_dir = PathBuf::from(&manifest_dir).join("src/kernels/kernels_src");
@@ -40,40 +39,51 @@ fn main() {
     // Track common headers for rerun-if-changed
     println!("cargo:rerun-if-changed=src/kernels/kernels_src/common/common.cuh");
     println!("cargo:rerun-if-changed=src/kernels/kernels_src/common/vec_utils.cuh");
-    // Also track build.rs itself
     println!("cargo:rerun-if-changed=build.rs");
 
-    for (category, filename, output_name) in kernel_modules.iter() {
+    for &(category, filename, _) in kernel_modules.iter() {
         let kernel_src = kernels_dir.join(category).join(filename);
-        let ptx_path = out_dir.join(format!("{}.ptx", output_name));
-
         println!("cargo:rerun-if-changed={}", kernel_src.display());
+    }
 
-        let status = Command::new(&nvcc)
-            .args([
-                "--ptx",
-                kernel_src.to_str().unwrap(),
-                "-o",
-                ptx_path.to_str().unwrap(),
-                &arch_flag,
-                &include_flag,
-                "-O3",
-                "--use_fast_math",
-                "--expt-relaxed-constexpr",
-            ])
-            .status()
-            .unwrap_or_else(|e| panic!("Failed to run nvcc at {}: {}", nvcc.display(), e));
+    // Compile all PTX kernels in parallel
+    let nvcc = Arc::new(nvcc);
+    let arch_flag = Arc::new(arch_flag);
+    let include_flag = Arc::new(include_flag);
 
-        assert!(
-            status.success(),
-            "nvcc PTX compilation of {} failed",
-            filename
-        );
+    let handles: Vec<_> = kernel_modules.iter().map(|&(category, filename, output_name)| {
+        let kernels_dir = kernels_dir.clone();
+        let out_dir = out_dir.clone();
+        let nvcc = nvcc.clone();
+        let arch_flag = arch_flag.clone();
+        let include_flag = include_flag.clone();
+        std::thread::spawn(move || {
+            let kernel_src = kernels_dir.join(category).join(filename);
+            let ptx_path = out_dir.join(format!("{output_name}.ptx"));
+            let status = Command::new(&*nvcc)
+                .args([
+                    "--ptx",
+                    kernel_src.to_str().unwrap(),
+                    "-o",
+                    ptx_path.to_str().unwrap(),
+                    &arch_flag,
+                    &include_flag,
+                    "-O3",
+                    "--use_fast_math",
+                    "--expt-relaxed-constexpr",
+                ])
+                .status()
+                .unwrap_or_else(|e| panic!("Failed to run nvcc at {}: {}", nvcc.display(), e));
+            assert!(status.success(), "nvcc PTX compilation of {filename} failed");
+        })
+    }).collect();
+
+    for h in handles {
+        h.join().expect("nvcc compilation thread panicked");
     }
 }
 
 fn detect_compute_cap() -> Option<u32> {
-    // Try CUDA_ARCH_LIST env var first, then nvidia-smi
     if let Ok(arch_list) = std::env::var("CUDA_ARCH_LIST") {
         if let Some(cap) = arch_list
             .split(',')

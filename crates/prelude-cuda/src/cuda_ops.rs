@@ -325,13 +325,16 @@ impl OpsSession for CudaSession {
 
     fn precompute_paged_plan(
         &self,
+        _q_shape: (usize, usize, usize),
+        _key_cache: &Tensor,
+        _cu_seqlens_q: &Tensor,
         _block_tables: &Tensor,
         _cu_seqlens_k: &Tensor,
-        _block_size: usize,
+        _softmax_scale: f32,
     ) -> Result<()> {
         #[cfg(feature = "flashinfer")]
         crate::attn::flashinfer::precompute_paged_plan(
-            i(_block_tables), i(_cu_seqlens_k), _block_size,
+            _q_shape, i(_key_cache), i(_cu_seqlens_q), i(_block_tables), i(_cu_seqlens_k), _softmax_scale,
         )?;
         Ok(())
     }
@@ -369,22 +372,23 @@ fn select_attention_backend() -> Arc<dyn AttentionOps + 'static> {
 // ── Shared dispatch helper ──────────────────────────────────────────
 
 macro_rules! dispatch_varlen {
-    ($mod:path, $q:expr, $k:expr, $v:expr, $p:expr, dispatch) => {
+    ($mod:path, $q:expr, $k:expr, $v:expr, $p:expr, dispatch) => {{
+        use $mod as _backend;
         match &$p.mask {
             MaskType::Causal => {
-                w($mod::varlen_causal(
+                w(_backend::varlen_causal(
                     i($q), i($k), i($v), i($p.cu_seqlens_q), i($p.cu_seqlens_k),
                     $p.max_seqlen_q, $p.max_seqlen_k, $p.scale,
                 ))
             }
             MaskType::Bidirectional => {
-                w($mod::varlen_bidirectional(
+                w(_backend::varlen_bidirectional(
                     i($q), i($k), i($v), i($p.cu_seqlens_q), i($p.cu_seqlens_k),
                     $p.max_seqlen_q, $p.max_seqlen_k, $p.scale,
                 ))
             }
             MaskType::SlidingWindow { left, right } => {
-                w($mod::varlen_windowed(
+                w(_backend::varlen_windowed(
                     i($q), i($k), i($v), i($p.cu_seqlens_q), i($p.cu_seqlens_k),
                     $p.max_seqlen_q, $p.max_seqlen_k, $p.scale,
                     Some(*left), Some(*right),
@@ -394,7 +398,7 @@ macro_rules! dispatch_varlen {
                 bail!("custom mask not yet supported by {}", stringify!($mod))
             }
         }
-    };
+    }};
 }
 
 // ── FA4 ─────────────────────────────────────────────────────────────

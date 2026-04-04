@@ -243,7 +243,7 @@ fn generate_dispatch_code(
 /// Kernel .o files reference TVM FFI symbols (TVMFFIEnvGetStream, etc.)
 /// that need to be resolved at link time.
 /// Also links vendored libcuda_dialect_runtime_static.a.
-fn compile_tvm_ffi_static(manifest_dir: &Path, out_dir: &Path, venv_dir: &Path) -> Result<()> {
+fn compile_tvm_ffi_static(manifest_dir: &Path, _out_dir: &Path, venv_dir: &Path) -> Result<()> {
     // tvm-ffi lives in workspace third_party/
     let workspace_root = manifest_dir.parent().unwrap().parent().unwrap().parent().unwrap();
     let tvm_ffi_dir = workspace_root.join("third_party/tvm-ffi");

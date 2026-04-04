@@ -39,7 +39,9 @@ fn main() {
 
         let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("onednn-build");
         let ffi_lib = build_dir.join("libonednn_ffi.a");
-        let dnnl_lib_dir = build_dir.join("_deps/onednn-build/src");
+        // With add_subdirectory (local submodule), libdnnl.a is in onednn/src/.
+        // (With FetchContent it was in _deps/onednn-build/src/.)
+        let dnnl_lib_dir = build_dir.join("onednn/src");
 
         // Configure cmake if build dir doesn't exist yet (first build)
         if !build_dir.join("CMakeCache.txt").exists() {
