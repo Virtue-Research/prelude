@@ -2,12 +2,15 @@ use std::sync::Arc;
 
 use crate::tensor::{DType, Device, Module, Result, Tensor, D};
 use crate::loading::var_builder::VarBuilder;
-use crate::nn_ops::{Activation, CandleLinear, Embedding, Qwen3Config};
+use crate::modules::activation::Activation;
+use crate::modules::embedding::Embedding;
+use crate::modules::linear::NaiveLinear;
+use crate::models::config::Qwen3Config;
 
 // Shared layer primitives (extracted from qwen3 into reusable modules)
 use crate::modules::{
     fast_add, fast_rms_norm, fused_add_rmsnorm, last_token_select,
-    BatchAttnContext, LayerAttnContext, GatedMlp, RotaryEmbedding, Linear, RmsNorm,
+    BatchAttnContext, BatchState, LayerAttnContext, GatedMlp, RotaryEmbedding, Linear, RmsNorm,
     TransformerBlock,
 };
 
@@ -93,17 +96,27 @@ impl Qwen3MoeExpert {
     }
 
     fn forward(&self, ops: &crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
-        crate::modules::fast_silu_mul(ops, &gate, &up)?.apply(&self.down_proj)
+        let bs = BatchState::no_lora();
+        let gate = self.gate_proj.forward(x, &bs, ops)?;
+        let up = self.up_proj.forward(x, &bs, ops)?;
+        self.down_proj.forward(&crate::modules::fast_silu_mul(ops, &gate, &up)?, &bs, ops)
     }
+}
+
+fn count_tokens_per_expert(sorted_expert_ids: &Tensor, num_experts: usize, device: &Device) -> Result<Tensor> {
+    let ids: Vec<u32> = sorted_expert_ids.to_vec1()?;
+    let mut counts = vec![0u32; num_experts];
+    for &id in &ids {
+        if (id as usize) < num_experts { counts[id as usize] += 1; }
+    }
+    Tensor::from_vec(counts, (num_experts,), device)
 }
 
 // ── Sparse MoE Block ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 struct Qwen3SparseMoeBlock {
-    gate: CandleLinear,
+    gate: NaiveLinear,
     experts: Vec<Qwen3MoeExpert>,
     // Stacked expert weights for fused GEMM [num_experts, N, K]
     gate_w: Option<Tensor>,
@@ -118,7 +131,7 @@ impl Qwen3SparseMoeBlock {
         let gate = {
             let gvb = vb.pp("gate");
             let w = gvb.get((cfg.num_experts, cfg.hidden_size), "weight")?;
-            CandleLinear::new(w, None)
+            NaiveLinear::new(w, None)
         };
         let mut experts = Vec::with_capacity(cfg.num_experts);
         let vb_e = vb.pp("experts");
@@ -162,7 +175,8 @@ impl Qwen3SparseMoeBlock {
     fn compute_routing_2d(&self, xs: &Tensor) -> Result<(Tensor, Tensor, usize)> {
         let (_total_tokens, hidden_dim) = xs.dims2()?;
         let router_logits = xs.apply(&self.gate)?;
-        let routing_weights = crate::nn_ops::ops::softmax_last_dim(&router_logits)?;
+        let last_dim = router_logits.rank() - 1;
+        let routing_weights = crate::ops::current_ops().act.softmax(&router_logits, last_dim)?;
 
         let experts_per_tok = routing_weights
             .arg_sort_last_dim(false)?
@@ -226,26 +240,36 @@ impl Qwen3SparseMoeBlock {
             self.sort_expert_assignments(experts_per_tok, xs.device())?;
 
         let is_prefill = total_tokens > 1;
+        let num_tokens_per_expert = count_tokens_per_expert(&sorted_expert_ids, self.experts.len(), xs.device())?;
 
-        let gate = ops.gemm.moe_gemm(
-            xs, gate_w, &None,
-            &sorted_token_ids, &sorted_expert_ids,
-            self.num_experts_per_tok, is_prefill,
+        let gate = ops.gemm.grouped_gemm(
+            xs, gate_w,
+            &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
         )?;
 
-        let up = ops.gemm.moe_gemm(
-            xs, up_w, &None,
-            &sorted_token_ids, &sorted_expert_ids,
-            self.num_experts_per_tok, is_prefill,
+        let up = ops.gemm.grouped_gemm(
+            xs, up_w,
+            &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
         )?;
 
         let down_input = crate::modules::fast_silu_mul(ops, &gate, &up)?;
 
-        let ys = ops.gemm.moe_gemm(
-            &down_input, down_w, &Some(topk_weights.clone()),
+        let ys = match ops.fused.fused_moe_gemm(
+            &down_input, down_w, topk_weights,
             &sorted_token_ids, &sorted_expert_ids,
             self.num_experts_per_tok, is_prefill,
-        )?;
+        ) {
+            Some(r) => r?,
+            None => {
+                let raw = ops.gemm.grouped_gemm(
+                    &down_input, down_w,
+                    &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
+                )?;
+                let raw = raw.reshape((total_tokens, self.num_experts_per_tok, hidden_dim))?;
+                let w = topk_weights.unsqueeze(D::Minus1)?;
+                return (raw * w)?.sum(D::Minus2);
+            }
+        };
 
         ys.reshape((total_tokens, self.num_experts_per_tok, hidden_dim))?
             .sum(D::Minus2)
@@ -320,7 +344,7 @@ enum MoeFeedForward {
 impl MoeFeedForward {
     fn forward_2d(&self, ops: &crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Mlp(mlp) => mlp.forward(ops, x),
+            Self::Mlp(mlp) => mlp.forward(&BatchState::no_lora(), ops, x),
             Self::SparseMoe(moe) => moe.forward_varlen(ops, x),
         }
     }
@@ -464,9 +488,10 @@ impl Qwen3MoeModelForCausalLM {
 
     pub fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> Result<Tensor> {
         let hidden = self.base.forward(packed_input, ctx)?;
-        last_token_select(&hidden, ctx.seq_lens)?
-            .unsqueeze(1)?
-            .apply(&self.lm_head)
+        self.lm_head.forward(
+            &last_token_select(&hidden, ctx.seq_lens)?.unsqueeze(1)?,
+            &BatchState::no_lora(), ctx.ops,
+        )
     }
 
     pub fn clear_kv_cache(&mut self) {
@@ -484,7 +509,7 @@ impl crate::models::LogitsSplitModel for Qwen3MoeModelForCausalLM {
     }
 
     fn compute_logits(&self, hidden: &Tensor) -> crate::tensor::Result<Tensor> {
-        hidden.apply(&self.lm_head)
+        self.lm_head.forward(hidden, &BatchState::no_lora(), crate::ops::select_ops(hidden.device()))
     }
 }
 

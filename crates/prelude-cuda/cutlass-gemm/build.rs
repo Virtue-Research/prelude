@@ -8,8 +8,11 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+include!("../../../build_log.rs");
+
 fn main() {
     println!("cargo:rerun-if-changed=src/cutlass_wrapper.cu");
+    track_submodule("cutlass");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -40,9 +43,9 @@ fn main() {
 
     let sm100 = nvcc_supports_sm100(&nvcc);
     if sm100 {
-        println!("cargo:warning=CUTLASS GEMM: compiling 3.x for SM80 + SM90a + SM100a (fat binary)");
+        build_log!("compiling 3.x for SM80 + SM90a + SM100a (fat binary)");
     } else {
-        println!("cargo:warning=CUTLASS GEMM: compiling 3.x for SM80 + SM90a");
+        build_log!("compiling 3.x for SM80 + SM90a");
     }
 
     let mut nvcc_cmd = Command::new(&nvcc);

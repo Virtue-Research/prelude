@@ -14,6 +14,8 @@ use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+include!("../../../build_log.rs");
+
 /// Recursively search for a file by name under a directory.
 fn find_file_recursive(dir: &Path, name: &str) -> Option<PathBuf> {
     if !dir.is_dir() {
@@ -52,14 +54,16 @@ fn detect_torch_cuda_index() -> Option<String> {
 }
 
 fn main() -> Result<()> {
-    println!("cargo:rerun-if-changed=kernels/");
+    println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=scripts/compile_kernels.py");
     println!("cargo:rerun-if-changed=vendor/");
+    track_submodule("flash-attention");
+    track_submodule("tvm-ffi");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let workspace_root = manifest_dir.parent().unwrap().parent().unwrap().parent().unwrap();
-    let kernels_dir = manifest_dir.join("kernels");
+    let kernels_dir = out_dir.join("fa4_kernels");
     // Stable venv location — survives `cargo clean -p`
     let venv_dir = workspace_root.join("target/fa4-venv");
 
@@ -94,12 +98,12 @@ fn link_kernel_objects(kernels_dir: &Path, out_dir: &Path) -> Result<bool> {
         .collect();
 
     if obj_files.is_empty() {
-        println!("cargo:warning=No kernel .o files found, FA4 dispatch will be empty");
+        build_log!("No kernel .o files found, FA4 dispatch will be empty");
         return Ok(false);
     }
 
-    println!(
-        "cargo:warning=Archiving {} kernel .o files into libfa4_kernels.a",
+    build_log!(
+        "Archiving {} kernel .o files into libfa4_kernels.a",
         obj_files.len()
     );
 
@@ -227,8 +231,8 @@ fn generate_dispatch_code(
     writeln!(code, "}}")?;
 
     std::fs::write(&dispatch_path, &code)?;
-    println!(
-        "cargo:warning=Generated fa4_dispatch.rs with {} kernel variants",
+    build_log!(
+        "Generated fa4_dispatch.rs with {} kernel variants",
         variants.len()
     );
 
@@ -262,8 +266,8 @@ fn compile_tvm_ffi_static(manifest_dir: &Path, out_dir: &Path, venv_dir: &Path) 
         })
         .collect();
 
-    println!(
-        "cargo:warning=Compiling tvm_ffi: {} C++ source files",
+    build_log!(
+        "Compiling tvm_ffi: {} C++ source files",
         cc_files.len()
     );
 
@@ -307,7 +311,7 @@ fn compile_tvm_ffi_static(manifest_dir: &Path, out_dir: &Path, venv_dir: &Path) 
         println!("cargo:rustc-link-search=native={}", dir.display());
         println!("cargo:rustc-link-lib=static:+whole-archive=cuda_dialect_runtime_static");
     } else {
-        println!("cargo:warning=cuda_dialect_runtime_static.a not found — FA4 SM90 kernels may fail to link");
+        build_log!("cuda_dialect_runtime_static.a not found — FA4 SM90 kernels may fail to link");
     }
 
     // CUDA runtime (cudaLibraryLoadData etc.)
@@ -477,8 +481,8 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_d
                 if stored_hash == current_hash {
                     return Ok(());
                 }
-                println!(
-                    "cargo:warning=compile_kernels.py changed (hash {stored_hash:.8} → {current_hash:.8}), \
+                build_log!(
+                    "compile_kernels.py changed (hash {stored_hash:.8} → {current_hash:.8}), \
                      clearing old kernels and recompiling..."
                 );
                 // Clear all old .o files
@@ -498,7 +502,7 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_d
         }
     }
 
-    println!("cargo:warning=No pre-compiled FA4 kernels, attempting AOT compilation...");
+    build_log!("No pre-compiled FA4 kernels, attempting AOT compilation...");
 
     let script = manifest_dir.join("scripts/compile_kernels.py");
     if !script.exists() {
@@ -529,7 +533,7 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_d
 
     // Compile for each target arch
     for arch in &archs {
-        println!("cargo:warning=FA4 AOT compiling for {arch}...");
+        build_log!("FA4 AOT compiling for {arch}...");
 
         let workers = std::env::var("PRELUDE_FA4_WORKERS").unwrap_or_else(|_| {
             let num_cpus = std::thread::available_parallelism()
@@ -551,7 +555,7 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_d
             .context("Failed to run FA4 compile script")?;
 
         if !status.success() {
-            println!("cargo:warning=FA4 kernel compilation failed for {arch}");
+            build_log!("FA4 kernel compilation failed for {arch}");
         }
     }
 
@@ -578,7 +582,7 @@ fn ensure_python_env(venv_dir: &Path) -> Result<String> {
     // 1. Check if system/venv python already has cutlass
     for candidate in ["python3", "python"] {
         if check_cutlass(candidate) {
-            println!("cargo:warning=Using {candidate} (cutlass already available)");
+            build_log!("Using {candidate} (cutlass already available)");
             return Ok(candidate.to_string());
         }
     }
@@ -587,11 +591,11 @@ fn ensure_python_env(venv_dir: &Path) -> Result<String> {
     let venv_python = venv_dir.join("bin/python3");
 
     if check_cutlass(venv_python.to_str().unwrap_or("")) {
-        println!("cargo:warning=Using cached venv at {}", venv_dir.display());
+        build_log!("Using cached venv at {}", venv_dir.display());
         return Ok(venv_python.to_string_lossy().into_owned());
     }
 
-    println!("cargo:warning=Creating Python venv for FA4 kernel compilation...");
+    build_log!("Creating Python venv for FA4 kernel compilation...");
 
     // Try uv first (fast), fall back to python3 -m venv
     let venv_created = Command::new("uv")
@@ -614,10 +618,10 @@ fn ensure_python_env(venv_dir: &Path) -> Result<String> {
     // Detect CUDA version to pick matching PyTorch wheel (avoids driver mismatch)
     let torch_index = detect_torch_cuda_index();
     if let Some(ref idx) = torch_index {
-        println!("cargo:warning=Detected CUDA index: {idx}");
+        build_log!("Detected CUDA index: {idx}");
     }
 
-    println!("cargo:warning=Installing FA4 Python deps (nvidia-cutlass-dsl, torch)...");
+    build_log!("Installing FA4 Python deps (nvidia-cutlass-dsl, torch)...");
 
     let venv_python_str = venv_python.to_string_lossy().to_string();
     let has_uv = Command::new("uv")
@@ -663,7 +667,7 @@ fn ensure_python_env(venv_dir: &Path) -> Result<String> {
         anyhow::bail!("cutlass not importable after install — check Python/CUDA setup");
     }
 
-    println!("cargo:warning=FA4 Python env ready at {}", venv_dir.display());
+    build_log!("FA4 Python env ready at {}", venv_dir.display());
     Ok(venv_python.to_string_lossy().into_owned())
 }
 

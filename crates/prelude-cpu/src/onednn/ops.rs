@@ -190,21 +190,21 @@ impl Drop for OnednnF32PackedWeight {
     }
 }
 
-// ── OnednnLinear: drop-in replacement for prelude_core::nn_ops::CandleLinear ──────────
+// ── OnednnLinear: drop-in replacement for prelude_core::modules::linear::NaiveLinear ──────────
 
 /// Drop-in Linear layer that dispatches BF16/F32 CPU to oneDNN packed GEMM,
 /// falling back to candle for other dtypes/devices.
 #[derive(Clone, Debug)]
 pub struct OnednnLinear {
-    candle_linear: prelude_core::nn_ops::CandleLinear,
+    candle_linear: prelude_core::modules::linear::NaiveLinear,
     brgemm_packed: Option<Arc<BrgemmPackedWeight>>,
     f32_packed: Option<Arc<OnednnF32PackedWeight>>,
 }
 
 impl OnednnLinear {
-    /// Wrap a `prelude_core::nn_ops::CandleLinear`. If BF16 or F32 CPU, pre-packs weights for oneDNN.
+    /// Wrap a `prelude_core::modules::linear::NaiveLinear`. If BF16 or F32 CPU, pre-packs weights for oneDNN.
     /// Also packs brgemm VNNI weights and AMX VNNI weights if available.
-    pub fn new(linear: prelude_core::nn_ops::CandleLinear) -> Result<Self> {
+    pub fn new(linear: prelude_core::modules::linear::NaiveLinear) -> Result<Self> {
         init(); // ensure oneDNN engine/stream exist
         let w = linear.weight();
 

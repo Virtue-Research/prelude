@@ -81,7 +81,7 @@ pub fn bench_extend(
                     .narrow(1, kv_h, 1)?
                     .squeeze(1)?;
                 let scores = q_h.matmul(&k_h.t()?)?;
-                let _ = prelude_core::nn_ops::ops::softmax(&(scores * sm_scale)?, 1)?
+                let _ = prelude_core::modules::activation::softmax(&(scores * sm_scale)?, 1)?
                     .matmul(&v_h)?;
             }
         }
@@ -102,7 +102,7 @@ pub fn bench_extend(
                     .narrow(1, kv_h, 1)?
                     .squeeze(1)?;
                 let scores = q_h.matmul(&k_h.t()?)?;
-                let _ = prelude_core::nn_ops::ops::softmax(&(scores * sm_scale)?, 1)?
+                let _ = prelude_core::modules::activation::softmax(&(scores * sm_scale)?, 1)?
                     .matmul(&v_h)?;
             }
         }

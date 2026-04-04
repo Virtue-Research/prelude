@@ -16,6 +16,8 @@ use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+include!("../../../build_log.rs");
+
 // ── Manifest schema ─────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -45,6 +47,8 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=scripts/compile_kernels.py");
     println!("cargo:rerun-if-env-changed=FLASHINFER_SRC");
     println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_ARCHS");
+    track_submodule("flashinfer");
+    track_submodule("tvm-ffi");
     println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_HEAD_DIMS");
     println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_DTYPES");
     println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_WORKERS");
@@ -66,7 +70,7 @@ fn main() -> Result<()> {
 
     // Phase 4: Compile TVM FFI
     if env::var("CARGO_FEATURE_SKIP_TVM_FFI").is_ok() {
-        println!("cargo:warning=FlashInfer: skipping tvm_ffi (provided by flash-attn-v4)");
+        build_log!("skipping tvm_ffi (provided by flash-attn-v4)");
     } else {
         compile_tvm_ffi(&manifest_dir)?;
     }
@@ -84,7 +88,7 @@ fn find_flashinfer_source(manifest_dir: &Path) -> Result<PathBuf> {
     if let Ok(src) = env::var("FLASHINFER_SRC") {
         let p = PathBuf::from(&src);
         if p.join("csrc").exists() {
-            println!("cargo:warning=FlashInfer: using source at {src}");
+            build_log!("using source at {src}");
             return Ok(p);
         }
         anyhow::bail!("FLASHINFER_SRC={src} does not contain csrc/");
@@ -118,14 +122,14 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fi_src: &Path) -> Res
         let manifest_mtime = manifest.metadata()?.modified()?;
         if manifest_mtime > script_mtime {
             let n = walkdir_ext(kernels_dir, "o").len();
-            println!("cargo:warning=FlashInfer: {n} kernel objects up-to-date");
+            build_log!("{n} kernel objects up-to-date");
             return Ok(());
         }
-        println!("cargo:warning=FlashInfer: compile_kernels.py changed, recompiling...");
+        build_log!("compile_kernels.py changed, recompiling...");
         // Remove stale manifest so the script regenerates everything
         std::fs::remove_file(&manifest)?;
     } else {
-        println!("cargo:warning=FlashInfer: compiling kernels...");
+        build_log!("compiling kernels...");
     }
     let python = find_python()?;
 
@@ -163,13 +167,13 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fi_src: &Path) -> Res
 fn archive_objects(kernels_dir: &Path, out_dir: &Path) -> Result<bool> {
     let obj_files = walkdir_ext(kernels_dir, "o");
     if obj_files.is_empty() {
-        println!("cargo:warning=FlashInfer: no kernel .o files found");
+        build_log!("no kernel .o files found");
         return Ok(false);
     }
 
     let archive = out_dir.join("libflashinfer_kernels.a");
     if !archive.exists() {
-        println!("cargo:warning=FlashInfer: creating archive ({} objects)", obj_files.len());
+        build_log!("creating archive ({} objects)", obj_files.len());
         // Use `q` (quick append) not `r` (replace) — multiple variants have
         // identically named .o files (e.g. batch_decode.o) and `r` would
         // keep only the last one, losing symbols from other variants.
@@ -525,7 +529,7 @@ fn generate_dispatch(kernels_dir: &Path, out_dir: &Path, has_kernels: bool) -> R
     writeln!(code, "    }}\n}}")?;
 
     std::fs::write(&path, &code)?;
-    println!("cargo:warning=FlashInfer: generated dispatch ({} variants)", manifest.variants.len());
+    build_log!("generated dispatch ({} variants)", manifest.variants.len());
 
     Ok(())
 }

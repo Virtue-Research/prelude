@@ -19,3 +19,6 @@
 [submodule "third_party/cuLA"]
 	path = third_party/cuLA
 	url = /scratch/yuzhou/projects/cuLA
+[submodule "third_party/oneDNN"]
+	path = third_party/oneDNN
+	url = https://github.com/uxlfoundation/oneDNN.git

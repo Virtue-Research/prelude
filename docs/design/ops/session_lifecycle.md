@@ -19,11 +19,11 @@ trait OpsSession: Send + Sync {
     /// Converts block_tables → kernel-specific metadata (e.g., FlashInfer indptr/indices).
     /// Called once before model.forward(), reused across all N layers.
     ///
-    /// Same `&[u32]` convention as attention params — device uploads internally.
+    /// Uses `&Tensor` for device-agnostic scheduling metadata.
     fn precompute_paged_plan(
         &self,
-        block_tables: &[u32],       // [batch * max_blocks_per_seq]
-        cu_seqlens_k: &[u32],       // [batch + 1]
+        block_tables: &Tensor,      // [batch * max_blocks_per_seq]
+        cu_seqlens_k: &Tensor,      // [batch + 1]
         block_size: usize,
     ) -> Result<()>;
 }

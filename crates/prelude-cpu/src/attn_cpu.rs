@@ -351,7 +351,7 @@ fn matmul_sdpa_candle(
             scores
         };
 
-        let attn_weights = prelude_core::nn_ops::ops::softmax_last_dim(&scores)?;
+        let attn_weights = prelude_core::modules::activation::softmax_last_dim(&scores)?;
         let out = attn_weights.matmul(&v_t)?;
         outputs.push(out.transpose(0, 1)?);
         offset += slen;

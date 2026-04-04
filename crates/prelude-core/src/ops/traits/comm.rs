@@ -1,5 +1,14 @@
 use crate::tensor::{Result, Tensor};
 
+/// Routing target for point-to-point communication.
+/// Supports both rank-level (TP) and group-level (EP, disaggregation) targeting.
+pub enum RemoteTarget {
+    /// A specific rank index.
+    Rank(usize),
+    /// A named group with a rank within it.
+    Group { name: String, rank: usize },
+}
+
 pub trait CommOps: Send + Sync {
     fn world_size(&self) -> usize;
     fn rank(&self) -> usize;
@@ -14,11 +23,11 @@ pub trait CommOps: Send + Sync {
         output_splits: &[usize],
     ) -> Result<Tensor>;
 
-    fn send(&self, _x: &Tensor, _dst: usize) -> Result<()> {
+    fn send(&self, _x: &Tensor, _dst: RemoteTarget) -> Result<()> {
         crate::tensor::bail!("point-to-point send not supported on this device")
     }
 
-    fn recv(&self, _src: usize) -> Result<Tensor> {
+    fn recv(&self, _src: RemoteTarget) -> Result<Tensor> {
         crate::tensor::bail!("point-to-point recv not supported on this device")
     }
 

@@ -112,7 +112,8 @@ impl LogitsProcessor {
         let logits = logits.to_dtype(DType::F32)?;
         let prs = |temperature: f64| -> Result<Vec<f32>> {
             let logits = (&logits / temperature)?;
-            let prs = crate::nn_ops::ops::softmax_last_dim(&logits)?;
+            let last_dim = logits.rank() - 1;
+            let prs = crate::ops::current_ops().act.softmax(&logits, last_dim)?;
             let mut prs = prs.to_vec1()?;
             f(&mut prs);
             Ok(prs)

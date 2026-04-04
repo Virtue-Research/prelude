@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::tensor::{DType, Device, Module, Result, Tensor};
-use crate::nn_ops::{Activation, Embedding};
+use crate::modules::activation::Activation;
+use crate::modules::embedding::Embedding;
 use crate::loading::var_builder::VarBuilder;
 use serde::Deserialize;
 
 use crate::modules::{
-    Linear, RmsNorm,
+    BatchState, Linear, RmsNorm,
     varlen_attention, varlen_attention_bidirectional, varlen_attention_windowed,
 };
 
@@ -148,8 +149,8 @@ impl Gemma3RotaryEmbedding {
         let h_k = k.dim(1)?;
         let q4 = q.reshape((1, total, h_q, d))?;
         let k4 = k.reshape((1, total, h_k, d))?;
-        let q_embed = crate::nn_ops::rotary_emb::rope_thd(&q4, &cos, &sin)?;
-        let k_embed = crate::nn_ops::rotary_emb::rope_thd(&k4, &cos, &sin)?;
+        let q_embed = q4.rope_thd(&cos, &sin)?;
+        let k_embed = k4.rope_thd(&cos, &sin)?;
         Ok((
             q_embed.reshape((total, h_q, d))?,
             k_embed.reshape((total, h_k, d))?,
@@ -192,10 +193,11 @@ impl Gemma3Mlp {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
-        (gate.apply(&self.act_fn)? * up)?.apply(&self.down_proj)
+    fn forward(&self, ops: &crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
+        let bs = BatchState::no_lora();
+        let gate = self.gate_proj.forward(x, &bs, ops)?;
+        let up = self.up_proj.forward(x, &bs, ops)?;
+        self.down_proj.forward(&(gate.apply(&self.act_fn)? * up)?, &bs, ops)
     }
 }
 
@@ -266,10 +268,11 @@ impl Gemma3Attention {
         position_ids: &Tensor,
     ) -> Result<Tensor> {
         let (total_tokens, _) = packed_input.dims2()?;
+        let bs = BatchState::no_lora();
 
-        let q = self.q_proj.forward(packed_input)?;
-        let k = self.k_proj.forward(packed_input)?;
-        let v = self.v_proj.forward(packed_input)?;
+        let q = self.q_proj.forward(packed_input, &bs, ops)?;
+        let k = self.k_proj.forward(packed_input, &bs, ops)?;
+        let v = self.v_proj.forward(packed_input, &bs, ops)?;
 
         let q = q.reshape((total_tokens, self.num_heads, self.head_dim))?;
         let k = k.reshape((total_tokens, self.num_kv_heads, self.head_dim))?;
@@ -311,7 +314,7 @@ impl Gemma3Attention {
         };
 
         let attn_dim = self.num_heads * self.head_dim;
-        attn_out.reshape((total_tokens, attn_dim))?.apply(&self.o_proj)
+        self.o_proj.forward(&attn_out.reshape((total_tokens, attn_dim))?, &bs, ops)
     }
 
     fn clear_kv_cache(&mut self) {}
@@ -383,7 +386,7 @@ impl Gemma3DecoderLayer {
         let xs = crate::modules::fast_add(ops, &post_attn_normed, xs)?;
 
         let pre_ffn_normed = self.pre_feedforward_layernorm.forward(&xs)?;
-        let mlp_output = self.mlp.forward(&pre_ffn_normed)?;
+        let mlp_output = self.mlp.forward(ops, &pre_ffn_normed)?;
 
         let post_ffn_normed = self.post_feedforward_layernorm.forward(&mlp_output)?;
         crate::modules::fast_add(ops, &post_ffn_normed, &xs)
@@ -549,7 +552,7 @@ impl Gemma3ForCausalLM {
         let last_hidden =
             crate::modules::last_token_select(&hidden, ctx.seq_lens)?.contiguous()?;
 
-        let logits = last_hidden.unsqueeze(1)?.apply(&self.lm_head)?;
+        let logits = self.lm_head.forward(&last_hidden.unsqueeze(1)?, &BatchState::no_lora(), ctx.ops)?;
 
         if let Some(cap) = self.final_logit_softcapping {
             let scaled = (&logits / cap)?;
@@ -581,7 +584,7 @@ impl crate::models::LogitsSplitModel for Gemma3ForCausalLM {
     }
 
     fn compute_logits(&self, hidden: &Tensor) -> crate::tensor::Result<Tensor> {
-        let logits = hidden.apply(&self.lm_head)?;
+        let logits = self.lm_head.forward(hidden, &BatchState::no_lora(), crate::ops::select_ops(hidden.device()))?;
         if let Some(cap) = self.final_logit_softcapping {
             let scaled = (&logits / cap)?;
             let tanh = scaled.tanh()?;
@@ -667,7 +670,7 @@ impl Gemma3ForSequenceClassification {
             ctx.position_ids,
         )?;
         let last_hidden = crate::modules::last_token_select(&hidden_states, ctx.seq_lens)?;
-        last_hidden.apply(&self.score)
+        self.score.forward(&last_hidden, &BatchState::no_lora(), ctx.ops)
     }
 
     pub fn get_label(&self, class_idx: usize) -> Option<String> {
@@ -701,7 +704,7 @@ impl Gemma3EmbeddingDenseLayer {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = x.apply(&self.linear)?;
+        let x = self.linear.forward(x, &BatchState::no_lora(), crate::ops::select_ops(x.device()))?;
         match self.activation {
             EmbeddingActivation::Identity => Ok(x),
         }

@@ -51,6 +51,10 @@ pub trait AttentionOps: Send + Sync {
     ) -> Result<Tensor>;
 
     /// Paged attention: Q attends to K/V in block cache.
+    ///
+    /// Covers decode (max_seqlen_q=1) and chunked prefill (max_seqlen_q>1).
+    /// If the underlying kernel doesn't support paged prefill natively,
+    /// the device implementation handles the fallback internally.
     fn paged_attention(
         &self,
         q: &Tensor,
@@ -58,7 +62,4 @@ pub trait AttentionOps: Send + Sync {
         value_cache: &Tensor,
         params: &PagedParams,
     ) -> Result<Tensor>;
-
-    /// Whether this backend supports paged attention for prefill (Q > 1).
-    fn supports_paged_prefill(&self) -> bool { true }
 }

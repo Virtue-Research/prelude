@@ -4,7 +4,7 @@
 //! optimized implementations that override this.
 
 use std::sync::{Arc, LazyLock};
-use crate::tensor::{Module, Result, Tensor};
+use crate::tensor::{DType, Device, Module, Shape, Result, Tensor};
 use crate::ops::traits::*;
 
 struct NaiveOps;
@@ -15,7 +15,8 @@ pub fn naive_ops() -> &'static Ops {
         Ops {
             attn: n.clone(), kv_cache: n.clone(), gemm: n.clone(),
             norm: n.clone(), act: n.clone(), conv: n.clone(),
-            comm: n.clone(), fused: n.clone(), session: n,
+            comm: n.clone(), fused: n.clone(), session: n.clone(),
+            tensor: n,
         }
     });
     &OPS
@@ -109,14 +110,21 @@ impl GemmOps for NaiveOps {
     fn quantized_matmul(&self, _a: &Tensor, _b: &Tensor, _sa: Option<&Tensor>, _sb: Option<&Tensor>, _q: QuantScheme) -> Result<Tensor> {
         crate::tensor::bail!("quantized_matmul requires prelude-cpu or prelude-cuda")
     }
-    fn moe_gemm(&self, _input: &Tensor, _weights: &Tensor, _topk_weights: &Option<Tensor>, _sorted_token_ids: &Tensor, _sorted_expert_ids: &Tensor, _topk: usize, _is_prefill: bool) -> Result<Tensor> {
-        crate::tensor::bail!("moe_gemm requires prelude-cuda")
+    fn grouped_gemm(&self, _input: &Tensor, _weights: &Tensor, _sorted_token_ids: &Tensor, _sorted_expert_ids: &Tensor, _num_tokens_per_expert: &Tensor) -> Result<Tensor> {
+        crate::tensor::bail!("grouped_gemm requires prelude-cuda")
     }
 }
 
 impl NormOps for NaiveOps {
     fn rms_norm(&self, x: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor> {
-        crate::nn_ops::CandleRmsNorm::new(w.clone(), eps as f64).forward(x)
+        use crate::tensor::{DType, D};
+        let xs_f32 = x.to_dtype(DType::F32)?;
+        let variance = xs_f32.sqr()?.mean_keepdim(D::Minus1)?;
+        let eps_t = Tensor::new(&[eps], x.device())?.broadcast_as(variance.shape())?;
+        let inv_rms = (variance + eps_t)?.sqrt()?.recip()?;
+        let normed = xs_f32.broadcast_mul(&inv_rms)?;
+        let weight = w.to_dtype(DType::F32)?;
+        normed.broadcast_mul(&weight)?.to_dtype(x.dtype())
     }
     fn layer_norm(&self, _x: &Tensor, _w: &Tensor, _b: Option<&Tensor>, _eps: f32) -> Result<Tensor> {
         crate::tensor::bail!("layer_norm: not implemented in naive ops")
@@ -127,7 +135,7 @@ impl NormOps for NaiveOps {
 }
 
 impl ActivationOps for NaiveOps {
-    fn silu(&self, x: &Tensor) -> Result<Tensor> { crate::nn_ops::Activation::Silu.forward(x) }
+    fn silu(&self, x: &Tensor) -> Result<Tensor> { x.silu() }
     fn gelu(&self, x: &Tensor) -> Result<Tensor> { x.gelu_erf() }
     fn gelu_approximate(&self, x: &Tensor) -> Result<Tensor> { x.gelu() }
     fn softmax(&self, x: &Tensor, dim: usize) -> Result<Tensor> {
@@ -164,4 +172,114 @@ impl FusedOps for NaiveOps {}
 impl OpsSession for NaiveOps {
     fn begin_forward(&self) {}
     fn end_forward(&self) {}
+}
+
+// ── TensorOps (calls candle_core::Tensor directly via .inner()) ─────
+//
+// Fallback implementation. Device crates override with optimized versions.
+// IMPORTANT: uses x.inner() to call candle directly, NOT our Tensor methods,
+// because Tensor methods will route through current_ops().tensor (→ infinite recursion).
+
+fn w(r: candle_core::Result<candle_core::Tensor>) -> Result<Tensor> {
+    Ok(Tensor::from_candle(r?))
+}
+
+impl TensorOps for NaiveOps {
+    fn unary(&self, x: &Tensor, op: UnaryOp) -> Result<Tensor> {
+        let i = x.inner();
+        w(match op {
+            UnaryOp::Exp => i.exp(),
+            UnaryOp::Log => i.log(),
+            UnaryOp::Sin => i.sin(),
+            UnaryOp::Cos => i.cos(),
+            UnaryOp::Abs => i.abs(),
+            UnaryOp::Neg => i.neg(),
+            UnaryOp::Sqr => i.sqr(),
+            UnaryOp::Sqrt => i.sqrt(),
+            UnaryOp::Recip => i.recip(),
+            UnaryOp::Tanh => i.tanh(),
+            UnaryOp::Relu => i.relu(),
+            UnaryOp::Ceil => i.ceil(),
+            UnaryOp::Floor => i.floor(),
+            UnaryOp::Round => i.round_to(0),
+            UnaryOp::Sign => i.sign(),
+        })
+    }
+
+    fn binary(&self, a: &Tensor, b: &Tensor, op: BinaryOp) -> Result<Tensor> {
+        let (ai, bi) = (a.inner(), b.inner());
+        w(match op {
+            BinaryOp::Add => ai.broadcast_add(bi),
+            BinaryOp::Sub => ai.broadcast_sub(bi),
+            BinaryOp::Mul => ai.broadcast_mul(bi),
+            BinaryOp::Div => ai.broadcast_div(bi),
+            BinaryOp::Min => ai.minimum(bi),
+            BinaryOp::Max => ai.maximum(bi),
+        })
+    }
+
+    fn compare(&self, a: &Tensor, b: &Tensor, op: CompareOp) -> Result<Tensor> {
+        let (ai, bi) = (a.inner(), b.inner());
+        w(match op {
+            CompareOp::Eq => ai.eq(bi),
+            CompareOp::Ne => ai.ne(bi),
+            CompareOp::Lt => ai.lt(bi),
+            CompareOp::Gt => ai.gt(bi),
+            CompareOp::Ge => ai.ge(bi),
+            CompareOp::Le => ai.le(bi),
+        })
+    }
+
+    fn reduce(&self, x: &Tensor, dim: usize, keepdim: bool, op: ReduceOp) -> Result<Tensor> {
+        let i = x.inner();
+        w(if keepdim {
+            match op {
+                ReduceOp::Sum => i.sum_keepdim(dim),
+                ReduceOp::Max => i.max_keepdim(dim),
+                ReduceOp::Min => i.min_keepdim(dim),
+                ReduceOp::ArgMax => i.argmax_keepdim(dim),
+                ReduceOp::ArgMin => i.argmin_keepdim(dim),
+            }
+        } else {
+            match op {
+                ReduceOp::Sum => i.sum(dim),
+                ReduceOp::Max => i.max(dim),
+                ReduceOp::Min => i.min(dim),
+                ReduceOp::ArgMax => i.argmax(dim),
+                ReduceOp::ArgMin => i.argmin(dim),
+            }
+        })
+    }
+
+    fn cast(&self, x: &Tensor, dtype: DType) -> Result<Tensor> { w(x.inner().to_dtype(dtype.into())) }
+    fn contiguous(&self, x: &Tensor) -> Result<Tensor> { w(x.inner().contiguous()) }
+    fn to_device(&self, x: &Tensor, device: &Device) -> Result<Tensor> { w(x.inner().to_device(device)) }
+
+    fn index_select(&self, x: &Tensor, indices: &Tensor, dim: usize) -> Result<Tensor> {
+        w(x.inner().index_select(indices.inner(), dim))
+    }
+    fn gather(&self, x: &Tensor, indices: &Tensor, dim: usize) -> Result<Tensor> {
+        w(x.inner().gather(indices.inner(), dim))
+    }
+    fn scatter_add(&self, x: &Tensor, indices: &Tensor, src: &Tensor, dim: usize) -> Result<Tensor> {
+        w(x.inner().scatter_add(indices.inner(), src.inner(), dim))
+    }
+    fn where_cond(&self, cond: &Tensor, on_true: &Tensor, on_false: &Tensor) -> Result<Tensor> {
+        w(cond.inner().where_cond(on_true.inner(), on_false.inner()))
+    }
+    fn affine(&self, x: &Tensor, mul: f64, add: f64) -> Result<Tensor> {
+        w(x.inner().affine(mul, add))
+    }
+    fn zeros(&self, shape: &Shape, dtype: DType, device: &Device) -> Result<Tensor> {
+        let cs: candle_core::Shape = shape.clone().into();
+        w(candle_core::Tensor::zeros(cs, dtype.into(), device))
+    }
+    fn sort_last_dim(&self, x: &Tensor, asc: bool) -> Result<(Tensor, Tensor)> {
+        let (a, b) = x.inner().sort_last_dim(asc)?;
+        Ok((Tensor::from_candle(a), Tensor::from_candle(b)))
+    }
+    fn cat(&self, tensors: &[&Tensor], dim: usize) -> Result<Tensor> {
+        let inner: Vec<&candle_core::Tensor> = tensors.iter().map(|t| t.inner()).collect();
+        w(candle_core::Tensor::cat(&inner, dim))
+    }
 }

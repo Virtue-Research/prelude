@@ -33,6 +33,7 @@ rand.workspace = true
 fastokens.workspace = true
 hf-hub.workspace = true
 half = { version = "2.7.1", features = ["bytemuck"] }
+safetensors = "0.7.0"
 bytemuck = { version = "1", features = ["extern_crate_alloc", "derive"] }
 inventory = "0.3"
 rayon = "1.11.0"

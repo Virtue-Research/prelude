@@ -41,7 +41,7 @@ oneDNN is auto-downloaded and statically linked on first build.
 uv venv .venv --python 3.12 --seed
 source .venv/bin/activate
 
-uv pip install transformers torch requests numpy cmake
+uv pip install transformers torch requests numpy cmake nvidia-cutlass
 ```
 
 

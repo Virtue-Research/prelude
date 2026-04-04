@@ -857,7 +857,7 @@ pub(crate) fn extract_prompt_logprobs_from_hidden_offset(
 
         let chunk_hidden = hidden_states.narrow(0, start, chunk_len).map_err(candle_err)?;
         let chunk_logits = model.compute_logits(&chunk_hidden).map_err(candle_err)?;
-        let chunk_log_probs = crate::nn_ops::ops::log_softmax(&chunk_logits, 1).map_err(candle_err)?;
+        let chunk_log_probs = crate::ops::current_ops().act.log_softmax(&chunk_logits, 1).map_err(candle_err)?;
         drop(chunk_logits); // free (chunk, vocab_size) before gather allocates
 
         let chunk_token_ids = Tensor::from_vec(

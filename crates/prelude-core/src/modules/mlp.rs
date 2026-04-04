@@ -3,10 +3,11 @@
 // Used by Qwen3, Qwen3-MoE (dense layers), and other architectures.
 // Raw CPU forward paths (brgemm, raw_f32) are in prelude-cpu.
 
-use crate::tensor::{DType, Module, Result, Tensor};
+use crate::tensor::{DType, Result, Tensor};
 use crate::loading::var_builder::VarBuilder;
-use crate::nn_ops::Qwen3Config;
+use crate::models::config::Qwen3Config;
 
+use super::BatchState;
 use super::linear::Linear;
 
 #[derive(Debug, Clone)]
@@ -49,20 +50,20 @@ impl GatedMlp {
         })
     }
 
-    pub(crate) fn forward(&self, ops: &crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, ctx: &BatchState, ops: &crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
         // Fused gate_up GEMM path (CPU BF16) — uses merged weight if available
         if let Some(ref gup) = self.gate_up_proj {
-            let gate_up = gup.forward(x)?;
+            let gate_up = gup.forward(x, ctx, ops)?;
             // SiLU×Mul via Ops fused kernel or fallback
             let dims = gate_up.dims();
             let dim = dims[dims.len() - 1] / 2;
             let gate = gate_up.narrow(dims.len() - 1, 0, dim)?;
             let up = gate_up.narrow(dims.len() - 1, dim, dim)?;
-            return super::norm::fast_silu_mul(ops, &gate, &up)?.apply(&self.down_proj);
+            return self.down_proj.forward(&super::norm::fast_silu_mul(ops, &gate, &up)?, ctx, ops);
         }
 
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
-        super::norm::fast_silu_mul(ops, &gate, &up)?.apply(&self.down_proj)
+        let gate = self.gate_proj.forward(x, ctx, ops)?;
+        let up = self.up_proj.forward(x, ctx, ops)?;
+        self.down_proj.forward(&super::norm::fast_silu_mul(ops, &gate, &up)?, ctx, ops)
     }
 }

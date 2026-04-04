@@ -4,11 +4,12 @@ use std::sync::Arc;
 
 use crate::tensor::{DType, Module, Result, Tensor};
 use crate::loading::var_builder::VarBuilder;
-use crate::nn_ops::{Embedding, Qwen3Config};
+use crate::modules::embedding::Embedding;
+use crate::models::config::Qwen3Config;
 use serde::Deserialize;
 
 use crate::modules::varlen_attention;
-use crate::modules::{BatchAttnContext, LayerAttnContext};
+use crate::modules::{BatchAttnContext, BatchState, LayerAttnContext};
 use crate::modules::{
     GatedMlp, Linear, RmsNorm, RotaryEmbedding, TransformerBlock,
     fast_add, fast_rms_norm, fused_add_rmsnorm, last_token_select, qknorm_rope_varlen,
@@ -146,12 +147,13 @@ impl Qwen3Attention {
 
     /// Project Q, K, V and reshape to `[total_tokens, H, D]` (varlen layout).
     #[inline]
-    fn fused_qkv_projection(&self, x: &Tensor, total: usize) -> Result<(Tensor, Tensor, Tensor)> {
+    fn fused_qkv_projection(&self, x: &Tensor, total: usize, ctx: &BatchState, ops: &crate::ops::Ops) -> Result<(Tensor, Tensor, Tensor)> {
         crate::modules::attn_utils::fused_qkv_projection(
             x,
             &self.q_proj, &self.k_proj, &self.v_proj,
             self.qkv_proj.as_ref(),
             total, self.num_heads, self.num_kv_heads, self.head_dim,
+            ctx, ops,
         )
     }
 
@@ -179,11 +181,12 @@ impl Qwen3Attention {
     pub(crate) fn forward(&self, x: &Tensor, ctx: &LayerAttnContext) -> Result<Tensor> {
         {
             let total_q = x.dim(0)?;
+            let bs = BatchState::no_lora();
 
             // Raw CPU fast paths (brgemm, raw_f32) are in prelude-cpu.
             // The generic path below handles both GPU and CPU via Ops traits.
 
-            let (q, k, v) = self.fused_qkv_projection(x, total_q)?;
+            let (q, k, v) = self.fused_qkv_projection(x, total_q, &bs, ctx.ops)?;
 
             // Fused path: try fused Q+K norm+rope via Ops trait
             if !debug_disable_fused_qknorm_rope() {
@@ -222,18 +225,21 @@ impl Qwen3Attention {
                             ctx.max_seqlen_q, kv.max_seqlen_k,
                             self.softmax_scale,
                         )?;
-                        return attn
-                            .reshape((total_q, self.hidden_size))?
-                            .apply(&self.o_proj);
+                        return self.o_proj.forward(
+                            &attn.reshape((total_q, self.hidden_size))?,
+                            &bs, ctx.ops,
+                        );
                     }
-                    return varlen_attention(
-                        ctx.ops, &q, &k, &v,
-                        ctx.cu_seqlens_q, ctx.cu_seqlens_q,
-                        ctx.max_seqlen_q, ctx.max_seqlen_q,
-                        self.softmax_scale, None,
-                    )?
-                    .reshape((total_q, self.hidden_size))?
-                    .apply(&self.o_proj);
+                    return self.o_proj.forward(
+                        &varlen_attention(
+                            ctx.ops, &q, &k, &v,
+                            ctx.cu_seqlens_q, ctx.cu_seqlens_q,
+                            ctx.max_seqlen_q, ctx.max_seqlen_q,
+                            self.softmax_scale, None,
+                        )?
+                        .reshape((total_q, self.hidden_size))?,
+                        &bs, ctx.ops,
+                    );
                 }
             }
 
@@ -253,9 +259,10 @@ impl Qwen3Attention {
                 ctx.paged_kv,
             )?;
 
-            attn_out
-                .reshape((total_q, self.hidden_size))?
-                .apply(&self.o_proj)
+            self.o_proj.forward(
+                &attn_out.reshape((total_q, self.hidden_size))?,
+                &bs, ctx.ops,
+            )
         }
     }
 
@@ -267,13 +274,14 @@ impl Qwen3Attention {
     /// Uses matmul-based SDPA as a universal fallback.
     fn forward_with_cache(&mut self, x: &Tensor, position_offset: usize) -> Result<Tensor> {
         let seq_len = x.dim(0)?;
+        let bs = BatchState::no_lora();
 
         // ── Tensor-based path ──
-        let (q, k, v) = self.fused_qkv_projection(x, seq_len)?;
+        let ops = crate::ops::select_ops(x.device());
+        let (q, k, v) = self.fused_qkv_projection(x, seq_len, &bs, ops)?;
         let position_ids: Vec<u32> =
             (0..seq_len).map(|i| (position_offset + i) as u32).collect();
         let position_ids = Tensor::from_vec(position_ids, (seq_len,), x.device())?;
-        let ops = crate::ops::select_ops(x.device());
         let (q, k) = self.norm_rope_varlen(ops, &q, &k, seq_len, &position_ids)?;
 
         self.k_cache.append(&k)?;
@@ -285,9 +293,10 @@ impl Qwen3Attention {
             &q, &k_full, &v_full, seq_len, position_offset,
         )?;
 
-        attn_out
-            .reshape((seq_len, self.hidden_size))?
-            .apply(&self.o_proj)
+        self.o_proj.forward(
+            &attn_out.reshape((seq_len, self.hidden_size))?,
+            &bs, ops,
+        )
     }
 
     /// Matmul-based cross-attention for decode: Q attends to full KV cache.
@@ -364,7 +373,8 @@ impl Qwen3Attention {
         };
 
         // Softmax over last dim
-        let attn_weights = crate::nn_ops::ops::softmax_last_dim(&scores)?;
+        let last_dim = scores.rank() - 1;
+        let attn_weights = crate::ops::current_ops().act.softmax(&scores, last_dim)?;
 
         // output = attn_weights @ V → [H, seq_len, D]
         let out = attn_weights.matmul(&v3)?;
@@ -417,7 +427,7 @@ impl DecoderLayer {
 
     #[inline]
     fn residual_mlp(&self, ops: &crate::ops::Ops, x_res: &Tensor, h2: &Tensor) -> Result<Tensor> {
-        fast_add(ops, x_res, &self.mlp.forward(ops, h2)?)
+        fast_add(ops, x_res, &self.mlp.forward(&BatchState::no_lora(), ops, h2)?)
     }
 
     fn forward_with_cache(&mut self, ops: &crate::ops::Ops, x: &Tensor, position_offset: usize) -> Result<Tensor> {
@@ -556,9 +566,11 @@ impl Qwen3ModelForCausalLM {
 
     /// Helper: extract last-token hidden per varlen sequence → logits.
     fn last_token_logits(&self, hidden: &Tensor, seq_lens: &[usize]) -> Result<Tensor> {
-        last_token_select(hidden, seq_lens)?
-            .unsqueeze(1)?
-            .apply(&self.lm_head)
+        let bs = BatchState::no_lora();
+        self.lm_head.forward(
+            &last_token_select(hidden, seq_lens)?.unsqueeze(1)?,
+            &bs, crate::ops::select_ops(hidden.device()),
+        )
     }
 
     pub fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> Result<Tensor> {
@@ -574,7 +586,7 @@ impl Qwen3ModelForCausalLM {
         position_offset: usize,
     ) -> Result<Tensor> {
         let hidden = self.base.forward_with_cache(ops, input_ids, position_offset)?;
-        hidden.apply(&self.lm_head)
+        self.lm_head.forward(&hidden, &BatchState::no_lora(), ops)
     }
 
     pub fn clear_kv_cache(&mut self) {
@@ -622,7 +634,7 @@ impl Qwen3ForSequenceClassification {
 
     pub fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> Result<Tensor> {
         let hidden_states = self.base.forward(packed_input, ctx)?;
-        last_token_select(&hidden_states, ctx.seq_lens)?.apply(&self.score)
+        self.score.forward(&last_token_select(&hidden_states, ctx.seq_lens)?, &BatchState::no_lora(), ctx.ops)
     }
 
     pub fn get_label(&self, class_idx: usize) -> Option<String> {
@@ -680,7 +692,7 @@ impl LogitsSplitModel for Qwen3ModelForCausalLM {
     }
 
     fn compute_logits(&self, hidden: &Tensor) -> crate::tensor::Result<Tensor> {
-        hidden.apply(&self.lm_head)
+        self.lm_head.forward(hidden, &BatchState::no_lora(), crate::ops::select_ops(hidden.device()))
     }
 }
 
@@ -922,7 +934,7 @@ mod tests {
 
 mod meta {
     use crate::loading::var_builder::VarBuilder;
-    use crate::nn_ops::Qwen3Config;
+    use crate::models::config::Qwen3Config;
 
     use super::{
         Qwen3ClassifierConfig, Qwen3ForEmbedding, Qwen3ForSequenceClassification, Qwen3ModelForCausalLM,

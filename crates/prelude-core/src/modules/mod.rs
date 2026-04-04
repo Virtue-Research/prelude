@@ -1,6 +1,8 @@
 // Shared layer primitives reusable across all model architectures.
 
+pub mod activation;
 pub(crate) mod attn_utils;
+pub mod embedding;
 pub mod linear;
 pub(crate) mod mlp;
 mod moe;
@@ -45,6 +47,26 @@ impl<'a> PagedKvBatchContext<'a> {
             cu_seqlens_k: self.cu_seqlens_k,
             max_seqlen_k: self.max_seqlen_k,
         }
+    }
+}
+
+// ── BatchState (per-batch runtime state for Linear / modules) ──────────
+
+/// Per-batch runtime state passed to `Linear.forward` and module functions.
+///
+/// Separate from `Ops` (per-device, static) and model weights (per-model, static).
+/// Models that don't use LoRA still receive this but never inspect it — they just
+/// forward it to `Linear` and module functions.
+pub struct BatchState<'a> {
+    /// Per-token LoRA adapter index. `[batch_size]` mapping each token to its adapter.
+    /// `-1` = no LoRA for this token. `None` = LoRA not active for this batch.
+    pub adapter_ids: Option<&'a Tensor>,
+}
+
+impl<'a> BatchState<'a> {
+    /// Create a BatchState with no LoRA active.
+    pub fn no_lora() -> Self {
+        Self { adapter_ids: None }
     }
 }
 

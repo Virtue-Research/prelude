@@ -5,10 +5,63 @@
 // RmsNorm: AVX-512 on CPU, candle on GPU.
 
 use crate::loading::var_builder::VarBuilder;
-use crate::nn_ops::{CandleLinear, CandleRmsNorm};
-use crate::tensor::{Module, Result, Tensor};
+use crate::tensor::{DType, Module, Result, Tensor, D};
 use std::any::Any;
 use std::sync::Arc;
+
+// ── NaiveLinear (inlined from nn_ops::NaiveLinear) ─────────────────────
+
+/// A linear layer: `y = x @ weight.T + bias`.
+///
+/// Used as the fallback backend when no optimized backend is available.
+/// On CUDA, `Tensor::matmul()` routes through the registered CUTLASS/DeepGEMM dispatch.
+#[derive(Clone, Debug)]
+pub struct NaiveLinear {
+    weight: Tensor,
+    bias: Option<Tensor>,
+}
+
+impl NaiveLinear {
+    pub fn new(weight: Tensor, bias: Option<Tensor>) -> Self {
+        Self { weight, bias }
+    }
+
+    pub fn weight(&self) -> &Tensor { &self.weight }
+    pub fn bias(&self) -> Option<&Tensor> { self.bias.as_ref() }
+}
+
+impl Module for NaiveLinear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x = match *x.dims() {
+            [b1, b2, m, k] => {
+                if x.is_contiguous() {
+                    let w = self.weight.t()?;
+                    x.reshape((b1 * b2 * m, k))?.matmul(&w)?.reshape((b1, b2, m, ()))?
+                } else {
+                    let w = self.weight.broadcast_left((b1, b2))?.t()?;
+                    x.matmul(&w)?
+                }
+            }
+            [bsize, m, k] => {
+                if x.is_contiguous() {
+                    let w = self.weight.t()?;
+                    x.reshape((bsize * m, k))?.matmul(&w)?.reshape((bsize, m, ()))?
+                } else {
+                    let w = self.weight.broadcast_left(bsize)?.t()?;
+                    x.matmul(&w)?
+                }
+            }
+            _ => {
+                let w = self.weight.t()?;
+                x.matmul(&w)?
+            }
+        };
+        match &self.bias {
+            None => Ok(x),
+            Some(bias) => x.broadcast_add(bias),
+        }
+    }
+}
 
 // ── LinearBackend trait ───────────────────────────────────────────────────
 
@@ -87,7 +140,7 @@ fn find_quant_format(
 
 /// Factory for creating optimized CPU linear backends.
 pub trait CpuLinearFactory: Send + Sync {
-    fn create(&self, linear: CandleLinear) -> Result<Box<dyn LinearBackend>>;
+    fn create(&self, linear: NaiveLinear) -> Result<Box<dyn LinearBackend>>;
 }
 
 pub struct CpuLinearFactoryEntry {
@@ -123,21 +176,21 @@ impl Linear {
         } else {
             None
         };
-        Self::from_candle(CandleLinear::new(weight, bias))
+        Self::from_candle(NaiveLinear::new(weight, bias))
     }
 
     /// Construct from a raw weight tensor (e.g., for tied embeddings / lm_head).
     pub fn from_weight(weight: Tensor, bias: Option<Tensor>) -> Result<Self> {
-        Self::from_candle(CandleLinear::new(weight, bias))
+        Self::from_candle(NaiveLinear::new(weight, bias))
     }
 
-    /// Wrap an existing `CandleLinear`, selecting the best backend by device.
+    /// Wrap an existing `NaiveLinear`, selecting the best backend by device.
     ///
-    /// CUDA: uses `CandleLinear` — `Tensor::matmul()` routes through the registered
+    /// CUDA: uses `NaiveLinear` — `Tensor::matmul()` routes through the registered
     /// CUTLASS/DeepGEMM dispatch (set up by `CudaOps::create()`).
     /// CPU: uses registered CPU linear factory (OnednnLinear from prelude-cpu) if available,
-    ///      otherwise falls back to CandleLinear.
-    pub fn from_candle(linear: CandleLinear) -> Result<Self> {
+    ///      otherwise falls back to NaiveLinear.
+    pub fn from_candle(linear: NaiveLinear) -> Result<Self> {
         if linear.weight().device().is_cpu() {
             // Use registered CPU linear factory if available (e.g., OnednnLinear)
             if let Some(entry) = inventory::iter::<CpuLinearFactoryEntry>().next() {
@@ -147,7 +200,7 @@ impl Linear {
             }
         }
         Ok(Self {
-            inner: Box::new(CandleLinearBackend(linear)),
+            inner: Box::new(NaiveLinearBackend(linear)),
         })
     }
 
@@ -185,29 +238,32 @@ impl Linear {
     pub fn backend_as<T: 'static>(&self) -> Option<&T> {
         self.inner.as_any().downcast_ref::<T>()
     }
-}
 
-impl Module for Linear {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    /// Forward pass: GEMM (plain/quantized) → LoRA (fused/fallback) → TP (reduce/gather).
+    ///
+    /// `ctx` carries per-batch LoRA adapter routing. `ops` provides device kernels.
+    /// Currently LoRA and TP are not yet implemented — `ctx` and `ops` are accepted
+    /// for API stability and will be used when those features land.
+    pub fn forward(&self, x: &Tensor, _ctx: &super::BatchState, _ops: &crate::ops::Ops) -> Result<Tensor> {
         self.inner.forward(x)
     }
 }
 
-// ── CandleLinear backend (CUDA via registered dispatch) ─────────────────
+// ── NaiveLinear backend (CUDA via registered dispatch) ─────────────────
 
-/// Simple wrapper around `CandleLinear` for CUDA devices.
+/// Simple wrapper around `NaiveLinear` for CUDA devices.
 /// `Tensor::matmul()` is intercepted by the registered GEMM dispatch
 /// (CUTLASS/DeepGEMM), so no direct FFI needed here.
 #[derive(Debug, Clone)]
-struct CandleLinearBackend(CandleLinear);
+struct NaiveLinearBackend(NaiveLinear);
 
-impl Module for CandleLinearBackend {
+impl Module for NaiveLinearBackend {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.0.forward(x)
     }
 }
 
-impl LinearBackend for CandleLinearBackend {
+impl LinearBackend for NaiveLinearBackend {
     fn name(&self) -> &str { "gpu/candle" }
     fn weight(&self) -> Option<&Tensor> { Some(self.0.weight()) }
     fn clone_box(&self) -> Box<dyn LinearBackend> { Box::new(self.clone()) }
@@ -254,7 +310,12 @@ impl RmsNorm {
 
 impl Module for RmsNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let norm = CandleRmsNorm::new(self.weight.clone(), self.eps);
-        norm.forward(x)
+        let xs_f32 = x.to_dtype(DType::F32)?;
+        let variance = xs_f32.sqr()?.mean_keepdim(D::Minus1)?;
+        let eps_t = Tensor::new(&[self.eps as f32], x.device())?.broadcast_as(variance.shape())?;
+        let inv_rms = (variance + eps_t)?.sqrt()?.recip()?;
+        let normed = xs_f32.broadcast_mul(&inv_rms)?;
+        let weight = self.weight.to_dtype(DType::F32)?;
+        normed.broadcast_mul(&weight)?.to_dtype(x.dtype())
     }
 }

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn candle_err(e: crate::tensor::Error) -> EngineError {
+pub(crate) fn candle_err(e: impl std::fmt::Display) -> EngineError {
     EngineError::Internal(format!("candle error: {e}"))
 }
 

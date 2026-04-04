@@ -9,7 +9,7 @@ use prelude_core::modules::linear::{
     CpuLinearFactory, CpuLinearFactoryEntry,
     LinearBackend, QuantFormat, QuantFormatEntry,
 };
-use prelude_core::nn_ops::CandleLinear;
+use prelude_core::modules::linear::NaiveLinear;
 use std::any::Any;
 
 // ── OneDNN CPU linear factory ───────────────────────────────────────
@@ -19,7 +19,7 @@ struct OnednnLinearFactory;
 
 #[cfg(feature = "onednn")]
 impl CpuLinearFactory for OnednnLinearFactory {
-    fn create(&self, linear: CandleLinear) -> Result<Box<dyn LinearBackend>> {
+    fn create(&self, linear: NaiveLinear) -> Result<Box<dyn LinearBackend>> {
         Ok(Box::new(crate::onednn::OnednnLinear::new(linear)?))
     }
 }

@@ -10,10 +10,15 @@ use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+include!("../../../build_log.rs");
+
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/cula_wrapper.cu");
     println!("cargo:rerun-if-changed=scripts/compile_kernels.py");
-    println!("cargo:rerun-if-changed=kernels/");
+    track_submodule("cuLA");
+    track_submodule("cutlass");
+    track_submodule("tvm-ffi");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -42,7 +47,25 @@ fn main() {
     }
     let sm100 = nvcc_supports_sm100(&nvcc);
 
-    // ── Phase 1: C++ CUTLASS kernels ─────────────────────────────────
+    // ── Phase 1 (nvcc C++) and Phase 2 (Python DSL) run in parallel ──
+    //
+    //   Phase 1: nvcc compiles C++ CUTLASS kernels (uses GPU compiler)
+    //   Phase 2: Python compiles CuTe DSL kernels (uses Python + cutlass-dsl)
+    //
+    // They share no state and use different tools → safe to parallelize.
+
+    let kernels_dir = out_dir.join("dsl_kernels");
+
+    // Spawn Phase 2 in a background thread (it may take minutes for venv setup)
+    let dsl_kernels_dir = kernels_dir.clone();
+    let dsl_manifest_dir = manifest_dir.clone();
+    let dsl_cula_dir = cula_dir.clone();
+    let dsl_out_dir = out_dir.clone();
+    let dsl_handle = std::thread::spawn(move || {
+        compile_dsl_kernels(&dsl_kernels_dir, &dsl_manifest_dir, &dsl_cula_dir, &dsl_out_dir)
+    });
+
+    // Phase 1: C++ CUTLASS kernels (runs on main thread concurrently)
     let cpp_objects = compile_cpp_kernels(
         &nvcc, &cula_dir, &cutlass_dir, &cuda_path, &out_dir, &manifest_dir, sm100,
     );
@@ -63,16 +86,12 @@ fn main() {
         println!("cargo:rustc-link-lib=static=cula_cpp");
     }
 
-    // ── Phase 2: CuTe DSL kernels ────────────────────────────────────
-    let kernels_dir = manifest_dir.join("kernels");
-    let has_dsl_kernels = compile_dsl_kernels(&kernels_dir, &manifest_dir, &cula_dir, &out_dir);
+    // Wait for Phase 2 to finish
+    let has_dsl_kernels = dsl_handle.join().expect("DSL compilation thread panicked");
 
+    // ── Phase 3: TVM FFI (depends on Phase 2) ────────────────────────
     if has_dsl_kernels {
         link_dsl_kernel_objects(&kernels_dir, &out_dir);
-    }
-
-    // ── Phase 3: TVM FFI ─────────────────────────────────────────────
-    if has_dsl_kernels {
         let workspace_root = manifest_dir.parent().unwrap().parent().unwrap().parent().unwrap();
         let tvm_ffi_dir = workspace_root.join("third_party/tvm-ffi");
         if !tvm_ffi_dir.join("src").exists() {
@@ -115,45 +134,63 @@ fn compile_cpp_kernels(
     ];
     let wrapper_src = manifest_dir.join("src/cula_wrapper.cu");
 
-    let mut objects = Vec::new();
+    // Collect all (src, obj, arch_args, defines) tasks, then compile in parallel.
+    let mut tasks: Vec<(PathBuf, PathBuf, Vec<&str>, Vec<&str>)> = Vec::new();
 
     // SM90 kernel sources
     for src in &sm90_sources {
         let stem = src.file_stem().unwrap().to_str().unwrap();
         let obj = out_dir.join(format!("{stem}.o"));
-        nvcc_compile(nvcc, src, &obj, &include_args, &[
-            "-gencode=arch=compute_90a,code=sm_90a",
-        ], &["-DCULA_SM90A_ENABLED"]);
-        objects.push(obj);
+        tasks.push((src.clone(), obj, vec!["-gencode=arch=compute_90a,code=sm_90a"], vec!["-DCULA_SM90A_ENABLED"]));
     }
 
     // SM90 wrapper
-    {
-        let obj = out_dir.join("cula_wrapper_sm90.o");
-        nvcc_compile(nvcc, &wrapper_src, &obj, &include_args, &[
-            "-gencode=arch=compute_90a,code=sm_90a",
-        ], &["-DCULA_SM90A_ENABLED"]);
-        objects.push(obj);
-    }
+    tasks.push((
+        wrapper_src.clone(),
+        out_dir.join("cula_wrapper_sm90.o"),
+        vec!["-gencode=arch=compute_90a,code=sm_90a"],
+        vec!["-DCULA_SM90A_ENABLED"],
+    ));
 
     // SM100
     if sm100 {
-        println!("cargo:warning=cuLA: compiling SM100 KDA kernels");
-        let sm100_src = cula_dir.join("csrc/kda/sm100/kda_fwd_sm100.cu");
-        let obj = out_dir.join("kda_fwd_sm100.o");
-        nvcc_compile(nvcc, &sm100_src, &obj, &include_args, &[
-            "-gencode=arch=compute_100a,code=sm_100a",
-        ], &[]);
-        objects.push(obj);
-
-        let obj = out_dir.join("cula_wrapper_sm100.o");
-        nvcc_compile(nvcc, &wrapper_src, &obj, &include_args, &[
-            "-gencode=arch=compute_100a,code=sm_100a",
-        ], &["-DCULA_SM100_ENABLED"]);
-        objects.push(obj);
+        build_log!("compiling SM100 KDA kernels");
+        tasks.push((
+            cula_dir.join("csrc/kda/sm100/kda_fwd_sm100.cu"),
+            out_dir.join("kda_fwd_sm100.o"),
+            vec!["-gencode=arch=compute_100a,code=sm_100a"],
+            vec![],
+        ));
+        tasks.push((
+            wrapper_src.clone(),
+            out_dir.join("cula_wrapper_sm100.o"),
+            vec!["-gencode=arch=compute_100a,code=sm_100a"],
+            vec!["-DCULA_SM100_ENABLED"],
+        ));
     } else {
-        println!("cargo:warning=cuLA: SM100 not supported by nvcc, skipping Blackwell kernels");
+        build_log!("SM100 not supported by nvcc, skipping Blackwell kernels");
     }
+
+    // Compile all in parallel using threads
+    let include_args_shared: std::sync::Arc<Vec<String>> = std::sync::Arc::new(include_args);
+    let nvcc_shared: std::sync::Arc<PathBuf> = std::sync::Arc::new(nvcc.to_path_buf());
+
+    let handles: Vec<_> = tasks.into_iter().map(|(src, obj, arch_args, defines)| {
+        let inc = include_args_shared.clone();
+        let nvcc_p = nvcc_shared.clone();
+        let arch_owned: Vec<String> = arch_args.into_iter().map(String::from).collect();
+        let def_owned: Vec<String> = defines.into_iter().map(String::from).collect();
+        std::thread::spawn(move || {
+            let arch_refs: Vec<&str> = arch_owned.iter().map(|s| s.as_str()).collect();
+            let def_refs: Vec<&str> = def_owned.iter().map(|s| s.as_str()).collect();
+            nvcc_compile(&nvcc_p, &src, &obj, &inc, &arch_refs, &def_refs);
+            obj
+        })
+    }).collect();
+
+    let objects: Vec<PathBuf> = handles.into_iter()
+        .map(|h| h.join().expect("nvcc compilation thread panicked"))
+        .collect();
 
     objects
 }
@@ -162,6 +199,10 @@ fn nvcc_compile(
     nvcc: &Path, src: &Path, obj: &Path,
     include_args: &[String], arch_args: &[&str], defines: &[&str],
 ) {
+    let src_name = src.file_name().unwrap().to_str().unwrap();
+    let arch_str = arch_args.first().map(|a| *a).unwrap_or("unknown");
+    build_log!("[nvcc] {src_name} ({arch_str})");
+
     let mut cmd = Command::new(nvcc);
     cmd.args([
         "-std=c++20", "-O3",
@@ -182,6 +223,7 @@ fn nvcc_compile(
     if !status.success() {
         panic!("nvcc failed for {}", src.display());
     }
+    build_log!("[nvcc] {src_name} ✓");
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -206,33 +248,45 @@ fn compile_dsl_kernels(
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if stored == hash {
-                    println!("cargo:warning=cuLA DSL: using cached kernels");
+                    build_log!("[DSL] using cached kernels");
                     return true;
                 }
-                println!("cargo:warning=cuLA DSL: compile_kernels.py changed, recompiling...");
+                build_log!("[DSL] compile_kernels.py changed, recompiling...");
                 clear_obj_files(kernels_dir);
             }
         }
     }
 
-    println!("cargo:warning=cuLA DSL: attempting AOT compilation...");
+    // Check if a previous attempt already failed (don't retry every build)
+    let fail_marker = kernels_dir.join(".dsl_compile_failed");
+    if let Some(hash) = file_hash(&script) {
+        if fail_marker.exists() {
+            let stored = std::fs::read_to_string(&fail_marker).unwrap_or_default();
+            if stored.trim() == hash {
+                build_log!("[DSL] skipping (previously failed, script unchanged)");
+                return false;
+            }
+        }
+    }
+
+    build_log!("[DSL] attempting AOT compilation...");
 
     if !script.exists() {
-        println!("cargo:warning=cuLA DSL: no compile script, skipping DSL kernels");
+        build_log!("[DSL] no compile script, skipping DSL kernels");
         return false;
     }
 
     let python = match ensure_python_env(out_dir) {
         Ok(p) => p,
         Err(e) => {
-            println!("cargo:warning=cuLA DSL: Python env failed: {e}, skipping DSL kernels");
+            build_log!("[DSL] Python env failed: {e}, skipping DSL kernels");
             return false;
         }
     };
 
     // Detect GPU arch
     let arch = detect_gpu_arch().unwrap_or_else(|| "sm_90".to_string());
-    println!("cargo:warning=cuLA DSL: AOT compiling for {arch}...");
+    build_log!("[DSL] AOT compiling for {arch}...");
 
     let workers = env::var("PRELUDE_CULA_WORKERS").unwrap_or_else(|_| {
         let n = std::thread::available_parallelism()
@@ -241,25 +295,41 @@ fn compile_dsl_kernels(
         n.min(8).to_string()
     });
 
-    let status = Command::new(&python)
+    let output = Command::new(&python)
         .arg(&script)
         .arg("--output-dir").arg(kernels_dir)
         .args(["-j", &workers])
         .env("PYTHONPATH", cula_dir)
         .env("CUTE_DSL_ARCH", format!("{arch}a"))
-        .status();
+        .output();
 
-    match status {
-        Ok(s) if s.success() => {
-            println!("cargo:warning=cuLA DSL: compilation succeeded");
+    match output {
+        Ok(o) if o.status.success() => {
+            build_log!("[DSL] compilation succeeded");
             has_obj_files(kernels_dir)
         }
-        Ok(_) => {
-            println!("cargo:warning=cuLA DSL: compilation failed");
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            build_log!("[DSL] compilation failed (exit code: {:?})", o.status.code());
+            // Print last ~10 lines of stderr for actionable diagnostics
+            for line in stderr.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev() {
+                build_log!("[DSL] {line}");
+            }
+            if !stdout.is_empty() {
+                for line in stdout.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev() {
+                    build_log!("[DSL] [stdout] {line}");
+                }
+            }
+            // Write fail marker so we don't retry every build
+            if let Some(hash) = file_hash(&script) {
+                let _ = std::fs::create_dir_all(kernels_dir);
+                let _ = std::fs::write(&fail_marker, &hash);
+            }
             false
         }
         Err(e) => {
-            println!("cargo:warning=cuLA DSL: failed to run script: {e}");
+            build_log!("[DSL] failed to run script: {e}");
             false
         }
     }
@@ -314,7 +384,7 @@ fn compile_tvm_ffi_static(tvm_ffi_dir: &Path, manifest_dir: &Path, out_dir: &Pat
         })
         .collect();
 
-    println!("cargo:warning=cuLA: compiling TVM FFI ({} files)", cc_files.len());
+    build_log!("compiling TVM FFI ({} files)", cc_files.len());
 
     let mut build = cc::Build::new();
     build
@@ -355,7 +425,7 @@ fn compile_tvm_ffi_static(tvm_ffi_dir: &Path, manifest_dir: &Path, out_dir: &Pat
         println!("cargo:rustc-link-search=native={}", dir.display());
         println!("cargo:rustc-link-lib=static:+whole-archive=cuda_dialect_runtime_static");
     } else {
-        println!("cargo:warning=cuLA: cuda_dialect_runtime_static.a not found");
+        build_log!("cuda_dialect_runtime_static.a not found");
     }
 }
 
@@ -587,84 +657,124 @@ fn detect_gpu_arch() -> Option<String> {
 }
 
 fn ensure_python_env(out_dir: &Path) -> Result<String, String> {
-    // Check if system python has cutlass
-    for candidate in ["python3", "python"] {
-        if check_cutlass(candidate) {
-            return Ok(candidate.to_string());
-        }
-    }
-
-    // Create venv
     let venv_dir = out_dir.join("cula-venv");
     let venv_python = venv_dir.join("bin/python3");
 
-    if check_cutlass(venv_python.to_str().unwrap_or("")) {
+    // If venv already has cuLA installed, reuse it.
+    if check_cula_importable(venv_python.to_str().unwrap_or("")) {
         return Ok(venv_python.to_string_lossy().into_owned());
     }
 
-    println!("cargo:warning=cuLA: creating Python venv for DSL kernel compilation...");
+    // Find cuLA source (third_party/cuLA with pyproject.toml)
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap().parent().unwrap();
+    let cula_src = workspace_root.join("third_party/cuLA");
+    if !cula_src.join("pyproject.toml").exists() {
+        return Err(format!("cuLA source not found at {}", cula_src.display()));
+    }
 
-    let venv_created = Command::new("uv")
-        .args(["venv", venv_dir.to_str().unwrap(), "--python", "3.12"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    build_log!("creating Python venv and installing cuLA from {}...", cula_src.display());
 
-    if !venv_created {
-        let status = Command::new("python3")
+    // Create venv (prefer uv for speed, fallback to python3 -m venv)
+    let has_uv = Command::new("uv").arg("--version").output()
+        .map(|o| o.status.success()).unwrap_or(false);
+
+    if has_uv {
+        let s = Command::new("uv")
+            .args(["venv", venv_dir.to_str().unwrap(), "--python", "3.12"])
+            .status().map_err(|e| format!("uv venv: {e}"))?;
+        if !s.success() {
+            return Err("uv venv creation failed".into());
+        }
+    } else {
+        let s = Command::new("python3")
             .args(["-m", "venv", venv_dir.to_str().unwrap()])
-            .status()
-            .map_err(|e| format!("Failed to create venv: {e}"))?;
-        if !status.success() {
-            return Err("Failed to create Python venv".to_string());
+            .status().map_err(|e| format!("python3 -m venv: {e}"))?;
+        if !s.success() {
+            return Err("venv creation failed".into());
         }
     }
 
-    // Detect CUDA version for PyTorch wheel
+    // Step 1: Install torch first (cuLA's build imports torch at setup time).
+    let venv_python_str = venv_python.to_string_lossy().to_string();
     let torch_index = detect_torch_cuda_index();
 
-    println!("cargo:warning=cuLA: installing Python deps...");
-
-    let venv_python_str = venv_python.to_string_lossy().to_string();
-    let has_uv = Command::new("uv")
-        .arg("--version").output()
-        .map(|o| o.status.success()).unwrap_or(false);
-
-    let base_pkgs = &["nvidia-cutlass-dsl>=4.4.2", "torch"];
-
-    let status = if has_uv {
+    build_log!("installing torch...");
+    let torch_ok = if has_uv {
         let mut cmd = Command::new("uv");
-        cmd.args(["pip", "install", "--python", &venv_python_str]);
+        cmd.args(["pip", "install", "--python", &venv_python_str, "torch"]);
         if let Some(ref idx) = torch_index {
             cmd.args(["--extra-index-url", idx]);
         }
-        cmd.args(base_pkgs);
-        cmd.status().map_err(|e| format!("uv pip install failed: {e}"))?
+        cmd.status().map(|s| s.success()).unwrap_or(false)
     } else {
         let pip = venv_dir.join("bin/pip");
         let mut cmd = Command::new(&pip);
-        cmd.arg("install");
+        cmd.args(["install", "torch"]);
         if let Some(ref idx) = torch_index {
             cmd.args(["--extra-index-url", idx]);
         }
-        cmd.args(base_pkgs);
-        cmd.status().map_err(|e| format!("pip install failed: {e}"))?
+        cmd.status().map(|s| s.success()).unwrap_or(false)
+    };
+    if !torch_ok {
+        return Err("Failed to install torch".into());
+    }
+
+    // Step 2: Install flash-linear-attention (provides `fla` module, needed by KDA kernels).
+    // cuLA's pyproject.toml doesn't declare this dep (upstream oversight).
+    build_log!("installing flash-linear-attention...");
+    let fla_ok = if has_uv {
+        Command::new("uv").args(["pip", "install", "--python", &venv_python_str, "flash-linear-attention"])
+            .status().map(|s| s.success()).unwrap_or(false)
+    } else {
+        let pip = venv_dir.join("bin/pip");
+        Command::new(&pip).args(["install", "flash-linear-attention"])
+            .status().map(|s| s.success()).unwrap_or(false)
+    };
+    if !fla_ok {
+        build_log!("flash-linear-attention install failed (KDA kernels will be skipped)");
+    }
+
+    // Step 3: Install cuLA from source (--no-build-isolation since torch is already installed).
+    build_log!("installing cuLA from source...");
+    let output = if has_uv {
+        let mut cmd = Command::new("uv");
+        cmd.args(["pip", "install", "--python", &venv_python_str, "--no-build-isolation"]);
+        if let Some(ref idx) = torch_index {
+            cmd.args(["--extra-index-url", idx]);
+        }
+        cmd.arg(cula_src.to_str().unwrap());
+        cmd.output().map_err(|e| format!("uv pip install cuLA: {e}"))?
+    } else {
+        let pip = venv_dir.join("bin/pip");
+        let mut cmd = Command::new(&pip);
+        cmd.args(["install", "--no-build-isolation"]);
+        if let Some(ref idx) = torch_index {
+            cmd.args(["--extra-index-url", idx]);
+        }
+        cmd.arg(cula_src.to_str().unwrap());
+        cmd.output().map_err(|e| format!("pip install cuLA: {e}"))?
     };
 
-    if !status.success() {
-        return Err("Failed to install Python deps".to_string());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for line in stderr.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev() {
+            build_log!("[venv] {line}");
+        }
+        return Err(format!("pip install cuLA failed (exit {})", output.status));
     }
 
-    if !check_cutlass(venv_python.to_str().unwrap_or("")) {
-        return Err("cutlass not importable after install".to_string());
+    if !check_cula_importable(&venv_python_str) {
+        return Err("cuLA not importable after install".into());
     }
 
-    Ok(venv_python.to_string_lossy().into_owned())
+    Ok(venv_python_str)
 }
 
-fn check_cutlass(python: &str) -> bool {
+fn check_cula_importable(python: &str) -> bool {
+    if python.is_empty() { return false; }
     Command::new(python)
-        .args(["-c", "import cutlass"])
+        .args(["-c", "import cula; import cutlass"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)

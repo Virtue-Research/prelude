@@ -22,27 +22,21 @@ pub trait GemmOps: Send + Sync {
         quant: QuantScheme,
     ) -> Result<Tensor>;
 
-    /// MoE expert-parallel GEMM.
+    /// Grouped GEMM for MoE: per-expert weights applied to routed tokens.
     ///
-    /// Each token is dispatched to `topk` experts. The kernel reads tokens in
-    /// `sorted_token_ids` order, applies the per-expert weight slice from
-    /// `weights[expert_id]`, and optionally multiplies by `topk_weights`.
+    /// Pure GEMM — no MoE-specific weight application.
     ///
-    /// - `input`:            [num_tokens, K]
-    /// - `weights`:          [num_experts, N, K]
-    /// - `topk_weights`:     if Some, [num_tokens, topk] F32
-    /// - `sorted_token_ids`: [num_tokens * topk] U32
-    /// - `sorted_expert_ids`: [num_tokens * topk] U32
-    /// - `topk`:             number of experts per token
-    /// - `is_prefill`:       true for prefill (batch), false for decode (M=1)
-    fn moe_gemm(
+    /// - `input`:             [total_tokens, K]
+    /// - `weights`:           [num_experts, N, K]
+    /// - `sorted_token_ids`:  [total_tokens * topk] U32
+    /// - `sorted_expert_ids`: [total_tokens * topk] U32
+    /// - `num_tokens_per_expert`: [num_experts] U32
+    fn grouped_gemm(
         &self,
         input: &Tensor,
         weights: &Tensor,
-        topk_weights: &Option<Tensor>,
         sorted_token_ids: &Tensor,
         sorted_expert_ids: &Tensor,
-        topk: usize,
-        is_prefill: bool,
+        num_tokens_per_expert: &Tensor,
     ) -> Result<Tensor>;
 }

@@ -2080,9 +2080,6 @@ impl Tensor {
         self.is_variable
     }
 
-    pub(crate) fn op(&self) -> &Option<Op> {
-        &self.op
-    }
 
     /// Computes the max of all the elements in this tensor and returns a tensor holding this
     /// scalar with zero dimensions.
@@ -2486,15 +2483,6 @@ impl Tensor {
         Ok(from_storage(storage, shape.clone(), op, false))
     }
 
-    /// Create a variable based on the values currently stored in a tensor. The storage is always
-    /// copied.
-    pub(crate) fn make_var(&self) -> Result<Tensor> {
-        let shape = self.shape().clone();
-        let mut storage = unsafe { self.device().alloc_uninit(&shape, self.dtype())? };
-        self.storage()
-            .copy_strided_src(&mut storage, 0, self.layout())?;
-        Ok(from_storage(storage, shape, BackpropOp::none(), true))
-    }
 
     /// Reshape returns a tensor with the target shape provided that the number of elements of the
     /// original tensor is the same.
@@ -2724,10 +2712,6 @@ impl Tensor {
         m.forward(self)
     }
 
-    /// Run the `forward` method of `m` on `self`.
-    pub fn apply_t<M: crate::ModuleT>(&self, m: &M, train: bool) -> Result<Self> {
-        m.forward_t(self, train)
-    }
 
     pub(crate) fn storage(&self) -> std::sync::RwLockReadGuard<'_, Storage> {
         self.storage.read().unwrap()

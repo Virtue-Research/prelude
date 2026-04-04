@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::{
     ActivationOps, AttentionOps, CommOps, ConvOps, FusedOps, GemmOps, KvCacheOps, NormOps,
-    OpsSession,
+    OpsSession, TensorOps,
 };
 
 /// The Ops bundle — models receive this via dependency injection.
@@ -19,4 +19,5 @@ pub struct Ops {
     pub comm: Arc<dyn CommOps>,
     pub fused: Arc<dyn FusedOps>,
     pub session: Arc<dyn OpsSession>,
+    pub tensor: Arc<dyn TensorOps>,
 }

@@ -5,7 +5,7 @@
 //! in `crate::attn::*`, exposing them through the Ops trait interface.
 
 use std::sync::Arc;
-use prelude_core::tensor::{bail, DType, Result, Tensor};
+use prelude_core::tensor::{bail, DType, Device, Shape, Result, Tensor};
 use prelude_core::ops::traits::*;
 
 /// Return a static reference to the CUDA Ops bundle (created once on first call).
@@ -35,6 +35,7 @@ pub fn create_cuda_ops() -> Ops {
         comm: cuda.clone(),
         fused: cuda.clone(),
         session: Arc::new(CudaSession),
+        tensor: cuda,
     }
 }
 
@@ -45,17 +46,19 @@ fn i(t: &Tensor) -> &candle_core::Tensor { t.inner() }
 
 /// Wrap a candle_core::Tensor result into our Tensor.
 fn w(r: candle_core::Result<candle_core::Tensor>) -> Result<Tensor> {
-    r.map(Tensor::from_candle)
+    Ok(Tensor::from_candle(r?))
 }
 
 /// Wrap a candle_core::Tensor pair result into our Tensor pair.
 fn w2(r: candle_core::Result<(candle_core::Tensor, candle_core::Tensor)>) -> Result<(Tensor, Tensor)> {
-    r.map(|(a, b)| (Tensor::from_candle(a), Tensor::from_candle(b)))
+    let (a, b) = r?;
+    Ok((Tensor::from_candle(a), Tensor::from_candle(b)))
 }
 
 /// Wrap a 4-tuple result.
 fn w4(r: candle_core::Result<(candle_core::Tensor, candle_core::Tensor, candle_core::Tensor, candle_core::Tensor)>) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
-    r.map(|(a, b, c, d)| (Tensor::from_candle(a), Tensor::from_candle(b), Tensor::from_candle(c), Tensor::from_candle(d)))
+    let (a, b, c, d) = r?;
+    Ok((Tensor::from_candle(a), Tensor::from_candle(b), Tensor::from_candle(c), Tensor::from_candle(d)))
 }
 
 // ── GemmOps ─────────────────────────────────────────────────────────
@@ -75,16 +78,19 @@ impl GemmOps for CudaOps {
         bail!("quantized_matmul not yet implemented in CudaOps")
     }
 
-    fn moe_gemm(
+    fn grouped_gemm(
         &self,
         input: &Tensor, weights: &Tensor,
-        topk_weights: &Option<Tensor>,
         sorted_token_ids: &Tensor, sorted_expert_ids: &Tensor,
-        topk: usize, is_prefill: bool,
+        num_tokens_per_expert: &Tensor,
     ) -> Result<Tensor> {
-        let topk_inner = topk_weights.as_ref().map(|t| t.inner().clone());
+        // Derive topk from total assignments / num input tokens
+        let num_assignments = sorted_token_ids.elem_count();
+        let num_tokens = input.dims()[0];
+        let topk = if num_tokens > 0 { num_assignments / num_tokens } else { 1 };
+        let is_prefill = num_tokens > 1;
         w(crate::ops::moe::moe_gemm_wmma(
-            i(input), i(weights), &topk_inner,
+            i(input), i(weights), &None,
             i(sorted_token_ids), i(sorted_expert_ids),
             topk, is_prefill,
         ))
@@ -100,7 +106,7 @@ impl KvCacheOps for CudaOps {
         key_cache: &Tensor, value_cache: &Tensor,
         slot_mapping: &Tensor,
     ) -> Result<()> {
-        crate::ops::kv_cache::scatter_kv_cache_flash(i(key), i(value), i(key_cache), i(value_cache), i(slot_mapping))
+        Ok(crate::ops::kv_cache::scatter_kv_cache_flash(i(key), i(value), i(key_cache), i(value_cache), i(slot_mapping))?)
     }
 }
 
@@ -241,13 +247,13 @@ impl FusedOps for CudaOps {
             i(q), i(q_weight), i(cos), i(sin), i(position_ids), eps as f64,
         ) {
             Ok(t) => Tensor::from_candle(t),
-            Err(e) => return Some(Err(e)),
+            Err(e) => return Some(Err(e.into())),
         };
         let k_out = match crate::ops::rope::fused_qknorm_rope_varlen(
             i(k), i(k_weight), i(cos), i(sin), i(position_ids), eps as f64,
         ) {
             Ok(t) => Tensor::from_candle(t),
-            Err(e) => return Some(Err(e)),
+            Err(e) => return Some(Err(e.into())),
         };
         Some(Ok((q_out, k_out)))
     }
@@ -275,7 +281,7 @@ impl FusedOps for CudaOps {
             i(key_cache), i(value_cache), i(slot_mapping),
             num_kv_heads, head_dim, block_size,
             eps as f64,
-        ))
+        ).map_err(Into::into))
     }
 
     fn fused_moe_routing(
@@ -284,6 +290,21 @@ impl FusedOps for CudaOps {
         top_k: usize,
     ) -> Option<Result<(Tensor, Tensor, Tensor, Tensor)>> {
         Some(w4(crate::ops::moe::fused_moe_routing(i(gate_logits), top_k, true)))
+    }
+
+    fn fused_moe_gemm(
+        &self,
+        input: &Tensor, weights: &Tensor,
+        topk_weights: &Tensor,
+        sorted_token_ids: &Tensor, sorted_expert_ids: &Tensor,
+        topk: usize, is_prefill: bool,
+    ) -> Option<Result<Tensor>> {
+        let topk_inner = Some(topk_weights.inner().clone());
+        Some(w(crate::ops::moe::moe_gemm_wmma(
+            i(input), i(weights), &topk_inner,
+            i(sorted_token_ids), i(sorted_expert_ids),
+            topk, is_prefill,
+        )))
     }
 }
 
@@ -426,4 +447,69 @@ fn cu_seqlens_to_lens(cu_seqlens: &Tensor) -> Result<Tensor> {
     let v: Vec<u32> = cu_seqlens.to_vec1()?;
     let lens: Vec<u32> = v.windows(2).map(|w| w[1] - w[0]).collect();
     Tensor::from_vec(lens, (v.len() - 1,), cu_seqlens.device())
+}
+
+// ── TensorOps (delegates to candle — will be replaced with direct CUDA kernels) ──
+// IMPORTANT: all methods use i() to get the candle_core::Tensor directly,
+// because calling our Tensor methods (e.g. x.exp()) would route back through
+// ops().tensor and cause infinite recursion.
+
+impl prelude_core::ops::traits::TensorOps for CudaOps {
+    fn unary(&self, x: &Tensor, op: prelude_core::ops::traits::UnaryOp) -> Result<Tensor> {
+        use prelude_core::ops::traits::UnaryOp::*;
+        let xi = i(x);
+        let r = match op {
+            Exp => xi.exp(), Log => xi.log(), Sin => xi.sin(), Cos => xi.cos(),
+            Abs => xi.abs(), Neg => xi.neg(), Sqr => xi.sqr(), Sqrt => xi.sqrt(),
+            Recip => xi.recip(), Tanh => xi.tanh(), Relu => xi.relu(),
+            Ceil | Floor | Round | Sign => Ok(xi.clone()), // TODO
+        };
+        w(r)
+    }
+    fn binary(&self, a: &Tensor, b: &Tensor, op: prelude_core::ops::traits::BinaryOp) -> Result<Tensor> {
+        use prelude_core::ops::traits::BinaryOp::*;
+        let (ai, bi) = (i(a), i(b));
+        let r = match op {
+            Add => ai.broadcast_add(bi), Sub => ai.broadcast_sub(bi),
+            Mul => ai.broadcast_mul(bi), Div => ai.broadcast_div(bi),
+            Min => ai.broadcast_minimum(bi), Max => ai.broadcast_maximum(bi),
+        };
+        w(r)
+    }
+    fn compare(&self, a: &Tensor, b: &Tensor, op: prelude_core::ops::traits::CompareOp) -> Result<Tensor> {
+        use prelude_core::ops::traits::CompareOp::*;
+        let (ai, bi) = (i(a), i(b));
+        let r = match op {
+            Eq => ai.eq(bi), Ne => ai.ne(bi), Lt => ai.lt(bi),
+            Gt => ai.gt(bi), Ge => ai.ge(bi), Le => ai.le(bi),
+        };
+        w(r)
+    }
+    fn reduce(&self, x: &Tensor, dim: usize, keepdim: bool, op: prelude_core::ops::traits::ReduceOp) -> Result<Tensor> {
+        use prelude_core::ops::traits::ReduceOp::*;
+        let xi = i(x);
+        let r = if keepdim {
+            match op { Sum => xi.sum_keepdim(dim), Max => xi.max_keepdim(dim), Min => xi.min_keepdim(dim), ArgMax => xi.argmax_keepdim(dim), ArgMin => xi.argmin_keepdim(dim) }
+        } else {
+            match op { Sum => xi.sum(dim), Max => xi.max(dim), Min => xi.min(dim), ArgMax => xi.argmax(dim), ArgMin => xi.argmin(dim) }
+        };
+        w(r)
+    }
+    fn cast(&self, x: &Tensor, dtype: DType) -> Result<Tensor> { w(i(x).to_dtype(dtype.into())) }
+    fn contiguous(&self, x: &Tensor) -> Result<Tensor> { w(i(x).contiguous()) }
+    fn to_device(&self, x: &Tensor, device: &Device) -> Result<Tensor> { w(i(x).to_device(device)) }
+    fn index_select(&self, x: &Tensor, indices: &Tensor, dim: usize) -> Result<Tensor> { w(i(x).index_select(i(indices), dim)) }
+    fn gather(&self, x: &Tensor, indices: &Tensor, dim: usize) -> Result<Tensor> { w(i(x).gather(i(indices), dim)) }
+    fn scatter_add(&self, x: &Tensor, indices: &Tensor, src: &Tensor, dim: usize) -> Result<Tensor> { w(i(x).scatter_add(i(indices), i(src), dim)) }
+    fn where_cond(&self, cond: &Tensor, on_true: &Tensor, on_false: &Tensor) -> Result<Tensor> { w(i(cond).where_cond(i(on_true), i(on_false))) }
+    fn affine(&self, x: &Tensor, mul: f64, add: f64) -> Result<Tensor> { w(i(x).affine(mul, add)) }
+    fn zeros(&self, shape: &Shape, dtype: DType, device: &Device) -> Result<Tensor> {
+        let cs: candle_core::Shape = shape.clone().into();
+        w(candle_core::Tensor::zeros(cs, dtype.into(), device))
+    }
+    fn sort_last_dim(&self, x: &Tensor, asc: bool) -> Result<(Tensor, Tensor)> { w2(i(x).sort_last_dim(asc)) }
+    fn cat(&self, tensors: &[&Tensor], dim: usize) -> Result<Tensor> {
+        let inner: Vec<&candle_core::Tensor> = tensors.iter().map(|t| i(t)).collect();
+        w(candle_core::Tensor::cat(&inner, dim))
+    }
 }

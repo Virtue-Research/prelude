@@ -6,6 +6,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+include!("../../../build_log.rs");
+
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -17,6 +19,7 @@ fn main() {
     println!("cargo:rerun-if-changed=csrc/dequantize_ffi.c");
     println!("cargo:rerun-if-changed=csrc/dequantize_gpu.cu");
     println!("cargo:rerun-if-changed=csrc/iq_tables.cuh");
+    track_submodule("llama.cpp");
 
     // 1. Ensure llama.cpp headers (third_party/llama.cpp submodule)
     let workspace_root = PathBuf::from(&manifest_dir).join("../../..");
@@ -44,9 +47,7 @@ fn main() {
         "-gencode=arch=compute_{compute_cap},code=sm_{compute_cap}"
     );
 
-    println!(
-        "cargo:warning=prelude-quant-gemm: compiling tiled MMQ for sm_{compute_cap}"
-    );
+    build_log!("compiling tiled MMQ for sm_{compute_cap}");
 
     // 4. Compile mmq_ffi.cu → mmq_ffi.o
     //    Include paths match upstream llama.cpp CMake:

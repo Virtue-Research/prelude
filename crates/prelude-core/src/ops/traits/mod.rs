@@ -13,6 +13,7 @@ mod gemm;
 mod kv_cache;
 mod norm;
 mod session;
+mod tensor_ops;
 
 pub use activation::ActivationOps;
 pub use attention::{AttentionOps, MaskType, VarlenParams, PagedParams};
@@ -24,3 +25,4 @@ pub use gemm::{GemmOps, QuantScheme};
 pub use kv_cache::{CacheSlotSpec, KvCacheOps};
 pub use norm::NormOps;
 pub use session::OpsSession;
+pub use tensor_ops::{TensorOps, UnaryOp, BinaryOp, CompareOp, ReduceOp};

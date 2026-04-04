@@ -13,14 +13,15 @@
 
 
 use crate::tensor::{DType, Device, Module, Result, Tensor, D};
-use crate::nn_ops::{CandleLinear, Embedding};
+use crate::modules::embedding::Embedding;
+use crate::modules::linear::NaiveLinear;
 use crate::loading::var_builder::VarBuilder;
 
 use crate::modules::varlen_attention;
 
 use crate::modules::{
     fast_add, fast_rms_norm, last_token_select, BatchAttnContext,
-    LayerAttnContext, Linear, RmsNorm, TransformerBlock,
+    BatchState, LayerAttnContext, Linear, RmsNorm, TransformerBlock,
 };
 use crate::models::model_config;
 
@@ -209,7 +210,7 @@ impl RmsNormGated {
         let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
         let normed = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
         let normed = normed.to_dtype(x.dtype())?.broadcast_mul(&self.weight)?;
-        let gate = crate::nn_ops::Activation::Silu.forward(&z)?;
+        let gate = crate::ops::current_ops().act.silu(&z)?;
         let result = normed.broadcast_mul(&gate)?;
 
         // Reshape back to [..., num_heads * head_dim]
@@ -296,10 +297,12 @@ impl Qwen3NextGatedDeltaNet {
     fn forward(&mut self, x: &Tensor, _offset: usize) -> Result<Tensor> {
         let (b, seq_len, _) = x.dims3()?;
         assert_eq!(b, 1, "Qwen3-Next DeltaNet only supports batch_size=1");
+        let bs = BatchState::no_lora();
+        let ops = crate::ops::current_ops();
 
         // Project
-        let full_proj = x.apply(&self.in_proj_qkvz)?; // [1, L, proj_dim]
-        let ba = x.apply(&self.in_proj_ba)?; // [1, L, num_v_heads*2]
+        let full_proj = self.in_proj_qkvz.forward(x, &bs, ops)?; // [1, L, proj_dim]
+        let ba = self.in_proj_ba.forward(x, &bs, ops)?; // [1, L, num_v_heads*2]
 
         // Fix interleaved QKVZ split: layout is grouped by key heads.
         // Each key-head group contains: [q(hk) | k(hk) | v(ratio*hv) | z(ratio*hv)]
@@ -344,7 +347,7 @@ impl Qwen3NextGatedDeltaNet {
         };
 
         // Apply SiLU activation after conv
-        let qkv_conv = crate::nn_ops::Activation::Silu.forward(&qkv_conv)?;
+        let qkv_conv = crate::ops::current_ops().act.silu(&qkv_conv)?;
 
         // Split into q, k, v
         let q = qkv_conv.narrow(D::Minus1, 0, self.key_dim)?;
@@ -392,7 +395,7 @@ impl Qwen3NextGatedDeltaNet {
 
         // Gated RMSNorm + output projection
         let normed = self.norm.forward(&output, &z)?;
-        normed.apply(&self.out_proj)
+        self.out_proj.forward(&normed, &bs, ops)
     }
 
     /// Single-step delta rule update (batched across all v_heads).
@@ -443,7 +446,7 @@ impl Qwen3NextGatedDeltaNet {
         let a_plus_dt = (a + &self.dt_bias)?;
         let g = (self.a_log.exp()?.neg()? * softplus(&a_plus_dt)?)?;
         // beta = sigmoid(b)
-        let beta = crate::nn_ops::ops::sigmoid(b)?;
+        let beta = crate::ops::current_ops().act.sigmoid(b)?;
 
         // Initialize recurrent state if needed
         if self.recurrent_state.is_none() {
@@ -652,10 +655,11 @@ impl Qwen3NextAttention {
     /// Varlen forward for prefill (GPU flash-attn or CPU fallback via ops dispatch).
     fn forward(&mut self, x: &Tensor, ctx: &LayerAttnContext) -> Result<Tensor> {
         let total_tokens = x.dim(0)?;
+        let bs = BatchState::no_lora();
 
-        let q_raw = x.apply(&self.q_proj)?;
-        let k = x.apply(&self.k_proj)?;
-        let v = x.apply(&self.v_proj)?;
+        let q_raw = self.q_proj.forward(x, &bs, ctx.ops)?;
+        let k = self.k_proj.forward(x, &bs, ctx.ops)?;
+        let v = self.v_proj.forward(x, &bs, ctx.ops)?;
 
         let q_and_gate = q_raw.reshape((total_tokens, self.num_heads, self.head_dim * 2))?;
         let q = q_and_gate.narrow(D::Minus1, 0, self.head_dim)?;
@@ -704,8 +708,8 @@ impl Qwen3NextAttention {
             ctx.paged_kv,
         )?;
         let attn_output = attn_output.reshape((total_tokens, self.num_heads * self.head_dim))?;
-        let gate = crate::nn_ops::ops::sigmoid(&gate)?;
-        (attn_output * gate)?.apply(&self.o_proj)
+        let gate = ctx.ops.act.sigmoid(&gate)?;
+        self.o_proj.forward(&(attn_output * gate)?, &bs, ctx.ops)
     }
 }
 
@@ -728,19 +732,20 @@ impl ExpertMlp {
     }
 
     fn forward(&self, ops: &crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
-        crate::modules::fast_silu_mul(ops, &gate, &up)?.apply(&self.down_proj)
+        let bs = BatchState::no_lora();
+        let gate = self.gate_proj.forward(x, &bs, ops)?;
+        let up = self.up_proj.forward(x, &bs, ops)?;
+        self.down_proj.forward(&crate::modules::fast_silu_mul(ops, &gate, &up)?, &bs, ops)
     }
 }
 
 // ── Sparse MoE Block with Shared Expert ─────────────────────────────────
 
 struct Qwen3NextSparseMoeBlock {
-    gate: CandleLinear,
+    gate: NaiveLinear,
     experts: Vec<ExpertMlp>,
     shared_expert: ExpertMlp,
-    shared_expert_gate: CandleLinear,
+    shared_expert_gate: NaiveLinear,
     // Stacked weights for fused MoE GEMM (GPU only)
     gate_w: Option<Tensor>,
     up_w: Option<Tensor>,
@@ -755,7 +760,7 @@ impl Qwen3NextSparseMoeBlock {
         let gate = {
             let gvb = vb.pp("gate");
             let w = gvb.get((cfg.num_experts, cfg.hidden_size), "weight")?;
-            CandleLinear::new(w, None)
+            NaiveLinear::new(w, None)
         };
 
         let mut experts = Vec::with_capacity(cfg.num_experts);
@@ -776,7 +781,7 @@ impl Qwen3NextSparseMoeBlock {
         let shared_expert_gate = {
             let gvb = vb.pp("shared_expert_gate");
             let w = gvb.get((1, cfg.hidden_size), "weight")?;
-            CandleLinear::new(w, None)
+            NaiveLinear::new(w, None)
         };
 
         // Stack expert weights for fused GEMM (GPU only)
@@ -820,12 +825,13 @@ impl Qwen3NextSparseMoeBlock {
         // Shared expert (always active)
         let shared_out = self.shared_expert.forward(ops, &xs_2d)?;
         let shared_gate_logit = xs_2d.apply(&self.shared_expert_gate)?;
-        let shared_gate = crate::nn_ops::ops::sigmoid(&shared_gate_logit)?;
+        let shared_gate = ops.act.sigmoid(&shared_gate_logit)?;
         let shared_contribution = shared_out.broadcast_mul(&shared_gate)?;
 
         // Router: topk expert selection
         let router_logits = xs_2d.apply(&self.gate)?;
-        let routing_weights = crate::nn_ops::ops::softmax_last_dim(&router_logits)?;
+        let last_dim = router_logits.rank() - 1;
+        let routing_weights = ops.act.softmax(&router_logits, last_dim)?;
 
         let experts_per_tok = routing_weights
             .arg_sort_last_dim(false)?
@@ -876,24 +882,37 @@ impl Qwen3NextSparseMoeBlock {
             sort_expert_assignments(experts_per_tok, xs.device(), self.num_experts)?;
 
         let is_prefill = (b_size * seq_len) > 1;
+        let num_tokens_per_expert = count_tokens_per_expert(&sorted_expert_ids, self.num_experts, xs.device())?;
 
-        let gate = ops.gemm.moe_gemm(
-            xs, gate_w, &None,
-            &sorted_token_ids, &sorted_expert_ids,
-            self.num_experts_per_tok, is_prefill,
+        let gate = ops.gemm.grouped_gemm(
+            xs, gate_w,
+            &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
         )?;
-        let up = ops.gemm.moe_gemm(
-            xs, up_w, &None,
-            &sorted_token_ids, &sorted_expert_ids,
-            self.num_experts_per_tok, is_prefill,
+        let up = ops.gemm.grouped_gemm(
+            xs, up_w,
+            &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
         )?;
         let down_input = crate::modules::fast_silu_mul(ops, &gate, &up)?;
-        let ys = ops.gemm.moe_gemm(
-            &down_input, down_w, &Some(topk_weights.clone()),
+
+        // Last step: GEMM + topk weight application (fused when available)
+        let ys = match ops.fused.fused_moe_gemm(
+            &down_input, down_w, topk_weights,
             &sorted_token_ids, &sorted_expert_ids,
-            self.num_experts_per_tok,
-            is_prefill,
-        )?;
+            self.num_experts_per_tok, is_prefill,
+        ) {
+            Some(r) => r?,
+            None => {
+                // Fallback: grouped_gemm + manual weight apply
+                let raw = ops.gemm.grouped_gemm(
+                    &down_input, down_w,
+                    &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
+                )?;
+                let num_tokens = b_size * seq_len;
+                let raw = raw.reshape((num_tokens, self.num_experts_per_tok, hidden_dim))?;
+                let w = topk_weights.unsqueeze(D::Minus1)?;
+                return (raw * w)?.sum(D::Minus2);
+            }
+        };
 
         let num_tokens = b_size * seq_len;
         ys.reshape((num_tokens, self.num_experts_per_tok, hidden_dim))?
@@ -943,6 +962,18 @@ impl Qwen3NextSparseMoeBlock {
         }
         Ok(ys)
     }
+}
+
+/// Count how many token-slots are assigned to each expert.
+fn count_tokens_per_expert(sorted_expert_ids: &Tensor, num_experts: usize, device: &Device) -> Result<Tensor> {
+    let ids: Vec<u32> = sorted_expert_ids.to_vec1()?;
+    let mut counts = vec![0u32; num_experts];
+    for &id in &ids {
+        if (id as usize) < num_experts {
+            counts[id as usize] += 1;
+        }
+    }
+    Tensor::from_vec(counts, (num_experts,), device)
 }
 
 fn sort_expert_assignments(
@@ -1244,9 +1275,10 @@ impl Qwen3NextForCausalLM {
 
     pub fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> Result<Tensor> {
         let hidden = self.model.forward(packed_input, ctx)?;
-        last_token_select(&hidden, ctx.seq_lens)?
-            .unsqueeze(1)?
-            .apply(&self.lm_head)
+        self.lm_head.forward(
+            &last_token_select(&hidden, ctx.seq_lens)?.unsqueeze(1)?,
+            &BatchState::no_lora(), ctx.ops,
+        )
     }
 }
 
@@ -1260,7 +1292,7 @@ impl crate::models::LogitsSplitModel for Qwen3NextForCausalLM {
     }
 
     fn compute_logits(&self, hidden: &Tensor) -> crate::tensor::Result<Tensor> {
-        hidden.apply(&self.lm_head)
+        self.lm_head.forward(hidden, &BatchState::no_lora(), crate::ops::select_ops(hidden.device()))
     }
 }
 

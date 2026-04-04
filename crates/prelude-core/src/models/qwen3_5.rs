@@ -14,14 +14,15 @@
 
 
 use crate::tensor::{DType, Device, Module, Result, Tensor, D};
-use crate::nn_ops::{CandleLinear, Embedding};
+use crate::modules::embedding::Embedding;
+use crate::modules::linear::NaiveLinear;
 use crate::loading::var_builder::VarBuilder;
 
 use crate::modules::varlen_attention;
 
 use crate::modules::{
     fast_add, fast_rms_norm, last_token_select, BatchAttnContext,
-    LayerAttnContext, Linear, RmsNorm, TransformerBlock,
+    BatchState, LayerAttnContext, Linear, RmsNorm, TransformerBlock,
 };
 use crate::models::resolve_or_warn;
 
@@ -330,7 +331,7 @@ impl RmsNormGated {
         let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
         let normed = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
         let normed = normed.to_dtype(x.dtype())?.broadcast_mul(&self.weight)?;
-        let gate = crate::nn_ops::Activation::Silu.forward(&z)?;
+        let gate = crate::ops::current_ops().act.silu(&z)?;
         let result = normed.broadcast_mul(&gate)?;
 
         // Reshape back to [..., num_heads * head_dim]
@@ -449,12 +450,14 @@ impl Qwen3_5GatedDeltaNet {
     fn forward(&mut self, x: &Tensor, _offset: usize) -> Result<Tensor> {
         let (b, seq_len, _) = x.dims3()?;
         assert_eq!(b, 1, "Qwen3.5 DeltaNet only supports batch_size=1");
+        let bst = BatchState::no_lora();
+        let ops = crate::ops::current_ops();
 
         // Project with split projections
-        let qkv = x.apply(&self.in_proj_qkv)?; // [1, L, key_dim*2 + value_dim]
-        let z = x.apply(&self.in_proj_z)?; // [1, L, value_dim]
-        let b_param = x.apply(&self.in_proj_b)?; // [1, L, num_v_heads]
-        let a_param = x.apply(&self.in_proj_a)?; // [1, L, num_v_heads]
+        let qkv = self.in_proj_qkv.forward(x, &bst, ops)?; // [1, L, key_dim*2 + value_dim]
+        let z = self.in_proj_z.forward(x, &bst, ops)?; // [1, L, value_dim]
+        let b_param = self.in_proj_b.forward(x, &bst, ops)?; // [1, L, num_v_heads]
+        let a_param = self.in_proj_a.forward(x, &bst, ops)?; // [1, L, num_v_heads]
 
         // Split QKV: simple concat layout [Q(key_dim) | K(key_dim) | V(value_dim)]
         let q_cat = qkv.narrow(D::Minus1, 0, self.key_dim)?;
@@ -474,7 +477,7 @@ impl Qwen3_5GatedDeltaNet {
         };
 
         // Apply SiLU activation after conv
-        let qkv_conv = crate::nn_ops::Activation::Silu.forward(&qkv_conv)?;
+        let qkv_conv = crate::ops::current_ops().act.silu(&qkv_conv)?;
 
         // Split into q, k, v
         let q = qkv_conv.narrow(D::Minus1, 0, self.key_dim)?;
@@ -511,7 +514,7 @@ impl Qwen3_5GatedDeltaNet {
 
         // Gated RMSNorm + output projection
         let normed = self.norm.forward(&output, &z)?;
-        normed.apply(&self.out_proj)
+        self.out_proj.forward(&normed, &bst, ops)
     }
 
     /// Single-step delta rule update (batched across all v_heads).
@@ -548,7 +551,7 @@ impl Qwen3_5GatedDeltaNet {
         let g = (neg_a_exp * softplus_val)?; // [num_v_heads]
 
         // beta = sigmoid(b) per head
-        let beta = crate::nn_ops::ops::sigmoid(&b_f32)?; // [num_v_heads]
+        let beta = crate::ops::current_ops().act.sigmoid(&b_f32)?; // [num_v_heads]
 
         // decay = exp(g)
         let decay = g.exp()?; // [num_v_heads]
@@ -792,11 +795,12 @@ impl Qwen3_5Attention {
     /// Flash-attn-v3 varlen forward for GPU prefill.
     fn forward(&mut self, x: &Tensor, ctx: &LayerAttnContext) -> Result<Tensor> {
         let total_tokens = x.dim(0)?;
+        let bs = BatchState::no_lora();
 
         // Project
-        let q_raw = x.apply(&self.q_proj)?;
-        let k = x.apply(&self.k_proj)?;
-        let v = x.apply(&self.v_proj)?;
+        let q_raw = self.q_proj.forward(x, &bs, ctx.ops)?;
+        let k = self.k_proj.forward(x, &bs, ctx.ops)?;
+        let v = self.v_proj.forward(x, &bs, ctx.ops)?;
 
         // Split Q and gate
         let (q, gate) = if self.attn_output_gate {
@@ -855,22 +859,23 @@ impl Qwen3_5Attention {
         )?;
         let attn_output = attn_output.reshape((total_tokens, self.num_heads * self.head_dim))?;
         let gated = if let Some(gate) = gate {
-            (attn_output * crate::nn_ops::ops::sigmoid(&gate)?)?
+            (attn_output * ctx.ops.act.sigmoid(&gate)?)?
         } else {
             attn_output
         };
-        gated.apply(&self.o_proj)
+        self.o_proj.forward(&gated, &bs, ctx.ops)
     }
 
     /// Cached forward for CPU decode: handles both prefill (L>1) and decode (L=1).
     /// KV cache accumulates across calls; call `clear_cache()` between requests.
     fn forward_with_cache(&mut self, ops: &crate::ops::Ops, x: &Tensor, position_offset: usize) -> Result<Tensor> {
         let seq_len = x.dim(0)?;
+        let bs = BatchState::no_lora();
 
         // 1. Project Q/K/V (separate projections, same as varlen forward)
-        let q_raw = x.apply(&self.q_proj)?;
-        let k = x.apply(&self.k_proj)?;
-        let v = x.apply(&self.v_proj)?;
+        let q_raw = self.q_proj.forward(x, &bs, ops)?;
+        let k = self.k_proj.forward(x, &bs, ops)?;
+        let v = self.v_proj.forward(x, &bs, ops)?;
 
         // Split Q and gate
         let (q, gate) = if self.attn_output_gate {
@@ -959,7 +964,8 @@ impl Qwen3_5Attention {
             attn_weights.to_dtype(DType::F32)?
         };
 
-        let attn_weights = crate::nn_ops::ops::softmax_last_dim(&attn_weights)?;
+        let last_dim = attn_weights.rank() - 1;
+        let attn_weights = ops.act.softmax(&attn_weights, last_dim)?;
         let attn_weights = attn_weights.to_dtype(v_t.dtype())?;
         let attn_out = attn_weights.matmul(&v_t)?; // [H, L, D]
         let attn_out = attn_out
@@ -968,11 +974,11 @@ impl Qwen3_5Attention {
 
         // 7. Gate + O projection
         let gated = if let Some(gate) = gate {
-            (attn_out * crate::nn_ops::ops::sigmoid(&gate)?)?
+            (attn_out * ops.act.sigmoid(&gate)?)?
         } else {
             attn_out
         };
-        gated.apply(&self.o_proj)
+        self.o_proj.forward(&gated, &bs, ops)
     }
 }
 
@@ -994,22 +1000,23 @@ impl Qwen3_5Mlp {
     }
 
     fn forward(&self, ops: &crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
-        crate::modules::fast_silu_mul(ops, &gate, &up)?.apply(&self.down_proj)
+        let bs = BatchState::no_lora();
+        let gate = self.gate_proj.forward(x, &bs, ops)?;
+        let up = self.up_proj.forward(x, &bs, ops)?;
+        self.down_proj.forward(&crate::modules::fast_silu_mul(ops, &gate, &up)?, &bs, ops)
     }
 }
 
 // ── Sparse MoE Block ────────────────────────────────────────────────────
 
 struct Qwen3_5SparseMoeBlock {
-    gate: CandleLinear, // [num_experts, hidden_size]
+    gate: NaiveLinear, // [num_experts, hidden_size]
     // Fused expert weights: gate_up [E, 2*inter, hidden], down [E, hidden, inter]
     experts_gate_up: Tensor,
     experts_down: Tensor,
     moe_intermediate_size: usize,
     shared_expert: Option<Qwen3_5Mlp>,
-    shared_expert_gate: Option<CandleLinear>, // [1, hidden_size]
+    shared_expert_gate: Option<NaiveLinear>, // [1, hidden_size]
     num_experts_per_tok: usize,
     norm_topk_prob: bool,
 }
@@ -1023,7 +1030,7 @@ impl Qwen3_5SparseMoeBlock {
         let gate = {
             let gvb = vb.pp("gate");
             let w = gvb.get((num_experts, cfg.hidden_size), "weight")?;
-            CandleLinear::new(w, None)
+            NaiveLinear::new(w, None)
         };
 
         // Load fused expert weights: [num_experts, 2*inter, hidden] and [num_experts, hidden, inter]
@@ -1055,7 +1062,7 @@ impl Qwen3_5SparseMoeBlock {
             Some({
                 let gvb = vb.pp("shared_expert_gate");
                 let w = gvb.get((1, cfg.hidden_size), "weight")?;
-                CandleLinear::new(w, None)
+                NaiveLinear::new(w, None)
             })
         } else {
             None
@@ -1096,7 +1103,7 @@ impl Qwen3_5SparseMoeBlock {
         let gate_up = x.matmul(&gate_up_w.t()?)?;
         let gate = gate_up.narrow(D::Minus1, 0, inter)?;
         let up = gate_up.narrow(D::Minus1, inter, inter)?;
-        let act = crate::nn_ops::Activation::Silu.forward(&gate)?;
+        let act = crate::ops::current_ops().act.silu(&gate)?;
         let hidden = (act * up)?;
         hidden.matmul(&down_w.t()?)
     }
@@ -1109,7 +1116,7 @@ impl Qwen3_5SparseMoeBlock {
         let gate = gate_up.narrow(gate_up.dims().len() - 1, 0, inter)?;
         let up = gate_up.narrow(gate_up.dims().len() - 1, inter, inter)?;
         // SiLU(gate) * up
-        let silu_gate = crate::nn_ops::Activation::Silu.forward(&gate)?;
+        let silu_gate = crate::ops::current_ops().act.silu(&gate)?;
         let hidden = (&silu_gate * &up)?;
         // down GEMM: hidden @ down_w^T
         hidden.matmul(&down_w.t()?)
@@ -1120,7 +1127,8 @@ impl Qwen3_5SparseMoeBlock {
 
         // Router: softmax → topk → gather weights
         let router_logits = xs.apply(&self.gate)?;
-        let routing_weights = crate::nn_ops::ops::softmax_last_dim(&router_logits)?;
+        let last_dim = router_logits.rank() - 1;
+        let routing_weights = ops.act.softmax(&router_logits, last_dim)?;
 
         let experts_per_tok = routing_weights
             .arg_sort_last_dim(false)?
@@ -1160,7 +1168,7 @@ impl Qwen3_5SparseMoeBlock {
         if let Some(ref shared) = self.shared_expert {
             let shared_out = shared.forward(ops, xs)?;
             let shared_out = if let Some(ref gate) = self.shared_expert_gate {
-                let gate_val = crate::nn_ops::ops::sigmoid(&xs.apply(gate)?)?; // [n, 1]
+                let gate_val = ops.act.sigmoid(&xs.apply(gate)?)?; // [n, 1]
                 shared_out.broadcast_mul(&gate_val)?
             } else {
                 shared_out
@@ -1526,9 +1534,10 @@ impl Qwen3_5ForCausalLM {
 
     pub fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> Result<Tensor> {
         let hidden = self.model.forward(packed_input, ctx)?;
-        last_token_select(&hidden, ctx.seq_lens)?
-            .unsqueeze(1)?
-            .apply(&self.lm_head)
+        self.lm_head.forward(
+            &last_token_select(&hidden, ctx.seq_lens)?.unsqueeze(1)?,
+            &BatchState::no_lora(), ctx.ops,
+        )
     }
 
     /// Cached forward: returns logits `[L, vocab_size]` for all input tokens.
@@ -1538,7 +1547,7 @@ impl Qwen3_5ForCausalLM {
         position_offset: usize,
     ) -> Result<Tensor> {
         let hidden = self.model.forward_with_cache(input_ids, position_offset)?;
-        hidden.apply(&self.lm_head)
+        self.lm_head.forward(&hidden, &BatchState::no_lora(), crate::ops::select_ops(hidden.device()))
     }
 }
 
@@ -1552,7 +1561,7 @@ impl crate::models::LogitsSplitModel for Qwen3_5ForCausalLM {
     }
 
     fn compute_logits(&self, hidden: &Tensor) -> crate::tensor::Result<Tensor> {
-        hidden.apply(&self.lm_head)
+        self.lm_head.forward(hidden, &BatchState::no_lora(), crate::ops::select_ops(hidden.device()))
     }
 }
 
@@ -1756,7 +1765,7 @@ pub mod gguf {
     
     use crate::constants::GGUF_INTERMEDIATE_SIZE_MULTIPLIER;
     use crate::modules::{Linear, RmsNorm, TransformerBlock};
-    use crate::nn_ops::Embedding;
+    use crate::modules::embedding::Embedding;
     
     // ── Config ──────────────────────────────────────────────────────────────
     
@@ -1829,7 +1838,7 @@ pub mod gguf {
             device: &Device,
         ) -> Result<Tensor> {
             let qtensor = ct.tensor(reader, name, device)?;
-            qtensor.dequantize(device).map(Tensor::from_candle)
+            Ok(Tensor::from_candle(qtensor.dequantize(device)?))
         }
     
         pub fn from_gguf<R: Read + Seek>(
@@ -2166,10 +2175,9 @@ pub mod gguf {
         let md = &ct.metadata;
     
         let get_u32 = |key: &str| -> Result<usize> {
-            md.get(key)
-                .ok_or_else(|| crate::tensor::Error::Msg(format!("missing GGUF metadata: {key}")))?
-                .to_u32()
-                .map(|v| v as usize)
+            let val = md.get(key)
+                .ok_or_else(|| crate::tensor::Error::Msg(format!("missing GGUF metadata: {key}")))?;
+            Ok(val.to_u32().map(|v| v as usize)?)
         };
     
         let get_u32_or = |key: &str, default: usize| -> usize {
@@ -2185,10 +2193,9 @@ pub mod gguf {
         };
     
         let get_f32 = |key: &str| -> Result<f64> {
-            md.get(key)
-                .ok_or_else(|| crate::tensor::Error::Msg(format!("missing GGUF metadata: {key}")))?
-                .to_f32()
-                .map(|v| v as f64)
+            let val = md.get(key)
+                .ok_or_else(|| crate::tensor::Error::Msg(format!("missing GGUF metadata: {key}")))?;
+            Ok(val.to_f32().map(|v| v as f64)?)
         };
     
         let get_f32_or = |key: &str, default: f64| -> f64 {

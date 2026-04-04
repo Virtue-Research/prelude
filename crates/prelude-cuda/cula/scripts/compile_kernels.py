@@ -158,6 +158,7 @@ def compile_chunk_delta_h(spec: ChunkDeltaHSpec, arch: int, output_dir: Path):
             spec.K,
             spec.V,
             spec.chunk_size,
+            use_fast_math=True,
         )
 
         compiled_fn.export_to_c(
@@ -207,6 +208,7 @@ def compile_fwd_o(spec: FwdOSpec, arch: int, output_dir: Path):
             spec.V,
             spec.scale,
             spec.chunk_size,
+            use_fast_math=True,
         )
 
         compiled_fn.export_to_c(
@@ -282,11 +284,18 @@ def build_variant_matrix(arch: int, prototype: bool = False):
                             is_varlen=varlen, persistent=persistent,
                         ))
 
-    return {
-        "lightning_prefill": la_prefill,
+    result = {
         "chunk_delta_h": delta_h,
         "fwd_o": fwd_o_specs,
     }
+    # Lightning Attention prefill requires SM100+ (Blackwell CuTe DSL).
+    # Only include when targeting SM100+.
+    if arch >= 100:
+        result["lightning_prefill"] = la_prefill
+    else:
+        print(f"  Note: skipping lightning_prefill (requires SM100+, target is SM{arch})")
+
+    return result
 
 
 # ---------------------------------------------------------------------------

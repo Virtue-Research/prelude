@@ -4,8 +4,6 @@ project(onednn_ffi C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-include(FetchContent)
-
 # ── oneDNN minimal build ──────────────────────────────────────────────
 # Only matmul + reorder, CPU inference only
 set(DNNL_LIBRARY_TYPE STATIC CACHE STRING "" FORCE)
@@ -27,21 +25,20 @@ set(DNNL_EXPERIMENTAL_UKERNEL ON CACHE BOOL "" FORCE)
 set(DNNL_CPU_RUNTIME THREADPOOL CACHE STRING "" FORCE)
 message(STATUS "oneDNN FFI: using THREADPOOL runtime (rayon-backed)")
 
-FetchContent_Declare(
-    onednn
-    GIT_REPOSITORY https://github.com/uxlfoundation/oneDNN.git
-    GIT_TAG main
-    GIT_SHALLOW FALSE
-    GIT_PROGRESS TRUE
-)
-FetchContent_MakeAvailable(onednn)
+# Use local submodule (third_party/oneDNN) instead of FetchContent download.
+set(ONEDNN_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/oneDNN")
+if(NOT EXISTS "${ONEDNN_SOURCE_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+        "third_party/oneDNN not found. Run: git submodule update --init third_party/oneDNN")
+endif()
+add_subdirectory(${ONEDNN_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/onednn)
 
 # ── Our FFI wrapper (static) ─────────────────────────────────────────
 # Both libonednn_ffi.a and libdnnl.a are linked statically into the Rust binary.
 # No .so needed at runtime — only system libs (libc, libstdc++).
 add_library(onednn_ffi STATIC src/onednn_ffi.cpp src/amx_gemm.c)
 target_include_directories(onednn_ffi PUBLIC include)
-target_include_directories(onednn_ffi PRIVATE ${onednn_SOURCE_DIR}/include)
+target_include_directories(onednn_ffi PRIVATE ${ONEDNN_SOURCE_DIR}/include)
 target_link_libraries(onednn_ffi PRIVATE dnnl)
 
 # ── AMX GEMM compile flags ──────────────────────────────────────────

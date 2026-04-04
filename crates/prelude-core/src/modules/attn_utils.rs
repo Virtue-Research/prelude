@@ -4,7 +4,7 @@
 //! and attention dispatch wrappers (varlen, paged, windowed, bidirectional).
 
 use crate::tensor::{DType, Device, Module, Result, Tensor};
-use crate::nn_ops::Qwen3Config;
+use crate::models::config::Qwen3Config;
 use crate::ops::{MaskType, VarlenParams, PagedParams};
 
 use super::linear::{Linear, RmsNorm};
@@ -72,8 +72,8 @@ impl RotaryEmbedding {
         let h_k = k.dim(1)?;
         let q4 = q.reshape((1, total, h_q, d))?;
         let k4 = k.reshape((1, total, h_k, d))?;
-        let q_embed = crate::nn_ops::rotary_emb::rope_thd(&q4, &cos, &sin)?;
-        let k_embed = crate::nn_ops::rotary_emb::rope_thd(&k4, &cos, &sin)?;
+        let q_embed = q4.rope_thd(&cos, &sin)?;
+        let k_embed = k4.rope_thd(&cos, &sin)?;
         Ok((
             q_embed.reshape((total, h_q, d))?,
             k_embed.reshape((total, h_k, d))?,
@@ -97,9 +97,11 @@ pub(crate) fn fused_qkv_projection(
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    ctx: &super::BatchState,
+    ops: &crate::ops::Ops,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     if let Some(qkv) = qkv_proj {
-        let qkv_out = qkv.forward(x)?;
+        let qkv_out = qkv.forward(x, ctx, ops)?;
         let q_size = num_heads * head_dim;
         let kv_size = num_kv_heads * head_dim;
         let q = qkv_out
@@ -113,9 +115,9 @@ pub(crate) fn fused_qkv_projection(
             .reshape((total, num_kv_heads, head_dim))?;
         return Ok((q, k, v));
     }
-    let q = q_proj.forward(x)?;
-    let k = k_proj.forward(x)?;
-    let v = v_proj.forward(x)?;
+    let q = q_proj.forward(x, ctx, ops)?;
+    let k = k_proj.forward(x, ctx, ops)?;
+    let v = v_proj.forward(x, ctx, ops)?;
     Ok((
         q.reshape((total, num_heads, head_dim))?,
         k.reshape((total, num_kv_heads, head_dim))?,
@@ -186,16 +188,6 @@ pub(crate) fn varlen_attention(
     if let Some(kv) = paged_kv {
         // Write K/V to paged cache
         ops.kv_cache.reshape_and_cache(k, v, kv.key_cache, kv.value_cache, kv.slot_mapping)?;
-
-        // FA2 can't do paged prefill — fall back to non-paged varlen (local K/V only)
-        if max_seqlen_q > 1 && !ops.attn.supports_paged_prefill() {
-            let params = VarlenParams {
-                cu_seqlens_q, cu_seqlens_k: cu_seqlens_q,
-                max_seqlen_q, max_seqlen_k: max_seqlen_q,
-                scale: softmax_scale, mask: MaskType::Causal, softcap: None,
-            };
-            return ops.attn.varlen_attention(q, k, v, &params);
-        }
 
         let params = PagedParams {
             block_tables: kv.block_tables,

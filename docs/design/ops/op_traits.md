@@ -211,6 +211,8 @@ trait ActivationOps: Send + Sync {
     fn gelu(&self, x: &Tensor) -> Result<Tensor>;
     fn gelu_approximate(&self, x: &Tensor) -> Result<Tensor>; // tanh approx, used by Flux/DiT
     fn softmax(&self, x: &Tensor, dim: usize) -> Result<Tensor>;
+    fn sigmoid(&self, x: &Tensor) -> Result<Tensor>;           // default: 1/(1+exp(-x))
+    fn log_softmax(&self, x: &Tensor, dim: usize) -> Result<Tensor>; // default: x - log(sum(exp(x)))
 }
 ```
 
@@ -396,6 +398,17 @@ trait FusedOps: Send + Sync {
         adapter_indices: &Tensor,
         lora_scale: f32,
     ) -> Option<Result<Tensor>> { None }
+
+    /// Fused element-wise add. Used by Tensor `+` operator overload via thread-local
+    /// Ops context. Returns `None` to fall back to candle's add, `Some` for vectorized kernel.
+    fn fused_add(
+        &self, a: &Tensor, b: &Tensor,
+    ) -> Option<Result<Tensor>> { None }
+
+    /// Fused MoE routing: topk selection + weight normalization in one kernel.
+    fn fused_moe_routing(
+        &self, router_logits: &Tensor, topk: usize,
+    ) -> Option<Result<(Tensor, Tensor)>> { None }  // (topk_weights, topk_ids)
 }
 ```
 

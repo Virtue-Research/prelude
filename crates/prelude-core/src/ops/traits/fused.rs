@@ -111,4 +111,22 @@ pub trait FusedOps: Send + Sync {
     ) -> Option<Result<(Tensor, Tensor, Tensor, Tensor)>> {
         None
     }
+
+    /// Fused MoE GEMM + topk weight application.
+    ///
+    /// Combines grouped GEMM with topk weight multiplication in one kernel.
+    /// Used for the final down-projection in MoE where expert outputs are
+    /// weighted and combined.
+    fn fused_moe_gemm(
+        &self,
+        _input: &Tensor,
+        _weights: &Tensor,
+        _topk_weights: &Tensor,
+        _sorted_token_ids: &Tensor,
+        _sorted_expert_ids: &Tensor,
+        _topk: usize,
+        _is_prefill: bool,
+    ) -> Option<Result<Tensor>> {
+        None
+    }
 }

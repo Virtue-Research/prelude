@@ -29,7 +29,7 @@ pub fn bench(hidden: usize, batch: usize, warmup: usize, repeats: usize) -> Resu
     // candle F32
     let input_f32 = input.to_dtype(DType::F32)?;
     let weight_f32 = weight.to_dtype(DType::F32)?;
-    let candle_norm = prelude_core::nn_ops::CandleRmsNorm::new(weight_f32, 1e-6);
+    let candle_norm = prelude_core::modules::linear::RmsNorm::from_weight(weight_f32, 1e-6);
     for _ in 0..warmup {
         let _ = candle_norm.forward(&input_f32)?;
     }
@@ -56,7 +56,7 @@ pub fn bench_dtypes(hidden: usize, batch: usize, warmup: usize, repeats: usize) 
         .map(|i| 0.8 + i as f32 * 0.001)
         .collect();
     let weight_f32_t = Tensor::from_vec(weight_f32, (hidden,), &device)?;
-    let candle_norm = prelude_core::nn_ops::CandleRmsNorm::new(weight_f32_t.clone(), 1e-6);
+    let candle_norm = prelude_core::modules::linear::RmsNorm::from_weight(weight_f32_t.clone(), 1e-6);
 
     for &(dtype, label) in &[(DType::F16, "rms_f16 "), (DType::F32, "rms_f32 ")] {
         let input = Tensor::from_vec(input_f32.clone(), (batch, hidden), &device)?.to_dtype(dtype)?;
@@ -109,7 +109,7 @@ pub fn bench_fused(hidden: usize, batch: usize, warmup: usize, repeats: usize) -
 
     // candle F32 (separate add + norm) — same: reuse input tensors
     let weight_f32 = weight.to_dtype(DType::F32)?;
-    let candle_norm = prelude_core::nn_ops::CandleRmsNorm::new(weight_f32, 1e-6);
+    let candle_norm = prelude_core::modules::linear::RmsNorm::from_weight(weight_f32, 1e-6);
     let h_f32 = h.to_dtype(DType::F32)?;
     let r_f32 = r.to_dtype(DType::F32)?;
     for _ in 0..warmup {
@@ -155,7 +155,7 @@ pub fn bench_fused_dtypes(hidden: usize, batch: usize, warmup: usize, repeats: u
         let h_c = h.to_dtype(DType::F32)?;
         let r_c = r.to_dtype(DType::F32)?;
         let w_c = w.to_dtype(DType::F32)?;
-        let candle_norm = prelude_core::nn_ops::CandleRmsNorm::new(w_c, 1e-6);
+        let candle_norm = prelude_core::modules::linear::RmsNorm::from_weight(w_c, 1e-6);
         for _ in 0..warmup {
             let _ = candle_norm.forward(&(&h_c + &r_c)?)?;
         }

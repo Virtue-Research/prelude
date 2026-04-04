@@ -174,19 +174,8 @@ pub enum Error {
     #[error("Metal error {0}")]
     Metal(#[from] MetalError),
 
-    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios"), feature = "ug"))]
-    #[error(transparent)]
-    Ug(#[from] candle_ug::Error),
-
     #[error(transparent)]
     TryFromIntError(#[from] core::num::TryFromIntError),
-
-    #[error("npy/npz error {0}")]
-    Npy(String),
-
-    /// Zip file format error.
-    #[error(transparent)]
-    Zip(#[from] zip::result::ZipError),
 
     /// Integer parse error.
     #[error(transparent)]

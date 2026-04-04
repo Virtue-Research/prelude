@@ -22,7 +22,7 @@ fn main() -> Result<()> {
     let up = Tensor::randn(0f64, 1.0, n, &dev)?.to_dtype(DType::BF16)?;
 
     // Reference: silu(gate) * up
-    let silu_gate = gate.apply(&prelude_core::nn_ops::Activation::Silu)?;
+    let silu_gate = gate.apply(&prelude_core::modules::activation::Activation::Silu)?;
     let ref_result = (&silu_gate * &up)?;
 
     // Fused
@@ -91,7 +91,7 @@ fn main() -> Result<()> {
     // Reference silu*mul perf
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
-        let s = gate.apply(&prelude_core::nn_ops::Activation::Silu)?;
+        let s = gate.apply(&prelude_core::modules::activation::Activation::Silu)?;
         let _ = (&s * &up)?;
     }
     dev.synchronize()?;

@@ -1,3 +1,5 @@
+include!("../../build_log.rs");
+
 fn configured_parallel_jobs() -> Option<usize> {
     for key in ["NUM_JOBS", "CARGO_BUILD_JOBS"] {
         if let Ok(value) = std::env::var(key)
@@ -42,10 +44,10 @@ fn main() {
         // Configure cmake if build dir doesn't exist yet (first build)
         if !build_dir.join("CMakeCache.txt").exists() {
             let jobs = configured_parallel_jobs().unwrap_or(1);
-            println!(
-                "cargo:warning=Configuring oneDNN FFI with cmake (first build downloads oneDNN ~200MB)..."
+            build_log!(
+                "Configuring oneDNN FFI with cmake (first build downloads oneDNN ~200MB)..."
             );
-            println!("cargo:warning=building oneDNN FFI with {} job(s)", jobs);
+            build_log!("building oneDNN FFI with {} job(s)", jobs);
 
             std::fs::create_dir_all(&build_dir).expect("failed to create build dir");
 
@@ -94,6 +96,7 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=stdc++");
 
         println!("cargo:rerun-if-env-changed=ONEDNN_FFI_DIR");
+        track_submodule("oneDNN");
         println!("cargo:rerun-if-changed={}", ffi_lib.display());
         println!(
             "cargo:rerun-if-changed={}",

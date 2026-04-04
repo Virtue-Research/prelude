@@ -1,3 +1,5 @@
+include!("../../build_log.rs");
+
 fn main() {
     // ── Compile custom CUDA kernels to PTX (loaded at runtime via cudarc) ──
     use std::path::PathBuf;
@@ -36,8 +38,10 @@ fn main() {
     ];
 
     // Track common headers for rerun-if-changed
-    println!("cargo:rerun-if-changed=src/kernels/common/common.cuh");
-    println!("cargo:rerun-if-changed=src/kernels/common/vec_utils.cuh");
+    println!("cargo:rerun-if-changed=src/kernels/kernels_src/common/common.cuh");
+    println!("cargo:rerun-if-changed=src/kernels/kernels_src/common/vec_utils.cuh");
+    // Also track build.rs itself
+    println!("cargo:rerun-if-changed=build.rs");
 
     for (category, filename, output_name) in kernel_modules.iter() {
         let kernel_src = kernels_dir.join(category).join(filename);

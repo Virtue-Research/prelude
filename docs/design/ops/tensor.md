@@ -131,20 +131,24 @@ wrapper, not a fundamental coupling. Models can also call ops directly.
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DType {
-    F32,
-    F16,
-    BF16,
-    F8E4M3,     // FP8 (SM89+, gfx942+)
     U8,          // packed quantized (TurboQuant, GGUF)
     U32,
+    I16,         // some quantization formats
+    I32,         // integer indices
     I64,
+    BF16,
+    F16,
+    F32,
+    F64,         // high-precision math
+    F8E4M3,     // FP8 (SM89+, gfx942+)
 }
 
 impl DType {
     pub fn size_in_bytes(&self) -> usize {
         match self {
-            F32 | U32 => 4,
-            F16 | BF16 => 2,
+            U8 | F8E4M3 => 1,
+            I16 | BF16 | F16 => 2,
+            U32 | I32 | F32 => 4,
             F8E4M3 | U8 => 1,
             I64 => 8,
         }

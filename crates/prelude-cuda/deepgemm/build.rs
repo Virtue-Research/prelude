@@ -9,6 +9,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+include!("../../../build_log.rs");
+
 fn main() {
     println!("cargo:rerun-if-changed=src/deepgemm_wrapper.cu");
     println!("cargo:rerun-if-changed=src/common.cuh");
@@ -19,6 +21,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/attention.cuh");
     println!("cargo:rerun-if-changed=src/layout.cuh");
     println!("cargo:rerun-if-changed=src/einsum.cuh");
+    track_submodule("DeepGEMM");
+    track_submodule("cutlass");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -65,9 +69,9 @@ fn main() {
 
     let sm100 = nvcc_supports_sm100(&nvcc);
     if sm100 {
-        println!("cargo:warning=DeepGEMM: compiling for SM90a + SM100a (fat binary)");
+        build_log!("compiling for SM90a + SM100a (fat binary)");
     } else {
-        println!("cargo:warning=DeepGEMM: compiling for SM90a only (CUDA toolkit lacks SM100 support)");
+        build_log!("compiling for SM90a only (CUDA toolkit lacks SM100 support)");
     }
 
     let mut nvcc_cmd = Command::new(&nvcc);
@@ -143,7 +147,7 @@ fn ensure_deepgemm(out_dir: &Path, workspace_root: &Path) -> PathBuf {
     }
 
     // Copy submodule to OUT_DIR so we can apply patches without modifying the submodule
-    println!("cargo:warning=Copying DeepGEMM from third_party/ submodule...");
+    build_log!("Copying DeepGEMM from third_party/ submodule...");
     if dg_dir.exists() {
         std::fs::remove_dir_all(&dg_dir).ok();
     }
@@ -172,7 +176,7 @@ fn ensure_deepgemm(out_dir: &Path, workspace_root: &Path) -> PathBuf {
             );
             if patched != content {
                 std::fs::write(&path, patched).expect("Failed to patch DeepGEMM header");
-                println!("cargo:warning=Patched {file} for fat binary arch guard");
+                build_log!("Patched {file} for fat binary arch guard");
             }
         }
     }
@@ -215,7 +219,7 @@ fn ensure_deepgemm(out_dir: &Path, workspace_root: &Path) -> PathBuf {
     patch_smem_name(&dg_dir, "deep_gemm/include/deep_gemm/impls/sm100_fp8_paged_mqa_logits.cuh",
                     "smem_buffer", "smem_pmqa100_");
 
-    println!("cargo:warning=DeepGEMM headers ready");
+    build_log!("DeepGEMM headers ready");
     dg_dir
 }
 
@@ -227,7 +231,7 @@ fn patch_smem_name(dg_dir: &Path, file: &str, old_name: &str, new_name: &str) {
         if patched != content {
             std::fs::write(&path, patched).expect("Failed to patch smem name");
             let fname = path.file_name().unwrap().to_str().unwrap();
-            println!("cargo:warning=Patched {fname}: renamed {old_name} → {new_name}");
+            build_log!("Patched {fname}: renamed {old_name} → {new_name}");
         }
     }
 }
@@ -281,7 +285,7 @@ fn patch_kernel_arch_guard(path: &Path, kernel_name_prefix: &str, arch_guard: &s
         lines.insert(*idx, text.clone());
     }
     std::fs::write(path, lines.join("\n")).expect("Failed to patch kernel header");
-    println!("cargo:warning=Patched {file_name} for fat binary arch guard ({} insertions)", insertions.len());
+    build_log!("Patched {file_name} for fat binary arch guard ({} insertions)", insertions.len());
 }
 
 fn find_cuda() -> PathBuf {
