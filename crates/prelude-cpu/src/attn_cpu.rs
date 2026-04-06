@@ -5,27 +5,39 @@
 use prelude_core::tensor::{Result, Tensor};
 
 /// Causal varlen attention on CPU.
-/// BF16: optimized tiled kernel. F32: matmul SDPA with causal mask.
+/// BF16: optimized tiled kernel (when Q and K have equal lengths).
+/// F32 or cross-attention: matmul SDPA.
 pub fn varlen_causal(
     q: &Tensor, k: &Tensor, v: &Tensor,
-    cu_seqlens_q: &Tensor, _cu_seqlens_k: &Tensor,
+    cu_seqlens_q: &Tensor, cu_seqlens_k: &Tensor,
     softmax_scale: f32,
 ) -> Result<Tensor> {
     let cu_q: Vec<u32> = cu_seqlens_q.to_vec1()?;
-    let seq_lens: Vec<usize> = cu_q.windows(2).map(|w| (w[1] - w[0]) as usize).collect();
+    let cu_k: Vec<u32> = cu_seqlens_k.to_vec1()?;
+    let seq_lens_q: Vec<usize> = cu_q.windows(2).map(|w| (w[1] - w[0]) as usize).collect();
+    let seq_lens_k: Vec<usize> = cu_k.windows(2).map(|w| (w[1] - w[0]) as usize).collect();
     let num_heads = q.dim(1)?;
     let num_kv_heads = k.dim(1)?;
     let head_dim = q.dim(2)?;
 
-    // BF16: optimized tiled attention kernel
-    if q.dtype() == prelude_core::tensor::DType::BF16 {
+    let same_lengths = seq_lens_q == seq_lens_k;
+
+    // BF16 fast path: only when Q and K have equal per-sequence lengths
+    // (the tiled kernel assumes Q and K share the same seq_lens).
+    if q.dtype() == prelude_core::tensor::DType::BF16 && same_lengths {
         return crate::ops::cpu_prefill_attention(
-            q, k, v, &seq_lens, num_heads, num_kv_heads, head_dim, softmax_scale as f64,
+            q, k, v, &seq_lens_q, num_heads, num_kv_heads, head_dim, softmax_scale as f64,
         );
     }
 
-    // F32: matmul-based SDPA (per-sequence causal attention)
-    matmul_sdpa(q, k, v, &seq_lens, num_heads, num_kv_heads, head_dim, softmax_scale, true)
+    // Cross-attention or F32: per-sequence matmul SDPA with proper Q/K lengths.
+    // Convert to F32 if needed (BF16 cross-attention).
+    let q_f32 = q.to_dtype(prelude_core::tensor::DType::F32)?;
+    let k_f32 = k.to_dtype(prelude_core::tensor::DType::F32)?;
+    let v_f32 = v.to_dtype(prelude_core::tensor::DType::F32)?;
+    let out = matmul_sdpa_cross(&q_f32, &k_f32, &v_f32, &seq_lens_q, &seq_lens_k,
+        num_heads, num_kv_heads, head_dim, softmax_scale, true)?;
+    out.to_dtype(q.dtype())
 }
 
 /// Non-causal (bidirectional) varlen attention on CPU.
@@ -40,10 +52,15 @@ pub fn varlen_bidirectional(
     let num_kv_heads = k.dim(1)?;
     let head_dim = q.dim(2)?;
 
-    matmul_sdpa(q, k, v, &seq_lens, num_heads, num_kv_heads, head_dim, softmax_scale, false)
+    // Always use F32 path (the BF16 tiled kernel only supports causal mask)
+    let q_f32 = q.to_dtype(prelude_core::tensor::DType::F32)?;
+    let k_f32 = k.to_dtype(prelude_core::tensor::DType::F32)?;
+    let v_f32 = v.to_dtype(prelude_core::tensor::DType::F32)?;
+    let out = matmul_sdpa(&q_f32, &k_f32, &v_f32, &seq_lens, num_heads, num_kv_heads, head_dim, softmax_scale, false)?;
+    out.to_dtype(q.dtype())
 }
 
-/// Dispatch: oneDNN path (when available) or candle fallback.
+/// Dispatch: oneDNN path (when available) or naive fallback.
 #[allow(clippy::too_many_arguments)]
 fn matmul_sdpa(
     q: &Tensor, k: &Tensor, v: &Tensor,
@@ -54,10 +71,49 @@ fn matmul_sdpa(
     matmul_sdpa_onednn(q, k, v, seq_lens, num_heads, num_kv_heads, head_dim, softmax_scale, causal)
 }
 
+/// Dispatch for cross-attention: Q and K may have different per-sequence lengths.
+/// Falls back to per-sequence cross_attention_f32_onednn.
+#[allow(clippy::too_many_arguments)]
+fn matmul_sdpa_cross(
+    q: &Tensor, k: &Tensor, v: &Tensor,
+    seq_lens_q: &[usize], seq_lens_k: &[usize],
+    num_heads: usize, num_kv_heads: usize, head_dim: usize,
+    softmax_scale: f32, causal: bool,
+) -> Result<Tensor> {
+    let batch = seq_lens_q.len();
+    let mut outputs = Vec::with_capacity(batch);
+    let mut q_offset = 0usize;
+    let mut k_offset = 0usize;
+
+    for i in 0..batch {
+        let sq = seq_lens_q[i];
+        let sk = seq_lens_k[i];
+        let q_seq = q.narrow(0, q_offset, sq)?;
+        let k_seq = k.narrow(0, k_offset, sk)?;
+        let v_seq = v.narrow(0, k_offset, sk)?;
+
+        let position_offset = sk.saturating_sub(sq); // causal offset for cross-attention
+        let out = cross_attention_f32_onednn(
+            &q_seq, &k_seq, &v_seq,
+            sq, sk, num_heads, num_kv_heads, head_dim,
+            softmax_scale, causal, position_offset,
+        )?;
+        outputs.push(out);
+        q_offset += sq;
+        k_offset += sk;
+    }
+
+    if outputs.len() == 1 {
+        Ok(outputs.into_iter().next().unwrap())
+    } else {
+        Tensor::cat(&outputs, 0)
+    }
+}
+
 // ── oneDNN F32 SDPA ──────────────────────────────────────────────────────
 
 /// F32 SDPA using raw `CpuTensorF32` + per-head oneDNN matmul + custom softmax,
-/// parallelized across heads with rayon. No candle compute in the hot path.
+/// parallelized across heads with rayon. No tensor overhead in the hot path.
 #[allow(clippy::too_many_arguments)]
 fn matmul_sdpa_onednn(
     q: &Tensor, k: &Tensor, v: &Tensor,
@@ -72,13 +128,13 @@ fn matmul_sdpa_onednn(
 
     let gqa_ratio = num_heads / num_kv_heads;
 
-    // Extract raw F32 slices once at the boundary — no candle after this
+    // Extract raw F32 slices once at the boundary
     let q_cont = q.contiguous()?;
     let k_cont = k.contiguous()?;
     let v_cont = v.contiguous()?;
-    let q_all = CpuTensorF32::from_candle(&q_cont)?;
-    let k_all = CpuTensorF32::from_candle(&k_cont)?;
-    let v_all = CpuTensorF32::from_candle(&v_cont)?;
+    let q_all = CpuTensorF32::from_tensor(&q_cont)?;
+    let k_all = CpuTensorF32::from_tensor(&k_cont)?;
+    let v_all = CpuTensorF32::from_tensor(&v_cont)?;
 
     let total_tokens: usize = seq_lens.iter().sum();
     let mut out_flat = vec![0.0f32; total_tokens * num_heads * head_dim];
@@ -178,7 +234,7 @@ fn matmul_sdpa_onednn(
         offset += slen;
     }
 
-    // Single candle Tensor construction at the very end
+    // Single Tensor construction at the very end
     Tensor::from_vec(out_flat, &[total_tokens, num_heads, head_dim], q.device())
 }
 
@@ -206,9 +262,9 @@ pub fn cross_attention_f32_onednn(
     let q_cont = q.contiguous()?;
     let k_cont = k.contiguous()?;
     let v_cont = v.contiguous()?;
-    let q_all = CpuTensorF32::from_candle(&q_cont)?;
-    let k_all = CpuTensorF32::from_candle(&k_cont)?;
-    let v_all = CpuTensorF32::from_candle(&v_cont)?;
+    let q_all = CpuTensorF32::from_tensor(&q_cont)?;
+    let k_all = CpuTensorF32::from_tensor(&k_cont)?;
+    let v_all = CpuTensorF32::from_tensor(&v_cont)?;
 
     let q_data = q_all.as_slice();
     let k_data = k_all.as_slice();
@@ -296,12 +352,12 @@ pub fn cross_attention_f32_onednn(
     Tensor::from_vec(out_flat, &[seq_q, num_heads, head_dim], q.device())
 }
 
-// ── Candle reference SDPA ────────────────────────────────────────────────
+// ── Reference SDPA ──────────────────────────────────────────────────────
 
-/// Candle-based F32 SDPA (reference / fallback when oneDNN is unavailable).
+/// Reference F32 SDPA (fallback when oneDNN is unavailable).
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
-fn matmul_sdpa_candle(
+fn matmul_sdpa_reference(
     q: &Tensor, k: &Tensor, v: &Tensor,
     seq_lens: &[usize],
     num_heads: usize, num_kv_heads: usize, head_dim: usize,
@@ -351,7 +407,7 @@ fn matmul_sdpa_candle(
             scores
         };
 
-        let attn_weights = prelude_core::modules::activation::softmax_last_dim(&scores)?;
+        let attn_weights = scores.softmax(scores.rank() - 1)?;
         let out = attn_weights.matmul(&v_t)?;
         outputs.push(out.transpose(0, 1)?);
         offset += slen;
@@ -378,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn test_f32_sdpa_candle_vs_onednn() {
+    fn test_f32_sdpa_reference_vs_onednn() {
         let seq_len = 32;
         let num_heads = 8;
         let num_kv_heads = 4;
@@ -389,7 +445,7 @@ mod tests {
         let k = deterministic_f32_tensor(&[seq_len, num_kv_heads, head_dim], 2);
         let v = deterministic_f32_tensor(&[seq_len, num_kv_heads, head_dim], 3);
 
-        let candle_out = matmul_sdpa_candle(
+        let ref_out = matmul_sdpa_reference(
             &q, &k, &v, &[seq_len], num_heads, num_kv_heads, head_dim, scale, true,
         ).unwrap();
 
@@ -398,7 +454,7 @@ mod tests {
                 &q, &k, &v, &[seq_len], num_heads, num_kv_heads, head_dim, scale, true,
             ).unwrap();
 
-            let c: Vec<f32> = candle_out.flatten_all().unwrap().to_vec1().unwrap();
+            let c: Vec<f32> = ref_out.flatten_all().unwrap().to_vec1().unwrap();
             let o: Vec<f32> = onednn_out.flatten_all().unwrap().to_vec1().unwrap();
             assert_eq!(c.len(), o.len());
 
@@ -423,7 +479,7 @@ mod tests {
         let k = deterministic_f32_tensor(&[total, num_kv_heads, head_dim], 20);
         let v = deterministic_f32_tensor(&[total, num_kv_heads, head_dim], 30);
 
-        let candle_out = matmul_sdpa_candle(
+        let ref_out = matmul_sdpa_reference(
             &q, &k, &v, &seq_lens, num_heads, num_kv_heads, head_dim, scale, true,
         ).unwrap();
 
@@ -432,7 +488,7 @@ mod tests {
                 &q, &k, &v, &seq_lens, num_heads, num_kv_heads, head_dim, scale, true,
             ).unwrap();
 
-            let c: Vec<f32> = candle_out.flatten_all().unwrap().to_vec1().unwrap();
+            let c: Vec<f32> = ref_out.flatten_all().unwrap().to_vec1().unwrap();
             let o: Vec<f32> = onednn_out.flatten_all().unwrap().to_vec1().unwrap();
             let max_diff = c.iter().zip(o.iter())
                 .map(|(a, b)| (a - b).abs())
@@ -457,17 +513,17 @@ mod tests {
         let v = deterministic_f32_tensor(&[seq_len, num_kv_heads, head_dim], 44);
 
         for _ in 0..warmup {
-            let _ = matmul_sdpa_candle(
+            let _ = matmul_sdpa_reference(
                 &q, &k, &v, &[seq_len], num_heads, num_kv_heads, head_dim, scale, true,
             );
         }
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
-            let _ = matmul_sdpa_candle(
+            let _ = matmul_sdpa_reference(
                 &q, &k, &v, &[seq_len], num_heads, num_kv_heads, head_dim, scale, true,
             );
         }
-        let candle_us = t0.elapsed().as_micros() / iters as u128;
+        let ref_us = t0.elapsed().as_micros() / iters as u128;
 
         {
             for _ in 0..warmup {
@@ -485,10 +541,10 @@ mod tests {
 
             eprintln!();
             eprintln!("=== F32 SDPA Benchmark (seq={seq_len}, H={num_heads}, Hkv={num_kv_heads}, D={head_dim}) ===");
-            eprintln!("candle:  {candle_us} us/iter");
+            eprintln!("reference: {ref_us} us/iter");
             eprintln!("oneDNN:  {onednn_us} us/iter");
             if onednn_us > 0 {
-                let speedup = candle_us as f64 / onednn_us as f64;
+                let speedup = ref_us as f64 / onednn_us as f64;
                 eprintln!("speedup: {speedup:.2}x");
             }
         }

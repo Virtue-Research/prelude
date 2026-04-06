@@ -1,6 +1,8 @@
 pub mod config;
+pub mod commons;
 mod forward;
 pub mod gemma3;
+pub mod gemma4;
 pub mod qwen3;
 pub mod qwen3_5;
 pub mod qwen3_moe;

@@ -3,8 +3,7 @@
 //! 1. Find FlashInfer source (third_party/flashinfer/ or FLASHINFER_SRC env var).
 //! 2. Run scripts/compile_kernels.py to AOT-compile kernel variants.
 //! 3. Archive all .o files into libflashinfer_kernels.a.
-//! 4. Compile vendored tvm_ffi C++ (shared with FA4).
-//! 5. Generate fi_dispatch.rs from manifest.json.
+//! 4. Generate fi_dispatch.rs from manifest.json.
 //!
 //! All build artifacts go into OUT_DIR. `cargo clean` = full rebuild.
 
@@ -48,7 +47,6 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-env-changed=FLASHINFER_SRC");
     println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_ARCHS");
     track_submodule("flashinfer");
-    track_submodule("tvm-ffi");
     println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_HEAD_DIMS");
     println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_DTYPES");
     println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_WORKERS");
@@ -68,14 +66,7 @@ fn main() -> Result<()> {
     // Phase 3: Archive .o → .a
     let has_kernels = archive_objects(&kernels_dir, &out_dir)?;
 
-    // Phase 4: Compile TVM FFI
-    if env::var("CARGO_FEATURE_SKIP_TVM_FFI").is_ok() {
-        build_log!("skipping tvm_ffi (provided by flash-attn-v4)");
-    } else {
-        compile_tvm_ffi(&manifest_dir)?;
-    }
-
-    // Phase 5: Generate dispatch code
+    // Phase 4: Generate dispatch code
     generate_dispatch(&kernels_dir, &out_dir, has_kernels)?;
 
     Ok(())
@@ -136,7 +127,7 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fi_src: &Path) -> Res
     let archs = env::var("PRELUDE_FLASHINFER_ARCHS")
         .unwrap_or_else(|_| "sm_80,sm_90".to_string());
     let head_dims = env::var("PRELUDE_FLASHINFER_HEAD_DIMS")
-        .unwrap_or_else(|_| "64,96,128,192,256".to_string());
+        .unwrap_or_else(|_| "64,96,128,192,256,512".to_string());
     let dtypes = env::var("PRELUDE_FLASHINFER_DTYPES")
         .unwrap_or_else(|_| "bf16,fp16".to_string());
     let workers = env::var("PRELUDE_FLASHINFER_WORKERS").unwrap_or_else(|_| {
@@ -191,168 +182,6 @@ fn archive_objects(kernels_dir: &Path, out_dir: &Path) -> Result<bool> {
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static:+whole-archive=flashinfer_kernels");
     Ok(true)
-}
-
-// ── TVM FFI ──────────────────────────────────────────────────────────
-
-fn compile_tvm_ffi(manifest_dir: &Path) -> Result<()> {
-    // tvm-ffi lives in workspace third_party/
-    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap().parent().unwrap();
-    let tvm_ffi_dir = workspace_root.join("third_party/tvm-ffi");
-
-    let (tvm_src, tvm_include, dlpack_include) = if tvm_ffi_dir.join("src").exists() {
-        (
-            tvm_ffi_dir.join("src"),
-            tvm_ffi_dir.join("include"),
-            tvm_ffi_dir.join("3rdparty/dlpack/include"),
-        )
-    } else {
-        anyhow::bail!(
-            "third_party/tvm-ffi not found. Run: git submodule update --init third_party/tvm-ffi"
-        );
-    };
-
-    let cc_files: Vec<PathBuf> = walkdir_ext(&tvm_src, "cc")
-        .into_iter()
-        .filter(|p| {
-            let name = p.file_name().unwrap().to_str().unwrap_or("");
-            !name.contains("win") && !name.contains("testing")
-        })
-        .collect();
-
-    let mut build = cc::Build::new();
-    build
-        .cpp(true)
-        .std("c++17")
-        .opt_level(2)
-        .pic(true)
-        .include(&tvm_include)
-        .include(&dlpack_include)
-        .define("TVM_FFI_EXPORTS", None)
-        .define("NDEBUG", None)
-        .warnings(false);
-
-    for f in &cc_files {
-        build.file(f);
-    }
-
-    // Our C++ helper that uses upstream TVM FFI APIs for error extraction
-    let tvm_error_helper = manifest_dir.join("src/tvm_error_helper.cc");
-    build.file(&tvm_error_helper);
-
-    // Compile libbacktrace (backtrace.cc references it)
-    compile_libbacktrace(&tvm_ffi_dir)?;
-
-    build.link_lib_modifier("+whole-archive");
-    build.try_compile("tvm_ffi_fi_static")
-        .context("Failed to compile tvm_ffi")?;
-
-    // cuda_dialect_runtime_static.a — installed by cutlass-dsl in fa4-venv
-    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap().parent().unwrap();
-    let venv_dir = workspace_root.join("target/fa4-venv");
-    if let Some(p) = find_file_recursive(&venv_dir, "libcuda_dialect_runtime_static.a") {
-        println!("cargo:rustc-link-search=native={}", p.parent().unwrap().display());
-        println!("cargo:rustc-link-lib=static:+whole-archive=cuda_dialect_runtime_static");
-    }
-
-    for candidate in [
-        "/opt/cuda/targets/x86_64-linux/lib",
-        "/opt/cuda/lib64",
-        "/usr/local/cuda/lib64",
-    ] {
-        if Path::new(candidate).join("libcudart.so").exists() {
-            println!("cargo:rustc-link-search=native={candidate}");
-            break;
-        }
-    }
-    println!("cargo:rustc-link-lib=static=cudart_static");
-    println!("cargo:rustc-link-lib=dylib=cuda");  // CUDA Driver API (comes with GPU driver)
-    println!("cargo:rustc-link-lib=dylib=rt");   // required by cudart_static
-    println!("cargo:rustc-link-lib=dylib=dl");   // required by cudart_static
-    println!("cargo:rustc-link-lib=dylib=stdc++");
-
-    Ok(())
-}
-
-// ── libbacktrace (required by tvm_ffi backtrace.cc) ────────────────
-
-fn compile_libbacktrace(tvm_ffi_dir: &Path) -> Result<()> {
-    let bt_dir = tvm_ffi_dir.join("3rdparty/libbacktrace");
-    if !bt_dir.exists() {
-        anyhow::bail!(
-            "libbacktrace not found. Run: git submodule update --init --recursive third_party/tvm-ffi"
-        );
-    }
-
-    // Generate config.h for the target platform
-    let out = PathBuf::from(env::var("OUT_DIR")?);
-    let config_dir = out.join("libbacktrace");
-    std::fs::create_dir_all(&config_dir)?;
-
-    let config_h = if cfg!(target_os = "linux") {
-        r#"
-#define BACKTRACE_ELF_SIZE 64
-#define HAVE_ATOMIC_FUNCTIONS 1
-#define HAVE_DL_ITERATE_PHDR 1
-#define HAVE_DLFCN_H 1
-#define HAVE_FCNTL 1
-#define HAVE_LINK_H 1
-#define HAVE_LSTAT 1
-#define HAVE_READLINK 1
-#define HAVE_SYS_MMAN_H 1
-#define HAVE_DECL_STRNLEN 1
-#define HAVE_DECL_GETPAGESIZE 0
-"#
-    } else if cfg!(target_os = "macos") {
-        r#"
-#define BACKTRACE_ELF_SIZE 64
-#define HAVE_ATOMIC_FUNCTIONS 1
-#define HAVE_DLFCN_H 1
-#define HAVE_FCNTL 1
-#define HAVE_MACH_O_DYLD_H 1
-#define HAVE_SYS_MMAN_H 1
-#define HAVE_DECL_STRNLEN 1
-#define HAVE_DECL_GETPAGESIZE 0
-"#
-    } else {
-        // Windows or unknown — minimal config
-        r#"
-#define HAVE_ATOMIC_FUNCTIONS 1
-#define HAVE_DECL_STRNLEN 1
-#define HAVE_DECL_GETPAGESIZE 0
-"#
-    };
-    std::fs::write(config_dir.join("config.h"), config_h)?;
-
-    // Select platform-specific source files
-    let core_files = ["backtrace.c", "dwarf.c", "fileline.c", "posix.c",
-                      "sort.c", "state.c", "alloc.c", "read.c", "mmapio.c", "mmap.c"];
-    let format_file = if cfg!(target_os = "macos") { "macho.c" } else { "elf.c" };
-
-    let mut build = cc::Build::new();
-    build
-        .opt_level(2)
-        .pic(true)
-        .include(&bt_dir)
-        .include(&config_dir)  // for generated config.h
-        .define("_GNU_SOURCE", None)
-        .warnings(false);
-
-    for name in &core_files {
-        let f = bt_dir.join(name);
-        if f.exists() {
-            build.file(&f);
-        }
-    }
-    let fmt = bt_dir.join(format_file);
-    if fmt.exists() {
-        build.file(&fmt);
-    }
-
-    build.try_compile("backtrace")
-        .context("Failed to compile libbacktrace")?;
-
-    Ok(())
 }
 
 // ── Dispatch codegen ─────────────────────────────────────────────────
@@ -561,20 +390,4 @@ fn find_python() -> Result<PathBuf> {
         }
     }
     anyhow::bail!("Python 3 not found")
-}
-
-fn find_file_recursive(dir: &Path, name: &str) -> Option<PathBuf> {
-    if !dir.exists() { return None; }
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.is_file() && path.file_name().is_some_and(|n| n == name) {
-            return Some(path);
-        }
-        if path.is_dir() {
-            if let Some(found) = find_file_recursive(&path, name) {
-                return Some(found);
-            }
-        }
-    }
-    None
 }

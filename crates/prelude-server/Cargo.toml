@@ -52,11 +52,10 @@ cpu = []
 # CUDA inference — all GPU backends (FlashInfer, FA4, CUTLASS, DeepGEMM, quant-gemm, cuLA)
 cuda = [
     "dep:prelude-cuda",
-    "prelude-cuda/flash-attn-v4",
-    "prelude-cuda/flashinfer",
-    "prelude-cuda/deepgemm",
-    "prelude-cuda/quant-gemm",
-    "prelude-cuda/cula",
 ]
 # Everything
 full = ["cpu", "cuda"]
+
+[[bin]]
+name = "gemma4_test"
+path = "src/bin/gemma4_test.rs"

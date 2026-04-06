@@ -11,7 +11,6 @@ members = [
     "crates/prelude-cuda/quant-gemm",
     "crates/prelude-cuda/cula",
 ]
-exclude = ["crates/candle-core"]
 resolver = "2"
 
 [workspace.package]
@@ -47,8 +46,6 @@ tracing-opentelemetry = { version = "0.32.1" }
 uuid = { version = "1.22.0", features = ["v4", "serde"] }
 
 # ML / Tensor computation
-candle-core = { version = "0.9.2" }
-candle-transformers = { version = "0.9.2" }
 prelude-cuda = { path = "crates/prelude-cuda" }
 prelude-flash-attn-v4 = { path = "crates/prelude-cuda/fa4" }
 prelude-deepgemm = { path = "crates/prelude-cuda/deepgemm" }
@@ -56,6 +53,11 @@ prelude-cutlass-gemm = { path = "crates/prelude-cuda/cutlass-gemm" }
 prelude-flashinfer = { path = "crates/prelude-cuda/flashinfer" }
 prelude-quant-gemm = { path = "crates/prelude-cuda/quant-gemm" }
 prelude-cula = { path = "crates/prelude-cuda/cula" }
+
+# CubeCL — multi-backend tensor primitives (pure Rust, JIT-compiled GPU kernels)
+cubecl = { git = "https://github.com/tracel-ai/cubecl", rev = "e743e8f7b22b93378bab28b26916f7cf61321ccc", default-features = false, features = ["cpu", "stdlib"] }
+# CubeK — pre-built CubeCL kernels (matmul, reduce, attention, convolution)
+cubek = { git = "https://github.com/tracel-ai/cubek", default-features = false, features = ["reduce", "matmul", "stdlib"] }
 
 # Tokenization & model loading
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
@@ -75,5 +77,3 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 
-[patch.crates-io]
-candle-core = { path = "crates/candle-core" }

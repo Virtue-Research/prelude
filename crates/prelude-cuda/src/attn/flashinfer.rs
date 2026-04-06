@@ -3,8 +3,9 @@
 //! Wraps `prelude_flashinfer` crate with the plan-then-run API.
 //! Workspace buffers are allocated once per device and reused.
 
-use candle_core::cuda_backend::cudarc::driver::DevicePtr;
-use candle_core::{DType, Result, Tensor};
+use crate::device::{self as cb, DevicePtr};
+use cudarc::driver::CudaStream;
+use prelude_core::tensor::{bail, DType, Device, Result, Tensor};
 use half::bf16;
 use prelude_flashinfer::types::*;
 use prelude_flashinfer::{DecodeKey, KernelDtype, KernelRegistry, MaskMode, PrefillKey};
@@ -160,7 +161,7 @@ pub fn precompute_paged_plan_graphed(
 pub fn allocate_fi_graph_meta(
     batch_size: usize,
     max_total_pages: usize,
-    device: &candle_core::Device,
+    device: &Device,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     Ok((
         Tensor::zeros((batch_size + 1,), DType::I32, device)?,
@@ -186,12 +187,8 @@ fn precompute_paged_plan_impl(
     let (batch_size, num_qo_heads, head_dim) = q_shape;
     let (_, block_size, num_kv_heads, _) = key_cache.shape().dims4()?;
 
-    let dev = match key_cache.device() {
-        candle_core::Device::Cuda(d) => d,
-        _ => candle_core::bail!("need CUDA"),
-    };
+    let stream = cb::tensor_stream(key_cache)?;
     let did = device_id(key_cache.device());
-    let stream = dev.cuda_stream();
     let raw_stream = stream.cu_stream() as *mut c_void;
 
     let meta = if let Some((fi_ip, fi_ix, fi_lp)) = graph_buffers {
@@ -209,7 +206,7 @@ fn precompute_paged_plan_impl(
             sliding_window: false, logits_soft_cap: false,
             backend,
         })
-        .ok_or_else(|| candle_core::Error::Msg(format!("FlashInfer: no {backend:?} prefill variant")))?;
+        .ok_or_else(|| prelude_core::tensor::Error::Msg(format!("FlashInfer: no {backend:?} prefill variant")))?;
 
     let ws_guard = get_workspace(did)?;
     let ws = ws_guard.as_ref().unwrap();
@@ -258,7 +255,7 @@ fn precompute_paged_plan_impl(
 
     let pi = unsafe {
         reg.call(variant.plan, &plan_args)
-            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer precompute plan: {e}")))?
+            .map_err(|e| prelude_core::tensor::Error::Msg(format!("FlashInfer precompute plan: {e}")))?
     };
 
     drop(ws_guard);
@@ -295,21 +292,21 @@ impl Workspace {
             let mut int_ws = std::ptr::null_mut();
             let mut pinned_ws = std::ptr::null_mut();
             if cudaMalloc(&mut float_ws, FLOAT_WS_BYTES) != 0 {
-                candle_core::bail!("FlashInfer: cudaMalloc float_ws failed");
+                bail!("FlashInfer: cudaMalloc float_ws failed");
             }
             if cudaMalloc(&mut int_ws, INT_WS_BYTES) != 0 {
                 cudaFree(float_ws);
-                candle_core::bail!("FlashInfer: cudaMalloc int_ws failed");
+                bail!("FlashInfer: cudaMalloc int_ws failed");
             }
             if cudaMallocHost(&mut pinned_ws, PINNED_WS_BYTES) != 0 {
                 cudaFree(float_ws);
                 cudaFree(int_ws);
-                candle_core::bail!("FlashInfer: cudaMallocHost pinned_ws failed");
+                bail!("FlashInfer: cudaMallocHost pinned_ws failed");
             }
             cudaMemset(float_ws, 0, FLOAT_WS_BYTES);
             cudaMemset(int_ws, 0, INT_WS_BYTES);
             // Sync to ensure workspace zeroing completes before any non-default
-            // stream (candle/cudarc) uses these buffers. Without this, the first
+            // stream (cudarc) uses these buffers. Without this, the first
             // FlashInfer plan/run can read uninitialized workspace data.
             cudaDeviceSynchronize();
             tracing::debug!("FlashInfer workspace: float=128MB int=8MB pinned=8MB");
@@ -332,7 +329,7 @@ impl Drop for Workspace {
 fn get_workspace(device_id: i32) -> Result<std::sync::MutexGuard<'static, Option<Workspace>>> {
     let mut guard = WORKSPACE
         .lock()
-        .map_err(|e| candle_core::Error::Msg(format!("FlashInfer workspace lock: {e}")))?;
+        .map_err(|e| prelude_core::tensor::Error::Msg(format!("FlashInfer workspace lock: {e}")))?;
     if guard.is_none() {
         *guard = Some(Workspace::new(device_id)?);
     }
@@ -383,22 +380,16 @@ const U8_DT: DLDataType = DLDataType { code: KDLUINT, bits: 8, lanes: 1 };
 
 macro_rules! cuda_ptr {
     ($t:expr, $ty:ty, $stream:expr) => {{
-        let (storage, layout) = $t.storage_and_layout();
-        let cuda = match &*storage {
-            candle_core::Storage::Cuda(c) => c,
-            _ => candle_core::bail!("FlashInfer: tensor not on CUDA"),
-        };
-        let slice = cuda.as_cuda_slice::<$ty>()?.slice(layout.start_offset()..);
+        let (storage, layout) = cb::storage_and_layout(&$t);
+        let cuda = cb::as_cuda(&storage, "FlashInfer")?;
+        let slice = cuda.as_slice::<$ty>()?.slice(layout.start_offset()..);
         let (ptr, _guard) = slice.device_ptr($stream);
         ptr as u64 as *mut c_void
     }};
 }
 
-fn device_id(dev: &candle_core::Device) -> i32 {
-    match dev.location() {
-        candle_core::DeviceLocation::Cuda { gpu_id } => gpu_id as i32,
-        _ => 0,
-    }
+fn device_id(dev: &Device) -> i32 {
+    dev.ordinal() as i32
 }
 
 // ── Public API ───────────────────────────────────────────────────────
@@ -488,22 +479,28 @@ fn ragged_prefill(
     let (_, num_kv_heads, _) = k.shape().dims3()?;
     let batch_size = cu_seqlens_q.dim(0)? - 1;
 
-    // SM90+ uses FA3 (Hopper TMA kernels), SM80+ uses FA2
+    // SM90+ uses FA3 (Hopper TMA kernels), SM80+ uses FA2.
+    // FA3 supports head_dim up to 256; fall back to FA2 for larger (e.g. 512).
     let backend = reg.default_backend();
     let use_swa = window_left >= 0;
-    let variant = reg
-        .get_prefill(&PrefillKey {
-            dtype: dtype_to_kernel(q.dtype()),
-            head_dim_qk: head_dim as u32, head_dim_vo: head_dim as u32,
-            sliding_window: use_swa, logits_soft_cap: false,
-            backend,
+    let prefill_key = |b| PrefillKey {
+        dtype: dtype_to_kernel(q.dtype()),
+        head_dim_qk: head_dim as u32, head_dim_vo: head_dim as u32,
+        sliding_window: use_swa, logits_soft_cap: false,
+        backend: b,
+    };
+    let (variant, backend) = reg.get_prefill(&prefill_key(backend))
+        .map(|v| (v, backend))
+        .or_else(|| {
+            // FA3 doesn't have this variant — try FA2
+            let fb = prelude_flashinfer::Backend::FA2;
+            reg.get_prefill(&prefill_key(fb)).map(|v| (v, fb))
         })
-        .ok_or_else(|| candle_core::Error::Msg(format!("FlashInfer: no {backend:?} prefill variant")))?;
+        .ok_or_else(|| prelude_core::tensor::Error::Msg(format!("FlashInfer: no prefill variant for head_dim={head_dim}")))?;
 
-    let dev = match q.device() { candle_core::Device::Cuda(d) => d, _ => candle_core::bail!("need CUDA") };
+    let stream = cb::tensor_stream(q)?;
     let did = device_id(q.device());
     let out = Tensor::zeros(q.shape(), q.dtype(), q.device())?;
-    let stream = dev.cuda_stream();
     let raw_stream = stream.cu_stream() as *mut c_void;
 
     let ws_guard = get_workspace(did)?;
@@ -579,7 +576,7 @@ fn ragged_prefill(
 
         let pi = unsafe {
             reg.call(variant.plan, &plan_args)
-                .map_err(|e| candle_core::Error::Msg(format!("FlashInfer prefill plan: {e}")))?
+                .map_err(|e| prelude_core::tensor::Error::Msg(format!("FlashInfer prefill plan: {e}")))?
         };
 
         // Cache the plan for subsequent layers
@@ -605,7 +602,7 @@ fn ragged_prefill(
 
     unsafe {
         reg.call(variant.ragged_run, &run_args)
-            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer ragged_run: {e}")))?;
+            .map_err(|e| prelude_core::tensor::Error::Msg(format!("FlashInfer ragged_run: {e}")))?;
     }
 
     drop(ws_guard);
@@ -626,13 +623,14 @@ fn append_fa2_plan_tail(plan_args: &mut Vec<TVMFFIAny>, is_fa3: bool) {
 /// Append FA2/FA3 run-time trailing arguments for prefill/paged_run kernels.
 fn append_prefill_run_tail(run_args: &mut Vec<TVMFFIAny>, is_fa3: bool, softmax_scale: f32) {
     if is_fa3 {
-        // FA3/SM90: prefix_len, token_pos, max_item_len, scale_v, soft_cap, sm_scale, scale_v_scalar
+        // FA3/SM90: prefix_len, token_pos, max_item_len, scale_v, soft_cap, sm_scale, scale_v_scalar, token_pos_in_items_len
         run_args.extend_from_slice(&[
             TVMFFIAny::none(), TVMFFIAny::none(), TVMFFIAny::none(),
             TVMFFIAny::none(),
             TVMFFIAny::float64(0.0),                        // logits_soft_cap
             TVMFFIAny::float64(softmax_scale as f64),        // sm_scale
             TVMFFIAny::float64(1.0),                         // scale_v_scalar
+            TVMFFIAny::int64(0),                             // token_pos_in_items_len
         ]);
     } else {
         // FA2: masks, alibi, prefix, token, max, soft_cap, sm_scale, rope_scale, rope_theta, token_len
@@ -665,12 +663,11 @@ fn paged_decode(
             head_dim_qk: head_dim as u32, head_dim_vo: head_dim as u32,
             sliding_window: false, logits_soft_cap: false,
         })
-        .ok_or_else(|| candle_core::Error::Msg("FlashInfer: no decode variant".into()))?;
+        .ok_or_else(|| prelude_core::tensor::Error::Msg("FlashInfer: no decode variant".into()))?;
 
-    let dev = match q.device() { candle_core::Device::Cuda(d) => d, _ => candle_core::bail!("need CUDA") };
+    let stream = cb::tensor_stream(q)?;
     let did = device_id(q.device());
     let out = Tensor::zeros(q.shape(), q.dtype(), q.device())?;
-    let stream = dev.cuda_stream();
     let raw_stream = stream.cu_stream() as *mut c_void;
 
     let ws_guard = get_workspace(did)?;
@@ -735,7 +732,7 @@ fn paged_decode(
             TVMFFIAny::float64(0.0), // logits_soft_cap
             TVMFFIAny::int64(head_dim as i64), TVMFFIAny::int64(head_dim as i64),
             TVMFFIAny::dltensor(&dl_eq), TVMFFIAny::dltensor(&dl_ek),
-        ]).map_err(|e| candle_core::Error::Msg(format!("FlashInfer decode plan: {e}")))?
+        ]).map_err(|e| prelude_core::tensor::Error::Msg(format!("FlashInfer decode plan: {e}")))?
     };
 
     unsafe {
@@ -751,7 +748,7 @@ fn paged_decode(
             TVMFFIAny::none(), // alibi
             TVMFFIAny::float64(0.0), TVMFFIAny::float64(softmax_scale as f64),
             TVMFFIAny::float64(1.0), TVMFFIAny::float64(1e4), // rope defaults
-        ]).map_err(|e| candle_core::Error::Msg(format!("FlashInfer decode run: {e}")))?;
+        ]).map_err(|e| prelude_core::tensor::Error::Msg(format!("FlashInfer decode run: {e}")))?;
     }
 
     drop(ws_guard);
@@ -786,12 +783,11 @@ fn paged_prefill_impl(
             sliding_window: false, logits_soft_cap: false,
             backend,
         })
-        .ok_or_else(|| candle_core::Error::Msg(format!("FlashInfer: no {backend:?} prefill variant")))?;
+        .ok_or_else(|| prelude_core::tensor::Error::Msg(format!("FlashInfer: no {backend:?} prefill variant")))?;
 
-    let dev = match q.device() { candle_core::Device::Cuda(d) => d, _ => candle_core::bail!("need CUDA") };
+    let stream = cb::tensor_stream(q)?;
     let did = device_id(q.device());
     let out = Tensor::zeros(q.shape(), q.dtype(), q.device())?;
-    let stream = dev.cuda_stream();
     let raw_stream = stream.cu_stream() as *mut c_void;
 
     let ws_guard = get_workspace(did)?;
@@ -900,7 +896,7 @@ fn paged_prefill_impl(
 
         let pi = unsafe {
             reg.call(variant.plan, &plan_args)
-                .map_err(|e| candle_core::Error::Msg(format!("FlashInfer paged prefill plan: {e}")))?
+                .map_err(|e| prelude_core::tensor::Error::Msg(format!("FlashInfer paged prefill plan: {e}")))?
         };
 
         PLAN_CACHE.with(|c| {
@@ -926,7 +922,7 @@ fn paged_prefill_impl(
 
     unsafe {
         reg.call(variant.paged_run, &run_args)
-            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer paged_run: {e}")))?;
+            .map_err(|e| prelude_core::tensor::Error::Msg(format!("FlashInfer paged_run: {e}")))?;
     }
 
     drop(ws_guard);
@@ -1031,7 +1027,7 @@ fn convert_paged_metadata(
 fn convert_paged_metadata_into(
     block_tables: &Tensor, cu_seqlens_k: &Tensor, block_size: usize,
     fi_indptr: &Tensor, fi_indices: &Tensor, fi_last_page_len: &Tensor,
-    stream: &std::sync::Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>,
+    stream: &std::sync::Arc<CudaStream>,
     raw_stream: *mut c_void,
 ) -> Result<PagedMeta> {
     let raw = compute_paged_metadata_cpu(block_tables, cu_seqlens_k, block_size)?;
@@ -1044,7 +1040,7 @@ fn convert_paged_metadata_into(
             ip_ptr, raw.indptr.as_ptr() as *const c_void,
             raw.indptr.len() * std::mem::size_of::<i32>(), CUDA_MEMCPY_HOST_TO_DEVICE, raw_stream,
         );
-        if rc != 0 { candle_core::bail!("cudaMemcpyAsync indptr failed: {rc}"); }
+        if rc != 0 { bail!("cudaMemcpyAsync indptr failed: {rc}"); }
 
         if !raw.indices.is_empty() {
             let ix_ptr = cuda_ptr!(fi_indices, i32, stream);
@@ -1052,7 +1048,7 @@ fn convert_paged_metadata_into(
                 ix_ptr, raw.indices.as_ptr() as *const c_void,
                 raw.indices.len() * std::mem::size_of::<i32>(), CUDA_MEMCPY_HOST_TO_DEVICE, raw_stream,
             );
-            if rc != 0 { candle_core::bail!("cudaMemcpyAsync indices failed: {rc}"); }
+            if rc != 0 { bail!("cudaMemcpyAsync indices failed: {rc}"); }
         }
 
         let lp_ptr = cuda_ptr!(fi_last_page_len, i32, stream);
@@ -1060,7 +1056,7 @@ fn convert_paged_metadata_into(
             lp_ptr, raw.last_page.as_ptr() as *const c_void,
             raw.last_page.len() * std::mem::size_of::<i32>(), CUDA_MEMCPY_HOST_TO_DEVICE, raw_stream,
         );
-        if rc != 0 { candle_core::bail!("cudaMemcpyAsync last_page_len failed: {rc}"); }
+        if rc != 0 { bail!("cudaMemcpyAsync last_page_len failed: {rc}"); }
     }
 
     Ok(PagedMeta {
@@ -1073,11 +1069,11 @@ fn convert_paged_metadata_into(
     })
 }
 
-// ── Integration test: candle tensors + real CUDA kernels ────────────
+// ── Integration test: tensors + real CUDA kernels ────────────
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{DType, Device, Tensor};
+    use prelude_core::tensor::{DType, Device, Tensor};
 
     fn bf16_to_f32(bits: u16) -> f32 {
         f32::from_bits((bits as u32) << 16)
@@ -1116,12 +1112,13 @@ mod tests {
         out
     }
 
-    /// Full engine-path test using candle tensors + real CUDA reshape_and_cache_flash.
+    /// Full engine-path test using tensors + real CUDA reshape_and_cache_flash.
     ///
     /// Run: cargo test -p prelude-core --features flashinfer -- flashinfer_paged_decode_engine_path --nocapture
     #[test]
     fn flashinfer_paged_decode_engine_path() {
-        let dev = Device::new_cuda(0).expect("need CUDA GPU");
+        crate::register();
+        let dev = Device::Cuda(0);
 
         let num_qo: usize = 16;
         let num_kv: usize = 8;
@@ -1170,7 +1167,7 @@ mod tests {
                 })
                 .collect();
 
-            // Create candle tensors
+            // Create tensors
             let k_t = Tensor::new(&k_f32[..], &dev).unwrap()
                 .to_dtype(DType::BF16).unwrap()
                 .reshape((kv_len, num_kv, head_dim)).unwrap();
@@ -1180,7 +1177,7 @@ mod tests {
             let slot_t = Tensor::new(&slots[..], &dev).unwrap();
 
             // Call the REAL CUDA scatter kernel
-            super::super::paged::reshape_and_cache_flash(
+            crate::ops::kv_cache::scatter_kv_cache_flash(
                 &k_t, &v_t, &key_cache, &value_cache, &slot_t,
             ).unwrap();
 
@@ -1299,7 +1296,8 @@ mod tests {
     /// Run: cargo test -p prelude-core --lib --features flashinfer -- flashinfer_multi_layer_decode --nocapture
     #[test]
     fn flashinfer_multi_layer_decode() {
-        let dev = Device::new_cuda(0).expect("need CUDA GPU");
+        crate::register();
+        let dev = Device::Cuda(0);
 
         let num_layers: usize = 28; // Qwen3-0.6B
         let num_qo: usize = 16;
@@ -1374,7 +1372,7 @@ mod tests {
                     .to_dtype(DType::BF16).unwrap()
                     .reshape((kv_len, num_kv, head_dim)).unwrap();
                 let slot_t = Tensor::new(&slots[..], &dev).unwrap();
-                super::super::paged::reshape_and_cache_flash(
+                crate::ops::kv_cache::scatter_kv_cache_flash(
                     &k_t, &v_t, &key_caches[layer_idx], &value_caches[layer_idx], &slot_t,
                 ).unwrap();
             }

@@ -11,33 +11,30 @@ name = "prelude_cuda"
 path = "src/lib.rs"
 
 [features]
-default = ["cutlass-gemm"]
-deepgemm = ["dep:prelude-deepgemm"]
-cutlass-gemm = ["dep:prelude-cutlass-gemm"]
-flash-attn-v4 = ["dep:prelude-flash-attn-v4"]
-flashinfer = ["dep:prelude-flashinfer"]
-quant-gemm = ["dep:prelude-quant-gemm"]
-cula = ["dep:prelude-cula"]
+default = []
 
 [dependencies]
 prelude-core = { path = "../prelude-core" }
-candle-core = { workspace = true, features = ["cuda"] }
+cudarc = { version = "0.19.4", features = ["std", "driver", "f16", "nvrtc", "fallback-dynamic-loading", "cuda-version-from-build-system"], default-features = false }
 half = { version = "2.7.1", features = ["bytemuck"] }
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 bc-mimalloc.workspace = true
-ctor = "0.8"
+inventory = "0.3"
 
-prelude-deepgemm = { path = "deepgemm", optional = true }
-prelude-cutlass-gemm = { path = "cutlass-gemm", optional = true }
-prelude-flash-attn-v4 = { path = "fa4", optional = true }
-prelude-flashinfer = { path = "flashinfer", optional = true }
-prelude-quant-gemm = { path = "quant-gemm", optional = true }
-prelude-cula = { path = "cula", optional = true }
+# Always compiled — runtime dispatch selects the best kernel
+prelude-flash-attn-v4 = { path = "fa4" }
+prelude-flashinfer = { path = "flashinfer" }
 
-[[bin]]
-name = "gpu_ops_bench"
-path = "src/bin/gpu_ops_bench/main.rs"
+prelude-deepgemm = { path = "deepgemm" }
+prelude-cutlass-gemm = { path = "cutlass-gemm" }
+prelude-quant-gemm = { path = "quant-gemm" }
+prelude-cula = { path = "cula" }
+
+# gpu_ops_bench temporarily disabled — needs migration from candle_core
+# [[bin]]
+# name = "gpu_ops_bench"
+# path = "src/bin/gpu_ops_bench/main.rs"
 
 [[bin]]
 name = "fused_ops_test"

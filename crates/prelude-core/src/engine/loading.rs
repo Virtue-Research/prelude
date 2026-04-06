@@ -16,7 +16,7 @@ use crate::engine::{
     CommonModelConfig, EmbeddingActivation, EmbeddingDenseLayerSpec, EmbeddingNormalization,
     EmbeddingPooling, EmbeddingSemantics, Engine, EngineError, ModelDescriptor, ModelExecutor,
     ModelVariant, ResolvedModelConfig, RuntimeCaps, TaskKind, TaskOverride, WeightsBackend,
-    candle_err, has_remote_file, init_runtime, load_model_config,
+    tensor_err, has_remote_file, init_runtime, load_model_config,
     load_safetensor_filenames, load_var_builder_from_filenames, load_weights,
     parse_model_config_for_source, select_device,
 };
@@ -361,7 +361,7 @@ fn load_gguf(
 
     let mut file = std::fs::File::open(gguf_path)
         .map_err(|e| EngineError::Internal(format!("failed to open GGUF: {e}")))?;
-    let ct = crate::tensor::quantized::gguf_file::Content::read(&mut file).map_err(candle_err)?;
+    let ct = crate::tensor::quantized::gguf_file::Content::read(&mut file).map_err(tensor_err)?;
 
     let arch = detect_gguf_arch(&ct);
     tracing::info!(arch = %arch, "detected GGUF architecture");
@@ -607,7 +607,7 @@ fn dense_bias_from_config_or_weights(
     // Some sentence-transformers dense configs omit `bias`; use the safetensor
     // payload as the source of truth so we don't silently drop a present bias.
     let weights = unsafe { crate::tensor::safetensors::MmapedSafetensors::new(weight_path) }
-        .map_err(candle_err)?;
+        .map_err(tensor_err)?;
     Ok(weights
         .tensors()
         .into_iter()
@@ -820,8 +820,7 @@ mod tests {
                 Tensor::from_vec(vec![0f32; out_features], out_features, &Device::Cpu).unwrap();
             tensors.insert("linear.bias".to_string(), bias);
         }
-        let candle_tensors: HashMap<String, _> = tensors.into_iter().map(|(k, v)| (k, v.into_candle())).collect();
-        save_safetensors(&candle_tensors, path).unwrap();
+        save_safetensors(&tensors, path).unwrap();
     }
 
     fn write_dense_weights(path: &Path, in_features: usize, out_features: usize) {
