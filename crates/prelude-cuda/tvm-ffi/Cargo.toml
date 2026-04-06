@@ -1,0 +1,15 @@
+[package]
+name = "prelude-tvm-ffi"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+description = "TVM FFI runtime library — shared by FA4, FlashInfer, and cuLA kernel crates."
+license = "Apache-2.0"
+
+[lib]
+name = "prelude_tvm_ffi"
+path = "src/lib.rs"
+
+[build-dependencies]
+anyhow = "1"
+cc = "1"

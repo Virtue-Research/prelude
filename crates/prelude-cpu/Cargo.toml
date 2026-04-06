@@ -16,14 +16,12 @@ onednn = []
 
 [dependencies]
 prelude-core = { path = "../prelude-core" }
-candle-core.workspace = true
 half = { version = "2.7.1", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["extern_crate_alloc", "derive"] }
 rayon = "1.11.0"
 nix = { version = "0.31", features = ["sched"] }
 tracing.workspace = true
 bc-mimalloc.workspace = true
-ctor = "0.8"
 inventory = "0.3"
 
 [[bin]]

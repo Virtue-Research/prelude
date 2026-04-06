@@ -1,10 +1,58 @@
 ## Device Implementations
 
 Each device crate provides two things:
-1. **`Ops`** — implements all 9 op traits (AttentionOps, GemmOps, ...) with optimized kernels
+1. **`OpsBundle`** — overrides **hot-path** op traits with optimized kernels. Non-hot-path ops fall through
+   to **ComposedOps** — default implementations that compose TensorOps primitives.
 2. **`Executor`** — implements `Executor` trait (submit/collect) with device-specific execution strategy
 
 Both are auto-registered via `ctor` at link time. See [construction.md](construction.md).
+
+### Tiered Ops Architecture
+
+```
+Layer 1: TensorOps primitives (unary, binary, reduce, cast, contiguous, matmul, ...)
+          └── Provided by: CubeCL (CUDA/ROCm/Vulkan/Metal/CPU) or XLA (TPU)
+
+Layer 2: ComposedOps (prelude-core, pure composition, no device dependency)
+          └── Composes TensorOps → NormOps, ActivationOps, ConvOps defaults
+          └── e.g., rms_norm = sqr → mean → rsqrt → mul
+
+Layer 3: Device Ops (device crate, optimized overrides)
+          └── Override any op at any level: TensorOps, ComposedOps, or FusedOps
+```
+
+**What each device crate provides:**
+
+| | TensorOps primitives | Hot-path overrides | ComposedOps |
+|--|---------------------|-------------------|------------|
+| **CUDA** | CubeCL `<CudaRuntime>` | CUTLASS/DeepGEMM, FlashInfer/FA4, NCCL | inherits from core |
+| **ROCm** | CubeCL `<HipRuntime>` | CK GEMM, aiter attention, RCCL | inherits from core |
+| **Vulkan** | CubeCL `<WgpuRuntime>` | SPIR-V flash attn, cooperative matmul | inherits from core |
+| **Metal** | CubeCL `<WgpuRuntime>` | MSL flash attn, simdgroup matmul | inherits from core |
+| **TPU** | XLA (`XLATensorOps`) | Pallas attention, XLA dot_general | inherits from core |
+| **CPU** | CubeCL `<CpuRuntime>` | oneDNN GEMM, AVX-512 attention | inherits from core |
+
+**All backends follow the same pattern.** No exceptions. Each:
+1. Provides TensorOps primitives (CubeCL or XLA)
+2. Overrides hot-path ops (GEMM, Attention, KV cache)
+3. Optionally overrides FusedOps, NormOps, ActivationOps, quantized ops, or even individual TensorOps methods
+4. Inherits ComposedOps for everything else
+
+ComposedOps provides correct-but-slow defaults for quantized operations too:
+- `quantized_matmul`: dequantize weights to BF16/FP16, then standard matmul
+- `QuantFormat` (GGUF): dequantize packed weights to float tensor, then standard Linear
+
+Device crates override with native quantized kernels for performance:
+- CUDA: DeepGEMM FP8, CUTLASS INT8, tiled MMQ for GGUF (operates on packed format directly)
+- ROCm: CK FP8 GEMM
+- TPU: XLA INT8/FP8 matmul
+- Metal/Vulkan: in-shader dequant + compute
+- CPU: AVX vec_dot on packed GGUF blocks
+
+**Adding a new device backend (e.g., ROCm):**
+- MUST implement: TensorOps (via `CubeCLTensorOps::<HipRuntime>`), GemmOps, AttentionOps, KvCacheOps, Executor
+- SHOULD implement: FusedOps (fused_add_rmsnorm, fused_silu_mul for performance)
+- CAN skip: NormOps, ActivationOps, ConvOps — ComposedOps handles them automatically
 
 ### CUDA
 

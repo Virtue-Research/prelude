@@ -6,7 +6,7 @@ Target audience: contributors and power users who want to understand the interna
 
 All inference goes through the `InferenceEngine` trait (`engine/mod.rs`).
 Three implementations exist: `PseudoEngine` for testing (no model), `Engine` for
-direct single-request inference via Candle tensors, and `ScheduledEngine` which
+direct single-request inference, and `ScheduledEngine` which
 wraps `Engine` with dynamic batching, pipelined tokenization, and streaming support.
 `ScheduledEngine` is the production path.
 
@@ -14,7 +14,7 @@ wraps `Engine` with dynamic batching, pipelined tokenization, and streaming supp
 InferenceEngine (trait)
   |
   +-- PseudoEngine          mock, no model
-  +-- Engine                 real forward pass (Candle tensors)
+  +-- Engine                 real forward pass (own tensors)
   +-- ScheduledEngine        Engine + dynamic batching + GPU queue
 ```
 
@@ -112,7 +112,7 @@ Recommended GPU build: `flashinfer-v4,onednn,deepgemm` (~98MB binary).
 | cuBLAS    | `cuda`      | GPU      | Default GPU GEMM                              |
 | DeepGEMM  | `deepgemm`  | SM90+    | BF16, replaces cuBLAS. Decode 17%-2x faster   |
 | oneDNN    | `onednn`    | CPU      | BF16 + F32 GEMM, packed weights, static link  |
-| Candle    | (default)   | CPU      | Fallback F32 GEMM when oneDNN is absent       |
+| Built-in  | (default)   | CPU      | Fallback F32 GEMM when oneDNN is absent       |
 
 ## 7. KV Cache
 
@@ -121,7 +121,7 @@ for the active attention backend (128 with FlashInfer/FA3, 16 otherwise) and
 overridable via `PRELUDE_PAGED_BLOCK_SIZE`.
 
 **KV cache write**: custom vectorized PTX kernel (`scatter_kv_cache_flash` in
-`ops/gpu/kv_cache.rs`), 128-bit float4 loads/stores. Independent of candle-paged-attn.
+`ops/gpu/kv_cache.rs`), 128-bit float4 loads/stores.
 
 **Prefix cache** (`prefix_cache.rs`): hash-trie structure that matches incoming
 prompts against cached token blocks using hash chains. LRU eviction of leaf

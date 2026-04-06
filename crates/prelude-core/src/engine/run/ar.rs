@@ -312,9 +312,19 @@ fn process_output(
     // Process each sampled token
     let mut completed: Vec<(String, FinishReason)> = Vec::new();
 
+    let is_prefill = !step.prefill_request_ids.is_empty();
+
     for (row_idx, request_id) in all_ids.iter().enumerate() {
         let Some(state) = states.get_mut(request_id) else { continue; };
         let next_token = sampled[row_idx];
+
+        // After prefill: set prompt_len and next_decode_position from the prepared request.
+        if is_prefill && state.prompt_len == 0 {
+            if let Some(ref prepared) = state.prepared {
+                state.prompt_len = prepared.prompt_tokens.len();
+                state.next_decode_position = state.prompt_len;
+            }
+        }
 
         scheduler.on_token_generated(request_id, next_token);
         state.next_decode_position += 1;

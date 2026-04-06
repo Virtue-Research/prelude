@@ -1,6 +1,4 @@
-//! Prelude error types.
-//!
-//! Subset of candle-core's error enum — only the variants we actually use.
+//! Prelude tensor error types.
 
 use super::shape::Shape;
 
@@ -80,10 +78,10 @@ pub enum Error {
     #[error("{op} expects at least one tensor")]
     OpRequiresAtLeastOneTensor { op: &'static str },
 
-    #[error("the candle crate has not been built with cuda support")]
+    #[error("not compiled with CUDA support")]
     NotCompiledWithCudaSupport,
 
-    #[error("the candle crate has not been built with metal support")]
+    #[error("not compiled with Metal support")]
     NotCompiledWithMetalSupport,
 
     #[error("cannot find tensor {path}")]
@@ -133,19 +131,6 @@ impl Error {
     }
 }
 
-/// Bridge: convert candle_core::Error into our Error.
-impl From<candle_core::Error> for Error {
-    fn from(e: candle_core::Error) -> Self {
-        Error::Msg(e.to_string())
-    }
-}
-
-/// Bridge: convert our Error back to candle_core::Error.
-impl From<Error> for candle_core::Error {
-    fn from(e: Error) -> Self {
-        candle_core::Error::Msg(e.to_string())
-    }
-}
 
 #[macro_export]
 macro_rules! bail {

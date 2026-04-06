@@ -95,110 +95,41 @@ pub fn tensor_as_u16_slice_pub(tensor: &Tensor) -> Result<&[u16]> {
 
 /// Get a zero-copy `&[u16]` view of a CPU BF16 tensor.
 /// Tensor must be contiguous.
+///
+/// # Safety (lifetime)
+/// The returned slice borrows from the tensor's `Arc<RwLock<Storage>>`.
+/// The data pointer is stable because CPU storage Vecs are never reallocated
+/// after creation. The caller must keep the tensor alive.
+/// Internal zero-copy slice (unsafe lifetime extension, no lock held).
+/// Pointer valid while tensor is alive. For perf-critical internal code only;
+/// external users should use `tensor.as_slice::<T>()` which returns a guard.
 pub(crate) fn tensor_as_u16_slice(tensor: &Tensor) -> Result<&[u16]> {
-    if !tensor.is_contiguous() {
-        prelude_core::tensor::bail!(
-            "tensor_as_u16_slice: tensor is not contiguous (shape={:?}, stride={:?}). \
-             Call .contiguous()? first and keep the result alive.",
-            tensor.dims(), tensor.stride()
-        );
-    }
-    let (storage, layout) = tensor.storage_and_layout();
-    let offset = layout.start_offset();
-    let n = layout.shape().elem_count();
-    match &*storage {
-        prelude_core::tensor::backend::Storage::Cpu(cpu) => {
-            let slice = cpu.as_slice::<half::bf16>()?;
-            let data = &slice[offset..offset + n];
-            Ok(unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u16, data.len()) })
-        }
-        _ => prelude_core::tensor::bail!("cpu_ops: expected CPU storage"),
-    }
+    assert!(tensor.is_contiguous());
+    unsafe { Ok(std::slice::from_raw_parts(tensor.data_ptr()? as *const u16, tensor.elem_count())) }
 }
 
-/// Get a zero-copy `&[f32]` view of a CPU F32 tensor.
-/// Tensor must be contiguous.
-///
-/// # Safety
-/// Same lifetime contract as `tensor_as_u16_slice`: the returned slice is
-/// valid as long as the originating `Tensor` is alive.
+pub(crate) fn tensor_as_bf16_slice(tensor: &Tensor) -> Result<&[half::bf16]> {
+    assert!(tensor.is_contiguous());
+    unsafe { Ok(std::slice::from_raw_parts(tensor.data_ptr()? as *const half::bf16, tensor.elem_count())) }
+}
+
 pub(crate) fn tensor_as_f32_slice(tensor: &Tensor) -> Result<&[f32]> {
-    if !tensor.is_contiguous() {
-        prelude_core::tensor::bail!(
-            "tensor_as_f32_slice: tensor is not contiguous (shape={:?}, stride={:?})",
-            tensor.dims(), tensor.stride()
-        );
-    }
-    let (storage, layout) = tensor.storage_and_layout();
-    let offset = layout.start_offset();
-    let n = layout.shape().elem_count();
-    match &*storage {
-        prelude_core::tensor::backend::Storage::Cpu(cpu) => {
-            let slice = cpu.as_slice::<f32>()?;
-            let data = &slice[offset..offset + n];
-            Ok(unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) })
-        }
-        _ => prelude_core::tensor::bail!("tensor_as_f32_slice: expected CPU storage"),
-    }
-}
-
-/// Get a mutable `&mut [u16]` view into a CPU BF16 tensor's storage.
-///
-/// # Safety
-/// Caller must guarantee exclusive access to the storage region `[offset..offset+n]`.
-pub(crate) unsafe fn extract_bf16_mut_u16(
-    storage: &mut prelude_core::tensor::backend::Storage,
-    offset: usize,
-    n: usize,
-) -> Result<&mut [u16]> {
-    match storage {
-        prelude_core::tensor::backend::Storage::Cpu(prelude_core::tensor::backend::CpuStorage::BF16(data)) => {
-            let ptr = unsafe { data.as_mut_ptr().add(offset) as *mut u16 };
-            Ok(unsafe { std::slice::from_raw_parts_mut(ptr, n) })
-        }
-        _ => prelude_core::tensor::bail!("cpu_ops: expected CPU BF16 storage"),
-    }
-}
-
-/// Get a mutable `&mut [f32]` view into a CPU F32 tensor's storage.
-///
-/// # Safety
-/// Caller must guarantee exclusive access to the storage region `[offset..offset+n]`.
-pub(crate) unsafe fn extract_f32_mut(
-    storage: &mut prelude_core::tensor::backend::Storage,
-    offset: usize,
-    n: usize,
-) -> Result<&mut [f32]> {
-    match storage {
-        prelude_core::tensor::backend::Storage::Cpu(prelude_core::tensor::backend::CpuStorage::F32(data)) => {
-            let ptr = unsafe { data.as_mut_ptr().add(offset) };
-            Ok(unsafe { std::slice::from_raw_parts_mut(ptr, n) })
-        }
-        _ => prelude_core::tensor::bail!("cpu_ops: expected CPU F32 storage"),
-    }
+    assert!(tensor.is_contiguous());
+    unsafe { Ok(std::slice::from_raw_parts(tensor.data_ptr()? as *const f32, tensor.elem_count())) }
 }
 
 // ── Safe in-place mutation helpers ──────────────────────────────────────
 
+
 /// In-place BF16 residual add: `tensor[..] += src[..]`.
 ///
-/// This is safe because it acquires exclusive mutable access via candle's
-/// `storage_mut_and_layout()` write lock. The caller must ensure this tensor
-/// is not aliased by other tensors sharing the same storage (e.g., via reshape/narrow).
+/// Acquires exclusive write access to the tensor's storage.
+/// Caller must ensure no other tensor aliases this storage region.
 pub(crate) fn inplace_add_bf16(tensor: &Tensor, src: &[u16]) -> Result<()> {
     let n = src.len();
-    // SAFETY: we hold the exclusive write lock for the duration of this function.
-    let (mut storage, layout) = unsafe { tensor.storage_mut_and_layout() };
-    // SAFETY: we hold the exclusive write lock via storage_mut_and_layout().
-    // Caller guarantees no other tensor aliases this storage region.
-    let data = unsafe { extract_bf16_mut_u16(&mut storage, layout.start_offset(), n)? };
-    // SAFETY: both pointers are valid, non-overlapping, and cover `n` elements.
     unsafe {
-        crate::raw_cpu::raw_residual_add_bf16(
-            data.as_mut_ptr(),
-            src.as_ptr(),
-            n,
-        );
+        let ptr = tensor.data_ptr_mut()? as *mut u16;
+        crate::raw_cpu::raw_residual_add_bf16(ptr, src.as_ptr(), n);
     }
     Ok(())
 }
@@ -206,20 +137,14 @@ pub(crate) fn inplace_add_bf16(tensor: &Tensor, src: &[u16]) -> Result<()> {
 /// In-place F32 residual add: `tensor[..] += src[..]`.
 pub(crate) fn inplace_add_f32(tensor: &Tensor, src: &[f32]) -> Result<()> {
     let n = src.len();
-    // SAFETY: we hold the exclusive write lock for the duration of this function.
-    let (mut storage, layout) = unsafe { tensor.storage_mut_and_layout() };
-    let data = unsafe { extract_f32_mut(&mut storage, layout.start_offset(), n)? };
     unsafe {
-        crate::raw_cpu::raw_residual_add_f32(
-            data.as_mut_ptr(),
-            src.as_ptr(),
-            n,
-        );
+        let ptr = tensor.data_ptr_mut()? as *mut f32;
+        crate::raw_cpu::raw_residual_add_f32(ptr, src.as_ptr(), n);
     }
     Ok(())
 }
 
-/// Convert a `Vec<u16>` (BF16 bit patterns) back to a Candle BF16 tensor.
+/// Convert a `Vec<u16>` (BF16 bit patterns) back to a BF16 tensor.
 pub(crate) fn u16_vec_to_bf16_tensor(buf: Vec<u16>, shape: &[usize], device: &Device) -> Result<Tensor> {
     let bf16_vec: Vec<half::bf16> = bytemuck::cast_vec(buf);
     Tensor::from_vec(bf16_vec, shape, device)
@@ -352,14 +277,10 @@ mod rope_tensor {
         let cache_slice = super::tensor_as_u16_slice(cos_sin_cache)?;
 
         {
-            let (mut q_guard, q_layout) = unsafe { q_2d.storage_mut_and_layout() };
-            let (mut k_guard, k_layout) = unsafe { k_2d.storage_mut_and_layout() };
-            let q_slice = unsafe {
-                super::extract_bf16_mut_u16(&mut q_guard, q_layout.start_offset(), batch_size * seq_len * num_heads * head_dim)?
-            };
-            let k_slice = unsafe {
-                super::extract_bf16_mut_u16(&mut k_guard, k_layout.start_offset(), batch_size * seq_len * num_kv_heads * head_dim)?
-            };
+            let q_n = batch_size * seq_len * num_heads * head_dim;
+            let k_n = batch_size * seq_len * num_kv_heads * head_dim;
+            let q_slice = unsafe { std::slice::from_raw_parts_mut(q_2d.data_ptr_mut()? as *mut u16, q_n) };
+            let k_slice = unsafe { std::slice::from_raw_parts_mut(k_2d.data_ptr_mut()? as *mut u16, k_n) };
 
             super::rope::rope_neox_bf16(
                 q_slice, k_slice, cache_slice, positions,
@@ -397,14 +318,10 @@ mod rope_tensor {
         let cache_slice = super::tensor_as_f32_slice(cos_sin_cache)?;
 
         {
-            let (mut q_guard, q_layout) = unsafe { q_2d.storage_mut_and_layout() };
-            let (mut k_guard, k_layout) = unsafe { k_2d.storage_mut_and_layout() };
-            let q_slice = unsafe {
-                super::extract_f32_mut(&mut q_guard, q_layout.start_offset(), batch_size * seq_len * num_heads * head_dim)?
-            };
-            let k_slice = unsafe {
-                super::extract_f32_mut(&mut k_guard, k_layout.start_offset(), batch_size * seq_len * num_kv_heads * head_dim)?
-            };
+            let q_n = batch_size * seq_len * num_heads * head_dim;
+            let k_n = batch_size * seq_len * num_kv_heads * head_dim;
+            let q_slice = unsafe { std::slice::from_raw_parts_mut(q_2d.data_ptr_mut()? as *mut f32, q_n) };
+            let k_slice = unsafe { std::slice::from_raw_parts_mut(k_2d.data_ptr_mut()? as *mut f32, k_n) };
 
             super::rope::rope_neox_f32(
                 q_slice, k_slice, cache_slice, positions,

@@ -3,9 +3,8 @@
 //! Converts quantized weight blocks to BF16 on the GPU.
 //! All kernel implementations live in prelude-quant-gemm.
 
-use candle_core::backend::BackendStorage;
-use candle_core::cuda_backend::cudarc::driver::DevicePtr;
-use candle_core::{DType, Result, Tensor};
+use crate::device::{self as cb, CuResultExt, DevicePtr};
+use prelude_core::tensor::{bail, DType, Result, Tensor};
 use std::ffi::c_void;
 
 /// Dequantize a GGUF quantized tensor to BF16 on the GPU.
@@ -19,21 +18,17 @@ pub fn dequantize_to_bf16(
     num_elements: usize,
     weight_type: prelude_quant_gemm::GgmlType,
 ) -> Result<Tensor> {
-    let (storage, layout) = quantized_data.storage_and_layout();
-    let cuda_storage = match &*storage {
-        candle_core::Storage::Cuda(s) => s,
-        _ => candle_core::bail!("dequantize_to_bf16: requires CUDA tensor"),
-    };
+    let (storage, layout) = cb::storage_and_layout(&quantized_data);
+    let device = cb::as_cuda(&storage, "dequantize_to_bf16")?;
 
-    if cuda_storage.dtype() != DType::U8 {
-        candle_core::bail!("dequantize_to_bf16: input must be U8 (raw GGUF bytes)");
+    if device.dtype() != DType::U8 {
+        bail!("dequantize_to_bf16: input must be U8 (raw GGUF bytes)");
     }
 
-    let dev = cuda_storage.device().clone();
-    let input_slice = cuda_storage.as_cuda_slice::<u8>()?.slice(layout.start_offset()..);
-    let output = unsafe { dev.alloc::<half::bf16>(num_elements) }?;
+    let stream = device.stream.clone();
+    let input_slice = device.as_slice::<u8>()?.slice(layout.start_offset()..);
+    let output = unsafe { stream.alloc::<half::bf16>(num_elements) }.ce()?;
 
-    let stream = dev.cuda_stream();
     let raw_stream = unsafe { stream.cu_stream() } as *const c_void;
 
     let in_ptr = input_slice.device_ptr(&stream).0 as *const c_void;
@@ -50,12 +45,5 @@ pub fn dequantize_to_bf16(
 
     drop(storage);
 
-    let out_storage = candle_core::CudaStorage::wrap_cuda_slice(output, dev);
-    let out_tensor = Tensor::from_storage(
-        candle_core::Storage::Cuda(out_storage),
-        candle_core::Shape::from(num_elements),
-        candle_core::op::BackpropOp::none(),
-        false,
-    );
-    Ok(out_tensor)
+    Ok(cb::tensor_from_cuda(output, stream, num_elements))
 }

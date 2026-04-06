@@ -12,6 +12,7 @@ include!("../../../build_log.rs");
 
 fn main() {
     println!("cargo:rerun-if-changed=src/cutlass_wrapper.cu");
+    println!("cargo:rerun-if-changed=src/naive_gemm.cu");
     track_submodule("cutlass");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -35,7 +36,7 @@ fn main() {
         panic!("nvcc not found at {}", nvcc.display());
     }
 
-    // 3. Compile cutlass_wrapper.cu
+    // 3. Compile cutlass_wrapper.cu (CUTLASS template kernels)
     // SM90 native for 3.x CollectiveBuilder (TMA + warp-specialized)
     // SM80 for 3.x manual CollectiveMma (cp.async + TensorOp)
     let cu_src = manifest_dir.join("src/cutlass_wrapper.cu");
@@ -77,12 +78,42 @@ fn main() {
         panic!("nvcc compilation failed for cutlass_wrapper.cu");
     }
 
-    // 4. Create static archive
+    // 3b. Compile naive_gemm.cu — separate TU, no CUTLASS headers.
+    // Isolated to avoid CUTLASS template machinery corrupting simple kernels.
+    let naive_src = manifest_dir.join("src/naive_gemm.cu");
+    let naive_obj = out_dir.join("naive_gemm.o");
+
+    let mut naive_cmd = Command::new(&nvcc);
+    naive_cmd.args([
+        "-std=c++17",
+        "-O3",
+        "-Xcompiler", "-fPIC",
+        "-gencode=arch=compute_80,code=sm_80",
+        "-gencode=arch=compute_90a,code=sm_90a",
+    ]);
+    if sm100 {
+        naive_cmd.arg("-gencode=arch=compute_100a,code=sm_100a");
+    }
+    let status = naive_cmd
+        .args([
+            "-I", &format!("{}/include", cuda_path.display()),
+            "-c", naive_src.to_str().unwrap(),
+            "-o", naive_obj.to_str().unwrap(),
+        ])
+        .status()
+        .expect("Failed to run nvcc for naive_gemm.cu");
+
+    if !status.success() {
+        panic!("nvcc compilation failed for naive_gemm.cu");
+    }
+
+    // 4. Create static archive from both object files
     let lib = out_dir.join("libcutlass_gemm.a");
     let status = Command::new(&nvcc)
         .arg("--lib")
         .args(["-o", lib.to_str().unwrap()])
         .arg(&obj)
+        .arg(&naive_obj)
         .status()
         .expect("Failed to run nvcc --lib");
     if !status.success() {

@@ -1,7 +1,7 @@
 ## Tensor Type
 
 The `Tensor` is the fundamental data structure. It is a **thin handle** — holds a device
-pointer, shape, and dtype. No computation methods. All computation goes through `Ops` traits.
+pointer, shape, and dtype. No computation methods. All computation goes through `OpsBundle`.
 
 ```rust
 // prelude-core/src/tensor.rs
@@ -56,8 +56,8 @@ impl Tensor {
 ### What Tensor CANNOT do (computation → goes through Ops)
 
 ```
-❌ tensor.matmul(&other)         →  ops.gemm.matmul(&a, &b)
-❌ tensor.softmax(dim)           →  ops.act.softmax(&x, dim)
+❌ tensor.matmul(&other)         →  ops.matmul(&a, &b)
+❌ tensor.softmax(dim)           →  ops.softmax(&x, dim)
 ❌ tensor.add(&other)            →  element-wise via Ops or operator overload delegating to Ops
 ❌ tensor.to_device(cuda)        →  device crate allocates + copies
 ❌ tensor.to_dtype(bf16)         →  device crate handles cast kernel
@@ -159,7 +159,7 @@ impl DType {
 ### BatchState
 
 Per-batch runtime state passed to model forward and `Linear.forward`.
-Separate from `Ops` (per-device, static) and model weights (per-model, static).
+Separate from `OpsBundle` (per-device, static) and model weights (per-model, static).
 
 ```rust
 // prelude-core/src/tensor.rs
@@ -178,15 +178,9 @@ Models that don't use LoRA still receive `BatchState` but never inspect it — t
 forward it to `Linear` and module functions. The engine constructs it before each
 forward pass with the current batch's adapter routing.
 
-### Relation to candle-core
+### Relation to prelude_core::tensor
 
-The current codebase uses `candle_core::Tensor` which bundles computation + device dispatch
-inside the Tensor itself. Migrating to this minimal Tensor is part of the Ops trait refactoring:
-
-1. Replace `candle_core::Tensor` with `prelude_core::Tensor` (thin handle)
-2. Move `Storage::Cuda` pattern matches into `CudaOps` trait impls
-3. Move `Storage::Cpu` pattern matches into `CpuOps` trait impls
-4. Model code changes `tensor.matmul(&b)` → `ops.gemm.matmul(&a, &b)`
-5. candle-core becomes unused, remove dependency
-
-This is the same work as implementing the Ops trait system — not additional effort.
+The codebase uses `prelude_core::tensor::Tensor` — a thin handle over own Storage + Layout.
+Device-specific storage (`CudaStorage`, `CpuStorage`) lives in the device crates
+(`prelude-cuda`, `prelude-core`). Computation is dispatched through the OpsBundle system,
+not bundled inside the Tensor itself.

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::tensor::{DType, Device};
 use super::weight_loader::VarBuilder;
 
-use crate::engine::{candle_err, EngineError};
+use crate::engine::{tensor_err, EngineError};
 
 pub(crate) fn has_remote_file(repo: &hf_hub::api::sync::ApiRepo, filename: &str) -> bool {
     repo.get(filename).is_ok()
@@ -83,7 +83,7 @@ pub(crate) fn load_var_builder_from_filenames(
         )));
     }
     tracing::info!(count = filenames.len(), "loading safetensors shards");
-    unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, device).map_err(candle_err) }
+    unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, device).map_err(tensor_err) }
 }
 
 /// Parse `model.safetensors.index.json` content and return unique shard filenames

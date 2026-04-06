@@ -32,10 +32,9 @@ trait AttentionOps: Send + Sync {
 /// Scheduling metadata uses `&Tensor`, not `&[u32]`.
 ///
 /// Rationale: cu_seqlens and block_tables may live on any device. Using Tensor
-/// lets the backend read them wherever they are. When we replace candle_core
-/// with our own minimal Tensor, the type changes but the trait signatures don't.
-/// Our minimal Tensor will be a zero-cost wrapper over host slices for CPU data,
-/// so there's no overhead vs `&[u32]` for the CPU case.
+/// lets the backend read them wherever they are. Our own Tensor is a zero-cost
+/// wrapper over host slices for CPU data, so there's no overhead vs `&[u32]`
+/// for the CPU case.
 struct VarlenParams<'a> {
     pub cu_seqlens_q: &'a Tensor,  // [batch+1], cumulative sequence offsets
     pub cu_seqlens_k: &'a Tensor,  // [batch+1], may differ from cu_seqlens_q (cross-attention)
@@ -302,12 +301,12 @@ trait CommOps: Send + Sync {
 **How TP uses CommOps:**
 
 ```rust
-// prelude-core/src/modules/linear.rs — inside Linear::forward, step 3 (TP)
+// prelude-core/src/models/commons/linear.rs — inside Linear::forward, step 3 (TP)
 
 match self.tp {
-    TpMode::Row => ops.comm.all_reduce_sum(&out),           // row parallel: reduce
+    TpMode::Row => ops.all_reduce_sum(&out),           // row parallel: reduce
     TpMode::Column { gather_output: true } =>
-        ops.comm.all_gather(&out, /*dim=*/-1),              // col parallel: gather
+        ops.all_gather(&out, /*dim=*/-1),              // col parallel: gather
     _ => Ok(out),                                            // col { gather: false } or None
 }
 ```
@@ -400,7 +399,7 @@ trait FusedOps: Send + Sync {
     ) -> Option<Result<Tensor>> { None }
 
     /// Fused element-wise add. Used by Tensor `+` operator overload via thread-local
-    /// Ops context. Returns `None` to fall back to candle's add, `Some` for vectorized kernel.
+    /// Ops context. Returns `None` to fall back to the built-in add, `Some` for vectorized kernel.
     fn fused_add(
         &self, a: &Tensor, b: &Tensor,
     ) -> Option<Result<Tensor>> { None }
@@ -416,11 +415,11 @@ trait FusedOps: Send + Sync {
 
 ```rust
 // prelude-core/src/models/ — model code, fusion boundary is explicit
-let (q, k) = match ops.fused.fused_qknorm_rope(&q, &k, ...) {
+let (q, k) = match ops.fused_qknorm_rope(&q, &k, ...) {
     Some(result) => result?,            // device supports it
     None => {                           // fallback to separate ops
-        let q = ops.norm.rms_norm(&q, &qw, eps)?;
-        let k = ops.norm.rms_norm(&k, &kw, eps)?;
+        let q = ops.rms_norm(&q, &qw, eps)?;
+        let k = ops.rms_norm(&k, &kw, eps)?;
         (apply_rope(&q, cos, sin)?, apply_rope(&k, cos, sin)?)
     }
 };
@@ -439,3 +438,25 @@ step 2: paged_attention(q, cache)                            // reads from cache
 If cache write were a "hint" inside `paged_attention`, step 1 couldn't exist as a separate fused kernel. The model must control the boundary between cache write and attention.
 
 **Extensibility:** New fusions are new methods on `FusedOps`. Devices that don't support them return `None`. No combinatorial explosion — each fusion is independent, not a combination of flags.
+
+### TensorOps Dual Backend (Temporary)
+
+The `TensorOps` trait currently has two parallel implementations for CPU:
+
+```
+ops/
+  traits/              — trait definitions (shared)
+  composed/            — ComposedOps fallbacks (shared, backend-agnostic)
+  cubecl_backend/      — CubeCLTensorOps: CubeCL runtime, Storage::CubeCL
+  device_backend/      — DeviceTensorOps: pure Rust, Storage::Device
+```
+
+**Why two:** We're validating CubeCL as our long-term compute backend. During this period, both implementations run the same test suite, selected by `PRELUDE_TENSOR_BACKEND` env var (`"device"` or `"cubecl"`, default `"cubecl"`).
+
+**Rules:**
+- The two paths are completely isolated. No bridge code, no cross-storage conversion.
+- `Tensor::from_vec` creates the matching storage type based on the active backend.
+- `Tensor::data_ptr()` / `as_slice<T>()` / `as_mut_slice<T>()` dispatch through TensorOps — backend-agnostic API for device crates.
+- prelude-cpu's high-level ops (attention, rmsnorm, etc.) use only these generic APIs, never reference a specific backend.
+
+**End state:** Once CubeCL stabilizes, delete one backend, rename the survivor to `primitives/`, and remove the env var switch. The directory structure returns to a single `primitives/` folder. No other code changes needed — everything goes through TensorOps dispatch.

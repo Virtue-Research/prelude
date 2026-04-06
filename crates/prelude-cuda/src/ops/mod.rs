@@ -10,7 +10,5 @@ pub(crate) mod moe;
 pub(crate) mod rmsnorm;
 pub(crate) mod rope;
 
-#[cfg(feature = "quant-gemm")]
 pub(crate) mod quant;
-#[cfg(feature = "quant-gemm")]
 pub(crate) mod tiled_mmq;

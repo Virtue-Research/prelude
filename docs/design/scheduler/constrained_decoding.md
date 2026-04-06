@@ -53,7 +53,7 @@ Next step (or finish if grammar reaches accept state)
 // prelude-core/src/engine/sampling/grammar.rs
 
 /// Pluggable grammar engine. Compiles constraints into token-level matchers.
-/// Default implementation uses xgrammar (compiled C++ via FFI).
+/// Default implementation uses llguidance (pure Rust, MIT license).
 trait GrammarBackend: Send + Sync {
     /// Compile a constraint specification into a grammar matcher.
     /// This can be expensive (10-100ms for complex JSON schemas).
@@ -102,26 +102,21 @@ enum ConstraintSpec {
 - **We take**: vLLM's clean interface names + SGLang's `rollback()` method (needed for spec decode).
   Keep the trait minimal — `fill_bitmask` + `accept_token` + `rollback` + `is_terminated`.
 
-### Concrete Backends
+### Concrete Backend
 
 ```rust
 // prelude-core/src/engine/sampling/grammar.rs
 
-/// XGrammar: compiled C++ engine via FFI. Fast, GPU-optimized bitmask.
-/// Primary backend for production.
-/// Implemented in prelude-xgrammar/ crate (compiles third_party/xgrammar/).
-struct XGrammarBackend {
-    compiler: XGrammarCompiler,  // FFI to xgrammar C++ library
-    cache: LruCache<String, CompiledGrammar>,  // cache compiled grammars
+/// LLGuidance: pure Rust constrained decoding engine (MIT license, Microsoft).
+/// Earley parser + derivative-based regex. ~50μs per token for 128k tokenizers.
+/// Zero startup overhead (no pre-computation needed).
+/// Powers OpenAI Structured Outputs. Integrated in llama.cpp, vLLM, SGLang.
+///
+/// Direct Rust crate dependency — no C++ FFI, no third_party/ submodule.
+struct LlguidanceBackend {
+    tokenizer: llguidance::LLTokenizer,
+    cache: LruCache<String, llguidance::CompiledGrammar>,
 }
-
-/// Outlines: Python-originated FSM engine, ported to Rust.
-/// Fallback for complex grammars that xgrammar can't handle.
-struct OutlinesBackend {
-    // regex → FSM compilation
-}
-
-// Future: LLGuidance, custom Rust grammar engine, etc.
 ```
 
 ## GrammarManager
@@ -189,9 +184,9 @@ impl GrammarManager {
 
 Executor::execute(&batch)
     │
-    ├── ops.session.begin_forward()
+    ├── ops.begin_forward()
     ├── model.forward() → logits             # GPU
-    ├── ops.session.end_forward()
+    ├── ops.end_forward()
     │
     ├── grammar_manager.fill_bitmask(&batch)  # CPU (parallel for large batches)
     │
@@ -222,7 +217,7 @@ Request 3: choice ["yes", "no", "maybe"]
 ```
 
 The bitmask tensor has one row per request. `fill_bitmask` fills each row independently:
-- Request 0: xgrammar JSON matcher → row 0
+- Request 0: llguidance JSON matcher → row 0
 - Request 1: regex FSM → row 1
 - Request 2: all 1s → row 2 (no filtering)
 - Request 3: only tokens starting "yes"/"no"/"maybe" → row 3
@@ -276,8 +271,8 @@ struct SamplingParams {
 
 // Engine-level config for grammar backend
 struct GrammarConfig {
-    /// Backend to use. "auto" picks xgrammar if available.
-    pub backend: String,           // "xgrammar" | "outlines" | "auto"
+    /// Backend to use. Default: llguidance (pure Rust, always available).
+    pub backend: String,           // "llguidance" | "auto"
     /// Max concurrent grammar compilations.
     pub compile_workers: usize,    // default: num_cpus / 2
     /// Grammar compilation cache size.

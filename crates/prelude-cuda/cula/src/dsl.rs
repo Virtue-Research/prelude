@@ -5,72 +5,12 @@
 
 use std::ffi::c_void;
 
-// ── TVM FFI types (identical to FA4) ─────────────────────────────────
+// ── TVM FFI types (from shared prelude-tvm-ffi crate) ───────────────
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct DLDevice {
-    pub device_type: i32,
-    pub device_id: i32,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct DLDataType {
-    pub code: u8,
-    pub bits: u8,
-    pub lanes: u16,
-}
-
-#[repr(C)]
-pub struct DLTensor {
-    pub data: *mut c_void,
-    pub device: DLDevice,
-    pub ndim: i32,
-    pub dtype: DLDataType,
-    pub shape: *const i64,
-    pub strides: *const i64,
-    pub byte_offset: u64,
-}
-
-pub const KDLCUDA: i32 = 2;
-pub const KDLBFLOAT: u8 = 4;
-pub const KDLFLOAT: u8 = 2;
-pub const KDLINT: u8 = 0;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct TVMFFIAny {
-    pub type_index: i32,
-    pub zero_padding: u32,
-    pub v_union: u64,
-}
-
-const KTVMFFI_NONE: i32 = 0;
-const KTVMFFI_INT: i32 = 1;
-const KTVMFFI_FLOAT: i32 = 3;
-const KTVMFFI_DLTENSOR_PTR: i32 = 7;
-
-impl TVMFFIAny {
-    pub fn none() -> Self {
-        Self { type_index: KTVMFFI_NONE, zero_padding: 0, v_union: 0 }
-    }
-    pub fn dltensor(tensor: *const DLTensor) -> Self {
-        Self { type_index: KTVMFFI_DLTENSOR_PTR, zero_padding: 0, v_union: tensor as u64 }
-    }
-    pub fn float32(val: f32) -> Self {
-        let f64_val = val as f64;
-        Self { type_index: KTVMFFI_FLOAT, zero_padding: 0, v_union: f64_val.to_bits() }
-    }
-    pub fn int32(val: i32) -> Self {
-        Self { type_index: KTVMFFI_INT, zero_padding: 0, v_union: val as i64 as u64 }
-    }
-}
-
-// ── Kernel dispatch ──────────────────────────────────────────────────
-
-pub type TVMSafeCallFn =
-    unsafe extern "C" fn(*mut c_void, *const TVMFFIAny, i32, *mut TVMFFIAny) -> i32;
+pub use prelude_tvm_ffi::{
+    DLDevice, DLDataType, DLTensor, TVMFFIAny, TVMSafeCallFn,
+    KDLCUDA, KDLBFLOAT, KDLFLOAT, KDLINT,
+};
 
 // Include build.rs-generated dispatch table
 include!(concat!(env!("OUT_DIR"), "/cula_dsl_dispatch.rs"));

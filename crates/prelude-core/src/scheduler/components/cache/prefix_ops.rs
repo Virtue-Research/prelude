@@ -3,8 +3,8 @@ use crate::engine::EngineError;
 use crate::engine::PreparedGenerateRequest;
 use tracing::debug;
 
-fn candle_err(e: crate::tensor::Error) -> EngineError {
-    EngineError::Internal(format!("candle: {e}"))
+fn tensor_err(e: crate::tensor::Error) -> EngineError {
+    EngineError::Internal(format!("tensor error: {e}"))
 }
 
 impl CacheManager {
@@ -21,7 +21,7 @@ impl CacheManager {
         let mut pc = pc_mutex
             .lock()
             .map_err(|e| EngineError::Internal(format!("prefix cache lock poisoned: {e}")))?;
-        let (cached_len, paged_ids) = pc.match_paged_blocks_only(tokens).map_err(candle_err)?;
+        let (cached_len, paged_ids) = pc.match_paged_blocks_only(tokens).map_err(tensor_err)?;
         if cached_len > 0 {
             debug!(
                 cached_tokens = cached_len,

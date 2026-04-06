@@ -72,7 +72,7 @@ Build the model layers and implement the forward pass:
 
 ```rust
 pub struct MyModelForCausalLM {
-    embed_tokens: candle_nn::Embedding,
+    embed_tokens: prelude_core::modules::embedding::Embedding,
     layers: Vec<MyDecoderLayer>,
     norm: RmsNorm,
     lm_head: Linear,
@@ -81,7 +81,7 @@ pub struct MyModelForCausalLM {
 }
 
 impl MyModelForCausalLM {
-    pub fn new(cfg: &MyModelConfig, vb: VarBuilder<'_>) -> candle_core::Result<Self> {
+    pub fn new(cfg: &MyModelConfig, vb: VarBuilder<'_>) -> prelude_core::tensor::Result<Self> {
         // load weights from vb
     }
 
@@ -89,7 +89,7 @@ impl MyModelForCausalLM {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
+    ) -> prelude_core::tensor::Result<Tensor> {
         // embed -> layers -> norm -> lm_head
     }
 
@@ -113,7 +113,7 @@ impl ModelForward for MyModelForCausalLM {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
+    ) -> prelude_core::tensor::Result<Tensor> {
         self.forward(packed_input, ctx)
     }
 
@@ -125,7 +125,7 @@ impl ModelForward for MyModelForCausalLM {
     fn set_kv_cache_enabled(&mut self, enabled: bool) { /* ... */ }
     fn set_kv_cache_capacity(&mut self, target: usize) { /* ... */ }
     fn force_kv_cache_prealloc(&mut self, target: usize) { /* ... */ }
-    fn inject_kv_cache(&mut self, layer_kvs: &[(Tensor, Tensor)]) -> candle_core::Result<()> { /* ... */ }
+    fn inject_kv_cache(&mut self, layer_kvs: &[(Tensor, Tensor)]) -> prelude_core::tensor::Result<()> { /* ... */ }
     fn extract_kv_cache(&self) -> Vec<Option<(Tensor, Tensor)>> { /* ... */ }
 }
 ```
@@ -134,7 +134,7 @@ impl ModelForward for MyModelForCausalLM {
 
 ```rust
 impl ModelForward for MyModelForClassification {
-    fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> candle_core::Result<Tensor> {
+    fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> prelude_core::tensor::Result<Tensor> {
         MyModelForClassification::forward(self, packed_input, ctx)
         // ^ use fully-qualified syntax to call inherent method, not trait method
     }
@@ -163,7 +163,7 @@ impl ModelForward for MyModelForClassification {
 
 ```rust
 impl ModelForward for MyModelForEmbedding {
-    fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> candle_core::Result<Tensor> {
+    fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> prelude_core::tensor::Result<Tensor> {
         self.forward(packed_input, ctx)
     }
 
@@ -201,7 +201,7 @@ use super::*;
 use crate::engine::{CommonModelConfig, RuntimeCaps, TaskKind, WeightsBackend};
 use crate::engine::EngineError;
 use crate::models::registry::{
-    parse_json, candle_model_err, ArchSpec, ParsedModelConfig,
+    parse_json, model_err, ArchSpec, ParsedModelConfig,
 };
 
 const ARCHITECTURE_ALIASES: &[&str] = &["MyModelForCausalLM"];
@@ -248,7 +248,7 @@ impl ArchSpec for MyModelArchSpec {
             .downcast_ref::<MyModelConfig>()
             .ok_or_else(|| EngineError::Internal("unexpected config for MyModel".into()))?;
         Ok(Box::new(
-            MyModelForCausalLM::new(cfg, vb).map_err(candle_model_err)?,
+            MyModelForCausalLM::new(cfg, vb).map_err(model_err)?,
         ))
     }
 
@@ -256,7 +256,7 @@ impl ArchSpec for MyModelArchSpec {
         &self,
         task: TaskKind,
         backend: WeightsBackend,
-        device: &candle_core::Device,
+        device: &prelude_core::tensor::Device,
     ) -> RuntimeCaps {
         let cuda_safetensors = device.is_cuda() && backend == WeightsBackend::Safetensors;
         RuntimeCaps {
@@ -313,9 +313,9 @@ fn build_model(&self, arch_config: &dyn std::any::Any, vb: VarBuilder<'_>)
     let cfg = arch_config.downcast_ref::<MyModelArchConfig>()
         .ok_or_else(|| EngineError::Internal("unexpected config".into()))?;
     match cfg {
-        MyModelArchConfig::Dense(c) => Ok(Box::new(MyModelForCausalLM::new(c, vb).map_err(candle_model_err)?)),
-        MyModelArchConfig::Classifier(c) => Ok(Box::new(MyModelForClassification::new(c, vb).map_err(candle_model_err)?)),
-        MyModelArchConfig::Embedding(c) => Ok(Box::new(MyModelForEmbedding::new(c, vb).map_err(candle_model_err)?)),
+        MyModelArchConfig::Dense(c) => Ok(Box::new(MyModelForCausalLM::new(c, vb).map_err(model_err)?)),
+        MyModelArchConfig::Classifier(c) => Ok(Box::new(MyModelForClassification::new(c, vb).map_err(model_err)?)),
+        MyModelArchConfig::Embedding(c) => Ok(Box::new(MyModelForEmbedding::new(c, vb).map_err(model_err)?)),
     }
 }
 ```

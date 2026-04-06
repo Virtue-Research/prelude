@@ -57,7 +57,7 @@ trait DraftProposer: Send + Sync {
         last_token_ids: &Tensor,         // [batch_size] last verified tokens
         positions: &Tensor,              // [batch_size] current positions
         num_draft_tokens: usize,
-        ops: &Ops,
+        ops: &OpsBundle,
     ) -> Result<Tensor>;
 
     /// For tree-based methods (EAGLE/Medusa): generate a tree of candidates.
@@ -68,7 +68,7 @@ trait DraftProposer: Send + Sync {
         last_token_ids: &Tensor,
         positions: &Tensor,
         tree_config: &TreeConfig,
-        ops: &Ops,
+        ops: &OpsBundle,
     ) -> Result<Vec<Tensor>> {
         // Default: linear chain, wrap propose() output as single-path tree
         let drafts = self.propose(target_hidden_states, last_token_ids, positions,
@@ -289,7 +289,7 @@ The scheduler's token budget accounts for speculative tokens:
 
 | Concern | Where it lives | Impact on ops |
 |---------|---------------|---------------|
-| Draft model forward | SpecDecodeRunner | None — same `Ops` as target |
+| Draft model forward | SpecDecodeRunner | None — same `OpsBundle` as target |
 | Target verification | SpecDecodeRunner | None — chunked prefill via `paged_attention` |
 | Tree attention mask | `MaskType::Custom(Tensor)` | Already in `AttentionOps` |
 | KV cache for rejected tokens | `slot_mapping` with -1 | `reshape_and_cache` skips -1 slots |

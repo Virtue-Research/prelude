@@ -22,11 +22,10 @@ pub(crate) type ModelVariant = Box<dyn crate::models::ModelForward>;
 pub(crate) struct ModelExecutor {
     pub(crate) model: Mutex<ModelVariant>,
     pub(crate) device: Device,
-    #[allow(dead_code)]
     pub(crate) dtype: DType,
     pub(crate) config: CommonModelConfig,
     pub(crate) runtime_caps: RuntimeCaps,
-    pub(crate) ops: &'static crate::ops::Ops,
+    pub(crate) ops: &'static dyn crate::ops::Ops,
 }
 
 pub struct Engine {
@@ -106,7 +105,8 @@ impl Engine {
     #[inline]
     pub(crate) fn maybe_sync_device(&self) {
         if self.sync_timing_enabled() && self.executor.device.is_cuda() {
-            let _ = self.executor.device.synchronize();
+            // GPU synchronization is handled by the device crate (prelude-cuda)
+            // via cudarc; no-op here since we don't own the CUDA context.
         }
     }
 

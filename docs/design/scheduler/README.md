@@ -86,7 +86,7 @@ crates/prelude-core/src/
    don't (diffusion, embedding) simply ignore them. No coupling, no mandatory dependency.
 
 4. **Model code never sees the scheduler.** The scheduler prepares its output, the model runner
-   translates it into `model.forward()` calls using the `Ops` bundle. The model only knows `Ops`.
+   translates it into `model.forward()` calls using the `OpsBundle` bundle. The model only knows `OpsBundle`.
 
 5. **Scheduler-to-Ops boundary is `OpsSession`.** The scheduler calls `begin_forward()` /
    `end_forward()` and optionally `precompute_paged_plan()`. Nothing else. The scheduler does
@@ -112,10 +112,10 @@ Scheduler           produces     ScheduledBatch
   └── Prefix Cache                radix tree for KV cache prefix sharing
                         ↓
 Model Runner        translates   ScheduledBatch → model inputs (tensors, metadata)
-  │                  calls        ops.session.begin_forward()
-  │                  calls        ops.session.precompute_paged_plan(block_tables, cu_seqlens_k)
+  │                  calls        ops.begin_forward()
+  │                  calls        ops.precompute_paged_plan(block_tables, cu_seqlens_k)
   │                  calls        model.forward(input_ids, ops, paged_ctx)
-  │                  calls        ops.session.end_forward()
+  │                  calls        ops.end_forward()
   │                  returns      StepResult (sampled token IDs per request)
   ├── Model                       the neural network (Qwen3, Flux, ...)
   └── Ops                         device dispatch layer (CudaOps, RocmOps, ...)
@@ -145,10 +145,10 @@ Executor.execute(&scheduled_batch)
     │       slot_mapping: [total_tokens]           ← block_table → per-token slot indices
     │
     │  2. Call ops:
-    │       ops.session.begin_forward()
-    │       ops.session.precompute_paged_plan(&block_tables, &cu_seqlens_k, block_size)
+    │       ops.begin_forward()
+    │       ops.precompute_paged_plan(&block_tables, &cu_seqlens_k, block_size)
     │       logits = model.forward(&input_ids, &ops, &paged_ctx)
-    │       ops.session.end_forward()
+    │       ops.end_forward()
     │
     │  3. Sample:
     │       sampled_tokens = sample(&logits, &sampling_params)
@@ -377,10 +377,10 @@ let step_result = executor.collect(handle);
 
 Inside `Executor::submit`, the implementation calls:
 ```rust
-ops.session.begin_forward();
-ops.session.precompute_paged_plan(&block_tables, &cu_seqlens_k, block_size);
+ops.begin_forward();
+ops.precompute_paged_plan(&block_tables, &cu_seqlens_k, block_size);
 model.forward(&input_ids, &ops, &paged_ctx);
-ops.session.end_forward();
+ops.end_forward();
 ```
 
 For CUDA graphs, the executor (not scheduler) downcasts to `CudaOps`:
@@ -416,7 +416,7 @@ See [speculative.md](speculative.md) for the draft-then-verify framework:
 ## Constrained Decoding (Structured Output)
 
 See [constrained_decoding.md](constrained_decoding.md) for grammar-based token filtering:
-`GrammarBackend` trait (xgrammar/outlines pluggable), async compilation overlapping with GPU,
+`GrammarBackend` trait (llguidance, pure Rust), async compilation overlapping with GPU,
 per-request bitmask, integration with sampling pipeline and speculative decoding.
 
 ## Examples
@@ -446,6 +446,6 @@ diffusion, P/D disaggregation, adding a new scheduler) with file references.
 | TTS streaming | `TtsPipelineScheduler`: chain `ArScheduler` stages with `StreamBuffer` |
 | Embedding / prefill-only | `OneShotScheduler`: one forward per request, no KV cache, no decode loop |
 | P/D disaggregation | Coordinator above per-worker ArSchedulers. `FinishReason::Transferred` + `preloaded_blocks` + `import_blocks()`. ArScheduler core loop unchanged |
-| A/F disaggregation (AFD) | FFN follower loop (separate from ArScheduler). ArScheduler unchanged — AFD hidden inside `modules::moe_layer` |
+| A/F disaggregation (AFD) | FFN follower loop (separate from ArScheduler). ArScheduler unchanged — AFD hidden inside `models::commons::moe_layer` |
 | Scheduler ↔ Ops | `OpsSession::begin/end_forward` + `precompute_paged_plan`. Nothing else |
-| Model code | Unchanged. Models see `Ops`, not schedulers |
+| Model code | Unchanged. Models see `OpsBundle`, not schedulers |

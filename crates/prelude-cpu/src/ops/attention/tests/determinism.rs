@@ -118,12 +118,12 @@ fn test_fused_add_rmsnorm_determinism() {
     }
 }
 
-/// Linear forward (candle Linear → brgemm dispatch): run twice, assert bit-exact.
+/// Linear forward (brgemm dispatch): run twice, assert bit-exact.
 /// Tests the full Linear layer path including Tensor allocation/dispatch.
 #[test]
 fn test_qwen_linear_determinism() {
-    use prelude_core::modules::linear::Linear;
-    use prelude_core::tensor::{DType, Device, Tensor};
+    use prelude_core::models::commons::linear::Linear;
+    use prelude_core::tensor::{DType, Device, Module, Tensor};
 
     if !crate::onednn::brgemm_available() { return; }
 
@@ -145,8 +145,11 @@ fn test_qwen_linear_determinism() {
         Tensor::from_vec(vals, &[batch, in_dim], &Device::Cpu).unwrap()
     };
 
-    let out1 = prelude_core::tensor::Module::forward(&linear, &make_input()).unwrap();
-    let out2 = prelude_core::tensor::Module::forward(&linear, &make_input()).unwrap();
+    // Linear::forward needs (x, ctx, ops), but ctx/ops are unused for plain GEMM.
+    // Access the inner LinearBackend directly via Module trait.
+    let backend = linear.backend_as::<crate::onednn::ops::OnednnLinear>().expect("should be OnednnLinear");
+    let out1 = Module::forward(backend, &make_input()).unwrap();
+    let out2 = Module::forward(backend, &make_input()).unwrap();
 
     let v1: Vec<f32> = out1.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
     let v2: Vec<f32> = out2.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
@@ -259,7 +262,7 @@ fn test_layer_chain_determinism() {
 #[test]
 fn test_linear_chain_determinism() {
     use crate::ops::{cpu_rmsnorm, cpu_fused_add_rmsnorm};
-    use prelude_core::modules::linear::Linear;
+    use prelude_core::models::commons::linear::Linear;
     use prelude_core::tensor::{DType, Device, Module, Tensor};
 
     if !crate::onednn::brgemm_available() { return; }
@@ -279,10 +282,12 @@ fn test_linear_chain_determinism() {
     };
 
     let norm_w = make_bf16_tensor(1, hidden, 0.001).reshape(&[hidden]).unwrap();
-    let proj = Linear::from_weight(make_bf16_tensor(inter, hidden, 0.0003), None).unwrap();
+    let proj_linear = Linear::from_weight(make_bf16_tensor(inter, hidden, 0.0003), None).unwrap();
+    let proj = proj_linear.backend_as::<crate::onednn::ops::OnednnLinear>().expect("should be OnednnLinear");
     // down: [hidden, hidden] — input from fused_add_rmsnorm is [seq_len, hidden]
     // (Previously [hidden, inter] caused K=inter mismatch: brgemm read past buffer)
-    let down = Linear::from_weight(make_bf16_tensor(hidden, hidden, 0.0004), None).unwrap();
+    let down_linear = Linear::from_weight(make_bf16_tensor(hidden, hidden, 0.0004), None).unwrap();
+    let down = down_linear.backend_as::<crate::onednn::ops::OnednnLinear>().expect("should be OnednnLinear");
 
     // Step-by-step: find first diverging operation
     let x1 = make_bf16_tensor(seq_len, hidden, 0.002);

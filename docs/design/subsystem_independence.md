@@ -5,7 +5,7 @@ and their own internals. No cross-subsystem code reading required.
 
 | Subsystem | Needs to know | Does NOT need to know |
 |-----------|--------------|----------------------|
-| **Model impl** (Qwen3, Flux, TTS) | Module APIs (`Linear`, `residual_norm`, ...), `Ops` bundle | Any device impl, kernel library, engine |
+| **Model impl** (Qwen3, Flux, TTS) | Module APIs (`Linear`, `residual_norm`, ...), `OpsBundle` | Any device impl, kernel library, engine |
 | **Modules** (Linear, residual_norm, gated_mlp, ...) | Op trait signatures, `FusedOps` match pattern | Device internals, model specifics |
 | **Device crate** (CudaOps+Executor, RocmOps+Executor, ...) | Op traits, Executor trait, kernel library APIs | Model code, other devices |
 | **Kernel wrapper** (FA4, FlashInfer, DeepGEMM) | Kernel library C API | Op traits, model code, other wrappers |

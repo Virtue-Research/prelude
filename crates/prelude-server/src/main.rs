@@ -148,6 +148,11 @@ impl From<CliTaskOverride> for TaskOverride {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Register device backends before anything else.
+    prelude_cpu::register();
+    #[cfg(feature = "cuda")]
+    prelude_cuda::register();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {

@@ -19,9 +19,9 @@
 //!
 //! ```ignore
 //! // prelude-cuda/src/lib.rs
-//! #[ctor::ctor]
-//! fn _register() {
-//!     prelude_core::engine::register_executor(|| Box::new(CudaExecutor::new()));
+//! pub fn register() {
+//!     prelude_core::ops::register_gpu_ops(cuda_ops::cuda_ops);
+//!     prelude_core::engine::executor::register_executor(|e| Box::new(CudaExecutor::new(e)));
 //! }
 //! ```
 

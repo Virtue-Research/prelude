@@ -286,6 +286,9 @@ fn load_safetensor_parts(
     let common_config = resolved.parsed.common;
     let deltanet_config = resolved.parsed.deltanet;
 
+    // Read KV sharing map from model before moving it into the executor.
+    let kv_sharing = built.model.kv_cache_sharing();
+
     let executor = ModelExecutor {
         model: Mutex::new(built.model),
         ops: crate::ops::select_ops(&device),
@@ -302,6 +305,7 @@ fn load_safetensor_parts(
         &executor.device,
         &executor.runtime_caps,
         &engine_config.cache,
+        &kv_sharing,
     )?;
 
     tracing::info!(

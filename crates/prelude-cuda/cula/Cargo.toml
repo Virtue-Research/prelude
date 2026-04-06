@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 tracing = "0.1"
+prelude-tvm-ffi = { path = "../tvm-ffi" }
 
 [dev-dependencies]
 cudarc = { version = "0.19.4", features = ["std", "cuda-version-from-build-system", "f16"] }

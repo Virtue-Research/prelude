@@ -67,15 +67,10 @@ impl BrgemmPackedWeight {
         }
         let (n, k) = weight.dims2()?;
 
-        let (w_storage, w_layout) = weight.storage_and_layout();
-        let w_data = match &*w_storage {
-            prelude_core::tensor::backend::Storage::Cpu(s) => s.as_slice::<bf16>()?,
-            _ => return Ok(None),
-        };
-        let w_ptr = w_data[w_layout.start_offset()..].as_ptr() as *const std::ffi::c_void;
+        let w_data = crate::ops::tensor_as_bf16_slice(&weight)?;
+        let w_ptr = w_data.as_ptr() as *const std::ffi::c_void;
 
         let ptr = unsafe { super::ffi::brgemm_bf16_pack(w_ptr, k as i64, n as i64) };
-        drop(w_storage);
 
         if ptr.is_null() {
             return Ok(None);
@@ -123,17 +118,12 @@ impl OnednnF32PackedWeight {
         }
         let (n, k) = weight.dims2()?;
 
-        let (w_storage, w_layout) = weight.storage_and_layout();
-        let w_data = match &*w_storage {
-            prelude_core::tensor::backend::Storage::Cpu(s) => s.as_slice::<f32>()?,
-            _ => return Ok(None),
-        };
-        let w_ptr = w_data[w_layout.start_offset()..].as_ptr() as *const std::ffi::c_void;
+        let w_data = crate::ops::tensor_as_f32_slice(&weight)?;
+        let w_ptr = w_data.as_ptr() as *const std::ffi::c_void;
 
         let ptr = unsafe {
             super::ffi::onednn_f32_pack_weights(w_ptr, k as i64, n as i64, ref_m as i64)
         };
-        drop(w_storage);
 
         if ptr.is_null() {
             return Ok(None);
@@ -163,12 +153,8 @@ impl OnednnF32PackedWeight {
         let m: usize = dims[..dims.len() - 1].iter().product();
         let input = input.contiguous()?;
 
-        let (in_storage, in_layout) = input.storage_and_layout();
-        let in_data = match &*in_storage {
-            prelude_core::tensor::backend::Storage::Cpu(s) => s.as_slice::<f32>()?,
-            _ => prelude_core::tensor::bail!("OnednnF32PackedWeight::forward: CPU tensor required"),
-        };
-        let in_ptr = in_data[in_layout.start_offset()..].as_ptr() as *const std::ffi::c_void;
+        let in_data = crate::ops::tensor_as_f32_slice(&input)?;
+        let in_ptr = in_data.as_ptr() as *const std::ffi::c_void;
 
         let mut out_buf = vec![0.0f32; m * self.n];
         unsafe {
@@ -177,7 +163,6 @@ impl OnednnF32PackedWeight {
             );
         }
 
-        drop(in_storage);
         let mut shape = dims.to_vec();
         *shape.last_mut().unwrap() = self.n;
         Tensor::from_vec(out_buf, shape.as_slice(), &Device::Cpu)
@@ -190,21 +175,21 @@ impl Drop for OnednnF32PackedWeight {
     }
 }
 
-// ── OnednnLinear: drop-in replacement for prelude_core::modules::linear::NaiveLinear ──────────
+// ── OnednnLinear: drop-in replacement for prelude_core::models::commons::linear::NaiveLinear ──────────
 
 /// Drop-in Linear layer that dispatches BF16/F32 CPU to oneDNN packed GEMM,
-/// falling back to candle for other dtypes/devices.
+/// falling back to naive implementation for other dtypes/devices.
 #[derive(Clone, Debug)]
 pub struct OnednnLinear {
-    candle_linear: prelude_core::modules::linear::NaiveLinear,
+    naive_linear: prelude_core::models::commons::linear::NaiveLinear,
     brgemm_packed: Option<Arc<BrgemmPackedWeight>>,
     f32_packed: Option<Arc<OnednnF32PackedWeight>>,
 }
 
 impl OnednnLinear {
-    /// Wrap a `prelude_core::modules::linear::NaiveLinear`. If BF16 or F32 CPU, pre-packs weights for oneDNN.
+    /// Wrap a `prelude_core::models::commons::linear::NaiveLinear`. If BF16 or F32 CPU, pre-packs weights for oneDNN.
     /// Also packs brgemm VNNI weights and AMX VNNI weights if available.
-    pub fn new(linear: prelude_core::modules::linear::NaiveLinear) -> Result<Self> {
+    pub fn new(linear: prelude_core::models::commons::linear::NaiveLinear) -> Result<Self> {
         init(); // ensure oneDNN engine/stream exist
         let w = linear.weight();
 
@@ -257,7 +242,7 @@ impl OnednnLinear {
         };
 
         Ok(Self {
-            candle_linear: linear,
+            naive_linear: linear,
             brgemm_packed,
             f32_packed,
         })
@@ -265,7 +250,7 @@ impl OnednnLinear {
 
     /// Access the underlying weight tensor.
     pub fn weight(&self) -> &Tensor {
-        self.candle_linear.weight()
+        self.naive_linear.weight()
     }
 
     /// Access the brgemm packed weight (if available) for fused operations.
@@ -295,7 +280,7 @@ impl Module for OnednnLinear {
             let out = if let Some(ref brg) = self.brgemm_packed {
                 brgemm_gemm_forward(&flat, brg, m, brg.k, brg.n)?
             } else {
-                let w = self.candle_linear.weight();
+                let w = self.naive_linear.weight();
                 let (n, k) = w.dims2()?;
                 cpu_gemm_forward(&flat, w, m, k, n)?
             };
@@ -321,7 +306,7 @@ impl Module for OnednnLinear {
                 (x.contiguous()?, m)
             };
 
-            let w = self.candle_linear.weight();
+            let w = self.naive_linear.weight();
             let (n, k) = w.dims2()?;
             let out = f32_linear_forward(&flat, w, m, k, n)?;
 
@@ -331,14 +316,14 @@ impl Module for OnednnLinear {
             return Ok(out);
         }
 
-        self.candle_linear.forward(x)
+        self.naive_linear.forward(x)
     }
 }
 
-impl prelude_core::modules::linear::LinearBackend for OnednnLinear {
+impl prelude_core::models::commons::linear::LinearBackend for OnednnLinear {
     fn name(&self) -> &str { "cpu/onednn" }
-    fn weight(&self) -> Option<&Tensor> { Some(self.candle_linear.weight()) }
-    fn clone_box(&self) -> Box<dyn prelude_core::modules::linear::LinearBackend> { Box::new(self.clone()) }
+    fn weight(&self) -> Option<&Tensor> { Some(self.naive_linear.weight()) }
+    fn clone_box(&self) -> Box<dyn prelude_core::models::commons::linear::LinearBackend> { Box::new(self.clone()) }
     fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
@@ -347,19 +332,11 @@ fn f32_linear_forward(input: &Tensor, weight: &Tensor, m: usize, k: usize, n: us
     let input = input.contiguous()?;
     let weight = weight.contiguous()?;
 
-    let (in_storage, in_layout) = input.storage_and_layout();
-    let in_data = match &*in_storage {
-        prelude_core::tensor::backend::Storage::Cpu(s) => s.as_slice::<f32>()?,
-        _ => prelude_core::tensor::bail!("f32_linear_forward: CPU tensor required"),
-    };
-    let (w_storage, w_layout) = weight.storage_and_layout();
-    let w_data = match &*w_storage {
-        prelude_core::tensor::backend::Storage::Cpu(s) => s.as_slice::<f32>()?,
-        _ => prelude_core::tensor::bail!("f32_linear_forward: CPU tensor required"),
-    };
+    let in_data = crate::ops::tensor_as_f32_slice(&input)?;
+    let w_data = crate::ops::tensor_as_f32_slice(&weight)?;
 
-    let in_ptr = in_data[in_layout.start_offset()..].as_ptr() as *const std::ffi::c_void;
-    let w_ptr = w_data[w_layout.start_offset()..].as_ptr() as *const std::ffi::c_void;
+    let in_ptr = in_data.as_ptr() as *const std::ffi::c_void;
+    let w_ptr = w_data.as_ptr() as *const std::ffi::c_void;
 
     let mut out_buf = vec![0.0f32; m * n];
     unsafe {
@@ -369,8 +346,6 @@ fn f32_linear_forward(input: &Tensor, weight: &Tensor, m: usize, k: usize, n: us
         );
     }
 
-    drop(in_storage);
-    drop(w_storage);
     Tensor::from_vec(out_buf, &[m, n], &Device::Cpu)
 }
 
@@ -575,12 +550,8 @@ pub fn brgemm_gemm_forward_pub(input: &Tensor, brg: &BrgemmPackedWeight, m: usiz
     let t0 = if profile { Some(std::time::Instant::now()) } else { None };
 
     let input = input.contiguous()?;
-    let (in_storage, in_layout) = input.storage_and_layout();
-    let in_data = match &*in_storage {
-        prelude_core::tensor::backend::Storage::Cpu(s) => s.as_slice::<half::bf16>()?,
-        _ => prelude_core::tensor::bail!("brgemm_gemm_forward: CPU tensor required"),
-    };
-    let in_ptr = in_data[in_layout.start_offset()..].as_ptr();
+    let in_data = crate::ops::tensor_as_bf16_slice(&input)?;
+    let in_ptr = in_data.as_ptr();
 
     let t1 = t0.map(|_| std::time::Instant::now());
 
@@ -649,8 +620,6 @@ pub fn brgemm_gemm_forward_pub(input: &Tensor, brg: &BrgemmPackedWeight, m: usiz
     }
 
     let t3 = t0.map(|_| std::time::Instant::now());
-
-    drop(in_storage);
 
     let bf16_vec: Vec<half::bf16> =
         bytemuck::cast_vec(out_buf);
@@ -726,12 +695,8 @@ pub fn brgemm_fused_silu_mul(
     debug_assert_eq!(brg.n, 2 * dim, "brgemm_fused_silu_mul: packed weight N must be 2*dim");
 
     let input = input.contiguous()?;
-    let (in_storage, in_layout) = input.storage_and_layout();
-    let in_data = match &*in_storage {
-        prelude_core::tensor::backend::Storage::Cpu(s) => s.as_slice::<half::bf16>()?,
-        _ => prelude_core::tensor::bail!("brgemm_fused_silu_mul: CPU tensor required"),
-    };
-    let in_ptr = in_data[in_layout.start_offset()..].as_ptr();
+    let in_data = crate::ops::tensor_as_bf16_slice(&input)?;
+    let in_ptr = in_data.as_ptr();
 
     // Output is [M, dim] (half the size of unfused gate_up)
     let mut out_buf = BRGEMM_OUT_BUF.with_borrow_mut(|buf| {
@@ -795,7 +760,6 @@ pub fn brgemm_fused_silu_mul(
         }
     }
 
-    drop(in_storage);
     let bf16_vec: Vec<half::bf16> =
         bytemuck::cast_vec(out_buf);
     Tensor::from_vec(bf16_vec, &[m, dim], &prelude_core::tensor::Device::Cpu)
@@ -991,18 +955,13 @@ pub fn brgemm_quantize_bf16_s8(input: &Tensor) -> Result<(Vec<i8>, f32)> {
     let m: usize = dims[..dims.len() - 1].iter().product();
     let k = *dims.last().unwrap();
 
-    let (in_storage, in_layout) = input.storage_and_layout();
-    let in_data = match &*in_storage {
-        prelude_core::tensor::backend::Storage::Cpu(s) => s.as_slice::<half::bf16>()?,
-        _ => prelude_core::tensor::bail!("brgemm_quantize_bf16_s8: CPU BF16 tensor required"),
-    };
-    let in_ptr = in_data[in_layout.start_offset()..].as_ptr() as *const std::ffi::c_void;
+    let in_data = crate::ops::tensor_as_bf16_slice(&input)?;
+    let in_ptr = in_data.as_ptr() as *const std::ffi::c_void;
 
     let mut out_s8 = vec![0i8; m * k];
     let scale = unsafe {
         super::ffi::brgemm_quantize_bf16_s8(in_ptr, out_s8.as_mut_ptr(), m as i64, k as i64)
     };
-    drop(in_storage);
     Ok((out_s8, scale))
 }
 
@@ -1049,20 +1008,14 @@ pub fn brgemm_s8_gemm_forward(
     m: usize, k: usize, n: usize,
 ) -> Result<Tensor> {
     let input = input.contiguous()?;
-    let (in_storage, in_layout) = input.storage_and_layout();
-    let in_data = match &*in_storage {
-        prelude_core::tensor::backend::Storage::Cpu(s) => s.as_slice::<half::bf16>()?,
-        _ => prelude_core::tensor::bail!("brgemm_s8_gemm_forward: CPU tensor required"),
-    };
-    let in_ptr = in_data[in_layout.start_offset()..].as_ptr() as *const std::ffi::c_void;
+    let in_data = crate::ops::tensor_as_bf16_slice(&input)?;
+    let in_ptr = in_data.as_ptr() as *const std::ffi::c_void;
 
     // Step 1: Quantize BF16 → INT8
     let mut input_s8 = vec![0i8; m * k];
     let a_scale = unsafe {
         super::ffi::brgemm_quantize_bf16_s8(in_ptr, input_s8.as_mut_ptr(), m as i64, k as i64)
     };
-
-    drop(in_storage);
 
     // Step 2: Dispatch INT8 GEMM
     let mut out_buf = BRGEMM_OUT_BUF.with_borrow_mut(|buf| {
@@ -1213,25 +1166,16 @@ pub fn brgemm_gemm_forward_postops(
     m: usize, _k: usize, n: usize,
 ) -> Result<Tensor> {
     let input = input.contiguous()?;
-    let (in_storage, in_layout) = input.storage_and_layout();
-    let in_data = match &*in_storage {
-        prelude_core::tensor::backend::Storage::Cpu(s) => s.as_slice::<half::bf16>()?,
-        _ => prelude_core::tensor::bail!("brgemm_gemm_forward_postops: CPU tensor required"),
-    };
-    let in_ptr = in_data[in_layout.start_offset()..].as_ptr();
+    let in_data = crate::ops::tensor_as_bf16_slice(&input)?;
+    let in_ptr = in_data.as_ptr();
 
     // Make bias contiguous and extract pointer (keep alive until dispatch completes)
     let bias_contig = bias.map(|b| b.contiguous()).transpose()?;
-    let (_bias_storage, bias_ptr) = if let Some(ref b) = bias_contig {
-        let (bs, bl) = b.storage_and_layout();
-        let bd = match &*bs {
-            prelude_core::tensor::backend::Storage::Cpu(s) => s.as_slice::<half::bf16>()?,
-            _ => prelude_core::tensor::bail!("brgemm_gemm_forward_postops: bias must be CPU BF16"),
-        };
-        let bp = bd[bl.start_offset()..].as_ptr() as usize;
-        (Some(bs), bp)
+    let bias_ptr = if let Some(ref b) = bias_contig {
+        let bd = crate::ops::tensor_as_bf16_slice(b)?;
+        bd.as_ptr() as usize
     } else {
-        (None, 0usize)
+        0usize
     };
 
     let mut out_buf = BRGEMM_OUT_BUF.with_borrow_mut(|buf| {
@@ -1265,8 +1209,6 @@ pub fn brgemm_gemm_forward_postops(
         );
     }
 
-    drop(in_storage);
-    drop(_bias_storage);
     drop(bias_contig);
 
     let bf16_vec: Vec<half::bf16> = bytemuck::cast_vec(out_buf);
@@ -1279,34 +1221,15 @@ fn cpu_gemm_forward(input: &Tensor, weight: &Tensor, m: usize, k: usize, n: usiz
     let input = input.contiguous()?;
     let weight = weight.contiguous()?;
 
-    let (in_storage, in_layout) = input.storage_and_layout();
-    let in_offset = in_layout.start_offset();
-    let (w_storage, w_layout) = weight.storage_and_layout();
-    let w_offset = w_layout.start_offset();
+    let in_data = crate::ops::tensor_as_u16_slice(&input)?;
+    let w_data = crate::ops::tensor_as_u16_slice(&weight)?;
 
-    let in_data = match &*in_storage {
-        prelude_core::tensor::backend::Storage::Cpu(s) => s.as_slice::<half::bf16>()?,
-        _ => prelude_core::tensor::bail!("cpu_gemm_forward: CPU tensor required"),
-    };
-    let w_data = match &*w_storage {
-        prelude_core::tensor::backend::Storage::Cpu(s) => s.as_slice::<half::bf16>()?,
-        _ => prelude_core::tensor::bail!("cpu_gemm_forward: CPU tensor required"),
-    };
-
-    // Safety: bf16 is repr(transparent) over u16
-    let in_slice = unsafe {
-        std::slice::from_raw_parts(in_data[in_offset..].as_ptr() as *const u16, m * k)
-    };
-    let w_slice = unsafe {
-        std::slice::from_raw_parts(w_data[w_offset..].as_ptr() as *const u16, n * k)
-    };
+    let in_slice = &in_data[..m * k];
+    let w_slice = &w_data[..n * k];
 
     let mut out_buf: Vec<u16> = vec![0u16; m * n];
 
     crate::ops::gemm::bf16_gemm_small_m(&mut out_buf, in_slice, w_slice, m, k, n);
-
-    drop(in_storage);
-    drop(w_storage);
 
     let bf16_vec: Vec<half::bf16> =
         bytemuck::cast_vec(out_buf);

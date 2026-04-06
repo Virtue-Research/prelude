@@ -72,18 +72,18 @@ impl<'a> CpuTensor<'a> {
         }
     }
 
-    /// Extract from a contiguous CPU BF16 candle Tensor.
+    /// Extract from a contiguous CPU BF16 Tensor.
     ///
     /// The tensor must be contiguous (all BF16 weight tensors from safetensor
     /// loading are contiguous). The returned `CpuTensor` borrows from the
     /// tensor's underlying storage — the tensor must outlive the `CpuTensor`.
-    pub fn from_candle(tensor: &'a Tensor) -> Result<Self> {
+    pub fn from_tensor(tensor: &'a Tensor) -> Result<Self> {
         let slice = super::tensor_as_u16_slice_pub(tensor)?;
         Ok(unsafe { Self::from_raw(slice.as_ptr(), slice.len(), tensor.dims()) })
     }
 
-    /// Copy data into a new candle BF16 Tensor.
-    pub fn to_candle(&self, device: &Device) -> Result<Tensor> {
+    /// Copy data into a new BF16 Tensor.
+    pub fn to_tensor(&self, device: &Device) -> Result<Tensor> {
         let data = self.as_slice();
         let bf16_vec: Vec<half::bf16> = bytemuck::cast_slice::<u16, half::bf16>(data).to_vec();
         Tensor::from_vec(bf16_vec, self.dims(), device)
@@ -221,12 +221,12 @@ impl<'a> CpuTensorF32<'a> {
         Self { data, len, shape: s, ndim: ndim as u8, _phantom: PhantomData }
     }
 
-    pub fn from_candle(tensor: &'a Tensor) -> Result<Self> {
+    pub fn from_tensor(tensor: &'a Tensor) -> Result<Self> {
         let slice = super::tensor_as_f32_slice(tensor)?;
         Ok(unsafe { Self::from_raw(slice.as_ptr(), slice.len(), tensor.dims()) })
     }
 
-    pub fn to_candle(&self, device: &Device) -> Result<Tensor> {
+    pub fn to_tensor(&self, device: &Device) -> Result<Tensor> {
         let data = self.as_slice().to_vec();
         Tensor::from_vec(data, self.dims(), device)
     }
@@ -341,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn from_candle_roundtrip() {
+    fn from_tensor_roundtrip() {
         use prelude_core::tensor::{DType, Device};
         let bf16_vals: Vec<half::bf16> = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]
             .iter()
@@ -349,11 +349,11 @@ mod tests {
             .collect();
         let tensor = Tensor::from_vec(bf16_vals, &[2, 3], &Device::Cpu).unwrap();
 
-        let ct = CpuTensor::from_candle(&tensor).unwrap();
+        let ct = CpuTensor::from_tensor(&tensor).unwrap();
         assert_eq!(ct.dims(), &[2, 3]);
         assert_eq!(ct.len(), 6);
 
-        let back = ct.to_candle(&Device::Cpu).unwrap();
+        let back = ct.to_tensor(&Device::Cpu).unwrap();
         assert_eq!(back.dims(), &[2, 3]);
         assert_eq!(back.dtype(), DType::BF16);
         let vals: Vec<f32> = back.to_dtype(DType::F32).unwrap().to_vec2::<f32>().unwrap().into_iter().flatten().collect();

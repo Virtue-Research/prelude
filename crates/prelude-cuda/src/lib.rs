@@ -4,7 +4,7 @@
 //! - PTX kernel compilation (build.rs) and runtime loading constants
 //! - GPU kernel wrappers (ops/) and attention backends (attn/)
 //! - CudaOps: implements all Ops traits from prelude-core
-//! - Feature-gated re-exports of kernel sub-crates (deepgemm, cutlass-gemm, etc.)
+//! - Re-exports of kernel sub-crates (deepgemm, cutlass-gemm, etc.)
 
 // ── PTX modules compiled from src/kernels/ ──────────────────────────
 
@@ -22,6 +22,17 @@ pub const PTX_KNORM_ROPE_KV_WRITE: &str =
 pub const PTX_SCATTER_KV_CACHE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/scatter_kv_cache.ptx"));
 
+// ── General-purpose PTX kernels (ported from candle-kernels) ────
+pub const PTX_UNARY: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_unary.ptx"));
+pub const PTX_BINARY: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_binary.ptx"));
+pub const PTX_CAST: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_cast.ptx"));
+pub const PTX_REDUCE: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_reduce.ptx"));
+pub const PTX_INDEXING: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_indexing.ptx"));
+pub const PTX_TERNARY: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_ternary.ptx"));
+pub const PTX_AFFINE: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_affine.ptx"));
+pub const PTX_FILL: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_fill.ptx"));
+pub const PTX_SORT: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_sort.ptx"));
+
 // ── Module names for cudarc caching ─────────────────────────────────
 
 pub const MOD_ADD: &str = "elementwise_add";
@@ -36,39 +47,44 @@ pub const MOD_KV_APPEND: &str = "kvcache_kv_append";
 pub const MOD_KNORM_ROPE_KV_WRITE: &str = "kvcache_knorm_rope_kv_write";
 pub const MOD_SCATTER_KV_CACHE: &str = "kvcache_scatter_kv_cache";
 
-// ── Auto-register GPU ops at link time ──────────────────────────────
+// ── General-purpose module names ────────────────────────────────
+pub const MOD_UNARY: &str = "candle_unary";
+pub const MOD_BINARY: &str = "candle_binary";
+pub const MOD_CAST: &str = "candle_cast";
+pub const MOD_REDUCE: &str = "candle_reduce";
+pub const MOD_INDEXING: &str = "candle_indexing";
+pub const MOD_TERNARY: &str = "candle_ternary";
+pub const MOD_AFFINE: &str = "candle_affine";
+pub const MOD_FILL: &str = "candle_fill";
+pub const MOD_SORT: &str = "candle_sort";
 
-#[ctor::ctor]
-fn _register_gpu_ops() {
+/// Register GPU ops and executor. Call once at startup.
+pub fn register() {
     prelude_core::ops::register_gpu_ops(cuda_ops::cuda_ops);
     prelude_core::engine::executor::register_executor(|engine| Box::new(executor::CudaExecutor::new(engine)));
 }
+
+// ── Own CUDA storage ─────────────────
+
+pub mod device;
+pub(crate) mod tensor_ops_kernels;
 
 // ── GPU kernel modules ──────────────────────────────────────────────
 
 pub(crate) mod ops;
 pub(crate) mod attn;
+pub(crate) mod moe_ffi;
 mod cuda_ops;
+mod quant_backends;
 pub mod executor;
 
-pub use cuda_ops::{create_cuda_ops, cuda_ops};
+pub use cuda_ops::cuda_ops;
 
 // ── Sub-crate re-exports ────────────────────────────────────────────
 
-#[cfg(feature = "deepgemm")]
 pub use prelude_deepgemm;
-
-#[cfg(feature = "cutlass-gemm")]
 pub use prelude_cutlass_gemm;
-
-#[cfg(feature = "flash-attn-v4")]
 pub use prelude_flash_attn_v4;
-
-#[cfg(feature = "flashinfer")]
 pub use prelude_flashinfer;
-
-#[cfg(feature = "quant-gemm")]
 pub use prelude_quant_gemm;
-
-#[cfg(feature = "cula")]
 pub use prelude_cula;

@@ -1,26 +1,18 @@
-use candle_core::backend::BackendStorage;
+use crate::device::{self as cb, CuResultExt, LaunchConfig, PushKernelArg};
 use crate::{MOD_ADD_RMSNORM, MOD_RMSNORM, PTX_ADD_RMSNORM, PTX_RMSNORM};
-use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
-use candle_core::cuda_backend::WrapErr;
-use candle_core::{DType, Result, Tensor};
+use prelude_core::tensor::{bail, DType, Result, Tensor};
 
 /// Fast standalone RMSNorm with register caching and vectorized loads.
-/// Replaces candle's built-in rmsnorm_bf16 which runs at ~13% of bandwidth.
+/// Replaces naive rmsnorm_bf16 which runs at ~13% of bandwidth.
 pub fn fast_rmsnorm(input: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
-    let (x_storage, x_layout) = input.storage_and_layout();
-    let (w_storage, w_layout) = weight.storage_and_layout();
+    let (x_storage, x_layout) = cb::storage_and_layout(&input);
+    let (w_storage, w_layout) = cb::storage_and_layout(&weight);
 
-    let x_cuda = match &*x_storage {
-        candle_core::Storage::Cuda(s) => s,
-        _ => candle_core::bail!("fast_rmsnorm: requires CUDA"),
-    };
-    let w_cuda = match &*w_storage {
-        candle_core::Storage::Cuda(s) => s,
-        _ => candle_core::bail!("fast_rmsnorm: requires CUDA"),
-    };
+    let x_cuda = cb::as_cuda(&x_storage, "fast_rmsnorm")?;
+    let w_cuda = cb::as_cuda(&w_storage, "fast_rmsnorm: weight")?;
 
     if x_cuda.dtype() != DType::BF16 {
-        candle_core::bail!("fast_rmsnorm: requires BF16");
+        bail!("fast_rmsnorm: requires BF16");
     }
 
     let shape = x_layout.shape();
@@ -28,17 +20,17 @@ pub fn fast_rmsnorm(input: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor>
     let d = *dims.last().unwrap();
     let n_rows = shape.elem_count() / d;
 
-    let dev = x_cuda.device().clone();
+    let stream = x_cuda.stream.clone();
     let n = shape.elem_count();
 
     let x_slice = x_cuda
-        .as_cuda_slice::<half::bf16>()?
+        .as_slice::<half::bf16>()?
         .slice(x_layout.start_offset()..);
     let w_slice = w_cuda
-        .as_cuda_slice::<half::bf16>()?
+        .as_slice::<half::bf16>()?
         .slice(w_layout.start_offset()..);
 
-    let out = unsafe { dev.alloc::<half::bf16>(n) }?;
+    let out = unsafe { stream.alloc::<half::bf16>(n) }.ce()?;
 
     // For small D (<=256): multi-row warp-parallel, 1 warp per row, 256 threads = 8 rows/block
     // For large D (1024): 1 row per block, 128 threads, vectorized float4 loads
@@ -53,13 +45,13 @@ pub fn fast_rmsnorm(input: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor>
         (block, n_rows as u32, num_warps * 4)
     };
 
-    let func = dev.get_or_load_custom_func("fast_rmsnorm_bf16", MOD_RMSNORM, PTX_RMSNORM)?;
+    let func = crate::device::get_or_load_func(x_cuda.device(), "fast_rmsnorm_bf16", MOD_RMSNORM, PTX_RMSNORM)?;
     let cfg = LaunchConfig {
         grid_dim: (grid_size, 1, 1),
         block_dim: (block_size, 1, 1),
         shared_mem_bytes: shared_mem,
     };
-    let mut builder = func.builder();
+    let mut builder = stream.launch_builder(&func);
     builder.arg(&x_slice);
     builder.arg(&w_slice);
     builder.arg(&out);
@@ -69,20 +61,12 @@ pub fn fast_rmsnorm(input: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor>
     builder.arg(&n_rows_val);
     builder.arg(&d_val);
     builder.arg(&eps_val);
-    unsafe { builder.launch(cfg) }.w()?;
+    unsafe { builder.launch(cfg) }.ce()?;
 
     drop(x_storage);
     drop(w_storage);
 
-    let out_storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
-    let out_tensor = Tensor::from_storage(
-        candle_core::Storage::Cuda(out_storage),
-        shape.clone(),
-        candle_core::op::BackpropOp::none(),
-        false,
-    );
-
-    Ok(out_tensor)
+    Ok(cb::tensor_from_cuda(out, stream, shape.clone()))
 }
 
 /// Fused residual add + RMSNorm.
@@ -94,25 +78,16 @@ pub fn fused_add_rmsnorm(
     weight: &Tensor,
     eps: f64,
 ) -> Result<(Tensor, Tensor)> {
-    let (x_storage, x_layout) = x.storage_and_layout();
-    let (r_storage, r_layout) = residual.storage_and_layout();
-    let (w_storage, w_layout) = weight.storage_and_layout();
+    let (x_storage, x_layout) = cb::storage_and_layout(&x);
+    let (r_storage, r_layout) = cb::storage_and_layout(&residual);
+    let (w_storage, w_layout) = cb::storage_and_layout(&weight);
 
-    let x_cuda = match &*x_storage {
-        candle_core::Storage::Cuda(s) => s,
-        _ => candle_core::bail!("fused_add_rmsnorm: requires CUDA"),
-    };
-    let r_cuda = match &*r_storage {
-        candle_core::Storage::Cuda(s) => s,
-        _ => candle_core::bail!("fused_add_rmsnorm: requires CUDA"),
-    };
-    let w_cuda = match &*w_storage {
-        candle_core::Storage::Cuda(s) => s,
-        _ => candle_core::bail!("fused_add_rmsnorm: requires CUDA"),
-    };
+    let x_cuda = cb::as_cuda(&x_storage, "fused_add_rmsnorm")?;
+    let r_cuda = cb::as_cuda(&r_storage, "fused_add_rmsnorm: residual")?;
+    let w_cuda = cb::as_cuda(&w_storage, "fused_add_rmsnorm: weight")?;
 
     if x_cuda.dtype() != DType::BF16 {
-        candle_core::bail!("fused_add_rmsnorm: requires BF16");
+        bail!("fused_add_rmsnorm: requires BF16");
     }
 
     let shape = x_layout.shape();
@@ -120,21 +95,21 @@ pub fn fused_add_rmsnorm(
     let d = *dims.last().unwrap();
     let n_rows = shape.elem_count() / d;
 
-    let dev = x_cuda.device().clone();
+    let stream = x_cuda.stream.clone();
     let n = shape.elem_count();
 
     let x_slice = x_cuda
-        .as_cuda_slice::<half::bf16>()?
+        .as_slice::<half::bf16>()?
         .slice(x_layout.start_offset()..);
     let r_slice = r_cuda
-        .as_cuda_slice::<half::bf16>()?
+        .as_slice::<half::bf16>()?
         .slice(r_layout.start_offset()..);
     let w_slice = w_cuda
-        .as_cuda_slice::<half::bf16>()?
+        .as_slice::<half::bf16>()?
         .slice(w_layout.start_offset()..);
 
-    let out_sum = unsafe { dev.alloc::<half::bf16>(n) }?;
-    let out_norm = unsafe { dev.alloc::<half::bf16>(n) }?;
+    let out_sum = unsafe { stream.alloc::<half::bf16>(n) }.ce()?;
+    let out_norm = unsafe { stream.alloc::<half::bf16>(n) }.ce()?;
 
     // Launch: one block per row, 256 threads per block
     let block_size = 256u32;
@@ -142,13 +117,13 @@ pub fn fused_add_rmsnorm(
     let shared_mem = num_warps * 4; // float per warp for reduction
 
     let func =
-        dev.get_or_load_custom_func("fused_add_rmsnorm_bf16", MOD_ADD_RMSNORM, PTX_ADD_RMSNORM)?;
+        crate::device::get_or_load_func(x_cuda.device(), "fused_add_rmsnorm_bf16", MOD_ADD_RMSNORM, PTX_ADD_RMSNORM)?;
     let cfg = LaunchConfig {
         grid_dim: (n_rows as u32, 1, 1),
         block_dim: (block_size, 1, 1),
         shared_mem_bytes: shared_mem,
     };
-    let mut builder = func.builder();
+    let mut builder = stream.launch_builder(&func);
     builder.arg(&x_slice);
     builder.arg(&r_slice);
     builder.arg(&w_slice);
@@ -160,28 +135,15 @@ pub fn fused_add_rmsnorm(
     builder.arg(&n_rows_val);
     builder.arg(&d_val);
     builder.arg(&eps_val);
-    unsafe { builder.launch(cfg) }.w()?;
+    unsafe { builder.launch(cfg) }.ce()?;
 
     // Drop storage refs before creating new tensors
     drop(x_storage);
     drop(r_storage);
     drop(w_storage);
 
-    let sum_storage = candle_core::CudaStorage::wrap_cuda_slice(out_sum, dev.clone());
-    let norm_storage = candle_core::CudaStorage::wrap_cuda_slice(out_norm, dev.clone());
-
-    let sum_tensor = Tensor::from_storage(
-        candle_core::Storage::Cuda(sum_storage),
-        shape.clone(),
-        candle_core::op::BackpropOp::none(),
-        false,
-    );
-    let norm_tensor = Tensor::from_storage(
-        candle_core::Storage::Cuda(norm_storage),
-        shape.clone(),
-        candle_core::op::BackpropOp::none(),
-        false,
-    );
+    let sum_tensor = cb::tensor_from_cuda(out_sum, stream.clone(), shape.clone());
+    let norm_tensor = cb::tensor_from_cuda(out_norm, stream, shape.clone());
 
     Ok((sum_tensor, norm_tensor))
 }

@@ -12,11 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 tracing = "0.1"
-
-[features]
-## When enabled, skip compiling tvm_ffi (another crate already provides it).
-## prelude-core enables this when flash-attn-v4 is also active.
-skip-tvm-ffi = []
+prelude-tvm-ffi = { path = "../tvm-ffi" }
 
 [build-dependencies]
 anyhow = "1"

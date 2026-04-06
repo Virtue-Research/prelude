@@ -1,6 +1,6 @@
 use crate::engine::*;
-use crate::modules::BatchAttnContext;
-use crate::modules::PagedKvBatchContext;
+use crate::models::commons::BatchAttnContext;
+use crate::models::commons::PagedKvBatchContext;
 
 impl Engine {
     /// Batch prefill multiple requests using varlen paged attention.
@@ -52,13 +52,13 @@ impl Engine {
 
         let total_tokens = flat_tokens.len();
         let packed_input = Tensor::from_vec(flat_tokens, (total_tokens,), &self.executor.device)
-            .map_err(candle_err)?;
+            .map_err(tensor_err)?;
         let cu_seqlens_q_t =
             Tensor::from_vec(cu_seqlens_q, (batch_size + 1,), &self.executor.device)
-                .map_err(candle_err)?;
+                .map_err(tensor_err)?;
         let cu_seqlens_k_t =
             Tensor::from_vec(cu_seqlens_k, (batch_size + 1,), &self.executor.device)
-                .map_err(candle_err)?;
+                .map_err(tensor_err)?;
 
         // Position IDs for suffix tokens: [cached_len..cached_len+q_len_1, ...]
         let mut position_ids: Vec<u32> = Vec::with_capacity(total_tokens);
@@ -68,7 +68,7 @@ impl Engine {
             }
         }
         let position_ids_t = Tensor::from_vec(position_ids, (total_tokens,), &self.executor.device)
-            .map_err(candle_err)?;
+            .map_err(tensor_err)?;
 
         // Allocate paged blocks for each request
         let block_tables =
@@ -85,9 +85,9 @@ impl Engine {
         }
         let block_tables_t =
             Tensor::from_vec(flat_bt, (batch_size, max_blocks), &self.executor.device)
-                .map_err(candle_err)?
+                .map_err(tensor_err)?
                 .to_dtype(DType::U32)
-                .map_err(candle_err)?;
+                .map_err(tensor_err)?;
 
         // Build slot_mapping for all tokens
         let mut slots: Vec<i64> = Vec::with_capacity(total_tokens);
@@ -101,7 +101,7 @@ impl Engine {
             }
         }
         let slot_mapping_t =
-            Tensor::new(slots.as_slice(), &self.executor.device).map_err(candle_err)?;
+            Tensor::new(slots.as_slice(), &self.executor.device).map_err(tensor_err)?;
 
         // Allocate DeltaNet pool slots if this is a hybrid model
         let deltanet_slots: Option<Vec<u32>> = if let Some(ref dn_pool_mutex) =
@@ -153,7 +153,7 @@ impl Engine {
         };
         let needs_prompt_logprobs = items.iter().any(|item| item.request.prompt_logprobs.is_some());
 
-        self.executor.ops.session.begin_forward();
+        self.executor.ops.begin_forward();
 
         // When prompt logprobs needed: get hidden states, apply compute_logits in chunks.
         // This avoids materializing the full (total_tokens, vocab_size) logits tensor.
@@ -162,11 +162,11 @@ impl Engine {
                 .ok_or_else(|| EngineError::InvalidRequest(
                     "prompt_logprobs requested but model doesn't support LogitsSplitModel".into()
                 ))?;
-            let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
-            let last_hidden = crate::modules::last_token_select(&hidden, &q_seq_lens)
-                .map_err(candle_err)?;
-            let last_logits = lm.compute_logits(&last_hidden).map_err(candle_err)?
-                .unsqueeze(1).map_err(candle_err)?;
+            let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(tensor_err)?;
+            let last_hidden = crate::models::commons::last_token_select(&hidden, &q_seq_lens)
+                .map_err(tensor_err)?;
+            let last_logits = lm.compute_logits(&last_hidden).map_err(tensor_err)?
+                .unsqueeze(1).map_err(tensor_err)?;
 
             // Chunked prompt logprobs extraction while model lock is still held.
             // Uses the shared extract function (avoids duplicating chunk logic).
@@ -176,16 +176,16 @@ impl Engine {
             drop(hidden);
             (last_logits, Some(logprobs_cpu))
         } else {
-            (model.forward(&packed_input, &mut ctx).map_err(candle_err)?, None)
+            (model.forward(&packed_input, &mut ctx).map_err(tensor_err)?, None)
         };
-        self.executor.ops.session.end_forward();
+        self.executor.ops.end_forward();
         drop(dn_pool_guard);
         drop(model);
 
         let prefill_ms = prefill_start.elapsed().as_secs_f32() * 1000.0;
 
         // Sample first token per request
-        let logits_2d = logits.squeeze(1).map_err(candle_err)?;
+        let logits_2d = logits.squeeze(1).map_err(tensor_err)?;
         let mut results: Vec<BatchPrefillResult> = Vec::with_capacity(batch_size);
 
         // Build prompt logprobs per item from pre-extracted CPU data.
@@ -222,12 +222,12 @@ impl Engine {
         if prefill_plan.all_greedy {
             let all_tokens = logits_2d
                 .argmax(crate::tensor::D::Minus1)
-                .map_err(candle_err)?
+                .map_err(tensor_err)?
                 .to_vec1::<u32>()
-                .map_err(candle_err)?;
+                .map_err(tensor_err)?;
             for (i, token) in all_tokens.into_iter().enumerate() {
                 let first_token_logprobs = if let Some(k) = items[i].request.logprobs {
-                    let row = logits_2d.get(i).map_err(candle_err)?;
+                    let row = logits_2d.get(i).map_err(tensor_err)?;
                     Some(Self::extract_top_logprobs(&row, token, k, &self.tokenizer)?)
                 } else {
                     None
@@ -244,9 +244,9 @@ impl Engine {
             }
         } else {
             for (i, item) in items.iter_mut().enumerate() {
-                let row = logits_2d.get(i).map_err(candle_err)?;
-                let row_f32 = row.to_dtype(DType::F32).map_err(candle_err)?;
-                let token = item.logits_processor.sample(&row_f32).map_err(candle_err)?;
+                let row = logits_2d.get(i).map_err(tensor_err)?;
+                let row_f32 = row.to_dtype(DType::F32).map_err(tensor_err)?;
+                let token = item.logits_processor.sample(&row_f32).map_err(tensor_err)?;
                 let first_token_logprobs = if let Some(k) = item.request.logprobs {
                     Some(Self::extract_top_logprobs(&row, token, k, &self.tokenizer)?)
                 } else {

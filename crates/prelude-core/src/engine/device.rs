@@ -1,7 +1,7 @@
 use super::*;
 
-pub(crate) fn candle_err(e: impl std::fmt::Display) -> EngineError {
-    EngineError::Internal(format!("candle error: {e}"))
+pub(crate) fn tensor_err(e: impl std::fmt::Display) -> EngineError {
+    EngineError::Internal(format!("tensor error: {e}"))
 }
 
 pub(crate) fn init_runtime(_device: &Device, _runtime: &crate::config::RuntimeConfig) {
@@ -16,7 +16,7 @@ pub(crate) fn select_device(
 
     let device = match requested.as_str() {
         "cpu" => Device::Cpu,
-        "auto" => Device::cuda_if_available(0).map_err(candle_err)?,
+        "auto" => Device::Cuda(0),
         s if s.starts_with("cuda:") => {
             let ordinal = s
                 .trim_start_matches("cuda:")
@@ -24,9 +24,9 @@ pub(crate) fn select_device(
                 .map_err(|e| {
                     EngineError::InvalidRequest(format!("invalid PRELUDE_DEVICE: {e}"))
                 })?;
-            Device::new_cuda(ordinal).map_err(candle_err)?
+            Device::Cuda(ordinal)
         }
-        "cuda" => Device::new_cuda(0).map_err(candle_err)?,
+        "cuda" => Device::Cuda(0),
         other => {
             return Err(EngineError::InvalidRequest(format!(
                 "invalid PRELUDE_DEVICE '{other}', expected auto|cpu|cuda|cuda:N"
@@ -37,9 +37,7 @@ pub(crate) fn select_device(
     let dtype = match runtime.dtype.as_deref() {
         Some("f32" | "F32" | "float32") => DType::F32,
         Some("bf16" | "BF16" | "bfloat16") => DType::BF16,
-        _ if device.is_cuda() => {
-            if device.supports_bf16() { DType::BF16 } else { DType::F32 }
-        }
+        _ if device.is_cuda() => DType::BF16,
         // CPU: BF16 with oneDNN BRGeMM backend
         _ => DType::BF16,
     };

@@ -1,5 +1,5 @@
 use super::prefill::PrefillForwardResult;
-use super::super::candle_err;
+use super::super::tensor_err;
 use crate::EngineError;
 
 pub(crate) struct PrefillOutputRows {
@@ -26,8 +26,8 @@ pub(crate) fn materialize_prefill_output_rows(
     let output_f32 = result
         .output
         .to_dtype(crate::tensor::DType::F32)
-        .map_err(candle_err)?;
-    let output_rows = output_f32.to_vec2().map_err(candle_err)?;
+        .map_err(tensor_err)?;
+    let output_rows = output_f32.to_vec2().map_err(tensor_err)?;
 
     Ok(Some(PrefillOutputRows {
         item_seq_counts,

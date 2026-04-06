@@ -1,4 +1,4 @@
-use crate::modules::activation::Activation;
+use crate::models::commons::activation::Activation;
 
 /// Qwen3 model configuration (from HuggingFace config.json).
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]

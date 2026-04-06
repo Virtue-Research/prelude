@@ -8,7 +8,8 @@ use serde::Deserialize;
 use crate::models::commons::{
     BatchState, Linear, RmsNorm,
 };
-use crate::ops::{MaskType, VarlenParams};
+use crate::ops::{MaskType, PagedParams, VarlenParams};
+use crate::models::commons::{PagedKvContext, PagedKvBatchContext};
 
 use crate::models::model_config;
 
@@ -131,6 +132,15 @@ impl Gemma4Config {
         }
         let first = self.num_hidden_layers.saturating_sub(self.num_kv_shared_layers);
         layer_idx >= first && first > 0
+    }
+
+    /// For a KV-shared layer, find the source layer (last non-shared layer of the same type).
+    /// Returns None for non-shared layers.
+    fn kv_sharing_source(&self, layer_idx: usize) -> Option<usize> {
+        if !self.is_kv_shared_layer(layer_idx) { return None; }
+        let first = self.num_hidden_layers.saturating_sub(self.num_kv_shared_layers);
+        let current_type = self.layer_type(layer_idx);
+        (0..first).rev().find(|&i| self.layer_type(i) == current_type)
     }
 
     fn layer_intermediate_size(&self, layer_idx: usize) -> usize {
@@ -438,6 +448,7 @@ struct Gemma4Attention {
     sliding_window: Option<usize>,
     is_kv_shared: bool,
     softcap: Option<f32>,
+    layer_idx: usize,
 }
 
 impl Gemma4Attention {
@@ -504,9 +515,13 @@ impl Gemma4Attention {
             sliding_window,
             is_kv_shared,
             softcap,
+            layer_idx,
         })
     }
 
+    /// Forward pass. For KV-shared layers, `shared_kv` provides the source layer's
+    /// post-norm/RoPE K and post-norm V. Returns (output, Option<(K, V)>) where
+    /// the K/V are returned for source layers so they can be shared during prefill.
     fn forward(
         &mut self,
         ops: &dyn crate::ops::Ops,
@@ -514,55 +529,70 @@ impl Gemma4Attention {
         cu_seqlens: &Tensor,
         max_seqlen: usize,
         position_ids: &Tensor,
-    ) -> Result<Tensor> {
+        shared_kv: Option<(&Tensor, &Tensor)>,
+        paged_kv: Option<&PagedKvContext<'_>>,
+    ) -> Result<(Tensor, Option<(Tensor, Tensor)>)> {
         let (total_tokens, _) = packed_input.dims2()?;
         let bs = BatchState::no_lora();
+        let is_shared = shared_kv.is_some();
 
+        // Q: always computed (proj + norm + RoPE)
         let q = self.q_proj.forward(packed_input, &bs, ops)?;
-        let k = self.k_proj.forward(packed_input, &bs, ops)?;
-        let v = self.v_proj.forward(packed_input, &bs, ops)?;
-
-        // Reshape to [total, heads, head_dim]
         let q = q.reshape((total_tokens, self.num_heads, self.head_dim))?;
+        let q = ops.rms_norm(&q, self.q_norm.weight(), self.q_norm.eps() as f32)?;
 
-        // For KV-shared layers with no cache (prefill), do full K/V processing.
-        // KV sharing is only active when we have paged KV cache (decode path).
-        let k = k.reshape((total_tokens, self.num_kv_heads, self.head_dim))?;
+        let q_cos = self.rotary_emb.cos.index_select(position_ids, 0)?;
+        let q_sin = self.rotary_emb.sin.index_select(position_ids, 0)?;
+        let (total, hq, d2) = q.dims3()?;
+        let q = q.reshape((1, total, hq, d2))?.rope_thd(&q_cos, &q_sin)?.reshape((total, hq, d2))?;
 
-        let (q, k) = ops.qknorm_rope_and_cache(
-            &q, &k, &v,
-            self.q_norm.weight(), self.k_norm.weight(),
-            &self.rotary_emb.cos, &self.rotary_emb.sin,
-            position_ids, self.q_norm.eps() as f32,
-            None,
-        )?;
+        // K/V: shared layers reuse source layer's K/V, non-shared compute their own
+        let (k, v, kv_to_share) = if let Some((sk, sv)) = shared_kv {
+            (sk.clone(), sv.clone(), None)
+        } else {
+            let k = self.k_proj.forward(packed_input, &bs, ops)?;
+            let v = self.v_proj.forward(packed_input, &bs, ops)?;
+            let k = k.reshape((total_tokens, self.num_kv_heads, self.head_dim))?;
+            let k = ops.rms_norm(&k, self.k_norm.weight(), self.k_norm.eps() as f32)?;
+            let hk = k.dim(1)?;
+            let k = k.reshape((1, total, hk, d2))?.rope_thd(&q_cos, &q_sin)?.reshape((total, hk, d2))?;
+            let v = v.reshape((total_tokens, self.num_kv_heads, self.head_dim))?;
+            let v = self.v_norm.forward(&v)?;
+            (k.clone(), v.clone(), Some((k, v)))
+        };
 
-        let v = v.reshape((total_tokens, self.num_kv_heads, self.head_dim))?;
-        let v = self.v_norm.forward(&v)?;
-
-        // Gemma4 uses scaling=1.0 (Q/K norms replace explicit scaling)
+        // Attention dispatch: paged KV cache (decode) or varlen (prefill)
         let mask = if self.is_sliding {
             let ws = self.sliding_window.unwrap_or(max_seqlen);
-            MaskType::SlidingWindow {
-                left: ws.saturating_sub(1),
-                right: 0,
-            }
+            MaskType::SlidingWindow { left: ws.saturating_sub(1), right: 0 }
         } else {
             MaskType::Causal
         };
 
-        let attn_out = ops.varlen_attention(&q, &k, &v, &VarlenParams {
-            cu_seqlens_q: cu_seqlens,
-            cu_seqlens_k: cu_seqlens,
-            max_seqlen_q: max_seqlen,
-            max_seqlen_k: max_seqlen,
-            scale: 1.0,
-            mask,
-            softcap: self.softcap,
-        })?;
+        let attn_out = if let Some(kv) = paged_kv {
+            // Paged decode: write K/V to cache (skip for shared layers — cache is aliased),
+            // then read from cache for attention.
+            if !is_shared {
+                ops.reshape_and_cache(&k, &v, kv.key_cache, kv.value_cache, kv.slot_mapping)?;
+            }
+            ops.paged_attention(&q, kv.key_cache, kv.value_cache, &PagedParams {
+                block_tables: kv.block_tables,
+                cu_seqlens_q: cu_seqlens, cu_seqlens_k: kv.cu_seqlens_k,
+                max_seqlen_q: max_seqlen, max_seqlen_k: kv.max_seqlen_k,
+                scale: 1.0, mask, softcap: self.softcap,
+            })?
+        } else {
+            // Varlen prefill
+            ops.varlen_attention(&q, &k, &v, &VarlenParams {
+                cu_seqlens_q: cu_seqlens, cu_seqlens_k: cu_seqlens,
+                max_seqlen_q: max_seqlen, max_seqlen_k: max_seqlen,
+                scale: 1.0, mask, softcap: self.softcap,
+            })?
+        };
 
         let attn_dim = self.num_heads * self.head_dim;
-        self.o_proj.forward(&attn_out.reshape((total_tokens, attn_dim))?, &bs, ops)
+        let output = self.o_proj.forward(&attn_out.reshape((total_tokens, attn_dim))?, &bs, ops)?;
+        Ok((output, kv_to_share))
     }
 
     fn clear_kv_cache(&mut self) {}
@@ -572,6 +602,7 @@ impl Gemma4Attention {
 
 #[derive(Debug, Clone)]
 struct Gemma4DecoderLayer {
+    layer_idx: usize,
     self_attn: Gemma4Attention,
     mlp: Gemma4Mlp,
     input_layernorm: RmsNorm,
@@ -637,6 +668,7 @@ impl Gemma4DecoderLayer {
         };
 
         Ok(Self {
+            layer_idx,
             self_attn,
             mlp,
             input_layernorm,
@@ -655,6 +687,7 @@ impl Gemma4DecoderLayer {
         })
     }
 
+    /// Forward pass. Returns (output, Option<(K, V)>) — K/V returned for source layers.
     fn forward(
         &mut self,
         ops: &dyn crate::ops::Ops,
@@ -663,11 +696,13 @@ impl Gemma4DecoderLayer {
         max_seqlen: usize,
         position_ids: &Tensor,
         per_layer_input: Option<&Tensor>,
-    ) -> Result<Tensor> {
+        shared_kv: Option<(&Tensor, &Tensor)>,
+        paged_kv: Option<&PagedKvContext<'_>>,
+    ) -> Result<(Tensor, Option<(Tensor, Tensor)>)> {
         // 1. Self-attention with residual
         let residual = xs;
         let hidden = self.input_layernorm.forward(residual)?;
-        let hidden = self.self_attn.forward(ops, &hidden, cu_seqlens, max_seqlen, position_ids)?;
+        let (hidden, kv_to_share) = self.self_attn.forward(ops, &hidden, cu_seqlens, max_seqlen, position_ids, shared_kv, paged_kv)?;
         let hidden = self.post_attention_layernorm.forward(&hidden)?;
         let xs = ops.add_or_fused(&hidden, residual)?;
         let residual = &xs;
@@ -702,16 +737,6 @@ impl Gemma4DecoderLayer {
             &self.per_layer_input_gate, &self.per_layer_projection, &self.post_per_layer_input_norm,
         ) {
             if let Some(ple_input) = per_layer_input {
-                // Debug layer 15+ divergence
-                if std::env::var("GEMMA4_DEBUG_PLE").is_ok() {
-                    let lsv: f32 = self.layer_scalar.to_dtype(DType::F32).unwrap().to_vec1::<f32>().unwrap()[0];
-                    let xm: f32 = {
-                        let t = xs.narrow(0, xs.dim(0).unwrap()-1, 1).unwrap().to_dtype(DType::F32).unwrap().squeeze(0).unwrap();
-                        let v: Vec<f32> = t.to_vec1().unwrap();
-                        v.iter().sum::<f32>() / v.len() as f32
-                    };
-                    eprintln!("PLE[ls={lsv:.4}] pre_ple_mean={xm:.6}");
-                }
                 let gate = gate_linear.forward(&xs, &BatchState::no_lora(), ops)?;
                 let gate = gate.gelu()?;
                 let gated = (gate * ple_input)?;
@@ -722,7 +747,8 @@ impl Gemma4DecoderLayer {
         }
 
         // 6. Layer scalar
-        xs.broadcast_mul(&self.layer_scalar)
+        let xs = xs.broadcast_mul(&self.layer_scalar)?;
+        Ok((xs, kv_to_share))
     }
 
     fn clear_kv_cache(&mut self) {
@@ -744,6 +770,8 @@ struct Gemma4Model {
     per_layer_projection_norm: Option<RmsNorm>,
     ple_dim: usize,
     num_hidden_layers: usize,
+    /// KV sharing: kv_sharing_map[layer_idx] = Some(source_layer_idx) for shared layers.
+    kv_sharing_map: Vec<Option<usize>>,
 }
 
 impl Gemma4Model {
@@ -812,6 +840,9 @@ impl Gemma4Model {
             per_layer_projection_norm,
             ple_dim,
             num_hidden_layers: cfg.num_hidden_layers,
+            kv_sharing_map: (0..cfg.num_hidden_layers)
+                .map(|i| cfg.kv_sharing_source(i))
+                .collect(),
         })
     }
 
@@ -866,36 +897,46 @@ impl Gemma4Model {
         cu_seqlens: &Tensor,
         max_seqlen: usize,
         position_ids: &Tensor,
+        paged_kv: Option<&PagedKvBatchContext<'_>>,
     ) -> Result<Tensor> {
         let embed_scale = (self.hidden_size as f64).sqrt();
         let mut xs = (self.embed_tokens.forward(packed_input)? * embed_scale)?;
 
-        // Debug: print hidden state stats per layer
-        let debug_hs = std::env::var("GEMMA4_DEBUG_HS").is_ok();
-        if debug_hs {
-            let last = xs.narrow(0, xs.dim(0)? - 1, 1)?.to_dtype(DType::F32)?.squeeze(0)?;
-            let vals: Vec<f32> = last.to_vec1()?;
-            let mean: f32 = vals.iter().sum::<f32>() / vals.len() as f32;
-            eprintln!("hs[ 0]: mean={mean:.6} first5={:?}", &vals[..5]);
-        }
-
         // Compute PLE inputs
         let per_layer_inputs = self.compute_per_layer_inputs(ops, &xs, packed_input)?;
+
+        // KV sharing: source layers store their K/V for shared layers to reuse (prefill path).
+        // In paged path, sharing is handled by cache aliasing — shared layers read from
+        // the source layer's cache automatically.
+        let mut shared_kv_store: std::collections::HashMap<usize, (Tensor, Tensor)> =
+            std::collections::HashMap::new();
 
         for (i, layer) in self.layers.iter_mut().enumerate() {
             let ple_input = per_layer_inputs.as_ref().map(|pli| {
                 pli.narrow(1, i, 1).unwrap().squeeze(1).unwrap()
             });
-            xs = layer.forward(
+
+            // For KV-shared layers in prefill: get source layer's K/V
+            let shared_kv = if paged_kv.is_none() {
+                self.kv_sharing_map[i].and_then(|src| {
+                    shared_kv_store.get(&src).map(|(k, v)| (k, v))
+                })
+            } else {
+                None  // Paged path: sharing handled by cache aliasing
+            };
+
+            // Per-layer paged KV context
+            let layer_kv = paged_kv.map(|p| p.layer(i));
+
+            let (out, kv_to_share) = layer.forward(
                 ops, &xs, cu_seqlens, max_seqlen, position_ids,
-                ple_input.as_ref(),
+                ple_input.as_ref(), shared_kv, layer_kv.as_ref(),
             )?;
-            if debug_hs {
-                let last = xs.narrow(0, xs.dim(0).unwrap() - 1, 1).unwrap()
-                    .to_dtype(DType::F32).unwrap().squeeze(0).unwrap();
-                let vals: Vec<f32> = last.to_vec1().unwrap();
-                let mean: f32 = vals.iter().sum::<f32>() / vals.len() as f32;
-                eprintln!("hs[{:2}]: mean={mean:.6} first5={:?}", i + 1, &vals[..5]);
+            xs = out;
+
+            // Source layers: store K/V for future shared layers (prefill only)
+            if let Some(kv) = kv_to_share {
+                shared_kv_store.insert(i, kv);
             }
         }
 
@@ -958,6 +999,7 @@ impl Gemma4ForCausalLM {
             ctx.cu_seqlens_q,
             ctx.max_seqlen_q,
             ctx.position_ids,
+            ctx.paged_kv,
         )?;
         let last_hidden =
             crate::models::commons::last_token_select(&hidden, ctx.seq_lens)?.contiguous()?;
@@ -990,6 +1032,7 @@ impl crate::models::LogitsSplitModel for Gemma4ForCausalLM {
             ctx.cu_seqlens_q,
             ctx.max_seqlen_q,
             ctx.position_ids,
+            ctx.paged_kv,
         )
     }
 
@@ -1016,6 +1059,10 @@ impl crate::models::ModelForward for Gemma4ForCausalLM {
 
     fn clear_kv_cache(&mut self) {
         self.clear_kv_cache();
+    }
+
+    fn kv_cache_sharing(&self) -> Vec<Option<usize>> {
+        self.base.kv_sharing_map.clone()
     }
 
     fn as_logits_model(&self) -> Option<&dyn crate::models::LogitsSplitModel> {

@@ -21,7 +21,7 @@ limitation (Metal framework only on macOS, nvcc/hipcc only on Linux).
 NCCL and RCCL are **dlopen'd at runtime** (not statically linked), avoiding symbol
 conflicts when both CUDA and ROCm backends are compiled into the same binary.
 
-Model code compiles identically in all targets — only the `Ops` implementation differs.
+Model code compiles identically in all targets — only the `OpsBundle` implementation differs.
 
 | Device | Runtime dependency | Build dependency (not needed at runtime) |
 |--------|-------------------|----------------------------------------|
@@ -39,7 +39,7 @@ Model code compiles identically in all targets — only the `Ops` implementation
   - GEMM: DeepGEMM (vendored) → CUTLASS (vendored, header-only) → no fallback needed
   - Attention: FA4 (vendored, TVM AOT) → FlashInfer (vendored, AOT)
   - Conv: CUTLASS conv (vendored) or custom CUDA/HIP kernels
-  - Norm/activation/element-wise: custom kernels (FlashInfer utilities, Triton AOT)
+  - Norm/activation/element-wise: ComposedOps via CubeCL TensorOps (JIT-compiled at first run, cached)
 - **ROCm follows the same pattern**: CK (header-only, vendored) for GEMM + attention,
   aiter kernels (vendored, AOT) for flash attention. All compiled with hipcc at build time,
   runtime only needs libamdhip64.so from the driver package.

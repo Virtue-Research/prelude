@@ -55,13 +55,7 @@ pub fn cpu_silu_and_mul_inplace(input: Tensor) -> Result<Tensor> {
     }
     let dim = d2 / 2;
 
-    let data_ptr = {
-        let (mut storage, layout) = unsafe { input.storage_mut_and_layout() };
-        let slice = unsafe {
-            super::extract_bf16_mut_u16(&mut storage, layout.start_offset(), n * d2)?
-        };
-        slice.as_mut_ptr()
-    };
+    let data_ptr = unsafe { input.data_ptr_mut()? as *mut u16 };
 
     silu_and_mul_bf16_inplace(data_ptr, n, dim);
     input.narrow(1, 0, dim)

@@ -55,7 +55,3 @@ cuda = [
 ]
 # Everything
 full = ["cpu", "cuda"]
-
-[[bin]]
-name = "gemma4_test"
-path = "src/bin/gemma4_test.rs"

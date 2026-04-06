@@ -1,10 +1,8 @@
 //! A `VarBuilder` for variable retrieval from safetensors model files.
 //!
-//! This is a standalone, inference-only version of `candle_nn::VarBuilder`.
-//! It removes training-specific features (VarMap, gradient tracking) and
-//! format-specific backends (npz, pth) that are not needed for serving.
-//!
-//! Adapted from candle-nn 0.9.2.
+//! Standalone, inference-only VarBuilder. Removes training-specific features
+//! (VarMap, gradient tracking) and format-specific backends (npz, pth)
+//! that are not needed for serving.
 
 use crate::tensor::{DType, Device, Error, Result, Shape, Tensor};
 use std::collections::HashMap;
@@ -385,7 +383,7 @@ impl SimpleBackend for crate::tensor::safetensors::MmapedSafetensors {
         dtype: DType,
         dev: &Device,
     ) -> Result<Tensor> {
-        let tensor = Tensor::from_candle(self.load(name, dev)?).to_dtype(dtype)?;
+        let tensor = self.load(name, dev)?.to_dtype(dtype)?;
         if tensor.shape() != &s {
             Err(crate::tensor::Error::UnexpectedShape {
                 msg: format!("shape mismatch for {name}"),
@@ -398,7 +396,7 @@ impl SimpleBackend for crate::tensor::safetensors::MmapedSafetensors {
     }
 
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
-        Ok(Tensor::from_candle(self.load(name, dev)?).to_dtype(dtype)?)
+        self.load(name, dev)?.to_dtype(dtype)
     }
 
     fn contains_tensor(&self, name: &str) -> bool {
@@ -415,7 +413,7 @@ impl SimpleBackend for crate::tensor::safetensors::BufferedSafetensors {
         dtype: DType,
         dev: &Device,
     ) -> Result<Tensor> {
-        let tensor = Tensor::from_candle(self.load(name, dev)?).to_dtype(dtype)?;
+        let tensor = self.load(name, dev)?.to_dtype(dtype)?;
         if tensor.shape() != &s {
             Err(crate::tensor::Error::UnexpectedShape {
                 msg: format!("shape mismatch for {name}"),
@@ -428,7 +426,7 @@ impl SimpleBackend for crate::tensor::safetensors::BufferedSafetensors {
     }
 
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
-        Ok(Tensor::from_candle(self.load(name, dev)?).to_dtype(dtype)?)
+        self.load(name, dev)?.to_dtype(dtype)
     }
 
     fn contains_tensor(&self, name: &str) -> bool {

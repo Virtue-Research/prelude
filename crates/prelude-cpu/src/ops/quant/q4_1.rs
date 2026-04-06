@@ -98,12 +98,22 @@ mod avx2 {
 
 #[inline]
 pub fn vec_dot_q4_1_q8_1(x: &[BlockQ4_1], y: &[BlockQ8_1]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { super::neon::q4_1::vec_dot_q4_1_q8_1_neon(x, y) };
+    }
+
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
             return unsafe { avx2::vec_dot_q4_1_q8_1_avx2(x, y) };
         }
     }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    { /* fall through to scalar below */ }
+
+    #[allow(unreachable_code)]
     vec_dot_q4_1_q8_1_scalar(x, y)
 }
 
@@ -133,14 +143,9 @@ pub fn quantized_matmul_q4_1(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prelude_core::tensor::quantized::{GgmlDType, QTensor};
-    use prelude_core::tensor::{Device, Tensor};
 
     fn make_test_blocks(values: &[f32]) -> Vec<BlockQ4_1> {
-        assert!(values.len() % 32 == 0);
-        let t = Tensor::from_vec(values.to_vec(), (values.len(),), &Device::Cpu).unwrap();
-        let qt = QTensor::quantize_onto(&t, GgmlDType::Q4_1, &Device::Cpu).unwrap();
-        bytemuck::cast_slice(&qt.data().unwrap()).to_vec()
+        crate::ops::quant::quantize_f32_q4_1(values)
     }
 
     #[test]
@@ -153,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_vs_candle_dequant() {
+    fn scalar_vs_dequant() {
         let k = 128;
         let values: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.007).sin() * 2.0).collect();
         let x_vals: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.013).cos()).collect();
@@ -162,9 +167,16 @@ mod tests {
         let q8 = super::super::quantize::quantize_row_q8_1_scalar(&x_vals);
         let our_dot = vec_dot_q4_1_q8_1_scalar(&q4, &q8);
 
-        let t = Tensor::from_vec(values, (k,), &Device::Cpu).unwrap();
-        let qt = QTensor::quantize_onto(&t, GgmlDType::Q4_1, &Device::Cpu).unwrap();
-        let w_deq = qt.dequantize(&Device::Cpu).unwrap().to_vec1::<f32>().unwrap();
+        // Dequantize our blocks and compute reference dot product
+        let mut w_deq = vec![0.0f32; k];
+        for (bi, b) in q4.iter().enumerate() {
+            let d = fp16_to_f32(b.d);
+            let m = fp16_to_f32(b.m);
+            for j in 0..16 {
+                w_deq[bi * 32 + j] = (b.qs[j] & 0x0F) as f32 * d + m;
+                w_deq[bi * 32 + 16 + j] = (b.qs[j] >> 4) as f32 * d + m;
+            }
+        }
         let ref_dot: f32 = w_deq.iter().zip(x_vals.iter()).map(|(w, x)| w * x).sum();
 
         let rel_err = (our_dot - ref_dot).abs() / ref_dot.abs().max(1e-6);

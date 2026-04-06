@@ -126,6 +126,127 @@ mod avx2 {
 
         output
     }
+
+    /// Quantize a row of FP32 values into Q8_K blocks (AVX2).
+    ///
+    /// Processes 256 floats per block. Each block uses f32 scale and
+    /// precomputes 16-element sub-block sums (bsums).
+    #[target_feature(enable = "avx2")]
+    pub(super) fn quantize_row_q8k_avx2(x: &[f32]) -> Vec<BlockQ8K> {
+        let nb = x.len() / QK_K;
+        let mut output = Vec::with_capacity(nb);
+
+        let sign_bit = _mm256_set1_ps(-0.0f32);
+
+        for i in 0..nb {
+            let block_start = i * QK_K;
+            let ptr = unsafe { x.as_ptr().add(block_start) };
+
+            // Find max absolute value across all 256 elements (8 groups of 32)
+            let mut max_abs = _mm256_setzero_ps();
+            for g in 0..8 {
+                // SAFETY: block_start + g*32 + 24 < block_start + 256 <= x.len()
+                let v0 = unsafe { _mm256_loadu_ps(ptr.add(g * 32)) };
+                let v1 = unsafe { _mm256_loadu_ps(ptr.add(g * 32 + 8)) };
+                let v2 = unsafe { _mm256_loadu_ps(ptr.add(g * 32 + 16)) };
+                let v3 = unsafe { _mm256_loadu_ps(ptr.add(g * 32 + 24)) };
+                max_abs = _mm256_max_ps(max_abs, _mm256_andnot_ps(sign_bit, v0));
+                max_abs = _mm256_max_ps(max_abs, _mm256_andnot_ps(sign_bit, v1));
+                max_abs = _mm256_max_ps(max_abs, _mm256_andnot_ps(sign_bit, v2));
+                max_abs = _mm256_max_ps(max_abs, _mm256_andnot_ps(sign_bit, v3));
+            }
+
+            // Horizontal max across 8 lanes
+            let hi128 = _mm256_extractf128_ps(max_abs, 1);
+            let lo128 = _mm256_castps256_ps128(max_abs);
+            let max4 = _mm_max_ps(hi128, lo128);
+            let max2 = _mm_max_ps(max4, _mm_movehl_ps(max4, max4));
+            let max1 = _mm_max_ss(max2, _mm_movehdup_ps(max2));
+            let amax = _mm_cvtss_f32(max1);
+
+            let d = amax / 127.0f32;
+            let id = if amax != 0.0 { 127.0f32 / amax } else { 0.0f32 };
+            let mul = _mm256_set1_ps(id);
+
+            let mut qs = [0i8; QK_K];
+            let mut bsums = [0i16; QK_K / 16];
+
+            // Process 256 elements in groups of 32 (matching Q8_0 pattern),
+            // quantize to i8 and compute bsums
+            let perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+
+            for g in 0..8 {
+                let base = g * 32;
+                // SAFETY: ptr.add(base + 24) < ptr + 256
+                let v0 = unsafe { _mm256_loadu_ps(ptr.add(base)) };
+                let v1 = unsafe { _mm256_loadu_ps(ptr.add(base + 8)) };
+                let v2 = unsafe { _mm256_loadu_ps(ptr.add(base + 16)) };
+                let v3 = unsafe { _mm256_loadu_ps(ptr.add(base + 24)) };
+
+                // Scale + round
+                let r0 = _mm256_round_ps(
+                    _mm256_mul_ps(v0, mul),
+                    _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+                );
+                let r1 = _mm256_round_ps(
+                    _mm256_mul_ps(v1, mul),
+                    _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+                );
+                let r2 = _mm256_round_ps(
+                    _mm256_mul_ps(v2, mul),
+                    _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+                );
+                let r3 = _mm256_round_ps(
+                    _mm256_mul_ps(v3, mul),
+                    _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+                );
+
+                // f32 → i32
+                let i0 = _mm256_cvtps_epi32(r0);
+                let i1 = _mm256_cvtps_epi32(r1);
+                let i2 = _mm256_cvtps_epi32(r2);
+                let i3 = _mm256_cvtps_epi32(r3);
+
+                // i32 → i16 → i8 (same pack+permute as Q8_0)
+                let packed16_01 = _mm256_packs_epi32(i0, i1);
+                let packed16_23 = _mm256_packs_epi32(i2, i3);
+                let packed8 = _mm256_packs_epi16(packed16_01, packed16_23);
+                let packed8 = _mm256_permutevar8x32_epi32(packed8, perm);
+
+                // Store 32 quantized bytes
+                // SAFETY: qs[base..base+32] is within [0..256]
+                unsafe {
+                    _mm256_storeu_si256(qs.as_mut_ptr().add(base) as *mut __m256i, packed8);
+                }
+
+                // Compute bsums for the two 16-element subblocks in this group.
+                // First subblock: elements [base..base+16] from i0+i1
+                // Second subblock: elements [base+16..base+32] from i2+i3
+                //
+                // For each pair, add the two __m256i vectors, then reduce the
+                // resulting 8 × i32 to a single sum.
+                let s01 = _mm256_add_epi32(i0, i1); // 8 partial sums
+                let s01_hi = _mm256_extracti128_si256(s01, 1);
+                let s01_lo = _mm256_castsi256_si128(s01);
+                let s01_4 = _mm_add_epi32(s01_lo, s01_hi); // 4 sums
+                let s01_2 = _mm_add_epi32(s01_4, _mm_srli_si128(s01_4, 8)); // 2 sums
+                let s01_1 = _mm_add_epi32(s01_2, _mm_srli_si128(s01_2, 4)); // 1 sum
+                bsums[g * 2] = _mm_cvtsi128_si32(s01_1) as i16;
+
+                let s23 = _mm256_add_epi32(i2, i3);
+                let s23_hi = _mm256_extracti128_si256(s23, 1);
+                let s23_lo = _mm256_castsi256_si128(s23);
+                let s23_4 = _mm_add_epi32(s23_lo, s23_hi);
+                let s23_2 = _mm_add_epi32(s23_4, _mm_srli_si128(s23_4, 8));
+                let s23_1 = _mm_add_epi32(s23_2, _mm_srli_si128(s23_2, 4));
+                bsums[g * 2 + 1] = _mm_cvtsi128_si32(s23_1) as i16;
+            }
+
+            output.push(BlockQ8K { d, qs, bsums });
+        }
+
+        output
+    }
 }
 
 // ── Auto-dispatch ────────────────────────────────────────────────────────
@@ -195,7 +316,13 @@ pub fn quantize_row_q8k_scalar(x: &[f32]) -> Vec<BlockQ8K> {
 
 /// Quantize FP32 activations to Q8_K, selecting the best kernel at runtime.
 pub fn quantize_row_q8k(x: &[f32]) -> Vec<BlockQ8K> {
-    // TODO: AVX2 implementation for Q8_K
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: feature detection above guarantees AVX2 is available
+            return unsafe { avx2::quantize_row_q8k_avx2(x) };
+        }
+    }
     quantize_row_q8k_scalar(x)
 }
 
@@ -396,6 +523,79 @@ mod tests {
             for (bi, (sb, db)) in scalar.iter().zip(dispatched.iter()).enumerate() {
                 assert_eq!(sb.d, db.d, "block {bi} scale mismatch");
                 assert_eq!(sb.qs, db.qs, "block {bi} values mismatch");
+            }
+        }
+
+        #[test]
+        fn avx2_q8k_matches_scalar() {
+            if !is_x86_feature_detected!("avx2") {
+                return;
+            }
+
+            // Generate test data: 2 blocks = 512 floats with varied magnitudes
+            let mut input = vec![0.0f32; 512];
+            for (i, v) in input.iter_mut().enumerate() {
+                *v = ((i as f32) * 0.37).sin() * ((i as f32) * 0.13).cos() * 50.0;
+            }
+
+            let scalar_blocks = quantize_row_q8k_scalar(&input);
+            // SAFETY: AVX2 checked above
+            let avx2_blocks = unsafe { avx2::quantize_row_q8k_avx2(&input) };
+
+            assert_eq!(scalar_blocks.len(), avx2_blocks.len());
+
+            for (bi, (sb, ab)) in scalar_blocks.iter().zip(avx2_blocks.iter()).enumerate() {
+                assert!(
+                    (sb.d - ab.d).abs() < 1e-6,
+                    "block {bi}: scale mismatch scalar={} avx2={}",
+                    sb.d, ab.d,
+                );
+
+                for j in 0..QK_K {
+                    assert_eq!(
+                        sb.qs[j], ab.qs[j],
+                        "block {bi} elem {j}: scalar={}, avx2={}",
+                        sb.qs[j], ab.qs[j]
+                    );
+                }
+
+                for j in 0..(QK_K / 16) {
+                    assert_eq!(
+                        sb.bsums[j], ab.bsums[j],
+                        "block {bi} bsum {j}: scalar={}, avx2={}",
+                        sb.bsums[j], ab.bsums[j]
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn avx2_q8k_all_zeros() {
+            if !is_x86_feature_detected!("avx2") {
+                return;
+            }
+            let input = vec![0.0f32; 256];
+            // SAFETY: AVX2 checked above
+            let blocks = unsafe { avx2::quantize_row_q8k_avx2(&input) };
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].d, 0.0);
+            assert!(blocks[0].qs.iter().all(|&q| q == 0));
+            assert!(blocks[0].bsums.iter().all(|&s| s == 0));
+        }
+
+        #[test]
+        fn q8k_dispatch_matches_scalar() {
+            let mut input = vec![0.0f32; 512];
+            for (i, v) in input.iter_mut().enumerate() {
+                *v = (i as f32 - 256.0) * 0.3;
+            }
+            let scalar = quantize_row_q8k_scalar(&input);
+            let dispatched = quantize_row_q8k(&input);
+
+            for (bi, (sb, db)) in scalar.iter().zip(dispatched.iter()).enumerate() {
+                assert!((sb.d - db.d).abs() < 1e-6, "block {bi} scale mismatch");
+                assert_eq!(sb.qs, db.qs, "block {bi} values mismatch");
+                assert_eq!(sb.bsums, db.bsums, "block {bi} bsums mismatch");
             }
         }
     }

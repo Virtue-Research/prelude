@@ -11,11 +11,11 @@ Mamba:             (x, conv_state, ssm_state) → (o, conv_state', ssm_state')
 These do NOT go through `AttentionOps`. Models own their token mixer implementations. The `TransformerBlock` handles this via closure injection:
 
 ```rust
-// prelude-core/src/modules/ — TransformerBlock is agnostic to token mixer type
+// prelude-core/src/models/commons/ — TransformerBlock is agnostic to token mixer type
 fn forward<A, M>(&self, x: &Tensor, attn_fn: A, mlp_fn: M) -> Result<Tensor>
 where A: FnOnce(&Tensor) -> Result<Tensor>
 {
-    let h = ops.norm.rms_norm(x, &self.ln1_weight, eps)?;
+    let h = ops.rms_norm(x, &self.ln1_weight, eps)?;
     let h = attn_fn(&h)?;  // softmax attention OR DeltaNet OR Mamba
     // ...
 }
@@ -25,7 +25,7 @@ The model decides per-layer:
 ```rust
 // prelude-core/src/models/qwen35.rs
 match self.layer_type(i) {
-    Softmax  => block.forward(x, |h| ops.attn.varlen_attention(h, ...)),
+    Softmax  => block.forward(x, |h| ops.varlen_attention(h, ...)),
     DeltaNet => block.forward(x, |h| self.deltanet[i].forward(h, ...)),
 }
 ```
@@ -64,7 +64,7 @@ enum LayerCacheSpec {
 /// Model declares cache requirements per layer at load time.
 trait Model {
     fn cache_specs(&self) -> Vec<LayerCacheSpec>;
-    fn forward(&mut self, x: &Tensor, ctx: &BatchState, ops: &Ops, cache: &Cache) -> Result<Tensor>;
+    fn forward(&mut self, x: &Tensor, ctx: &BatchState, ops: &OpsBundle, cache: &Cache) -> Result<Tensor>;
 }
 ```
 
@@ -74,7 +74,7 @@ trait Model {
 // prelude-core/src/engine/executor.rs
 
 /// Group layers by cache spec, allocate one pool per group.
-fn allocate_cache(model: &dyn Model, ops: &Ops, config: &CacheConfig) -> Cache {
+fn allocate_cache(model: &dyn Model, ops: &OpsBundle, config: &CacheConfig) -> Cache {
     let specs = model.cache_specs();
     
     // Group: layers 0,2,4 = Attention, layers 1,3,5 = Recurrent

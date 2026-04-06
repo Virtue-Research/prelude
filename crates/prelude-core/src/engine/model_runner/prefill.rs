@@ -84,7 +84,7 @@ impl Engine {
         token_groups: &[&[Vec<u32>]],
         need_hidden_states: bool,
     ) -> Result<Option<PrefillForwardResult>, EngineError> {
-        use crate::modules::BatchAttnContext;
+        use crate::models::commons::BatchAttnContext;
         // Set thread-local ops for operator overload dispatch.
         let _ops_guard = crate::ops::OpsGuard::new(self.executor.ops);
 
@@ -119,11 +119,11 @@ impl Engine {
 
         let device = &self.executor.device;
         let packed_input = crate::tensor::Tensor::from_vec(flat_tokens, (total_tokens,), device)
-            .map_err(candle_err)?;
+            .map_err(tensor_err)?;
         let cu_seqlens_q_t = crate::tensor::Tensor::from_vec(cu_seqlens, (batch_size + 1,), device)
-            .map_err(candle_err)?;
+            .map_err(tensor_err)?;
         let position_ids_t = crate::tensor::Tensor::from_vec(position_ids, (total_tokens,), device)
-            .map_err(candle_err)?;
+            .map_err(tensor_err)?;
 
         // ── Step 3: Varlen forward ──
         let mut model = self
@@ -163,7 +163,7 @@ impl Engine {
                 let run = (|| -> Result<(crate::tensor::Tensor, Option<crate::tensor::Tensor>), EngineError> {
                     if use_paged_forward {
                         if let Some(pool) = &self.cache.paged_pool {
-                            use crate::modules::PagedKvBatchContext;
+                            use crate::models::commons::PagedKvBatchContext;
 
                             paged_block_size = pool.block_size;
 
@@ -189,9 +189,9 @@ impl Engine {
                                 (batch_size, max_blocks),
                                 device,
                             )
-                            .map_err(candle_err)?
+                            .map_err(tensor_err)?
                             .to_dtype(crate::tensor::DType::U32)
-                            .map_err(candle_err)?;
+                            .map_err(tensor_err)?;
 
                             // Slot mapping for suffix tokens being written to paged cache.
                             let mut slots: Vec<i64> = Vec::with_capacity(total_tokens);
@@ -206,7 +206,7 @@ impl Engine {
                                 }
                             }
                             let slot_mapping_t = crate::tensor::Tensor::new(slots.as_slice(), device)
-                                .map_err(candle_err)?;
+                                .map_err(tensor_err)?;
 
                             // cu_seqlens_k: cumulative full seq lengths (cached + suffix).
                             let mut cu_seqlens_k = Vec::with_capacity(batch_size + 1);
@@ -222,7 +222,7 @@ impl Engine {
                                 (batch_size + 1,),
                                 device,
                             )
-                            .map_err(candle_err)?;
+                            .map_err(tensor_err)?;
 
                             allocated_block_tables = Some(block_tables);
 
@@ -253,22 +253,22 @@ impl Engine {
                                 deltanet_pool: None,
                                 deltanet_slots: None,
                             };
-                            self.executor.ops.session.begin_forward();
+                            self.executor.ops.begin_forward();
                             let result = if need_hidden_states {
                                 let lm = model.as_logits_model_mut()
                                     .ok_or_else(|| EngineError::InvalidRequest(
                                         "prompt_logprobs requested but model doesn't support LogitsSplitModel".into()
                                     ))?;
-                                let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
-                                let last = crate::modules::last_token_select(&hidden, &seq_lens)
-                                    .map_err(candle_err)?;
-                                let logits = lm.compute_logits(&last).map_err(candle_err)?
-                                    .unsqueeze(1).map_err(candle_err)?;
+                                let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(tensor_err)?;
+                                let last = crate::models::commons::last_token_select(&hidden, &seq_lens)
+                                    .map_err(tensor_err)?;
+                                let logits = lm.compute_logits(&last).map_err(tensor_err)?
+                                    .unsqueeze(1).map_err(tensor_err)?;
                                 Ok((logits, Some(hidden)))
                             } else {
-                                Ok((model.forward(&packed_input, &mut ctx).map_err(candle_err)?, None))
+                                Ok((model.forward(&packed_input, &mut ctx).map_err(tensor_err)?, None))
                             };
-                            self.executor.ops.session.end_forward();
+                            self.executor.ops.end_forward();
                             return result;
                         }
                     }
@@ -284,22 +284,22 @@ impl Engine {
                         deltanet_pool: None,
                         deltanet_slots: None,
                     };
-                    self.executor.ops.session.begin_forward();
+                    self.executor.ops.begin_forward();
                     let result = if need_hidden_states {
                         let lm = model.as_logits_model_mut()
                             .ok_or_else(|| EngineError::InvalidRequest(
                                         "prompt_logprobs requested but model doesn't support LogitsSplitModel".into()
                                     ))?;
-                        let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
-                        let last = crate::modules::last_token_select(&hidden, &seq_lens)
-                            .map_err(candle_err)?;
-                        let logits = lm.compute_logits(&last).map_err(candle_err)?
-                            .unsqueeze(1).map_err(candle_err)?;
+                        let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(tensor_err)?;
+                        let last = crate::models::commons::last_token_select(&hidden, &seq_lens)
+                            .map_err(tensor_err)?;
+                        let logits = lm.compute_logits(&last).map_err(tensor_err)?
+                            .unsqueeze(1).map_err(tensor_err)?;
                         Ok((logits, Some(hidden)))
                     } else {
-                        Ok((model.forward(&packed_input, &mut ctx).map_err(candle_err)?, None))
+                        Ok((model.forward(&packed_input, &mut ctx).map_err(tensor_err)?, None))
                     };
-                    self.executor.ops.session.end_forward();
+                    self.executor.ops.end_forward();
                     result
                 })();
 

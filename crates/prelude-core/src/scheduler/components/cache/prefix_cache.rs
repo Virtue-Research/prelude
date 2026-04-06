@@ -1,7 +1,7 @@
 //! Block-level prefix KV cache with hash-trie matching and LRU eviction.
 //!
 //! Wraps `PrefixMatchIndex` (tensor-free) with
-//! actual KV tensor storage and assembly via candle `Tensor::cat`/`narrow`.
+//! actual KV tensor storage and assembly via `Tensor::cat`/`narrow`.
 //!
 //! When paged attention is active, entries also store paged block IDs.
 //! On a cache hit the prefix blocks are already in the paged pool, so the

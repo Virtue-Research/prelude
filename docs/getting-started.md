@@ -11,11 +11,9 @@ This guide gets you from zero to a running server with your first request.
 | CUDA Toolkit     | 12.x       | GPU builds           |
 | CMake            | >= 3.18    | oneDNN (CPU BF16)    |
 | Python + CUDA GPU| -          | FA4 AOT kernel compilation (first build only) |
+| Python + PyTorch | 2.x        | Precision tests (`cargo test`, optional — tests skip if missing) |
 
 oneDNN is auto-downloaded and statically linked on first build -- no manual setup.
-
-The workspace uses `[patch.crates-io]` to override `candle-core` with a local copy at `crates/candle-core/`.
-This directory must exist (symlink or copy of candle-core source).
 
 ## Build
 
@@ -171,8 +169,6 @@ curl -s http://localhost:8000/v1/models
 ## Troubleshooting
 
 **FA4 AOT compilation is slow on first build.** Flash Attention v4 compiles ~120 CuTeDSL kernel variants per SM architecture. This takes 10-20 minutes on first build but is cached afterwards. Skip with `flash-attn-v3` only if you don't need FA4.
-
-**`candle-core` not found.** The workspace uses `[patch.crates-io]` to override `candle-core` with a local copy at `crates/candle-core/`. This directory must exist (symlink or copy of candle-core source).
 
 **CMake version too old for oneDNN.** oneDNN requires CMake >= 3.18. On Ubuntu 20.04, install via `pip install cmake` or use the Kitware PPA.
 

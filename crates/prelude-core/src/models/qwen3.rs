@@ -4,25 +4,16 @@ use std::sync::Arc;
 
 use crate::tensor::{DType, Module, Result, Tensor};
 use crate::loading::var_builder::VarBuilder;
-use crate::modules::embedding::Embedding;
+use crate::models::commons::embedding::Embedding;
 use crate::models::config::Qwen3Config;
 use serde::Deserialize;
 
-use crate::modules::varlen_attention;
-use crate::modules::{BatchAttnContext, BatchState, LayerAttnContext};
-use crate::modules::{
-    GatedMlp, Linear, RmsNorm, RotaryEmbedding, TransformerBlock,
-    fast_add, fast_rms_norm, fused_add_rmsnorm, last_token_select, qknorm_rope_varlen,
+use crate::models::commons::{BatchAttnContext, BatchState, LayerAttnContext};
+use crate::models::commons::{
+    Linear, RmsNorm, RotaryEmbedding,
+    last_token_select,
 };
-use crate::modules::debug_disable_fused_qknorm_rope;
 use crate::profiling::{nvtx_push, nvtx_pop};
-
-// Re-export public debug setters so existing callers (`use qwen3::set_debug_*`) still compile.
-pub use crate::modules::{
-    set_debug_disable_fast_rmsnorm, set_debug_disable_flash_attn_path,
-    set_debug_disable_fused_add_rmsnorm, set_debug_disable_fused_qknorm_rope,
-    set_debug_disable_fused_silu_mul, set_debug_disable_vectorized_add,
-};
 
 use crate::models::{ClassifierModel, EmbeddingModel, KvCacheModel, LogitsSplitModel, ModelForward};
 use crate::cache::kv_buf::KvBuf;
@@ -147,8 +138,8 @@ impl Qwen3Attention {
 
     /// Project Q, K, V and reshape to `[total_tokens, H, D]` (varlen layout).
     #[inline]
-    fn fused_qkv_projection(&self, x: &Tensor, total: usize, ctx: &BatchState, ops: &crate::ops::Ops) -> Result<(Tensor, Tensor, Tensor)> {
-        crate::modules::attn_utils::fused_qkv_projection(
+    fn fused_qkv_projection(&self, x: &Tensor, total: usize, ctx: &BatchState, ops: &dyn crate::ops::Ops) -> Result<(Tensor, Tensor, Tensor)> {
+        crate::models::commons::attn_utils::fused_qkv_projection(
             x,
             &self.q_proj, &self.k_proj, &self.v_proj,
             self.qkv_proj.as_ref(),
@@ -157,113 +148,42 @@ impl Qwen3Attention {
         )
     }
 
-    /// QK-norm + RoPE for varlen layout `[total, H, D]`.
-    fn norm_rope_varlen(
-        &self,
-        ops: &crate::ops::Ops,
-        q: &Tensor,
-        k: &Tensor,
-        total: usize,
-        position_ids: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
-        qknorm_rope_varlen(
-            ops, q, k,
-            &self.q_norm_weight, &self.k_norm_weight,
-            &self.q_norm, &self.k_norm,
-            &self.rotary_emb, position_ids,
-            total, self.num_heads, self.num_kv_heads, self.head_dim,
-            self.rms_norm_eps,
-        )
-    }
-
     // ── Varlen forward (unified: GPU flash-attn / CPU cpu_ops) ──────────
 
     pub(crate) fn forward(&self, x: &Tensor, ctx: &LayerAttnContext) -> Result<Tensor> {
-        {
-            let total_q = x.dim(0)?;
-            let bs = BatchState::no_lora();
+        let total_q = x.dim(0)?;
+        let bs = BatchState::no_lora();
+        let ops = ctx.ops;
 
-            // Raw CPU fast paths (brgemm, raw_f32) are in prelude-cpu.
-            // The generic path below handles both GPU and CPU via Ops traits.
+        let (q, k, v) = self.fused_qkv_projection(x, total_q, &bs, ops)?;
 
-            let (q, k, v) = self.fused_qkv_projection(x, total_q, &bs, ctx.ops)?;
+        // QK-norm + RoPE + optional cache write (OpsBundle picks optimal fuse path)
+        let kv_cache = ctx.paged_kv.map(|kv| (kv.key_cache, kv.value_cache, kv.slot_mapping));
+        let (q, k) = ops.qknorm_rope_and_cache(
+            &q, &k, &v,
+            &self.q_norm_weight, &self.k_norm_weight,
+            &self.rotary_emb.cos, &self.rotary_emb.sin,
+            ctx.position_ids, self.rms_norm_eps as f32,
+            kv_cache,
+        )?;
 
-            // Fused path: try fused Q+K norm+rope via Ops trait
-            if !debug_disable_fused_qknorm_rope() {
-                if let Some(result) = ctx.ops.fused.fused_qknorm_rope(
-                    &q, &k, &self.q_norm_weight, &self.k_norm_weight,
-                    &self.rotary_emb.cos, &self.rotary_emb.sin,
-                    ctx.position_ids, self.rms_norm_eps as f32,
-                ) {
-                    let (q, k) = result?;
-                    if let Some(kv) = ctx.paged_kv {
-                        // Try fused K-norm + RoPE + KV cache write
-                        let used_fused_kv_write = if let Some(fused_result) =
-                            ctx.ops.fused.fused_knorm_rope_cache_write(
-                                &k, &v, &self.k_norm_weight,
-                                &self.rotary_emb.cos, &self.rotary_emb.sin,
-                                ctx.position_ids,
-                                kv.key_cache, kv.value_cache, kv.slot_mapping,
-                                self.rms_norm_eps as f32,
-                            )
-                        {
-                            fused_result?;
-                            true
-                        } else {
-                            false
-                        };
-                        if !used_fused_kv_write {
-                            crate::modules::reshape_and_cache(
-                                ctx.ops, &k, &v,
-                                kv.key_cache, kv.value_cache, kv.slot_mapping,
-                            )?;
-                        }
-                        let attn = crate::modules::varlen_attention_paged(
-                            ctx.ops, &q,
-                            kv.key_cache, kv.value_cache, kv.block_tables,
-                            ctx.cu_seqlens_q, kv.cu_seqlens_k,
-                            ctx.max_seqlen_q, kv.max_seqlen_k,
-                            self.softmax_scale,
-                        )?;
-                        return self.o_proj.forward(
-                            &attn.reshape((total_q, self.hidden_size))?,
-                            &bs, ctx.ops,
-                        );
-                    }
-                    return self.o_proj.forward(
-                        &varlen_attention(
-                            ctx.ops, &q, &k, &v,
-                            ctx.cu_seqlens_q, ctx.cu_seqlens_q,
-                            ctx.max_seqlen_q, ctx.max_seqlen_q,
-                            self.softmax_scale, None,
-                        )?
-                        .reshape((total_q, self.hidden_size))?,
-                        &bs, ctx.ops,
-                    );
-                }
-            }
+        // Attention
+        let attn_out = if let Some(kv) = ctx.paged_kv {
+            ops.paged_attention(&q, kv.key_cache, kv.value_cache, &crate::ops::PagedParams {
+                block_tables: kv.block_tables,
+                cu_seqlens_q: ctx.cu_seqlens_q, cu_seqlens_k: kv.cu_seqlens_k,
+                max_seqlen_q: ctx.max_seqlen_q, max_seqlen_k: kv.max_seqlen_k,
+                scale: self.softmax_scale, mask: crate::ops::MaskType::Causal, softcap: None,
+            })?
+        } else {
+            ops.varlen_attention(&q, &k, &v, &crate::ops::VarlenParams {
+                cu_seqlens_q: ctx.cu_seqlens_q, cu_seqlens_k: ctx.cu_seqlens_q,
+                max_seqlen_q: ctx.max_seqlen_q, max_seqlen_k: ctx.max_seqlen_q,
+                scale: self.softmax_scale, mask: crate::ops::MaskType::Causal, softcap: None,
+            })?
+        };
 
-            // Non-fused path: norm + rope then varlen attention (GPU flash-attn or CPU matmul)
-            let (q, k) = self.norm_rope_varlen(ctx.ops, &q, &k, total_q, ctx.position_ids)?;
-
-            let (cu_seqlens_k, max_seqlen_k) = match ctx.paged_kv {
-                Some(kv) => (kv.cu_seqlens_k, kv.max_seqlen_k),
-                None => (ctx.cu_seqlens_q, ctx.max_seqlen_q),
-            };
-            let attn_out = varlen_attention(
-                ctx.ops,
-                &q, &k, &v,
-                ctx.cu_seqlens_q, cu_seqlens_k,
-                ctx.max_seqlen_q, max_seqlen_k,
-                self.softmax_scale,
-                ctx.paged_kv,
-            )?;
-
-            self.o_proj.forward(
-                &attn_out.reshape((total_q, self.hidden_size))?,
-                &bs, ctx.ops,
-            )
-        }
+        self.o_proj.forward(&attn_out.reshape((total_q, self.hidden_size))?, &bs, ops)
     }
 
     /// Cached forward for CPU decode: handles both prefill (L=prompt_len) and
@@ -282,7 +202,13 @@ impl Qwen3Attention {
         let position_ids: Vec<u32> =
             (0..seq_len).map(|i| (position_offset + i) as u32).collect();
         let position_ids = Tensor::from_vec(position_ids, (seq_len,), x.device())?;
-        let (q, k) = self.norm_rope_varlen(ops, &q, &k, seq_len, &position_ids)?;
+        let (q, k) = ops.qknorm_rope_and_cache(
+            &q, &k, &v,
+            &self.q_norm_weight, &self.k_norm_weight,
+            &self.rotary_emb.cos, &self.rotary_emb.sin,
+            &position_ids, self.rms_norm_eps as f32,
+            None,  // no paged KV cache
+        )?;
 
         self.k_cache.append(&k)?;
         self.v_cache.append(&v)?;
@@ -374,7 +300,7 @@ impl Qwen3Attention {
 
         // Softmax over last dim
         let last_dim = scores.rank() - 1;
-        let attn_weights = crate::ops::current_ops().act.softmax(&scores, last_dim)?;
+        let attn_weights = scores.softmax(last_dim)?;
 
         // output = attn_weights @ V → [H, seq_len, D]
         let out = attn_weights.matmul(&v3)?;
@@ -391,6 +317,52 @@ impl Qwen3Attention {
 }
 
 // ============================================================================
+// Gated MLP (SiLU-gated FFN: down_proj(SiLU(gate_proj(x)) * up_proj(x)))
+// ============================================================================
+
+#[derive(Debug, Clone)]
+struct GatedMlp {
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
+    gate_up_proj: Option<Linear>,
+}
+
+impl GatedMlp {
+    fn new(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
+        let gate_proj = Linear::load(vb.pp("gate_proj"), cfg.hidden_size, cfg.intermediate_size, false)?;
+        let up_proj = Linear::load(vb.pp("up_proj"), cfg.hidden_size, cfg.intermediate_size, false)?;
+        let down_proj = Linear::load(vb.pp("down_proj"), cfg.intermediate_size, cfg.hidden_size, false)?;
+
+        let gate_up_proj = {
+            let gw = gate_proj.weight();
+            if gw.device().is_cpu() && gw.dtype() == DType::BF16 {
+                let merged_w = Tensor::cat(&[gw, up_proj.weight()], 0)?;
+                Linear::from_weight(merged_w, None).ok()
+            } else {
+                None
+            }
+        };
+
+        Ok(Self { gate_proj, up_proj, down_proj, gate_up_proj })
+    }
+
+    fn forward(&self, ctx: &BatchState, ops: &dyn crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
+        if let Some(ref gup) = self.gate_up_proj {
+            let gate_up = gup.forward(x, ctx, ops)?;
+            let dims = gate_up.dims();
+            let dim = dims[dims.len() - 1] / 2;
+            let gate = gate_up.narrow(dims.len() - 1, 0, dim)?;
+            let up = gate_up.narrow(dims.len() - 1, dim, dim)?;
+            return self.down_proj.forward(&ops.silu_mul(&gate, &up)?, ctx, ops);
+        }
+        let gate = self.gate_proj.forward(x, ctx, ops)?;
+        let up = self.up_proj.forward(x, ctx, ops)?;
+        self.down_proj.forward(&ops.silu_mul(&gate, &up)?, ctx, ops)
+    }
+}
+
+// ============================================================================
 // Decoder Layer
 // ============================================================================
 
@@ -398,7 +370,9 @@ impl Qwen3Attention {
 struct DecoderLayer {
     self_attn: Qwen3Attention,
     mlp: GatedMlp,
-    block: TransformerBlock,
+    ln1_weight: Tensor,
+    ln2_weight: Tensor,
+    rms_norm_eps: f32,
 }
 
 impl DecoderLayer {
@@ -406,46 +380,32 @@ impl DecoderLayer {
         cfg: &Qwen3Config,
         rotary: Arc<RotaryEmbedding>,
         vb: VarBuilder,
-        layer_idx: usize,
+        _layer_idx: usize,
     ) -> Result<Self> {
-        let self_attn = Qwen3Attention::new(
-            cfg,
-            rotary,
-            vb.pp("self_attn"),
-        )?;
+        let self_attn = Qwen3Attention::new(cfg, rotary, vb.pp("self_attn"))?;
         let mlp = GatedMlp::new(cfg, vb.pp("mlp"))?;
-        let ln1 = RmsNorm::load(vb.pp("input_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let ln1_weight = ln1.weight().clone();
-        let ln2 = RmsNorm::load(vb.pp("post_attention_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let ln2_weight = ln2.weight().clone();
-        Ok(Self {
-            self_attn,
-            mlp,
-            block: TransformerBlock::new(ln1, ln1_weight, ln2, ln2_weight, cfg.rms_norm_eps, layer_idx),
-        })
+        let ln1_weight = RmsNorm::load(vb.pp("input_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?.weight().clone();
+        let ln2_weight = RmsNorm::load(vb.pp("post_attention_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?.weight().clone();
+        Ok(Self { self_attn, mlp, ln1_weight, ln2_weight, rms_norm_eps: cfg.rms_norm_eps as f32 })
     }
 
-    #[inline]
-    fn residual_mlp(&self, ops: &crate::ops::Ops, x_res: &Tensor, h2: &Tensor) -> Result<Tensor> {
-        fast_add(ops, x_res, &self.mlp.forward(&BatchState::no_lora(), ops, h2)?)
+    fn forward(&self, x: &Tensor, ctx: &LayerAttnContext) -> Result<Tensor> {
+        let ops = ctx.ops;
+        let h = ops.rms_norm(x, &self.ln1_weight, self.rms_norm_eps)?;
+        let h = self.self_attn.forward(&h, ctx)?;
+        let (x_res, h2) = ops.add_rmsnorm(x, &h, &self.ln2_weight, self.rms_norm_eps)?;
+        ops.add_or_fused(&x_res, &self.mlp.forward(&BatchState::no_lora(), ops, &h2)?)
     }
 
-    fn forward_with_cache(&mut self, ops: &crate::ops::Ops, x: &Tensor, position_offset: usize) -> Result<Tensor> {
-        let h = fast_rms_norm(ops, x, &self.block.ln1, &self.block.ln1_weight, self.block.rms_norm_eps)?;
+    fn forward_with_cache(&mut self, ops: &dyn crate::ops::Ops, x: &Tensor, position_offset: usize) -> Result<Tensor> {
+        let h = ops.rms_norm(x, &self.ln1_weight, self.rms_norm_eps)?;
         let h = self.self_attn.forward_with_cache(&h, position_offset)?;
-        let (x_res, h2) = fused_add_rmsnorm(ops, x, &h, &self.block.ln2, &self.block.ln2_weight, self.block.rms_norm_eps)?;
-        self.residual_mlp(ops, &x_res, &h2)
+        let (x_res, h2) = ops.add_rmsnorm(x, &h, &self.ln2_weight, self.rms_norm_eps)?;
+        ops.add_or_fused(&x_res, &self.mlp.forward(&BatchState::no_lora(), ops, &h2)?)
     }
 
     fn reset_kv_cache(&mut self) {
         self.self_attn.reset_kv_cache();
-    }
-
-    fn forward(&self, x: &Tensor, ctx: &LayerAttnContext) -> Result<Tensor> {
-        self.block.forward(ctx.ops, x,
-            |h| self.self_attn.forward(h, ctx),
-            |x_res, h2| self.residual_mlp(ctx.ops, x_res, h2),
-        )
     }
 }
 
@@ -511,7 +471,7 @@ impl Model {
 
     fn forward_with_cache(
         &mut self,
-        ops: &crate::ops::Ops,
+        ops: &dyn crate::ops::Ops,
         input_ids: &Tensor,
         position_offset: usize,
     ) -> Result<Tensor> {
@@ -521,7 +481,7 @@ impl Model {
             h = layer.forward_with_cache(ops, &h, position_offset)?;
             nvtx_pop!();
         }
-        fast_rms_norm(ops, &h, &self.norm, &self.norm_weight, self.rms_norm_eps)
+        ops.rms_norm(&h, &self.norm_weight, self.rms_norm_eps as f32)
     }
 
     fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> Result<Tensor> {
@@ -539,7 +499,7 @@ impl Model {
             h = layer.forward(&h, &layer_ctx)?;
             nvtx_pop!();
         }
-        fast_rms_norm(ctx.ops, &h, &self.norm, &self.norm_weight, self.rms_norm_eps)
+        ctx.ops.rms_norm(&h, &self.norm_weight, self.rms_norm_eps as f32)
     }
 }
 
@@ -581,7 +541,7 @@ impl Qwen3ModelForCausalLM {
     /// Cached forward: returns logits `[L, vocab_size]` for all input tokens.
     pub fn forward_with_cache(
         &mut self,
-        ops: &crate::ops::Ops,
+        ops: &dyn crate::ops::Ops,
         input_ids: &Tensor,
         position_offset: usize,
     ) -> Result<Tensor> {
@@ -793,7 +753,7 @@ mod tests {
     use super::*;
     use crate::tensor::Device;
     use crate::loading::var_builder::VarBuilder;
-    use crate::modules::BatchAttnContext;
+    use crate::models::commons::BatchAttnContext;
 
     fn tiny_config() -> Qwen3Config {
         serde_json::from_value(serde_json::json!({
@@ -1112,7 +1072,7 @@ pub mod gguf {
         pub fn forward(
             &mut self,
             _packed_input: &Tensor,
-            _ctx: &mut crate::modules::BatchAttnContext,
+            _ctx: &mut crate::models::commons::BatchAttnContext,
         ) -> Result<Tensor> {
             crate::tensor::bail!("GGUF model does not support varlen forward")
         }
@@ -1122,7 +1082,7 @@ pub mod gguf {
         fn forward(
             &mut self,
             _packed_input: &Tensor,
-            _ctx: &mut crate::modules::BatchAttnContext,
+            _ctx: &mut crate::models::commons::BatchAttnContext,
         ) -> crate::tensor::Result<Tensor> {
             crate::tensor::bail!("GGUF model does not support varlen forward")
         }

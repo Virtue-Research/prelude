@@ -158,6 +158,22 @@ The transfer layer moves block data between workers using the best available tra
 The scheduler doesn't know which transport is used. It calls `transfer.send()` and
 `transfer.receive()`. The transfer layer handles the rest.
 
+#### Transport backend: Mooncake
+
+In standalone multi-node mode, `plugins/prelude-mooncake` implements `KvTransfer` using
+[Mooncake](https://github.com/kvcache-ai/Mooncake)'s Transfer Engine. Mooncake provides
+topology-aware path selection, multi-NIC bandwidth aggregation (up to 190 GB/s on 8x400 Gbps
+RoCE), and automatic fault recovery. It covers all three transport tiers above plus NVMe-of
+and EFA. See [integration.md](../integration.md) for details.
+
+#### Alternative: Dynamo-managed transfer
+
+When running as a Dynamo backend (`prelude-dynamo`), Prelude does NOT own the transfer layer.
+Dynamo's NIXL/Mooncake handles KV transfers. Prelude only exposes block memory addresses
+via `BlockAllocator::get_block_memory_info()`. The scheduler's `import_blocks()` path is
+identical regardless of who initiated the transfer.
+See [integration.md](../integration.md) for the full Dynamo integration design.
+
 ### What stays unchanged
 
 - **ArScheduler core loop** (`step()`, `update()`): identical on both prefill and decode workers.
@@ -165,7 +181,7 @@ The scheduler doesn't know which transport is used. It calls `transfer.send()` a
 - **BlockAllocator**: same logic. `import_blocks()` is a small addition for decode workers.
 - **PrefixCache**: same per-worker radix tree. Cross-worker prefix awareness is coordinator's job.
 - **Model code**: zero changes. Models don't know about disaggregation.
-- **Ops layer**: zero changes. The model runner calls the same `Ops` on both worker types.
+- **Ops layer**: zero changes. The model runner calls the same `OpsBundle` on both worker types.
 
 ## Attention-FFN Disaggregation (`disaggregated/afd/`)
 
@@ -179,7 +195,7 @@ See ops dispatch doc for the module changes (`MoeMode::Disaggregated`,
 
 **The attention side's ArScheduler is completely unchanged.** It runs `step()` → `ScheduledBatch` →
 `execute()` → `update()` as normal. The attention-FFN communication happens inside
-`modules::moe_layer` during model forward — invisible to the scheduler.
+`models::commons::moe_layer` during model forward — invisible to the scheduler.
 
 **The FFN side needs a passive follower loop**, because the FFN process doesn't make scheduling
 decisions — it just executes FFN layers when the attention side sends hidden states.
@@ -195,7 +211,7 @@ fn run_ffn_follower(executor: &Executor, sync: &AfdSync) {
         match sync.recv() {
             AfdSignal::Forward => {
                 // Run FFN-only forward: iterate MoE layers, recv/compute/send for each.
-                // Hidden states arrive via CommOps::recv inside modules::moe_layer.
+                // Hidden states arrive via CommOps::recv inside models::commons::moe_layer.
                 executor.execute_ffn_only();
             }
             AfdSignal::Shutdown => break,
@@ -208,7 +224,7 @@ fn run_ffn_follower(executor: &Executor, sync: &AfdSync) {
 fn execute_with_afd(executor: &Executor, plan: &ScheduledBatch, sync: &AfdSync) -> StepResult {
     // Signal FFN workers to start their forward pass
     sync.send(AfdSignal::Forward);
-    // Normal model forward — modules::moe_layer handles send/recv internally
+    // Normal model forward — models::commons::moe_layer handles send/recv internally
     executor.execute(plan)
 }
 ```
@@ -217,12 +233,12 @@ fn execute_with_afd(executor: &Executor, plan: &ScheduledBatch, sync: &AfdSync) 
 
 | Concern | SGLang | Prelude |
 |---------|--------|---------|
-| MoE layer | Replace class (`AFDATTNMoE` / `AFDFFNMoE`) | `modules::moe_layer` absorbs AFD internally |
+| MoE layer | Replace class (`AFDATTNMoE` / `AFDFFNMoE`) | `models::commons::moe_layer` absorbs AFD internally |
 | Model code | Must swap MoE class per model | Zero changes |
 | FFN scheduler | Modified `event_loop_afd_ffn_normal` in main scheduler | Separate `run_ffn_follower` loop, not part of ArScheduler |
 | Sync mechanism | ZMQ IPC socket, custom `AFSyncReq` | `AfdSync` abstraction, transport-agnostic |
 | Communication | StepMesh (push-pull, tensor caching) | `CommOps::send/recv` (device impl chooses transport) |
-| Model support | Qwen3MoE only, hardcoded check | Any MoE model using `modules::moe_layer` |
+| Model support | Qwen3MoE only, hardcoded check | Any MoE model using `models::commons::moe_layer` |
 
 **The FFN follower is not an ArScheduler mode.** It's a separate, simpler loop that doesn't
 manage requests, blocks, or queues. Keeping it separate from ArScheduler avoids polluting the

@@ -77,8 +77,8 @@ impl DiffusionScheduler {
 ```rust
 // engine/run.rs (diffusion section)
 
-fn execute_diffusion(plan: &DiffusionScheduledBatch, dit: &FluxDiT, ops: &Ops) -> Vec<DiffusionStepResult> {
-    ops.session.begin_forward();
+fn execute_diffusion(plan: &DiffusionScheduledBatch, dit: &FluxDiT, ops: &OpsBundle) -> Vec<DiffusionStepResult> {
+    ops.begin_forward();
 
     let results: Vec<_> = plan.jobs.iter().map(|input| {
         let latents = if input.use_cfg {
@@ -104,7 +104,7 @@ fn execute_diffusion(plan: &DiffusionScheduledBatch, dit: &FluxDiT, ops: &Ops) -
         DiffusionStepResult { job_id: input.job_id, new_latents }
     }).collect();
 
-    ops.session.end_forward();
+    ops.end_forward();
     results
 }
 ```

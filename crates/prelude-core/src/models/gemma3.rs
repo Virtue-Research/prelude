@@ -2,15 +2,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::tensor::{DType, Device, Module, Result, Tensor};
-use crate::modules::activation::Activation;
-use crate::modules::embedding::Embedding;
+use crate::models::commons::activation::Activation;
+use crate::models::commons::embedding::Embedding;
 use crate::loading::var_builder::VarBuilder;
 use serde::Deserialize;
 
-use crate::modules::{
+use crate::models::commons::{
     BatchState, Linear, RmsNorm,
-    varlen_attention, varlen_attention_bidirectional, varlen_attention_windowed,
 };
+use crate::ops::{MaskType, VarlenParams};
 
 use crate::engine::{EmbeddingActivation, EmbeddingSemantics};
 
@@ -193,7 +193,7 @@ impl Gemma3Mlp {
         })
     }
 
-    fn forward(&self, ops: &crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, ops: &dyn crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
         let bs = BatchState::no_lora();
         let gate = self.gate_proj.forward(x, &bs, ops)?;
         let up = self.up_proj.forward(x, &bs, ops)?;
@@ -261,7 +261,7 @@ impl Gemma3Attention {
 
     fn forward(
         &mut self,
-        ops: &crate::ops::Ops,
+        ops: &dyn crate::ops::Ops,
         packed_input: &Tensor,
         cu_seqlens: &Tensor,
         max_seqlen: usize,
@@ -282,36 +282,21 @@ impl Gemma3Attention {
 
         let (q, k) = self.rotary_emb.apply_varlen(&q, &k, position_ids)?;
 
-        let attn_out = match self.attention_mode {
-            Gemma3AttentionMode::FullCausal => varlen_attention(
-                ops,
-                &q, &k, &v,
-                cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
-                self.softmax_scale, None,
-            )?,
-            Gemma3AttentionMode::FullBidirectional => varlen_attention_bidirectional(
-                ops,
-                &q, &k, &v,
-                cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
-                self.softmax_scale,
-            )?,
-            Gemma3AttentionMode::SlidingCausal { window_size } => varlen_attention_windowed(
-                ops,
-                &q, &k, &v,
-                cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
-                self.softmax_scale,
-                Some(window_size.saturating_sub(1)),
-                Some(0),
-            )?,
-            Gemma3AttentionMode::SlidingBidirectional { window_size } => varlen_attention_windowed(
-                ops,
-                &q, &k, &v,
-                cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
-                self.softmax_scale,
-                Some(window_size.saturating_sub(1)),
-                Some(window_size.saturating_sub(1)),
-            )?,
+        let mask = match self.attention_mode {
+            Gemma3AttentionMode::FullCausal => MaskType::Causal,
+            Gemma3AttentionMode::FullBidirectional => MaskType::Bidirectional,
+            Gemma3AttentionMode::SlidingCausal { window_size } => MaskType::SlidingWindow {
+                left: window_size.saturating_sub(1), right: 0,
+            },
+            Gemma3AttentionMode::SlidingBidirectional { window_size } => MaskType::SlidingWindow {
+                left: window_size.saturating_sub(1), right: window_size.saturating_sub(1),
+            },
         };
+        let attn_out = ops.varlen_attention(&q, &k, &v, &VarlenParams {
+            cu_seqlens_q: cu_seqlens, cu_seqlens_k: cu_seqlens,
+            max_seqlen_q: max_seqlen, max_seqlen_k: max_seqlen,
+            scale: self.softmax_scale, mask, softcap: None,
+        })?;
 
         let attn_dim = self.num_heads * self.head_dim;
         self.o_proj.forward(&attn_out.reshape((total_tokens, attn_dim))?, &bs, ops)
@@ -371,7 +356,7 @@ impl Gemma3DecoderLayer {
 
     fn forward(
         &mut self,
-        ops: &crate::ops::Ops,
+        ops: &dyn crate::ops::Ops,
         xs: &Tensor,
         cu_seqlens: &Tensor,
         max_seqlen: usize,
@@ -383,13 +368,13 @@ impl Gemma3DecoderLayer {
                 .forward(ops, &normed, cu_seqlens, max_seqlen, position_ids)?;
 
         let post_attn_normed = self.post_attention_layernorm.forward(&attn_output)?;
-        let xs = crate::modules::fast_add(ops, &post_attn_normed, xs)?;
+        let xs = ops.add_or_fused(&post_attn_normed, xs)?;
 
         let pre_ffn_normed = self.pre_feedforward_layernorm.forward(&xs)?;
         let mlp_output = self.mlp.forward(ops, &pre_ffn_normed)?;
 
         let post_ffn_normed = self.post_feedforward_layernorm.forward(&mlp_output)?;
-        crate::modules::fast_add(ops, &post_ffn_normed, &xs)
+        ops.add_or_fused(&post_ffn_normed, &xs)
     }
 
     fn clear_kv_cache(&mut self) {
@@ -463,7 +448,7 @@ impl Gemma3Model {
 
     fn forward(
         &mut self,
-        ops: &crate::ops::Ops,
+        ops: &dyn crate::ops::Ops,
         packed_input: &Tensor,
         cu_seqlens: &Tensor,
         max_seqlen: usize,
@@ -540,7 +525,7 @@ impl Gemma3ForCausalLM {
     pub fn forward(
         &mut self,
         packed_input: &Tensor,
-        ctx: &mut crate::modules::BatchAttnContext,
+        ctx: &mut crate::models::commons::BatchAttnContext,
     ) -> Result<Tensor> {
         let hidden = self.base.forward(
             ctx.ops,
@@ -550,7 +535,7 @@ impl Gemma3ForCausalLM {
             ctx.position_ids,
         )?;
         let last_hidden =
-            crate::modules::last_token_select(&hidden, ctx.seq_lens)?.contiguous()?;
+            crate::models::commons::last_token_select(&hidden, ctx.seq_lens)?.contiguous()?;
 
         let logits = self.lm_head.forward(&last_hidden.unsqueeze(1)?, &BatchState::no_lora(), ctx.ops)?;
 
@@ -572,7 +557,7 @@ impl crate::models::LogitsSplitModel for Gemma3ForCausalLM {
     fn forward_hidden_states(
         &mut self,
         packed_input: &Tensor,
-        ctx: &mut crate::modules::BatchAttnContext,
+        ctx: &mut crate::models::commons::BatchAttnContext,
     ) -> crate::tensor::Result<Tensor> {
         self.base.forward(
             ctx.ops,
@@ -599,7 +584,7 @@ impl crate::models::ModelForward for Gemma3ForCausalLM {
     fn forward(
         &mut self,
         packed_input: &Tensor,
-        ctx: &mut crate::modules::BatchAttnContext,
+        ctx: &mut crate::models::commons::BatchAttnContext,
     ) -> crate::tensor::Result<Tensor> {
         self.forward(packed_input, ctx)
     }
@@ -660,7 +645,7 @@ impl Gemma3ForSequenceClassification {
     pub fn forward(
         &mut self,
         packed_input: &Tensor,
-        ctx: &mut crate::modules::BatchAttnContext,
+        ctx: &mut crate::models::commons::BatchAttnContext,
     ) -> Result<Tensor> {
         let hidden_states = self.base.forward(
             ctx.ops,
@@ -669,7 +654,7 @@ impl Gemma3ForSequenceClassification {
             ctx.max_seqlen_q,
             ctx.position_ids,
         )?;
-        let last_hidden = crate::modules::last_token_select(&hidden_states, ctx.seq_lens)?;
+        let last_hidden = crate::models::commons::last_token_select(&hidden_states, ctx.seq_lens)?;
         self.score.forward(&last_hidden, &BatchState::no_lora(), ctx.ops)
     }
 
@@ -737,7 +722,7 @@ impl Gemma3ForEmbedding {
     pub fn forward(
         &mut self,
         packed_input: &Tensor,
-        ctx: &mut crate::modules::BatchAttnContext,
+        ctx: &mut crate::models::commons::BatchAttnContext,
     ) -> Result<Tensor> {
         let hidden_states = self.base.forward(
             ctx.ops,
@@ -749,13 +734,13 @@ impl Gemma3ForEmbedding {
         let hidden_states = hidden_states.to_dtype(DType::F32)?;
         let mut pooled = match self.pooling {
             crate::engine::EmbeddingPooling::LastToken => {
-                crate::modules::last_token_select(&hidden_states, ctx.seq_lens)?
+                crate::models::commons::last_token_select(&hidden_states, ctx.seq_lens)?
             }
             crate::engine::EmbeddingPooling::Mean => {
                 pool_mean_varlen(&hidden_states, ctx.seq_lens)?
             }
             crate::engine::EmbeddingPooling::Cls => {
-                crate::modules::first_token_select(&hidden_states, ctx.seq_lens)?
+                crate::models::commons::first_token_select(&hidden_states, ctx.seq_lens)?
             }
         };
 
@@ -789,7 +774,7 @@ impl crate::models::ModelForward for Gemma3ForSequenceClassification {
     fn forward(
         &mut self,
         packed_input: &Tensor,
-        ctx: &mut crate::modules::BatchAttnContext,
+        ctx: &mut crate::models::commons::BatchAttnContext,
     ) -> crate::tensor::Result<Tensor> {
         self.forward(packed_input, ctx)
     }
@@ -813,7 +798,7 @@ impl crate::models::ModelForward for Gemma3ForEmbedding {
     fn forward(
         &mut self,
         packed_input: &Tensor,
-        ctx: &mut crate::modules::BatchAttnContext,
+        ctx: &mut crate::models::commons::BatchAttnContext,
     ) -> crate::tensor::Result<Tensor> {
         Gemma3ForEmbedding::forward(self, packed_input, ctx)
     }

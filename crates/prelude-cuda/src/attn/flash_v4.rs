@@ -228,12 +228,9 @@ fn try_call_fa4(
         let mut key = KernelKey::new(head_dim as u32, gqa_ratio as u32, causal, has_window);
         key.head_dim_v = half as u32;
         key = key.with_softcap(softcap);
-        eprintln!("FA4 V-split lookup: hdim={} hdimv={} gqa={} causal={} window={} packgqa={} softcap={} dtype={:?} arch={}",
-            key.head_dim, key.head_dim_v, key.gqa_ratio, key.causal, key.window,
-            key.pack_gqa, key.softcap_bits, key.dtype, registry.arch());
         let func = match registry.get(&key) {
-            Some(f) => { eprintln!("  → FOUND kernel"); f },
-            None => { eprintln!("  → NOT FOUND, falling back"); return None; },
+            Some(f) => f,
+            None => return None,
         };
         // Committed — V-split path.
         return Some(call_fa4_vsplit(registry, func, q, k, v, cu_seqlens_q, cu_seqlens_k,

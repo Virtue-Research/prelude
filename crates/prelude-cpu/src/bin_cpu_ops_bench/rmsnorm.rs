@@ -26,10 +26,10 @@ pub fn bench(hidden: usize, batch: usize, warmup: usize, repeats: usize) -> Resu
     }
     let cpu_ops_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 
-    // candle F32
+    // naive F32
     let input_f32 = input.to_dtype(DType::F32)?;
     let weight_f32 = weight.to_dtype(DType::F32)?;
-    let candle_norm = prelude_core::modules::linear::RmsNorm::from_weight(weight_f32, 1e-6);
+    let candle_norm = prelude_core::models::commons::linear::RmsNorm::from_weight(weight_f32, 1e-6);
     for _ in 0..warmup {
         let _ = candle_norm.forward(&input_f32)?;
     }
@@ -37,11 +37,11 @@ pub fn bench(hidden: usize, batch: usize, warmup: usize, repeats: usize) -> Resu
     for _ in 0..repeats {
         let _ = candle_norm.forward(&input_f32)?;
     }
-    let candle_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
+    let naive_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 
     let sgl_us: Option<f64> = None;
 
-    print_result("rmsnorm  ", hidden, batch, &BenchResult { cpu_ops_us, candle_us, sgl_us });
+    print_result("rmsnorm  ", hidden, batch, &BenchResult { cpu_ops_us, naive_us, sgl_us });
     Ok(())
 }
 
@@ -56,7 +56,7 @@ pub fn bench_dtypes(hidden: usize, batch: usize, warmup: usize, repeats: usize) 
         .map(|i| 0.8 + i as f32 * 0.001)
         .collect();
     let weight_f32_t = Tensor::from_vec(weight_f32, (hidden,), &device)?;
-    let candle_norm = prelude_core::modules::linear::RmsNorm::from_weight(weight_f32_t.clone(), 1e-6);
+    let candle_norm = prelude_core::models::commons::linear::RmsNorm::from_weight(weight_f32_t.clone(), 1e-6);
 
     for &(dtype, label) in &[(DType::F16, "rms_f16 "), (DType::F32, "rms_f32 ")] {
         let input = Tensor::from_vec(input_f32.clone(), (batch, hidden), &device)?.to_dtype(dtype)?;
@@ -79,9 +79,9 @@ pub fn bench_dtypes(hidden: usize, batch: usize, warmup: usize, repeats: usize) 
         for _ in 0..repeats {
             let _ = candle_norm.forward(&input_c)?;
         }
-        let candle_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
+        let naive_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 
-        print_result(label, hidden, batch, &BenchResult { cpu_ops_us, candle_us, sgl_us: None });
+        print_result(label, hidden, batch, &BenchResult { cpu_ops_us, naive_us, sgl_us: None });
     }
     Ok(())
 }
@@ -107,9 +107,9 @@ pub fn bench_fused(hidden: usize, batch: usize, warmup: usize, repeats: usize) -
     }
     let cpu_ops_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 
-    // candle F32 (separate add + norm) — same: reuse input tensors
+    // naive F32 (separate add + norm) — same: reuse input tensors
     let weight_f32 = weight.to_dtype(DType::F32)?;
-    let candle_norm = prelude_core::modules::linear::RmsNorm::from_weight(weight_f32, 1e-6);
+    let candle_norm = prelude_core::models::commons::linear::RmsNorm::from_weight(weight_f32, 1e-6);
     let h_f32 = h.to_dtype(DType::F32)?;
     let r_f32 = r.to_dtype(DType::F32)?;
     for _ in 0..warmup {
@@ -119,11 +119,11 @@ pub fn bench_fused(hidden: usize, batch: usize, warmup: usize, repeats: usize) -
     for _ in 0..repeats {
         let _ = candle_norm.forward(&(&h_f32 + &r_f32)?)?;
     }
-    let candle_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
+    let naive_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 
     let sgl_us: Option<f64> = None;
 
-    print_result("fused_rms", hidden, batch, &BenchResult { cpu_ops_us, candle_us, sgl_us });
+    print_result("fused_rms", hidden, batch, &BenchResult { cpu_ops_us, naive_us, sgl_us });
     Ok(())
 }
 
@@ -151,11 +151,11 @@ pub fn bench_fused_dtypes(hidden: usize, batch: usize, warmup: usize, repeats: u
         }
         let cpu_ops_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 
-        // candle baseline: separate add + norm in the same dtype converted to F32
+        // naive baseline: separate add + norm in the same dtype converted to F32
         let h_c = h.to_dtype(DType::F32)?;
         let r_c = r.to_dtype(DType::F32)?;
         let w_c = w.to_dtype(DType::F32)?;
-        let candle_norm = prelude_core::modules::linear::RmsNorm::from_weight(w_c, 1e-6);
+        let candle_norm = prelude_core::models::commons::linear::RmsNorm::from_weight(w_c, 1e-6);
         for _ in 0..warmup {
             let _ = candle_norm.forward(&(&h_c + &r_c)?)?;
         }
@@ -163,9 +163,9 @@ pub fn bench_fused_dtypes(hidden: usize, batch: usize, warmup: usize, repeats: u
         for _ in 0..repeats {
             let _ = candle_norm.forward(&(&h_c + &r_c)?)?;
         }
-        let candle_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
+        let naive_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 
-        print_result(label, hidden, batch, &BenchResult { cpu_ops_us, candle_us, sgl_us: None });
+        print_result(label, hidden, batch, &BenchResult { cpu_ops_us, naive_us, sgl_us: None });
     }
     Ok(())
 }

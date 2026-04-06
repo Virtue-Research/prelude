@@ -1,4 +1,4 @@
-//! Raw CPU BF16 forward path — bypasses candle Tensor for zero-overhead inference.
+//! Raw CPU BF16 forward path — bypasses Tensor abstraction for zero-overhead inference.
 //!
 //! All operations work on `&[u16]` / `*mut u16` slices (BF16 as u16).
 //! Thread-local scratch buffers are pre-allocated and reused across layers.

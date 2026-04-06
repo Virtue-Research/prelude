@@ -290,7 +290,6 @@ impl OwnedBatchDecodeSeq {
 
 // ── Paged KV pool ───────────────────────────────────────────────────────
 
-#[allow(dead_code)]
 pub(crate) struct PagedKvPool {
     pub(crate) key_caches: Vec<Tensor>,
     pub(crate) value_caches: Vec<Tensor>,

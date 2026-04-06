@@ -1,6 +1,6 @@
 use crate::engine::*;
-use crate::modules::BatchAttnContext;
-use crate::modules::PagedKvBatchContext;
+use crate::models::commons::BatchAttnContext;
+use crate::models::commons::PagedKvBatchContext;
 
 impl Engine {
     /// Batched decode step: N sequences, each with Q=1 (one new token),
@@ -23,13 +23,13 @@ impl Engine {
         // packed input: one token per sequence
         let flat_tokens: Vec<u32> = seqs.iter().map(|s| s.token).collect();
         let packed_input = Tensor::from_vec(flat_tokens, (batch_size,), &self.executor.device)
-            .map_err(candle_err)?;
+            .map_err(tensor_err)?;
 
         // cu_seqlens_q: [0, 1, 2, ..., N] — each seq has Q=1
         let cu_seqlens_q: Vec<u32> = (0..=batch_size as u32).collect();
         let cu_seqlens_q_t =
             Tensor::from_vec(cu_seqlens_q, (batch_size + 1,), &self.executor.device)
-                .map_err(candle_err)?;
+                .map_err(tensor_err)?;
 
         // cu_seqlens_k: [0, ctx1, ctx1+ctx2, ...] — different K lengths
         let mut cu_seqlens_k: Vec<u32> = vec![0];
@@ -40,12 +40,12 @@ impl Engine {
         }
         let cu_seqlens_k_t =
             Tensor::from_vec(cu_seqlens_k, (batch_size + 1,), &self.executor.device)
-                .map_err(candle_err)?;
+                .map_err(tensor_err)?;
 
         // position_ids: position for each token
         let position_ids: Vec<u32> = seqs.iter().map(|s| s.position as u32).collect();
         let position_ids_t = Tensor::from_vec(position_ids, (batch_size,), &self.executor.device)
-            .map_err(candle_err)?;
+            .map_err(tensor_err)?;
 
         let q_seq_lens: Vec<usize> = vec![1; batch_size];
 
@@ -57,7 +57,7 @@ impl Engine {
             })
             .collect();
         let slot_mapping_t =
-            Tensor::new(slots.as_slice(), &self.executor.device).map_err(candle_err)?;
+            Tensor::new(slots.as_slice(), &self.executor.device).map_err(tensor_err)?;
 
         // block_tables: padded to max_blocks
         let max_blocks = seqs.iter().map(|s| s.block_table.len()).max().unwrap_or(0);
@@ -68,9 +68,9 @@ impl Engine {
         }
         let block_tables_t =
             Tensor::from_vec(flat_bt, (batch_size, max_blocks), &self.executor.device)
-                .map_err(candle_err)?
+                .map_err(tensor_err)?
                 .to_dtype(DType::U32)
-                .map_err(candle_err)?;
+                .map_err(tensor_err)?;
 
         // Build deltanet_slots from BatchDecodeSeq
         let deltanet_slots: Option<Vec<u32>> = if self.cache.deltanet_pool.is_some() {
@@ -112,14 +112,14 @@ impl Engine {
             deltanet_pool: dn_pool_ref,
             deltanet_slots: deltanet_slots.as_deref(),
         };
-        self.executor.ops.session.begin_forward();
-        let logits = model.forward(&packed_input, &mut ctx).map_err(candle_err)?;
-        self.executor.ops.session.end_forward();
+        self.executor.ops.begin_forward();
+        let logits = model.forward(&packed_input, &mut ctx).map_err(tensor_err)?;
+        self.executor.ops.end_forward();
         drop(dn_pool_guard);
         drop(model);
 
         // logits: (batch_size, 1, vocab_size) → (batch_size, vocab_size)
-        logits.squeeze(1).map_err(candle_err)
+        logits.squeeze(1).map_err(tensor_err)
     }
 
     /// Continue streaming decode from a block table retained by `batch_prefill_paged`.
@@ -201,27 +201,27 @@ impl Engine {
                 // Build single-token varlen input
                 let last_token = *output_tokens.last().unwrap();
                 let input_t = Tensor::from_vec(vec![last_token], (1,), &self.executor.device)
-                    .map_err(candle_err)?;
+                    .map_err(tensor_err)?;
                 let cu_q = Tensor::from_vec(vec![0u32, 1u32], (2,), &self.executor.device)
-                    .map_err(candle_err)?;
+                    .map_err(tensor_err)?;
                 let context_len = (pos + 1) as u32;
                 let cu_k = Tensor::from_vec(vec![0u32, context_len], (2,), &self.executor.device)
-                    .map_err(candle_err)?;
+                    .map_err(tensor_err)?;
                 let pos_ids = Tensor::from_vec(vec![pos as u32], (1,), &self.executor.device)
-                    .map_err(candle_err)?;
+                    .map_err(tensor_err)?;
 
                 let slot =
                     crate::cache::block_manager::BlockManager::slot(&block_table, pos, pool.block_size);
                 let slot_mapping =
-                    Tensor::new(&[slot], &self.executor.device).map_err(candle_err)?;
+                    Tensor::new(&[slot], &self.executor.device).map_err(tensor_err)?;
 
                 // Block table tensor [1, num_blocks]
                 let bt_t = Tensor::new(block_table.as_slice(), &self.executor.device)
-                    .map_err(candle_err)?
+                    .map_err(tensor_err)?
                     .to_dtype(DType::U32)
-                    .map_err(candle_err)?
+                    .map_err(tensor_err)?
                     .unsqueeze(0)
-                    .map_err(candle_err)?;
+                    .map_err(tensor_err)?;
 
                 let mut model = self
                     .executor
@@ -252,27 +252,27 @@ impl Engine {
                     deltanet_pool: dn_pool_ref,
                     deltanet_slots: dn_slots.as_deref(),
                 };
-                self.executor.ops.session.begin_forward();
-                let logits = model.forward(&input_t, &mut ctx).map_err(candle_err)?;
-                self.executor.ops.session.end_forward();
+                self.executor.ops.begin_forward();
+                let logits = model.forward(&input_t, &mut ctx).map_err(tensor_err)?;
+                self.executor.ops.end_forward();
                 drop(dn_pool_guard);
                 drop(model);
 
                 let logits = logits
                     .squeeze(0)
-                    .map_err(candle_err)?
+                    .map_err(tensor_err)?
                     .squeeze(0)
-                    .map_err(candle_err)?;
+                    .map_err(tensor_err)?;
 
                 let next_token = if request.sampling.temperature <= 1e-7 {
                     logits
                         .argmax(crate::tensor::D::Minus1)
-                        .map_err(candle_err)?
+                        .map_err(tensor_err)?
                         .to_scalar::<u32>()
-                        .map_err(candle_err)?
+                        .map_err(tensor_err)?
                 } else {
-                    let logits_f32 = logits.to_dtype(DType::F32).map_err(candle_err)?;
-                    logits_processor.sample(&logits_f32).map_err(candle_err)?
+                    let logits_f32 = logits.to_dtype(DType::F32).map_err(tensor_err)?;
+                    logits_processor.sample(&logits_f32).map_err(tensor_err)?
                 };
                 pos += 1;
 

@@ -1,6 +1,6 @@
 ## Construction
 
-Device crates auto-register their `Ops` + `Executor` at link time using `#[ctor::ctor]`.
+Device crates auto-register their `OpsBundle` + `Executor` at link time using `#[ctor::ctor]`.
 The core registry has **zero device-specific types** — no `DeviceType` enum, no hardware
 detection code. Each device crate provides its own `probe()` function that checks whether
 its hardware is available.
@@ -68,7 +68,7 @@ pub struct RegisteredBackend {
     pub name: &'static str,
     pub priority: u32,                      // higher = preferred
     pub probe: fn() -> bool,               // device crate's hardware check
-    pub create: fn() -> (Arc<dyn Ops>, Arc<dyn Executor>),
+    pub create: fn() -> (Arc<dyn OpsBundle>, Arc<dyn Executor>),
 }
 
 static BACKENDS: Mutex<Vec<RegisteredBackend>> = Mutex::new(Vec::new());
@@ -79,23 +79,27 @@ pub fn register_backend(backend: RegisteredBackend) {
 
 /// Select the best available backend.
 /// Tries registered backends in priority order, picks the first whose probe() returns true.
-/// Falls back to naive_ops if nothing is registered (always works, never panics).
-pub fn select_backend() -> (Arc<dyn Ops>, Arc<dyn Executor>) {
-    let mut backends = BACKENDS.lock().unwrap();
-    backends.sort_by(|a, b| b.priority.cmp(&a.priority));
-    for b in backends.iter() {
-        if (b.probe)() {
-            return (b.create)();
-        }
+/// Falls back to ComposedOps (CubeCL CPU) if nothing is registered.
+pub fn select_ops(device: &Device) -> &'static OpsBundle {
+    if device.is_cuda() {
+        if let Some(factory) = GPU_OPS_FACTORY.get() { return factory(); }
     }
-    // No registered backend available — use built-in naive fallback
-    (Arc::new(NaiveOps), Arc::new(NaiveExecutor))
+    if let Some(factory) = CPU_OPS_FACTORY.get() { return factory(); }
+    primitives::default_cpu_ops()  // CubeCL CPU runtime + ComposedOps
 }
 ```
 
 **Key: prelude-core has NO device types.** No `DeviceType::Cuda`, no `has_nvidia_gpu()`.
-The core only knows "backends register with a name, priority, and probe function."
-All hardware detection logic lives in the device crate's `probe()` closure.
+Device crates register their `OpsBundle` via `#[ctor]` at link time.
+`ComposedOps` is pure composition logic (calls TensorOps trait methods). It doesn't know whether
+the primitives come from CubeCL or XLA. Device crates inject the concrete TensorOps at construction.
+
+**Design principles:**
+- `OpsBundle` flat API: models call `ops.xxx()` for everything. No nesting.
+- `TensorOps` uses `base()` delegation: device backends override only what they need.
+- `Linear` is a parameter carrier: holds weights + LoRA state, passes them to `ops.xxx()`.
+  All fused/fallback/device decisions live in OpsBundle, never in Linear or model code.
+- Fused ops: `ops.fused_add_rmsnorm()` tries device kernel → auto-fallback to composed.
 
 **CUDA + ROCm in one binary:** Both register at priority 100. Runtime: `probe()` checks
 for actual hardware. Machine with NVIDIA GPU → CUDA probe returns true first. Machine
@@ -167,20 +171,27 @@ symbol conflicts.
 
 ```
 prelude-server (binary)
-    ├── prelude-core               (pure Rust leaf — no device dependency, no device types)
-    ├── plugins/prelude-xgrammar   (impl GrammarBackend)
+    ├── prelude-core               (OpsBundle, ComposedOps, CubeCLTensorOps<R>, llguidance — no C++, no device types)
+    │       ├── cubecl                 (pure Rust: IR + TensorOps primitives, generic over CubeRuntime)
+    │       └── llguidance             (constrained decoding, pure Rust)
     ├── prelude-cuda               (feature-gated, ctor registers at link time)
     │       ├── prelude-core
+    │       ├── cubecl (features=["cuda"])  (CubeCL CUDA runtime for TensorOps)
     │       └── fa4/, flashinfer/, deepgemm/, nccl/, uccl-ep/
     ├── prelude-rocm               (feature-gated, ctor registers at link time)
     │       ├── prelude-core
+    │       ├── cubecl (features=["hip"])
     │       └── ck/, aiter/, rccl/, uccl-ep/
-    └── prelude-cpu                (always included, priority 0 fallback)
+    └── prelude-tpu                (feature-gated, same override pattern — XLATensorOps instead of CubeCL)
+            ├── prelude-core
+            └── pjrt C API (XLA runtime, dlopen libpjrt_tpu.so)
 ```
 
-`prelude-core` is a pure leaf — it depends on no device crate, compiles no C++, and
-contains no device-specific types. The `RegisteredBackend` struct uses only generic
-fields (`name`, `priority`, `probe`, `create`).
+`prelude-core` compiles no C++ and contains no device-specific types. It depends on CubeCL
+(pure Rust) for `CubeCLTensorOps<R: Runtime>` — a generic TensorOps implementation that
+device crates instantiate with their runtime. `ComposedOps` composes TensorOps primitives into
+higher-level ops (NormOps, ActivationOps, AttentionOps, etc.) — pure logic, no device dependency.
+CubeCL's CPU runtime serves as the lowest-priority fallback.
 
 **Why this design:**
 
@@ -188,5 +199,6 @@ fields (`name`, `priority`, `probe`, `create`).
   detection. Device crates own their probe logic.
 - **Additive features**: adding a new device crate = zero changes to server or core.
 - **Multi-GPU binary**: CUDA + ROCm both register, runtime probe picks the right one.
-- **Three-tier fallback**: registered GPU → registered CPU → built-in naive_ops. Always works.
+- **Uniform override pattern**: all backends provide TensorOps primitives + hot-path overrides.
+  ComposedOps composes the rest. No exceptions — TPU follows the same pattern (XLA provides TensorOps).
 - **Model code has zero `#[cfg]`**: all device branching is in the registry layer.

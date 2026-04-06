@@ -18,7 +18,7 @@ pub fn bench(m: usize, k: usize, n: usize, warmup: usize, repeats: usize) -> Res
     let input = Tensor::from_vec(input_data, (m, k), &device)?;
     let weight = Tensor::from_vec(weight_data, (n, k), &device)?;
 
-    // -- candle F32 baseline (cast -> matmul -> cast) --
+    // -- naive F32 baseline (cast -> matmul -> cast) --
     let input_f32 = input.to_dtype(DType::F32)?;
     let weight_f32_t = weight.to_dtype(DType::F32)?.t()?;
     for _ in 0..warmup {
@@ -28,7 +28,7 @@ pub fn bench(m: usize, k: usize, n: usize, warmup: usize, repeats: usize) -> Res
     for _ in 0..repeats {
         let _ = input_f32.matmul(&weight_f32_t)?;
     }
-    let candle_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
+    let naive_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 
     let onednn_us: Option<f64> = None; // removed: unpacked bf16_linear no longer exists
     let onednn_packed_us: Option<f64> = None; // removed: PackedWeight no longer exists
@@ -61,22 +61,8 @@ pub fn bench(m: usize, k: usize, n: usize, warmup: usize, repeats: usize) -> Res
     // -- Custom cpu_ops GEMM (raw kernel, no Tensor overhead) --
     let custom_us = {
         // Get raw u16 slices
-        let in_storage = input.storage_and_layout();
-        let w_storage = weight.storage_and_layout();
-        let in_u16: &[u16] = match &*in_storage.0 {
-            prelude_core::tensor::backend::Storage::Cpu(s) => {
-                let sl = s.as_slice::<bf16>().unwrap();
-                unsafe { std::slice::from_raw_parts(sl.as_ptr() as *const u16, sl.len()) }
-            }
-            _ => unreachable!(),
-        };
-        let w_u16: &[u16] = match &*w_storage.0 {
-            prelude_core::tensor::backend::Storage::Cpu(s) => {
-                let sl = s.as_slice::<bf16>().unwrap();
-                unsafe { std::slice::from_raw_parts(sl.as_ptr() as *const u16, sl.len()) }
-            }
-            _ => unreachable!(),
-        };
+        let in_u16: &[u16] = prelude_cpu::ops::tensor_as_u16_slice_pub(&input).unwrap();
+        let w_u16: &[u16] = prelude_cpu::ops::tensor_as_u16_slice_pub(&weight).unwrap();
         let mut out_buf = vec![0u16; m * n];
         for _ in 0..warmup {
             prelude_cpu::ops::gemm::bf16_gemm_small_m(&mut out_buf, in_u16, w_u16, m, k, n);
@@ -92,7 +78,7 @@ pub fn bench(m: usize, k: usize, n: usize, warmup: usize, repeats: usize) -> Res
     let label = format!("[{m}x{k}x{n}]");
     let weight_mb = (n * k * 2) as f64 / 1e6;
     let bw_gbs = weight_mb / (custom_us / 1e6) / 1e3;
-    print!("  gemm {label:<22} candle_f32={candle_us:>10.1}us  custom={custom_us:>10.1}us ({bw_gbs:.0} GB/s)");
+    print!("  gemm {label:<22} naive_f32={naive_us:>10.1}us  custom={custom_us:>10.1}us ({bw_gbs:.0} GB/s)");
     if let Some(dnn) = onednn_us {
         let speedup = dnn / custom_us;
         print!("  onednn={dnn:>10.1}us ({speedup:.1}x)");
@@ -359,7 +345,7 @@ pub fn verify_s8_accuracy(m: usize, k: usize, n: usize) -> Result<()> {
     Ok(())
 }
 
-/// Accuracy: compare GEMM backends against candle F32 reference
+/// Accuracy: compare GEMM backends against F32 reference
 pub fn verify_accuracy(m: usize, k: usize, n: usize) -> Result<()> {
     let device = Device::Cpu;
 
@@ -383,7 +369,7 @@ pub fn verify_accuracy(m: usize, k: usize, n: usize) -> Result<()> {
     let rtol = 5e-2f32;
     let label = format!("[{m}x{k}x{n}]");
 
-    // accuracy check against candle reference is sufficient
+    // accuracy check against F32 reference is sufficient
     let _ = (atol, rtol, label);
 
     Ok(())

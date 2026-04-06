@@ -23,21 +23,21 @@ pub fn bench(dim: usize, batch: usize, warmup: usize, repeats: usize) -> Result<
     }
     let cpu_ops_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 
-    // candle F32 (separate silu + mul)
+    // naive F32 (separate silu + mul)
     let input_f32 = input.to_dtype(DType::F32)?;
     let gate = input_f32.narrow(1, 0, dim)?;
     let up = input_f32.narrow(1, dim, dim)?;
     for _ in 0..warmup {
-        let _ = (prelude_core::modules::activation::silu(&gate)? * &up)?;
+        let _ = (gate.silu()? * &up)?;
     }
     let start = Instant::now();
     for _ in 0..repeats {
-        let _ = (prelude_core::modules::activation::silu(&gate)? * &up)?;
+        let _ = (gate.silu()? * &up)?;
     }
-    let candle_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
+    let naive_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 
     let sgl_us: Option<f64> = None;
 
-    print_result("silu_mul ", dim, batch, &BenchResult { cpu_ops_us, candle_us, sgl_us });
+    print_result("silu_mul ", dim, batch, &BenchResult { cpu_ops_us, naive_us, sgl_us });
     Ok(())
 }

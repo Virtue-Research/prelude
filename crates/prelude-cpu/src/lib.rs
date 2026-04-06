@@ -6,10 +6,8 @@
 //! - Quantized format support (Q4_0, Q4_K, etc.)
 //! - CpuOps: implements all Ops traits from prelude-core
 
-// ── Auto-register CPU ops at link time ─────────────────────────────
-
-#[ctor::ctor]
-fn _register_cpu_ops() {
+/// Register CPU ops and executor. Call once at startup.
+pub fn register() {
     prelude_core::ops::register_cpu_ops(cpu_ops::cpu_ops);
     prelude_core::engine::executor::register_executor(|engine| Box::new(executor::CpuExecutor::new(engine)));
 }

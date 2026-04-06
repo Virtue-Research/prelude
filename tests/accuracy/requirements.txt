@@ -1,0 +1,5 @@
+requests>=2.31.0
+safetensors>=0.4.0
+torch>=2.0.0
+transformers>=4.40.0
+numpy>=1.24.0

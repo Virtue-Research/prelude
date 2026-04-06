@@ -3,7 +3,7 @@ use half::bf16;
 use std::time::Instant;
 
 /// Benchmark prefill (extend) attention.
-/// Measures: cpu_ops pure Rust, candle F32 baseline.
+/// Measures: cpu_ops pure Rust, naive F32 baseline.
 pub fn bench_extend(
     num_heads: usize,
     num_kv_heads: usize,
@@ -50,8 +50,8 @@ pub fn bench_extend(
     }
     let cpu_ops_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 
-    // -- candle F32 baseline (matmul-based) -- skip for large sequences (too slow) --
-    let candle_us: Option<f64> = if seq_len <= 1024 {
+    // -- naive F32 baseline (matmul-based) -- skip for large sequences (too slow) --
+    let naive_us: Option<f64> = if seq_len <= 1024 {
         let q_f32 =
             Tensor::from_vec(q_data.clone(), (total_tokens, num_heads, head_dim), &device)?
                 .to_dtype(DType::F32)?;
@@ -81,7 +81,7 @@ pub fn bench_extend(
                     .narrow(1, kv_h, 1)?
                     .squeeze(1)?;
                 let scores = q_h.matmul(&k_h.t()?)?;
-                let _ = prelude_core::modules::activation::softmax(&(scores * sm_scale)?, 1)?
+                let _ = (scores * sm_scale)?.softmax(1)?
                     .matmul(&v_h)?;
             }
         }
@@ -102,7 +102,7 @@ pub fn bench_extend(
                     .narrow(1, kv_h, 1)?
                     .squeeze(1)?;
                 let scores = q_h.matmul(&k_h.t()?)?;
-                let _ = prelude_core::modules::activation::softmax(&(scores * sm_scale)?, 1)?
+                let _ = (scores * sm_scale)?.softmax(1)?
                     .matmul(&v_h)?;
             }
         }
@@ -116,8 +116,8 @@ pub fn bench_extend(
         "[{num_seqs}x{seq_len} H={num_heads}/{num_kv_heads} D={head_dim}]"
     );
     print!("  extend {label:<40} cpu_ops={cpu_ops_us:>10.1}us");
-    if let Some(candle) = candle_us {
-        print!("  candle_f32={candle:>10.1}us  ({:.2}x)", candle / cpu_ops_us);
+    if let Some(naive) = naive_us {
+        print!("  naive_f32={naive:>10.1}us  ({:.2}x)", naive / cpu_ops_us);
     }
     println!();
     Ok(())

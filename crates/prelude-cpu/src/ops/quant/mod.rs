@@ -35,6 +35,9 @@ pub mod q6_k;
 pub mod iq4_nl;
 pub mod quantize;
 pub mod matmul;
+pub mod weight_quantize;
+#[cfg(target_arch = "aarch64")]
+pub mod neon;
 
 pub use types::{
     BlockQ4_0, BlockQ4_1, BlockQ5_0, BlockQ5_1, BlockQ8_0, BlockQ8_1,
@@ -55,3 +58,4 @@ pub use q6_k::vec_dot_q6k_q8k;
 pub use iq4_nl::vec_dot_iq4_nl_q8_0;
 pub use quantize::{quantize_row_q8_0, quantize_row_q8_1, quantize_row_q8k};
 pub use matmul::quantized_matmul_f32;
+pub use weight_quantize::*;

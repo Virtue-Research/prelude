@@ -69,7 +69,7 @@ pub trait AttentionOps: Send + Sync {
 Create `crates/prelude-cuda/src/attn/mybackend.rs`:
 
 ```rust
-use candle_core::{Result, Tensor};
+use prelude_core::tensor::{Result, Tensor};
 use prelude_core::ops::traits::attention::{AttentionOps, VarlenParams, PagedParams, MaskType};
 
 pub struct MyBackendOps {

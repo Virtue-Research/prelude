@@ -1,4 +1,4 @@
-//! Micro-benchmark for pure Rust CPU kernels vs Candle baseline (and onednn if available).
+//! Micro-benchmark for pure Rust CPU kernels vs naive baseline (and onednn if available).
 //!
 //! Usage:
 //!   cargo run -p prelude-core --bin cpu_ops_bench --release
@@ -237,37 +237,23 @@ fn main() -> Result<()> {
 
     // -- Quantized kernels --
     if run("quant") {
-        // Precision (llama.cpp style: dot product error vs F32)
         quant::verify_dot_precision()?;
 
-        // Dot product throughput
         println!("\n=== Quantized dot product throughput ===");
-        for &k in &[256, 512, 1024, 2048, 4096] {
-            quant::bench_dot(k, 100, 10000)?;
+        for &k in &[256, 896, 4096, 7168] {
+            quant::bench_dot(k, warmup, repeats)?;
         }
 
-        // Matmul throughput
-        println!("\n=== Quantized matmul: Q4_0 / Q4_K vs F32 ===");
-        let quant_repeats = 50;
-        let quant_configs: &[(usize, usize, usize)] = &[
-            (1, 1024, 1024),
-            (1, 2048, 2048),
-            (1, 4096, 4096),
-            (4, 2048, 2048),
-            (4, 4096, 4096),
-            (16, 4096, 4096),
-            (1, 1024, 4096),
-            (1, 4096, 1024),
-        ];
-        for &(m, k, n) in quant_configs {
-            quant::bench_matmul(m, k, n, 5, quant_repeats)?;
+        println!("\n=== Quantized matmul throughput ===");
+        for &(m, k, n) in &[(1, 4096, 4096), (4, 4096, 4096), (16, 4096, 4096)] {
+            quant::bench_matmul(m, k, n, 5, 100)?;
         }
     }
 
     // -- Numerical accuracy --
     if run("accuracy") {
         {
-            println!("\n=== Numerical accuracy: GEMM backends vs candle F32 ===");
+            println!("\n=== Numerical accuracy: GEMM backends vs F32 reference ===");
             println!("  Pass criteria: |a-b| <= atol + rtol*max(|a|,|b|) (atol=5e-2, rtol=5e-2)");
             for &(m, k, n) in gemm_configs {
                 gemm::verify_accuracy(m, k, n)?;
@@ -289,16 +275,16 @@ fn main() -> Result<()> {
 
 pub(crate) struct BenchResult {
     pub cpu_ops_us: f64,
-    pub candle_us: f64,
+    pub naive_us: f64,
     pub sgl_us: Option<f64>,
 }
 
 pub(crate) fn print_result(label: &str, hidden: usize, batch: usize, r: &BenchResult) {
     print!(
-        "  {label} [{batch:>3}x{hidden:>4}]  cpu_ops={:>8.1}us  candle={:>8.1}us  ({:.2}x)",
+        "  {label} [{batch:>3}x{hidden:>4}]  cpu_ops={:>8.1}us  naive={:>8.1}us  ({:.2}x)",
         r.cpu_ops_us,
-        r.candle_us,
-        r.candle_us / r.cpu_ops_us,
+        r.naive_us,
+        r.naive_us / r.cpu_ops_us,
     );
     if let Some(sgl) = r.sgl_us {
         print!("  sgl={sgl:>8.1}us  ({:.2}x)", sgl / r.cpu_ops_us);

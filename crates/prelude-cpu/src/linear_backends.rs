@@ -5,11 +5,10 @@
 
 use std::sync::Arc;
 use prelude_core::tensor::{Module, Result, Tensor};
-use prelude_core::modules::linear::{
-    CpuLinearFactory, CpuLinearFactoryEntry,
-    LinearBackend, QuantFormat, QuantFormatEntry,
+use prelude_core::models::commons::linear::{
+    CpuLinearFactory, CpuLinearFactoryEntry, LinearBackend,
 };
-use prelude_core::modules::linear::NaiveLinear;
+use prelude_core::models::commons::linear::NaiveLinear;
 use std::any::Any;
 
 // ── OneDNN CPU linear factory ───────────────────────────────────────
@@ -51,12 +50,8 @@ impl Module for QuantizedWeight {
             );
         }
 
-        let x_cont = x.flatten_all()?;
-        let x_storage = x_cont.storage_and_layout().0;
-        let x_slice = match &*x_storage {
-            prelude_core::tensor::backend::Storage::Cpu(cpu) => cpu.as_slice::<f32>()?,
-            _ => prelude_core::tensor::bail!("quantized matmul: expected CPU tensor"),
-        };
+        let x_cont = x.flatten_all()?.contiguous()?;
+        let x_slice = crate::ops::tensor_as_f32_slice(&x_cont)?;
 
         let mut out = vec![0.0f32; m * self.n];
         crate::ops::quant::quantized_matmul_f32(x_slice, &self.blocks, &mut out, m, self.n, self.k);
@@ -73,27 +68,6 @@ impl LinearBackend for QuantizedWeight {
     fn clone_box(&self) -> Box<dyn LinearBackend> { Box::new(self.clone()) }
     fn as_any(&self) -> &dyn Any { self }
 }
-
-struct Q4_0Format;
-
-impl QuantFormat for Q4_0Format {
-    fn name(&self) -> &str { "Q4_0" }
-    fn can_handle(&self, dtype: prelude_core::tensor::quantized::GgmlDType) -> bool {
-        dtype == prelude_core::tensor::quantized::GgmlDType::Q4_0
-    }
-    fn load(&self, qtensor: Arc<prelude_core::tensor::quantized::QTensor>) -> Result<Box<dyn LinearBackend>> {
-        let shape = qtensor.shape();
-        let dims = shape.dims();
-        let n = dims[0];
-        let k = dims[1];
-        let raw = qtensor.data()?;
-        let blocks: Vec<crate::ops::quant::BlockQ4_0> =
-            bytemuck::cast_slice(&raw).to_vec();
-        Ok(Box::new(QuantizedWeight { blocks, n, k }))
-    }
-}
-
-inventory::submit!(QuantFormatEntry::new(&Q4_0Format));
 
 // ── Q4_K quantized backend ──────────────────────────────────────────
 
@@ -119,12 +93,8 @@ impl Module for QuantizedWeightQ4K {
             );
         }
 
-        let x_cont = x.flatten_all()?;
-        let x_storage = x_cont.storage_and_layout().0;
-        let x_slice = match &*x_storage {
-            prelude_core::tensor::backend::Storage::Cpu(cpu) => cpu.as_slice::<f32>()?,
-            _ => prelude_core::tensor::bail!("Q4_K matmul: expected CPU tensor"),
-        };
+        let x_cont = x.flatten_all()?.contiguous()?;
+        let x_slice = crate::ops::tensor_as_f32_slice(&x_cont)?;
 
         let mut out = vec![0.0f32; m * self.n];
         crate::ops::quant::q4_k::quantized_matmul_q4k(x_slice, &self.blocks, &mut out, m, self.n, self.k);
@@ -142,23 +112,48 @@ impl LinearBackend for QuantizedWeightQ4K {
     fn as_any(&self) -> &dyn Any { self }
 }
 
-struct Q4KFormat;
+// ── QuantFormat registrations ───────────────────────────────────────
 
-impl QuantFormat for Q4KFormat {
-    fn name(&self) -> &str { "Q4_K" }
-    fn can_handle(&self, dtype: prelude_core::tensor::quantized::GgmlDType) -> bool {
-        dtype == prelude_core::tensor::quantized::GgmlDType::Q4K
+use prelude_core::models::commons::linear::{QuantFormat, QuantFormatEntry};
+use prelude_core::tensor::quantized::GgmlDType;
+use prelude_core::tensor::Device;
+
+struct CpuQ4_0Format;
+
+impl QuantFormat for CpuQ4_0Format {
+    fn name(&self) -> &str { "cpu/q4_0" }
+
+    fn can_handle(&self, dtype: GgmlDType) -> bool {
+        dtype == GgmlDType::Q4_0
     }
+
     fn load(&self, qtensor: Arc<prelude_core::tensor::quantized::QTensor>) -> Result<Box<dyn LinearBackend>> {
         let shape = qtensor.shape();
         let dims = shape.dims();
-        let n = dims[0];
-        let k = dims[1];
-        let raw = qtensor.data()?;
-        let blocks: Vec<crate::ops::quant::BlockQ4K> =
-            bytemuck::cast_slice(&raw).to_vec();
+        let (n, k) = (dims[0], dims[1]);
+        let blocks: Vec<crate::ops::quant::BlockQ4_0> = bytemuck::cast_slice(qtensor.data()).to_vec();
+        Ok(Box::new(QuantizedWeight { blocks, n, k }))
+    }
+}
+
+inventory::submit!(QuantFormatEntry::new(&CpuQ4_0Format));
+
+struct CpuQ4KFormat;
+
+impl QuantFormat for CpuQ4KFormat {
+    fn name(&self) -> &str { "cpu/q4_k" }
+
+    fn can_handle(&self, dtype: GgmlDType) -> bool {
+        dtype == GgmlDType::Q4K
+    }
+
+    fn load(&self, qtensor: Arc<prelude_core::tensor::quantized::QTensor>) -> Result<Box<dyn LinearBackend>> {
+        let shape = qtensor.shape();
+        let dims = shape.dims();
+        let (n, k) = (dims[0], dims[1]);
+        let blocks: Vec<crate::ops::quant::BlockQ4K> = bytemuck::cast_slice(qtensor.data()).to_vec();
         Ok(Box::new(QuantizedWeightQ4K { blocks, n, k }))
     }
 }
 
-inventory::submit!(QuantFormatEntry::new(&Q4KFormat));
+inventory::submit!(QuantFormatEntry::new(&CpuQ4KFormat));

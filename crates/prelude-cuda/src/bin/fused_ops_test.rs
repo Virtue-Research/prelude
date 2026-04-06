@@ -4,11 +4,20 @@ static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
 // Quick correctness and performance test for fused CUDA kernels.
 // Usage: cargo run --bin fused_ops_test -p prelude-cuda --release
 
-use prelude_core::tensor::{DType, Device, Module, Result, Tensor};
+use prelude_core::ops::traits::Ops;
+use prelude_core::tensor::{bail, DType, Device, Module, Result, Tensor};
+
+/// Helper: call a fused op that returns Option<Result<T>>, bail if None.
+fn must_fuse<T>(opt: Option<Result<T>>, name: &str) -> Result<T> {
+    match opt {
+        Some(r) => r,
+        None => bail!("{name}: fused kernel not available"),
+    }
+}
 
 fn main() -> Result<()> {
-    let dev = Device::new_cuda(0)?;
-    let ops = prelude_cuda::create_cuda_ops();
+    let dev = Device::Cuda(0);
+    let ops = prelude_cuda::cuda_ops();
     let n = 1024 * 3072; // typical intermediate_size * seq
 
     println!(
@@ -22,12 +31,11 @@ fn main() -> Result<()> {
     let up = Tensor::randn(0f64, 1.0, n, &dev)?.to_dtype(DType::BF16)?;
 
     // Reference: silu(gate) * up
-    let silu_gate = gate.apply(&prelude_core::modules::activation::Activation::Silu)?;
+    let silu_gate = gate.apply(&prelude_core::models::commons::activation::Activation::Silu)?;
     let ref_result = (&silu_gate * &up)?;
 
     // Fused
-    let fused_result = ops.fused.fused_silu_mul(&gate, &up)
-        .expect("CudaOps must support fused_silu_mul")?;
+    let fused_result = must_fuse(ops.fused_silu_mul(&gate, &up), "fused_silu_mul")?;
 
     // Compare
     let ref_f32: Vec<f32> = ref_result.to_dtype(DType::F32)?.to_vec1()?;
@@ -36,7 +44,7 @@ fn main() -> Result<()> {
     let max_diff: f32 = ref_f32
         .iter()
         .zip(fused_f32.iter())
-        .map(|(a, b)| (a - b).abs())
+        .map(|(a, b): (&f32, &f32)| (a - b).abs())
         .fold(0.0f32, f32::max);
     let mean_abs: f32 = ref_f32.iter().map(|x: &f32| x.abs()).sum::<f32>() / ref_f32.len() as f32;
     println!(
@@ -51,8 +59,7 @@ fn main() -> Result<()> {
     let b = Tensor::randn(0f64, 1.0, n, &dev)?.to_dtype(DType::BF16)?;
 
     let ref_add = (&a + &b)?;
-    let fused_add = ops.fused.fused_add(&a, &b)
-        .expect("CudaOps must support fused_add")?;
+    let fused_add = must_fuse(ops.fused_add(&a, &b), "fused_add")?;
 
     let ref_f32: Vec<f32> = ref_add.to_dtype(DType::F32)?.to_vec1()?;
     let fused_f32: Vec<f32> = fused_add.to_dtype(DType::F32)?.to_vec1()?;
@@ -60,7 +67,7 @@ fn main() -> Result<()> {
     let max_diff: f32 = ref_f32
         .iter()
         .zip(fused_f32.iter())
-        .map(|(a, b)| (a - b).abs())
+        .map(|(a, b): (&f32, &f32)| (a - b).abs())
         .fold(0.0f32, f32::max);
     let mean_abs: f32 = ref_f32.iter().map(|x: &f32| x.abs()).sum::<f32>() / ref_f32.len() as f32;
     println!(
@@ -73,36 +80,36 @@ fn main() -> Result<()> {
     // ── Performance test ─────────────────────────────────────
     // Warmup
     for _ in 0..5 {
-        let _ = ops.fused.fused_silu_mul(&gate, &up);
-        let _ = ops.fused.fused_add(&a, &b);
+        let _ = ops.fused_silu_mul(&gate, &up);
+        let _ = ops.fused_add(&a, &b);
     }
-    dev.synchronize()?;
+    prelude_cuda::device::synchronize(&dev)?;
 
     let iters = 100;
 
     // fused_silu_mul perf
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
-        let _ = ops.fused.fused_silu_mul(&gate, &up);
+        let _ = ops.fused_silu_mul(&gate, &up);
     }
-    dev.synchronize()?;
+    prelude_cuda::device::synchronize(&dev)?;
     let fused_silu_us = t0.elapsed().as_micros() as f64 / iters as f64;
 
     // Reference silu*mul perf
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
-        let s = gate.apply(&prelude_core::modules::activation::Activation::Silu)?;
+        let s = gate.apply(&prelude_core::models::commons::activation::Activation::Silu)?;
         let _ = (&s * &up)?;
     }
-    dev.synchronize()?;
+    prelude_cuda::device::synchronize(&dev)?;
     let ref_silu_us = t0.elapsed().as_micros() as f64 / iters as f64;
 
     // vectorized_add perf
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
-        let _ = ops.fused.fused_add(&a, &b);
+        let _ = ops.fused_add(&a, &b);
     }
-    dev.synchronize()?;
+    prelude_cuda::device::synchronize(&dev)?;
     let fused_add_us = t0.elapsed().as_micros() as f64 / iters as f64;
 
     // Reference add perf
@@ -110,7 +117,7 @@ fn main() -> Result<()> {
     for _ in 0..iters {
         let _ = (&a + &b)?;
     }
-    dev.synchronize()?;
+    prelude_cuda::device::synchronize(&dev)?;
     let ref_add_us = t0.elapsed().as_micros() as f64 / iters as f64;
 
     println!("\nPerformance (n={}):", n);

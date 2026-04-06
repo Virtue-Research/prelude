@@ -7,8 +7,7 @@
 //!
 //! Throughput: dot product and matmul at typical LLM dimensions.
 
-use prelude_core::tensor::{Device, Result, Tensor};
-use prelude_core::tensor::quantized::{GgmlDType, QTensor};
+use prelude_core::tensor::Result;
 use std::time::Instant;
 
 use prelude_cpu::ops::quant::*;
@@ -17,17 +16,17 @@ use prelude_cpu::ops::quant::*;
 const GGML_TEST_SIZE: usize = 32 * 128; // 4096
 const GGML_MAX_DOT_PRODUCT_ERROR: f32 = 0.02;
 
-/// Reference errors (empirically measured, candle quantizer + our kernels).
+/// Reference errors (empirically measured, our quantizers + our kernels).
 /// These may differ slightly from llama.cpp due to quantizer implementation.
-fn ggml_reference_error(dtype: GgmlDType) -> f32 {
-    match dtype {
-        GgmlDType::Q4_0 => 0.001143,
-        GgmlDType::Q2K  => 0.004086,
-        GgmlDType::Q3K  => 0.018000, // candle Q3_K quantizer has higher error than llama.cpp
-        GgmlDType::Q4K  => 0.002425,
-        GgmlDType::Q5K  => 0.001401,
-        GgmlDType::Q6K  => 0.000520,
-        GgmlDType::Q8_0 => 0.000092,
+fn reference_error(name: &str) -> f32 {
+    match name {
+        "Q4_0" => 0.001143,
+        "Q2_K" => 0.004086,
+        "Q3_K" => 0.018000, // our Q3_K quantizer has higher error than llama.cpp
+        "Q4_K" => 0.002425,
+        "Q5_K" => 0.001401,
+        "Q6_K" => 0.000520,
+        "Q8_0" => 0.000092,
         _ => 0.01,
     }
 }
@@ -44,9 +43,8 @@ fn vec_dot_reference(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(a, b)| a * b).sum()
 }
 
-/// Helper: quantize test vector into blocks and compute dot product error.
+/// Helper: quantize K-quant test vector into blocks and compute dot product error.
 fn check_dot_error(
-    dtype: GgmlDType,
     name: &str,
     a: &[f32],
     b: &[f32],
@@ -56,37 +54,34 @@ fn check_dot_error(
     let k = a.len();
     assert_eq!(k % 256, 0);
 
-    let a_t = Tensor::from_vec(a.to_vec(), (k,), &Device::Cpu)?;
-    let qt_a = QTensor::quantize_onto(a_t.inner(), dtype, &Device::Cpu)?;
-    let raw = qt_a.data()?;
     let b_q8k = quantize_row_q8k(b);
 
-    let quant_dot = match dtype {
-        GgmlDType::Q2K => {
-            let blocks: Vec<BlockQ2K> = bytemuck::cast_slice(&raw).to_vec();
+    let quant_dot = match name {
+        "Q2_K" => {
+            let blocks = quantize_f32_q2k(a);
             q2_k::vec_dot_q2k_q8k(&blocks, &b_q8k)
         }
-        GgmlDType::Q3K => {
-            let blocks: Vec<BlockQ3K> = bytemuck::cast_slice(&raw).to_vec();
+        "Q3_K" => {
+            let blocks = quantize_f32_q3k(a);
             q3_k::vec_dot_q3k_q8k(&blocks, &b_q8k)
         }
-        GgmlDType::Q4K => {
-            let blocks: Vec<BlockQ4K> = bytemuck::cast_slice(&raw).to_vec();
+        "Q4_K" => {
+            let blocks = quantize_f32_q4k(a);
             vec_dot_q4k_q8k(&blocks, &b_q8k)
         }
-        GgmlDType::Q5K => {
-            let blocks: Vec<BlockQ5K> = bytemuck::cast_slice(&raw).to_vec();
+        "Q5_K" => {
+            let blocks = quantize_f32_q5k(a);
             q5_k::vec_dot_q5k_q8k(&blocks, &b_q8k)
         }
-        GgmlDType::Q6K => {
-            let blocks: Vec<BlockQ6K> = bytemuck::cast_slice(&raw).to_vec();
+        "Q6_K" => {
+            let blocks = quantize_f32_q6k(a);
             q6_k::vec_dot_q6k_q8k(&blocks, &b_q8k)
         }
-        _ => unreachable!(),
+        _ => unreachable!("unsupported K-quant: {name}"),
     };
 
     let error = (quant_dot - f32_dot).abs() / k as f32;
-    let ref_err = ggml_reference_error(dtype) * err_multiplier;
+    let ref_err = reference_error(name) * err_multiplier;
     let pass = error <= GGML_MAX_DOT_PRODUCT_ERROR && error <= ref_err * 1.1;
     println!(
         "  {name:>5}:  error={error:.6}  ref={ref_err:.6}  f32={f32_dot:.2}  quant={quant_dot:.2}  [{}]",
@@ -110,14 +105,12 @@ pub fn verify_dot_precision() -> Result<()> {
 
     // Q4_0 dot product
     {
-        let a_t = Tensor::from_vec(a.clone(), (GGML_TEST_SIZE,), &Device::Cpu)?;
-        let qt_a = QTensor::quantize_onto(a_t.inner(), GgmlDType::Q4_0, &Device::Cpu)?;
-        let a_blocks: Vec<BlockQ4_0> = bytemuck::cast_slice(&qt_a.data()?).to_vec();
+        let a_blocks = quantize_f32_q4_0(&a);
         let b_q8 = quantize_row_q8_0(&b);
 
         let quant_dot = vec_dot_q4_0_q8_0(&a_blocks, &b_q8);
         let error = (quant_dot - f32_dot).abs() / GGML_TEST_SIZE as f32;
-        let ref_err = ggml_reference_error(GgmlDType::Q4_0);
+        let ref_err = reference_error("Q4_0");
         let pass = error <= GGML_MAX_DOT_PRODUCT_ERROR && error <= ref_err * 1.1;
         println!(
             "  Q4_0:  error={error:.6}  ref={ref_err:.6}  f32={f32_dot:.2}  quant={quant_dot:.2}  [{}]",
@@ -126,14 +119,8 @@ pub fn verify_dot_precision() -> Result<()> {
     }
 
     // K-quant dot products
-    for &(dtype, name) in &[
-        (GgmlDType::Q2K, "Q2_K"),
-        (GgmlDType::Q3K, "Q3_K"),
-        (GgmlDType::Q4K, "Q4_K"),
-        (GgmlDType::Q5K, "Q5_K"),
-        (GgmlDType::Q6K, "Q6_K"),
-    ] {
-        check_dot_error(dtype, name, &a, &b, f32_dot, 1.0)?;
+    for name in &["Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K"] {
+        check_dot_error(name, &a, &b, f32_dot, 1.0)?;
     }
 
     // Second test vector (overflow-prone: linear ramp 0→1)
@@ -147,9 +134,7 @@ pub fn verify_dot_precision() -> Result<()> {
     let f32_dot2 = vec_dot_reference(&a2, &b2);
 
     {
-        let a_t = Tensor::from_vec(a2.clone(), (GGML_TEST_SIZE,), &Device::Cpu)?;
-        let qt_a = QTensor::quantize_onto(a_t.inner(), GgmlDType::Q4_0, &Device::Cpu)?;
-        let a_blocks: Vec<BlockQ4_0> = bytemuck::cast_slice(&qt_a.data()?).to_vec();
+        let a_blocks = quantize_f32_q4_0(&a2);
         let b_q8 = quantize_row_q8_0(&b2);
         let quant_dot = vec_dot_q4_0_q8_0(&a_blocks, &b_q8);
         let error = (quant_dot - f32_dot2).abs() / GGML_TEST_SIZE as f32;
@@ -160,14 +145,8 @@ pub fn verify_dot_precision() -> Result<()> {
         );
     }
 
-    for &(dtype, name) in &[
-        (GgmlDType::Q2K, "Q2_K"),
-        (GgmlDType::Q3K, "Q3_K"),
-        (GgmlDType::Q4K, "Q4_K"),
-        (GgmlDType::Q5K, "Q5_K"),
-        (GgmlDType::Q6K, "Q6_K"),
-    ] {
-        check_dot_error(dtype, &format!("{name} (overflow)"), &a2, &b2, f32_dot2, 2.0)?;
+    for name in &["Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K"] {
+        check_dot_error(&format!("{name} (overflow)"), &a2, &b2, f32_dot2, 2.0)?;
     }
 
     Ok(())
@@ -182,9 +161,7 @@ pub fn bench_dot(k: usize, warmup: usize, repeats: usize) -> Result<()> {
 
     // Q4_0
     let q4_0_us = {
-        let a_t = Tensor::from_vec(a_data.clone(), (k,), &Device::Cpu)?;
-        let qt = QTensor::quantize_onto(a_t.inner(), GgmlDType::Q4_0, &Device::Cpu)?;
-        let w_blocks: Vec<BlockQ4_0> = bytemuck::cast_slice(&qt.data()?).to_vec();
+        let w_blocks = quantize_f32_q4_0(&a_data);
         let x_q8 = quantize_row_q8_0(&b_data);
 
         for _ in 0..warmup {
@@ -202,44 +179,37 @@ pub fn bench_dot(k: usize, warmup: usize, repeats: usize) -> Result<()> {
 
     let mut results: Vec<(&str, f64)> = vec![("Q4_0", q4_0_us)];
 
-    for &(dtype, name) in &[
-        (GgmlDType::Q2K, "Q2_K"),
-        (GgmlDType::Q3K, "Q3_K"),
-        (GgmlDType::Q4K, "Q4_K"),
-        (GgmlDType::Q5K, "Q5_K"),
-        (GgmlDType::Q6K, "Q6_K"),
-    ] {
-        if k % 256 != 0 {
-            continue;
+    if k % 256 == 0 {
+        // Q2_K
+        {
+            let blocks = quantize_f32_q2k(&a_data);
+            let us = bench_kernel(warmup, repeats, || q2_k::vec_dot_q2k_q8k(&blocks, &b_q8k));
+            results.push(("Q2_K", us));
         }
-        let a_t = Tensor::from_vec(a_data.clone(), (k,), &Device::Cpu)?;
-        let qt = QTensor::quantize_onto(a_t.inner(), dtype, &Device::Cpu)?;
-        let raw = qt.data()?;
-
-        let us = match dtype {
-            GgmlDType::Q2K => {
-                let blocks: Vec<BlockQ2K> = bytemuck::cast_slice(&raw).to_vec();
-                bench_kernel(warmup, repeats, || q2_k::vec_dot_q2k_q8k(&blocks, &b_q8k))
-            }
-            GgmlDType::Q3K => {
-                let blocks: Vec<BlockQ3K> = bytemuck::cast_slice(&raw).to_vec();
-                bench_kernel(warmup, repeats, || q3_k::vec_dot_q3k_q8k(&blocks, &b_q8k))
-            }
-            GgmlDType::Q4K => {
-                let blocks: Vec<BlockQ4K> = bytemuck::cast_slice(&raw).to_vec();
-                bench_kernel(warmup, repeats, || vec_dot_q4k_q8k(&blocks, &b_q8k))
-            }
-            GgmlDType::Q5K => {
-                let blocks: Vec<BlockQ5K> = bytemuck::cast_slice(&raw).to_vec();
-                bench_kernel(warmup, repeats, || q5_k::vec_dot_q5k_q8k(&blocks, &b_q8k))
-            }
-            GgmlDType::Q6K => {
-                let blocks: Vec<BlockQ6K> = bytemuck::cast_slice(&raw).to_vec();
-                bench_kernel(warmup, repeats, || q6_k::vec_dot_q6k_q8k(&blocks, &b_q8k))
-            }
-            _ => unreachable!(),
-        };
-        results.push((name, us));
+        // Q3_K
+        {
+            let blocks = quantize_f32_q3k(&a_data);
+            let us = bench_kernel(warmup, repeats, || q3_k::vec_dot_q3k_q8k(&blocks, &b_q8k));
+            results.push(("Q3_K", us));
+        }
+        // Q4_K
+        {
+            let blocks = quantize_f32_q4k(&a_data);
+            let us = bench_kernel(warmup, repeats, || vec_dot_q4k_q8k(&blocks, &b_q8k));
+            results.push(("Q4_K", us));
+        }
+        // Q5_K
+        {
+            let blocks = quantize_f32_q5k(&a_data);
+            let us = bench_kernel(warmup, repeats, || q5_k::vec_dot_q5k_q8k(&blocks, &b_q8k));
+            results.push(("Q5_K", us));
+        }
+        // Q6_K
+        {
+            let blocks = quantize_f32_q6k(&a_data);
+            let us = bench_kernel(warmup, repeats, || q6_k::vec_dot_q6k_q8k(&blocks, &b_q8k));
+            results.push(("Q6_K", us));
+        }
     }
 
     print!("  K={k:>5}");
@@ -261,6 +231,19 @@ fn bench_kernel<F: Fn() -> f32>(warmup: usize, repeats: usize, f: F) -> f64 {
     t0.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0
 }
 
+/// Naive F32 matmul: y[m,n] = x[m,k] @ w[n,k]^T
+fn naive_matmul_f32(x: &[f32], w: &[f32], out: &mut [f32], m: usize, n: usize, k: usize) {
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum = 0.0f32;
+            for l in 0..k {
+                sum += x[i * k + l] * w[j * k + l];
+            }
+            out[i * n + j] = sum;
+        }
+    }
+}
+
 /// Benchmark matmul throughput: y[M,N] = x[M,K] @ W[N,K]^T
 pub fn bench_matmul(m: usize, k: usize, n: usize, warmup: usize, repeats: usize) -> Result<()> {
     let x_data: Vec<f32> = (0..m * k)
@@ -270,32 +253,35 @@ pub fn bench_matmul(m: usize, k: usize, n: usize, warmup: usize, repeats: usize)
         .map(|i| 0.1 + 2.0 * (i as f32 * 0.013).cos())
         .collect();
 
-    // F32 reference
+    // F32 reference (naive)
     let f32_us = {
-        let x_t = Tensor::from_vec(x_data.clone(), (m, k), &Device::Cpu)?;
-        let w_t = Tensor::from_vec(w_data.clone(), (n, k), &Device::Cpu)?.t()?;
+        let mut out = vec![0.0f32; m * n];
         for _ in 0..warmup {
-            std::hint::black_box(x_t.matmul(&w_t)?);
+            naive_matmul_f32(&x_data, &w_data, &mut out, m, n, k);
+            std::hint::black_box(&out);
         }
         let t0 = Instant::now();
         for _ in 0..repeats {
-            std::hint::black_box(x_t.matmul(&w_t)?);
+            naive_matmul_f32(&x_data, &w_data, &mut out, m, n, k);
+            std::hint::black_box(&out);
         }
         t0.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0
     };
 
     // Q4_0
     let q4_0_us = {
-        let w_tensor = Tensor::from_vec(w_data.clone(), (n, k), &Device::Cpu)?;
-        let qt = QTensor::quantize_onto(w_tensor.inner(), GgmlDType::Q4_0, &Device::Cpu)?;
-        let blocks: Vec<BlockQ4_0> = bytemuck::cast_slice(&qt.data()?).to_vec();
+        let mut all_blocks = Vec::new();
+        for j in 0..n {
+            let row = &w_data[j * k..(j + 1) * k];
+            all_blocks.extend(quantize_f32_q4_0(row));
+        }
         let mut out = vec![0.0f32; m * n];
         for _ in 0..warmup {
-            quantized_matmul_f32(&x_data, &blocks, &mut out, m, n, k);
+            quantized_matmul_f32(&x_data, &all_blocks, &mut out, m, n, k);
         }
         let t0 = Instant::now();
         for _ in 0..repeats {
-            quantized_matmul_f32(&x_data, &blocks, &mut out, m, n, k);
+            quantized_matmul_f32(&x_data, &all_blocks, &mut out, m, n, k);
         }
         t0.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0
     };
@@ -304,15 +290,30 @@ pub fn bench_matmul(m: usize, k: usize, n: usize, warmup: usize, repeats: usize)
     let mut kquant_results: Vec<(&str, f64)> = Vec::new();
 
     if k % 256 == 0 {
-        for &(dtype, name, matmul_fn) in &[
-            (GgmlDType::Q2K, "Q2_K", bench_matmul_kquant::<BlockQ2K> as fn(&[f32], &[f32], usize, usize, usize, usize, usize, GgmlDType) -> Result<f64>),
-            (GgmlDType::Q3K, "Q3_K", bench_matmul_kquant::<BlockQ3K> as fn(&[f32], &[f32], usize, usize, usize, usize, usize, GgmlDType) -> Result<f64>),
-            (GgmlDType::Q4K, "Q4_K", bench_matmul_kquant::<BlockQ4K> as fn(&[f32], &[f32], usize, usize, usize, usize, usize, GgmlDType) -> Result<f64>),
-            (GgmlDType::Q5K, "Q5_K", bench_matmul_kquant::<BlockQ5K> as fn(&[f32], &[f32], usize, usize, usize, usize, usize, GgmlDType) -> Result<f64>),
-            (GgmlDType::Q6K, "Q6_K", bench_matmul_kquant::<BlockQ6K> as fn(&[f32], &[f32], usize, usize, usize, usize, usize, GgmlDType) -> Result<f64>),
-        ] {
-            let us = matmul_fn(&x_data, &w_data, m, n, k, warmup, repeats, dtype)?;
-            kquant_results.push((name, us));
+        // Q2_K
+        {
+            let us = bench_matmul_kquant_q2k(&x_data, &w_data, m, n, k, warmup, repeats);
+            kquant_results.push(("Q2_K", us));
+        }
+        // Q3_K
+        {
+            let us = bench_matmul_kquant_q3k(&x_data, &w_data, m, n, k, warmup, repeats);
+            kquant_results.push(("Q3_K", us));
+        }
+        // Q4_K
+        {
+            let us = bench_matmul_kquant_q4k(&x_data, &w_data, m, n, k, warmup, repeats);
+            kquant_results.push(("Q4_K", us));
+        }
+        // Q5_K
+        {
+            let us = bench_matmul_kquant_q5k(&x_data, &w_data, m, n, k, warmup, repeats);
+            kquant_results.push(("Q5_K", us));
+        }
+        // Q6_K
+        {
+            let us = bench_matmul_kquant_q6k(&x_data, &w_data, m, n, k, warmup, repeats);
+            kquant_results.push(("Q6_K", us));
         }
     }
 
@@ -332,83 +333,114 @@ pub fn bench_matmul(m: usize, k: usize, n: usize, warmup: usize, repeats: usize)
     Ok(())
 }
 
-/// Generic K-quant matmul benchmark helper.
-fn bench_matmul_kquant<B: bytemuck::Pod>(
-    x_data: &[f32],
-    w_data: &[f32],
-    m: usize,
-    n: usize,
-    k: usize,
-    warmup: usize,
-    repeats: usize,
-    dtype: GgmlDType,
-) -> Result<f64> {
-    let mut w_blocks: Vec<B> = Vec::new();
+/// K-quant matmul benchmark helpers — one per dtype to avoid generics + GgmlDType.
+
+fn bench_matmul_kquant_q2k(
+    x_data: &[f32], w_data: &[f32], m: usize, n: usize, k: usize,
+    warmup: usize, repeats: usize,
+) -> f64 {
+    let mut w_blocks = Vec::new();
     for j in 0..n {
         let row = &w_data[j * k..(j + 1) * k];
-        let t = Tensor::from_vec(row.to_vec(), (k,), &Device::Cpu)?;
-        let qt = QTensor::quantize_onto(t.inner(), dtype, &Device::Cpu)?;
-        let blocks: Vec<B> = bytemuck::cast_slice(&qt.data()?).to_vec();
-        w_blocks.extend(blocks);
+        w_blocks.extend(quantize_f32_q2k(row));
     }
     let mut out = vec![0.0f32; m * n];
-
-    // Use trait objects to dispatch the matmul
-    let matmul_fn: Box<dyn Fn()> = match dtype {
-        GgmlDType::Q2K => {
-            let w: Vec<BlockQ2K> = bytemuck::cast_slice(bytemuck::cast_slice::<B, u8>(&w_blocks)).to_vec();
-            let x = x_data.to_vec();
-            Box::new(move || {
-                let mut out = vec![0.0f32; m * n];
-                q2_k::quantized_matmul_q2k(&x, &w, &mut out, m, n, k);
-                std::hint::black_box(&out);
-            })
-        }
-        GgmlDType::Q3K => {
-            let w: Vec<BlockQ3K> = bytemuck::cast_slice(bytemuck::cast_slice::<B, u8>(&w_blocks)).to_vec();
-            let x = x_data.to_vec();
-            Box::new(move || {
-                let mut out = vec![0.0f32; m * n];
-                q3_k::quantized_matmul_q3k(&x, &w, &mut out, m, n, k);
-                std::hint::black_box(&out);
-            })
-        }
-        GgmlDType::Q4K => {
-            let w: Vec<BlockQ4K> = bytemuck::cast_slice(bytemuck::cast_slice::<B, u8>(&w_blocks)).to_vec();
-            let x = x_data.to_vec();
-            Box::new(move || {
-                let mut out = vec![0.0f32; m * n];
-                q4_k::quantized_matmul_q4k(&x, &w, &mut out, m, n, k);
-                std::hint::black_box(&out);
-            })
-        }
-        GgmlDType::Q5K => {
-            let w: Vec<BlockQ5K> = bytemuck::cast_slice(bytemuck::cast_slice::<B, u8>(&w_blocks)).to_vec();
-            let x = x_data.to_vec();
-            Box::new(move || {
-                let mut out = vec![0.0f32; m * n];
-                q5_k::quantized_matmul_q5k(&x, &w, &mut out, m, n, k);
-                std::hint::black_box(&out);
-            })
-        }
-        GgmlDType::Q6K => {
-            let w: Vec<BlockQ6K> = bytemuck::cast_slice(bytemuck::cast_slice::<B, u8>(&w_blocks)).to_vec();
-            let x = x_data.to_vec();
-            Box::new(move || {
-                let mut out = vec![0.0f32; m * n];
-                q6_k::quantized_matmul_q6k(&x, &w, &mut out, m, n, k);
-                std::hint::black_box(&out);
-            })
-        }
-        _ => unreachable!(),
-    };
-
     for _ in 0..warmup {
-        matmul_fn();
+        q2_k::quantized_matmul_q2k(x_data, &w_blocks, &mut out, m, n, k);
+        std::hint::black_box(&out);
     }
     let t0 = Instant::now();
     for _ in 0..repeats {
-        matmul_fn();
+        q2_k::quantized_matmul_q2k(x_data, &w_blocks, &mut out, m, n, k);
+        std::hint::black_box(&out);
     }
-    Ok(t0.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0)
+    t0.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0
+}
+
+fn bench_matmul_kquant_q3k(
+    x_data: &[f32], w_data: &[f32], m: usize, n: usize, k: usize,
+    warmup: usize, repeats: usize,
+) -> f64 {
+    let mut w_blocks = Vec::new();
+    for j in 0..n {
+        let row = &w_data[j * k..(j + 1) * k];
+        w_blocks.extend(quantize_f32_q3k(row));
+    }
+    let mut out = vec![0.0f32; m * n];
+    for _ in 0..warmup {
+        q3_k::quantized_matmul_q3k(x_data, &w_blocks, &mut out, m, n, k);
+        std::hint::black_box(&out);
+    }
+    let t0 = Instant::now();
+    for _ in 0..repeats {
+        q3_k::quantized_matmul_q3k(x_data, &w_blocks, &mut out, m, n, k);
+        std::hint::black_box(&out);
+    }
+    t0.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0
+}
+
+fn bench_matmul_kquant_q4k(
+    x_data: &[f32], w_data: &[f32], m: usize, n: usize, k: usize,
+    warmup: usize, repeats: usize,
+) -> f64 {
+    let mut w_blocks = Vec::new();
+    for j in 0..n {
+        let row = &w_data[j * k..(j + 1) * k];
+        w_blocks.extend(quantize_f32_q4k(row));
+    }
+    let mut out = vec![0.0f32; m * n];
+    for _ in 0..warmup {
+        q4_k::quantized_matmul_q4k(x_data, &w_blocks, &mut out, m, n, k);
+        std::hint::black_box(&out);
+    }
+    let t0 = Instant::now();
+    for _ in 0..repeats {
+        q4_k::quantized_matmul_q4k(x_data, &w_blocks, &mut out, m, n, k);
+        std::hint::black_box(&out);
+    }
+    t0.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0
+}
+
+fn bench_matmul_kquant_q5k(
+    x_data: &[f32], w_data: &[f32], m: usize, n: usize, k: usize,
+    warmup: usize, repeats: usize,
+) -> f64 {
+    let mut w_blocks = Vec::new();
+    for j in 0..n {
+        let row = &w_data[j * k..(j + 1) * k];
+        w_blocks.extend(quantize_f32_q5k(row));
+    }
+    let mut out = vec![0.0f32; m * n];
+    for _ in 0..warmup {
+        q5_k::quantized_matmul_q5k(x_data, &w_blocks, &mut out, m, n, k);
+        std::hint::black_box(&out);
+    }
+    let t0 = Instant::now();
+    for _ in 0..repeats {
+        q5_k::quantized_matmul_q5k(x_data, &w_blocks, &mut out, m, n, k);
+        std::hint::black_box(&out);
+    }
+    t0.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0
+}
+
+fn bench_matmul_kquant_q6k(
+    x_data: &[f32], w_data: &[f32], m: usize, n: usize, k: usize,
+    warmup: usize, repeats: usize,
+) -> f64 {
+    let mut w_blocks = Vec::new();
+    for j in 0..n {
+        let row = &w_data[j * k..(j + 1) * k];
+        w_blocks.extend(quantize_f32_q6k(row));
+    }
+    let mut out = vec![0.0f32; m * n];
+    for _ in 0..warmup {
+        q6_k::quantized_matmul_q6k(x_data, &w_blocks, &mut out, m, n, k);
+        std::hint::black_box(&out);
+    }
+    let t0 = Instant::now();
+    for _ in 0..repeats {
+        q6_k::quantized_matmul_q6k(x_data, &w_blocks, &mut out, m, n, k);
+        std::hint::black_box(&out);
+    }
+    t0.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0
 }

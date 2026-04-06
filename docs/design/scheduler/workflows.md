@@ -28,10 +28,10 @@ A request arrives, gets prefilled, decoded, and returned.
    │ b. Executor::execute(&batch)                 │  # engine/executor/mod.rs
    │    ├─ build tensors (input_ids, cu_seqlens,     │
    │    │   block_tables, slot_mapping)              │
-   │    ├─ ops.session.begin_forward()               │  # (ops dispatch layer)
-   │    ├─ ops.session.precompute_paged_plan()       │
+   │    ├─ ops.begin_forward()               │  # (ops dispatch layer)
+   │    ├─ ops.precompute_paged_plan()       │
    │    ├─ model.forward()                           │
-   │    ├─ ops.session.end_forward()                 │
+   │    ├─ ops.end_forward()                 │
    │    └─ sample() → StepResult                     │  # scheduler/types.rs
    │                                                 │
    │ c. ArScheduler::update(&result)                 │  # scheduler/ar.rs

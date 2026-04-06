@@ -48,7 +48,6 @@ crates/
   prelude-ggml-quants/   llama.cpp FFI for GGUF inference
   prelude-deepgemm/      DeepGEMM BF16 GEMM (SM90+)
   onednn-ffi/            oneDNN FFI for CPU BF16 GEMM
-  candle-core/           Patched candle tensor library
 benchmark/               Benchmark suite (bench.sh + bench_utils.py)
 tests/                   Accuracy and integration tests
 docs/                    This documentation

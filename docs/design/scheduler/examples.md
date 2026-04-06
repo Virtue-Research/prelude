@@ -366,21 +366,21 @@ Per-layer execution for one batch (e.g., 64 decode tokens):
        a) residual_norm → QKV projection → RoPE → paged_attention → O projection
           (all on A0/A1, standard TP all-reduce between A0/A1)
        b) residual_norm
-       c) modules::moe_layer(&h, &gate, &weights, &afd_config, ops):
+       c) models::commons::moe_layer(&h, &gate, &weights, &afd_config, ops):
           → gate.route(h): compute top-2 expert IDs per token (on A0/A1)
-          → ops.comm.send(h, topk_ids, topk_weights → FFN pool)
-          → ops.comm.recv(result ← FFN pool)
+          → ops.send(h, topk_ids, topk_weights → FFN pool)
+          → ops.recv(result ← FFN pool)
           → return result
        d) residual add
 
 2. FFN side (F0-F3), running in parallel:
    run_ffn_follower() waits for AfdSignal::Forward
      for each layer:
-       a) ops.comm.recv(h, topk_ids, topk_weights ← attention pool)
+       a) ops.recv(h, topk_ids, topk_weights ← attention pool)
        b) Dispatch tokens to expert-owning ranks (all-to-all among F0-F3)
-       c) ops.gemm.grouped_gemm on local 32 experts
+       c) ops.grouped_gemm on local 32 experts
        d) Combine results (all-to-all among F0-F3)
-       e) ops.comm.send(result → attention pool)
+       e) ops.send(result → attention pool)
 
 3. After all 36 layers:
    Attention side: lm_head → sample → StepResult
@@ -418,10 +418,10 @@ With 2 micro-batches (layer L):
 
 Key points:
 - **ArScheduler is identical to non-AFD.** It produces the same `ScheduledBatch` for 64 decode tokens.
-  The AFD communication happens inside `modules::moe_layer` during `model.forward()`.
+  The AFD communication happens inside `models::commons::moe_layer` during `model.forward()`.
 - **FFN follower is not an ArScheduler.** It's `run_ffn_follower()` — a passive loop that
   waits for `AfdSignal::Forward` and runs FFN layers. No request management, no block allocation.
-- **Model code is unchanged.** The Qwen3-MoE model calls `modules::moe_layer(...)` exactly
+- **Model code is unchanged.** The Qwen3-MoE model calls `models::commons::moe_layer(...)` exactly
   as in non-AFD mode. The `MoeMode::Disaggregated` config is set at load time.
 - **Heterogeneous hardware.** Attention GPUs need large memory (KV cache). FFN GPUs need
   compute (expert matmuls). This enables cost-efficient deployments with mixed GPU types.

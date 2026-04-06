@@ -388,7 +388,7 @@ impl Engine {
             ).map_err(|e| EngineError::Internal(e.to_string()))?;
             let seq_lens_vec = vec![seq_len];
 
-            let mut ctx = crate::modules::BatchAttnContext {
+            let mut ctx = crate::models::commons::BatchAttnContext {
                 ops: crate::ops::select_ops(device),
                 cu_seqlens_q: &cu_seqlens,
                 max_seqlen_q: seq_len,
@@ -575,8 +575,8 @@ impl Engine {
     ) -> Result<TokenLogprobInfo, EngineError> {
         let logits_f32 = logits
             .to_dtype(crate::tensor::DType::F32)
-            .map_err(candle_err)?;
-        let logits_vec: Vec<f32> = logits_f32.to_vec1().map_err(candle_err)?;
+            .map_err(tensor_err)?;
+        let logits_vec: Vec<f32> = logits_f32.to_vec1().map_err(tensor_err)?;
         let vocab_size = logits_vec.len();
         let max_logit = logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let sum_exp: f32 = logits_vec.iter().map(|&x| (x - max_logit).exp()).sum();
@@ -705,12 +705,12 @@ pub(crate) fn generate_postprocess(
     let logits = forward_result.output;
     let fwd_seq_lens = forward_result.seq_lens;
     let argmax_start = Instant::now();
-    let logits_2d = logits.squeeze(1).map_err(candle_err)?;
+    let logits_2d = logits.squeeze(1).map_err(tensor_err)?;
     let all_tokens = logits_2d
         .argmax(crate::tensor::D::Minus1)
-        .map_err(candle_err)?
+        .map_err(tensor_err)?
         .to_vec1::<u32>()
-        .map_err(candle_err)?;
+        .map_err(tensor_err)?;
     let argmax_ms = argmax_start.elapsed().as_secs_f32() * 1000.0;
 
     // Build prompt logprobs per item from pre-extracted CPU data.
@@ -754,7 +754,7 @@ pub(crate) fn generate_postprocess(
             FinishReason::Length
         };
         let token_logprobs = if let Some(k) = item.request.logprobs {
-            let row = logits_2d.get(i).map_err(candle_err)?;
+            let row = logits_2d.get(i).map_err(tensor_err)?;
             Some(vec![Engine::extract_top_logprobs(
                 &row,
                 token,
@@ -831,7 +831,7 @@ pub(crate) fn extract_prompt_logprobs_from_hidden_offset(
     seq_lens: &[usize],
     token_offset: usize,
 ) -> Result<Vec<f32>, EngineError> {
-    let total_tokens = hidden_states.dim(0).map_err(candle_err)?;
+    let total_tokens = hidden_states.dim(0).map_err(tensor_err)?;
     let device = hidden_states.device().clone();
 
     // Build flat token_ids: for each position, the next token being predicted.
@@ -855,23 +855,23 @@ pub(crate) fn extract_prompt_logprobs_from_hidden_offset(
         let end = (start + PROMPT_LOGPROBS_CHUNK_SIZE).min(total_tokens);
         let chunk_len = end - start;
 
-        let chunk_hidden = hidden_states.narrow(0, start, chunk_len).map_err(candle_err)?;
-        let chunk_logits = model.compute_logits(&chunk_hidden).map_err(candle_err)?;
-        let chunk_log_probs = crate::ops::current_ops().act.log_softmax(&chunk_logits, 1).map_err(candle_err)?;
+        let chunk_hidden = hidden_states.narrow(0, start, chunk_len).map_err(tensor_err)?;
+        let chunk_logits = model.compute_logits(&chunk_hidden).map_err(tensor_err)?;
+        let chunk_log_probs = crate::ops::ops_for(chunk_logits.device()).log_softmax(&chunk_logits, 1).map_err(tensor_err)?;
         drop(chunk_logits); // free (chunk, vocab_size) before gather allocates
 
         let chunk_token_ids = Tensor::from_vec(
             flat_next_tokens[start..end].to_vec(), (chunk_len, 1), &device,
         )
-        .map_err(candle_err)?
+        .map_err(tensor_err)?
         .to_dtype(crate::tensor::DType::U32)
-        .map_err(candle_err)?;
+        .map_err(tensor_err)?;
 
         let chunk_gathered = chunk_log_probs
-            .gather(&chunk_token_ids, 1).map_err(candle_err)?
-            .squeeze(1).map_err(candle_err)?
-            .to_dtype(crate::tensor::DType::F32).map_err(candle_err)?;
-        logprobs_cpu.extend(chunk_gathered.to_vec1::<f32>().map_err(candle_err)?);
+            .gather(&chunk_token_ids, 1).map_err(tensor_err)?
+            .squeeze(1).map_err(tensor_err)?
+            .to_dtype(crate::tensor::DType::F32).map_err(tensor_err)?;
+        logprobs_cpu.extend(chunk_gathered.to_vec1::<f32>().map_err(tensor_err)?);
         // chunk_log_probs freed here
     }
 

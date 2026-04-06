@@ -106,28 +106,25 @@ const MOD_MY_KERNEL: &str = "my_kernel_module";
 Create `ops/my_kernel.rs` (inside `prelude-cuda/src/`):
 
 ```rust
-use candle_core::{CudaDevice, CudaStorage, Result, Tensor};
+use prelude_core::tensor::{bail, Result, Tensor, Device};
+use crate::device::{CudaStorage, as_cuda_slice_bf16, load_ptx, get_func, cuda_stream};
 use super::{PTX_MY_KERNEL, MOD_MY_KERNEL};
 
 pub fn my_operation(input: &Tensor) -> Result<Tensor> {
     let device = input.device();
-    let cuda_dev = match device {
-        candle_core::Device::Cuda(dev) => dev,
-        _ => candle_core::bail!("my_operation requires CUDA"),
+    let ordinal = match device {
+        Device::Cuda(ord) => *ord,
+        _ => bail!("my_operation requires CUDA"),
     };
 
-    let (storage, layout) = input.storage_and_layout();
-    let input_slice = match &*storage {
-        candle_core::Storage::Cuda(s) => s.as_cuda_slice::<half::bf16>()?,
-        _ => candle_core::bail!("expected CUDA storage"),
-    };
+    let input_slice = as_cuda_slice_bf16(input)?;
+    let n = input.elem_count();
+    let stream = cuda_stream(ordinal)?;
+    let output = unsafe { stream.ctx().alloc::<half::bf16>(n) }?;
 
-    let n = layout.shape().elem_count();
-    let output = unsafe { cuda_dev.alloc::<half::bf16>(n) }?;
-
-    // Load module (cached by cudarc)
-    cuda_dev.load_ptx(PTX_MY_KERNEL.into(), MOD_MY_KERNEL, &["my_kernel_bf16"])?;
-    let func = cuda_dev.get_func(MOD_MY_KERNEL, "my_kernel_bf16").unwrap();
+    // Load module (cached by device.rs registry)
+    load_ptx(ordinal, PTX_MY_KERNEL, MOD_MY_KERNEL, &["my_kernel_bf16"])?;
+    let func = get_func(ordinal, MOD_MY_KERNEL, "my_kernel_bf16")?;
 
     let block_size = 256u32;
     let grid_size = (n as u32 + block_size - 1) / block_size;
@@ -144,8 +141,8 @@ pub fn my_operation(input: &Tensor) -> Result<Tensor> {
     }
 
     // Wrap output into a Tensor
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(output, cuda_dev.clone());
-    Ok(Tensor::from_storage(storage.into(), layout.shape(), device))
+    let storage = CudaStorage::wrap_cuda_slice(output, ordinal);
+    Ok(Tensor::from_storage(storage.into(), input.shape(), device))
 }
 ```
 

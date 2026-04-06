@@ -158,6 +158,11 @@ mod avx2 {
 /// Compute Q4_0 · Q8_0 dot product, automatically selecting the best kernel.
 #[inline]
 pub fn vec_dot_q4_0_q8_0(x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { super::neon::q4_0::vec_dot_q4_0_q8_0_neon(x, y) };
+    }
+
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -167,6 +172,11 @@ pub fn vec_dot_q4_0_q8_0(x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
             return unsafe { avx2::vec_dot_q4_0_q8_0_avx2(x, y) };
         }
     }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    { /* fall through to scalar below */ }
+
+    #[allow(unreachable_code)]
     vec_dot_q4_0_q8_0_scalar(x, y)
 }
 
