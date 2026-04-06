@@ -684,13 +684,10 @@ impl Gemma4DecoderLayer {
             &self.post_feedforward_layernorm_2,
         ) {
             let mlp_normed = pf_ln1.forward(&hidden)?;
-
-            // Router sees residual (pre-MLP state)
             let router_logits = router.forward(ops, residual)?;
             let moe_input = pf_ln2_pre.forward(residual)?;
             let moe_out = moe.forward(ops, &moe_input, &router_logits)?;
             let moe_normed = pf_ln2.forward(&moe_out)?;
-
             ops.add_or_fused(&mlp_normed, &moe_normed)?
         } else {
             hidden
@@ -705,6 +702,16 @@ impl Gemma4DecoderLayer {
             &self.per_layer_input_gate, &self.per_layer_projection, &self.post_per_layer_input_norm,
         ) {
             if let Some(ple_input) = per_layer_input {
+                // Debug layer 15+ divergence
+                if std::env::var("GEMMA4_DEBUG_PLE").is_ok() {
+                    let lsv: f32 = self.layer_scalar.to_dtype(DType::F32).unwrap().to_vec1::<f32>().unwrap()[0];
+                    let xm: f32 = {
+                        let t = xs.narrow(0, xs.dim(0).unwrap()-1, 1).unwrap().to_dtype(DType::F32).unwrap().squeeze(0).unwrap();
+                        let v: Vec<f32> = t.to_vec1().unwrap();
+                        v.iter().sum::<f32>() / v.len() as f32
+                    };
+                    eprintln!("PLE[ls={lsv:.4}] pre_ple_mean={xm:.6}");
+                }
                 let gate = gate_linear.forward(&xs, &BatchState::no_lora(), ops)?;
                 let gate = gate.gelu()?;
                 let gated = (gate * ple_input)?;

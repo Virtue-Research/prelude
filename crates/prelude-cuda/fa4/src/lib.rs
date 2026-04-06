@@ -93,6 +93,7 @@ pub unsafe fn fa4_varlen_fwd(
     cu_seqlens_k_ptr: *mut c_void,
     q_shape: &[i64],
     k_shape: &[i64],
+    v_shape: &[i64],
     o_shape: &[i64],
     lse_shape: &[i64],
     cu_seqlens_shape: &[i64],
@@ -113,8 +114,8 @@ pub unsafe fn fa4_varlen_fwd(
     let k_strides = contiguous_strides(k_shape);
     let dl_k = make_dltensor(k_ptr, device, half_dt, k_shape, &k_strides);
 
-    let v_strides = contiguous_strides(k_shape);
-    let dl_v = make_dltensor(v_ptr, device, half_dt, k_shape, &v_strides);
+    let v_strides = contiguous_strides(v_shape);
+    let dl_v = make_dltensor(v_ptr, device, half_dt, v_shape, &v_strides);
 
     let o_strides = contiguous_strides(o_shape);
     let dl_o = make_dltensor(o_ptr, device, half_dt, o_shape, &o_strides);
@@ -197,6 +198,7 @@ pub unsafe fn fa4_varlen_paged_fwd(
     page_table_ptr: *mut c_void,
     q_shape: &[i64],
     k_shape: &[i64],
+    v_shape: &[i64],
     o_shape: &[i64],
     lse_shape: &[i64],
     cu_seqlens_q_shape: &[i64],
@@ -217,8 +219,8 @@ pub unsafe fn fa4_varlen_paged_fwd(
     let k_strides = contiguous_strides(k_shape);
     let dl_k = make_dltensor(k_ptr, device, half_dt, k_shape, &k_strides);
 
-    let v_strides = contiguous_strides(k_shape);
-    let dl_v = make_dltensor(v_ptr, device, half_dt, k_shape, &v_strides);
+    let v_strides = contiguous_strides(v_shape);
+    let dl_v = make_dltensor(v_ptr, device, half_dt, v_shape, &v_strides);
 
     let o_strides = contiguous_strides(o_shape);
     let dl_o = make_dltensor(o_ptr, device, half_dt, o_shape, &o_strides);

@@ -5,9 +5,8 @@
 //!
 //! Supports both non-paged varlen (prefill) and paged KV (prefill + decode).
 
-use candle_core::backend::BackendStorage;
-use candle_core::cuda_backend::cudarc::driver::DevicePtr;
-use candle_core::{DType, Result, Tensor};
+use crate::device::{self as cb, DevicePtr};
+use prelude_core::tensor::{bail, DType, Result, Tensor};
 use half::bf16;
 use prelude_flash_attn_v4::{KernelDtype, KernelKey, KernelRegistry};
 use std::ffi::c_void;
@@ -28,60 +27,46 @@ fn get_registry() -> &'static KernelRegistry {
 }
 
 // ── Non-paged varlen attention ─────────────────────────────────────────
+// All return Option<Result<Tensor>>: None = FA4 has no kernel for this combo.
 
 #[allow(clippy::too_many_arguments)]
-pub fn varlen_causal(
+pub fn try_varlen_causal(
     q: &Tensor, k: &Tensor, v: &Tensor,
     cu_seqlens_q: &Tensor, cu_seqlens_k: &Tensor,
     max_seqlen_q: usize, max_seqlen_k: usize,
     softmax_scale: f32,
-) -> Result<Tensor> {
-    call_fa4(q, k, v, cu_seqlens_q, cu_seqlens_k,
+) -> Option<Result<Tensor>> {
+    try_call_fa4(q, k, v, cu_seqlens_q, cu_seqlens_k,
              max_seqlen_q, max_seqlen_k, softmax_scale,
              true, None, None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn varlen_bidirectional(
+pub fn try_varlen_bidirectional(
     q: &Tensor, k: &Tensor, v: &Tensor,
     cu_seqlens_q: &Tensor, cu_seqlens_k: &Tensor,
     max_seqlen_q: usize, max_seqlen_k: usize,
     softmax_scale: f32,
-) -> Result<Tensor> {
-    call_fa4(q, k, v, cu_seqlens_q, cu_seqlens_k,
+) -> Option<Result<Tensor>> {
+    try_call_fa4(q, k, v, cu_seqlens_q, cu_seqlens_k,
              max_seqlen_q, max_seqlen_k, softmax_scale,
              false, None, None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn varlen_windowed(
+pub fn try_varlen_windowed(
     q: &Tensor, k: &Tensor, v: &Tensor,
     cu_seqlens_q: &Tensor, cu_seqlens_k: &Tensor,
     max_seqlen_q: usize, max_seqlen_k: usize,
     softmax_scale: f32,
     window_left: Option<usize>, window_right: Option<usize>,
-) -> Result<Tensor> {
-    call_fa4(q, k, v, cu_seqlens_q, cu_seqlens_k,
+) -> Option<Result<Tensor>> {
+    try_call_fa4(q, k, v, cu_seqlens_q, cu_seqlens_k,
              max_seqlen_q, max_seqlen_k, softmax_scale,
-             // causal = window_right == Some(0)
              window_right == Some(0),
              window_left.map(|v| v as i32),
              window_right.map(|v| v as i32),
              None)
-}
-
-/// Varlen causal attention with softcap (Gemma models).
-#[allow(clippy::too_many_arguments)]
-pub fn varlen_causal_softcap(
-    q: &Tensor, k: &Tensor, v: &Tensor,
-    cu_seqlens_q: &Tensor, cu_seqlens_k: &Tensor,
-    max_seqlen_q: usize, max_seqlen_k: usize,
-    softmax_scale: f32,
-    softcap: f32,
-) -> Result<Tensor> {
-    call_fa4(q, k, v, cu_seqlens_q, cu_seqlens_k,
-             max_seqlen_q, max_seqlen_k, softmax_scale,
-             true, None, None, Some(softcap))
 }
 
 // ── Paged varlen attention ─────────────────────────────────────────────
@@ -90,10 +75,10 @@ pub fn varlen_causal_softcap(
 ///
 /// Used for both prefill (variable Q lengths) and decode (Q=1 per seq).
 /// key_cache/value_cache shape: `[num_blocks, block_size, num_kv_heads, head_dim]`.
-/// block_tables shape: `[batch_size, max_blocks_per_seq]`, I32.
-/// seqused_k: per-sequence K lengths `[batch_size]`, I32.
+/// block_tables shape: `[batch_size, max_blocks_per_seq]`, U32.
+/// seqused_k: per-sequence K lengths `[batch_size]`, U32.
 #[allow(clippy::too_many_arguments)]
-pub fn varlen_paged(
+pub fn try_varlen_paged(
     q: &Tensor,
     key_cache: &Tensor, value_cache: &Tensor,
     block_tables: &Tensor,
@@ -101,21 +86,24 @@ pub fn varlen_paged(
     seqused_k: &Tensor,
     max_seqlen_q: usize, _max_seqlen_k: usize,
     softmax_scale: f32,
-) -> Result<Tensor> {
+) -> Option<Result<Tensor>> {
     if q.dtype() != DType::BF16 {
-        candle_core::bail!("FA4 only supports BF16 (got {:?})", q.dtype());
+        return None; // FA4 only supports BF16
     }
 
     let registry = get_registry();
 
-    // Q: [total_q, num_heads_q, head_dim]
-    let (total_q, num_heads_q, head_dim) = q.shape().dims3()?;
-    // key_cache: [num_blocks, block_size, num_kv_heads, head_dim]
-    let (_num_blocks, block_size, num_heads_k, _head_dim_k) = key_cache.shape().dims4()?;
+    let (total_q, num_heads_q, head_dim) = match q.shape().dims3() {
+        Ok(d) => d, Err(e) => return Some(Err(e)),
+    };
+    let (_num_blocks, block_size, num_heads_k, _head_dim_k) = match key_cache.shape().dims4() {
+        Ok(d) => d, Err(e) => return Some(Err(e)),
+    };
     let gqa_ratio = num_heads_q / num_heads_k;
 
-    // TMA requires page_size == tile_n. Determine tile_n via shared helper.
-    let head_dim_v = key_cache.dim(3)?;
+    let head_dim_v = match key_cache.dim(3) {
+        Ok(d) => d, Err(e) => return Some(Err(e)),
+    };
     let tile_n = super::fa4_tile_n(head_dim, head_dim_v);
     let non_tma = block_size != tile_n;
 
@@ -123,31 +111,39 @@ pub fn varlen_paged(
         .with_paged(true)
         .with_paged_non_tma(non_tma);
 
-    let func = registry.get(&key).ok_or_else(|| {
-        candle_core::Error::Msg(format!(
-            "FA4 paged kernel variant not found: hdim={head_dim} gqa={gqa_ratio} \
-             paged=true non_tma={non_tma} block_size={block_size}"
-        ))
-    })?;
+    let func = registry.get(&key)?; // None = no kernel for this combo
 
-    let dev = match q.device() {
-        candle_core::Device::Cuda(d) => d,
-        _ => candle_core::bail!("FA4 requires CUDA device"),
-    };
+    // FA4 is committed — errors from here are real errors, not "not available".
+    Some(varlen_paged_inner(
+        registry, func, q, key_cache, value_cache, block_tables,
+        cu_seqlens_q, seqused_k, softmax_scale,
+        total_q, num_heads_q, head_dim, num_heads_k,
+    ))
+}
+
+/// Inner paged FA4 call — always returns Result (no more Option branching).
+#[allow(clippy::too_many_arguments)]
+fn varlen_paged_inner(
+    registry: &KernelRegistry, func: prelude_flash_attn_v4::TVMSafeCallFn,
+    q: &Tensor,
+    key_cache: &Tensor, value_cache: &Tensor,
+    block_tables: &Tensor,
+    cu_seqlens_q: &Tensor,
+    seqused_k: &Tensor,
+    softmax_scale: f32,
+    total_q: usize, num_heads_q: usize, head_dim: usize, num_heads_k: usize,
+) -> Result<Tensor> {
+    let stream = cb::tensor_stream(q)?;
     let out = Tensor::zeros(q.shape(), DType::BF16, q.device())?;
-    let stream = dev.cuda_stream();
 
     {
         let raw_stream = unsafe { stream.cu_stream() as *mut c_void };
 
         macro_rules! cuda_ptr {
             ($t:expr, $ty:ty) => {{
-                let (storage, layout) = $t.storage_and_layout();
-                let cuda = match &*storage {
-                    candle_core::Storage::Cuda(c) => c,
-                    _ => candle_core::bail!("tensor not on CUDA"),
-                };
-                let slice = cuda.as_cuda_slice::<$ty>()?.slice(layout.start_offset()..);
+                let (storage, layout) = cb::storage_and_layout(&$t);
+                let cuda = cb::as_cuda(&storage, "FA4")?;
+                let slice = cuda.as_slice::<$ty>()?.slice(layout.start_offset()..);
                 let (ptr, _guard) = unsafe { slice.device_ptr(&stream) };
                 ptr as u64
             }};
@@ -177,10 +173,7 @@ pub fn varlen_paged(
             block_tables.dim(1)? as i64,
         ];
 
-        let device_id = match q.device().location() {
-            candle_core::DeviceLocation::Cuda { gpu_id } => gpu_id as i32,
-            _ => 0,
-        };
+        let device_id = q.device().ordinal() as i32;
 
         unsafe {
             prelude_flash_attn_v4::fa4_varlen_paged_fwd(
@@ -195,12 +188,12 @@ pub fn varlen_paged(
                 cu_q_ptr as *mut c_void,
                 seqused_k_ptr as *mut c_void,
                 pt_ptr as *mut c_void,
-                &q_shape, &k_shape, &o_shape, &lse_shape,
+                &q_shape, &k_shape, &k_shape, &o_shape, &lse_shape,
                 &cu_q_shape, &seqused_k_shape, &pt_shape,
                 device_id,
                 None, None, // no window
                 to_kernel_dtype(q.dtype()),
-            ).map_err(|e| candle_core::Error::Msg(format!("FA4 paged kernel error: {e}")))?;
+            ).map_err(|e| prelude_core::tensor::Error::Msg(format!("FA4 paged kernel error: {e}")))?;
         }
     }
 
@@ -209,9 +202,9 @@ pub fn varlen_paged(
 
 // ── Core non-paged dispatch ────────────────────────────────────────────
 
-/// Core FA4 dispatch: extract raw pointers from candle tensors and call the kernel.
+/// Core FA4 dispatch. Returns None if no kernel variant exists for this combo.
 #[allow(clippy::too_many_arguments)]
-fn call_fa4(
+fn try_call_fa4(
     q: &Tensor, k: &Tensor, v: &Tensor,
     cu_seqlens_q: &Tensor, cu_seqlens_k: &Tensor,
     _max_seqlen_q: usize, _max_seqlen_k: usize,
@@ -219,52 +212,163 @@ fn call_fa4(
     causal: bool,
     window_left: Option<i32>, window_right: Option<i32>,
     softcap: Option<f32>,
-) -> Result<Tensor> {
-    if q.dtype() != DType::BF16 {
-        candle_core::bail!("FA4 only supports BF16 (got {:?})", q.dtype());
-    }
+) -> Option<Result<Tensor>> {
+    if q.dtype() != DType::BF16 { return None; }
 
     let registry = get_registry();
-
-    // Determine kernel variant key
-    // Q: [total_q, num_heads_q, head_dim], K: [total_k, num_heads_k, head_dim]
-    let (total_q, num_heads_q, head_dim) = q.shape().dims3()?;
-    let (_total_k, num_heads_k, _head_dim_k) = k.shape().dims3()?;
+    let (total_q, num_heads_q, head_dim) = match q.shape().dims3() { Ok(d) => d, Err(e) => return Some(Err(e)) };
+    let (_total_k, num_heads_k, _head_dim_k) = match k.shape().dims3() { Ok(d) => d, Err(e) => return Some(Err(e)) };
     let gqa_ratio = num_heads_q / num_heads_k;
     let has_window = window_left.is_some() || window_right.is_some();
 
-    let key = KernelKey::new(head_dim as u32, gqa_ratio as u32, causal, has_window)
-        .with_softcap(softcap);
+    // V-split for head_dim > 256: SM90 MMA limits N ≤ 256, so we compile
+    // kernels with (head_dim, head_dim_v=256) and call twice with V split in half.
+    if head_dim > 256 {
+        let half = head_dim / 2;
+        let mut key = KernelKey::new(head_dim as u32, gqa_ratio as u32, causal, has_window);
+        key.head_dim_v = half as u32;
+        key = key.with_softcap(softcap);
+        eprintln!("FA4 V-split lookup: hdim={} hdimv={} gqa={} causal={} window={} packgqa={} softcap={} dtype={:?} arch={}",
+            key.head_dim, key.head_dim_v, key.gqa_ratio, key.causal, key.window,
+            key.pack_gqa, key.softcap_bits, key.dtype, registry.arch());
+        let func = match registry.get(&key) {
+            Some(f) => { eprintln!("  → FOUND kernel"); f },
+            None => { eprintln!("  → NOT FOUND, falling back"); return None; },
+        };
+        // Committed — V-split path.
+        return Some(call_fa4_vsplit(registry, func, q, k, v, cu_seqlens_q, cu_seqlens_k,
+            softmax_scale, window_left, window_right, total_q, num_heads_q, head_dim, num_heads_k, half));
+    }
 
-    let func = registry.get(&key).ok_or_else(|| {
-        candle_core::Error::Msg(format!(
-            "FA4 kernel variant not found: hdim={head_dim} gqa={gqa_ratio} causal={causal} \
-             window={has_window} softcap={softcap:?}"
-        ))
-    })?;
+    let key = KernelKey::new(head_dim as u32, gqa_ratio as u32, causal, has_window).with_softcap(softcap);
+    let func = registry.get(&key)?;
 
-    // Allocate output tensor (same shape as Q)
-    let dev = match q.device() {
-        candle_core::Device::Cuda(d) => d,
-        _ => candle_core::bail!("FA4 requires CUDA device"),
-    };
-    let out = Tensor::zeros(q.shape(), DType::BF16, q.device())?;
+    // From here on, FA4 is committed — errors are real errors, not "not available".
+    Some(call_fa4_inner(registry, func, q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale, window_left, window_right, total_q, num_heads_q, head_dim, num_heads_k))
+}
 
-    // Extract raw device pointers.
-    // Scope borrows so `out` can be moved into Ok() at the end.
-    let stream = dev.cuda_stream();
+/// V-split FA4: split V along head_dim, call kernel twice, concat outputs.
+/// Q@K^T uses full head_dim as reduction dimension (SM90 MMA iterates over K).
+/// P@V uses half head_dim as output dimension (within MMA N≤256 limit).
+#[allow(clippy::too_many_arguments)]
+fn call_fa4_vsplit(
+    registry: &KernelRegistry, func: prelude_flash_attn_v4::TVMSafeCallFn,
+    q: &Tensor, k: &Tensor, v: &Tensor,
+    cu_seqlens_q: &Tensor, cu_seqlens_k: &Tensor,
+    softmax_scale: f32,
+    window_left: Option<i32>, window_right: Option<i32>,
+    total_q: usize, num_heads_q: usize, head_dim: usize, num_heads_k: usize,
+    half_dim: usize,
+) -> Result<Tensor> {
+    let num_kv_heads = v.dim(1)?;
+    // V: [total_k, num_kv_heads, head_dim] → split last dim
+    let v_lo = v.narrow(2, 0, half_dim)?.contiguous()?;
+    let v_hi = v.narrow(2, half_dim, half_dim)?.contiguous()?;
+
+    let o_lo = call_fa4_inner_vsplit(registry, func, q, k, &v_lo, cu_seqlens_q, cu_seqlens_k,
+        softmax_scale, window_left, window_right, total_q, num_heads_q, head_dim, num_heads_k, half_dim)?;
+    let o_hi = call_fa4_inner_vsplit(registry, func, q, k, &v_hi, cu_seqlens_q, cu_seqlens_k,
+        softmax_scale, window_left, window_right, total_q, num_heads_q, head_dim, num_heads_k, half_dim)?;
+
+    // Concat along last dim: [total_q, num_heads_q, half] × 2 → [total_q, num_heads_q, head_dim]
+    Tensor::cat(&[&o_lo, &o_hi], 2)
+}
+
+/// Inner FA4 call for V-split: Q/K have head_dim, V/O have half_dim.
+#[allow(clippy::too_many_arguments)]
+fn call_fa4_inner_vsplit(
+    registry: &KernelRegistry, func: prelude_flash_attn_v4::TVMSafeCallFn,
+    q: &Tensor, k: &Tensor, v: &Tensor,
+    cu_seqlens_q: &Tensor, cu_seqlens_k: &Tensor,
+    softmax_scale: f32,
+    window_left: Option<i32>, window_right: Option<i32>,
+    total_q: usize, num_heads_q: usize, head_dim: usize, num_heads_k: usize,
+    head_dim_v: usize,
+) -> Result<Tensor> {
+    let stream = cb::tensor_stream(q)?;
+    // Output has head_dim_v, not head_dim
+    let out = Tensor::zeros(&[total_q, num_heads_q, head_dim_v], DType::BF16, q.device())?;
 
     {
         let raw_stream = unsafe { stream.cu_stream() as *mut c_void };
 
         macro_rules! cuda_ptr {
             ($t:expr, $ty:ty) => {{
-                let (storage, layout) = $t.storage_and_layout();
-                let cuda = match &*storage {
-                    candle_core::Storage::Cuda(c) => c,
-                    _ => candle_core::bail!("tensor not on CUDA"),
-                };
-                let slice = cuda.as_cuda_slice::<$ty>()?.slice(layout.start_offset()..);
+                let (storage, layout) = cb::storage_and_layout(&$t);
+                let cuda = cb::as_cuda(&storage, "FA4")?;
+                let slice = cuda.as_slice::<$ty>()?.slice(layout.start_offset()..);
+                let (ptr, _guard) = unsafe { slice.device_ptr(&stream) };
+                ptr as u64
+            }};
+        }
+
+        let q_ptr = cuda_ptr!(q, bf16);
+        let k_ptr = cuda_ptr!(k, bf16);
+        let v_ptr = cuda_ptr!(v, bf16);
+        let o_ptr = cuda_ptr!(&out, bf16);
+        let cu_q_ptr = cuda_ptr!(cu_seqlens_q, u32);
+        let cu_k_ptr = cuda_ptr!(cu_seqlens_k, u32);
+
+        let (tq, hq, _) = q.shape().dims3()?;
+        let (tk, hk, _) = k.shape().dims3()?;
+        // Q/K shapes use full head_dim; V/O shapes use head_dim_v
+        let q_shape: [i64; 3] = [tq as i64, hq as i64, head_dim as i64];
+        let k_shape: [i64; 3] = [tk as i64, hk as i64, head_dim as i64];
+        let v_shape: [i64; 3] = [tk as i64, hk as i64, head_dim_v as i64];
+        let o_shape: [i64; 3] = [total_q as i64, num_heads_q as i64, head_dim_v as i64];
+        let lse_shape: [i64; 2] = [num_heads_q as i64, total_q as i64];
+        let cu_shape: [i64; 1] = [cu_seqlens_q.dim(0)? as i64];
+
+        let device_id = q.device().ordinal() as i32;
+
+        unsafe {
+            prelude_flash_attn_v4::fa4_varlen_fwd(
+                registry, func,
+                q_ptr as *mut c_void,
+                k_ptr as *mut c_void,
+                v_ptr as *mut c_void,
+                o_ptr as *mut c_void,
+                std::ptr::null_mut(), // no LSE
+                softmax_scale,
+                raw_stream,
+                cu_q_ptr as *mut c_void,
+                cu_k_ptr as *mut c_void,
+                &q_shape, &k_shape, &v_shape, &o_shape, &lse_shape, &cu_shape,
+                device_id,
+                window_left, window_right,
+                None, None, // no seqused
+                to_kernel_dtype(q.dtype()),
+            ).map_err(|e| prelude_core::tensor::Error::Msg(format!("FA4 V-split kernel error: {e}")))?;
+        }
+    }
+
+    Ok(out)
+}
+
+/// Inner FA4 call — always returns Result (no more Option branching).
+#[allow(clippy::too_many_arguments)]
+fn call_fa4_inner(
+    registry: &KernelRegistry, func: prelude_flash_attn_v4::TVMSafeCallFn,
+    q: &Tensor, k: &Tensor, v: &Tensor,
+    cu_seqlens_q: &Tensor, cu_seqlens_k: &Tensor,
+    softmax_scale: f32,
+    window_left: Option<i32>, window_right: Option<i32>,
+    total_q: usize, num_heads_q: usize, head_dim: usize, num_heads_k: usize,
+) -> Result<Tensor> {
+    let stream = cb::tensor_stream(q)?;
+    let out = Tensor::zeros(q.shape(), DType::BF16, q.device())?;
+
+    // Extract raw device pointers.
+    // Scope borrows so `out` can be moved into Ok() at the end.
+
+    {
+        let raw_stream = unsafe { stream.cu_stream() as *mut c_void };
+
+        macro_rules! cuda_ptr {
+            ($t:expr, $ty:ty) => {{
+                let (storage, layout) = cb::storage_and_layout(&$t);
+                let cuda = cb::as_cuda(&storage, "FA4")?;
+                let slice = cuda.as_slice::<$ty>()?.slice(layout.start_offset()..);
                 let (ptr, _guard) = unsafe { slice.device_ptr(&stream) };
                 ptr as u64
             }};
@@ -281,14 +385,12 @@ fn call_fa4(
         let (tk, hk, _) = k.shape().dims3()?;
         let q_shape: [i64; 3] = [tq as i64, hq as i64, hd as i64];
         let k_shape: [i64; 3] = [tk as i64, hk as i64, hd as i64];
+        let v_shape = k_shape; // head_dim_v == head_dim for non-vsplit
         let o_shape = q_shape;
         let lse_shape: [i64; 2] = [num_heads_q as i64, total_q as i64];
         let cu_shape: [i64; 1] = [cu_seqlens_q.dim(0)? as i64];
 
-        let device_id = match q.device().location() {
-            candle_core::DeviceLocation::Cuda { gpu_id } => gpu_id as i32,
-            _ => 0,
-        };
+        let device_id = q.device().ordinal() as i32;
 
         unsafe {
             prelude_flash_attn_v4::fa4_varlen_fwd(
@@ -302,12 +404,12 @@ fn call_fa4(
                 raw_stream,
                 cu_q_ptr as *mut c_void,
                 cu_k_ptr as *mut c_void,
-                &q_shape, &k_shape, &o_shape, &lse_shape, &cu_shape,
+                &q_shape, &k_shape, &v_shape, &o_shape, &lse_shape, &cu_shape,
                 device_id,
                 window_left, window_right,
                 None, None, // no seqused
                 to_kernel_dtype(q.dtype()),
-            ).map_err(|e| candle_core::Error::Msg(format!("FA4 kernel error: {e}")))?;
+            ).map_err(|e| prelude_core::tensor::Error::Msg(format!("FA4 kernel error: {e}")))?;
         }
     }
 

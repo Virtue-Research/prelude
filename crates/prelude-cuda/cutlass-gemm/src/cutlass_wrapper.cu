@@ -22,6 +22,8 @@
 #include "cutlass/epilogue/thread/linear_combination.h"
 #include "cutlass/util/packed_stride.hpp"
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 using BF16 = cutlass::bfloat16_t;
 using FP16 = cutlass::half_t;
 using FP8E4M3 = cutlass::float_e4m3_t;
@@ -517,12 +519,136 @@ struct Sm80RunnerAlign2 {
 
 static int sm80_bf16_align2(const void* A, const void* B, void* D,
                             int m, int n, int k, cudaStream_t s) {
+    // Use smaller tile for small problems — large tiles fail initialize()
+    if (m < 64 || n < 64) {
+        return launch<Sm80RunnerAlign2<BF16, cutlass::gemm::MainloopSm80CpAsync<3>, Shape<_32,_32,_32>, 2>>(A, B, D, m, n, k, s);
+    }
     return launch<Sm80RunnerAlign2<BF16, cutlass::gemm::MainloopSm80CpAsync<3>>>(A, B, D, m, n, k, s);
 }
 
 static int sm80_fp16_align2(const void* A, const void* B, void* D,
                             int m, int n, int k, cudaStream_t s) {
+    if (m < 64 || n < 64) {
+        return launch<Sm80RunnerAlign2<FP16, cutlass::gemm::MainloopSm80CpAsync<3>, Shape<_32,_32,_32>, 2>>(A, B, D, m, n, k, s);
+    }
     return launch<Sm80RunnerAlign2<FP16, cutlass::gemm::MainloopSm80CpAsync<3>>>(A, B, D, m, n, k, s);
+}
+
+// ============================================================================
+// Naive BF16 GEMM — safe fallback for small matrices where CUTLASS has bugs.
+// FP32 accumulation, one thread per output element.
+// ============================================================================
+
+// Convert BF16 (uint16) ↔ float via bit manipulation — no type dependencies
+__device__ __forceinline__ float bf16_to_f32(uint16_t v) {
+    uint32_t bits = (uint32_t)v << 16;
+    float f; memcpy(&f, &bits, 4);
+    return f;
+}
+__device__ __forceinline__ uint16_t f32_to_bf16(float f) {
+    uint32_t bits; memcpy(&bits, &f, 4);
+    // Round to nearest even
+    bits += 0x7FFF + ((bits >> 16) & 1);
+    return (uint16_t)(bits >> 16);
+}
+
+__global__ void naive_bf16_gemm_kernel(
+    const uint16_t* __restrict__ A,
+    const uint16_t* __restrict__ B,
+    uint16_t* __restrict__ D,
+    int M, int N, int K)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * N) return;
+    int i = idx % M;
+    int j = idx / M;
+    float sum = 0.0f;
+    for (int t = 0; t < K; t++) {
+        sum += bf16_to_f32(A[i * K + t]) * bf16_to_f32(B[j * K + t]);
+    }
+    D[j * M + i] = f32_to_bf16(sum);
+}
+
+static int naive_bf16_gemm(const void* A, const void* B, void* D,
+                            int m, int n, int k, cudaStream_t s) {
+    cudaGetLastError();  // clear any prior error
+    int total = m * n;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    fprintf(stderr, "naive_bf16_gemm: m=%d n=%d k=%d grid=%d block=%d total=%d\n", m, n, k, grid, block, total);
+    naive_bf16_gemm_kernel<<<grid, block, 0, s>>>(
+        (const uint16_t*)A, (const uint16_t*)B, (uint16_t*)D, m, n, k);
+    auto err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "naive_bf16_gemm FAILED: %s\n", cudaGetErrorString(err));
+        return -31;
+    }
+    fprintf(stderr, "naive_bf16_gemm OK\n");
+    return 0;
+}
+
+// Same for FP16
+__global__ void naive_fp16_gemm_kernel(
+    const FP16* __restrict__ A,
+    const FP16* __restrict__ B,
+    FP16* __restrict__ D,
+    int M, int N, int K)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * N) return;
+    int i = idx % M;
+    int j = idx / M;
+    float sum = 0.0f;
+    for (int t = 0; t < K; t++) {
+        sum += float(A[i * K + t]) * float(B[j * K + t]);
+    }
+    D[j * M + i] = FP16(sum);
+}
+
+static int naive_fp16_gemm(const void* A, const void* B, void* D,
+                            int m, int n, int k, cudaStream_t s) {
+    int total = m * n;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    naive_fp16_gemm_kernel<<<grid, block, 0, s>>>(
+        (const FP16*)A, (const FP16*)B, (FP16*)D, m, n, k);
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -30;
+}
+
+// ============================================================================
+// Naive F32 GEMM — safe fallback for small matrices where CUTLASS has bugs.
+// One thread per output element, each computing a dot product.
+// ============================================================================
+
+__global__ void naive_f32_gemm_kernel(
+    const float* __restrict__ A,  // RowMajor [M, K]
+    const float* __restrict__ B,  // ColumnMajor [K, N] ≡ RowMajor [N, K]
+    float* __restrict__ D,        // ColumnMajor [M, N]
+    int M, int N, int K)
+{
+    // D[i,j] = sum_k A[i,k] * B[k,j]
+    // A is RM [M,K]: A[i,k] = A[i*K+k]
+    // B is CM [K,N]: B[k,j] = B[j*K+k]  (stored as RM [N,K])
+    // D is CM [M,N]: D[i,j] → D[j*M+i]
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * N) return;
+    int i = idx % M;  // row in D (CM layout: fast-varying)
+    int j = idx / M;  // col in D
+    float sum = 0.0f;
+    for (int t = 0; t < K; t++) {
+        sum += A[i * K + t] * B[j * K + t];
+    }
+    D[j * M + i] = sum;
+}
+
+static int naive_f32_gemm(const void* A, const void* B, void* D,
+                           int m, int n, int k, cudaStream_t s) {
+    int total = m * n;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    naive_f32_gemm_kernel<<<grid, block, 0, s>>>(
+        (const float*)A, (const float*)B, (float*)D, m, n, k);
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -30;
 }
 
 // ============================================================================
@@ -549,7 +675,11 @@ extern "C" int cutlass_gemm_dispatch(
     cudaGetLastError();
 
 #if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
-    {
+    // SM90 TMA descriptors require both M and N >= the copy atom tile size.
+    // can_implement() may pass but TMA descriptor creation asserts when a
+    // global dimension is smaller than the box dimension (e.g. N=7 < box=128).
+    // Skip SM90 for small dimensions to avoid the fatal assertion.
+    if (m >= 64 && n >= 64) {
         int ret;
         switch (dtype) {
             case 0: ret = launch<Sm90_Default<BF16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
@@ -559,9 +689,7 @@ extern "C" int cutlass_gemm_dispatch(
             default: ret = -20; break;
         }
         if (ret == 0) return 0;
-        // SM90 failed — log and fall through to SM80
-        fprintf(stderr, "CUTLASS: SM90 failed (code %d) for m=%d n=%d k=%d batch=%d dtype=%u, falling back to SM80\n",
-                ret, m, n, k, batch, dtype);
+        // SM90 failed — fall through to SM80
     }
 #endif
 
@@ -580,6 +708,10 @@ extern "C" int cutlass_gemm_dispatch(
     // Try unpredicated first (fastest), fall back to predicated for unaligned M.
     // Unpredicated requires M and N aligned to tile dims (128); skip if not aligned.
     if (dtype == 0) {
+        // Naive fallback for small matrices — CUTLASS tile kernels fail for M or N < 64
+        if (m < 64 || n < 64) {
+            return naive_bf16_gemm(A, B, D, m, n, k, s);
+        }
         if (m % 128 == 0 && n % 128 == 0) {
             int ret = sm80_bf16_c3(A, B, D, m, n, k, s);  // unpredicated
             if (ret == 0) return 0;
@@ -591,6 +723,9 @@ extern "C" int cutlass_gemm_dispatch(
         return sm80_bf16_align2(A, B, D, m, n, k, s);     // alignment=2 fallback
     }
     if (dtype == 1) {
+        if (m < 64 || n < 64) {
+            return naive_fp16_gemm(A, B, D, m, n, k, s);
+        }
         if (m % 128 == 0 && n % 128 == 0) {
             int ret = sm80_fp16_c3(A, B, D, m, n, k, s);
             if (ret == 0) return 0;
@@ -602,6 +737,10 @@ extern "C" int cutlass_gemm_dispatch(
         return sm80_fp16_align2(A, B, D, m, n, k, s);     // alignment=2 fallback
     }
     if (dtype == 2) {
+        // For small matrices, use a naive kernel to avoid CUTLASS tile/predication bugs.
+        if (m < 64 || n < 64) {
+            return naive_f32_gemm(A, B, D, m, n, k, s);
+        }
         return sm80_f32_gemm(A, B, D, m, n, k, s);
     }
     return -20;

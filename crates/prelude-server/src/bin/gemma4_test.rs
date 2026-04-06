@@ -46,7 +46,7 @@ fn create_generate_request(prompt: &str, max_tokens: u32) -> GenerateRequest {
         },
         seed: Some(42),
         deadline_ms: None,
-        logprobs: None,
+        logprobs: Some(5),
         prompt_logprobs: None,
     }
 }
@@ -70,8 +70,16 @@ async fn run_text_test(engine: &Engine) -> Result<(), Box<dyn std::error::Error>
         let elapsed = start.elapsed();
 
         println!("  Output: {:?}", result.output_text);
+        println!("  Output token IDs: {:?}", result.output_token_ids);
+        if let Some(lp) = &result.token_logprobs {
+            for info in lp {
+                println!("  Token: {} (id={}) logprob={:.4}", info.token, info.token_id, info.logprob);
+                for (tid, tok, lp2) in &info.top_logprobs {
+                    println!("    top: {tok:>20} (id={tid:>6}) logprob={lp2:.4}");
+                }
+            }
+        }
         println!("  Prompt tokens: {}", result.usage.prompt_tokens);
-        println!("  Completion tokens: {}", result.usage.completion_tokens);
         println!("  Time: {:.2}ms", elapsed.as_secs_f64() * 1000.0);
         if result.usage.completion_tokens > 0 {
             println!(

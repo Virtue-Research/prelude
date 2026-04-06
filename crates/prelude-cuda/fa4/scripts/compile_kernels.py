@@ -110,6 +110,26 @@ def compile_variant(spec: VariantSpec, arch: int, output_dir: Path):
     try:
         import torch
         from flash_attn.cute.interface import _flash_attn_fwd
+        import flash_attn.cute.interface as _fa4_iface
+
+        # Monkey-patch FA4 to support (head_dim=512, head_dim_v=256) on SM90.
+        # Upstream caps at 256; Gemma4 needs 512 for full-attention layers.
+        # The V-split approach: head_dim=512 is the K-reduction dim (MMA iterates),
+        # head_dim_v=256 is the output dim (within MMA N≤256 limit).
+        _orig_validate = _fa4_iface._validate_head_dims
+        def _patched_validate(head_dim, head_dim_v, compute_capability, alignment):
+            if compute_capability == 9 and head_dim <= 512 and head_dim_v <= 256:
+                assert head_dim % alignment == 0 and head_dim_v % alignment == 0
+                return
+            _orig_validate(head_dim, head_dim_v, compute_capability, alignment)
+        _fa4_iface._validate_head_dims = _patched_validate
+
+        _orig_tile_fwd = _fa4_iface._tile_size_fwd_sm90
+        def _patched_tile_fwd(head_dim, head_dim_v, is_causal, is_local, **kwargs):
+            if head_dim > 256:
+                return _fa4_iface.FwdConfig(64, 32, True, False)
+            return _orig_tile_fwd(head_dim, head_dim_v, is_causal, is_local, **kwargs)
+        _fa4_iface._tile_size_fwd_sm90 = _patched_tile_fwd
 
         torch_dtype = torch.bfloat16 if spec.dtype == "bf16" else torch.float16
 
@@ -131,8 +151,10 @@ def compile_variant(spec: VariantSpec, arch: int, output_dir: Path):
                     page_size = 128
                 elif spec.head_dim <= 192:
                     page_size = 112
-                else:
+                elif spec.head_dim <= 256:
                     page_size = 80
+                else:
+                    page_size = 64
             num_pages = 2
             max_pages_per_seq = 2
             total_q = 128
@@ -274,11 +296,12 @@ def _arch_constraints(arch: int):
     """
     cap = arch // 10
     if cap == 9:
-        # SM90: hdim 8-256, paged yes
+        # SM90: hdim 8-256 native, hdim 512 via V-split, paged yes
         return dict(
             head_dims=[64, 96, 128, 192, 256],
             supports_paged=True,
             supports_deepseek_mla=True,  # (192,128) within 8-256 range
+            supports_hdim512_vsplit=True,  # Gemma4: (512,256) with V-split dispatch
         )
     elif cap in [10, 11]:
         # SM100/SM110: hdim 8-128 + DeepSeek (192,128), paged yes
@@ -369,6 +392,16 @@ def build_variant_matrix(arch: int, prototype=False):
         for gqa in gqa_ratios:
             for c in causal_modes:
                 variants.append(VariantSpec(192, 128, gqa, c, False, None, False, False, "bf16", False))
+
+    # 7. Gemma4 hdim=512 via V-split: compile (hdim_qk=512, hdim_v=256).
+    #    At runtime, V is split into two 256-wide halves, the kernel is called
+    #    twice, and results are concatenated.  Q@K^T uses hdim=512 as the
+    #    reduction dimension (K-mode), which SM90 MMA handles via iteration.
+    if constraints.get("supports_hdim512_vsplit"):
+        for gqa in gqa_ratios:
+            for c in causal_modes:
+                for w in window_modes:
+                    variants.append(VariantSpec(512, 256, gqa, c, w, None, False, False, "bf16", False))
 
     return variants
 

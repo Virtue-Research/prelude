@@ -4,9 +4,7 @@
 //! 2. If pre-compiled kernel .o files exist in `kernels/`, use them.
 //!    Otherwise, run `scripts/compile_kernels.py` to AOT-compile.
 //! 3. Create a static archive (libfa4_kernels.a) from all kernel .o files.
-//! 4. Compile vendored tvm_ffi C++ source (needed by kernel .o symbol references).
-//! 5. Link vendored libcuda_dialect_runtime_static.a.
-//! 6. Generate Rust FFI dispatch table from manifest.json.
+//! 4. Generate Rust FFI dispatch table from manifest.json.
 
 use anyhow::{Context, Result};
 use std::env;
@@ -15,25 +13,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 include!("../../../build_log.rs");
-
-/// Recursively search for a file by name under a directory.
-fn find_file_recursive(dir: &Path, name: &str) -> Option<PathBuf> {
-    if !dir.is_dir() {
-        return None;
-    }
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.is_file() && path.file_name().map_or(false, |n| n == name) {
-            return Some(path);
-        }
-        if path.is_dir() {
-            if let Some(found) = find_file_recursive(&path, name) {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
 
 /// Detect local CUDA toolkit version from nvcc and return the matching
 /// PyTorch wheel index URL (e.g. "https://download.pytorch.org/whl/cu128").
@@ -58,7 +37,6 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=scripts/compile_kernels.py");
     println!("cargo:rerun-if-changed=vendor/");
     track_submodule("flash-attention");
-    track_submodule("tvm-ffi");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
@@ -76,10 +54,7 @@ fn main() -> Result<()> {
     // Phase 3: Create static archive from kernel .o files + generate dispatch table
     let has_kernels = link_kernel_objects(&kernels_dir, &out_dir)?;
 
-    // Phase 4: Compile vendored tvm_ffi + link cuda_dialect_runtime
-    compile_tvm_ffi_static(&manifest_dir, &out_dir, &venv_dir)?;
-
-    // Phase 5: Generate Rust dispatch code
+    // Phase 4: Generate Rust dispatch code
     generate_dispatch_code(&kernels_dir, &out_dir, has_kernels)?;
 
     Ok(())
@@ -239,204 +214,6 @@ fn generate_dispatch_code(
     Ok(())
 }
 
-/// Compile vendored tvm_ffi C++ source into a static library.
-/// Kernel .o files reference TVM FFI symbols (TVMFFIEnvGetStream, etc.)
-/// that need to be resolved at link time.
-/// Also links vendored libcuda_dialect_runtime_static.a.
-fn compile_tvm_ffi_static(manifest_dir: &Path, _out_dir: &Path, venv_dir: &Path) -> Result<()> {
-    // tvm-ffi lives in workspace third_party/
-    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap().parent().unwrap();
-    let tvm_ffi_dir = workspace_root.join("third_party/tvm-ffi");
-    let tvm_src = tvm_ffi_dir.join("src");
-    let tvm_include = tvm_ffi_dir.join("include");
-    let dlpack_include = tvm_ffi_dir.join("3rdparty/dlpack/include");
-
-    if !tvm_src.exists() {
-        anyhow::bail!(
-            "third_party/tvm-ffi not found. Run: git submodule update --init third_party/tvm-ffi"
-        );
-    }
-
-    // Collect all .cc files (skip Windows-only and testing)
-    let cc_files: Vec<PathBuf> = walkdir(&tvm_src, "cc")
-        .into_iter()
-        .filter(|p| {
-            let name = p.file_name().unwrap().to_str().unwrap_or("");
-            !name.contains("win") && !name.contains("testing")
-        })
-        .collect();
-
-    build_log!(
-        "Compiling tvm_ffi: {} C++ source files",
-        cc_files.len()
-    );
-
-    let mut build = cc::Build::new();
-    build
-        .cpp(true)
-        .std("c++17")
-        .opt_level(2)
-        .pic(true)
-        .include(&tvm_include)
-        .include(&dlpack_include)
-        .define("TVM_FFI_EXPORTS", None)
-        .define("NDEBUG", None)
-        .warnings(false);
-
-    for f in &cc_files {
-        build.file(f);
-    }
-
-    // TVM error helper for extracting error messages from TVM FFI calls
-    let error_helper = manifest_dir.join("src/tvm_error_helper.cc");
-    if error_helper.exists() {
-        build.file(&error_helper);
-    }
-
-    // Compile libbacktrace (backtrace.cc references it)
-    compile_libbacktrace(&tvm_ffi_dir)?;
-
-    // Use +whole-archive so kernel .o files can resolve TVM symbols at link time.
-    build.link_lib_modifier("+whole-archive");
-    build
-        .try_compile("tvm_ffi_static")
-        .context("Failed to compile vendored tvm_ffi")?;
-
-    // Link libcuda_dialect_runtime_static.a with +whole-archive.
-    // Kernel .o host code calls _cudaLibraryLoadData etc. from this library.
-    let cuda_dialect_lib = "libcuda_dialect_runtime_static.a";
-    let cuda_dialect_dir = find_file_recursive(venv_dir, cuda_dialect_lib)
-        .map(|p| p.parent().unwrap().to_path_buf());
-    if let Some(dir) = cuda_dialect_dir {
-        println!("cargo:rustc-link-search=native={}", dir.display());
-        println!("cargo:rustc-link-lib=static:+whole-archive=cuda_dialect_runtime_static");
-    } else {
-        build_log!("cuda_dialect_runtime_static.a not found — FA4 SM90 kernels may fail to link");
-    }
-
-    // CUDA runtime (cudaLibraryLoadData etc.)
-    // Search standard CUDA lib paths
-    for candidate in [
-        "/opt/cuda/targets/x86_64-linux/lib",
-        "/opt/cuda/lib64",
-        "/usr/local/cuda/lib64",
-        "/usr/lib/x86_64-linux-gnu",
-    ] {
-        if Path::new(candidate).join("libcudart.so").exists() {
-            println!("cargo:rustc-link-search=native={candidate}");
-            break;
-        }
-    }
-    // Also check CUDA_PATH env var
-    if let Ok(cuda_path) = env::var("CUDA_PATH") {
-        println!("cargo:rustc-link-search=native={cuda_path}/lib64");
-    }
-    println!("cargo:rustc-link-lib=static=cudart_static");
-    println!("cargo:rustc-link-lib=dylib=rt");   // required by cudart_static
-    println!("cargo:rustc-link-lib=dylib=dl");   // required by cudart_static
-
-    // C++ stdlib
-    println!("cargo:rustc-link-lib=dylib=stdc++");
-
-    // NOTE: --export-dynamic is NOT needed. Kernel symbols are statically linked,
-    // not loaded via dlopen. Removing this reduces the dynamic symbol table size.
-
-    Ok(())
-}
-
-/// Compile libbacktrace from third_party/tvm-ffi/3rdparty/libbacktrace.
-fn compile_libbacktrace(tvm_ffi_dir: &Path) -> Result<()> {
-    let bt_dir = tvm_ffi_dir.join("3rdparty/libbacktrace");
-    if !bt_dir.exists() {
-        anyhow::bail!(
-            "libbacktrace not found. Run: git submodule update --init --recursive third_party/tvm-ffi"
-        );
-    }
-
-    let out = PathBuf::from(env::var("OUT_DIR")?);
-    let config_dir = out.join("libbacktrace");
-    std::fs::create_dir_all(&config_dir)?;
-
-    let config_h = if cfg!(target_os = "linux") {
-        r#"
-#define BACKTRACE_ELF_SIZE 64
-#define HAVE_ATOMIC_FUNCTIONS 1
-#define HAVE_DL_ITERATE_PHDR 1
-#define HAVE_DLFCN_H 1
-#define HAVE_FCNTL 1
-#define HAVE_LINK_H 1
-#define HAVE_LSTAT 1
-#define HAVE_READLINK 1
-#define HAVE_SYS_MMAN_H 1
-#define HAVE_DECL_STRNLEN 1
-#define HAVE_DECL_GETPAGESIZE 0
-"#
-    } else if cfg!(target_os = "macos") {
-        r#"
-#define BACKTRACE_ELF_SIZE 64
-#define HAVE_ATOMIC_FUNCTIONS 1
-#define HAVE_DLFCN_H 1
-#define HAVE_FCNTL 1
-#define HAVE_MACH_O_DYLD_H 1
-#define HAVE_SYS_MMAN_H 1
-#define HAVE_DECL_STRNLEN 1
-#define HAVE_DECL_GETPAGESIZE 0
-"#
-    } else {
-        r#"
-#define HAVE_ATOMIC_FUNCTIONS 1
-#define HAVE_DECL_STRNLEN 1
-#define HAVE_DECL_GETPAGESIZE 0
-"#
-    };
-    std::fs::write(config_dir.join("config.h"), config_h)?;
-
-    let core_files = ["backtrace.c", "dwarf.c", "fileline.c", "posix.c",
-                      "sort.c", "state.c", "alloc.c", "read.c", "mmapio.c", "mmap.c"];
-    let format_file = if cfg!(target_os = "macos") { "macho.c" } else { "elf.c" };
-
-    let mut build = cc::Build::new();
-    build
-        .opt_level(2)
-        .pic(true)
-        .include(&bt_dir)
-        .include(&config_dir)
-        .define("_GNU_SOURCE", None)
-        .warnings(false);
-
-    for name in &core_files {
-        let f = bt_dir.join(name);
-        if f.exists() {
-            build.file(&f);
-        }
-    }
-    let fmt = bt_dir.join(format_file);
-    if fmt.exists() {
-        build.file(&fmt);
-    }
-
-    build.try_compile("backtrace")
-        .context("Failed to compile libbacktrace")?;
-
-    Ok(())
-}
-
-/// Recursively find files with given extension.
-fn walkdir(dir: &Path, ext: &str) -> Vec<PathBuf> {
-    let mut result = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                result.extend(walkdir(&path, ext));
-            } else if path.extension().is_some_and(|e| e == ext) {
-                result.push(path);
-            }
-        }
-    }
-    result
-}
-
 fn ensure_fa4_source(_out_dir: &Path) -> Result<PathBuf> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let workspace_root = manifest_dir.join("../../..");
@@ -551,6 +328,8 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_d
             .env("FLASH_ATTENTION_FAKE_TENSOR", "1")
             .env("FLASH_ATTENTION_ARCH", arch)
             .env("CUTE_DSL_ARCH", format!("{arch}a"))
+            .env("FA_CLC", "0")
+            .env("FA_DISABLE_2CTA", "0")
             .status()
             .context("Failed to run FA4 compile script")?;
 
