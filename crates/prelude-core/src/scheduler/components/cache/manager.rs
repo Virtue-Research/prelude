@@ -13,9 +13,9 @@ use crate::engine::{CommonModelConfig, EngineError, PagedKvPool, RuntimeCaps};
 /// from model execution.
 pub struct CacheManager {
     pub(crate) prefix_cache: Option<Mutex<PrefixKvCache>>,
-    pub(crate) paged_pool: Option<PagedKvPool>,
+    pub paged_pool: Option<PagedKvPool>,
     pub(crate) block_manager: Option<Mutex<crate::cache::block_manager::BlockManager>>,
-    pub(crate) deltanet_pool: Option<Mutex<DeltaNetPool>>,
+    pub deltanet_pool: Option<Mutex<DeltaNetPool>>,
 }
 
 impl CacheManager {

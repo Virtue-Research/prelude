@@ -39,10 +39,10 @@ mod tokenizer;
 
 
 // ── Re-exports: plan types + engine struct ──
-pub use self::engine::Engine;
-pub(crate) use self::engine::{ModelExecutor, ModelVariant};
-pub(crate) use self::types::OwnedBatchDecodeSeq;
-pub(crate) use self::types::PagedKvPool;
+pub use self::engine::{Engine, ModelExecutor};
+pub(crate) use self::engine::ModelVariant;
+pub use self::types::OwnedBatchDecodeSeq;
+pub use self::types::PagedKvPool;
 pub use self::types::TaskOverride;
 pub(crate) use self::types::{
     BatchDecodeSeq, BatchPrefillResult, CacheAllocationPlan, CacheAllocationPlanEntry,

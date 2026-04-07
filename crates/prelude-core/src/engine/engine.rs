@@ -19,24 +19,24 @@ pub(crate) type ModelVariant = Box<dyn crate::models::ModelForward>;
 
 /// Owns the model weights, device, dtype, and model configuration.
 /// Extracted from Engine to separate model execution concerns from cache management.
-pub(crate) struct ModelExecutor {
-    pub(crate) model: Mutex<ModelVariant>,
-    pub(crate) device: Device,
+pub struct ModelExecutor {
+    pub model: Mutex<ModelVariant>,
+    pub device: Device,
     pub(crate) dtype: DType,
-    pub(crate) config: CommonModelConfig,
+    pub config: CommonModelConfig,
     pub(crate) runtime_caps: RuntimeCaps,
-    pub(crate) ops: &'static dyn crate::ops::Ops,
+    pub ops: &'static dyn crate::ops::Ops,
 }
 
 pub struct Engine {
-    pub(crate) executor: ModelExecutor,
-    pub(crate) cache: crate::cache::manager::CacheManager,
+    pub executor: ModelExecutor,
+    pub cache: crate::cache::manager::CacheManager,
     pub(crate) tokenizer: Tokenizer,
     pub(crate) model_id: String,
     pub(crate) embedding_semantics: EmbeddingSemantics,
     pub(crate) eos_token_ids: Vec<u32>,
     pub(crate) descriptor: ModelDescriptor,
-    pub(crate) engine_config: crate::config::EngineConfig,
+    pub engine_config: crate::config::EngineConfig,
 }
 
 impl Engine {
@@ -111,7 +111,7 @@ impl Engine {
     }
 
     /// Access the engine configuration.
-    pub(crate) fn engine_config(&self) -> &crate::config::EngineConfig {
+    pub fn engine_config(&self) -> &crate::config::EngineConfig {
         &self.engine_config
     }
 

@@ -302,6 +302,8 @@ pub trait GpuDType: DeviceRepr + Sized + Copy + 'static {
     const DTYPE: DType;
     /// Extract typed slice from CudaStorageSlice.
     fn as_cuda_slice(s: &CudaStorageSlice) -> Result<&CudaSlice<Self>>;
+    /// Extract mutable typed slice from CudaStorageSlice.
+    fn as_cuda_slice_mut(s: &mut CudaStorageSlice) -> Result<&mut CudaSlice<Self>>;
     /// Wrap typed slice into CudaStorageSlice.
     fn wrap_cuda_slice(s: CudaSlice<Self>) -> CudaStorageSlice;
     /// Kernel name suffix: "f32", "bf16", etc.
@@ -316,6 +318,12 @@ macro_rules! impl_gpu_dtype {
                 match s {
                     CudaStorageSlice::$variant(s) => Ok(s),
                     other => bail!(concat!("expected ", $suffix, ", got {:?}"), other.dtype()),
+                }
+            }
+            fn as_cuda_slice_mut(s: &mut CudaStorageSlice) -> Result<&mut CudaSlice<Self>> {
+                match s {
+                    CudaStorageSlice::$variant(s) => Ok(s),
+                    other => bail!(concat!("expected mut ", $suffix, ", got {:?}"), other.dtype()),
                 }
             }
             fn wrap_cuda_slice(s: CudaSlice<Self>) -> CudaStorageSlice {
@@ -348,6 +356,19 @@ pub fn as_cuda<'a>(
     match &**guard {
         Storage::Device(ds) => ds
             .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| prelude_core::tensor::Error::Msg(format!("{ctx}: not CudaStorage"))),
+        _ => bail!("{ctx}: requires CUDA tensor"),
+    }
+}
+
+/// Extract `&mut CudaStorage` from a Tensor's write guard.
+pub fn as_cuda_mut<'a>(
+    guard: &'a mut std::sync::RwLockWriteGuard<Storage>,
+    ctx: &str,
+) -> Result<&'a mut CudaStorage> {
+    match &mut **guard {
+        Storage::Device(ds) => ds
+            .downcast_mut::<CudaStorage>()
             .ok_or_else(|| prelude_core::tensor::Error::Msg(format!("{ctx}: not CudaStorage"))),
         _ => bail!("{ctx}: requires CUDA tensor"),
     }

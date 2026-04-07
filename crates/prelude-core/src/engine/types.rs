@@ -291,24 +291,22 @@ impl OwnedBatchDecodeSeq {
 
 // ── Paged KV pool ───────────────────────────────────────────────────────
 
-pub(crate) struct PagedKvPool {
+pub struct PagedKvPool {
     pub(crate) key_caches: Vec<Tensor>,
     pub(crate) value_caches: Vec<Tensor>,
     pub(crate) key_caches_flash: Vec<Tensor>,
     pub(crate) value_caches_flash: Vec<Tensor>,
-    pub(crate) block_size: usize,
+    pub block_size: usize,
 }
 
 impl PagedKvPool {
     /// Returns the active key caches for the compiled attention backend.
-    /// FA3: flash layout `[blocks, block_sz, heads, dim]`.
-    /// FA2/others: v1 layout `[blocks, heads, dim/x, block_sz, x]`.
-    pub(crate) fn active_key_caches(&self) -> &[Tensor] {
+    pub fn active_key_caches(&self) -> &[Tensor] {
         &self.key_caches_flash
     }
 
     /// Returns the active value caches for the compiled attention backend.
-    pub(crate) fn active_value_caches(&self) -> &[Tensor] {
+    pub fn active_value_caches(&self) -> &[Tensor] {
         &self.value_caches_flash
     }
 }

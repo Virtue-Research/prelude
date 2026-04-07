@@ -95,6 +95,7 @@ pub(crate) mod ops;
 pub(crate) mod attn;
 pub(crate) mod moe_ffi;
 mod cuda_ops;
+mod cuda_graph;
 mod quant_backends;
 pub mod executor;
 
