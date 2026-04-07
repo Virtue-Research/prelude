@@ -1,9 +1,9 @@
-//! Own CUDA storage — own CUDA storage wrapping cudarc types.
+//! CUDA device helpers — cached contexts, PTX loading, GpuDType, tensor conversion.
 //!
-//! This module provides:
-//! - `CudaStorageSlice` enum: typed GPU memory slices
-//! - `CudaStorage` struct: GPU storage with device/stream handle
+//! `CudaStorage` and `CudaStorageSlice` are defined in `prelude_core::tensor` (behind
+//! the `cuda` feature). This module re-exports them and provides:
 //! - `GpuDType` trait: type-safe access to typed slices
+//! - `CudaStorageExt` trait: `as_slice::<T>()` (depends on GpuDType)
 //! - Helper functions for Tensor ↔ CudaStorage conversion
 //! - `CuResultExt` trait: convert cudarc errors to our Result
 //! - `cuda_device()`/`cuda_stream()`: cached device/stream registry
@@ -12,13 +12,16 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, ValidAsZeroBits,
+    CudaFunction, CudaModule, ValidAsZeroBits,
 };
 use half::{bf16, f16};
 use prelude_core::tensor::{
-    bail, CpuStorage, DType, Device, DeviceStorage, DeviceStorageTrait, Layout, Result, Shape,
-    Storage, Tensor, WithDType,
+    bail, CpuStorage, DType, Device, Layout, Result, Shape, Storage, Tensor, WithDType,
 };
+
+// Re-export CUDA storage types so downstream (cuda_ops, tensor_ops_kernels, ops/*)
+// can keep `use crate::device::{CudaStorage, CudaStorageSlice, ...}`
+pub use prelude_core::tensor::{CudaStorage, CudaStorageSlice, CudaSlice, CudaStream, CudaContext};
 
 // ── Error conversion ────────��─────────────────────────────────────
 
@@ -109,206 +112,20 @@ pub fn get_or_load_func(
     module.load_function(fn_name).ce()
 }
 
-// ── CudaStorageSlice ─────��───────────────────────────────────────
 
-/// Typed CUDA memory slice. Each variant holds a `CudaSlice<T>`.
-pub enum CudaStorageSlice {
-    U8(CudaSlice<u8>),
-    U32(CudaSlice<u32>),
-    I32(CudaSlice<i32>),
-    I64(CudaSlice<i64>),
-    BF16(CudaSlice<bf16>),
-    F16(CudaSlice<f16>),
-    F32(CudaSlice<f32>),
-    F64(CudaSlice<f64>),
+// ── CudaStorageExt — as_slice depends on GpuDType which lives here ──
+
+/// Extension trait for `CudaStorage` methods that depend on `GpuDType`.
+pub trait CudaStorageExt {
+    fn as_slice<T: GpuDType>(&self) -> Result<&CudaSlice<T>>;
 }
 
-impl CudaStorageSlice {
-    pub fn dtype(&self) -> DType {
-        match self {
-            Self::U8(_) => DType::U8,
-            Self::U32(_) => DType::U32,
-            Self::I32(_) => DType::I32,
-            Self::I64(_) => DType::I64,
-            Self::BF16(_) => DType::BF16,
-            Self::F16(_) => DType::F16,
-            Self::F32(_) => DType::F32,
-            Self::F64(_) => DType::F64,
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        match self {
-            Self::U8(s) => s.len(),
-            Self::U32(s) => s.len(),
-            Self::I32(s) => s.len(),
-            Self::I64(s) => s.len(),
-            Self::BF16(s) => s.len(),
-            Self::F16(s) => s.len(),
-            Self::F32(s) => s.len(),
-            Self::F64(s) => s.len(),
-        }
-    }
-}
-
-impl std::fmt::Debug for CudaStorageSlice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CudaStorageSlice({:?}, len={})", self.dtype(), self.len())
-    }
-}
-
-// ── CudaStorage ──────────────────────────────────────────────────
-
-/// GPU tensor storage wrapping cudarc types directly.
-pub struct CudaStorage {
-    pub slice: CudaStorageSlice,
-    pub stream: Arc<CudaStream>,
-}
-
-impl CudaStorage {
-    /// The CudaContext (GPU device) this storage lives on.
-    pub fn device(&self) -> &Arc<CudaContext> {
-        &self.stream.context()
-    }
-
-    pub fn dtype(&self) -> DType {
-        self.slice.dtype()
-    }
-
-    pub fn len(&self) -> usize {
-        self.slice.len()
-    }
-
-    /// Get a typed CudaSlice reference.
-    pub fn as_slice<T: GpuDType>(&self) -> Result<&CudaSlice<T>> {
+impl CudaStorageExt for CudaStorage {
+    fn as_slice<T: GpuDType>(&self) -> Result<&CudaSlice<T>> {
         T::as_cuda_slice(&self.slice)
     }
-
-    /// Allocate zeroed GPU memory of given dtype and element count.
-    pub fn zeros(stream: &Arc<CudaStream>, dtype: DType, n: usize) -> Result<Self> {
-        let slice = match dtype {
-            DType::U8 => CudaStorageSlice::U8(stream.alloc_zeros::<u8>(n).ce()?),
-            DType::U32 => CudaStorageSlice::U32(stream.alloc_zeros::<u32>(n).ce()?),
-            DType::I32 => CudaStorageSlice::I32(stream.alloc_zeros::<i32>(n).ce()?),
-            DType::I64 => CudaStorageSlice::I64(stream.alloc_zeros::<i64>(n).ce()?),
-            DType::BF16 => CudaStorageSlice::BF16(stream.alloc_zeros::<bf16>(n).ce()?),
-            DType::F16 => CudaStorageSlice::F16(stream.alloc_zeros::<f16>(n).ce()?),
-            DType::F32 => CudaStorageSlice::F32(stream.alloc_zeros::<f32>(n).ce()?),
-            DType::F64 => CudaStorageSlice::F64(stream.alloc_zeros::<f64>(n).ce()?),
-            dt => bail!("CudaStorage::zeros: unsupported dtype {dt:?}"),
-        };
-        Ok(Self { slice, stream: stream.clone() })
-    }
-
-    /// Upload CPU data to GPU.
-    pub fn from_cpu(stream: &Arc<CudaStream>, cpu: &CpuStorage, layout: &Layout) -> Result<Self> {
-        macro_rules! upload {
-            ($data:expr, $variant:ident) => {{
-                let data = if layout.is_contiguous() {
-                    let start = layout.start_offset();
-                    let len = layout.shape().elem_count();
-                    &$data[start..start + len]
-                } else {
-                    let extracted: Vec<_> = layout.strided_index().map(|i| $data[i]).collect();
-                    return Ok(Self {
-                        slice: CudaStorageSlice::$variant(stream.clone_htod(&extracted).ce()?),
-                        stream: stream.clone(),
-                    });
-                };
-                CudaStorageSlice::$variant(stream.clone_htod(data).ce()?)
-            }};
-        }
-        let slice = match cpu {
-            CpuStorage::U8(v) => upload!(v, U8),
-            CpuStorage::U32(v) => upload!(v, U32),
-            CpuStorage::I32(v) => upload!(v, I32),
-            CpuStorage::I64(v) => upload!(v, I64),
-            CpuStorage::BF16(v) => upload!(v, BF16),
-            CpuStorage::F16(v) => upload!(v, F16),
-            CpuStorage::F32(v) => upload!(v, F32),
-            CpuStorage::F64(v) => upload!(v, F64),
-        };
-        Ok(Self { slice, stream: stream.clone() })
-    }
-
-    /// Download GPU data to CPU storage.
-    pub fn to_cpu(&self, layout: &Layout) -> Result<CpuStorage> {
-        macro_rules! download {
-            ($slice:expr, $variant:ident) => {{
-                let data = self.stream.clone_dtoh($slice).ce()?;
-                if layout.is_contiguous() {
-                    let start = layout.start_offset();
-                    let len = layout.shape().elem_count();
-                    CpuStorage::$variant(data[start..start + len].to_vec())
-                } else {
-                    let extracted: Vec<_> = layout.strided_index().map(|i| data[i]).collect();
-                    CpuStorage::$variant(extracted)
-                }
-            }};
-        }
-        Ok(match &self.slice {
-            CudaStorageSlice::U8(s) => download!(s, U8),
-            CudaStorageSlice::U32(s) => download!(s, U32),
-            CudaStorageSlice::I32(s) => download!(s, I32),
-            CudaStorageSlice::I64(s) => download!(s, I64),
-            CudaStorageSlice::BF16(s) => download!(s, BF16),
-            CudaStorageSlice::F16(s) => download!(s, F16),
-            CudaStorageSlice::F32(s) => download!(s, F32),
-            CudaStorageSlice::F64(s) => download!(s, F64),
-        })
-    }
 }
 
-impl std::fmt::Debug for CudaStorage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "CudaStorage({:?}, gpu:{})",
-            self.slice,
-            self.stream.context().ordinal()
-        )
-    }
-}
-
-// ── DeviceStorageTrait impl ──────────────────────────────────────
-
-impl DeviceStorageTrait for CudaStorage {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-    fn clone_box(&self) -> Box<dyn DeviceStorageTrait> {
-        macro_rules! clone_slice {
-            ($s:expr, $variant:ident) => {
-                CudaStorageSlice::$variant(self.stream.clone_dtod($s).unwrap())
-            };
-        }
-        let new_slice = match &self.slice {
-            CudaStorageSlice::U8(s) => clone_slice!(s, U8),
-            CudaStorageSlice::U32(s) => clone_slice!(s, U32),
-            CudaStorageSlice::I32(s) => clone_slice!(s, I32),
-            CudaStorageSlice::I64(s) => clone_slice!(s, I64),
-            CudaStorageSlice::BF16(s) => clone_slice!(s, BF16),
-            CudaStorageSlice::F16(s) => clone_slice!(s, F16),
-            CudaStorageSlice::F32(s) => clone_slice!(s, F32),
-            CudaStorageSlice::F64(s) => clone_slice!(s, F64),
-        };
-        Box::new(CudaStorage {
-            slice: new_slice,
-            stream: self.stream.clone(),
-        })
-    }
-    fn dtype(&self) -> DType {
-        self.slice.dtype()
-    }
-    fn len(&self) -> usize {
-        self.slice.len()
-    }
-}
-
-// ── GpuDType trait ─────────���─────────────────────────────────────
 
 /// Type-safe CUDA dtype mapping. Enables generic kernel dispatch.
 pub trait GpuDType: DeviceRepr + Sized + Copy + 'static {
@@ -361,27 +178,13 @@ impl_gpu_dtype!(f64, F64, DType::F64, "f64");
 // ── Tensor ↔ CudaStorage helpers ─────────────────────────────────
 
 /// Extract `&CudaStorage` from a Storage reference.
-pub fn as_cuda<'a>(
-    storage: &'a Storage,
-    ctx: &str,
-) -> Result<&'a CudaStorage> {
-    match storage {
-        Storage::Device(ds) => ds
-            .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| prelude_core::tensor::Error::Msg(format!("{ctx}: not CudaStorage"))),
-    }
+pub fn as_cuda<'a>(storage: &'a Storage, _ctx: &str) -> Result<&'a CudaStorage> {
+    storage.as_cuda()
 }
 
 /// Extract `&mut CudaStorage` from a mutable Storage reference.
-pub fn as_cuda_mut<'a>(
-    storage: &'a mut Storage,
-    ctx: &str,
-) -> Result<&'a mut CudaStorage> {
-    match storage {
-        Storage::Device(ds) => ds
-            .downcast_mut::<CudaStorage>()
-            .ok_or_else(|| prelude_core::tensor::Error::Msg(format!("{ctx}: not CudaStorage"))),
-    }
+pub fn as_cuda_mut<'a>(storage: &'a mut Storage, _ctx: &str) -> Result<&'a mut CudaStorage> {
+    storage.as_cuda_mut()
 }
 
 // ── Tensor ↔ CudaStorage extraction helpers ────────────────────
@@ -393,7 +196,7 @@ pub fn storage_and_layout(t: &Tensor) -> (&Storage, &Layout) {
 
 /// Re-export cudarc types used by ops kernels.
 pub use cudarc::driver::{
-    CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, LaunchConfig, PushKernelArg,
+    DevicePtr, DevicePtrMut, DeviceRepr, LaunchConfig, PushKernelArg,
 };
 
 /// Create a Tensor from a CudaStorage (contiguous, no grad).
@@ -401,8 +204,7 @@ pub fn tensor_from_device(storage: CudaStorage, shape: Shape) -> Tensor {
     let dtype = storage.dtype();
     let device = Device::Cuda(storage.stream.context().ordinal());
     let layout = Layout::contiguous(shape);
-    let ds = DeviceStorage::new(Box::new(storage));
-    Tensor::from_storage_layout(Arc::new(Storage::Device(ds)), layout, dtype, device)
+    Tensor::from_storage_layout(Arc::new(Storage::Cuda(storage)), layout, dtype, device)
 }
 
 /// Create a Tensor from a typed CudaSlice (contiguous, no grad).

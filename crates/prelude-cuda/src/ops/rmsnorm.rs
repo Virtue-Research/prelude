@@ -1,4 +1,4 @@
-use crate::device::{self as cb, CuResultExt, LaunchConfig, PushKernelArg};
+use crate::device::{self as cb, CuResultExt, LaunchConfig, PushKernelArg, CudaStorageExt};
 use crate::{MOD_ADD_RMSNORM, MOD_RMSNORM, PTX_ADD_RMSNORM, PTX_RMSNORM};
 use prelude_core::tensor::{bail, DType, Result, Tensor};
 

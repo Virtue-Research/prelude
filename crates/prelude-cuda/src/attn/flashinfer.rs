@@ -3,7 +3,7 @@
 //! Wraps `prelude_flashinfer` crate with the plan-then-run API.
 //! Workspace buffers are allocated once per device and reused.
 
-use crate::device::{self as cb, DevicePtr};
+use crate::device::{self as cb, DevicePtr, CudaStorageExt};
 use cudarc::driver::CudaStream;
 use prelude_core::tensor::{bail, DType, Device, Result, Tensor};
 use half::bf16;

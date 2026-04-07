@@ -52,6 +52,7 @@ cpu = []
 # CUDA inference — all GPU backends (FlashInfer, FA4, CUTLASS, DeepGEMM, quant-gemm, cuLA)
 cuda = [
     "dep:prelude-cuda",
+    "prelude-core/cuda",
 ]
 # Everything
 full = ["cpu", "cuda"]

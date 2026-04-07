@@ -7,7 +7,7 @@
 //! (attention, RoPE, etc.) that haven't been converted yet.
 
 use prelude_core::tensor::{bail, DType, Module, Result, Tensor};
-use crate::device::{self as cb, CuResultExt, DeviceRepr, DevicePtr, GpuDType};
+use crate::device::{self as cb, CuResultExt, DeviceRepr, DevicePtr, GpuDType, CudaStorageExt};
 use std::ffi::c_void;
 
 /// Register our GEMM dispatch. Must be called before any GPU matmul.

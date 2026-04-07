@@ -3,7 +3,7 @@
 //! Converts quantized weight blocks to BF16 on the GPU.
 //! All kernel implementations live in prelude-quant-gemm.
 
-use crate::device::{self as cb, CuResultExt, DevicePtr};
+use crate::device::{self as cb, CuResultExt, DevicePtr, CudaStorageExt};
 use prelude_core::tensor::{bail, DType, Result, Tensor};
 use std::ffi::c_void;
 

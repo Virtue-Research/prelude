@@ -1,4 +1,4 @@
-use crate::device::{self as cb, CuResultExt, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg};
+use crate::device::{self as cb, CuResultExt, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg, CudaStorageExt};
 use crate::{MOD_MOE_ROUTING, PTX_MOE_ROUTING};
 use prelude_core::tensor::{bail, DType, Result, Tensor};
 
