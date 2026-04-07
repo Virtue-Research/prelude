@@ -89,9 +89,11 @@ unsafe fn update_tensor<T: GpuDType>(
         "update_tensor: data len {} exceeds tensor elem_count {}",
         data.len(), tensor.elem_count(),
     );
-    let mut guard = tensor.storage_rw().write()
-        .map_err(|_| EngineError::Internal("lock poisoned".into()))?;
-    let cuda = as_cuda_mut(&mut guard, "update_tensor")
+    // Safety: update_tensor is called from the single GPU worker thread;
+    // no concurrent access to these graph-owned buffers.
+    let storage_ptr = Arc::as_ptr(tensor.storage_arc()) as *mut prelude_core::tensor::Storage;
+    let storage_mut = &mut *storage_ptr;
+    let cuda = as_cuda_mut(storage_mut, "update_tensor")
         .map_err(|e| EngineError::Internal(format!("update_tensor: {e}")))?;
     let slice = T::as_cuda_slice_mut(&mut cuda.slice)
         .map_err(|e| EngineError::Internal(format!("as_cuda_slice_mut: {e}")))?;

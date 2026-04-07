@@ -24,16 +24,15 @@ pub fn cuda_ops() -> &'static dyn Ops {
 use crate::device::{self as cs, CuResultExt as CsResultExt, DevicePtr};
 use crate::tensor_ops_kernels as tk;
 
-fn extract(t: &Tensor) -> Result<(std::sync::RwLockReadGuard<'_, prelude_core::tensor::Storage>, &prelude_core::tensor::Layout)> {
-    let guard = t.storage_rw().read().map_err(|_| prelude_core::tensor::Error::Msg("lock poisoned".into()))?;
-    let layout = t.our_layout();
-    Ok((guard, layout))
+fn extract(t: &Tensor) -> (&prelude_core::tensor::Storage, &prelude_core::tensor::Layout) {
+    (t.storage(), t.our_layout())
 }
 
 fn cu_seqlens_to_lens(cu_seqlens: &Tensor) -> Result<Tensor> {
-    let v: Vec<u32> = cu_seqlens.to_vec1()?;
-    let lens: Vec<u32> = v.windows(2).map(|w| w[1] - w[0]).collect();
-    Tensor::from_vec(lens, (v.len() - 1,), cu_seqlens.device())
+    let n = cu_seqlens.dim(0)? - 1;
+    let hi = cu_seqlens.narrow(0, 1, n)?;
+    let lo = cu_seqlens.narrow(0, 0, n)?;
+    hi.sub(&lo)
 }
 
 // ── The single impl ───────────────────────────────────────────────
@@ -45,8 +44,8 @@ impl Ops for CudaOps {
 
     fn unary(&self, x: &Tensor, op: UnaryOp) -> Result<Tensor> {
         use UnaryOp::*;
-        let (guard, layout) = extract(x)?;
-        let cuda = cs::as_cuda(&guard, "unary")?;
+        let (storage, layout) = extract(x);
+        let cuda = cs::as_cuda(storage, "unary")?;
         let kernel = match op {
             Exp => "uexp", Log => "ulog", Sin => "usin", Cos => "ucos",
             Abs => "uabs", Neg => "uneg", Sqr => "usqr", Sqrt => "usqrt",
@@ -56,43 +55,39 @@ impl Ops for CudaOps {
         };
         let result = tk::launch_unary(cuda, layout, kernel)?;
         let shape = layout.shape().clone();
-        drop(guard);
         Ok(cs::tensor_from_device(result, shape))
     }
 
     fn binary(&self, a: &Tensor, b: &Tensor, op: BinaryOp) -> Result<Tensor> {
         use BinaryOp::*;
-        let (ga, la) = extract(a)?;
-        let (gb, lb) = extract(b)?;
-        let ca = cs::as_cuda(&ga, "binary lhs")?;
-        let cb = cs::as_cuda(&gb, "binary rhs")?;
+        let (sa, la) = extract(a);
+        let (sb, lb) = extract(b);
+        let ca = cs::as_cuda(sa, "binary lhs")?;
+        let cb = cs::as_cuda(sb, "binary rhs")?;
         let kernel = match op { Add => "badd", Sub => "bsub", Mul => "bmul", Div => "bdiv", Min => "bminimum", Max => "bmaximum" };
         let out_shape = la.shape().broadcast_shape_binary_op(lb.shape(), "binary")?;
         let result = tk::launch_binary(ca, &la.broadcast_as(&out_shape)?, cb, &lb.broadcast_as(&out_shape)?, &out_shape, kernel)?;
-        drop(ga); drop(gb);
         Ok(cs::tensor_from_device(result, out_shape))
     }
 
     fn compare(&self, a: &Tensor, b: &Tensor, op: CompareOp) -> Result<Tensor> {
         use CompareOp::*;
-        let (ga, la) = extract(a)?;
-        let (gb, lb) = extract(b)?;
-        let ca = cs::as_cuda(&ga, "compare lhs")?;
-        let cb = cs::as_cuda(&gb, "compare rhs")?;
+        let (sa, la) = extract(a);
+        let (sb, lb) = extract(b);
+        let ca = cs::as_cuda(sa, "compare lhs")?;
+        let cb = cs::as_cuda(sb, "compare rhs")?;
         let kernel = match op { Eq => "eq", Ne => "ne", Lt => "lt", Gt => "gt", Ge => "ge", Le => "le" };
         let out_shape = la.shape().broadcast_shape_binary_op(lb.shape(), "compare")?;
         let result = tk::launch_compare(ca, &la.broadcast_as(&out_shape)?, cb, &lb.broadcast_as(&out_shape)?, &out_shape, kernel)?;
-        drop(ga); drop(gb);
         Ok(cs::tensor_from_device(result, out_shape))
     }
 
     fn reduce(&self, x: &Tensor, dim: usize, keepdim: bool, op: ReduceOp) -> Result<Tensor> {
         use ReduceOp::*;
-        let (guard, layout) = extract(x)?;
-        let cuda = cs::as_cuda(&guard, "reduce")?;
+        let (storage, layout) = extract(x);
+        let cuda = cs::as_cuda(storage, "reduce")?;
         let kernel = match op { Sum => "fast_sum", Max => "fast_max", Min => "fast_min", ArgMax => "fast_argmax", ArgMin => "fast_argmin" };
         let (result, out_shape) = tk::launch_reduce(cuda, layout, kernel, dim)?;
-        drop(guard);
         if keepdim {
             let mut dims = x.dims().to_vec();
             dims[dim] = 1;
@@ -104,29 +99,26 @@ impl Ops for CudaOps {
 
     fn cast(&self, x: &Tensor, dtype: DType) -> Result<Tensor> {
         if x.dtype() == dtype { return Ok(x.clone()); }
-        let (guard, layout) = extract(x)?;
-        let cuda = cs::as_cuda(&guard, "cast")?;
+        let (storage, layout) = extract(x);
+        let cuda = cs::as_cuda(storage, "cast")?;
         let result = tk::launch_cast(cuda, layout, dtype)?;
         let shape = layout.shape().clone();
-        drop(guard);
         Ok(cs::tensor_from_device(result, shape))
     }
 
     fn contiguous(&self, x: &Tensor) -> Result<Tensor> {
-        let (guard, layout) = extract(x)?;
-        let cuda = cs::as_cuda(&guard, "contiguous")?;
+        let (storage, layout) = extract(x);
+        let cuda = cs::as_cuda(storage, "contiguous")?;
         let result = tk::launch_contiguous(cuda, layout)?;
         let shape = layout.shape().clone();
-        drop(guard);
         Ok(cs::tensor_from_device(result, shape))
     }
 
     fn affine(&self, x: &Tensor, mul: f64, add: f64) -> Result<Tensor> {
-        let (guard, layout) = extract(x)?;
-        let cuda = cs::as_cuda(&guard, "affine")?;
+        let (storage, layout) = extract(x);
+        let cuda = cs::as_cuda(storage, "affine")?;
         let result = tk::launch_affine(cuda, layout, mul, add)?;
         let shape = layout.shape().clone();
-        drop(guard);
         Ok(cs::tensor_from_device(result, shape))
     }
 
@@ -149,36 +141,31 @@ impl Ops for CudaOps {
         let shape = x.shape().clone();
         let layout = x.our_layout().clone();
         if device.is_cpu() {
-            let guard = x.storage_rw().read().map_err(|_| prelude_core::tensor::Error::Msg("lock".into()))?;
-            let cuda = cs::as_cuda(&guard, "to_device CPU")?;
+            let cuda = cs::as_cuda(x.storage(), "to_device CPU")?;
             let cpu = cuda.to_cpu(&layout)?;
-            drop(guard);
             Ok(Tensor::from_storage_layout(
-                std::sync::Arc::new(std::sync::RwLock::new(prelude_core::tensor::Storage::Device(
+                std::sync::Arc::new(prelude_core::tensor::Storage::Device(
                     prelude_core::tensor::DeviceStorage::from_cpu(cpu),
-                ))),
+                )),
                 prelude_core::tensor::Layout::contiguous(shape), x.dtype(), Device::Cpu,
             ))
         } else {
             let ordinal = device.ordinal();
             let stream = cs::cuda_stream(ordinal)?;
-            let guard = x.storage_rw().read().map_err(|_| prelude_core::tensor::Error::Msg("lock".into()))?;
-            match &*guard {
+            let storage = x.storage();
+            match storage {
                 prelude_core::tensor::Storage::Device(dev) if dev.downcast_ref::<prelude_core::tensor::CpuStorage>().is_some() => {
                     let cpu = dev.downcast_ref::<prelude_core::tensor::CpuStorage>().unwrap();
                     let result = cs::CudaStorage::from_cpu(&stream, cpu, &layout)?;
-                    drop(guard);
                     Ok(cs::tensor_from_device(result, shape))
                 }
                 prelude_core::tensor::Storage::Device(_) => {
-                    let cuda = cs::as_cuda(&guard, "to_device GPU")?;
+                    let cuda = cs::as_cuda(storage, "to_device GPU")?;
                     let cpu = cuda.to_cpu(&layout)?;
                     let cl = prelude_core::tensor::Layout::contiguous(shape.clone());
                     let result = cs::CudaStorage::from_cpu(&stream, &cpu, &cl)?;
-                    drop(guard);
                     Ok(cs::tensor_from_device(result, shape))
                 }
-                _ => bail!("to_device: unsupported storage type"),
             }
         }
     }
@@ -205,48 +192,44 @@ impl Ops for CudaOps {
     }
 
     fn index_select(&self, x: &Tensor, indices: &Tensor, dim: usize) -> Result<Tensor> {
-        let (gx, lx) = extract(x)?;
-        let (gi, li) = extract(indices)?;
-        let cx = cs::as_cuda(&gx, "index_select x")?;
-        let ci = cs::as_cuda(&gi, "index_select ids")?;
+        let (sx, lx) = extract(x);
+        let (si, li) = extract(indices);
+        let cx = cs::as_cuda(sx, "index_select x")?;
+        let ci = cs::as_cuda(si, "index_select ids")?;
         let (result, out_shape) = tk::launch_index_select(cx, lx, ci, li, dim)?;
-        drop(gx); drop(gi);
         Ok(cs::tensor_from_device(result, out_shape))
     }
 
     fn gather(&self, x: &Tensor, indices: &Tensor, dim: usize) -> Result<Tensor> {
-        let (gx, lx) = extract(x)?;
-        let (gi, li) = extract(indices)?;
-        let cx = cs::as_cuda(&gx, "gather x")?;
-        let ci = cs::as_cuda(&gi, "gather ids")?;
+        let (sx, lx) = extract(x);
+        let (si, li) = extract(indices);
+        let cx = cs::as_cuda(sx, "gather x")?;
+        let ci = cs::as_cuda(si, "gather ids")?;
         let (result, out_shape) = tk::launch_gather(cx, lx, ci, li, dim)?;
-        drop(gx); drop(gi);
         Ok(cs::tensor_from_device(result, out_shape))
     }
 
     fn scatter_add(&self, x: &Tensor, indices: &Tensor, src: &Tensor, dim: usize) -> Result<Tensor> {
-        let (gx, lx) = extract(x)?;
-        let (gi, li) = extract(indices)?;
-        let (gs, ls) = extract(src)?;
-        let cx = cs::as_cuda(&gx, "scatter_add dst")?;
-        let ci = cs::as_cuda(&gi, "scatter_add ids")?;
-        let cs_s = cs::as_cuda(&gs, "scatter_add src")?;
+        let (sx, lx) = extract(x);
+        let (si, li) = extract(indices);
+        let (ss, ls) = extract(src);
+        let cx = cs::as_cuda(sx, "scatter_add dst")?;
+        let ci = cs::as_cuda(si, "scatter_add ids")?;
+        let cs_s = cs::as_cuda(ss, "scatter_add src")?;
         let result = tk::launch_scatter_add(cx, lx, ci, li, cs_s, ls, dim)?;
         let shape = lx.shape().clone();
-        drop(gx); drop(gi); drop(gs);
         Ok(cs::tensor_from_device(result, shape))
     }
 
     fn index_add(&self, x: &Tensor, indices: &Tensor, src: &Tensor, dim: usize) -> Result<Tensor> {
-        let (gx, lx) = extract(x)?;
-        let (gi, li) = extract(indices)?;
-        let (gs, ls) = extract(src)?;
-        let cx = cs::as_cuda(&gx, "index_add dst")?;
-        let ci = cs::as_cuda(&gi, "index_add ids")?;
-        let cs_s = cs::as_cuda(&gs, "index_add src")?;
+        let (sx, lx) = extract(x);
+        let (si, li) = extract(indices);
+        let (ss, ls) = extract(src);
+        let cx = cs::as_cuda(sx, "index_add dst")?;
+        let ci = cs::as_cuda(si, "index_add ids")?;
+        let cs_s = cs::as_cuda(ss, "index_add src")?;
         let result = tk::launch_index_add(cx, lx, ci, li, cs_s, ls, dim)?;
         let shape = lx.shape().clone();
-        drop(gx); drop(gi); drop(gs);
         Ok(cs::tensor_from_device(result, shape))
     }
 
@@ -262,14 +245,11 @@ impl Ops for CudaOps {
         let mut out_dims = tensors[0].dims().to_vec();
         for t in &tensors[1..] { out_dims[dim] += t.dims()[dim]; }
         let out_shape = Shape::from(out_dims);
-        let guards: Vec<_> = tensors.iter()
-            .map(|t| t.storage_rw().read().map_err(|_| prelude_core::tensor::Error::Msg("lock".into())))
-            .collect::<Result<Vec<_>>>()?;
+        let storages: Vec<_> = tensors.iter().map(|t| t.storage()).collect();
         let layouts: Vec<_> = tensors.iter().map(|t| t.our_layout()).collect();
-        let cudas: Vec<_> = guards.iter().map(|g| cs::as_cuda(g, "cat")).collect::<Result<Vec<_>>>()?;
+        let cudas: Vec<_> = storages.iter().map(|s| cs::as_cuda(s, "cat")).collect::<Result<Vec<_>>>()?;
         let pairs: Vec<_> = cudas.iter().zip(layouts.iter()).map(|(c, l)| (*c, *l)).collect();
         let result = tk::launch_cat(&pairs, dim, &out_shape)?;
-        drop(guards);
         Ok(cs::tensor_from_device(result, out_shape))
     }
 
@@ -316,17 +296,13 @@ impl Ops for CudaOps {
     }
 
     fn paged_attention(&self, q: &Tensor, key_cache: &Tensor, value_cache: &Tensor, params: &PagedParams) -> Result<Tensor> {
-        // Decode (Q=1): FlashInfer's dedicated decode kernel is much faster
-        // than FA4's varlen prefill kernel for the single-token case.
-        if params.max_seqlen_q == 1 {
-            if let Some(r) = try_flashinfer_paged(q, key_cache, value_cache, params) { return r; }
-        }
-        // Prefill (Q>1): try FA4 first, fall back to FlashInfer prefill.
+        // FA4 paged: handles both prefill (Q>1) and decode (Q=1).
         let seqused_k = cu_seqlens_to_lens(params.cu_seqlens_k)?;
         if let Some(r) = crate::attn::flash_v4::try_varlen_paged(
             q, key_cache, value_cache, params.block_tables,
             params.cu_seqlens_q, &seqused_k, params.max_seqlen_q, params.max_seqlen_k, params.scale,
         ) { return r; }
+        // FlashInfer fallback (SM80 without FA4, or non-BF16).
         if let Some(r) = try_flashinfer_paged(q, key_cache, value_cache, params) { return r; }
         bail!("paged_attention: no kernel available for this configuration")
     }

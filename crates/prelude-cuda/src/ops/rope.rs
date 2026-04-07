@@ -86,11 +86,5 @@ pub fn fused_qknorm_rope_varlen(
     builder.arg(&eps_val);
     unsafe { builder.launch(cfg) }.ce()?;
 
-    drop(x_storage);
-    drop(w_storage);
-    drop(cos_storage);
-    drop(sin_storage);
-    drop(pos_storage);
-
     Ok(cb::tensor_from_cuda(out, stream, shape.clone()))
 }

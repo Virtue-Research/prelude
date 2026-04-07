@@ -49,9 +49,6 @@ pub fn fused_silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
 
     let out_shape = gate_layout.shape().clone();
 
-    drop(gate_storage);
-    drop(up_storage);
-
     Ok(cb::tensor_from_cuda(out, stream, out_shape))
 }
 
@@ -101,9 +98,6 @@ pub fn vectorized_add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     unsafe { builder.launch(cfg) }.ce()?;
 
     let out_shape = a_layout.shape().clone();
-
-    drop(a_storage);
-    drop(b_storage);
 
     Ok(cb::tensor_from_cuda(out, stream, out_shape))
 }

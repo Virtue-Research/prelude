@@ -133,15 +133,6 @@ pub fn fused_knorm_rope_kv_cache_write_thd(
     builder.arg(&eps_val);
     unsafe { builder.launch(cfg) }.ce()?;
 
-    drop(k_storage);
-    drop(v_storage);
-    drop(w_storage);
-    drop(cos_storage);
-    drop(sin_storage);
-    drop(kc_storage);
-    drop(vc_storage);
-    drop(sm_storage);
-
     Ok(())
 }
 
@@ -264,16 +255,6 @@ pub fn fused_knorm_rope_kv_cache_write_varlen(
     builder.arg(&eps_val);
     unsafe { builder.launch(cfg) }.ce()?;
 
-    drop(k_storage);
-    drop(v_storage);
-    drop(w_storage);
-    drop(cos_storage);
-    drop(sin_storage);
-    drop(pos_storage);
-    drop(kc_storage);
-    drop(vc_storage);
-    drop(sm_storage);
-
     Ok(())
 }
 
@@ -359,12 +340,6 @@ pub fn scatter_kv_cache_flash(
     builder.arg(&key_stride);
     builder.arg(&value_stride);
     unsafe { builder.launch(cfg) }.ce()?;
-
-    drop(k_storage);
-    drop(v_storage);
-    drop(kc_storage);
-    drop(vc_storage);
-    drop(sm_storage);
 
     Ok(())
 }

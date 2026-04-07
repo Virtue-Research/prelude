@@ -12,7 +12,7 @@ pub mod with_dtype;
 pub use error::{DeviceLocation, Error, Result};
 pub use shape::{D, Dim, Dims, Shape, ShapeWithOneHole};
 pub use layout::Layout;
-pub use storage::{CpuStorage, CubeCLStorage, DeviceStorage, DeviceStorageTrait, Storage, cpu_extract_vec};
+pub use storage::{CpuStorage, DeviceStorage, DeviceStorageTrait, Storage, cpu_extract_vec};
 pub use with_dtype::{WithDType, IntDType, FloatDType};
 
 // ── DType ──────────────────────────────────────────────────────────
@@ -73,30 +73,16 @@ pub trait Module {
     fn forward(&self, x: &Tensor) -> Result<Tensor>;
 }
 
-// ── TensorId ───────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TensorId(usize);
-
-impl TensorId {
-    fn new() -> Self {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        Self(COUNTER.fetch_add(1, Ordering::Relaxed))
-    }
-}
-
 // ── Tensor ─────────────────────────────────────────────────────────
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Tensor {
-    storage: Arc<RwLock<Storage>>,
+    storage: Arc<Storage>,
     layout: Layout,
     dtype: DType,
     device: Device,
-    id: TensorId,
 }
 
 impl std::fmt::Debug for Tensor {
@@ -108,41 +94,27 @@ impl std::fmt::Debug for Tensor {
 /// Device-aware ops: thread-local first, then device-based fallback.
 fn ops_for(device: &Device) -> &'static dyn crate::ops::Ops { crate::ops::ops_for(device) }
 
-/// Whether we're using the Device (pure CpuStorage) backend path.
-fn use_device_backend() -> bool {
-    use std::sync::LazyLock;
-    // Default: Device backend (CpuStorage / CudaStorage).
-    // Set PRELUDE_TENSOR_BACKEND=cubecl to use CubeCL runtime instead.
-    static CHOICE: LazyLock<bool> = LazyLock::new(|| {
-        !std::env::var("PRELUDE_TENSOR_BACKEND")
-            .map(|v| v == "cubecl")
-            .unwrap_or(false)
-    });
-    *CHOICE
-}
-
 impl Tensor {
     /// Device-aware ops dispatch for this tensor.
     fn ops(&self) -> &'static dyn crate::ops::Ops { ops_for(&self.device) }
 
     /// Create a Tensor from existing storage + layout.
     pub fn from_storage_layout(
-        storage: Arc<RwLock<Storage>>,
+        storage: Arc<Storage>,
         layout: Layout,
         dtype: DType,
         device: Device,
     ) -> Self {
-        Self { storage, layout, dtype, device, id: TensorId::new() }
+        Self { storage, layout, dtype, device }
     }
 
-    /// Create a legacy CPU tensor (wraps CpuStorage in DeviceStorage).
-    /// Used only by the legacy path. CubeCL path uses ops().zeros/from_bytes.
+    /// Create a CPU tensor (wraps CpuStorage in DeviceStorage).
     fn new_cpu_legacy(cpu_storage: CpuStorage, shape: Shape) -> Self {
         let dtype = cpu_storage.dtype();
         let layout = Layout::contiguous(shape);
         Self {
-            storage: Arc::new(RwLock::new(Storage::Device(DeviceStorage::from_cpu(cpu_storage)))),
-            layout, dtype, device: Device::Cpu, id: TensorId::new(),
+            storage: Arc::new(Storage::Device(DeviceStorage::from_cpu(cpu_storage))),
+            layout, dtype, device: Device::Cpu,
         }
     }
 
@@ -152,7 +124,6 @@ impl Tensor {
             layout,
             dtype: self.dtype,
             device: self.device,
-            id: TensorId::new(),
         }
     }
 
@@ -208,19 +179,9 @@ impl Tensor {
         }
 
         let cpu_storage = CpuStorage::from_typed_vec(data);
-        let bytes = cpu_storage.as_bytes();
-
-        // Choose storage based on active backend — no bridge between paths.
-        let storage = if use_device_backend() {
-            Storage::Device(DeviceStorage::from_cpu(cpu_storage))
-        } else {
-            let cubecl_device: cubecl::cpu::CpuDevice = Default::default();
-            let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&cubecl_device);
-            let handle = client.create(cubecl::bytes::Bytes::from_bytes_vec(bytes.to_vec()));
-            Storage::CubeCL(CubeCLStorage::new(handle, dtype, shape.elem_count()))
-        };
+        let storage = Storage::Device(DeviceStorage::from_cpu(cpu_storage));
         let t = Self::from_storage_layout(
-            Arc::new(RwLock::new(storage)),
+            Arc::new(storage),
             Layout::contiguous(shape),
             dtype,
             *device,
@@ -234,7 +195,7 @@ impl Tensor {
         let cpu_storage = CpuStorage::from_typed_vec(data);
         let storage = Storage::Device(DeviceStorage::from_cpu(cpu_storage));
         Ok(Self::from_storage_layout(
-            Arc::new(RwLock::new(storage)),
+            Arc::new(storage),
             Layout::contiguous(shape),
             dtype,
             Device::Cpu,
@@ -309,7 +270,7 @@ impl Tensor {
     pub fn is_contiguous(&self) -> bool { self.layout.is_contiguous() }
     pub fn our_layout(&self) -> &Layout { &self.layout }
     pub fn stride(&self) -> &[usize] { self.layout.stride() }
-    pub fn tensor_id(&self) -> TensorId { self.id }
+
 
     // ── View ops (pure metadata — shares storage Arc) ───────────────
 
@@ -452,16 +413,8 @@ impl Tensor {
             return self.to_device(&Device::Cpu)?.to_vec1();
         }
         let t = self.contiguous()?.flatten_all()?;
-        let guard = t.storage.read().map_err(|_| Error::Msg("lock poisoned".into()))?;
-        match &*guard {
-            Storage::CubeCL(s) => {
-                let device: cubecl::cpu::CpuDevice = Default::default();
-                let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&device);
-                let bytes = client.read_one(s.handle.clone())
-                    .map_err(|e| Error::Msg(format!("CubeCL readback: {e:?}").into()))?;
-                let cpu = CpuStorage::from_raw_bytes(&bytes, s.dtype, s.len)?;
-                storage::cpu_extract_vec::<T>(&cpu, &t.layout)
-            }
+        let storage = &*t.storage;
+        match storage {
             Storage::Device(dev) => {
                 if let Some(cpu) = dev.downcast_ref::<CpuStorage>() {
                     storage::cpu_extract_vec::<T>(cpu, &t.layout)
@@ -637,67 +590,15 @@ impl Tensor {
         let d = dim.to_index(self.shape(), "slice_set")?;
         let src = src.contiguous()?;
 
-        let guard = self.storage.read().map_err(|_| Error::Msg("lock poisoned".into()))?;
-        match &*guard {
-            Storage::CubeCL(_) => {
-                drop(guard);
-                // CubeCL path: use kernel_slice_assign
-                let ops = crate::ops::ops_for(&self.device);
-                let src_handle = {
-                    let sg = src.storage.read().map_err(|_| Error::Msg("lock poisoned".into()))?;
-                    match &*sg {
-                        Storage::CubeCL(s) => s.handle.clone(),
-                        _ => return Err(Error::Msg("slice_set: mixed storage".into()).bt()),
-                    }
-                };
-                let dst_handle = {
-                    let dg = self.storage.read().map_err(|_| Error::Msg("lock poisoned".into()))?;
-                    match &*dg {
-                        Storage::CubeCL(s) => s.handle.clone(),
-                        _ => return Err(Error::Msg("slice_set: mixed storage".into()).bt()),
-                    }
-                };
-
-                let dtype = self.dtype;
-                let n = src.shape().elem_count();
-                let cubecl_device: cubecl::cpu::CpuDevice = Default::default();
-                let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&cubecl_device);
-                let (cc, cd) = {
-                    let cube_dim = cubecl::prelude::CubeDim::new(&client, n);
-                    (cubecl::calculate_cube_count_elemwise(&client, n, cube_dim), cube_dim)
-                };
-
-                let mut offsets = vec![0u32; self.rank()];
-                offsets[d] = start as u32;
-                let offsets_h = client.create(cubecl::bytes::Bytes::from_elems(offsets));
-                let offsets_th = cubecl::std::tensor::TensorHandle::new_contiguous(
-                    vec![self.rank()], offsets_h, crate::ops::cubecl_backend::elementwise::dtype_to_storage(DType::U32),
-                );
-
-                let dst_th = cubecl::std::tensor::TensorHandle::new_contiguous(
-                    self.shape().dims().to_vec(), dst_handle, crate::ops::cubecl_backend::elementwise::dtype_to_storage(dtype),
-                );
-                let src_th = cubecl::std::tensor::TensorHandle::new_contiguous(
-                    src.shape().dims().to_vec(), src_handle, crate::ops::cubecl_backend::elementwise::dtype_to_storage(dtype),
-                );
-
-                crate::ops::cubecl_backend::elementwise::kernel_slice_assign::launch::<f32, cubecl::cpu::CpuRuntime>(
-                    &client, cc, cd, dst_th.into_arg(), src_th.into_arg(), offsets_th.into_arg(),
-                );
-                Ok(())
-            }
-            Storage::Device(_) => {
-                drop(guard);
-                let src = if src.device.is_cuda() { src.to_device(&Device::Cpu)? } else { src };
-                let self_c = self.contiguous()?;
-                let mut guard = self_c.storage.write().map_err(|_| Error::Msg("lock poisoned".into()))?;
-                let src_guard = src.storage.read().map_err(|_| Error::Msg("lock poisoned".into()))?;
-                let dst_cpu = guard.as_cpu_mut()?;
-                let src_cpu = src_guard.as_cpu()?;
-                storage::cpu_slice_set(dst_cpu, &self_c.layout, src_cpu, &src.layout, d, start)?;
-                Ok(())
-            }
-        }
+        let src = if src.device.is_cuda() { src.to_device(&Device::Cpu)? } else { src };
+        let self_c = self.contiguous()?;
+        // Safety: slice_set is logically exclusive — caller ensures no concurrent access.
+        let storage_ptr = Arc::as_ptr(&self_c.storage) as *mut Storage;
+        let storage_mut = unsafe { &mut *storage_ptr };
+        let dst_cpu = storage_mut.as_cpu_mut()?;
+        let src_cpu = src.storage.as_cpu()?;
+        storage::cpu_slice_set(dst_cpu, &self_c.layout, src_cpu, &src.layout, d, start)?;
+        Ok(())
     }
 
     pub fn slice_assign<D: std::ops::RangeBounds<usize>>(&self, _ranges: &[D], _src: &Self) -> Result<Self> {
@@ -724,58 +625,36 @@ impl Tensor {
 
     // ── Storage access (our own types) ──────────────────────────────
 
-    pub fn storage_rw(&self) -> &Arc<RwLock<Storage>> { &self.storage }
+    /// Direct access to the shared storage (no lock needed — storage is immutable after creation).
+    pub fn storage(&self) -> &Storage { &self.storage }
 
-    /// Zero-copy typed slice view with read lock held.
+    /// Access the underlying Arc for when you need ownership semantics.
+    pub fn storage_arc(&self) -> &Arc<Storage> { &self.storage }
+
+    /// Zero-copy typed slice view.
     ///
-    /// Checks dtype, contiguity, and device. Returns a guard that derefs to `&[T]`.
-    /// The read lock is held for the guard's lifetime — concurrent reads OK,
-    /// concurrent writes blocked.
-    pub fn as_slice<T: WithDType>(&self) -> Result<SliceGuard<'_, T>> {
-        if T::DTYPE != self.dtype {
-            bail!("as_slice: dtype mismatch: expected {:?}, tensor is {:?}", T::DTYPE, self.dtype);
-        }
-        if !self.is_contiguous() {
-            bail!("as_slice: tensor is not contiguous");
-        }
-        if !self.device.is_cpu() {
-            bail!("as_slice: only CPU tensors can be viewed as host slices");
-        }
+    /// Checks dtype, contiguity, and device. Returns `&[T]` valid for the
+    /// tensor's lifetime (Arc keeps storage alive).
+    pub fn as_slice<T: WithDType>(&self) -> Result<&[T]> {
+        if !self.is_contiguous() { bail!("as_slice requires contiguous tensor"); }
+        if T::DTYPE != self.dtype { bail!("dtype mismatch: expected {:?}, got {:?}", self.dtype, T::DTYPE); }
         let n = self.elem_count();
-        // SAFETY: dtype, contiguity, and device checked. Pointer valid while
-        // guard (and thus the tensor's storage) is alive.
         unsafe {
             let ptr = self.ops().data_ptr(self)? as *const T;
-            let slice = std::slice::from_raw_parts(ptr, n);
-            let guard = self.storage.read()
-                .map_err(|_| Error::Msg("lock poisoned".into()))?;
-            Ok(SliceGuard { _guard: guard, slice })
+            Ok(std::slice::from_raw_parts(ptr, n))
         }
     }
 
-    /// Zero-copy mutable typed slice view with write lock held.
+    /// Zero-copy mutable typed slice view.
     ///
-    /// Checks dtype, contiguity, and device. Returns a guard that derefs to `&mut [T]`.
-    /// The write lock is held for the guard's lifetime — all other access blocked.
-    pub fn as_mut_slice<T: WithDType>(&self) -> Result<MutSliceGuard<'_, T>> {
-        if T::DTYPE != self.dtype {
-            bail!("as_mut_slice: dtype mismatch: expected {:?}, tensor is {:?}", T::DTYPE, self.dtype);
-        }
-        if !self.is_contiguous() {
-            bail!("as_mut_slice: tensor is not contiguous");
-        }
-        if !self.device.is_cpu() {
-            bail!("as_mut_slice: only CPU tensors can be mutated as host slices");
-        }
+    /// # Safety
+    /// Caller must ensure exclusive access (no concurrent reads or writes).
+    pub unsafe fn as_mut_slice<T: WithDType>(&self) -> Result<&mut [T]> {
+        if !self.is_contiguous() { bail!("as_mut_slice requires contiguous tensor"); }
+        if T::DTYPE != self.dtype { bail!("dtype mismatch"); }
         let n = self.elem_count();
-        // SAFETY: dtype, contiguity, and device checked. Write lock ensures exclusive access.
-        unsafe {
-            let ptr = self.ops().data_ptr_mut(self)? as *mut T;
-            let slice = std::slice::from_raw_parts_mut(ptr, n);
-            let guard = self.storage.write()
-                .map_err(|_| Error::Msg("lock poisoned".into()))?;
-            Ok(MutSliceGuard { _guard: guard, slice })
-        }
+        let ptr = self.ops().data_ptr_mut(self)? as *mut T;
+        Ok(std::slice::from_raw_parts_mut(ptr, n))
     }
 
     /// Raw data pointer, like PyTorch's `tensor.data_ptr()`.
@@ -793,34 +672,6 @@ impl Tensor {
     pub unsafe fn data_ptr_mut(&self) -> Result<*mut u8> {
         self.ops().data_ptr_mut(self)
     }
-}
-
-// ── Slice guards (hold RwLock for safe zero-copy access) ──────────
-
-/// Read guard: holds a read lock, derefs to `&[T]`.
-pub struct SliceGuard<'a, T> {
-    _guard: std::sync::RwLockReadGuard<'a, Storage>,
-    slice: &'a [T],
-}
-
-impl<T> std::ops::Deref for SliceGuard<'_, T> {
-    type Target = [T];
-    fn deref(&self) -> &[T] { self.slice }
-}
-
-/// Write guard: holds a write lock, derefs to `&mut [T]`.
-pub struct MutSliceGuard<'a, T> {
-    _guard: std::sync::RwLockWriteGuard<'a, Storage>,
-    slice: &'a mut [T],
-}
-
-impl<T> std::ops::Deref for MutSliceGuard<'_, T> {
-    type Target = [T];
-    fn deref(&self) -> &[T] { self.slice }
-}
-
-impl<T> std::ops::DerefMut for MutSliceGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut [T] { self.slice }
 }
 
 // ── Operator overloads ─────────────────────────────────────────────

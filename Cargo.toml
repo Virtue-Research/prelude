@@ -54,11 +54,6 @@ prelude-flashinfer = { path = "crates/prelude-cuda/flashinfer" }
 prelude-quant-gemm = { path = "crates/prelude-cuda/quant-gemm" }
 prelude-cula = { path = "crates/prelude-cuda/cula" }
 
-# CubeCL — multi-backend tensor primitives (pure Rust, JIT-compiled GPU kernels)
-cubecl = { git = "https://github.com/tracel-ai/cubecl", rev = "e743e8f7b22b93378bab28b26916f7cf61321ccc", default-features = false, features = ["cpu", "stdlib"] }
-# CubeK — pre-built CubeCL kernels (matmul, reduce, attention, convolution)
-cubek = { git = "https://github.com/tracel-ai/cubek", default-features = false, features = ["reduce", "matmul", "stdlib"] }
-
 # Tokenization & model loading
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
 fastokens = { git = "https://github.com/rucnyz/fastokens" }

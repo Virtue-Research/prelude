@@ -68,8 +68,6 @@ pub fn fused_moe_routing(
     builder.arg(&norm_val);
     unsafe { builder.launch(cfg) }.ce()?;
 
-    drop(rl_storage);
-
     // Wrap outputs as tensors
     let tw_tensor = cb::tensor_from_cuda(topk_weights, stream.clone(), (num_tokens, topk));
     let ti_tensor = cb::tensor_from_cuda(topk_ids, stream.clone(), (num_tokens * topk,));

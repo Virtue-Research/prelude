@@ -78,8 +78,5 @@ pub fn tiled_mmq(
         );
     }
 
-    drop(w_storage);
-    drop(a_storage);
-
     Ok(cb::tensor_from_cuda(output, stream, (m, n)))
 }

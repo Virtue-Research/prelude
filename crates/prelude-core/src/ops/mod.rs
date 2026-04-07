@@ -1,12 +1,10 @@
-//! Kernel operations — unified `Ops` trait + two parallel backends.
+//! Kernel operations — unified `Ops` trait + device backend.
 //!
 //! - `traits/ops.rs`: The unified `Ops` trait — one trait, override any method.
-//! - `cubecl_backend/`: CubeCL runtime backend (Storage::CubeCL).
 //! - `device_backend/`: Pure Rust backend (Storage::Device).
 //! - Device crates register via `register_backend()` with priority/probe at startup.
 
 pub mod traits;
-pub mod cubecl_backend;
 pub mod device_backend;
 
 pub use traits::*;
@@ -91,21 +89,10 @@ thread_local! {
     static THREAD_OPS: Cell<Option<&'static dyn Ops>> = const { Cell::new(None) };
 }
 
-/// Bare primitives (Device or CubeCL), WITHOUT device crate overlay.
+/// Bare primitives (Device backend), WITHOUT device crate overlay.
 /// Used by device crates' `default_impl()` to avoid recursion.
 pub fn bare_ops() -> &'static dyn Ops {
-    use std::sync::LazyLock;
-    // Default: Device backend. Set PRELUDE_TENSOR_BACKEND=cubecl to use CubeCL.
-    static USE_CUBECL: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var("PRELUDE_TENSOR_BACKEND")
-            .map(|v| v == "cubecl")
-            .unwrap_or(false)
-    });
-    if *USE_CUBECL {
-        cubecl_backend::cubecl_ops()
-    } else {
-        device_backend::device_ops()
-    }
+    device_backend::device_ops()
 }
 
 pub fn with_ops<R>(ops: &'static dyn Ops, f: impl FnOnce() -> R) -> R {

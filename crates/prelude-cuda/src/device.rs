@@ -10,7 +10,7 @@
 //! - PTX module loading and caching
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, ValidAsZeroBits,
 };
@@ -360,40 +360,35 @@ impl_gpu_dtype!(f64, F64, DType::F64, "f64");
 
 // ── Tensor ↔ CudaStorage helpers ─────────────────────────────────
 
-/// Extract `&CudaStorage` from a Tensor's storage guard.
-/// Caller must hold the RwLockReadGuard for the duration of GPU access.
+/// Extract `&CudaStorage` from a Storage reference.
 pub fn as_cuda<'a>(
-    guard: &'a std::sync::RwLockReadGuard<Storage>,
+    storage: &'a Storage,
     ctx: &str,
 ) -> Result<&'a CudaStorage> {
-    match &**guard {
+    match storage {
         Storage::Device(ds) => ds
             .downcast_ref::<CudaStorage>()
             .ok_or_else(|| prelude_core::tensor::Error::Msg(format!("{ctx}: not CudaStorage"))),
-        _ => bail!("{ctx}: requires CUDA tensor"),
     }
 }
 
-/// Extract `&mut CudaStorage` from a Tensor's write guard.
+/// Extract `&mut CudaStorage` from a mutable Storage reference.
 pub fn as_cuda_mut<'a>(
-    guard: &'a mut std::sync::RwLockWriteGuard<Storage>,
+    storage: &'a mut Storage,
     ctx: &str,
 ) -> Result<&'a mut CudaStorage> {
-    match &mut **guard {
+    match storage {
         Storage::Device(ds) => ds
             .downcast_mut::<CudaStorage>()
             .ok_or_else(|| prelude_core::tensor::Error::Msg(format!("{ctx}: not CudaStorage"))),
-        _ => bail!("{ctx}: requires CUDA tensor"),
     }
 }
 
 // ── Tensor ↔ CudaStorage extraction helpers ────────────────────
 
-/// Extract storage guard + layout from a Tensor.
-pub fn storage_and_layout(t: &Tensor) -> (std::sync::RwLockReadGuard<'_, Storage>, &Layout) {
-    let guard = t.storage_rw().read().expect("lock poisoned");
-    let layout = t.our_layout();
-    (guard, layout)
+/// Extract storage + layout from a Tensor.
+pub fn storage_and_layout(t: &Tensor) -> (&Storage, &Layout) {
+    (t.storage(), t.our_layout())
 }
 
 /// Re-export cudarc types used by ops kernels.
@@ -407,7 +402,7 @@ pub fn tensor_from_device(storage: CudaStorage, shape: Shape) -> Tensor {
     let device = Device::Cuda(storage.stream.context().ordinal());
     let layout = Layout::contiguous(shape);
     let ds = DeviceStorage::new(Box::new(storage));
-    Tensor::from_storage_layout(Arc::new(RwLock::new(Storage::Device(ds))), layout, dtype, device)
+    Tensor::from_storage_layout(Arc::new(Storage::Device(ds)), layout, dtype, device)
 }
 
 /// Create a Tensor from a typed CudaSlice (contiguous, no grad).
@@ -425,19 +420,13 @@ pub fn tensor_from_cuda<T: GpuDType>(
 
 /// Get the CudaStream from a Tensor.
 pub fn tensor_stream(t: &Tensor) -> Result<Arc<CudaStream>> {
-    let guard = t.storage_rw().read().map_err(|_| {
-        prelude_core::tensor::Error::Msg("lock poisoned".into())
-    })?;
-    let cuda = as_cuda(&guard, "tensor_stream")?;
+    let cuda = as_cuda(t.storage(), "tensor_stream")?;
     Ok(cuda.stream.clone())
 }
 
 /// Get the CudaContext from a Tensor.
 pub fn tensor_cuda_device(t: &Tensor) -> Result<Arc<CudaContext>> {
-    let guard = t.storage_rw().read().map_err(|_| {
-        prelude_core::tensor::Error::Msg("lock poisoned".into())
-    })?;
-    let cuda = as_cuda(&guard, "tensor_cuda_device")?;
+    let cuda = as_cuda(t.storage(), "tensor_cuda_device")?;
     Ok(cuda.device().clone())
 }
 

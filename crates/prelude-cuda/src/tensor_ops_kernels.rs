@@ -26,7 +26,7 @@ use crate::{
 /// Upload dims + strides to GPU for strided kernel access.
 /// Returns None if the layout is contiguous (kernel can use fast path).
 fn layout_info(stream: &Arc<CudaStream>, layout: &Layout) -> Result<Option<CudaSlice<usize>>> {
-    if layout.is_contiguous() && layout.start_offset() == 0 {
+    if layout.is_contiguous() {
         return Ok(None);
     }
     let dims = layout.shape().dims();
@@ -44,8 +44,8 @@ fn binary_layout_info(
     lhs_layout: &Layout,
     rhs_layout: &Layout,
 ) -> Result<Option<CudaSlice<usize>>> {
-    let lhs_cont = lhs_layout.is_contiguous() && lhs_layout.start_offset() == 0;
-    let rhs_cont = rhs_layout.is_contiguous() && rhs_layout.start_offset() == 0;
+    let lhs_cont = lhs_layout.is_contiguous();
+    let rhs_cont = rhs_layout.is_contiguous();
     if lhs_cont && rhs_cont {
         return Ok(None);
     }
@@ -65,9 +65,9 @@ fn ternary_layout_info(
     t_layout: &Layout,
     f_layout: &Layout,
 ) -> Result<Option<CudaSlice<usize>>> {
-    let all_cont = cond_layout.is_contiguous() && cond_layout.start_offset() == 0
-        && t_layout.is_contiguous() && t_layout.start_offset() == 0
-        && f_layout.is_contiguous() && f_layout.start_offset() == 0;
+    let all_cont = cond_layout.is_contiguous()
+        && t_layout.is_contiguous()
+        && f_layout.is_contiguous();
     if all_cont {
         return Ok(None);
     }

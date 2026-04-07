@@ -63,9 +63,6 @@ pub fn fast_rmsnorm(input: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor>
     builder.arg(&eps_val);
     unsafe { builder.launch(cfg) }.ce()?;
 
-    drop(x_storage);
-    drop(w_storage);
-
     Ok(cb::tensor_from_cuda(out, stream, shape.clone()))
 }
 
@@ -136,11 +133,6 @@ pub fn fused_add_rmsnorm(
     builder.arg(&d_val);
     builder.arg(&eps_val);
     unsafe { builder.launch(cfg) }.ce()?;
-
-    // Drop storage refs before creating new tensors
-    drop(x_storage);
-    drop(r_storage);
-    drop(w_storage);
 
     let sum_tensor = cb::tensor_from_cuda(out_sum, stream.clone(), shape.clone());
     let norm_tensor = cb::tensor_from_cuda(out_norm, stream, shape.clone());

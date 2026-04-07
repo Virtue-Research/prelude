@@ -43,7 +43,5 @@ pub fn dequantize_to_bf16(
         );
     }
 
-    drop(storage);
-
     Ok(cb::tensor_from_cuda(output, stream, num_elements))
 }

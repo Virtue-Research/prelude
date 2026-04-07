@@ -1,9 +1,7 @@
-//! Tensor storage — two paths for A/B comparison.
+//! Tensor storage — device-based storage with opaque trait objects.
 //!
-//! - `Storage::Device`: Legacy path. Opaque trait object — device crates provide concrete impls.
+//! - `Storage::Device`: Opaque trait object — device crates provide concrete impls.
 //!   prelude-cpu wraps CpuStorage (Vec<T>), prelude-cuda wraps CudaStorage (cudarc).
-//! - `Storage::CubeCL`: New path. CubeCL Handle — runtime-agnostic, managed by CubeCL.
-//!   All backends (CUDA, ROCm, Vulkan, Metal, CPU) use this in the CubeCL path.
 
 use super::{DType, Error, Result};
 
@@ -232,75 +230,38 @@ impl DeviceStorage {
     pub fn from_cpu(cpu: CpuStorage) -> Self { Self(Box::new(cpu)) }
 }
 
-// ── CubeCL Storage ──────────────────────────────��─────────────────
-
-/// CubeCL-managed tensor storage. Runtime-agnostic Handle.
-#[derive(Debug, Clone)]
-pub struct CubeCLStorage {
-    pub handle: cubecl::server::Handle,
-    pub dtype: DType,
-    pub len: usize,
-}
-
-impl CubeCLStorage {
-    pub fn new(handle: cubecl::server::Handle, dtype: DType, len: usize) -> Self {
-        Self { handle, dtype, len }
-    }
-}
-
 // ── Top-level Storage ──────────────────────────────────────────────
 
-/// Where tensor data lives. Two paths:
-/// - `Device`: Legacy (CPU via CpuStorage, CUDA via cudarc). For A/B comparison.
-/// - `CubeCL`: New default. All backends.
+/// Where tensor data lives — device-based storage.
 #[derive(Debug, Clone)]
 pub enum Storage {
     Device(DeviceStorage),
-    CubeCL(CubeCLStorage),
 }
 
 impl Storage {
     pub fn dtype(&self) -> DType {
         match self {
             Self::Device(s) => s.dtype(),
-            Self::CubeCL(s) => s.dtype,
         }
     }
 
     pub fn as_device(&self) -> Result<&DeviceStorage> {
         match self {
             Self::Device(s) => Ok(s),
-            _ => Err(Error::Msg("expected device storage".into()).bt()),
         }
     }
 
     pub fn as_device_mut(&mut self) -> Result<&mut DeviceStorage> {
         match self {
             Self::Device(s) => Ok(s),
-            _ => Err(Error::Msg("expected device storage".into()).bt()),
         }
     }
 
-    pub fn as_cubecl(&self) -> Result<&CubeCLStorage> {
-        match self {
-            Self::CubeCL(s) => Ok(s),
-            _ => Err(Error::Msg("expected CubeCL storage".into()).bt()),
-        }
-    }
-
-    pub fn as_cubecl_mut(&mut self) -> Result<&mut CubeCLStorage> {
-        match self {
-            Self::CubeCL(s) => Ok(s),
-            _ => Err(Error::Msg("expected CubeCL storage".into()).bt()),
-        }
-    }
-
-    /// Legacy convenience: access CpuStorage inside DeviceStorage.
+    /// Convenience: access CpuStorage inside DeviceStorage.
     pub fn as_cpu(&self) -> Result<&CpuStorage> {
         match self {
             Self::Device(s) => s.downcast_ref::<CpuStorage>()
                 .ok_or_else(|| Error::Msg("expected CPU storage inside Device".into()).bt()),
-            _ => Err(Error::Msg("expected Device storage for CPU access".into()).bt()),
         }
     }
 
@@ -308,9 +269,6 @@ impl Storage {
         match self {
             Self::Device(s) => s.downcast_mut::<CpuStorage>()
                 .ok_or_else(|| Error::Msg("expected CPU storage inside Device".into()).bt()),
-            _ => Err(Error::Msg("expected Device storage for CPU access".into()).bt()),
         }
     }
-
-
 }

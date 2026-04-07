@@ -231,9 +231,6 @@ where
         bail!("GPU GEMM failed (code {ret}) M={m} N={n} K={k} batch={batch}");
     }
 
-    drop(x_storage);
-    drop(w_storage);
-
     Ok(cb::tensor_from_cuda(out, stream, (total,)))
 }
 

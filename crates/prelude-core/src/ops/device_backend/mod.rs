@@ -1,11 +1,11 @@
 //! Pure CPU TensorOps implementation over `Storage::Device(CpuStorage)`.
 //!
 //! `DeviceTensorOps` is a correctness reference — no SIMD, no parallelism.
-//! Performance-critical paths are handled by prelude-cpu overrides or the CubeCL backend.
+//! Performance-critical paths are handled by prelude-cpu overrides.
 //!
 //! All outputs are `Storage::Device(DeviceStorage::from_cpu(...))`.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use half::{bf16, f16};
 
@@ -21,7 +21,7 @@ use crate::tensor::{
 fn make_tensor(cpu: CpuStorage, shape: Shape, device: &Device) -> Tensor {
     let dtype = cpu.dtype();
     Tensor::from_storage_layout(
-        Arc::new(RwLock::new(Storage::Device(DeviceStorage::from_cpu(cpu)))),
+        Arc::new(Storage::Device(DeviceStorage::from_cpu(cpu))),
         Layout::contiguous(shape),
         dtype,
         *device,
@@ -1084,9 +1084,7 @@ fn apply_cat(tensors: &[&Tensor], dim: usize) -> Result<Tensor> {
 
     let mut start = 0usize;
     for t in tensors {
-        let guard = t.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let src_cpu = guard.as_cpu()?;
+        let src_cpu = t.storage().as_cpu()?;
         let src_layout = t.our_layout();
         let src_dim_size = src_layout.dims()[dim];
 
@@ -1132,63 +1130,46 @@ impl Ops for DeviceTensorOps {
     // ── unary ──────────────────────────────────────────────────────
 
     fn unary(&self, x: &Tensor, op: UnaryOp) -> Result<Tensor> {
-        let guard = x.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let cpu = guard.as_cpu()?;
+        let cpu = x.storage().as_cpu()?;
         let layout = x.our_layout();
         let out_cpu = apply_unary_op(cpu, layout, op)?;
         let shape = layout.shape().clone();
         let device = *x.device();
-        drop(guard);
         Ok(make_tensor(out_cpu, shape, &device))
     }
 
     // ── binary ─────────────────────────────────────────────────────
 
     fn binary(&self, a: &Tensor, b: &Tensor, op: BinaryOp) -> Result<Tensor> {
-        let ag = a.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let bg = b.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let a_cpu = ag.as_cpu()?;
-        let b_cpu = bg.as_cpu()?;
+        let a_cpu = a.storage().as_cpu()?;
+        let b_cpu = b.storage().as_cpu()?;
         let a_layout = a.our_layout();
         let b_layout = b.our_layout();
 
         let out_shape = a_layout.shape().broadcast_shape_binary_op(b_layout.shape(), "binary")?;
         let out_cpu = apply_binary_op(a_cpu, a_layout, b_cpu, b_layout, op)?;
         let device = *a.device();
-        drop(ag);
-        drop(bg);
         Ok(make_tensor(out_cpu, out_shape, &device))
     }
 
     // ── compare ────────────────────────────────────────────────────
 
     fn compare(&self, a: &Tensor, b: &Tensor, op: CompareOp) -> Result<Tensor> {
-        let ag = a.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let bg = b.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let a_cpu = ag.as_cpu()?;
-        let b_cpu = bg.as_cpu()?;
+        let a_cpu = a.storage().as_cpu()?;
+        let b_cpu = b.storage().as_cpu()?;
         let a_layout = a.our_layout();
         let b_layout = b.our_layout();
 
         let out_shape = a_layout.shape().broadcast_shape_binary_op(b_layout.shape(), "compare")?;
         let out_cpu = apply_compare_op(a_cpu, a_layout, b_cpu, b_layout, op)?;
         let device = *a.device();
-        drop(ag);
-        drop(bg);
         Ok(make_tensor(out_cpu, out_shape, &device))
     }
 
     // ── reduce ─────────────────────────────────────────────────────
 
     fn reduce(&self, x: &Tensor, dim: usize, keepdim: bool, op: ReduceOp) -> Result<Tensor> {
-        let guard = x.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let cpu = guard.as_cpu()?;
+        let cpu = x.storage().as_cpu()?;
         let layout = x.our_layout();
         let dims = layout.dims();
 
@@ -1213,7 +1194,6 @@ impl Ops for DeviceTensorOps {
         }
 
         let device = *x.device();
-        drop(guard);
         Ok(make_tensor(out_cpu, out_shape, &device))
     }
 
@@ -1224,14 +1204,11 @@ impl Ops for DeviceTensorOps {
             // Still materialise a contiguous copy in case layout is non-contiguous.
             return self.contiguous(x);
         }
-        let guard = x.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let cpu = guard.as_cpu()?;
+        let cpu = x.storage().as_cpu()?;
         let layout = x.our_layout();
         let out_cpu = apply_cast(cpu, layout, dtype)?;
         let shape = layout.shape().clone();
         let device = *x.device();
-        drop(guard);
         Ok(make_tensor(out_cpu, shape, &device))
     }
 
@@ -1239,26 +1216,19 @@ impl Ops for DeviceTensorOps {
 
     fn contiguous(&self, x: &Tensor) -> Result<Tensor> {
         if x.is_contiguous() { return Ok(x.clone()); }
-        let guard = x.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let cpu = guard.as_cpu()?;
+        let cpu = x.storage().as_cpu()?;
         let layout = x.our_layout();
         let out_cpu = apply_contiguous(cpu, layout);
         let shape = layout.shape().clone();
         let device = *x.device();
-        drop(guard);
         Ok(make_tensor(out_cpu, shape, &device))
     }
 
     // ── matmul ─────────────────────────────────────────────────────
 
     fn matmul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
-        let ag = a.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let bg = b.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let a_cpu = ag.as_cpu()?;
-        let b_cpu = bg.as_cpu()?;
+        let a_cpu = a.storage().as_cpu()?;
+        let b_cpu = b.storage().as_cpu()?;
         let a_layout = a.our_layout();
         let b_layout = b.our_layout();
 
@@ -1277,8 +1247,6 @@ impl Ops for DeviceTensorOps {
             _ => return Err(Error::DTypeMismatchBinaryOp { lhs: a_cpu.dtype(), rhs: b_cpu.dtype(), op: "matmul" }.bt()),
         };
         let device = *a.device();
-        drop(ag);
-        drop(bg);
         Ok(make_tensor(out_cpu, out_shape, &device))
     }
 
@@ -1288,13 +1256,10 @@ impl Ops for DeviceTensorOps {
         if x.device() == device { return Ok(x.clone()); }
         // CPU→CPU is trivial (different device enum values but same storage type).
         if device.is_cpu() {
-            let guard = x.storage_rw().read()
-                .map_err(|_| Error::Msg("lock poisoned".into()))?;
-            let cpu = guard.as_cpu()?;
+            let cpu = x.storage().as_cpu()?;
             let layout = x.our_layout();
             let out_cpu = apply_contiguous(cpu, layout);
             let shape = layout.shape().clone();
-            drop(guard);
             return Ok(make_tensor(out_cpu, shape, device));
         }
         crate::bail!("DeviceTensorOps::to_device: CPU→GPU transfer not implemented here")
@@ -1303,12 +1268,8 @@ impl Ops for DeviceTensorOps {
     // ── index_select ───────────────────────────────────────────────
 
     fn index_select(&self, x: &Tensor, indices: &Tensor, dim: usize) -> Result<Tensor> {
-        let xg = x.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let ig = indices.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let x_cpu = xg.as_cpu()?;
-        let idx_cpu = ig.as_cpu()?;
+        let x_cpu = x.storage().as_cpu()?;
+        let idx_cpu = indices.storage().as_cpu()?;
         let x_layout = x.our_layout();
         let idx_layout = indices.our_layout();
 
@@ -1319,43 +1280,29 @@ impl Ops for DeviceTensorOps {
 
         let out_cpu = apply_index_select(x_cpu, x_layout, idx_cpu, idx_layout, dim)?;
         let device = *x.device();
-        drop(xg);
-        drop(ig);
         Ok(make_tensor(out_cpu, out_shape, &device))
     }
 
     // ── gather ─────────────────────────────────────────────────────
 
     fn gather(&self, x: &Tensor, indices: &Tensor, dim: usize) -> Result<Tensor> {
-        let xg = x.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let ig = indices.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let x_cpu = xg.as_cpu()?;
-        let idx_cpu = ig.as_cpu()?;
+        let x_cpu = x.storage().as_cpu()?;
+        let idx_cpu = indices.storage().as_cpu()?;
         let x_layout = x.our_layout();
         let idx_layout = indices.our_layout();
 
         let out_shape = idx_layout.shape().clone();
         let out_cpu = apply_gather(x_cpu, x_layout, idx_cpu, idx_layout, dim)?;
         let device = *x.device();
-        drop(xg);
-        drop(ig);
         Ok(make_tensor(out_cpu, out_shape, &device))
     }
 
     // ── scatter_add ────────────────────────────────────────────────
 
     fn scatter_add(&self, x: &Tensor, indices: &Tensor, src: &Tensor, dim: usize) -> Result<Tensor> {
-        let xg = x.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let ig = indices.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let sg = src.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let x_cpu = xg.as_cpu()?;
-        let idx_cpu = ig.as_cpu()?;
-        let src_cpu = sg.as_cpu()?;
+        let x_cpu = x.storage().as_cpu()?;
+        let idx_cpu = indices.storage().as_cpu()?;
+        let src_cpu = src.storage().as_cpu()?;
         let x_layout = x.our_layout();
         let idx_layout = indices.our_layout();
         let src_layout = src.our_layout();
@@ -1363,22 +1310,15 @@ impl Ops for DeviceTensorOps {
         let out_shape = x_layout.shape().clone();
         let out_cpu = apply_scatter_add(x_cpu, x_layout, idx_cpu, idx_layout, src_cpu, src_layout, dim)?;
         let device = *x.device();
-        drop(xg); drop(ig); drop(sg);
         Ok(make_tensor(out_cpu, out_shape, &device))
     }
 
     // ── index_add ──────────────────────────────────────────────────
 
     fn index_add(&self, x: &Tensor, indices: &Tensor, src: &Tensor, dim: usize) -> Result<Tensor> {
-        let xg = x.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let ig = indices.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let sg = src.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let x_cpu = xg.as_cpu()?;
-        let idx_cpu = ig.as_cpu()?;
-        let src_cpu = sg.as_cpu()?;
+        let x_cpu = x.storage().as_cpu()?;
+        let idx_cpu = indices.storage().as_cpu()?;
+        let src_cpu = src.storage().as_cpu()?;
         let x_layout = x.our_layout();
         let idx_layout = indices.our_layout();
         let src_layout = src.our_layout();
@@ -1386,22 +1326,15 @@ impl Ops for DeviceTensorOps {
         let out_shape = x_layout.shape().clone();
         let out_cpu = apply_index_add(x_cpu, x_layout, idx_cpu, idx_layout, src_cpu, src_layout, dim)?;
         let device = *x.device();
-        drop(xg); drop(ig); drop(sg);
         Ok(make_tensor(out_cpu, out_shape, &device))
     }
 
     // ── where_cond ─────────────────────────────────────────────────
 
     fn where_cond(&self, cond: &Tensor, on_true: &Tensor, on_false: &Tensor) -> Result<Tensor> {
-        let cg = cond.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let tg = on_true.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let fg = on_false.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let cond_cpu = cg.as_cpu()?;
-        let t_cpu = tg.as_cpu()?;
-        let f_cpu = fg.as_cpu()?;
+        let cond_cpu = cond.storage().as_cpu()?;
+        let t_cpu = on_true.storage().as_cpu()?;
+        let f_cpu = on_false.storage().as_cpu()?;
         let cond_layout = cond.our_layout();
         let t_layout = on_true.our_layout();
         let f_layout = on_false.our_layout();
@@ -1417,7 +1350,6 @@ impl Ops for DeviceTensorOps {
 
         let out_cpu = apply_where_cond(cond_cpu, &cond_bc, t_cpu, &t_bc, f_cpu, &f_bc)?;
         let device = *cond.device();
-        drop(cg); drop(tg); drop(fg);
         Ok(make_tensor(out_cpu, out_shape, &device))
     }
 
@@ -1430,14 +1362,11 @@ impl Ops for DeviceTensorOps {
     // ── affine ─────────────────────────────────────────────────────
 
     fn affine(&self, x: &Tensor, mul: f64, add: f64) -> Result<Tensor> {
-        let guard = x.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let cpu = guard.as_cpu()?;
+        let cpu = x.storage().as_cpu()?;
         let layout = x.our_layout();
         let out_cpu = apply_affine(cpu, layout, mul, add);
         let shape = layout.shape().clone();
         let device = *x.device();
-        drop(guard);
         Ok(make_tensor(out_cpu, shape, &device))
     }
 
@@ -1452,15 +1381,12 @@ impl Ops for DeviceTensorOps {
     // ── sort_last_dim ──────────────────────────────────────────────
 
     fn sort_last_dim(&self, x: &Tensor, asc: bool) -> Result<(Tensor, Tensor)> {
-        let guard = x.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let cpu = guard.as_cpu()?;
+        let cpu = x.storage().as_cpu()?;
         let layout = x.our_layout();
         let shape = layout.shape().clone();
         let device = *x.device();
 
         let (sorted_cpu, idx_cpu) = apply_sort_last_dim(cpu, layout, asc)?;
-        drop(guard);
         let sorted = make_tensor(sorted_cpu, shape.clone(), &device);
         let indices = make_tensor(idx_cpu, shape, &device);
         Ok((sorted, indices))
@@ -1469,25 +1395,19 @@ impl Ops for DeviceTensorOps {
     // ── data_ptr / data_ptr_mut ────────────────────────────────────
 
     unsafe fn data_ptr(&self, x: &Tensor) -> Result<*const u8> {
-        let guard = x.storage_rw().read()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let cpu = guard.as_cpu()?;
+        let cpu = x.storage().as_cpu()?;
         let byte_offset = x.our_layout().start_offset() * x.dtype().size_in_bytes();
         let ptr = (cpu.as_bytes().as_ptr() as usize + byte_offset) as *const u8;
-        // Safety: caller promises tensor is alive; guard must be dropped separately.
-        // We return a pointer that is valid as long as the Arc<RwLock<Storage>> is alive.
-        // This is a best-effort raw pointer — no lifetime can be attached here.
-        std::mem::forget(guard);
+        // No need to forget anything — Arc keeps storage alive as long as Tensor exists
         Ok(ptr)
     }
 
     unsafe fn data_ptr_mut(&self, x: &Tensor) -> Result<*mut u8> {
-        // Obtain a write guard, extract pointer, forget the guard (raw pointer contract).
-        let mut guard = x.storage_rw().write()
-            .map_err(|_| Error::Msg("lock poisoned".into()))?;
-        let cpu = guard.as_cpu_mut()?;
+        // Safety: caller guarantees exclusive access for mut operations
+        let storage_ptr = Arc::as_ptr(x.storage_arc()) as *mut Storage;
+        let storage_mut = unsafe { &mut *storage_ptr };
+        let cpu = storage_mut.as_cpu_mut()?;
         let byte_offset = x.our_layout().start_offset() * x.dtype().size_in_bytes();
-        // as_bytes gives &[u8]; we need a *mut u8 into the actual Vec.
         let ptr = match cpu {
             CpuStorage::U8(v)   => v.as_mut_ptr() as *mut u8,
             CpuStorage::U32(v)  => v.as_mut_ptr() as *mut u8,
@@ -1499,7 +1419,6 @@ impl Ops for DeviceTensorOps {
             CpuStorage::F64(v)  => v.as_mut_ptr() as *mut u8,
         };
         let ptr = (ptr as usize + byte_offset) as *mut u8;
-        std::mem::forget(guard);
         Ok(ptr)
     }
 }

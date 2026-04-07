@@ -97,12 +97,11 @@ pub fn tensor_as_u16_slice_pub(tensor: &Tensor) -> Result<&[u16]> {
 /// Tensor must be contiguous.
 ///
 /// # Safety (lifetime)
-/// The returned slice borrows from the tensor's `Arc<RwLock<Storage>>`.
+/// The returned slice borrows from the tensor's `Arc<Storage>`.
 /// The data pointer is stable because CPU storage Vecs are never reallocated
 /// after creation. The caller must keep the tensor alive.
-/// Internal zero-copy slice (unsafe lifetime extension, no lock held).
-/// Pointer valid while tensor is alive. For perf-critical internal code only;
-/// external users should use `tensor.as_slice::<T>()` which returns a guard.
+/// Internal zero-copy slice (unsafe lifetime extension).
+/// Pointer valid while tensor is alive. For perf-critical internal code only.
 pub(crate) fn tensor_as_u16_slice(tensor: &Tensor) -> Result<&[u16]> {
     assert!(tensor.is_contiguous());
     unsafe { Ok(std::slice::from_raw_parts(tensor.data_ptr()? as *const u16, tensor.elem_count())) }

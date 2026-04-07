@@ -86,7 +86,7 @@ pub enum RemoteTarget {
 // ── The trait ──────────────────────────────────────────────────────
 
 pub trait Ops: Send + Sync {
-    /// Fallback implementation. Terminal backends (CubeCL, CUDA) return self.
+    /// Fallback implementation. Terminal backends (CUDA, etc.) return self.
     /// Device crates return the underlying backend.
     fn default_impl(&self) -> &dyn Ops;
 
