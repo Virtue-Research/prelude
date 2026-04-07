@@ -1,30 +1,42 @@
-//! CPU Executor: synchronous block_in_place execution.
+//! CPU Executor: dedicated worker thread, same async pattern as GPU.
 //!
-//! The simplest Executor implementation — runs model.forward() synchronously
-//! on the calling thread via `tokio::task::block_in_place`. No GPU queue,
-//! no graph capture, no double buffering.
-//!
-//! Since `submit()` completes synchronously, `collect()` always returns
-//! immediately with the already-computed result.
+//! Sends work to a worker thread via channel, returns an async oneshot handle.
+//! Same architecture as CudaExecutor — the AR loop always does `handle.recv().await`.
 
 use std::sync::Arc;
 
-use prelude_core::engine::executor::{ExecutionHandle, Executor, ForwardBatch, ModelOutput};
+use prelude_core::engine::executor::{ExecutionHandle, Executor, ForwardBatch};
 use prelude_core::engine::{Engine, EngineError};
 
-/// Completed result stored inside the ExecutionHandle.
-struct CpuResult {
-    output: Result<ModelOutput, EngineError>,
+struct CpuWork {
+    batch: ForwardBatch,
+    result_tx: tokio::sync::oneshot::Sender<Result<prelude_core::engine::executor::ModelOutput, EngineError>>,
 }
 
-/// CPU execution strategy: synchronous, zero-overhead.
 pub struct CpuExecutor {
-    engine: Arc<Engine>,
+    work_tx: tokio::sync::mpsc::UnboundedSender<CpuWork>,
+    _worker: std::thread::JoinHandle<()>,
 }
 
 impl CpuExecutor {
     pub fn new(engine: Arc<Engine>) -> Self {
-        Self { engine }
+        let (work_tx, mut work_rx) = tokio::sync::mpsc::unbounded_channel::<CpuWork>();
+        let worker = std::thread::Builder::new()
+            .name("cpu-executor".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("CPU executor worker runtime");
+                rt.block_on(async {
+                    while let Some(work) = work_rx.recv().await {
+                        let result = engine.forward_batch(work.batch);
+                        let _ = work.result_tx.send(result);
+                    }
+                });
+            })
+            .expect("spawn CPU executor worker thread");
+        Self { work_tx, _worker: worker }
     }
 }
 
@@ -33,17 +45,10 @@ impl Executor for CpuExecutor {
         &self,
         batch: ForwardBatch,
     ) -> Result<ExecutionHandle, EngineError> {
-        let result = self.engine.forward_batch(batch);
-        Ok(ExecutionHandle::new(CpuResult { output: result }))
-    }
-
-    fn collect(
-        &self,
-        handle: ExecutionHandle,
-    ) -> Result<ModelOutput, EngineError> {
-        let result = handle
-            .downcast::<CpuResult>()
-            .ok_or_else(|| EngineError::Internal("CpuExecutor: invalid handle type".into()))?;
-        result.output
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.work_tx
+            .send(CpuWork { batch, result_tx })
+            .map_err(|_| EngineError::Internal("CPU worker thread has exited".into()))?;
+        Ok(ExecutionHandle::new(result_rx))
     }
 }

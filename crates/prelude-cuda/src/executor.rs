@@ -12,44 +12,39 @@ use std::sync::Arc;
 use prelude_core::engine::executor::{ExecutionHandle, Executor, ForwardBatch, ModelOutput};
 use prelude_core::engine::{Engine, EngineError};
 
-// ── GPU work packet ────────────────────────────────────────────────
-
-/// A unit of work sent to the GPU thread.
 struct GpuWork {
     batch: ForwardBatch,
     result_tx: tokio::sync::oneshot::Sender<Result<ModelOutput, EngineError>>,
 }
 
-/// Handle holding the oneshot receiver for an in-flight GPU submission.
-struct CudaPending {
-    result_rx: tokio::sync::oneshot::Receiver<Result<ModelOutput, EngineError>>,
-}
-
-// ── CudaExecutor ───────────────────────────────────────────────────
-
 /// CUDA execution strategy: dedicated GPU worker thread.
 pub struct CudaExecutor {
     engine: Arc<Engine>,
     work_tx: tokio::sync::mpsc::UnboundedSender<GpuWork>,
-    // The worker thread handle — kept alive for the executor's lifetime.
     _worker: std::thread::JoinHandle<()>,
 }
 
 impl CudaExecutor {
     pub fn new(engine: Arc<Engine>) -> Self {
-        let (work_tx, work_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (work_tx, mut work_rx) = tokio::sync::mpsc::unbounded_channel::<GpuWork>();
         let worker_engine = engine.clone();
         let worker = std::thread::Builder::new()
             .name("gpu-executor".into())
             .spawn(move || {
-                gpu_worker_loop(work_rx, worker_engine);
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("GPU executor worker runtime");
+                rt.block_on(async {
+                    while let Some(work) = work_rx.recv().await {
+                        let result = worker_engine.forward_batch(work.batch);
+                        let _ = work.result_tx.send(result);
+                    }
+                });
+                tracing::info!("GPU executor worker exited");
             })
             .expect("spawn GPU executor worker thread");
-        Self {
-            engine,
-            work_tx,
-            _worker: worker,
-        }
+        Self { engine, work_tx, _worker: worker }
     }
 }
 
@@ -62,46 +57,6 @@ impl Executor for CudaExecutor {
         self.work_tx
             .send(GpuWork { batch, result_tx })
             .map_err(|_| EngineError::Internal("GPU worker thread has exited".into()))?;
-        Ok(ExecutionHandle::new(CudaPending { result_rx }))
+        Ok(ExecutionHandle::new(result_rx))
     }
-
-    fn collect(
-        &self,
-        handle: ExecutionHandle,
-    ) -> Result<ModelOutput, EngineError> {
-        let pending = handle
-            .downcast::<CudaPending>()
-            .ok_or_else(|| EngineError::Internal("CudaExecutor: invalid handle type".into()))?;
-        // block_in_place tells tokio this worker will block, so it moves other
-        // tasks to different workers. This is needed because the AR loop is async
-        // (it yields between decode steps for SSE streaming).
-        tokio::task::block_in_place(|| {
-            pending
-                .result_rx
-                .blocking_recv()
-                .map_err(|_| EngineError::Internal("GPU worker dropped result channel".into()))?
-        })
-    }
-}
-
-// ── GPU worker thread ──────────────────────────────────────────────
-
-fn gpu_worker_loop(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<GpuWork>,
-    engine: Arc<Engine>,
-) {
-    // Tiny single-threaded tokio runtime just for channel recv.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("GPU executor worker runtime");
-
-    rt.block_on(async {
-        while let Some(work) = rx.recv().await {
-            let result = engine.forward_batch(work.batch);
-            let _ = work.result_tx.send(result);
-        }
-    });
-
-    tracing::info!("GPU executor worker exited");
 }

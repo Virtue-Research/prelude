@@ -1,21 +1,15 @@
 //! Device execution trait.
 //!
-//! `Executor` defines how forward passes are submitted to and collected from
-//! a device. Device crates (prelude-cuda, prelude-cpu, ...) implement this trait
-//! with device-specific optimizations:
+//! All executors (GPU and CPU) use the same async pattern:
+//! 1. `submit()` sends work to a dedicated worker thread, returns immediately
+//! 2. The caller awaits `handle.recv()` — tokio interleaves other tasks while waiting
 //!
-//! - **CudaExecutor**: async GPU queue + CUDA graph replay + double buffering
-//! - **CpuExecutor**: synchronous `block_in_place` execution
-//!
-//! Core's scheduling loops (`engine/run/`) call `submit`/`collect` without knowing
-//! which device is running. `submit()` is non-blocking on GPU (queues work and
-//! returns immediately), so the scheduling loop naturally overlaps CPU preparation
-//! with device execution — no separate batch/continuous variants per device.
+//! This gives zero-overhead async for GPU (CPU thread is idle during GPU work)
+//! and keeps tokio workers free for SSE streaming, health checks, etc.
 //!
 //! # Registration
 //!
-//! Device crates register their executor via `register_executor()` at startup,
-//! with priority and probe for automatic backend selection:
+//! Device crates register their executor via `register_executor()` at startup:
 //!
 //! ```ignore
 //! prelude_core::engine::executor::register_executor(ExecutorBackend {
@@ -35,25 +29,25 @@ use super::EngineError;
 
 // ── Execution handle ───────────────────────────────────────────────
 
-/// Opaque handle returned by `Executor::submit()`.
+/// Handle for an in-flight forward pass.
 ///
-/// Represents an in-flight batch on the device. Call `Executor::collect()`
-/// to await completion and retrieve the output.
+/// All executors (GPU and CPU) use a dedicated worker thread and return
+/// results via a oneshot channel. Await with `.recv()` in the AR loop.
 pub struct ExecutionHandle {
-    inner: Box<dyn std::any::Any + Send>,
+    rx: tokio::sync::oneshot::Receiver<Result<ModelOutput, super::EngineError>>,
 }
 
 impl ExecutionHandle {
-    /// Create a new handle wrapping device-specific state.
-    pub fn new<T: Send + 'static>(inner: T) -> Self {
-        Self {
-            inner: Box::new(inner),
-        }
+    pub fn new(rx: tokio::sync::oneshot::Receiver<Result<ModelOutput, super::EngineError>>) -> Self {
+        Self { rx }
     }
 
-    /// Downcast to the device-specific handle type.
-    pub fn downcast<T: 'static>(self) -> Option<T> {
-        self.inner.downcast::<T>().ok().map(|b| *b)
+    /// Await the result. Yields to tokio while the worker thread runs,
+    /// allowing SSE streaming handlers to interleave naturally.
+    pub async fn recv(self) -> Result<ModelOutput, super::EngineError> {
+        self.rx.await.unwrap_or_else(|_|
+            Err(super::EngineError::Internal("executor worker dropped result channel".into()))
+        )
     }
 }
 
@@ -119,21 +113,13 @@ pub enum ForwardBatch {
 pub trait Executor: Send + Sync + 'static {
     /// Submit a forward pass to the device. Returns immediately.
     ///
-    /// - **GPU**: queues work to a dedicated GPU thread, returns a pending handle.
-    /// - **CPU**: runs `model.forward()` synchronously, returns a completed handle.
+    /// Both GPU and CPU executors send work to a dedicated worker thread
+    /// and return an `ExecutionHandle` backed by a oneshot channel.
+    /// The caller awaits the result with `handle.recv().await`.
     fn submit(
         &self,
         batch: ForwardBatch,
     ) -> Result<ExecutionHandle, EngineError>;
-
-    /// Await completion of a submitted forward pass and retrieve output.
-    ///
-    /// - **GPU**: blocks until the GPU thread signals completion.
-    /// - **CPU**: returns immediately (work already done in `submit`).
-    fn collect(
-        &self,
-        handle: ExecutionHandle,
-    ) -> Result<ModelOutput, EngineError>;
 }
 
 // ── Registration ───────────────────────────────────────────────────
@@ -186,15 +172,8 @@ pub fn create_executor(engine: std::sync::Arc<super::engine::Engine>) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::SchedulerStep;
 
-    /// Mock result stored in the handle.
-    struct MockResult {
-        logits: Tensor,
-        item_seq_counts: Vec<usize>,
-    }
-
-    /// A test executor that returns a fixed logits tensor.
+    /// Test executor: computes result in submit, sends via oneshot (same as real executors).
     struct TestExecutor {
         vocab_size: usize,
     }
@@ -218,128 +197,101 @@ mod tests {
                 crate::tensor::DType::F32,
                 &crate::tensor::Device::Cpu,
             ).map_err(|e| EngineError::Internal(format!("{e}")))?;
-            Ok(ExecutionHandle::new(MockResult { logits, item_seq_counts }))
-        }
 
-        fn collect(
-            &self,
-            handle: ExecutionHandle,
-        ) -> Result<ModelOutput, EngineError> {
-            let result = handle.downcast::<MockResult>()
-                .ok_or_else(|| EngineError::Internal("wrong handle type".into()))?;
-            Ok(ModelOutput { logits: result.logits, item_seq_counts: result.item_seq_counts, prefill_results: vec![] })
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(Ok(ModelOutput { logits, item_seq_counts, prefill_results: vec![] }));
+            Ok(ExecutionHandle::new(rx))
         }
     }
 
-    #[test]
-    fn submit_collect_prefill() {
-        let executor = TestExecutor { vocab_size: 100 };
-        let batch = ForwardBatch::Prefill { items: vec![] };
+    /// Helper: submit + recv in a blocking tokio context.
+    fn submit_recv(executor: &TestExecutor, batch: ForwardBatch) -> Result<ModelOutput, EngineError> {
+        let handle = executor.submit(batch)?;
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(handle.recv())
+    }
 
-        let handle = executor.submit(batch).unwrap();
-        let output = executor.collect(handle).unwrap();
+    #[test]
+    fn submit_recv_prefill() {
+        let output = submit_recv(&TestExecutor { vocab_size: 100 }, ForwardBatch::Prefill { items: vec![] }).unwrap();
         assert_eq!(output.logits.dims(), &[0, 100]);
     }
 
     #[test]
-    fn submit_collect_decode() {
-        let executor = TestExecutor { vocab_size: 50 };
-        let batch = ForwardBatch::Decode {
-            tokens: vec![1, 2, 3],
-            positions: vec![10, 20, 30],
-            block_tables: vec![vec![0, 1], vec![0, 2], vec![0, 3]],
-            deltanet_slots: None,
-        };
-
-        let handle = executor.submit(batch).unwrap();
-        let output = executor.collect(handle).unwrap();
+    fn submit_recv_decode() {
+        let output = submit_recv(
+            &TestExecutor { vocab_size: 50 },
+            ForwardBatch::Decode {
+                tokens: vec![1, 2, 3],
+                positions: vec![10, 20, 30],
+                block_tables: vec![vec![0, 1], vec![0, 2], vec![0, 3]],
+                deltanet_slots: None,
+            },
+        ).unwrap();
         assert_eq!(output.logits.dims(), &[3, 50]);
     }
 
     #[test]
-    fn submit_collect_oneshot() {
-        let executor = TestExecutor { vocab_size: 8 };
-        let batch = ForwardBatch::OneShot {
-            token_groups: vec![
-                vec![vec![1, 2, 3]],           // 1 sequence
-                vec![vec![4, 5], vec![6, 7]],  // 2 sequences
-            ],
-            task: crate::engine::TaskKind::Classify,
-        };
-
-        let handle = executor.submit(batch).unwrap();
-        let output = executor.collect(handle).unwrap();
-        assert_eq!(output.logits.dims(), &[3, 8]); // total 3 sequences
+    fn submit_recv_oneshot() {
+        let output = submit_recv(
+            &TestExecutor { vocab_size: 8 },
+            ForwardBatch::OneShot {
+                token_groups: vec![
+                    vec![vec![1, 2, 3]],
+                    vec![vec![4, 5], vec![6, 7]],
+                ],
+                task: crate::engine::TaskKind::Classify,
+            },
+        ).unwrap();
+        assert_eq!(output.logits.dims(), &[3, 8]);
         assert_eq!(output.item_seq_counts, vec![1, 2]);
     }
 
     #[test]
-    fn collect_wrong_handle_type() {
-        let executor = TestExecutor { vocab_size: 10 };
-        let bad_handle = ExecutionHandle::new(42u32);
-        let result = executor.collect(bad_handle);
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("wrong handle type"));
-    }
-
-    #[test]
-    fn handle_downcast_success() {
-        let handle = ExecutionHandle::new(String::from("hello"));
-        let value = handle.downcast::<String>();
-        assert_eq!(value, Some(String::from("hello")));
-    }
-
-    #[test]
-    fn handle_downcast_wrong_type() {
-        let handle = ExecutionHandle::new(42u32);
-        let value = handle.downcast::<String>();
-        assert!(value.is_none());
-    }
-
-    #[test]
-    fn submit_collect_decode_with_deltanet_slots() {
-        let executor = TestExecutor { vocab_size: 32 };
-        let batch = ForwardBatch::Decode {
-            tokens: vec![10, 20],
-            positions: vec![5, 8],
-            block_tables: vec![vec![0], vec![1]],
-            deltanet_slots: Some(vec![0, 1]),
-        };
-
-        let handle = executor.submit(batch).unwrap();
-        let output = executor.collect(handle).unwrap();
+    fn submit_recv_decode_with_deltanet() {
+        let output = submit_recv(
+            &TestExecutor { vocab_size: 32 },
+            ForwardBatch::Decode {
+                tokens: vec![10, 20],
+                positions: vec![5, 8],
+                block_tables: vec![vec![0], vec![1]],
+                deltanet_slots: Some(vec![0, 1]),
+            },
+        ).unwrap();
         assert_eq!(output.logits.dims(), &[2, 32]);
-        assert!(output.item_seq_counts.is_empty());
     }
 
     #[test]
-    fn submit_collect_oneshot_embed() {
-        let executor = TestExecutor { vocab_size: 64 };
-        let batch = ForwardBatch::OneShot {
-            token_groups: vec![
-                vec![vec![1, 2, 3, 4]],
-            ],
-            task: crate::engine::TaskKind::Embed,
-        };
-
-        let handle = executor.submit(batch).unwrap();
-        let output = executor.collect(handle).unwrap();
+    fn submit_recv_oneshot_embed() {
+        let output = submit_recv(
+            &TestExecutor { vocab_size: 64 },
+            ForwardBatch::OneShot {
+                token_groups: vec![vec![vec![1, 2, 3, 4]]],
+                task: crate::engine::TaskKind::Embed,
+            },
+        ).unwrap();
         assert_eq!(output.logits.dims(), &[1, 64]);
         assert_eq!(output.item_seq_counts, vec![1]);
     }
 
     #[test]
-    fn submit_collect_oneshot_empty() {
-        let executor = TestExecutor { vocab_size: 16 };
-        let batch = ForwardBatch::OneShot {
-            token_groups: vec![],
-            task: crate::engine::TaskKind::Classify,
-        };
-
-        let handle = executor.submit(batch).unwrap();
-        let output = executor.collect(handle).unwrap();
+    fn submit_recv_empty() {
+        let output = submit_recv(
+            &TestExecutor { vocab_size: 16 },
+            ForwardBatch::OneShot {
+                token_groups: vec![],
+                task: crate::engine::TaskKind::Classify,
+            },
+        ).unwrap();
         assert_eq!(output.logits.dims(), &[0, 16]);
-        assert!(output.item_seq_counts.is_empty());
+    }
+
+    #[test]
+    fn dropped_sender_returns_error() {
+        let (_, rx) = tokio::sync::oneshot::channel::<Result<ModelOutput, EngineError>>();
+        let handle = ExecutionHandle::new(rx);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let result = rt.block_on(handle.recv());
+        assert!(result.is_err());
     }
 }

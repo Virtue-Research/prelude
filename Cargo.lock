@@ -3057,6 +3057,7 @@ dependencies = [
  "nix",
  "prelude-core",
  "rayon",
+ "tokio",
  "tracing",
 ]
 

@@ -18,3 +18,4 @@ onednn-ffi/buildCargo.lock
 .cargo-ok
 .cargo_vcs_info.json
 *.orig
+genai_bench.log

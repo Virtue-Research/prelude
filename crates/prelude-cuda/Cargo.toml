@@ -17,7 +17,7 @@ default = []
 prelude-core = { path = "../prelude-core" }
 cudarc = { version = "0.19.4", features = ["std", "driver", "f16", "nvrtc", "fallback-dynamic-loading", "cuda-version-from-build-system"], default-features = false }
 half = { version = "2.7.1", features = ["bytemuck"] }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "rt"] }
 tracing.workspace = true
 bc-mimalloc.workspace = true
 inventory = "0.3"

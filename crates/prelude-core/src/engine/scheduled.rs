@@ -85,9 +85,6 @@ impl Executor for StubExecutor {
     fn submit(&self, _batch: ForwardBatch) -> Result<executor::ExecutionHandle, EngineError> {
         Err(EngineError::Unavailable("no device executor registered".into()))
     }
-    fn collect(&self, _handle: executor::ExecutionHandle) -> Result<executor::ModelOutput, EngineError> {
-        Err(EngineError::Unavailable("no device executor registered".into()))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -126,23 +123,11 @@ impl InferenceEngine for ScheduledEngine {
     }
 
     async fn classify(&self, request: ClassifyRequest) -> Result<ClassifyResult, EngineError> {
-        let engine = Arc::clone(&self.engine);
-        let executor = Arc::clone(&self.executor);
-        tokio::task::spawn_blocking(move || {
-            classify_via_executor(&engine, executor.as_ref(), request)
-        })
-        .await
-        .map_err(|e| EngineError::Internal(format!("classify task panicked: {e}")))?
+        classify_via_executor(&self.engine, self.executor.as_ref(), request).await
     }
 
     async fn embed(&self, request: EmbedRequest) -> Result<EmbedResult, EngineError> {
-        let engine = Arc::clone(&self.engine);
-        let executor = Arc::clone(&self.executor);
-        tokio::task::spawn_blocking(move || {
-            embed_via_executor(&engine, executor.as_ref(), request)
-        })
-        .await
-        .map_err(|e| EngineError::Internal(format!("embed task panicked: {e}")))?
+        embed_via_executor(&self.engine, self.executor.as_ref(), request).await
     }
 }
 
@@ -150,7 +135,7 @@ impl InferenceEngine for ScheduledEngine {
 // One-shot classify/embed via Executor
 // ---------------------------------------------------------------------------
 
-fn classify_via_executor(
+async fn classify_via_executor(
     engine: &Engine,
     executor: &dyn Executor,
     request: ClassifyRequest,
@@ -167,7 +152,7 @@ fn classify_via_executor(
         task: TaskKind::Classify,
     };
     let handle = executor.submit(batch)?;
-    let output = executor.collect(handle)?;
+    let output = handle.recv().await?;
 
     // Get model metadata
     let (num_labels, label_map) = engine.classify_metadata()?;
@@ -203,7 +188,7 @@ fn classify_via_executor(
     })
 }
 
-fn embed_via_executor(
+async fn embed_via_executor(
     engine: &Engine,
     executor: &dyn Executor,
     request: EmbedRequest,
@@ -221,7 +206,7 @@ fn embed_via_executor(
         task: TaskKind::Embed,
     };
     let handle = executor.submit(batch)?;
-    let output = executor.collect(handle)?;
+    let output = handle.recv().await?;
 
     // Get model metadata
     let (dimensions, normalization) = engine.embed_metadata()?;

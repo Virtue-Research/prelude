@@ -20,6 +20,7 @@ half = { version = "2.7.1", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["extern_crate_alloc", "derive"] }
 rayon = "1.11.0"
 nix = { version = "0.31", features = ["sched"] }
+tokio = { workspace = true, features = ["sync", "rt"] }
 tracing.workspace = true
 bc-mimalloc.workspace = true
 inventory = "0.3"

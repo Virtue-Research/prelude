@@ -33,7 +33,7 @@ use crate::engine::{
 };
 use crate::engine::executor::{Executor, ForwardBatch, ModelOutput};
 use crate::scheduler::{
-    FinishReason, ForwardMode, Scheduler, SchedulerConfig, SchedulerStep, SeqFinishReason,
+    FinishReason, Scheduler, SchedulerConfig, SchedulerStep, SeqFinishReason,
     Sequence, SamplingParams,
 };
 use crate::types::{GenerateResult, StreamEvent};
@@ -179,7 +179,7 @@ pub async fn ar_loop(
         };
 
         // ── Phase 5: Collect output ────────────────────────────────
-        let output = match executor.collect(handle) {
+        let output = match handle.recv().await {
             Ok(o) => o,
             Err(error) => {
                 fail_step(&engine, &mut scheduler, &mut states, &step, error);
@@ -189,14 +189,6 @@ pub async fn ar_loop(
 
         // ── Phase 6: Sample + stop conditions + deliver ────────────
         process_output(&engine, &mut scheduler, &mut states, &step, &output);
-
-        // Yield after decode steps so the tokio runtime can run the HTTP handler
-        // that reads from the streaming channel and sends SSE events to the client.
-        // Without this, all tokens are queued in the channel in a tight loop and
-        // the client receives them in a burst (TPOT ≈ 0).
-        if matches!(step.forward_mode, ForwardMode::Decode | ForwardMode::Mixed) {
-            tokio::task::yield_now().await;
-        }
 
         if !rx_open && !scheduler.has_work() { break; }
     }
