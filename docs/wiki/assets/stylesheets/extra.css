@@ -68,6 +68,13 @@
   filter: brightness(0) invert(1);
 }
 
+/* Match h4 style to h3 */
+.md-content h4 {
+  font-weight: 500;
+  font-size: 1em;
+  letter-spacing: -0.01em;
+}
+
 /* Make the homepage logo prominent. */
 .aginfer-home-logo {
   display: block;
