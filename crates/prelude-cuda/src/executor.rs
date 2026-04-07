@@ -72,10 +72,15 @@ impl Executor for CudaExecutor {
         let pending = handle
             .downcast::<CudaPending>()
             .ok_or_else(|| EngineError::Internal("CudaExecutor: invalid handle type".into()))?;
-        pending
-            .result_rx
-            .blocking_recv()
-            .map_err(|_| EngineError::Internal("GPU worker dropped result channel".into()))?
+        // block_in_place tells tokio this worker will block, so it moves other
+        // tasks to different workers. This is needed because the AR loop is async
+        // (it yields between decode steps for SSE streaming).
+        tokio::task::block_in_place(|| {
+            pending
+                .result_rx
+                .blocking_recv()
+                .map_err(|_| EngineError::Internal("GPU worker dropped result channel".into()))?
+        })
     }
 }
 

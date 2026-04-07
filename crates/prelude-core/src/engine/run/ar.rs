@@ -33,8 +33,8 @@ use crate::engine::{
 };
 use crate::engine::executor::{Executor, ForwardBatch, ModelOutput};
 use crate::scheduler::{
-    FinishReason, Scheduler, SchedulerConfig, SchedulerStep, SeqFinishReason, Sequence,
-    SamplingParams,
+    FinishReason, ForwardMode, Scheduler, SchedulerConfig, SchedulerStep, SeqFinishReason,
+    Sequence, SamplingParams,
 };
 use crate::types::{GenerateResult, StreamEvent};
 use crate::tensor::{DType, Tensor};
@@ -71,11 +71,13 @@ pub struct ArSequenceState {
     pub prompt_token_logprobs: Option<Vec<TokenLogprobInfo>>,
     pub block_table: Vec<u32>,
     pub deltanet_slot: Option<u32>,
+    /// Cached from PreparedGenerateRequest so it survives prepared.take() during prefill.
+    pub max_new_tokens: usize,
 }
 
 impl ArSequenceState {
     fn max_new(&self) -> usize {
-        self.prepared.as_ref().map(|p| p.max_new).unwrap_or(0)
+        self.max_new_tokens
     }
 
     fn is_greedy(&self) -> bool {
@@ -188,6 +190,14 @@ pub async fn ar_loop(
         // ── Phase 6: Sample + stop conditions + deliver ────────────
         process_output(&engine, &mut scheduler, &mut states, &step, &output);
 
+        // Yield after decode steps so the tokio runtime can run the HTTP handler
+        // that reads from the streaming channel and sends SSE events to the client.
+        // Without this, all tokens are queued in the channel in a tight loop and
+        // the client receives them in a burst (TPOT ≈ 0).
+        if matches!(step.forward_mode, ForwardMode::Decode | ForwardMode::Mixed) {
+            tokio::task::yield_now().await;
+        }
+
         if !rx_open && !scheduler.has_work() { break; }
     }
 
@@ -218,6 +228,7 @@ fn handle_message(
                 None,
             );
             scheduler.add_request(seq);
+            let max_new_tokens = prepared.max_new;
             states.insert(request_id, ArSequenceState {
                 request_id: prepared.request.request_id.clone(),
                 prepared: Some(prepared),
@@ -234,6 +245,7 @@ fn handle_message(
                 prompt_token_logprobs: None,
                 block_table: Vec::new(),
                 deltanet_slot: None,
+                max_new_tokens,
             });
         }
         ArMessage::Abort(request_id) => {
@@ -250,7 +262,9 @@ fn build_forward_batch(
     step: &SchedulerStep,
 ) -> ForwardBatch {
     if !step.prefill_request_ids.is_empty() {
-        // Prefill: extract PreparedGenerateRequests from states
+        // Prefill: take PreparedGenerateRequests for the forward pass.
+        // They're put back into states after process_output so decode steps
+        // can still read max_new, logprobs, and stop config.
         let items: Vec<_> = step.prefill_request_ids.iter()
             .filter_map(|id| {
                 states.get_mut(id).and_then(|s| s.prepared.take())
@@ -608,6 +622,7 @@ mod tests {
             sent_text_len: 0, prompt_len: 3, next_decode_position: 3,
             pending_token: None, output_tokens: vec![], token_logprobs: vec![],
             prompt_token_logprobs: None, block_table: vec![], deltanet_slot: None,
+            max_new_tokens: 10,
         });
         states_with_entries.insert("b".to_string(), ArSequenceState {
             request_id: "b".to_string(),
@@ -617,6 +632,7 @@ mod tests {
             sent_text_len: 0, prompt_len: 3, next_decode_position: 3,
             pending_token: None, output_tokens: vec![], token_logprobs: vec![],
             prompt_token_logprobs: None, block_table: vec![], deltanet_slot: None,
+            max_new_tokens: 10,
         });
 
         let ids = vec!["a".to_string(), "b".to_string()];
