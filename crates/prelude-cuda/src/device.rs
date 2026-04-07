@@ -48,7 +48,8 @@ pub fn cuda_device(ordinal: usize) -> Result<Arc<CudaContext>> {
     Ok(cache[ordinal].clone().unwrap())
 }
 
-/// Get or create the default CudaStream for a GPU ordinal.
+/// Get or create the CudaStream for a GPU ordinal.
+/// Uses a non-default (non-blocking) stream so it supports CUDA graph capture.
 pub fn cuda_stream(ordinal: usize) -> Result<Arc<CudaStream>> {
     static CACHE: Mutex<Vec<Option<Arc<CudaStream>>>> = Mutex::new(Vec::new());
     let mut cache = CACHE.lock().unwrap();
@@ -57,7 +58,7 @@ pub fn cuda_stream(ordinal: usize) -> Result<Arc<CudaStream>> {
     }
     if cache[ordinal].is_none() {
         let dev = cuda_device(ordinal)?;
-        cache[ordinal] = Some(dev.default_stream());
+        cache[ordinal] = Some(dev.new_stream().ce()?);
     }
     Ok(cache[ordinal].clone().unwrap())
 }
