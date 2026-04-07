@@ -404,10 +404,11 @@ trait FusedOps: Send + Sync {
         &self, a: &Tensor, b: &Tensor,
     ) -> Option<Result<Tensor>> { None }
 
-    /// Fused MoE routing: topk selection + weight normalization in one kernel.
+    /// Fused MoE routing: topk selection + weight normalization + sorting in one kernel.
+    /// Returns (topk_weights, topk_ids, sorted_expert_ids, sorted_token_ids).
     fn fused_moe_routing(
         &self, router_logits: &Tensor, topk: usize,
-    ) -> Option<Result<(Tensor, Tensor)>> { None }  // (topk_weights, topk_ids)
+    ) -> Option<Result<(Tensor, Tensor, Tensor, Tensor)>> { None }
 }
 ```
 
@@ -451,7 +452,7 @@ ops/
   device_backend/      — DeviceTensorOps: pure Rust, Storage::Device
 ```
 
-**Why two:** We're validating CubeCL as our long-term compute backend. During this period, both implementations run the same test suite, selected by `PRELUDE_TENSOR_BACKEND` env var (`"device"` or `"cubecl"`, default `"cubecl"`).
+**Why two:** We're validating CubeCL as our long-term compute backend. During this period, both implementations run the same test suite, selected by `PRELUDE_TENSOR_BACKEND` env var (`"device"` or `"cubecl"`, default `"device"`).
 
 **Rules:**
 - The two paths are completely isolated. No bridge code, no cross-storage conversion.

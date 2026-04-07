@@ -58,10 +58,30 @@ pub const MOD_AFFINE: &str = "candle_affine";
 pub const MOD_FILL: &str = "candle_fill";
 pub const MOD_SORT: &str = "candle_sort";
 
+/// Probe whether CUDA is usable on this machine.
+/// Creates a context for device 0; the context is cached for later use.
+fn cuda_probe() -> bool {
+    device::cuda_device(0).is_ok()
+}
+
 /// Register GPU ops and executor. Call once at startup.
 pub fn register() {
-    prelude_core::ops::register_gpu_ops(cuda_ops::cuda_ops);
-    prelude_core::engine::executor::register_executor(|engine| Box::new(executor::CudaExecutor::new(engine)));
+    prelude_core::ops::register_backend(prelude_core::ops::OpsBackend {
+        name: "cuda",
+        priority: 100,
+        probe: cuda_probe,
+        supports: |d| d.is_cuda(),
+        create_ops: cuda_ops::cuda_ops,
+    });
+    prelude_core::engine::executor::register_executor(
+        prelude_core::engine::executor::ExecutorBackend {
+            name: "cuda",
+            priority: 100,
+            probe: cuda_probe,
+            supports: |d| d.is_cuda(),
+            create: |engine| Box::new(executor::CudaExecutor::new(engine)),
+        },
+    );
 }
 
 // ── Own CUDA storage ─────────────────

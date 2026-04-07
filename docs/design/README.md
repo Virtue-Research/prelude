@@ -18,7 +18,7 @@ crates/
 │       ├── lib.rs                                 # pub use engine::Engine;
 │       │
 │       ├── ops/                                   # Op trait definitions + built-in implementations
-│       │   ├── mod.rs                             # register_cpu_ops(), select_ops(), thread-local OpsBundle context
+│       │   ├── mod.rs                             # register_backend(), select_ops(), thread-local Ops context
 │       │   ├── traits/                            # Trait definitions — the shared contract
 │       │   │   ├── mod.rs                         # re-exports all traits
 │       │   │   ├── bundle.rs                      # OpsBundle — flat API (ops.exp, ops.rms_norm, ops.fused_add_rmsnorm)
@@ -132,7 +132,7 @@ crates/
 │
 ├── prelude-cuda/                              # CUDA device impl (Ops + Executor)
 │   ├── src/
-│   │   ├── lib.rs                             # ctor auto-registers CudaOps + CudaExecutor at link time
+│   │   ├── lib.rs                             # register() registers CudaOps + CudaExecutor with priority/probe
 │   │   ├── device.rs                          # CUDA runtime: CudaStorage, stream/device registry, PTX loading
 │   │   ├── cuda_ops.rs                        # struct CudaOps, impl all 9 op traits
 │   │   ├── quant_backends.rs                  # GPU QuantFormat registration (inventory, priority=100)
@@ -164,7 +164,7 @@ crates/
 │
 ├── prelude-rocm/                              # ROCm device impl (Ops + Executor)
 │   ├── src/
-│   │   ├── lib.rs                             # ctor auto-registers RocmOps + RocmExecutor
+│   │   ├── lib.rs                             # register() registers RocmOps + RocmExecutor with priority/probe
 │   │   ├── rocm_ops.rs                        # struct RocmOps, enum RocmArch (gfx942/950/1100/1200)
 │   │   ├── executor.rs                          # RocmExecutor: HIP graphs, GPU queue
 │   │   └── ...                                # attention, gemm, comm, fused, norm, activation, conv
@@ -176,7 +176,7 @@ crates/
 │
 ├── prelude-metal/                             # Metal device impl (Apple Silicon)
 │   ├── src/
-│   │   ├── lib.rs                             # ctor auto-registers MetalOps + MetalExecutor
+│   │   ├── lib.rs                             # register() registers MetalOps + MetalExecutor with priority/probe
 │   │   ├── metal_ops.rs                       # struct MetalOps (unified memory, simdgroup mm)
 │   │   ├── executor.rs                          # MetalExecutor: Metal command buffer encoding
 │   │   └── ...                                # attention, gemm, fused, norm, activation, conv
@@ -184,7 +184,7 @@ crates/
 │
 ├── prelude-vulkan/                            # Vulkan device impl (cross-vendor)
 │   ├── src/
-│   │   ├── lib.rs                             # ctor auto-registers VulkanOps + VulkanExecutor
+│   │   ├── lib.rs                             # register() registers VulkanOps + VulkanExecutor with priority/probe
 │   │   ├── vulkan_ops.rs                      # struct VulkanOps (cooperative_matrix, subgroup_size)
 │   │   ├── executor.rs                          # VulkanExecutor: Vulkan command buffer + compute pipeline
 │   │   └── ...                                # attention, gemm, norm, activation, conv
@@ -192,14 +192,14 @@ crates/
 │
 ├── prelude-tpu/                               # TPU device impl (XLA/Pallas)
 │   └── src/
-│       ├── lib.rs                             # ctor auto-registers TpuOps + TpuExecutor
+│       ├── lib.rs                             # register() registers TpuOps + TpuExecutor with priority/probe
 │       ├── tpu_ops.rs                         # struct TpuOps (PjrtClient, compiled_cache)
 │       ├── executor.rs                          # TpuExecutor: XLA trace + compile cache
 │       └── ...                                # attention, gemm, session (FusedOps: all None, XLA auto-fuses)
 │
 └── prelude-cpu/                               # CPU device impl
     ├── src/
-    │   ├── lib.rs                             # ctor auto-registers CpuOps + CpuExecutor
+    │   ├── lib.rs                             # register() registers CpuOps + CpuExecutor with priority/probe
     │   ├── cpu_ops.rs                         # struct CpuOps, impl all 9 op traits
     │   ├── executor.rs                          # CpuExecutor: simple block_in_place execution
     │   ├── ops/                               # CPU kernel implementations
@@ -217,8 +217,8 @@ crates/
 **Reading guide:**
 
 - **`prelude-server/`** — binary crate, standalone composition root. Has zero device-specific code.
-  Device crates auto-register their `OpsBundle` + `Executor` via `ctor` at link time.
-  Server just creates `Engine::new(config)` — engine calls `select_backend()` internally.
+  Device crates register their Ops + Executor via `register()` at startup with priority/probe.
+  Server just calls `register()` then creates `Engine::new(config)`.
 
 - **`prelude-dynamo/`** — alternative binary crate for running as an NVIDIA Dynamo backend.
   Links `dynamo-runtime` + `prelude-core`. Implements Dynamo's `AsyncEngine` trait by wrapping
@@ -253,8 +253,8 @@ crates/
   context structs. Model-specific components stay in model files — no forced abstraction.
 
 - **`prelude-{cuda,rocm,metal,vulkan,tpu,cpu}/`** — one crate per device target. Each
-  provides `OpsBundle` (kernel dispatch) + `Executor` (execution strategy), auto-registered via `ctor`.
-  Features are **additive** — `--features cuda,rocm` builds both. Runtime auto-detects GPU.
+  provides Ops (kernel dispatch) + Executor (execution strategy), registered at startup via `register()`.
+  Features are **additive** — `--features cuda,rocm` builds both. Runtime probe auto-detects GPU.
 
 - **`plugins/`** — device-agnostic FFI crates.
   `prelude-mooncake` (KV cache transport) uses `bindgen` to wrap Mooncake's Transfer Engine C API.
@@ -292,7 +292,7 @@ crates/
 
 ```
 Engine              starts             Run loop (core: batch or continuous batching)
-Run loop            calls              Executor::submit/collect (device crate, via ctor)
+Run loop            calls              Executor::submit/collect (device crate, via register())
 Run loop            calls              Scheduler (core, pure CPU scheduling decisions)
 Executor            calls              Model code (prepare tensors → model.forward())
 Model code          calls              OpsBundle flat API (ops.rms_norm, ops.varlen_attention, ...)
@@ -423,7 +423,7 @@ third_party/                          (git submodules, source only — not Cargo
   It depends on CubeCL (pure Rust) for TensorOps primitives and llguidance (pure Rust) for
   constrained decoding. `ComposedOps` composes TensorOps primitives into higher-level ops —
   pure logic, no device dependency. CubeCL's CPU runtime serves as fallback when no device crate is linked.
-- Device crates auto-register `OpsBundle` + `Executor` via `ctor` at link time — no explicit init in server.
+- Device crates register Ops + Executor via explicit `register()` calls at startup with priority/probe.
 - `TensorOps` uses `base()` delegation: device backends override only hot-path methods, rest auto-delegates.
 - `OpsBundle` flat API: models call `ops.xxx()` for everything. Fused ops have built-in fallback.
   All backends follow the same pattern: provide TensorOps primitives + override hot-path ops.
@@ -452,8 +452,10 @@ Standalone binaries cover all platforms. Install script auto-detects and downloa
 Runtime auto-detection selects the best available backend:
 ```rust
 // prelude-server/src/main.rs
-// Device crates (prelude-cuda, prelude-cpu, ...) auto-register via ctor at link time.
-// Server has ZERO device-specific code — no imports from device crates, no cfg gates.
+// Device crates register at startup with priority/probe.
+prelude_cpu::register();
+#[cfg(feature = "cuda")]
+prelude_cuda::register();
 let engine = Engine::new(&config);
 engine.serve().await;
 ```

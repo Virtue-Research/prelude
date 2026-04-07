@@ -19,12 +19,16 @@ trait OpsSession: Send + Sync {
     /// Converts block_tables → kernel-specific metadata (e.g., FlashInfer indptr/indices).
     /// Called once before model.forward(), reused across all N layers.
     ///
-    /// Uses `&Tensor` for device-agnostic scheduling metadata.
+    /// Takes full attention context: Q shape for dispatch decisions, key_cache for layout,
+    /// both cu_seqlens for variable-length batch handling, and softmax scale.
     fn precompute_paged_plan(
         &self,
-        block_tables: &Tensor,      // [batch * max_blocks_per_seq]
-        cu_seqlens_k: &Tensor,      // [batch + 1]
-        block_size: usize,
+        q_shape: (usize, usize, usize),  // (total_tokens, num_heads, head_dim)
+        key_cache: &Tensor,               // cache tensor for layout info
+        cu_seqlens_q: &Tensor,            // [batch + 1]
+        block_tables: &Tensor,            // [batch * max_blocks_per_seq]
+        cu_seqlens_k: &Tensor,            // [batch + 1]
+        softmax_scale: f32,
     ) -> Result<()>;
 }
 ```

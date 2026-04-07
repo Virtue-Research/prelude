@@ -5,7 +5,7 @@ Each device crate provides two things:
    to **ComposedOps** — default implementations that compose TensorOps primitives.
 2. **`Executor`** — implements `Executor` trait (submit/collect) with device-specific execution strategy
 
-Both are auto-registered via `ctor` at link time. See [construction.md](construction.md).
+Both are registered at startup via `register()` with priority/probe. See [construction.md](construction.md).
 
 ### Tiered Ops Architecture
 

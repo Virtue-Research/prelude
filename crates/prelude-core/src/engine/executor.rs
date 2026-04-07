@@ -14,15 +14,17 @@
 //!
 //! # Registration
 //!
-//! Device crates register their Executor factory via `ctor` at link time,
-//! just like Ops registration:
+//! Device crates register their executor via `register_executor()` at startup,
+//! with priority and probe for automatic backend selection:
 //!
 //! ```ignore
-//! // prelude-cuda/src/lib.rs
-//! pub fn register() {
-//!     prelude_core::ops::register_gpu_ops(cuda_ops::cuda_ops);
-//!     prelude_core::engine::executor::register_executor(|e| Box::new(CudaExecutor::new(e)));
-//! }
+//! prelude_core::engine::executor::register_executor(ExecutorBackend {
+//!     name: "cuda",
+//!     priority: 100,
+//!     probe: || cuda_available(),
+//!     supports: |d| d.is_cuda(),
+//!     create: |e| Box::new(CudaExecutor::new(e)),
+//! });
 //! ```
 
 use std::sync::OnceLock;
@@ -133,24 +135,49 @@ pub trait Executor: Send + Sync + 'static {
 
 // ── Registration ───────────────────────────────────────────────────
 
+use std::sync::Mutex;
+use crate::tensor::Device;
+
 /// Factory function signature: takes shared engine state, returns a device executor.
-/// The factory is registered at link time (ctor), but called at runtime when
-/// Engine is ready.
 pub type ExecutorFactory = fn(engine: std::sync::Arc<super::engine::Engine>) -> Box<dyn Executor>;
 
-static EXECUTOR_FACTORY: OnceLock<ExecutorFactory> = OnceLock::new();
-
-/// Register a device executor factory. Called by device crates via `ctor`.
-///
-/// Only the first registration wins (consistent with Ops registration).
-pub fn register_executor(factory: ExecutorFactory) {
-    EXECUTOR_FACTORY.set(factory).ok();
+/// A registered executor backend with priority-based selection.
+pub struct ExecutorBackend {
+    /// Human-readable name (e.g. "cuda", "cpu").
+    pub name: &'static str,
+    /// Higher priority wins when multiple executors match.
+    pub priority: u32,
+    /// Runtime probe: returns `true` if this executor is usable.
+    pub probe: fn() -> bool,
+    /// Returns `true` if this executor handles the given device kind.
+    pub supports: fn(&Device) -> bool,
+    /// Factory that creates the executor for an engine.
+    pub create: ExecutorFactory,
 }
 
-/// Create the registered executor with the given engine, or return `None`
-/// if no device crate registered one.
+static EXECUTOR_REGISTRY: Mutex<Vec<ExecutorBackend>> = Mutex::new(Vec::new());
+
+/// Register an executor backend. Call during startup before engine creation.
+pub fn register_executor(entry: ExecutorBackend) {
+    EXECUTOR_REGISTRY.lock().unwrap().push(entry);
+}
+
+/// Create the best matching executor for the engine's device, or return `None`.
 pub fn create_executor(engine: std::sync::Arc<super::engine::Engine>) -> Option<Box<dyn Executor>> {
-    EXECUTOR_FACTORY.get().map(|f| f(engine))
+    let device = engine.device().clone();
+    let backends = EXECUTOR_REGISTRY.lock().unwrap();
+    let mut best: Option<&ExecutorBackend> = None;
+    for b in backends.iter() {
+        if (b.supports)(&device) && (b.probe)() {
+            if best.map_or(true, |cur| b.priority > cur.priority) {
+                best = Some(b);
+            }
+        }
+    }
+    best.map(|b| {
+        tracing::info!("executor for {device}: {} (priority {})", b.name, b.priority);
+        (b.create)(engine)
+    })
 }
 
 #[cfg(test)]

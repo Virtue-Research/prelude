@@ -1,8 +1,9 @@
 //! Sampling orchestration.
 //!
-//! Contains the `LogitsProcessor` for token sampling from raw logits.
-//! Future: `GrammarManager` for constrained decoding, penalty processors.
+//! Contains the `LogitsProcessor` for token sampling from raw logits,
+//! and `GrammarBackend`/`GrammarMatcher` traits for constrained decoding.
 
-mod grammar;
+pub mod grammar;
 mod logits_processor;
 pub use logits_processor::{LogitsProcessor, Sampling};
+pub use grammar::{ConstraintSpec, GrammarBackend, GrammarMatcher};

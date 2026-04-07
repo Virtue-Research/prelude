@@ -36,7 +36,7 @@ impl ScheduledEngine {
             owned_by: "prelude".to_string(),
         };
 
-        // Create the device executor (registered by device crate via ctor).
+        // Create the device executor (registered by device crate at startup).
         let executor: Arc<dyn Executor> = Arc::from(
             executor::create_executor(Arc::clone(&engine))
                 .unwrap_or_else(|| {

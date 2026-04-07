@@ -7,7 +7,14 @@ pub struct SamplingParams {
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: Option<u32>,
+    /// Adaptive nucleus: drop tokens with p < min_p * p_max.
+    pub min_p: Option<f32>,
+    /// Divide/multiply logits of previously seen tokens.
     pub repetition_penalty: Option<f32>,
+    /// Subtract a fixed value for each seen token.
+    pub presence_penalty: Option<f32>,
+    /// Subtract count * penalty for each seen token.
+    pub frequency_penalty: Option<f32>,
 }
 
 impl Default for SamplingParams {
@@ -16,7 +23,10 @@ impl Default for SamplingParams {
             temperature: 0.7,
             top_p: 1.0,
             top_k: None,
+            min_p: None,
             repetition_penalty: None,
+            presence_penalty: None,
+            frequency_penalty: None,
         }
     }
 }

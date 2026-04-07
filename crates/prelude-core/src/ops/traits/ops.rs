@@ -181,6 +181,17 @@ pub trait Ops: Send + Sync {
     fn send(&self, _x: &Tensor, _dst: RemoteTarget) -> Result<()> { crate::bail!("send: not supported") }
     fn recv(&self, _src: RemoteTarget) -> Result<Tensor> { crate::bail!("recv: not supported") }
 
+    /// Fused MoE dispatch: quantize to FP8 + send to expert owners.
+    /// None = not supported, fallback to all_to_all.
+    fn ep_dispatch_fused(
+        &self, _x: &Tensor, _topk_ids: &Tensor, _num_experts: usize, _use_fp8: bool,
+    ) -> Option<Result<(Tensor, Tensor)>> { None }
+
+    /// Fused MoE combine: receive + weighted accumulate expert outputs.
+    fn ep_combine_fused(
+        &self, _x: &Tensor, _topk_weights: &Tensor, _topk_ids: &Tensor,
+    ) -> Option<Result<Tensor>> { None }
+
     // ════════════════════════════════════════════════════════════════
     // Fused ops (optional — return None = no fused kernel)
     // ════════════════════════════════════════════════════════════════
@@ -193,6 +204,28 @@ pub trait Ops: Send + Sync {
     fn fused_add(&self, _a: &Tensor, _b: &Tensor) -> Option<Result<Tensor>> { None }
     fn fused_moe_routing(&self, _logits: &Tensor, _top_k: usize) -> Option<Result<(Tensor, Tensor, Tensor, Tensor)>> { None }
     fn fused_moe_gemm(&self, _input: &Tensor, _weights: &Tensor, _tw: &Tensor, _st: &Tensor, _se: &Tensor, _topk: usize, _prefill: bool) -> Option<Result<Tensor>> { None }
+
+    /// Fused Adaptive Layer Norm (AdaLN-Zero) for diffusion transformers.
+    /// Computes: normed = layer_norm(x) * (1 + scale) + shift, gated = normed * gate.
+    fn fused_adaln_zero(
+        &self, _x: &Tensor, _weight: &Tensor, _bias: Option<&Tensor>,
+        _scale: &Tensor, _shift: &Tensor, _gate: &Tensor, _eps: f32,
+    ) -> Option<Result<(Tensor, Tensor)>> { None }
+
+    /// Fused scale + shift (continuous AdaLN variant, no gate).
+    /// Computes: layer_norm(x) * (1 + scale) + shift.
+    fn fused_scale_shift(
+        &self, _x: &Tensor, _weight: &Tensor, _bias: Option<&Tensor>,
+        _scale: &Tensor, _shift: &Tensor, _eps: f32,
+    ) -> Option<Result<Tensor>> { None }
+
+    /// Fused multi-LoRA matmul: y = base_weight @ x + scale * (lora_b @ lora_a @ x).
+    /// adapter_indices: [batch] mapping each token to its adapter (-1 = no LoRA).
+    fn fused_lora_matmul(
+        &self, _x: &Tensor, _base_weight: &Tensor,
+        _lora_a: &Tensor, _lora_b: &Tensor,
+        _adapter_indices: &Tensor, _lora_scale: f32,
+    ) -> Option<Result<Tensor>> { None }
 
     // ════════════════════════════════════════════════════════════════
     // Convenience: try fused → fallback to composed
@@ -251,4 +284,44 @@ pub trait Ops: Send + Sync {
     fn end_forward(&self) {}
     fn precompute_paged_plan(&self, _q_shape: (usize, usize, usize), _kc: &Tensor, _csq: &Tensor, _bt: &Tensor, _csk: &Tensor, _scale: f32) -> Result<()> { Ok(()) }
     fn gpu_free_memory(&self) -> Option<usize> { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal Ops impl — all defaults inherited.
+    struct StubOps;
+    impl Ops for StubOps {
+        fn default_impl(&self) -> &dyn Ops { self }
+    }
+
+    #[test]
+    fn fused_stubs_return_none() {
+        let ops = StubOps;
+        let t = Tensor::zeros((2, 4), DType::F32, &Device::Cpu).unwrap();
+
+        // Existing fused ops
+        assert!(ops.fused_add_rmsnorm(&t, &t, &t, 1e-5).is_none());
+        assert!(ops.fused_silu_mul(&t, &t).is_none());
+        assert!(ops.fused_gelu_mul(&t, &t).is_none());
+        assert!(ops.fused_add(&t, &t).is_none());
+        assert!(ops.fused_moe_routing(&t, 2).is_none());
+
+        // New fused ops from design
+        assert!(ops.fused_adaln_zero(&t, &t, None, &t, &t, &t, 1e-5).is_none());
+        assert!(ops.fused_scale_shift(&t, &t, None, &t, &t, 1e-5).is_none());
+        assert!(ops.fused_lora_matmul(&t, &t, &t, &t, &t, 1.0).is_none());
+
+        // EP comm fused ops from design
+        assert!(ops.ep_dispatch_fused(&t, &t, 8, false).is_none());
+        assert!(ops.ep_combine_fused(&t, &t, &t).is_none());
+    }
+
+    #[test]
+    fn comm_defaults_single_device() {
+        let ops = StubOps;
+        assert_eq!(ops.world_size(), 1);
+        assert_eq!(ops.rank(), 0);
+    }
 }
