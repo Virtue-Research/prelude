@@ -36,6 +36,10 @@ impl<T> CuResultExt<T> for std::result::Result<T, cudarc::driver::DriverError> {
 // ── Device/Stream registry ───────��───────────────────────────────
 
 /// Get or create a cached CudaContext for the given GPU ordinal.
+///
+/// Event tracking is disabled because we use a single stream per device.
+/// cudarc's event tracking records inter-operation dependencies that break
+/// CUDA graph capture isolation — disabling it from the start avoids this.
 pub fn cuda_device(ordinal: usize) -> Result<Arc<CudaContext>> {
     static CACHE: Mutex<Vec<Option<Arc<CudaContext>>>> = Mutex::new(Vec::new());
     let mut cache = CACHE.lock().unwrap();
@@ -43,14 +47,21 @@ pub fn cuda_device(ordinal: usize) -> Result<Arc<CudaContext>> {
         cache.resize(ordinal + 1, None);
     }
     if cache[ordinal].is_none() {
-        cache[ordinal] = Some(CudaContext::new(ordinal).ce()?);
+        let ctx = CudaContext::new(ordinal).ce()?;
+        // Safety: single stream per device — no cross-stream ordering needed.
+        // Disabling event tracking is required for CUDA graph capture: cudarc's
+        // automatic CuEventRecord/CuStreamWaitEvent calls create cross-stream
+        // dependencies that violate graph capture isolation.
+        unsafe { ctx.disable_event_tracking(); }
+        cache[ordinal] = Some(ctx);
     }
     Ok(cache[ordinal].clone().unwrap())
 }
 
 /// Get or create the CudaStream for a GPU ordinal.
-/// Uses a non-default stream (CU_STREAM_NON_BLOCKING) so CUDA graph capture works.
-/// All tensor ops, kernel launches, and graph capture must use this same stream.
+///
+/// Uses `new_stream()` (CU_STREAM_NON_BLOCKING) — the NULL stream from
+/// `default_stream()` does not support CUDA graph capture.
 pub fn cuda_stream(ordinal: usize) -> Result<Arc<CudaStream>> {
     static CACHE: Mutex<Vec<Option<Arc<CudaStream>>>> = Mutex::new(Vec::new());
     let mut cache = CACHE.lock().unwrap();

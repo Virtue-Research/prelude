@@ -452,14 +452,13 @@ pub fn varlen_paged(
         m
     };
 
-    if max_seqlen_q == 1 && registry().arch() < 90 {
-        // SM80 (FA2): dedicated decode kernel (no tensor cores)
+    if max_seqlen_q == 1 {
+        // Decode: dedicated Q=1 kernel — faster than prefill kernel on all archs.
         paged_decode(q, key_cache, value_cache,
                      &meta.indptr_gpu, &meta.indices_gpu, &meta.last_page_len_gpu,
                      block_size, num_kv_heads, head_dim, softmax_scale)
     } else {
-        // SM90+ (FA3): use prefill kernel for decode (use_tensor_cores=True),
-        // matching SGLang/FlashInfer's approach. Also handles Q>1 prefill.
+        // Prefill: varlen paged prefill kernel for Q>1.
         paged_prefill_fast(q, key_cache, value_cache, cu_seqlens_q, &meta,
                            block_size, num_kv_heads, head_dim, softmax_scale)
     }

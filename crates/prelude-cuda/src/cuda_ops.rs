@@ -316,6 +316,12 @@ impl Ops for CudaOps {
     }
 
     fn paged_attention(&self, q: &Tensor, key_cache: &Tensor, value_cache: &Tensor, params: &PagedParams) -> Result<Tensor> {
+        // Decode (Q=1): FlashInfer's dedicated decode kernel is much faster
+        // than FA4's varlen prefill kernel for the single-token case.
+        if params.max_seqlen_q == 1 {
+            if let Some(r) = try_flashinfer_paged(q, key_cache, value_cache, params) { return r; }
+        }
+        // Prefill (Q>1): try FA4 first, fall back to FlashInfer prefill.
         let seqused_k = cu_seqlens_to_lens(params.cu_seqlens_k)?;
         if let Some(r) = crate::attn::flash_v4::try_varlen_paged(
             q, key_cache, value_cache, params.block_tables,

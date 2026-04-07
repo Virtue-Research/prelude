@@ -118,8 +118,8 @@ struct Cli {
 
     #[arg(
         long,
-        default_value_t = true,
-        help = "CUDA graph capture for decode steps (default: true)"
+        default_value_t = false,
+        help = "CUDA graph capture for decode steps (experimental, disabled by default)"
     )]
     cuda_graph: bool,
 
