@@ -49,8 +49,8 @@ pub fn cuda_device(ordinal: usize) -> Result<Arc<CudaContext>> {
 }
 
 /// Get or create the CudaStream for a GPU ordinal.
-/// Uses the default (NULL) stream — same as candle/origin. CUDA graph capture
-/// works on the NULL stream with RELAXED mode because all ops are on the same stream.
+/// Uses a non-default stream (CU_STREAM_NON_BLOCKING) so CUDA graph capture works.
+/// All tensor ops, kernel launches, and graph capture must use this same stream.
 pub fn cuda_stream(ordinal: usize) -> Result<Arc<CudaStream>> {
     static CACHE: Mutex<Vec<Option<Arc<CudaStream>>>> = Mutex::new(Vec::new());
     let mut cache = CACHE.lock().unwrap();
@@ -59,7 +59,7 @@ pub fn cuda_stream(ordinal: usize) -> Result<Arc<CudaStream>> {
     }
     if cache[ordinal].is_none() {
         let dev = cuda_device(ordinal)?;
-        cache[ordinal] = Some(dev.default_stream());
+        cache[ordinal] = Some(dev.new_stream().ce()?);
     }
     Ok(cache[ordinal].clone().unwrap())
 }

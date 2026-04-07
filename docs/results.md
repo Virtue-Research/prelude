@@ -9,6 +9,11 @@
 
 ## Prefill-Only (128 in → 1 out, c=1, 100 requests)
 
+```bash
+CUDA_VISIBLE_DEVICES=2 INPUT_TOKENS=128 OUTPUT_TOKENS=1 MAX_REQUESTS=100 CONCURRENCY=1 \
+  ./benchmark/bench.sh <engine> --gpu
+```
+
 | Engine  | Startup(s) | TTFT(s) | E2E(s) | Input tok/s | Output tok/s | RPM    |
 |---------|------------|---------|--------|-------------|-------------|--------|
 | Prelude | 4          | 0.0068  | 0.0069 | 14,520.9    | 108.6       | 6,514.8 |
@@ -20,6 +25,11 @@
 
 ## Decode (32 in → 32 out, c=4, 400 requests)
 
+```bash
+CUDA_VISIBLE_DEVICES=2 INPUT_TOKENS=32 OUTPUT_TOKENS=32 MAX_REQUESTS=400 CONCURRENCY=4 \
+  ./benchmark/bench.sh <engine> --gpu
+```
+
 | Engine  | Startup(s) | TTFT(s) | TPOT(s) | E2E(s) | Output tok/s | RPM    |
 |---------|------------|---------|---------|--------|-------------|--------|
 | Prelude | 2          | 0.0135  | 0.0441  | 1.3800 | 92.0        | 172.5  |
@@ -28,6 +38,11 @@
 SGLang result missing (benchmark timed out).
 
 ## Decode (128 in → 32 out, c=4, 400 requests)
+
+```bash
+CUDA_VISIBLE_DEVICES=2 INPUT_TOKENS=128 OUTPUT_TOKENS=32 MAX_REQUESTS=400 CONCURRENCY=4 \
+  ./benchmark/bench.sh <engine> --gpu
+```
 
 | Engine  | Startup(s) | TTFT(s) | TPOT(s) | E2E(s) | Output tok/s | RPM    |
 |---------|------------|---------|---------|--------|-------------|--------|
@@ -39,7 +54,7 @@ SGLang result missing (benchmark timed out).
 
 **Prefill**: Prelude is fastest — 1.46x vLLM, 4.69x SGLang in RPM. TTFT of 6.8ms beats vLLM (10.7ms) and SGLang (40.7ms). Startup is 4s vs 60s/38s.
 
-**Decode**: Prelude TPOT of ~44ms is significantly slower than vLLM (1.6ms) and SGLang (1.8ms). This is a known issue — the decode path uses `batch_decode_paged` which currently lacks CUDA graph replay and has per-step overhead from the scheduling loop. The origin codebase achieves ~5ms TPOT via CUDA graphs and tighter decode loop integration. This is the top priority for performance work.
+**Decode**: Prelude TPOT of ~44ms is significantly slower than vLLM (1.6ms) and SGLang (1.8ms). This is a known issue — the decode path runs `batch_decode_paged` eagerly every step (6 tensor allocations + H2D copies per step). CUDA graph capture is implemented but blocked by a stream isolation issue (weight tensors created on a different stream than the capture stream). This is the top priority for performance work.
 
 ## Notes
 

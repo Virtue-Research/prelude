@@ -368,16 +368,19 @@ impl DecodeGraphCache {
         }
 
         // Capture
+        tracing::debug!(batch_size, "CUDA graph: begin_capture");
         stream
             .begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
             )
             .map_err(|e| EngineError::Internal(format!("begin_capture: {e}")))?;
 
         // Plan is pre-populated — skip begin/end_forward during capture
+        tracing::debug!(batch_size, "CUDA graph: running model.forward inside capture");
         let output = decode_forward!(model, manage_fi_cache = false)?;
         let output = output.squeeze(1).map_err(tensor_err)?;
 
+        tracing::debug!(batch_size, "CUDA graph: end_capture");
         let graph = stream
             .end_capture(
                 cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
