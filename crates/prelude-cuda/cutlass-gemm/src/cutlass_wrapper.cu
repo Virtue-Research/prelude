@@ -570,11 +570,7 @@ extern "C" int cutlass_gemm_dispatch(
     cudaGetLastError();
 
 #if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
-    // SM90 TMA descriptors require both M and N >= the copy atom tile size.
-    // can_implement() may pass but TMA descriptor creation asserts when a
-    // global dimension is smaller than the box dimension (e.g. N=7 < box=128).
-    // Skip SM90 for small dimensions to avoid the fatal assertion.
-    if (m >= 64 && n >= 64) {
+    {
         int ret;
         switch (dtype) {
             case 0: ret = launch<Sm90_Default<BF16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
@@ -585,60 +581,27 @@ extern "C" int cutlass_gemm_dispatch(
         }
         if (ret == 0) return 0;
         // SM90 failed — fall through to SM80
+        fprintf(stderr, "CUTLASS: SM90 failed (code %d) for m=%d n=%d k=%d dtype=%u, falling back to SM80\n",
+                ret, m, n, k, dtype);
     }
 #endif
 
-    // SM80 fallback — handle batch > 1 by looping over batches.
-    if (batch > 1) {
-        // Element size: BF16/FP16 = 2, F32 = 4, FP8 = 1
-        size_t elem = (dtype == 2) ? 4 : (dtype == 3) ? 1 : 2;
-        for (int b = 0; b < batch; b++) {
-            const void* Ab = (const char*)A + b * stride_a * elem;
-            const void* Bb = (const char*)B + b * stride_b * elem;
-            void* Db = (char*)D + b * stride_d * elem;
-            int ret = cutlass_gemm_dispatch(Ab, Bb, Db, m, n, k, 1, lda, ldb, ldd, 0, 0, 0, transa, transb, dtype, stream);
-            if (ret != 0) return ret;
-        }
-        return 0;
-    }
+    if (batch > 1) return -30;
 
-    // Try unpredicated first (fastest), fall back to predicated for unaligned M.
-    // Unpredicated requires M and N aligned to tile dims (128); skip if not aligned.
+    // SM80 fallback — try unpredicated first (fastest), fall back to predicated.
     if (dtype == 0) {
-        // Naive fallback for small matrices — CUTLASS tile kernels fail for M or N < 64
-        if (m < 64 || n < 64) {
-            return naive_bf16_gemm(A, B, D, m, n, k, s);
-        }
         if (m % 128 == 0 && n % 128 == 0) {
             int ret = sm80_bf16_c3(A, B, D, m, n, k, s);  // unpredicated
             if (ret == 0) return 0;
         }
-        {
-            int ret = sm80_bf16_c1(A, B, D, m, n, k, s);  // predicated (alignment=8)
-            if (ret == 0) return 0;
-        }
-        return sm80_bf16_align2(A, B, D, m, n, k, s);     // alignment=2 fallback
+        return sm80_bf16_c1(A, B, D, m, n, k, s);         // predicated fallback
     }
     if (dtype == 1) {
-        if (m < 64 || n < 64) {
-            return naive_fp16_gemm(A, B, D, m, n, k, s);
-        }
         if (m % 128 == 0 && n % 128 == 0) {
             int ret = sm80_fp16_c3(A, B, D, m, n, k, s);
             if (ret == 0) return 0;
         }
-        {
-            int ret = sm80_fp16_c1(A, B, D, m, n, k, s);
-            if (ret == 0) return 0;
-        }
-        return sm80_fp16_align2(A, B, D, m, n, k, s);     // alignment=2 fallback
-    }
-    if (dtype == 2) {
-        // For small matrices, use a naive kernel to avoid CUTLASS tile/predication bugs.
-        if (m < 64 || n < 64) {
-            return naive_f32_gemm(A, B, D, m, n, k, s);
-        }
-        return sm80_f32_gemm(A, B, D, m, n, k, s);
+        return sm80_fp16_c1(A, B, D, m, n, k, s);
     }
     return -20;
 }

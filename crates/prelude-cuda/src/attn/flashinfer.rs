@@ -1150,11 +1150,12 @@ mod tests {
             let bt = &block_tables[seq_i];
 
             // Generate deterministic K/V data: [kv_len, num_kv, head_dim]
+            // V values are all-positive so the attention output is clearly non-zero.
             let mut k_f32 = vec![0.0f32; kv_len * kv_stride];
             let mut v_f32 = vec![0.0f32; kv_len * kv_stride];
             for i in 0..k_f32.len() {
-                k_f32[i] = (((seq_i * 1000 + i) % 23) as f32 - 11.0) * 0.01;
-                v_f32[i] = (((seq_i * 1000 + i) % 19) as f32 - 9.0) * 0.01;
+                k_f32[i] = 0.005 * (((seq_i * 1000 + i) % 11) as f32);
+                v_f32[i] = 0.01 * (((seq_i * 1000 + i) % 5) as f32) + 0.01;
             }
 
             // Build slot_mapping for this sequence (same as BlockManager::slot)
@@ -1210,7 +1211,7 @@ mod tests {
         let qo_stride = num_qo * head_dim;
         let mut q_f32 = vec![0.0f32; batch_size * qo_stride];
         for i in 0..q_f32.len() {
-            q_f32[i] = ((i % 17) as f32 - 8.0) * 0.01;
+            q_f32[i] = 0.01 * (i as f32 % 7.0);
         }
         let q_t = Tensor::new(&q_f32[..], &dev).unwrap()
             .to_dtype(DType::BF16).unwrap()
@@ -1272,20 +1273,17 @@ mod tests {
         for seq_i in 0..batch_size {
             let base = seq_i * qo_stride;
             let mut max_abs_err = 0.0f32;
-            let mut any_nonzero = false;
+            let gpu_sum: f32 = (0..qo_stride).map(|i| gpu_out[base + i].abs()).sum();
             for i in 0..qo_stride {
-                let g = gpu_out[base + i];
-                let r = ref_out[base + i];
-                if g.abs() > 1e-10 { any_nonzero = true; }
-                let err = (g - r).abs();
+                let err = (gpu_out[base + i] - ref_out[base + i]).abs();
                 if err > max_abs_err { max_abs_err = err; }
             }
-            assert!(any_nonzero, "seq {seq_i}: GPU output is all zeros");
+            eprintln!("  seq {seq_i}: max_abs_err={max_abs_err:.6}, gpu_sum={gpu_sum:.4}");
+            assert!(gpu_sum > 0.001, "seq {seq_i}: GPU output is all zeros");
             assert!(
                 max_abs_err < 0.01,
                 "seq {seq_i}: max_abs_err={max_abs_err:.6} (threshold 0.01)"
             );
-            eprintln!("  seq {seq_i}: max_abs_err={max_abs_err:.6} PASS");
         }
     }
 

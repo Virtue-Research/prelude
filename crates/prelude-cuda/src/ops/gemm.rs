@@ -51,9 +51,7 @@ pub(crate) unsafe fn gemm_dispatch_impl(
     // Features (m) and K are always model-dimension-aligned.
     // Tokens (n) can be any value — DeepGEMM handles partial tiles for M.
     //
-    // Skip DeepGEMM for small dimensions: TMA-based warp-specialized kernels
-    // can crash (ILLEGAL_INSTRUCTION) when global dims < TMA box dims.
-    if dtype == 0 && batch == 1 && transa && !transb && m >= 16 && n >= 16 {
+    if dtype == 0 && batch == 1 && transa && !transb {
         // Swap: DeepGEMM A=input(b), B=weight(a), M=tokens(n), N=features(m)
         let ret = prelude_deepgemm::bf16_gemm(
             b as *mut c_void, a as *mut c_void, d,
