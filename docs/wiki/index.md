@@ -30,7 +30,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 ### Developer Guide
 - [General](developer_guide/general.md) — Developer overview and contribution guidelines
-- [Adding a Model](developer_guide/adding-a-model.md) — Step-by-step guide to integrating a new model architecture
+- [Adding a component](developer_guide/add.md) — Step-by-step guide to integrating a new model architecture
 - [Integration](developer_guide/integration.md) — Dynamo backend, Mooncake transport, and RL training integration
 
 #### Design

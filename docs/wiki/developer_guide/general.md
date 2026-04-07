@@ -384,13 +384,13 @@ When working on sub-systems:
 
 ## Integration 
 
-- [integration](design/integration.md) — Integrate with external frameworks.
+- [Integration](integration.md) — Integrate with external frameworks.
 
 ## Common Contribution Paths
 
 <!-- TODO: what else to contribution -->
 
-- [add](design/add.md) — Details about how to add model, kernal backend, and schedular mechanisms.
+- [Add a component](add.md) — Details about how to add model, kernal backend, and schedular mechanisms.
 
 ## Design Docs
 
