@@ -6,7 +6,7 @@ AGInfer runs as a single binary HTTP server exposing an OpenAI-compatible API. T
 
 Before running the server, you need to build the binary for your target device. See [Getting Started](setup.md#build) for the full build instructions and feature flag reference.
 
-### GPU
+### NVIDIA GPU
 
 ```bash
 # Build
@@ -17,6 +17,30 @@ CUDA_VISIBLE_DEVICES=0 ./target/release/prelude-server \
   --model Qwen/Qwen3-4B \
   --port 8000 \
   --host 0.0.0.0
+```
+
+### AMD GPU (ROCm)
+
+```bash
+# Build
+cargo build -p prelude-server --release --features rocm
+
+# Run
+./target/release/prelude-server \
+  --model Qwen/Qwen3-4B \
+  --port 8000
+```
+
+### Apple Silicon (Metal)
+
+```bash
+# Build
+cargo build -p prelude-server --release --features metal
+
+# Run
+./target/release/prelude-server \
+  --model Qwen/Qwen3-4B \
+  --port 8000
 ```
 
 ### CPU
@@ -85,6 +109,8 @@ AGInfer implements the OpenAI HTTP API, making it a drop-in replacement for vLLM
 For quick curl and Python SDK examples to get your first request working, see [Getting Started → First Request](setup.md#first-request).
 
 ## Parallelism and scaling
+
+<!-- (do we support multi-gpu) -->
 
 AGInfer currently runs on a single GPU per process. Native multi-GPU tensor parallelism (splitting one model across multiple GPUs) is on the roadmap. The options below achieve multi-GPU throughput by running independent single-GPU instances behind a load balancer.
 

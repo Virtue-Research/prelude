@@ -83,6 +83,7 @@ nav:
       - Modules and Operators: developer_guide/design/ops.md 
       - Devices: developer_guide/design/devices.md
     - Adding a Model: developer_guide/adding-a-model.md
+    - Integration: developer_guide/integration.md
   - API Reference:
     - Overview: api/index.md
     - Endpoints: api/endpoints.md

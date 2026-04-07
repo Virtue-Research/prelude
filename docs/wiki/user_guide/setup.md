@@ -25,36 +25,57 @@ oneDNN is auto-downloaded and statically linked on first build — no manual set
 
     Without this step, `cargo build` will fail with a submodule-not-found error.
 
-Three main configurations:
+### NVIDIA GPU (Linux, x86_64)
 
 ```bash
-# GPU — full stack (recommended): FlashInfer + FA4 + DeepGEMM + oneDNN
+# Recommended — FlashInfer + FA4 + DeepGEMM + oneDNN
 cargo build -p prelude-server --release --features flashinfer-v4,onednn,deepgemm
 
-# GPU — FlashInfer only (no FA4)
+# FlashInfer only (skips FA4 compilation)
 cargo build -p prelude-server --release --features flashinfer,onednn
 
-# CPU only — oneDNN BF16 GEMM
-cargo build -p prelude-server --release --features onednn
-
-# GGUF models (auto-detected, no extra flags needed)
-cargo build -p prelude-server --release --features onednn
+# SM90+ only (H100/B200) — FA4 CuTeDSL
+cargo build -p prelude-server --release --features flash-attn-v4,onednn,deepgemm
 ```
 
-Feature flags cascade: `flashinfer`, `flash-attn-v4`, and `flash-attn` each imply `cuda`.
+### AMD GPU (Linux, ROCm)
 
-| Feature | What it does | GPU requirement |
+```bash
+cargo build -p prelude-server --release --features rocm
+```
+
+### Apple Silicon (macOS, Metal)
+
+```bash
+cargo build -p prelude-server --release --features metal
+```
+
+### CPU only
+
+```bash
+# oneDNN BF16 GEMM (recommended for x86_64)
+cargo build -p prelude-server --release --features onednn
+
+# Minimal — no external GEMM library
+cargo build -p prelude-server --release
+```
+
+GGUF models are auto-detected from HuggingFace Hub or local `.gguf` files — no extra build flags required.
+
+Feature flags cascade: `flashinfer`, `flash-attn-v4`, and `flash-attn` each imply `cuda`. Metal and CUDA/ROCm cannot coexist in one binary.
+
+| Feature | What it does | Requirement |
 |---|---|---|
-| `flashinfer-v4` | FlashInfer + FA4 combined (recommended) | SM80+ |
-| `flashinfer` | FlashInfer AOT attention (FA2 SM80+ / FA3 SM90+) | SM80+ |
-| `flash-attn-v4` | FA4 CuTeDSL AOT attention | SM80+ |
+| `flashinfer-v4` | FlashInfer + FA4 combined (recommended for NVIDIA) | SM80+ |
+| `flashinfer` | FlashInfer AOT attention (FA2/FA3) | SM80+ |
+| `flash-attn-v4` | FA4 CuTeDSL AOT attention | SM90+ |
 | `deepgemm` | DeepGEMM BF16 GEMM — up to 2× faster than cuBLAS | SM90+ |
+| `rocm` | ROCm/HIP GPU backend | AMD GPU |
+| `metal` | Metal GPU backend | Apple Silicon |
 | `onednn` | CPU BF16 GEMM via oneDNN | None (CPU) |
-| `cuda` | GPU fused ops + paged KV cache (implied by above) | Any CUDA |
+| `cuda` | GPU fused ops + paged KV cache (implied by flashinfer/fa flags) | Any CUDA GPU |
 
-Attention dispatch priority: FA4 → FlashInfer → FA3 → FA2 → CPU fallback.
-
-GGUF models are auto-detected from HuggingFace Hub or local `.gguf` files — no extra build flags required beyond `onednn`.
+Attention dispatch priority (NVIDIA): FA4 → FlashInfer → FA3 → FA2 → CPU fallback.
 
 !!! note "FA4 first build"
     FA4 AOT compilation compiles ~120 CuTeDSL kernel variants per SM architecture. This takes 10–20 minutes on first build but is fully cached afterwards. Use `flashinfer` only if you want to skip FA4.

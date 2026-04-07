@@ -142,13 +142,19 @@ print(response.choices[0].prompt_logprobs)
 
 AGInfer compiles multiple attention kernels at build time and dispatches to the best available one at runtime:
 
+**NVIDIA (CUDA)** — dispatch priority:
+
 | Priority | Backend | Requirement | Best for |
 |---|---|---|---|
-| 1 | FA4 (CuTeDSL) | SM80+ | Prefill throughput |
+| 1 | FA4 (CuTeDSL) | SM90+ | Prefill throughput |
 | 2 | FlashInfer | SM80+ | Decode (CUDA graph compatible) |
-| 3 | CPU | — | CPU inference |
+| 3 | CPU fallback | — | No GPU |
 
-No configuration needed — the best kernel is selected automatically based on your GPU. See [Getting Started](setup.md) for build flag details.
+**AMD (ROCm):** Uses HIP attention kernels via `prelude-rocm` (built with `--features rocm`).
+
+**Apple Silicon (Metal):** Uses Metal compute shaders via `prelude-metal` (built with `--features metal`).
+
+No configuration needed — the best kernel is selected automatically based on your device. See [Getting Started](setup.md) for build flag details.
 
 ---
 
@@ -156,13 +162,16 @@ No configuration needed — the best kernel is selected automatically based on y
 
 Matrix multiplication dispatch follows a similar priority:
 
-| Backend | Requirement | Speedup |
+| Backend | Requirement | Notes |
 |---|---|---|
-| DeepGEMM | SM90+ (H100/H200) | Up to 2× vs cuBLAS |
-| cuBLAS | Any CUDA | Baseline |
-| oneDNN | CPU | BF16 on CPU |
+| DeepGEMM | SM90+ (H100/H200) | Up to 2× faster than cuBLAS |
+| cuBLAS | Any CUDA GPU | Default NVIDIA GEMM |
+| ROCm (CK/aiter) | AMD GPU | Enabled with `--features rocm` |
+| Metal (simdgroup) | Apple Silicon | Enabled with `--features metal` |
+| oneDNN | x86_64 CPU | BF16 GEMM, statically linked |
+| Built-in | Any CPU | F32 fallback, no extra deps |
 
-Enable DeepGEMM at build time:
+Enable DeepGEMM at build time (NVIDIA SM90+):
 
 ```bash
 cargo build -p prelude-server --release --features flashinfer-v4,onednn,deepgemm
