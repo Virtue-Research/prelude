@@ -76,13 +76,13 @@ nav:
     - Features: user_guide/features.md
   - Developer Guide:
     - General: developer_guide/general.md
-    - Adding a Model: developer_guide/adding-a-model.md
     - Design:
       - Overview: developer_guide/design/overview.md
       - Schedular: developer_guide/design/schedular.md
       - Models: developer_guide/design/models.md
       - Modules and Operators: developer_guide/design/ops.md 
       - Devices: developer_guide/design/devices.md
+    - Adding a Model: developer_guide/adding-a-model.md
   - API Reference:
     - Overview: api/index.md
     - Endpoints: api/endpoints.md
