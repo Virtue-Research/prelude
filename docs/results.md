@@ -9,57 +9,39 @@
 
 ## Prefill-Only (128 in → 1 out, c=1, 100 requests)
 
-```bash
-CUDA_VISIBLE_DEVICES=2 INPUT_TOKENS=128 OUTPUT_TOKENS=1 MAX_REQUESTS=100 CONCURRENCY=1 \
-  ./benchmark/bench.sh <engine> --gpu
-```
+| Engine  | Startup(s) | TTFT(s) | E2E(s) | Input tok/s | Output tok/s | RPM    |
+|---------|------------|---------|--------|-------------|-------------|--------|
+| Prelude | 4          | 0.0068  | 0.0069 | 14,520.9    | 108.6       | 6,514.8 |
+| vLLM    | 60         | 0.0107  | 0.0108 | 9,926.3     | 74.2        | 4,452.4 |
+| SGLang  | 38         | 0.0407  | 0.0409 | 3,098.2     | 23.2        | 1,389.7 |
 
-| Engine  | Startup(s) | TTFT(s) | E2E(s) | Output tok/s | RPM    | Overall tok/s |
-|---------|------------|---------|--------|-------------|--------|---------------|
-| Prelude | 2          | 0.0080  | 0.0081 | 86.5        | 5191.6 | 11,162        |
-| vLLM    | 46         | 0.0137  | 0.0139 | 58.3        | 3495.5 | 7,517         |
-| SGLang  | 42         | 0.0438  | 0.0439 | 21.1        | 1268.7 | 2,728         |
-
-**Prelude vs vLLM: 1.48x throughput, 1.72x lower TTFT**
-**Prelude vs SGLang: 4.09x throughput, 5.48x lower TTFT**
+**Prelude vs vLLM: 1.46x RPM, 1.57x lower TTFT, 15x faster startup**
+**Prelude vs SGLang: 4.69x RPM, 5.99x lower TTFT**
 
 ## Decode (32 in → 32 out, c=4, 400 requests)
 
-```bash
-CUDA_VISIBLE_DEVICES=2 INPUT_TOKENS=32 OUTPUT_TOKENS=32 MAX_REQUESTS=400 CONCURRENCY=4 \
-  ./benchmark/bench.sh <engine> --gpu
-```
+| Engine  | Startup(s) | TTFT(s) | TPOT(s) | E2E(s) | Output tok/s | RPM    |
+|---------|------------|---------|---------|--------|-------------|--------|
+| Prelude | 2          | 0.0135  | 0.0441  | 1.3800 | 92.0        | 172.5  |
+| vLLM    | 50         | 0.0215  | 0.0016  | 0.0705 | 1,713.8     | 3,213.5 |
 
-| Engine  | Startup(s) | TTFT(s) | TPOT(s) | E2E(s) | Output tok/s | RPM    | Overall tok/s |
-|---------|------------|---------|---------|--------|-------------|--------|---------------|
-| Prelude | 6          | 0.0226  | 0.0000  | 0.0227 | 143.5       | 8607.9 | 9,176         |
-| vLLM    | 48         | 0.0292  | 0.0016  | 0.0800 | 1488.2      | 2790.3 | 2,976         |
-| SGLang  | 36         | 0.0574  | 0.0018  | 0.1127 | 1081.0      | 2026.9 | 2,162         |
-
-**Prelude vs vLLM: 3.08x RPM, 3.53x lower E2E latency**
-**Prelude vs SGLang: 4.25x RPM, 4.96x lower E2E latency**
+SGLang result missing (benchmark timed out).
 
 ## Decode (128 in → 32 out, c=4, 400 requests)
 
-```bash
-CUDA_VISIBLE_DEVICES=2 INPUT_TOKENS=128 OUTPUT_TOKENS=32 MAX_REQUESTS=400 CONCURRENCY=4 \
-  ./benchmark/bench.sh <engine> --gpu
-```
+| Engine  | Startup(s) | TTFT(s) | TPOT(s) | E2E(s) | Output tok/s | RPM    |
+|---------|------------|---------|---------|--------|-------------|--------|
+| Prelude | 14         | 0.0178  | 0.0442  | 1.3888 | 91.4        | 171.3  |
+| vLLM    | 42         | 0.0295  | 0.0016  | 0.0803 | 1,474.5     | 2,764.8 |
+| SGLang  | 32         | 0.0669  | 0.0018  | 0.1236 | 983.5       | 1,844.0 |
 
-| Engine  | Startup(s) | TTFT(s) | TPOT(s) | E2E(s) | Output tok/s | RPM    | Overall tok/s |
-|---------|------------|---------|---------|--------|-------------|--------|---------------|
-| Prelude | 2          | 0.0252  | 0.0000  | 0.0253 | 126.0       | 7557.7 | 20,154        |
-| vLLM    | 46         | 0.0302  | 0.0016  | 0.0812 | 1448.3      | 2715.5 | 7,241         |
-| SGLang  | 38         | 0.0520  | 0.0018  | 0.1088 | 1106.0      | 2073.8 | 5,530         |
+## Analysis
 
-**Prelude vs vLLM: 2.78x RPM, 3.21x lower E2E latency**
-**Prelude vs SGLang: 3.64x RPM, 4.30x lower E2E latency**
+**Prefill**: Prelude is fastest — 1.46x vLLM, 4.69x SGLang in RPM. TTFT of 6.8ms beats vLLM (10.7ms) and SGLang (40.7ms). Startup is 4s vs 60s/38s.
+
+**Decode**: Prelude TPOT of ~44ms is significantly slower than vLLM (1.6ms) and SGLang (1.8ms). This is a known issue — the decode path uses `batch_decode_paged` which currently lacks CUDA graph replay and has per-step overhead from the scheduling loop. The origin codebase achieves ~5ms TPOT via CUDA graphs and tighter decode loop integration. This is the top priority for performance work.
 
 ## Notes
 
-- TPOT=0.000 for Prelude is a genai-bench measurement artifact — it reports E2E-level timing, not per-token streaming latency.
-- vLLM and SGLang report per-token TPOT because they use chunked streaming responses.
-- Overall tok/s = RPM * (input_tokens + output_tokens) / 60.
-- vLLM/SGLang input_tps values come from genai-bench CSV; Prelude reports 0.0 due to the same measurement artifact.
+- GPUs 0,1,4-7 were occupied during this run; only GPU 2 was idle.
 - Docker images: `vllm/vllm-openai:latest` (v0.18.0), `lmsysorg/sglang:latest`.
-- Results may vary with machine load. GPUs 0,1,4-7 were occupied during this run.
