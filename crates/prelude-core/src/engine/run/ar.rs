@@ -650,26 +650,8 @@ mod tests {
 
         // Need states entries for the IDs
         let mut states_with_entries = HashMap::new();
-        states_with_entries.insert("a".to_string(), ArSequenceState {
-            request_id: "a".to_string(),
-            prepared: Some(make_prepared("a", 10)),
-            response: ResponseChannel::Complete(tokio::sync::oneshot::channel().0),
-            gen_start: Instant::now(), prefill_ms: 0.0, started_sent: false,
-            sent_text_len: 0, prompt_len: 3, next_decode_position: 3,
-            pending_token: None, output_tokens: vec![], token_logprobs: vec![],
-            prompt_token_logprobs: None, block_table: vec![], deltanet_slot: None,
-            max_new_tokens: 10,
-        });
-        states_with_entries.insert("b".to_string(), ArSequenceState {
-            request_id: "b".to_string(),
-            prepared: Some(make_prepared("b", 10)),
-            response: ResponseChannel::Complete(tokio::sync::oneshot::channel().0),
-            gen_start: Instant::now(), prefill_ms: 0.0, started_sent: false,
-            sent_text_len: 0, prompt_len: 3, next_decode_position: 3,
-            pending_token: None, output_tokens: vec![], token_logprobs: vec![],
-            prompt_token_logprobs: None, block_table: vec![], deltanet_slot: None,
-            max_new_tokens: 10,
-        });
+        states_with_entries.insert("a".to_string(), make_prefill_state("a", 10));
+        states_with_entries.insert("b".to_string(), make_prefill_state("b", 10));
 
         let ids = vec!["a".to_string(), "b".to_string()];
         let tokens = sample_batch(&mut states_with_entries, &ids, &logits).unwrap();
@@ -714,17 +696,31 @@ mod tests {
 
     // ── build_forward_batch tests ─────────────────────────────────
 
-    fn make_decode_state(id: &str, pending_token: u32, position: usize) -> ArSequenceState {
+    fn make_prefill_state(id: &str, max_new: usize) -> ArSequenceState {
         ArSequenceState {
             request_id: id.to_string(),
-            prepared: Some(make_prepared(id, 10)),
+            prepared: Some(make_prepared(id, max_new)),
+            response: ResponseChannel::Complete(tokio::sync::oneshot::channel().0),
+            gen_start: Instant::now(), prefill_ms: 0.0, started_sent: false,
+            sent_text_len: 0, prompt_len: 3, next_decode_position: 3,
+            pending_token: None, output_tokens: vec![], token_logprobs: vec![],
+            prompt_token_logprobs: None, block_table: vec![], deltanet_slot: None,
+            max_new_tokens: max_new,
+        }
+    }
+
+    fn make_decode_state(id: &str, pending_token: u32, position: usize) -> ArSequenceState {
+        let max_new = 10;
+        ArSequenceState {
+            request_id: id.to_string(),
+            prepared: Some(make_prepared(id, max_new)),
             response: ResponseChannel::Complete(tokio::sync::oneshot::channel().0),
             gen_start: Instant::now(), prefill_ms: 0.0, started_sent: true,
             sent_text_len: 0, prompt_len: 3, next_decode_position: position,
             pending_token: Some(pending_token), output_tokens: vec![pending_token],
             token_logprobs: vec![], prompt_token_logprobs: None,
             block_table: vec![0, 1], deltanet_slot: None,
-            max_new_tokens: 10,
+            max_new_tokens: max_new,
         }
     }
 
