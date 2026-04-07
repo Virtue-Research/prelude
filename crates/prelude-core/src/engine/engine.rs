@@ -171,7 +171,7 @@ impl Engine {
     /// of each sequence.
     fn forward_prefill(
         &self,
-        items: Vec<super::PreparedGenerateRequest>,
+        mut items: Vec<super::PreparedGenerateRequest>,
     ) -> Result<super::executor::ModelOutput, EngineError> {
         use super::executor::ModelOutput;
 
@@ -181,25 +181,33 @@ impl Engine {
                     (0, 0), DType::F32, &Device::Cpu,
                 ).map_err(|e| EngineError::Internal(e.to_string()))?,
                 item_seq_counts: vec![],
+                prefill_results: vec![],
             });
         }
 
-        // GPU path (flash attention available): use prefill_pipeline
-        {
-            let token_groups: Vec<&[Vec<u32>]> = items
-                .iter()
-                .map(|item| std::slice::from_ref(&item.prompt_tokens))
-                .collect();
+        // Use paged prefill to allocate KV cache blocks and run the forward pass.
+        // This returns per-request BatchPrefillResult with block_table, first_token, etc.
+        let execution_kind = if self.device().is_cuda() {
+            super::ExecutionKind::CudaPrefillOnly
+        } else {
+            super::ExecutionKind::CpuPrefillOnly
+        };
+        let prefill_plan = self.build_prefill_plan(&items, execution_kind);
+        let prefill_results = self.batch_prefill_paged(&mut items, &prefill_plan)?;
 
-            let forward_result = self.prefill_pipeline(&token_groups)?
-                .ok_or_else(|| EngineError::Internal("empty prefill batch".into()))?;
+        // Build logits tensor from first_token results (batch_prefill_paged already sampled).
+        // The AR loop will use the first_token from prefill_results directly.
+        // Return a dummy logits tensor — sampling is already done in batch_prefill_paged.
+        let batch_size = prefill_results.len();
+        let logits = crate::tensor::Tensor::zeros(
+            (batch_size, 1), DType::F32, self.device(),
+        ).map_err(|e| EngineError::Internal(e.to_string()))?;
 
-            Ok(ModelOutput {
-                logits: forward_result.output,
-                item_seq_counts: forward_result.item_seq_counts,
-            })
-        }
-
+        Ok(ModelOutput {
+            logits,
+            item_seq_counts: vec![],
+            prefill_results,
+        })
     }
 
     /// Forward pass for batched decode (one token per sequence, paged KV).
@@ -219,6 +227,7 @@ impl Engine {
                     (0, 0), DType::F32, &Device::Cpu,
                 ).map_err(|e| EngineError::Internal(e.to_string()))?,
                 item_seq_counts: vec![],
+                prefill_results: vec![],
             });
         }
 
@@ -237,6 +246,7 @@ impl Engine {
         Ok(ModelOutput {
             logits,
             item_seq_counts: vec![],
+            prefill_results: vec![],
         })
     }
 
@@ -260,6 +270,7 @@ impl Engine {
                     (0, 0), DType::F32, &Device::Cpu,
                 ).map_err(|e| EngineError::Internal(e.to_string()))?,
                 item_seq_counts: vec![],
+                prefill_results: vec![],
             });
         }
 
@@ -275,6 +286,7 @@ impl Engine {
             Ok(ModelOutput {
                 logits: forward_result.output,
                 item_seq_counts: forward_result.item_seq_counts,
+                prefill_results: vec![],
             })
         }
 

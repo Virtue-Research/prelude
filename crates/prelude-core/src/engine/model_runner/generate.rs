@@ -38,7 +38,7 @@ impl Engine {
         })
     }
 
-    fn build_prefill_plan(
+    pub(crate) fn build_prefill_plan(
         &self,
         items: &[PreparedGenerateRequest],
         execution_kind: ExecutionKind,

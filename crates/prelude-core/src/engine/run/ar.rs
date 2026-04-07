@@ -308,13 +308,19 @@ fn process_output(
     step: &SchedulerStep,
     output: &ModelOutput,
 ) {
-    let logits = &output.logits;
-    let all_ids: Vec<String> = step.prefill_request_ids.iter()
-        .chain(step.decode_request_ids.iter())
-        .cloned()
-        .collect();
+    let is_prefill = !step.prefill_request_ids.is_empty();
 
-    // Sample tokens (needs &mut states for non-greedy LogitsProcessor::sample)
+    // For prefill: batch_prefill_paged already sampled tokens and allocated blocks.
+    // Use BatchPrefillResult directly instead of sampling from logits.
+    if is_prefill && !output.prefill_results.is_empty() {
+        process_prefill_output(engine, scheduler, states, step, &output.prefill_results);
+        return;
+    }
+
+    // Decode path: sample from logits
+    let logits = &output.logits;
+    let all_ids: Vec<String> = step.decode_request_ids.iter().cloned().collect();
+
     let sampled = match sample_batch(states, &all_ids, logits) {
         Ok(tokens) => tokens,
         Err(error) => {
@@ -323,73 +329,103 @@ fn process_output(
         }
     };
 
-    // Process each sampled token
     let mut completed: Vec<(String, FinishReason)> = Vec::new();
-
-    let is_prefill = !step.prefill_request_ids.is_empty();
 
     for (row_idx, request_id) in all_ids.iter().enumerate() {
         let Some(state) = states.get_mut(request_id) else { continue; };
         let next_token = sampled[row_idx];
 
-        // After prefill: set prompt_len and next_decode_position from the prepared request.
-        if is_prefill && state.prompt_len == 0 {
-            if let Some(ref prepared) = state.prepared {
-                state.prompt_len = prepared.prompt_tokens.len();
-                state.next_decode_position = state.prompt_len;
-            }
-        }
-
-        scheduler.on_token_generated(request_id, next_token);
-        state.next_decode_position += 1;
-        state.ensure_started();
-
-        // Extract logprobs if requested
-        let token_logprobs = state.prepared.as_ref()
-            .and_then(|p| p.request.logprobs)
-            .and_then(|k| {
-                logits.get(row_idx).ok()
-                    .and_then(|row| Engine::extract_top_logprobs(&row, next_token, k, &engine.tokenizer).ok())
-            });
-
-        // Check stop conditions
-        if engine.is_eos(next_token) {
-            completed.push((request_id.clone(), FinishReason::Eos));
-            continue;
-        }
-        if let Some(ref prepared) = state.prepared {
-            if engine.check_stop_tokens(next_token, &prepared.request.stop.token_ids) {
-                completed.push((request_id.clone(), FinishReason::Stop));
-                continue;
-            }
-        }
-
-        // Append token and stream
-        state.pending_token = Some(next_token);
-        state.output_tokens.push(next_token);
-        if let Some(ref lp) = token_logprobs {
-            state.token_logprobs.push(lp.clone());
-        }
-        state.emit_text_delta(&engine.tokenizer, token_logprobs);
-
-        // Check max length and stop strings
-        let text = state.current_text(&engine.tokenizer);
-        if state.output_tokens.len() >= state.max_new() {
-            completed.push((request_id.clone(), FinishReason::Length));
-        } else if let Some(ref prepared) = state.prepared {
-            if !prepared.request.stop.strings.is_empty()
-                && prepared.request.stop.strings.iter().any(|s| text.contains(s))
-            {
-                completed.push((request_id.clone(), FinishReason::Stop));
-            }
-        }
+        process_single_token(engine, scheduler, state, request_id, next_token, None, &mut completed);
     }
 
-    // Finish completed sequences
     for (request_id, finish_reason) in completed {
         scheduler.finish_request(&request_id, seq_finish_reason(&finish_reason));
         if let Some(state) = states.remove(&request_id) {
             finish_state(engine, state, finish_reason);
+        }
+    }
+}
+
+/// Handle prefill results from batch_prefill_paged: set block_table, prompt_len,
+/// process first token, and stream it.
+fn process_prefill_output(
+    engine: &Engine,
+    scheduler: &mut Scheduler,
+    states: &mut HashMap<String, ArSequenceState>,
+    step: &SchedulerStep,
+    results: &[crate::engine::BatchPrefillResult],
+) {
+    let mut completed: Vec<(String, FinishReason)> = Vec::new();
+
+    for (i, request_id) in step.prefill_request_ids.iter().enumerate() {
+        let Some(result) = results.get(i) else { continue; };
+        let Some(state) = states.get_mut(request_id) else { continue; };
+
+        // Populate state from prefill result
+        state.block_table = result.block_table.clone();
+        state.prompt_len = result.prompt_len;
+        state.next_decode_position = result.prompt_len;
+        state.prefill_ms = result.prefill_ms;
+        state.deltanet_slot = result.deltanet_slot;
+        state.prompt_token_logprobs = result.prompt_token_logprobs.clone();
+
+        let next_token = result.first_token;
+        let logprobs = result.first_token_logprobs.clone();
+
+        process_single_token(engine, scheduler, state, request_id, next_token, logprobs, &mut completed);
+    }
+
+    for (request_id, finish_reason) in completed {
+        scheduler.finish_request(&request_id, seq_finish_reason(&finish_reason));
+        if let Some(state) = states.remove(&request_id) {
+            finish_state(engine, state, finish_reason);
+        }
+    }
+}
+
+/// Process a single sampled token: check stop conditions, stream, check length.
+fn process_single_token(
+    engine: &Engine,
+    scheduler: &mut Scheduler,
+    state: &mut ArSequenceState,
+    request_id: &str,
+    next_token: u32,
+    token_logprobs: Option<TokenLogprobInfo>,
+    completed: &mut Vec<(String, FinishReason)>,
+) {
+    scheduler.on_token_generated(request_id, next_token);
+    state.next_decode_position += 1;
+    state.ensure_started();
+
+    // Check stop conditions
+    if engine.is_eos(next_token) {
+        completed.push((request_id.to_string(), FinishReason::Eos));
+        return;
+    }
+    if let Some(ref prepared) = state.prepared {
+        if engine.check_stop_tokens(next_token, &prepared.request.stop.token_ids) {
+            completed.push((request_id.to_string(), FinishReason::Stop));
+            return;
+        }
+    }
+
+    // Append token and stream
+    state.pending_token = Some(next_token);
+    state.output_tokens.push(next_token);
+    if let Some(ref lp) = token_logprobs {
+        state.token_logprobs.push(lp.clone());
+    }
+    state.emit_text_delta(&engine.tokenizer, token_logprobs);
+
+    // Check max length and stop strings
+    let text = state.current_text(&engine.tokenizer);
+    if state.output_tokens.len() >= state.max_new() {
+        completed.push((request_id.to_string(), FinishReason::Length));
+    } else if let Some(ref prepared) = state.prepared {
+        if !prepared.request.stop.strings.is_empty()
+            && prepared.request.stop.strings.iter().any(|s| text.contains(s))
+        {
+            completed.push((request_id.to_string(), FinishReason::Stop));
         }
     }
 }
@@ -688,6 +724,7 @@ mod tests {
             pending_token: Some(pending_token), output_tokens: vec![pending_token],
             token_logprobs: vec![], prompt_token_logprobs: None,
             block_table: vec![0, 1], deltanet_slot: None,
+            max_new_tokens: 10,
         }
     }
 

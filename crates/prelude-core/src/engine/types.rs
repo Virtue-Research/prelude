@@ -244,6 +244,7 @@ pub type PreTokenizedEmbedItem = PreTokenizedBatchItem<EmbedRequest>;
 
 /// Result of batch prefill for a single request.
 /// Block table is retained (NOT freed) for subsequent streaming decode.
+#[derive(Debug)]
 pub struct BatchPrefillResult {
     pub first_token: u32,
     pub block_table: Vec<u32>,

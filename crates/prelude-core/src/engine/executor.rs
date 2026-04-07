@@ -71,6 +71,9 @@ pub struct ModelOutput {
     /// Number of sequences per input item (for one-shot classify/embed grouping).
     /// Empty for Prefill/Decode batches.
     pub item_seq_counts: Vec<usize>,
+    /// Per-request prefill metadata (block tables, prompt_len, etc.).
+    /// Populated only for Prefill batches; empty for Decode/OneShot.
+    pub prefill_results: Vec<super::BatchPrefillResult>,
 }
 
 // ── Forward batch ──────────────────────────────────────────────────
@@ -224,7 +227,7 @@ mod tests {
         ) -> Result<ModelOutput, EngineError> {
             let result = handle.downcast::<MockResult>()
                 .ok_or_else(|| EngineError::Internal("wrong handle type".into()))?;
-            Ok(ModelOutput { logits: result.logits, item_seq_counts: result.item_seq_counts })
+            Ok(ModelOutput { logits: result.logits, item_seq_counts: result.item_seq_counts, prefill_results: vec![] })
         }
     }
 
