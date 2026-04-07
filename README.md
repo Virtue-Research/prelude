@@ -1,12 +1,6 @@
 <p align="center">
-  <img src="assets/Prelude_logo_readme.svg" alt="Prelude" width="600">
+  <h1 align="center"><strong>AGInfer</strong>: Fast LLM inference engine in Rust. Optimized for prefill throughput</h1> 
 </p>
-
-<p align="center">
-  Fast LLM inference engine in Rust. Optimized for prefill throughput.
-</p>
-
----
 
 ## Performance
 
