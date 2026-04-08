@@ -160,7 +160,7 @@ impl QTensor {
         let storage = CpuStorage::F32(f32_data);
         let layout = Layout::contiguous(self.shape.clone());
         let t = Tensor::from_storage_layout(
-            Arc::new(crate::tensor::Storage::Cpu(storage)),
+            Arc::new(crate::tensor::Storage::Device(crate::tensor::DeviceStorage::from_cpu(storage))),
             layout, DType::F32, Device::Cpu,
         );
         if device.is_cuda() {

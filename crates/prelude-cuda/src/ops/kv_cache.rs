@@ -1,4 +1,4 @@
-use crate::device::{self as cb, CuResultExt, LaunchConfig, PushKernelArg, CudaStorageExt};
+use crate::device::{self as cb, CuResultExt, LaunchConfig, PushKernelArg};
 use crate::{MOD_KNORM_ROPE_KV_WRITE, PTX_KNORM_ROPE_KV_WRITE};
 use crate::{MOD_SCATTER_KV_CACHE, PTX_SCATTER_KV_CACHE};
 use prelude_core::tensor::{bail, DType, Result, Tensor};

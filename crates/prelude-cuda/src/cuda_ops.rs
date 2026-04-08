@@ -144,7 +144,9 @@ impl Ops for CudaOps {
             let cuda = cs::as_cuda(x.storage(), "to_device CPU")?;
             let cpu = cuda.to_cpu(&layout)?;
             Ok(Tensor::from_storage_layout(
-                std::sync::Arc::new(prelude_core::tensor::Storage::Cpu(cpu)),
+                std::sync::Arc::new(prelude_core::tensor::Storage::Device(
+                    prelude_core::tensor::DeviceStorage::from_cpu(cpu),
+                )),
                 prelude_core::tensor::Layout::contiguous(shape), x.dtype(), Device::Cpu,
             ))
         } else {
@@ -152,11 +154,12 @@ impl Ops for CudaOps {
             let stream = cs::cuda_stream(ordinal)?;
             let storage = x.storage();
             match storage {
-                prelude_core::tensor::Storage::Cpu(cpu) => {
+                prelude_core::tensor::Storage::Device(dev) if dev.downcast_ref::<prelude_core::tensor::CpuStorage>().is_some() => {
+                    let cpu = dev.downcast_ref::<prelude_core::tensor::CpuStorage>().unwrap();
                     let result = cs::CudaStorage::from_cpu(&stream, cpu, &layout)?;
                     Ok(cs::tensor_from_device(result, shape))
                 }
-                prelude_core::tensor::Storage::Cuda(_) => {
+                prelude_core::tensor::Storage::Device(_) => {
                     let cuda = cs::as_cuda(storage, "to_device GPU")?;
                     let cpu = cuda.to_cpu(&layout)?;
                     let cl = prelude_core::tensor::Layout::contiguous(shape.clone());

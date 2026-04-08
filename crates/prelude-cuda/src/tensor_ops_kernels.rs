@@ -12,7 +12,7 @@ use half::{bf16, f16};
 use prelude_core::tensor::{bail, CpuStorage, DType, Layout, Result, Shape};
 
 use crate::device::{
-    CuResultExt, CudaStorage, CudaStorageSlice, CudaStorageExt, GpuDType, get_or_load_func, tensor_from_device,
+    CuResultExt, CudaStorage, CudaStorageSlice, GpuDType, get_or_load_func, tensor_from_device,
 };
 use crate::{
     MOD_UNARY, MOD_BINARY, MOD_CAST, MOD_REDUCE, MOD_INDEXING,

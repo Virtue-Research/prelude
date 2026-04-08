@@ -5,7 +5,7 @@
 //!
 //! Supports both non-paged varlen (prefill) and paged KV (prefill + decode).
 
-use crate::device::{self as cb, DevicePtr, CudaStorageExt};
+use crate::device::{self as cb, DevicePtr};
 use prelude_core::tensor::{bail, DType, Result, Tensor};
 use half::bf16;
 use prelude_flash_attn_v4::{KernelDtype, KernelKey, KernelRegistry};

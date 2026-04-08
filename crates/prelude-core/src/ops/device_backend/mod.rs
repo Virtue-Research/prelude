@@ -1,9 +1,9 @@
-//! Pure CPU TensorOps implementation over `Storage::Cpu(CpuStorage)`.
+//! Pure CPU TensorOps implementation over `Storage::Device(CpuStorage)`.
 //!
 //! `DeviceTensorOps` is a correctness reference — no SIMD, no parallelism.
 //! Performance-critical paths are handled by prelude-cpu overrides.
 //!
-//! All outputs are `Storage::Cpu(...)`.
+//! All outputs are `Storage::Device(DeviceStorage::from_cpu(...))`.
 
 use std::sync::Arc;
 
@@ -11,7 +11,7 @@ use half::{bf16, f16};
 
 use crate::ops::traits::{BinaryOp, CompareOp, ReduceOp, Ops, UnaryOp};
 use crate::tensor::{
-    CpuStorage, DType, Device, Layout, Result, Shape, Storage, Tensor,
+    CpuStorage, DType, Device, DeviceStorage, Layout, Result, Shape, Storage, Tensor,
     WithDType,
     error::Error,
 };
@@ -21,7 +21,7 @@ use crate::tensor::{
 fn make_tensor(cpu: CpuStorage, shape: Shape, device: &Device) -> Tensor {
     let dtype = cpu.dtype();
     Tensor::from_storage_layout(
-        Arc::new(Storage::Cpu(cpu)),
+        Arc::new(Storage::Device(DeviceStorage::from_cpu(cpu))),
         Layout::contiguous(shape),
         dtype,
         *device,

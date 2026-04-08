@@ -5,7 +5,7 @@
 //!
 //! Use this for M > 1 (prefill). For M = 1 (decode), use `mmvq` instead.
 
-use crate::device::{self as cb, CuResultExt, DevicePtr, CudaStorageExt};
+use crate::device::{self as cb, CuResultExt, DevicePtr};
 use prelude_core::tensor::{bail, DType, Result, Tensor};
 use std::ffi::c_void;
 

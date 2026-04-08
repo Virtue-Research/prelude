@@ -14,7 +14,6 @@ keywords = ["llm", "inference", "serving", "scheduler", "rust"]
 
 [features]
 default = []
-cuda = ["dep:cudarc"]
 hf_tokenizer = ["dep:tokenizers"]
 nvtx = []
 test-cuda = []
@@ -43,7 +42,6 @@ rayon = "1.11.0"
 libm = "0.2"
 tokenizers = { workspace = true, optional = true }
 bc-mimalloc.workspace = true
-cudarc = { version = "0.19.4", features = ["std", "driver", "f16", "fallback-dynamic-loading"], default-features = false, optional = true }
 
 
 [dev-dependencies]

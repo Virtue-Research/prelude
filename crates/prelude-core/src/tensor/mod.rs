@@ -12,9 +12,7 @@ pub mod with_dtype;
 pub use error::{DeviceLocation, Error, Result};
 pub use shape::{D, Dim, Dims, Shape, ShapeWithOneHole};
 pub use layout::Layout;
-pub use storage::{CpuStorage, Storage, cpu_extract_vec};
-#[cfg(feature = "cuda")]
-pub use storage::{CudaStorage, CudaStorageSlice, CudaSlice, CudaStream, CudaContext};
+pub use storage::{CpuStorage, DeviceStorage, DeviceStorageTrait, Storage, cpu_extract_vec};
 pub use with_dtype::{WithDType, IntDType, FloatDType};
 
 // ── DType ──────────────────────────────────────────────────────────
@@ -115,7 +113,7 @@ impl Tensor {
         let dtype = cpu_storage.dtype();
         let layout = Layout::contiguous(shape);
         Self {
-            storage: Arc::new(Storage::Cpu(cpu_storage)),
+            storage: Arc::new(Storage::Device(DeviceStorage::from_cpu(cpu_storage))),
             layout, dtype, device: Device::Cpu,
         }
     }
@@ -181,7 +179,7 @@ impl Tensor {
         }
 
         let cpu_storage = CpuStorage::from_typed_vec(data);
-        let storage = Storage::Cpu(cpu_storage);
+        let storage = Storage::Device(DeviceStorage::from_cpu(cpu_storage));
         let t = Self::from_storage_layout(
             Arc::new(storage),
             Layout::contiguous(shape),
@@ -195,7 +193,7 @@ impl Tensor {
     fn from_vec_cpu<T: WithDType>(data: Vec<T>, shape: Shape) -> Result<Self> {
         let dtype = T::DTYPE;
         let cpu_storage = CpuStorage::from_typed_vec(data);
-        let storage = Storage::Cpu(cpu_storage);
+        let storage = Storage::Device(DeviceStorage::from_cpu(cpu_storage));
         Ok(Self::from_storage_layout(
             Arc::new(storage),
             Layout::contiguous(shape),
@@ -417,9 +415,13 @@ impl Tensor {
         let t = self.contiguous()?.flatten_all()?;
         let storage = &*t.storage;
         match storage {
-            Storage::Cpu(cpu) => storage::cpu_extract_vec::<T>(cpu, &t.layout),
-            #[cfg(feature = "cuda")]
-            Storage::Cuda(_) => Err(Error::Msg("to_vec1: unexpected CUDA storage after CPU transfer".into()).bt()),
+            Storage::Device(dev) => {
+                if let Some(cpu) = dev.downcast_ref::<CpuStorage>() {
+                    storage::cpu_extract_vec::<T>(cpu, &t.layout)
+                } else {
+                    Err(Error::Msg("to_vec1: device storage is not CPU — transfer to CPU first".into()).bt())
+                }
+            }
         }
     }
 
