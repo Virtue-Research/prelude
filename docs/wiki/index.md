@@ -35,7 +35,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 #### Design
 - [Overview](developer_guide/design/overview.md) — High-level design overview
-- [Scheduler](developer_guide/design/schedular.md) — Scheduler design
+- [Scheduler](developer_guide/design/scheduler.md) — Scheduler design
 - [Models](developer_guide/design/models.md) — Model architecture internals
 - [Modules and Operators](developer_guide/design/ops.md) — Module and operator design
 - [Devices](developer_guide/design/devices.md) — Device abstraction and backends
@@ -58,7 +58,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 ## Performance Highlight
 
-### Prefill throughout 
+### Prefill Throughput
 
 | Engine | Throughput (tok/s) | P50 Latency | P95 Latency |
 |--------|-------------------|-------------|-------------|

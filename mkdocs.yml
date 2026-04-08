@@ -80,7 +80,7 @@ nav:
     - Integration: developer_guide/integration.md
     - Design:
       - Overview: developer_guide/design/overview.md
-      - Schedular: developer_guide/design/schedular.md
+      - Scheduler: developer_guide/design/scheduler.md
       - Models: developer_guide/design/models.md
       - Modules and Operators: developer_guide/design/ops.md 
       - Devices: developer_guide/design/devices.md

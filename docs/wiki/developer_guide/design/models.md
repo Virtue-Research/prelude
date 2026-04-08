@@ -1,290 +1,305 @@
 # Models
 
-# Model Registry & Loading
+## Overview
+
+Each model is a self-contained file with its own structs and forward logic, mapping 1:1 to HuggingFace transformers. Models call `ops.xxx()` for all compute — device dispatch and fusion are invisible to model code. `models/commons/` holds only what is universally shared: weight containers (`Linear`, `Embedding`), `RotaryEmbedding`, and context structs.
+
+Three properties hold for all model code:
+
+- **Device-agnostic** — no `#[cfg(feature = "cuda")]`, no direct kernel calls
+- **Fusion-agnostic** — no if/else between fused and unfused paths; the `Ops` trait implementation decides internally
+- **Quant-agnostic** — `Linear::forward` dispatches to the right backend transparently
 
 ## File Layout
 
 ```
-prelude-core/src/
-├── engine/
-│   ├── weight_loader.rs                       # WeightLoader: safetensors/GGUF → model struct
-│   └── ...
-├── models/
-│   ├── mod.rs                                 # trait Model, re-exports
-│   ├── registry.rs                            # ModelRegistry: arch name → model constructor
-│   ├── config.rs                              # ModelConfig: parsed from HF config.json
-│   ├── qwen3.rs                               # impl Model for Qwen3
-│   ├── llama.rs                               # impl Model for Llama (also serves Phi3, InternLM3)
-│   └── ...
+prelude-core/src/models/
+├── commons/
+│   ├── linear.rs         # Linear (backend-dispatched), RmsNorm, LinearBackend trait
+│   ├── embedding.rs      # Embedding lookup
+│   ├── attn_utils.rs     # RotaryEmbedding, attention dispatch helpers
+│   ├── activation.rs     # Activation functions
+│   └── mod.rs            # Context structs (BatchAttnContext, LayerAttnContext, BatchState)
+├── forward.rs            # trait ModelForward + sub-traits (LogitsSplitModel, KvCacheModel, ...)
+├── registry.rs           # ArchSpec trait + ArchSpecEntry inventory registration
+├── config.rs             # Per-model config parsing helpers
+├── qwen3.rs              # Qwen3 (GQA + QK-norm)
+├── qwen3_moe.rs          # Qwen3-MoE (SparseMoeBlock)
+├── qwen3_5.rs            # Qwen3.5 hybrid (gated attention + DeltaNet)
+├── qwen3_next.rs         # Qwen3-Next
+├── gemma3.rs             # Gemma3 (softcap, sliding window)
+└── gemma4.rs             # Gemma4
 ```
+
+Model-specific components stay in the model file. No forced abstraction into commons/.
+
+## ModelForward Trait
+
+All model architectures implement `ModelForward`:
+
+```rust
+// prelude-core/src/models/forward.rs
+
+pub trait ModelForward: Send {
+    /// Main forward pass. packed_input is flat token IDs [total_tokens].
+    fn forward(
+        &mut self,
+        packed_input: &Tensor,
+        ctx: &mut BatchAttnContext,
+    ) -> Result<Tensor>;
+
+    fn clear_kv_cache(&mut self);
+
+    // Optional capability accessors — default to None
+    fn as_logits_model(&self) -> Option<&dyn LogitsSplitModel> { None }
+    fn as_logits_model_mut(&mut self) -> Option<&mut dyn LogitsSplitModel> { None }
+    fn as_kv_cache_model(&mut self) -> Option<&mut dyn KvCacheModel> { None }
+    fn as_classifier(&self) -> Option<&dyn ClassifierModel> { None }
+    fn as_embedding(&self) -> Option<&dyn EmbeddingModel> { None }
+    fn kv_cache_sharing(&self) -> Vec<Option<usize>> { vec![] }
+    fn generate_direct(&mut self, ..) -> Result<Option<(Vec<u32>, Vec<f32>)>> { Ok(None) }
+}
+```
+
+Sub-traits for optional capabilities:
+
+| Sub-trait | Purpose |
+|-----------|---------|
+| `LogitsSplitModel` | Split forward into hidden states + lm_head (for prompt logprobs) |
+| `KvCacheModel` | CPU sequential decode with internal KV cache |
+| `ClassifierModel` | Expose `num_labels` + label map |
+| `EmbeddingModel` | Expose `embedding_dim` |
 
 ## Model Registration
 
-Auto-registration via `inventory` crate. Adding a new model = one file + one `inventory::submit!`.
-No manual modification of registry.rs or mod.rs.
+### Auto-registration via `ArchSpec`
+
+Each model implements the `ArchSpec` trait and registers a static instance via the `inventory` crate. No changes to `registry.rs` when adding a new model.
 
 ```rust
 // prelude-core/src/models/registry.rs
 
-/// Registration entry. Submitted once per model file via inventory::submit!
-struct ModelRegistration {
-    /// HF architecture names this model handles.
-    /// Matched against config.json "architectures" field.
-    architectures: &'static [&'static str],
-    /// Constructor function.
-    create: fn(&ModelConfig, &Ops) -> Result<Box<dyn Model>>,
+pub(crate) trait ArchSpec: Sync {
+    fn name(&self) -> &'static str;
+    fn architecture_aliases(&self) -> &'static [&'static str];
+    fn model_type_aliases(&self) -> &'static [&'static str];
+    fn supported_tasks(&self) -> &'static [TaskKind];
+
+    fn parse_config(&self, task: TaskKind, raw: &serde_json::Value, content: &str)
+        -> Result<ParsedModelConfig, EngineError>;
+
+    fn build_model(&self, arch_config: &dyn Any, vb: VarBuilder<'_>)
+        -> Result<Box<dyn ModelForward>, EngineError>;
+
+    fn runtime_caps(&self, task: TaskKind, backend: WeightsBackend, device: &Device)
+        -> RuntimeCaps;
+
+    // Optional GGUF support
+    fn gguf_aliases(&self) -> &'static [&'static str] { &[] }
+    fn load_gguf(&self, ..) -> Result<GgufLoadResult, EngineError> { Err(..) }
 }
 
-inventory::collect!(ModelRegistration);
-
-/// Lookup: HF arch name → constructor.
-fn resolve_model(arch: &str) -> Option<&'static ModelRegistration> {
-    inventory::iter::<ModelRegistration>()
-        .find(|r| r.architectures.contains(&arch))
+pub(crate) struct ArchSpecEntry {
+    pub spec: &'static dyn ArchSpec,
 }
+inventory::collect!(ArchSpecEntry);
 ```
+
+Registration in each model file (one `inventory::submit!` call):
 
 ```rust
-// prelude-core/src/models/llama.rs
+// prelude-core/src/models/qwen3.rs — inside mod meta {}
 
-struct LlamaModel { /* layers, embed, lm_head */ }
+pub(crate) struct Qwen3ArchSpec;
+pub(crate) static QWEN3_ARCH_SPEC: Qwen3ArchSpec = Qwen3ArchSpec;
+inventory::submit!(ArchSpecEntry::new(&QWEN3_ARCH_SPEC));
 
-impl Model for LlamaModel {
-    fn forward(&mut self, x: &Tensor, ctx: &ForwardCtx, ops: &Ops, kv: &PagedKvCtx) -> Result<Tensor> {
-        // ...
+impl ArchSpec for Qwen3ArchSpec {
+    fn name(&self) -> &'static str { "qwen3" }
+    fn architecture_aliases(&self) -> &'static [&'static str] { &["Qwen3", "Qwen3Model"] }
+    fn model_type_aliases(&self) -> &'static [&'static str] { &["qwen3"] }
+    fn supported_tasks(&self) -> &'static [TaskKind] {
+        &[TaskKind::Generate, TaskKind::Classify, TaskKind::Embed]
     }
-}
-
-// One line: register this model for multiple HF architectures
-inventory::submit! {
-    ModelRegistration {
-        architectures: &[
-            "LlamaForCausalLM",
-            "Phi3ForCausalLM",       // Phi3 = Llama architecture
-            "InternLM3ForCausalLM",  // InternLM3 = Llama architecture
-        ],
-        create: |config, ops| {
-            let model = LlamaModel::from_config(config, ops)?;
-            Ok(Box::new(model))
-        },
-    }
+    fn parse_config(&self, task: TaskKind, raw: &serde_json::Value, content: &str)
+        -> Result<ParsedModelConfig, EngineError> { .. }
+    fn build_model(&self, arch_config: &dyn Any, vb: VarBuilder<'_>)
+        -> Result<Box<dyn ModelForward>, EngineError> { .. }
+    ..
 }
 ```
 
-**Design choice (learn from SGLang, avoid vLLM):**
-- SGLang: `EntryClass` convention + `pkgutil.iter_modules()` auto-discovery. 133 lines of registry.
-  Clean — adding a model doesn't touch the registry file.
-- vLLM: 19K-line registry dict mapping 500+ architecture names. Manual, error-prone.
-- **We use `inventory` crate** — Rust equivalent of SGLang's EntryClass.
-  Each model file `submit!`s its own registration. Registry just iterates.
-  Adding a model = add one file. Zero changes to existing code.
+Adding a new model = one new file + one `inventory::submit!`. Zero changes to existing code.
 
-### Architecture Aliasing
+### Architecture Resolution
 
-Multiple HF architectures can map to the same model implementation:
+The registry resolves HuggingFace `architectures` strings (e.g., `"Qwen3ForCausalLM"`) by splitting on `"For"`:
+
+- Prefix (`"Qwen3"`) → matched against `architecture_aliases()` (case/punctuation-insensitive)
+- Suffix (`"CausalLM"`) → mapped to `TaskKind::Generate`, `TaskKind::Classify`, or `TaskKind::Embed`
+
+GGUF uses a separate `gguf_aliases()` lookup.
+
+### Weight Loading
+
+Weight loading goes through `VarBuilder` inside `ArchSpec::build_model()`. Each model reads its own weights by name from the VarBuilder, which auto-detects format:
+
+| Format | Detection |
+|--------|-----------|
+| Safetensors (sharded) | `model.safetensors.index.json` exists |
+| Safetensors (single) | `model.safetensors` exists |
+| GGUF | `.gguf` extension → `ArchSpec::load_gguf()` |
+
+## Model Structure
+
+### Linear as Backend Dispatcher
+
+`Linear` is the unified weight container. It holds a `Box<dyn LinearBackend>` — the backend is chosen at load time based on device and quantization format. Model code always calls `Linear::forward()` and never branches on backend:
 
 ```rust
-// prelude-core/src/models/llama.rs — one file serves Llama, Phi3, InternLM3, Yi, etc.
-// All are architecturally identical (RoPE + GQA + SiLU MLP).
-// Config differences (num_layers, num_heads, vocab_size) handled by ModelConfig.
+// prelude-core/src/models/commons/linear.rs
 
-inventory::submit! {
-    ModelRegistration {
-        architectures: &[
-            "LlamaForCausalLM",
-            "Phi3ForCausalLM",
-            "InternLM3ForCausalLM",
-            "YiForCausalLM",
-            "MistralForCausalLM",
-        ],
-        create: |config, ops| Ok(Box::new(LlamaModel::from_config(config, ops)?)),
+pub struct Linear {
+    inner: Box<dyn LinearBackend>,
+}
+
+impl Linear {
+    pub fn forward(&self, x: &Tensor, _ctx: &BatchState, _ops: &dyn Ops) -> Result<Tensor> {
+        self.inner.forward(x)  // delegates entirely to backend
     }
 }
 ```
 
-This is SGLang's pattern (Phi3 = LlamaForCausalLM via inheritance) adapted for Rust.
-No inheritance needed — same struct, different config values.
+The backend is selected when `Linear` is constructed:
 
-## Model Config
+| Device | Backend | GEMM dispatch |
+|--------|---------|---------------|
+| CUDA | `NaiveLinearBackend` | `Tensor::matmul()` → registered CUTLASS/DeepGEMM |
+| CPU | `OnednnLinear` (via inventory) | OneDNN GEMM |
+| GGUF | registered `QuantFormat` backend | MMQ / dequant GEMM |
+
+> **LoRA and TP** — `Linear::forward` accepts `ctx` and `ops` for API stability. These will be used when LoRA and tensor-parallelism land. Currently unused (prefixed `_` in the implementation).
+
+### Fusion Strategy
+
+The `Ops` trait implementation owns all fusion decisions. Model code calls ops directly; the implementation tries the device kernel and falls back to composed ops internally:
 
 ```rust
-// prelude-core/src/models/config.rs
-
-/// Parsed from HF config.json. Architecture-agnostic fields.
-struct ModelConfig {
-    pub architectures: Vec<String>,
-    pub model_type: String,
-    pub hidden_size: usize,
-    pub num_hidden_layers: usize,
-    pub num_attention_heads: usize,
-    pub num_key_value_heads: usize,
-    pub head_dim: usize,
-    pub intermediate_size: usize,
-    pub vocab_size: usize,
-    pub max_position_embeddings: usize,
-    pub rope_theta: f64,
-    pub rms_norm_eps: f64,
-    pub tie_word_embeddings: bool,
-
-    // Quantization (if specified in config)
-    pub quantization_config: Option<QuantizationConfig>,
-
-    // MoE (optional)
-    pub num_experts: Option<usize>,
-    pub num_experts_per_tok: Option<usize>,
-
-    // Model-specific extra fields (parsed as raw JSON)
-    pub extra: serde_json::Value,
-}
-
-impl ModelConfig {
-    /// Parse from HF config.json. Handles different HF naming conventions.
-    fn from_hf_config(path: &Path) -> Result<Self> {
-        let json: serde_json::Value = serde_json::from_reader(File::open(path)?)?;
-        // Normalize: some models nest under "text_config" (Gemma3, multimodal)
-        let config = if let Some(tc) = json.get("text_config") { tc } else { &json };
-        // Extract fields with fallbacks for different naming conventions
-        Ok(ModelConfig {
-            hidden_size: config["hidden_size"].as_u64()? as usize,
-            num_attention_heads: config["num_attention_heads"].as_u64()? as usize,
-            num_key_value_heads: config.get("num_key_value_heads")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(config["num_attention_heads"].as_u64()?) as usize,
-            // ... etc ...
-            extra: json.clone(),  // keep raw JSON for model-specific fields
-        })
-    }
-}
+// Model code calls ops — no branching, no fallback handling
+let h = ops.rms_norm(x, &self.ln1_weight, eps)?;
+let (x_res, h2) = ops.add_rmsnorm(x, &h, &self.ln2_weight, eps)?;
+let out = ops.silu_mul(&gate, &up)?;
 ```
 
-**Design choice:**
-- vLLM: `ModelArchitectureConfig` with per-model converter functions (`MODEL_ARCH_CONFIG_CONVERTORS`). Modular but verbose.
-- SGLang: loads HF config directly, per-model `__init__` extracts fields. Simpler.
-- **We use**: common `ModelConfig` struct with `extra: serde_json::Value` for model-specific fields.
-  Common fields (hidden_size, num_layers, etc.) are normalized once. Models access
-  `config.extra["sliding_window"]` for anything non-standard.
+If a kernel developer adds a fused op to `CudaOps`, every model calling it benefits automatically.
 
-## Weight Loading
+## Model Code Patterns
+
+### Decoder Layer (Qwen3)
 
 ```rust
-// prelude-core/src/engine/weight_loader.rs
+// prelude-core/src/models/qwen3.rs — DecoderLayer
 
-/// Load model weights from safetensors/GGUF files.
-/// Maps HF tensor names to model struct fields.
-trait WeightLoadable {
-    /// Stacked parameter mappings: combine separate Q/K/V into fused QKV.
-    fn stacked_params() -> &'static [StackedParam] {
-        &[]  // default: no stacking
-    }
+fn forward(&self, x: &Tensor, ctx: &LayerAttnContext) -> Result<Tensor> {
+    let ops = ctx.ops;
 
-    /// Load weights into self. Called once at model init.
-    fn load_weights(&mut self, weights: &mut WeightIterator, ops: &Ops) -> Result<()>;
-}
+    // Pre-attention norm
+    let h = ops.rms_norm(x, &self.ln1_weight, self.rms_norm_eps)?;
 
-/// Stacked parameter mapping: combine multiple HF weights into one fused tensor.
-struct StackedParam {
-    /// Name in our model struct (e.g., "qkv_proj")
-    target: &'static str,
-    /// Names in HF safetensors (e.g., ["q_proj", "k_proj", "v_proj"])
-    sources: &'static [&'static str],
-    /// Shard IDs for each source (e.g., ["q", "k", "v"] or [0, 1])
-    shard_ids: &'static [&'static str],
-}
+    // Attention (handles QK-norm + RoPE + KV cache write internally)
+    let h = self.self_attn.forward(&h, ctx)?;
 
-/// Iterator over (name, tensor) pairs from safetensors/GGUF files.
-struct WeightIterator {
-    // Handles format detection, shard discovery, lazy loading
-}
+    // Residual + post-attention norm (fused when device supports it)
+    let (x_res, h2) = ops.add_rmsnorm(x, &h, &self.ln2_weight, self.rms_norm_eps)?;
 
-impl WeightIterator {
-    /// Open weight files at path. Auto-detects format.
-    fn open(path: &Path) -> Result<Self> {
-        if path.join("model.safetensors.index.json").exists() {
-            // Sharded safetensors: read index → load relevant shards
-            Self::open_safetensors_sharded(path)
-        } else if path.extension() == Some("gguf") {
-            Self::open_gguf(path)
-        } else {
-            // Single safetensors or .bin
-            Self::open_single(path)
-        }
-    }
+    // MLP + residual
+    ops.add_or_fused(&x_res, &self.mlp.forward(&BatchState::no_lora(), ops, &h2)?)
 }
 ```
 
-### Example: Llama Weight Loading
+### Attention Forward (Qwen3)
 
 ```rust
-// prelude-core/src/models/llama.rs
+// prelude-core/src/models/qwen3.rs — Qwen3Attention
 
-impl WeightLoadable for LlamaModel {
-    fn stacked_params() -> &'static [StackedParam] {
-        &[
-            StackedParam {
-                target: "qkv_proj",
-                sources: &["q_proj", "k_proj", "v_proj"],
-                shard_ids: &["q", "k", "v"],
-            },
-            StackedParam {
-                target: "gate_up_proj",
-                sources: &["gate_proj", "up_proj"],
-                shard_ids: &["0", "1"],
-            },
-        ]
-    }
+pub(crate) fn forward(&self, x: &Tensor, ctx: &LayerAttnContext) -> Result<Tensor> {
+    let ops = ctx.ops;
+    let (q, k, v) = self.fused_qkv_projection(x, total_q, &bs, ops)?;
 
-    fn load_weights(&mut self, weights: &mut WeightIterator, ops: &Ops) -> Result<()> {
-        let stacked = Self::stacked_params();
-        for (name, tensor) in weights {
-            // 1. Try stacked params mapping
-            if let Some(sp) = stacked.iter().find(|sp| sp.sources.iter().any(|s| name.contains(s))) {
-                let target_name = name.replace(matched_source, sp.target);
-                let param = self.get_param_mut(&target_name)?;
-                param.load_shard(&tensor, shard_id)?;
-                continue;
-            }
-            // 2. Direct load (name matches)
-            if let Some(param) = self.get_param_mut(&name) {
-                param.load(&tensor)?;
-            }
-        }
-        Ok(())
-    }
+    // QK-norm + RoPE + optional paged KV cache write (ops picks optimal fusion)
+    let kv_cache = ctx.paged_kv.map(|kv| (kv.key_cache, kv.value_cache, kv.slot_mapping));
+    let (q, k) = ops.qknorm_rope_and_cache(
+        &q, &k, &v,
+        &self.q_norm_weight, &self.k_norm_weight,
+        &self.rotary_emb.cos, &self.rotary_emb.sin,
+        ctx.position_ids, self.rms_norm_eps as f32,
+        kv_cache,
+    )?;
+
+    // Dispatch to paged (decode/chunked-prefill) or varlen (prefill without cache)
+    let attn_out = if let Some(kv) = ctx.paged_kv {
+        ops.paged_attention(&q, kv.key_cache, kv.value_cache, &PagedParams {
+            block_tables: kv.block_tables,
+            cu_seqlens_q: ctx.cu_seqlens_q, cu_seqlens_k: kv.cu_seqlens_k,
+            max_seqlen_q: ctx.max_seqlen_q, max_seqlen_k: kv.max_seqlen_k,
+            scale: self.softmax_scale, mask: MaskType::Causal, softcap: None,
+        })?
+    } else {
+        ops.varlen_attention(&q, &k, &v, &VarlenParams {
+            cu_seqlens_q: ctx.cu_seqlens_q, cu_seqlens_k: ctx.cu_seqlens_q,
+            max_seqlen_q: ctx.max_seqlen_q, max_seqlen_k: ctx.max_seqlen_q,
+            scale: self.softmax_scale, mask: MaskType::Causal, softcap: None,
+        })?
+    };
+
+    self.o_proj.forward(&attn_out.reshape((total_q, self.hidden_size))?, &bs, ops)
 }
 ```
 
-**Design choice (learn from SGLang):**
-- SGLang: per-model `stacked_params_mapping` list. Explicit, clear, but duplicated across 10+ models.
-- vLLM: recursive `AutoWeightsLoader` that traverses module tree. Generic but complex.
-- **We use**: `stacked_params()` as a trait method with default empty impl.
-  Models that need QKV fusion override it with a static list. Simple, no duplication
-  if models share the same stacking pattern (they can call a shared constant).
+`paged_attention` handles both decode (Q=1) and chunked prefill (Q>1). The `varlen` path is used when there is no paged KV cache (e.g., CPU sequential decode falls back to this path internally).
 
-## Weight Format Support
-
-| Format | Detection | Loading |
-|--------|-----------|---------|
-| **Safetensors** (sharded) | `model.safetensors.index.json` exists | Read index → load relevant shards |
-| **Safetensors** (single) | `model.safetensors` exists | Direct load |
-| **GGUF** | `.gguf` extension | GGUF parser → tensor iterator |
-| **.bin** | `.bin` extension (legacy PyTorch) | Not supported initially |
-
-GGUF needs a name mapping table (GGUF uses different naming than HF safetensors).
-This is per-model-family — kept in the model file alongside `stacked_params`.
-
-## Engine Integration
+### MLP Forward (Qwen3)
 
 ```rust
-// prelude-core/src/engine/mod.rs
-fn load_model(config: &ModelConfig, device: &Device) -> Result<Box<dyn Model>> {
-    let registration = resolve_model(&config.architectures[0])?;
-    let mut model = (registration.create)(config)?;
-    let mut weights = WeightIterator::open(&config.model_path)?;
-    model.load_weights(&mut weights)?;
-    Ok(model)
+// prelude-core/src/models/qwen3.rs — GatedMlp
+
+fn forward(&self, ctx: &BatchState, ops: &dyn Ops, x: &Tensor) -> Result<Tensor> {
+    // Fused gate+up projection if weights were merged at load time
+    if let Some(ref gup) = self.gate_up_proj {
+        let gate_up = gup.forward(x, ctx, ops)?;
+        let (gate, up) = gate_up.split_at_dim_half(..)?;
+        return self.down_proj.forward(&ops.silu_mul(&gate, &up)?, ctx, ops);
+    }
+    // Separate projections fallback
+    let gate = self.gate_proj.forward(x, ctx, ops)?;
+    let up   = self.up_proj.forward(x, ctx, ops)?;
+    self.down_proj.forward(&ops.silu_mul(&gate, &up)?, ctx, ops)
 }
 ```
 
-The engine calls `resolve_model()` once. No runtime registry modification.
-`inventory` collects all registrations at link time — the registry is immutable.
+## How Inference Kernels Are Reached
 
+Model code never names FlashInfer, DeepGEMM, CUTLASS, or FA4 directly. They are reached through two dispatch chains that are invisible to the model:
+
+**Attention kernels** — called via `ops.paged_attention()` / `ops.varlen_attention()`:
+
+```
+self.self_attn.forward(&h, ctx)         ← model code (qwen3.rs)
+  └── ops.paged_attention(...)           ← ops.xxx() call (via `&dyn Ops`)
+        └── CudaOps::paged_attention()   ← prelude-cuda/src/cuda_ops.rs
+              ├── try FA4                ← prelude-cuda/src/attn/flash_v4.rs  (SM90+, best-effort)
+              └── FlashInfer             ← prelude-cuda/src/attn/flashinfer.rs (SM80+ fallback)
+```
+
+**GEMM kernels** — called via `Linear::forward()`:
+
+```
+self.o_proj.forward(x, ctx, ops)        ← model code
+  └── Linear::forward()                 ← commons/linear.rs (delegates to inner backend)
+        └── NaiveLinearBackend::forward()
+              └── Tensor::matmul()      ← intercepted by registered GEMM dispatch
+                    ├── try DeepGEMM   ← prelude-cuda/src/ops/gemm.rs  (SM90+, BF16)
+                    └── CUTLASS         ← prelude-cuda/cutlass-gemm/    (SM80+ fallback)
+```
+
+The kernel choice is made two layers below the model. Adding a new kernel to `CudaOps` benefits every model that calls the corresponding op — zero model changes required.
