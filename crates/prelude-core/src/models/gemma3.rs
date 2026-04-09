@@ -149,8 +149,8 @@ impl Gemma3RotaryEmbedding {
         let h_k = k.dim(1)?;
         let q4 = q.reshape((1, total, h_q, d))?;
         let k4 = k.reshape((1, total, h_k, d))?;
-        let q_embed = q4.rope_thd(&cos, &sin)?;
-        let k_embed = k4.rope_thd(&cos, &sin)?;
+        let q_embed = crate::ops::rope_thd(&q4, &cos, &sin)?;
+        let k_embed = crate::ops::rope_thd(&k4, &cos, &sin)?;
         Ok((
             q_embed.reshape((total, h_q, d))?,
             k_embed.reshape((total, h_k, d))?,

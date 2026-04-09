@@ -116,11 +116,7 @@ struct Cli {
     )]
     gpu_memory_utilization: f32,
 
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "CUDA graph capture for decode steps (experimental, disabled by default)"
-    )]
+    #[arg(long, default_value_t = true, help = "CUDA graph capture for decode steps (use --no-cuda-graph to disable)")]
     cuda_graph: bool,
 
     #[arg(long, default_value = "auto", help = "Device: auto, cpu, cuda, cuda:N")]

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::engine::{Engine, EngineError, InferenceEngine, PreparedGenerateRequest};
+use crate::engine::{Engine, EngineError, InferenceEngine};
 use crate::engine::executor::{self, Executor, ForwardBatch};
 use crate::engine::run::ar::{ArMessage, ResponseChannel, ar_loop};
 use crate::engine::types::TaskKind;
@@ -142,7 +142,7 @@ async fn classify_via_executor(
 ) -> Result<ClassifyResult, EngineError> {
     use crate::engine::tokenize_batch_inputs;
     use crate::tensor::DType;
-    use crate::types::{ClassificationResult, ClassificationInputs};
+    use crate::types::ClassificationResult;
 
     let (token_ids, total_tokens) = tokenize_batch_inputs(&engine.tokenizer, &request.inputs)?;
 

@@ -174,7 +174,7 @@ impl Qwen3SparseMoeBlock {
     fn compute_routing_2d(&self, xs: &Tensor) -> Result<(Tensor, Tensor, usize)> {
         let (_total_tokens, hidden_dim) = xs.dims2()?;
         let router_logits = xs.apply(&self.gate)?;
-        let routing_weights = router_logits.softmax(D::Minus1)?;
+        let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
 
         let experts_per_tok = routing_weights
             .arg_sort_last_dim(false)?

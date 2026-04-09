@@ -1,23 +1,20 @@
-//! Own CUDA storage — own CUDA storage wrapping cudarc types.
+//! CUDA device helpers and own storage types.
 //!
-//! This module provides:
-//! - `CudaStorageSlice` enum: typed GPU memory slices
-//! - `CudaStorage` struct: GPU storage with device/stream handle
+//! - `CudaStorageSlice` / `CudaStorage`: typed GPU memory (used by tensor_ops_kernels)
 //! - `GpuDType` trait: type-safe access to typed slices
-//! - Helper functions for Tensor ↔ CudaStorage conversion
-//! - `CuResultExt` trait: convert cudarc errors to our Result
-//! - `cuda_device()`/`cuda_stream()`: cached device/stream registry
+//! - `tensor_from_cuda()`: wrap a CudaSlice into a candle Tensor
+//! - `tensor_stream()`: get CudaStream from a Tensor's device
 //! - PTX module loading and caching
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, ValidAsZeroBits,
+    CudaContext, CudaFunction, CudaModule, CudaSlice,
 };
 use half::{bf16, f16};
 use prelude_core::tensor::{
-    bail, CpuStorage, DType, Device, DeviceStorage, DeviceStorageTrait, Layout, Result, Shape,
-    Storage, Tensor, WithDType,
+    bail, CpuStorage, DType, Device, Layout, Result, Shape,
+    Storage, Tensor,
 };
 
 // ── Error conversion ────────��─────────────────────────────────────
@@ -33,46 +30,20 @@ impl<T> CuResultExt<T> for std::result::Result<T, cudarc::driver::DriverError> {
     }
 }
 
-// ── Device/Stream registry ───────��───────────────────────────────
+// ── Device/Stream helpers ────────────────────────────────────────
 
-/// Get or create a cached CudaContext for the given GPU ordinal.
-///
-/// Event tracking is disabled because we use a single stream per device.
-/// cudarc's event tracking records inter-operation dependencies that break
-/// CUDA graph capture isolation — disabling it from the start avoids this.
-pub fn cuda_device(ordinal: usize) -> Result<Arc<CudaContext>> {
-    static CACHE: Mutex<Vec<Option<Arc<CudaContext>>>> = Mutex::new(Vec::new());
-    let mut cache = CACHE.lock().unwrap();
-    if cache.len() <= ordinal {
-        cache.resize(ordinal + 1, None);
-    }
-    if cache[ordinal].is_none() {
-        let ctx = CudaContext::new(ordinal).ce()?;
-        // Safety: single stream per device — no cross-stream ordering needed.
-        // Disabling event tracking is required for CUDA graph capture: cudarc's
-        // automatic CuEventRecord/CuStreamWaitEvent calls create cross-stream
-        // dependencies that violate graph capture isolation.
-        unsafe { ctx.disable_event_tracking(); }
-        cache[ordinal] = Some(ctx);
-    }
-    Ok(cache[ordinal].clone().unwrap())
+/// Probe whether a CUDA device exists at the given ordinal.
+/// Only used for startup probing — creates a temporary context.
+pub fn cuda_probe(ordinal: usize) -> bool {
+    CudaContext::new(ordinal).is_ok()
 }
 
-/// Get or create the CudaStream for a GPU ordinal.
-///
-/// Uses `new_stream()` (CU_STREAM_NON_BLOCKING) — the NULL stream from
-/// `default_stream()` does not support CUDA graph capture.
-pub fn cuda_stream(ordinal: usize) -> Result<Arc<CudaStream>> {
-    static CACHE: Mutex<Vec<Option<Arc<CudaStream>>>> = Mutex::new(Vec::new());
-    let mut cache = CACHE.lock().unwrap();
-    if cache.len() <= ordinal {
-        cache.resize(ordinal + 1, None);
+/// Get the CudaStream from a candle Device.
+pub fn device_stream(device: &Device) -> Result<Arc<CudaStream>> {
+    match device {
+        Device::Cuda(d) => Ok(d.cuda_stream()),
+        _ => bail!("expected CUDA device"),
     }
-    if cache[ordinal].is_none() {
-        let dev = cuda_device(ordinal)?;
-        cache[ordinal] = Some(dev.new_stream().ce()?);
-    }
-    Ok(cache[ordinal].clone().unwrap())
 }
 
 // ── PTX module loading ───────────────────────────────────────────
@@ -200,24 +171,16 @@ impl CudaStorage {
         Ok(Self { slice, stream: stream.clone() })
     }
 
-    /// Upload CPU data to GPU.
+    /// Upload contiguous CPU data to GPU.
     pub fn from_cpu(stream: &Arc<CudaStream>, cpu: &CpuStorage, layout: &Layout) -> Result<Self> {
         macro_rules! upload {
             ($data:expr, $variant:ident) => {{
-                let data = if layout.is_contiguous() {
-                    let start = layout.start_offset();
-                    let len = layout.shape().elem_count();
-                    &$data[start..start + len]
-                } else {
-                    let extracted: Vec<_> = layout.strided_index().map(|i| $data[i]).collect();
-                    return Ok(Self {
-                        slice: CudaStorageSlice::$variant(stream.clone_htod(&extracted).ce()?),
-                        stream: stream.clone(),
-                    });
-                };
-                CudaStorageSlice::$variant(stream.clone_htod(data).ce()?)
+                let start = layout.start_offset();
+                let len = layout.shape().elem_count();
+                CudaStorageSlice::$variant(stream.clone_htod(&$data[start..start + len]).ce()?)
             }};
         }
+        assert!(layout.is_contiguous(), "from_cpu: non-contiguous layout; use tensor.contiguous() first");
         let slice = match cpu {
             CpuStorage::U8(v) => upload!(v, U8),
             CpuStorage::U32(v) => upload!(v, U32),
@@ -227,23 +190,16 @@ impl CudaStorage {
             CpuStorage::F16(v) => upload!(v, F16),
             CpuStorage::F32(v) => upload!(v, F32),
             CpuStorage::F64(v) => upload!(v, F64),
+            _ => bail!("from_cpu: unsupported dtype"),
         };
         Ok(Self { slice, stream: stream.clone() })
     }
 
-    /// Download GPU data to CPU storage.
-    pub fn to_cpu(&self, layout: &Layout) -> Result<CpuStorage> {
+    /// Download contiguous GPU data to CPU storage.
+    pub fn to_cpu(&self, _layout: &Layout) -> Result<CpuStorage> {
         macro_rules! download {
             ($slice:expr, $variant:ident) => {{
-                let data = self.stream.clone_dtoh($slice).ce()?;
-                if layout.is_contiguous() {
-                    let start = layout.start_offset();
-                    let len = layout.shape().elem_count();
-                    CpuStorage::$variant(data[start..start + len].to_vec())
-                } else {
-                    let extracted: Vec<_> = layout.strided_index().map(|i| data[i]).collect();
-                    CpuStorage::$variant(extracted)
-                }
+                CpuStorage::$variant(self.stream.clone_dtoh($slice).ce()?)
             }};
         }
         Ok(match &self.slice {
@@ -270,43 +226,6 @@ impl std::fmt::Debug for CudaStorage {
     }
 }
 
-// ── DeviceStorageTrait impl ──────────────────────────────────────
-
-impl DeviceStorageTrait for CudaStorage {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-    fn clone_box(&self) -> Box<dyn DeviceStorageTrait> {
-        macro_rules! clone_slice {
-            ($s:expr, $variant:ident) => {
-                CudaStorageSlice::$variant(self.stream.clone_dtod($s).unwrap())
-            };
-        }
-        let new_slice = match &self.slice {
-            CudaStorageSlice::U8(s) => clone_slice!(s, U8),
-            CudaStorageSlice::U32(s) => clone_slice!(s, U32),
-            CudaStorageSlice::I32(s) => clone_slice!(s, I32),
-            CudaStorageSlice::I64(s) => clone_slice!(s, I64),
-            CudaStorageSlice::BF16(s) => clone_slice!(s, BF16),
-            CudaStorageSlice::F16(s) => clone_slice!(s, F16),
-            CudaStorageSlice::F32(s) => clone_slice!(s, F32),
-            CudaStorageSlice::F64(s) => clone_slice!(s, F64),
-        };
-        Box::new(CudaStorage {
-            slice: new_slice,
-            stream: self.stream.clone(),
-        })
-    }
-    fn dtype(&self) -> DType {
-        self.slice.dtype()
-    }
-    fn len(&self) -> usize {
-        self.slice.len()
-    }
-}
 
 // ── GpuDType trait ─────────���─────────────────────────────────────
 
@@ -360,81 +279,35 @@ impl_gpu_dtype!(f64, F64, DType::F64, "f64");
 
 // ── Tensor ↔ CudaStorage helpers ─────────────────────────────────
 
-/// Extract `&CudaStorage` from a Storage reference.
-pub fn as_cuda<'a>(
-    storage: &'a Storage,
-    ctx: &str,
-) -> Result<&'a CudaStorage> {
-    match storage {
-        Storage::Device(ds) => ds
-            .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| prelude_core::tensor::Error::Msg(format!("{ctx}: not CudaStorage"))),
-    }
-}
-
-/// Extract `&mut CudaStorage` from a mutable Storage reference.
-pub fn as_cuda_mut<'a>(
-    storage: &'a mut Storage,
-    ctx: &str,
-) -> Result<&'a mut CudaStorage> {
-    match storage {
-        Storage::Device(ds) => ds
-            .downcast_mut::<CudaStorage>()
-            .ok_or_else(|| prelude_core::tensor::Error::Msg(format!("{ctx}: not CudaStorage"))),
-    }
-}
-
-// ── Tensor ↔ CudaStorage extraction helpers ────────────────────
-
-/// Extract storage + layout from a Tensor.
-pub fn storage_and_layout(t: &Tensor) -> (&Storage, &Layout) {
-    (t.storage(), t.our_layout())
-}
-
 /// Re-export cudarc types used by ops kernels.
 pub use cudarc::driver::{
     CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, LaunchConfig, PushKernelArg,
 };
 
-/// Create a Tensor from a CudaStorage (contiguous, no grad).
-pub fn tensor_from_device(storage: CudaStorage, shape: Shape) -> Tensor {
-    let dtype = storage.dtype();
-    let device = Device::Cuda(storage.stream.context().ordinal());
-    let layout = Layout::contiguous(shape);
-    let ds = DeviceStorage::new(Box::new(storage));
-    Tensor::from_storage_layout(Arc::new(Storage::Device(ds)), layout, dtype, device)
-}
-
-/// Create a Tensor from a typed CudaSlice (contiguous, no grad).
-pub fn tensor_from_cuda<T: GpuDType>(
+/// Create a candle Tensor from a typed CudaSlice (contiguous, no grad).
+pub fn tensor_from_cuda<T: GpuDType + candle_core::cuda_backend::CudaDType>(
     slice: CudaSlice<T>,
-    stream: Arc<CudaStream>,
+    dev: &candle_core::CudaDevice,
     shape: impl Into<Shape>,
 ) -> Tensor {
-    let storage = CudaStorage {
-        slice: T::wrap_cuda_slice(slice),
-        stream,
-    };
-    tensor_from_device(storage, shape.into())
+    let candle_storage = candle_core::CudaStorage::wrap_cuda_slice(slice, dev.clone());
+    Tensor::from_storage(
+        Storage::Cuda(candle_storage),
+        shape,
+        candle_core::op::BackpropOp::none(),
+        false,
+    )
 }
 
 /// Get the CudaStream from a Tensor.
 pub fn tensor_stream(t: &Tensor) -> Result<Arc<CudaStream>> {
-    let cuda = as_cuda(t.storage(), "tensor_stream")?;
-    Ok(cuda.stream.clone())
-}
-
-/// Get the CudaContext from a Tensor.
-pub fn tensor_cuda_device(t: &Tensor) -> Result<Arc<CudaContext>> {
-    let cuda = as_cuda(t.storage(), "tensor_cuda_device")?;
-    Ok(cuda.device().clone())
+    device_stream(t.device())
 }
 
 // ── Synchronize ──────────────────────────────────────────────────
 
-/// Synchronize the default CUDA stream for the given device.
-pub fn synchronize(device: &prelude_core::tensor::Device) -> Result<()> {
-    let stream = cuda_stream(device.ordinal())?;
-    stream.synchronize().ce()
+/// Synchronize the CUDA stream for the given device.
+pub fn synchronize(device: &Device) -> Result<()> {
+    device_stream(device)?.synchronize().ce()
 }
 

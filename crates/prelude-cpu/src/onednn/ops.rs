@@ -2,7 +2,6 @@
 //! Only available when the `onednn` feature is enabled.
 
 use prelude_core::tensor::{DType, Device, Module, Result, Tensor};
-use half::bf16;
 use std::sync::Arc;
 
 /// Initialize oneDNN engine and stream. Idempotent — safe to call multiple times.

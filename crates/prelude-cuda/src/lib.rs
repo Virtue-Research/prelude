@@ -61,7 +61,7 @@ pub const MOD_SORT: &str = "candle_sort";
 /// Probe whether CUDA is usable on this machine.
 /// Creates a context for device 0; the context is cached for later use.
 fn cuda_probe() -> bool {
-    device::cuda_device(0).is_ok()
+    device::cuda_probe(0)
 }
 
 /// Register GPU ops and executor. Call once at startup.

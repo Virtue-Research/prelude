@@ -16,11 +16,19 @@ pub use candle_core::{
 
 pub use candle_core::error::Context;
 
+// Re-export candle-nn ops used across models
+pub use candle_nn::ops::{softmax, softmax_last_dim, sigmoid};
+pub use candle_nn::rotary_emb::rope_thd;
+
 #[cfg(feature = "cuda")]
 pub use candle_core::{CudaDevice, CudaStorage};
 
 #[cfg(feature = "cuda")]
 pub use candle_core::cuda_backend as cuda;
+
+// ── Re-export safetensors from candle-core ─────────────────────
+
+pub use candle_core::safetensors;
 
 // ── Our modules (kept) ──────────────────────────────────────────
 
@@ -64,16 +72,23 @@ impl Dim for D {
                 if rank < 2 { bail!("{op}: cannot use Minus2 on rank-{rank} tensor") }
                 Ok(rank - 2)
             }
+            D::Minus(n) => {
+                if *n > rank || *n == 0 { bail!("{op}: Minus({n}) out of range for rank {rank}") }
+                Ok(rank - n)
+            }
         }
     }
     fn to_index_plus_one(&self, shape: &Shape, op: &'static str) -> Result<usize> {
-        // For unsqueeze, Minus1 means last position = rank
         let rank = shape.rank();
         match self {
             D::Minus1 => Ok(rank),
             D::Minus2 => {
                 if rank == 0 { bail!("{op}: cannot use Minus2 on rank-0 tensor") }
                 Ok(rank - 1)
+            }
+            D::Minus(n) => {
+                if *n > rank + 1 || *n == 0 { bail!("{op}: Minus({n}) out of range for rank+1 {}", rank + 1) }
+                Ok(rank + 1 - n)
             }
         }
     }
@@ -153,7 +168,7 @@ impl DeviceExt for Device {
         match self {
             Device::Cpu => 0,
             #[cfg(feature = "cuda")]
-            Device::Cuda(d) => d.ordinal(),
+            Device::Cuda(d) => d.cuda_stream().context().ordinal(),
             #[allow(unreachable_patterns)]
             _ => 0,
         }
@@ -162,13 +177,5 @@ impl DeviceExt for Device {
 
 // ── Helpers ─────────────────────────────────────────────────────
 
-/// CPU storage helpers — kept for quantized module and CPU ops.
+/// CPU storage inner type re-export.
 pub use candle_core::cpu_backend::CpuStorage as CpuStorageInner;
-
-pub fn cpu_extract_vec<T: WithDType>(
-    storage: &CpuStorage,
-    layout: &Layout,
-) -> Result<Vec<T>> {
-    storage.as_slice::<T>(layout)
-        .map(|s| s.to_vec())
-}

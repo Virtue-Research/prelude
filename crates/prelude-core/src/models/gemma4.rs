@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::tensor::{DType, Device, Module, Result, Tensor, D};
+use crate::tensor::{DType, Device, Module, Result, Tensor};
 use crate::models::commons::embedding::Embedding;
 use crate::loading::var_builder::VarBuilder;
 use serde::Deserialize;
@@ -223,8 +223,8 @@ impl Gemma4RotaryEmbedding {
         let h_k = k.dim(1)?;
         let q4 = q.reshape((1, total, h_q, d))?;
         let k4 = k.reshape((1, total, h_k, d))?;
-        let q_embed = q4.rope_thd(&cos, &sin)?;
-        let k_embed = k4.rope_thd(&cos, &sin)?;
+        let q_embed = crate::ops::rope_thd(&q4, &cos, &sin)?;
+        let k_embed = crate::ops::rope_thd(&k4, &cos, &sin)?;
         Ok((
             q_embed.reshape((total, h_q, d))?,
             k_embed.reshape((total, h_k, d))?,
@@ -240,7 +240,7 @@ impl Gemma4RotaryEmbedding {
         let sin = self.sin.index_select(position_ids, 0)?;
         let (total, h_q, d) = q.dims3()?;
         let q4 = q.reshape((1, total, h_q, d))?;
-        let q_embed = q4.rope_thd(&cos, &sin)?;
+        let q_embed = crate::ops::rope_thd(&q4, &cos, &sin)?;
         q_embed.reshape((total, h_q, d))
     }
 }
@@ -384,7 +384,7 @@ impl Gemma4Moe {
         let (total_tokens, _num_experts) = router_logits.dims2()?;
 
         // Softmax over all experts
-        let router_probs = router_logits.softmax(D::Minus1)?;
+        let router_probs = candle_nn::ops::softmax_last_dim(router_logits)?;
 
         // Top-k selection: get indices and weights
         let router_logits_vec: Vec<Vec<f32>> = router_logits.to_dtype(DType::F32)?.to_vec2()?;
@@ -544,7 +544,7 @@ impl Gemma4Attention {
         let q_cos = self.rotary_emb.cos.index_select(position_ids, 0)?;
         let q_sin = self.rotary_emb.sin.index_select(position_ids, 0)?;
         let (total, hq, d2) = q.dims3()?;
-        let q = q.reshape((1, total, hq, d2))?.rope_thd(&q_cos, &q_sin)?.reshape((total, hq, d2))?;
+        let q = crate::ops::rope_thd(&q.reshape((1, total, hq, d2))?, &q_cos, &q_sin)?.reshape((total, hq, d2))?;
 
         // K/V: shared layers reuse source layer's K/V, non-shared compute their own
         let (k, v, kv_to_share) = if let Some((sk, sv)) = shared_kv {
@@ -555,7 +555,7 @@ impl Gemma4Attention {
             let k = k.reshape((total_tokens, self.num_kv_heads, self.head_dim))?;
             let k = ops.rms_norm(&k, self.k_norm.weight(), self.k_norm.eps() as f32)?;
             let hk = k.dim(1)?;
-            let k = k.reshape((1, total, hk, d2))?.rope_thd(&q_cos, &q_sin)?.reshape((total, hk, d2))?;
+            let k = crate::ops::rope_thd(&k.reshape((1, total, hk, d2))?, &q_cos, &q_sin)?.reshape((total, hk, d2))?;
             let v = v.reshape((total_tokens, self.num_kv_heads, self.head_dim))?;
             let v = self.v_norm.forward(&v)?;
             (k.clone(), v.clone(), Some((k, v)))

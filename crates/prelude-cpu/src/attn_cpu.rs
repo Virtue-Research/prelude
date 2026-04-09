@@ -407,7 +407,7 @@ fn matmul_sdpa_reference(
             scores
         };
 
-        let attn_weights = scores.softmax(scores.rank() - 1)?;
+        let attn_weights = prelude_core::tensor::softmax(&scores, scores.rank() - 1)?;
         let out = attn_weights.matmul(&v_t)?;
         outputs.push(out.transpose(0, 1)?);
         offset += slen;

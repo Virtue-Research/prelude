@@ -16,7 +16,7 @@ pub mod rope;
 pub mod silu_mul;
 pub mod softmax;
 
-use prelude_core::tensor::{Device, Result, Tensor};
+use prelude_core::tensor::{Device, Result, Storage, Tensor};
 
 // ── Re-exports: Tensor-level kernel API ─────────────────────────────────
 
@@ -93,6 +93,32 @@ pub fn tensor_as_u16_slice_pub(tensor: &Tensor) -> Result<&[u16]> {
     tensor_as_u16_slice(tensor)
 }
 
+/// Get a raw const pointer to a contiguous CPU tensor's data, reinterpreted as `*const T`.
+/// The tensor's actual storage type must be layout-compatible with `T`.
+/// Pointer is valid while the tensor is alive.
+pub(crate) fn tensor_raw_ptr<T>(tensor: &Tensor) -> Result<*const T> {
+    use prelude_core::tensor::CpuStorage;
+    let (storage, _layout) = tensor.storage_and_layout();
+    match &*storage {
+        Storage::Cpu(cpu) => {
+            // Match on candle CpuStorage variants to get the raw data pointer.
+            let ptr = match cpu {
+                CpuStorage::U8(v) => v.as_ptr() as *const T,
+                CpuStorage::U32(v) => v.as_ptr() as *const T,
+                CpuStorage::I32(v) => v.as_ptr() as *const T,
+                CpuStorage::I64(v) => v.as_ptr() as *const T,
+                CpuStorage::BF16(v) => v.as_ptr() as *const T,
+                CpuStorage::F16(v) => v.as_ptr() as *const T,
+                CpuStorage::F32(v) => v.as_ptr() as *const T,
+                CpuStorage::F64(v) => v.as_ptr() as *const T,
+                _ => prelude_core::tensor::bail!("tensor_raw_ptr: unsupported storage variant"),
+            };
+            Ok(ptr)
+        }
+        _ => prelude_core::tensor::bail!("tensor_raw_ptr: expected CPU tensor"),
+    }
+}
+
 /// Get a zero-copy `&[u16]` view of a CPU BF16 tensor.
 /// Tensor must be contiguous.
 ///
@@ -104,17 +130,24 @@ pub fn tensor_as_u16_slice_pub(tensor: &Tensor) -> Result<&[u16]> {
 /// Pointer valid while tensor is alive. For perf-critical internal code only.
 pub(crate) fn tensor_as_u16_slice(tensor: &Tensor) -> Result<&[u16]> {
     assert!(tensor.is_contiguous());
-    unsafe { Ok(std::slice::from_raw_parts(tensor.data_ptr()? as *const u16, tensor.elem_count())) }
+    unsafe { Ok(std::slice::from_raw_parts(tensor_raw_ptr::<u16>(tensor)?, tensor.elem_count())) }
 }
 
 pub(crate) fn tensor_as_bf16_slice(tensor: &Tensor) -> Result<&[half::bf16]> {
     assert!(tensor.is_contiguous());
-    unsafe { Ok(std::slice::from_raw_parts(tensor.data_ptr()? as *const half::bf16, tensor.elem_count())) }
+    unsafe { Ok(std::slice::from_raw_parts(tensor_raw_ptr::<half::bf16>(tensor)?, tensor.elem_count())) }
 }
 
 pub(crate) fn tensor_as_f32_slice(tensor: &Tensor) -> Result<&[f32]> {
     assert!(tensor.is_contiguous());
-    unsafe { Ok(std::slice::from_raw_parts(tensor.data_ptr()? as *const f32, tensor.elem_count())) }
+    unsafe { Ok(std::slice::from_raw_parts(tensor_raw_ptr::<f32>(tensor)?, tensor.elem_count())) }
+}
+
+/// Get a raw mutable pointer to a contiguous CPU tensor's data, reinterpreted as `*mut T`.
+/// The tensor's actual storage type must be layout-compatible with `T`.
+/// Caller must ensure exclusive access (no other aliases).
+pub(crate) fn tensor_data_ptr_mut<T>(tensor: &Tensor) -> Result<*mut T> {
+    Ok(tensor_raw_ptr::<T>(tensor)? as *mut T)
 }
 
 // ── Safe in-place mutation helpers ──────────────────────────────────────
@@ -127,7 +160,7 @@ pub(crate) fn tensor_as_f32_slice(tensor: &Tensor) -> Result<&[f32]> {
 pub(crate) fn inplace_add_bf16(tensor: &Tensor, src: &[u16]) -> Result<()> {
     let n = src.len();
     unsafe {
-        let ptr = tensor.data_ptr_mut()? as *mut u16;
+        let ptr = tensor_data_ptr_mut::<u16>(tensor)?;
         crate::raw_cpu::raw_residual_add_bf16(ptr, src.as_ptr(), n);
     }
     Ok(())
@@ -137,7 +170,7 @@ pub(crate) fn inplace_add_bf16(tensor: &Tensor, src: &[u16]) -> Result<()> {
 pub(crate) fn inplace_add_f32(tensor: &Tensor, src: &[f32]) -> Result<()> {
     let n = src.len();
     unsafe {
-        let ptr = tensor.data_ptr_mut()? as *mut f32;
+        let ptr = tensor_data_ptr_mut::<f32>(tensor)?;
         crate::raw_cpu::raw_residual_add_f32(ptr, src.as_ptr(), n);
     }
     Ok(())
@@ -278,8 +311,8 @@ mod rope_tensor {
         {
             let q_n = batch_size * seq_len * num_heads * head_dim;
             let k_n = batch_size * seq_len * num_kv_heads * head_dim;
-            let q_slice = unsafe { std::slice::from_raw_parts_mut(q_2d.data_ptr_mut()? as *mut u16, q_n) };
-            let k_slice = unsafe { std::slice::from_raw_parts_mut(k_2d.data_ptr_mut()? as *mut u16, k_n) };
+            let q_slice = unsafe { std::slice::from_raw_parts_mut(super::tensor_data_ptr_mut::<u16>(&q_2d)?, q_n) };
+            let k_slice = unsafe { std::slice::from_raw_parts_mut(super::tensor_data_ptr_mut::<u16>(&k_2d)?, k_n) };
 
             super::rope::rope_neox_bf16(
                 q_slice, k_slice, cache_slice, positions,
@@ -319,8 +352,8 @@ mod rope_tensor {
         {
             let q_n = batch_size * seq_len * num_heads * head_dim;
             let k_n = batch_size * seq_len * num_kv_heads * head_dim;
-            let q_slice = unsafe { std::slice::from_raw_parts_mut(q_2d.data_ptr_mut()? as *mut f32, q_n) };
-            let k_slice = unsafe { std::slice::from_raw_parts_mut(k_2d.data_ptr_mut()? as *mut f32, k_n) };
+            let q_slice = unsafe { std::slice::from_raw_parts_mut(super::tensor_data_ptr_mut::<f32>(&q_2d)?, q_n) };
+            let k_slice = unsafe { std::slice::from_raw_parts_mut(super::tensor_data_ptr_mut::<f32>(&k_2d)?, k_n) };
 
             super::rope::rope_neox_f32(
                 q_slice, k_slice, cache_slice, positions,

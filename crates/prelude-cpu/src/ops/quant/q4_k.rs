@@ -255,7 +255,7 @@ mod avx512 {
         const KMASK3: u32 = 0x03030303;
 
         unsafe {
-            let m4 = _mm512_set1_epi8(0x0F);
+            let _m4 = _mm512_set1_epi8(0x0F);
             let mut acc = _mm512_setzero_ps();
             let mut acc_m = _mm_setzero_ps();
             let mut utmp = [0u32; 4];

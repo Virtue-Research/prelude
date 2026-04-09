@@ -21,7 +21,6 @@
 //! });
 //! ```
 
-use std::sync::OnceLock;
 
 use crate::tensor::Tensor;
 
@@ -164,7 +163,7 @@ pub fn create_executor(engine: std::sync::Arc<super::engine::Engine>) -> Option<
         }
     }
     best.map(|b| {
-        tracing::info!("executor for {device}: {} (priority {})", b.name, b.priority);
+        tracing::info!("executor for {:?}: {} (priority {})", device, b.name, b.priority);
         (b.create)(engine)
     })
 }

@@ -5,8 +5,7 @@
 pub mod gguf_file;
 mod k_quants;
 
-use crate::tensor::{CpuStorage, DType, Device, Result, Shape, Tensor, Layout};
-use std::sync::Arc;
+use crate::tensor::{Device, Result, Shape, Tensor};
 use half::f16;
 
 // ── GgmlDType ────────────────────────────────────────────────────
@@ -157,12 +156,8 @@ impl QTensor {
         } else {
             k_quants::dequantize(&self.data, self.dtype, n)?
         };
-        let storage = CpuStorage::F32(f32_data);
-        let layout = Layout::contiguous(self.shape.clone());
-        let t = Tensor::from_storage_layout(
-            Arc::new(crate::tensor::Storage::Device(crate::tensor::DeviceStorage::from_cpu(storage))),
-            layout, DType::F32, Device::Cpu,
-        );
+        let f32_data = f32_data;
+        let t = Tensor::from_vec(f32_data, self.shape.clone(), &Device::Cpu)?;
         if device.is_cuda() {
             t.to_device(device)
         } else {

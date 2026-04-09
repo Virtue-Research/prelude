@@ -169,7 +169,7 @@ pub async fn ar_loop(
         };
 
         // ── Phase 4: Build ForwardBatch and submit to Executor ──────
-        let batch = build_forward_batch(&mut states, &step);
+        let batch = build_forward_batch(&engine, &mut states, &step);
         let handle = match executor.submit(batch) {
             Ok(h) => h,
             Err(error) => {
@@ -250,6 +250,7 @@ fn handle_message(
 // ── Batch construction ─────────────────────────────────────────────
 
 fn build_forward_batch(
+    engine: &Engine,
     states: &mut HashMap<String, ArSequenceState>,
     step: &SchedulerStep,
 ) -> ForwardBatch {
@@ -264,6 +265,24 @@ fn build_forward_batch(
             .collect();
         ForwardBatch::Prefill { items }
     } else {
+        // Allocate new KV cache blocks where needed before building the batch.
+        // Each sequence may cross a block boundary during decode.
+        if let Some(pool) = engine.cache.paged_pool.as_ref() {
+            if let Some(bm_mutex) = engine.cache.block_manager.as_ref() {
+                if let Ok(mut bm) = bm_mutex.lock() {
+                    for id in &step.decode_request_ids {
+                        if let Some(state) = states.get_mut(id) {
+                            if state.next_decode_position % pool.block_size == 0 {
+                                if let Some(new_block) = bm.allocate() {
+                                    state.block_table.push(new_block);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Decode: collect (token, position, block_table) per sequence
         let cap = step.decode_request_ids.len();
         let mut tokens = Vec::with_capacity(cap);
@@ -723,7 +742,7 @@ mod tests {
         states.insert("s2".to_string(), make_decode_state("s2", 99, 8));
 
         let step = SchedulerStep::decode(vec!["s1".into(), "s2".into()]);
-        let batch = build_forward_batch(&mut states, &step);
+        let batch = build_forward_batch(&engine, &mut states, &step);
 
         match batch {
             ForwardBatch::Decode { tokens, positions, block_tables, deltanet_slots } => {
@@ -747,7 +766,7 @@ mod tests {
         states.insert("s2".to_string(), s2);
 
         let step = SchedulerStep::decode(vec!["s1".into(), "s2".into()]);
-        let batch = build_forward_batch(&mut states, &step);
+        let batch = build_forward_batch(&engine, &mut states, &step);
 
         match batch {
             ForwardBatch::Decode { deltanet_slots, .. } => {
@@ -772,7 +791,7 @@ mod tests {
         assert!(states.get("r1").unwrap().prepared.is_some());
 
         let step = SchedulerStep::prefill(vec!["r1".into()]);
-        let batch = build_forward_batch(&mut states, &step);
+        let batch = build_forward_batch(&engine, &mut states, &step);
 
         match batch {
             ForwardBatch::Prefill { items } => {

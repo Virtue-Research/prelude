@@ -14,7 +14,7 @@ keywords = ["llm", "inference", "serving", "scheduler", "rust"]
 
 [features]
 default = []
-cuda = ["candle-core/cuda"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
 hf_tokenizer = ["dep:tokenizers"]
 nvtx = []
 test-cuda = []
@@ -24,6 +24,7 @@ test-tpu = []     # planned
 
 [dependencies]
 candle-core = { workspace = true }
+candle-nn = { workspace = true }
 async-trait.workspace = true
 chrono.workspace = true
 serde.workspace = true

@@ -7,12 +7,10 @@ pub(crate) use crate::types::{
     ModelInfo, PromptInput, StreamEvent, TokenLogprobInfo, Usage,
 };
 
-pub(crate) use std::path::{Path, PathBuf};
-pub(crate) use std::sync::Mutex;
+pub(crate) use std::path::Path;
 pub(crate) use std::time::Instant;
 
 pub(crate) use crate::tensor::{DType, Device, Tensor};
-pub(crate) use self::weight_loader::VarBuilder;
 pub(crate) use self::sampling::{LogitsProcessor, Sampling};
 pub(crate) use fastokens::Tokenizer;
 pub(crate) use tracing::info;
@@ -55,11 +53,6 @@ pub(crate) use self::types::{
 
 // ── Re-exports: forward (task-specific execution + postprocessing) ──
 // Classify/Embed: always available (stubs return errors when flash-attn absent).
-pub(crate) use self::model_runner::{
-    RawClassifyOutput, classify_postprocess,
-    RawEmbedOutput, embed_postprocess,
-};
-pub(crate) use self::model_runner::{RawGenerateOutput, generate_postprocess};
 
 // ── Re-exports: helpers (config, device, weights, tokenizer) ──
 pub(crate) use self::config::*;

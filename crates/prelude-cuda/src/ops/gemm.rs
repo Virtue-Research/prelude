@@ -7,7 +7,7 @@
 //! (attention, RoPE, etc.) that haven't been converted yet.
 
 use prelude_core::tensor::{bail, DType, Module, Result, Tensor};
-use crate::device::{self as cb, CuResultExt, DeviceRepr, DevicePtr, GpuDType};
+use crate::device::{self as cb, DeviceRepr, DevicePtr};
 use std::ffi::c_void;
 
 /// Register our GEMM dispatch. Must be called before any GPU matmul.
@@ -15,9 +15,9 @@ use std::ffi::c_void;
 /// This replaces cuBLAS: all `Tensor::matmul()` on CUDA will route through
 /// CUTLASS (SM80+) with optional DeepGEMM fast path (SM90+ BF16).
 pub fn register_gpu_gemm() {
-    // No-op: TensorOps::matmul now uses our own dispatch directly.
-    // The old gemm_dispatch monkey-patch is no longer needed.
-    tracing::info!("GPU GEMM backend registered (CUTLASS + DeepGEMM)");
+    candle_core::cuda_backend::gemm_dispatch::register_gemm_dispatch(gemm_dispatch_impl);
+    tracing::info!("GPU GEMM backend registered (CUTLASS{})",
+        if cfg!(feature = "deepgemm") { " + DeepGEMM" } else { "" });
 }
 
 /// GEMM dispatch implementation.
@@ -185,20 +185,30 @@ fn gpu_matmul_nt_typed<T>(
     dtype_code: u32,
 ) -> Result<Tensor>
 where
-    T: GpuDType + DeviceRepr,
+    T: cb::GpuDType + DeviceRepr + candle_core::cuda_backend::CudaDType,
 {
-    let stream = cb::tensor_stream(x)?;
+    use candle_core::backend::BackendStorage;
+    use candle_core::cuda_backend::WrapErr;
 
-    let (x_storage, x_layout) = cb::storage_and_layout(&x);
-    let x_slice = cb::as_cuda(&x_storage, "gpu_matmul_nt: x")?.as_slice::<T>()?;
-    let x_slice = x_slice.slice(x_layout.start_offset()..);
+    let (x_storage, x_layout) = x.storage_and_layout();
+    let x_cuda = match &*x_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("gpu_matmul_nt: x requires CUDA"),
+    };
+    let (w_storage, w_layout) = w.storage_and_layout();
+    let w_cuda = match &*w_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("gpu_matmul_nt: w requires CUDA"),
+    };
 
-    let (w_storage, w_layout) = cb::storage_and_layout(&w);
-    let w_slice = cb::as_cuda(&w_storage, "gpu_matmul_nt: w")?.as_slice::<T>()?;
-    let w_slice = w_slice.slice(w_layout.start_offset()..);
+    let dev = x_cuda.device().clone();
+    let stream = dev.cuda_stream();
+
+    let x_slice = x_cuda.as_cuda_slice::<T>()?.slice(x_layout.start_offset()..);
+    let w_slice = w_cuda.as_cuda_slice::<T>()?.slice(w_layout.start_offset()..);
 
     let total = batch * m * n;
-    let out = unsafe { stream.alloc::<T>(total) }.ce()?;
+    let out = unsafe { dev.alloc::<T>(total) }?;
 
     let x_ptr = x_slice.device_ptr(&stream).0 as *const c_void;
     let w_ptr = w_slice.device_ptr(&stream).0 as *const c_void;
@@ -206,23 +216,17 @@ where
     let raw_stream = unsafe { stream.cu_stream() } as *const c_void;
 
     // TN convention: D[m_c,n_c] = A[N,K]^T @ B[M,K]
-    let stride_a = (n * k) as i64;  // W stride per batch
-    let stride_b = (m * k) as i64;  // x stride per batch
-    let stride_d = (m * n) as i64;  // out stride per batch
+    let stride_a = (n * k) as i64;
+    let stride_b = (m * k) as i64;
+    let stride_d = (m * n) as i64;
     let ret = unsafe {
         gemm_dispatch_impl(
-            w_ptr,       // A = weight [N,K]
-            x_ptr,       // B = input [M,K]
-            out_ptr,     // D = output [M,N]
-            n as i32,    // m_cublas = N
-            m as i32,    // n_cublas = M
-            k as i32,
+            w_ptr, x_ptr, out_ptr,
+            n as i32, m as i32, k as i32,
             batch as i32,
-            k as i32,    // lda
-            k as i32,    // ldb
-            n as i32,    // ldd
+            k as i32, k as i32, n as i32,
             stride_a, stride_b, stride_d,
-            true, false, // TN
+            true, false,
             dtype_code,
             raw_stream,
         )
@@ -231,6 +235,15 @@ where
         bail!("GPU GEMM failed (code {ret}) M={m} N={n} K={k} batch={batch}");
     }
 
-    Ok(cb::tensor_from_cuda(out, stream, (total,)))
+    drop(x_storage);
+    drop(w_storage);
+
+    let out_storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(out_storage),
+        (total,),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
 }
 

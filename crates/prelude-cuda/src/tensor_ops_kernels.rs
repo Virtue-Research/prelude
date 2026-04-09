@@ -5,20 +5,19 @@
 
 use std::sync::Arc;
 use cudarc::driver::{
-    CudaContext, CudaSlice, CudaStream, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg,
-    ValidAsZeroBits,
+    CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
 };
 use half::{bf16, f16};
 use prelude_core::tensor::{bail, CpuStorage, DType, Layout, Result, Shape};
 
 use crate::device::{
-    CuResultExt, CudaStorage, CudaStorageSlice, GpuDType, get_or_load_func, tensor_from_device,
+    CuResultExt, CudaStorage, CudaStorageSlice, GpuDType, get_or_load_func,
 };
 use crate::{
     MOD_UNARY, MOD_BINARY, MOD_CAST, MOD_REDUCE, MOD_INDEXING,
-    MOD_TERNARY, MOD_AFFINE, MOD_FILL, MOD_SORT,
+    MOD_TERNARY, MOD_AFFINE, MOD_SORT,
     PTX_UNARY, PTX_BINARY, PTX_CAST, PTX_REDUCE, PTX_INDEXING,
-    PTX_TERNARY, PTX_AFFINE, PTX_FILL, PTX_SORT,
+    PTX_TERNARY, PTX_AFFINE, PTX_SORT,
 };
 
 // ── Layout info helpers ──────────────────────────────────────────
@@ -1072,7 +1071,7 @@ pub fn launch_cat(
     let right_size: usize = out_dims[dim + 1..].iter().product();
 
     // Allocate output
-    let ctx = storages[0].0.device();
+    let _ctx = storages[0].0.device();
 
     macro_rules! dispatch {
         ($ty:ty, $variant:ident) => {{

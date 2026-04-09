@@ -1,6 +1,20 @@
-use crate::device::{self as cb, CuResultExt, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg};
-use crate::{MOD_MOE_ROUTING, PTX_MOE_ROUTING};
+use candle_core::backend::BackendStorage;
+use candle_core::cuda_backend::WrapErr;
+use cudarc::driver::{DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg};
 use prelude_core::tensor::{bail, DType, Result, Tensor};
+
+use crate::{MOD_MOE_ROUTING, PTX_MOE_ROUTING};
+
+/// Helper: extract candle CUDA storage or bail.
+fn as_candle_cuda<'a>(
+    storage: &'a std::sync::RwLockReadGuard<'a, candle_core::Storage>,
+    ctx: &str,
+) -> Result<&'a candle_core::CudaStorage> {
+    match &**storage {
+        candle_core::Storage::Cuda(s) => Ok(s),
+        _ => candle_core::bail!("{ctx}: requires CUDA"),
+    }
+}
 
 /// Fused MoE routing: softmax + top-k selection + weight normalization + sort.
 /// Replaces ~8 separate kernel launches with a single CUDA kernel.
@@ -16,8 +30,8 @@ pub fn fused_moe_routing(
     topk: usize,
     norm_topk_prob: bool,
 ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
-    let (rl_storage, rl_layout) = cb::storage_and_layout(&router_logits);
-    let rl_cuda = cb::as_cuda(&rl_storage, "fused_moe_routing")?;
+    let (rl_storage, rl_layout) = router_logits.storage_and_layout();
+    let rl_cuda = as_candle_cuda(&rl_storage, "fused_moe_routing")?;
     if rl_cuda.dtype() != DType::BF16 {
         bail!("fused_moe_routing: requires BF16 input");
     }
@@ -30,15 +44,15 @@ pub fn fused_moe_routing(
         bail!("fused_moe_routing: expected 2D input, got {:?}", dims);
     };
 
-    let stream = rl_cuda.stream.clone();
+    let dev = rl_cuda.device().clone();
     let rl_slice = rl_cuda
-        .as_slice::<half::bf16>()?
+        .as_cuda_slice::<half::bf16>()?
         .slice(rl_layout.start_offset()..);
 
-    let topk_weights = unsafe { stream.alloc::<f32>(num_tokens * topk) }.ce()?;
-    let topk_ids = unsafe { stream.alloc::<u32>(num_tokens * topk) }.ce()?;
-    let sorted_expert_ids = unsafe { stream.alloc::<u32>(num_tokens * topk) }.ce()?;
-    let sorted_token_ids = unsafe { stream.alloc::<u32>(num_tokens * topk) }.ce()?;
+    let topk_weights = unsafe { dev.alloc::<f32>(num_tokens * topk) }?;
+    let topk_ids = unsafe { dev.alloc::<u32>(num_tokens * topk) }?;
+    let sorted_expert_ids = unsafe { dev.alloc::<u32>(num_tokens * topk) }?;
+    let sorted_token_ids = unsafe { dev.alloc::<u32>(num_tokens * topk) }?;
 
     // Shared memory: num_experts floats (softmax vals) + num_experts u32 (indices) + 16 floats (warp reduce)
     let shared_mem = (num_experts * 4 + num_experts * 4 + 16 * 4) as u32;
@@ -46,13 +60,13 @@ pub fn fused_moe_routing(
     let block_size = if num_experts <= 128 { 128u32 } else { 256u32 };
 
     let func =
-        crate::device::get_or_load_func(rl_cuda.device(), "fused_moe_routing_bf16", MOD_MOE_ROUTING, PTX_MOE_ROUTING)?;
+        dev.get_or_load_custom_func("fused_moe_routing_bf16", MOD_MOE_ROUTING, PTX_MOE_ROUTING)?;
     let cfg = LaunchConfig {
         grid_dim: (num_tokens as u32, 1, 1),
         block_dim: (block_size, 1, 1),
         shared_mem_bytes: shared_mem,
     };
-    let mut builder = stream.launch_builder(&func);
+    let mut builder = func.builder();
     builder.arg(&rl_slice);
     builder.arg(&topk_weights);
     builder.arg(&topk_ids);
@@ -66,13 +80,19 @@ pub fn fused_moe_routing(
     builder.arg(&num_experts_val);
     builder.arg(&topk_val);
     builder.arg(&norm_val);
-    unsafe { builder.launch(cfg) }.ce()?;
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(rl_storage);
 
     // Wrap outputs as tensors
-    let tw_tensor = cb::tensor_from_cuda(topk_weights, stream.clone(), (num_tokens, topk));
-    let ti_tensor = cb::tensor_from_cuda(topk_ids, stream.clone(), (num_tokens * topk,));
-    let se_tensor = cb::tensor_from_cuda(sorted_expert_ids, stream.clone(), (num_tokens * topk,));
-    let st_tensor = cb::tensor_from_cuda(sorted_token_ids, stream.clone(), (num_tokens * topk,));
+    let tw_storage = candle_core::CudaStorage::wrap_cuda_slice(topk_weights, dev.clone());
+    let tw_tensor = Tensor::from_storage(candle_core::Storage::Cuda(tw_storage), (num_tokens, topk), candle_core::op::BackpropOp::none(), false);
+    let ti_storage = candle_core::CudaStorage::wrap_cuda_slice(topk_ids, dev.clone());
+    let ti_tensor = Tensor::from_storage(candle_core::Storage::Cuda(ti_storage), (num_tokens * topk,), candle_core::op::BackpropOp::none(), false);
+    let se_storage = candle_core::CudaStorage::wrap_cuda_slice(sorted_expert_ids, dev.clone());
+    let se_tensor = Tensor::from_storage(candle_core::Storage::Cuda(se_storage), (num_tokens * topk,), candle_core::op::BackpropOp::none(), false);
+    let st_storage = candle_core::CudaStorage::wrap_cuda_slice(sorted_token_ids, dev.clone());
+    let st_tensor = Tensor::from_storage(candle_core::Storage::Cuda(st_storage), (num_tokens * topk,), candle_core::op::BackpropOp::none(), false);
 
     Ok((tw_tensor, ti_tensor, se_tensor, st_tensor))
 }
@@ -94,7 +114,7 @@ pub fn moe_gemm_wmma(
     use crate::moe_ffi as ffi;
     use half::{bf16, f16};
 
-    fn cuda_fwd<T: GpuDType + DeviceRepr>(
+    fn cuda_fwd<T: GpuDType + DeviceRepr + candle_core::cuda_backend::CudaDType>(
         input: &Tensor,
         weights: &Tensor,
         topk_weights: &Option<Tensor>,
@@ -114,50 +134,73 @@ pub fn moe_gemm_wmma(
             size_k1,
             size_k
         );
-        let stream = cb::tensor_stream(input)?;
-        let data_type = match input.dtype() {
-            DType::F16 => 0,
-            DType::BF16 => 1,
-            _ => bail!("moe_gemm_wmma only accepts f16/bf16 inputs"),
+
+        let (input_g, input_l) = input.storage_and_layout();
+        let input_cuda = match &*input_g {
+            candle_core::Storage::Cuda(s) => s,
+            _ => candle_core::bail!("moe_gemm: input requires CUDA"),
         };
+        let input_s = input_cuda.as_cuda_slice::<T>()?.slice(input_l.start_offset()..);
 
-        let (input_s, _) = cb::storage_and_layout(&input);
-        let input_s = cb::as_cuda(&input_s, "input")?.as_slice::<T>()?;
+        let (weights_g, weights_l) = weights.storage_and_layout();
+        let weights_cuda = match &*weights_g {
+            candle_core::Storage::Cuda(s) => s,
+            _ => candle_core::bail!("moe_gemm: weights requires CUDA"),
+        };
+        let weights_s = weights_cuda.as_cuda_slice::<T>()?.slice(weights_l.start_offset()..);
 
-        let (weights_s, _) = cb::storage_and_layout(&weights);
-        let weights_s = cb::as_cuda(&weights_s, "weight")?.as_slice::<T>()?;
+        let (sti_g, sti_l) = sorted_token_ids.storage_and_layout();
+        let sti_cuda = match &*sti_g {
+            candle_core::Storage::Cuda(s) => s,
+            _ => candle_core::bail!("moe_gemm: sorted_token_ids requires CUDA"),
+        };
+        let sti = sti_cuda.as_cuda_slice::<u32>()?.slice(sti_l.start_offset()..);
 
-        let (sti, _) = cb::storage_and_layout(&sorted_token_ids);
-        let sti = cb::as_cuda(&sti, "sorted_token_ids")?.as_slice::<u32>()?;
+        let (ei_g, ei_l) = experts_ids.storage_and_layout();
+        let ei_cuda = match &*ei_g {
+            candle_core::Storage::Cuda(s) => s,
+            _ => candle_core::bail!("moe_gemm: experts_ids requires CUDA"),
+        };
+        let ei = ei_cuda.as_cuda_slice::<u32>()?.slice(ei_l.start_offset()..);
 
-        let (ei, _) = cb::storage_and_layout(&experts_ids);
-        let ei = cb::as_cuda(&ei, "experts_ids")?.as_slice::<u32>()?;
+        let dev = input_cuda.device().clone();
+        let stream = dev.cuda_stream();
 
         let topk_weights_ptr = if let Some(tw) = topk_weights {
-            let (tw_s, _) = cb::storage_and_layout(&tw);
-            let tw_s = cb::as_cuda(&tw_s, "topk_weights")?.as_slice::<f32>()?;
-            tw_s.device_ptr(tw_s.stream()).0 as *const f32
+            let (tw_g, tw_l) = tw.storage_and_layout();
+            let tw_cuda = match &*tw_g {
+                candle_core::Storage::Cuda(s) => s,
+                _ => candle_core::bail!("moe_gemm: topk_weights requires CUDA"),
+            };
+            let tw_s = tw_cuda.as_cuda_slice::<f32>()?.slice(tw_l.start_offset()..);
+            tw_s.device_ptr(&stream).0 as *const f32
         } else {
             std::ptr::null()
         };
 
-        let output = unsafe { stream.alloc::<T>(size_m * size_n) }.ce()?;
-        let expert_counts = unsafe { stream.alloc::<u32>(num_experts) }.ce()?;
-        let expert_offsets = unsafe { stream.alloc::<u32>(num_experts + 1) }.ce()?;
+        let output = unsafe { dev.alloc::<T>(size_m * size_n) }?;
+        let expert_counts = unsafe { dev.alloc::<u32>(num_experts) }?;
+        let expert_offsets = unsafe { dev.alloc::<u32>(num_experts + 1) }?;
 
         let cu_stream = stream.cu_stream() as i64;
         use core::ffi::c_void;
 
+        let data_type = match input.dtype() {
+            DType::F16 => 0,
+            DType::BF16 => 1,
+            _ => candle_core::bail!("moe_gemm_wmma only accepts f16/bf16 inputs"),
+        };
+
         unsafe {
             ffi::moe_gemm_wmma(
-                input_s.device_ptr(input_s.stream()).0 as *const c_void,
-                weights_s.device_ptr(weights_s.stream()).0 as *const c_void,
-                sti.device_ptr(sti.stream()).0 as *const i32,
-                ei.device_ptr(ei.stream()).0 as *const i32,
+                input_s.device_ptr(&stream).0 as *const c_void,
+                weights_s.device_ptr(&stream).0 as *const c_void,
+                sti.device_ptr(&stream).0 as *const i32,
+                ei.device_ptr(&stream).0 as *const i32,
                 topk_weights_ptr,
-                output.device_ptr(output.stream()).0 as *mut c_void,
-                expert_counts.device_ptr(expert_counts.stream()).0 as *mut i32,
-                expert_offsets.device_ptr(expert_offsets.stream()).0 as *mut i32,
+                output.device_ptr(&stream).0 as *mut c_void,
+                expert_counts.device_ptr(&stream).0 as *mut i32,
+                expert_offsets.device_ptr(&stream).0 as *mut i32,
                 num_experts as i32,
                 topk as i32,
                 size_m as i32,
@@ -169,8 +212,18 @@ pub fn moe_gemm_wmma(
             );
         }
 
-        let output = cb::tensor_from_cuda(output, stream.clone(), (size_m, size_n));
-        Ok(output)
+        drop(input_g);
+        drop(weights_g);
+        drop(sti_g);
+        drop(ei_g);
+
+        let out_storage = candle_core::CudaStorage::wrap_cuda_slice(output, dev);
+        Ok(Tensor::from_storage(
+            candle_core::Storage::Cuda(out_storage),
+            (size_m, size_n),
+            candle_core::op::BackpropOp::none(),
+            false,
+        ))
     }
 
     match input.dtype() {

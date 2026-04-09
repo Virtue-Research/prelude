@@ -245,3 +245,4 @@ fn parse_env_bool(name: &str) -> bool {
 fn parse_env_bool_eq1(name: &str) -> bool {
     std::env::var(name).map_or(false, |v| v == "1")
 }
+

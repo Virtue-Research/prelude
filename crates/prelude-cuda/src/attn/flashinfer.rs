@@ -5,7 +5,7 @@
 
 use crate::device::{self as cb, DevicePtr};
 use cudarc::driver::CudaStream;
-use prelude_core::tensor::{bail, DType, Device, Result, Tensor};
+use prelude_core::tensor::{bail, DType, Device, DeviceExt, Result, Tensor};
 use half::bf16;
 use prelude_flashinfer::types::*;
 use prelude_flashinfer::{DecodeKey, KernelDtype, KernelRegistry, MaskMode, PrefillKey};
@@ -181,7 +181,7 @@ fn precompute_paged_plan_impl(
     cu_seqlens_q: &Tensor,
     block_tables: &Tensor,
     cu_seqlens_k: &Tensor,
-    softmax_scale: f32,
+    _softmax_scale: f32,
     graph_buffers: Option<(&Tensor, &Tensor, &Tensor)>,
 ) -> Result<()> {
     let (batch_size, num_qo_heads, head_dim) = q_shape;
@@ -380,9 +380,12 @@ const U8_DT: DLDataType = DLDataType { code: KDLUINT, bits: 8, lanes: 1 };
 
 macro_rules! cuda_ptr {
     ($t:expr, $ty:ty, $stream:expr) => {{
-        let (storage, layout) = cb::storage_and_layout(&$t);
-        let cuda = cb::as_cuda(&storage, "FlashInfer")?;
-        let slice = cuda.as_slice::<$ty>()?.slice(layout.start_offset()..);
+        let (storage, layout) = $t.storage_and_layout();
+        let cuda = match &*storage {
+            candle_core::Storage::Cuda(s) => s,
+            _ => candle_core::bail!("FlashInfer: requires CUDA"),
+        };
+        let slice = cuda.as_cuda_slice::<$ty>()?.slice(layout.start_offset()..);
         let (ptr, _guard) = slice.device_ptr($stream);
         ptr as u64 as *mut c_void
     }};

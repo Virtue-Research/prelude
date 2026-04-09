@@ -299,8 +299,8 @@ impl Qwen3Attention {
         };
 
         // Softmax over last dim
-        let last_dim = scores.rank() - 1;
-        let attn_weights = scores.softmax(last_dim)?;
+        let _last_dim = scores.rank() - 1;
+        let attn_weights = candle_nn::ops::softmax_last_dim(&scores)?;
 
         // output = attn_weights @ V → [H, seq_len, D]
         let out = attn_weights.matmul(&v3)?;
@@ -476,7 +476,7 @@ impl Model {
         position_offset: usize,
     ) -> Result<Tensor> {
         let mut h = self.embed_tokens.forward(input_ids)?;
-        for (i, layer) in self.layers.iter_mut().enumerate() {
+        for (_i, layer) in self.layers.iter_mut().enumerate() {
             nvtx_push!("layer[{}]", i);
             h = layer.forward_with_cache(ops, &h, position_offset)?;
             nvtx_pop!();

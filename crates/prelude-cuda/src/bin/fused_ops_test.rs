@@ -16,7 +16,7 @@ fn must_fuse<T>(opt: Option<Result<T>>, name: &str) -> Result<T> {
 }
 
 fn main() -> Result<()> {
-    let dev = Device::Cuda(0);
+    let dev = Device::new_cuda(0)?;
     let ops = prelude_cuda::cuda_ops();
     let n = 1024 * 3072; // typical intermediate_size * seq
 

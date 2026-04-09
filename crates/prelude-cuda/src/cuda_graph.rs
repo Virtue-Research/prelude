@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cudarc::driver::CudaStream;
+use cudarc::driver::{CudaStream, DevicePtr};
 use prelude_core::tensor::{DType, Device, Tensor};
 
 use prelude_core::cache::block_manager::BlockManager;
@@ -17,7 +17,7 @@ use prelude_core::config::EngineConfig;
 use prelude_core::engine::{Engine, EngineError, OwnedBatchDecodeSeq};
 use prelude_core::models::commons::{BatchAttnContext, PagedKvBatchContext};
 
-use crate::device::{as_cuda_mut, CudaStorage, GpuDType};
+use crate::device::GpuDType;
 
 fn tensor_err(e: prelude_core::tensor::Error) -> EngineError {
     EngineError::Internal(format!("tensor: {e}"))
@@ -79,7 +79,10 @@ impl DecodeGraphBuffers {
 }
 
 /// Write host data into a pre-allocated GPU tensor without new allocation.
-unsafe fn update_tensor<T: GpuDType>(
+///
+/// Safety: caller must ensure no concurrent access to this tensor's storage.
+/// This is called from the single GPU worker thread for CUDA graph buffer updates.
+unsafe fn update_tensor<T: GpuDType + candle_core::cuda_backend::CudaDType>(
     tensor: &Tensor,
     data: &[T],
     stream: &Arc<CudaStream>,
@@ -89,17 +92,21 @@ unsafe fn update_tensor<T: GpuDType>(
         "update_tensor: data len {} exceeds tensor elem_count {}",
         data.len(), tensor.elem_count(),
     );
-    // Safety: update_tensor is called from the single GPU worker thread;
-    // no concurrent access to these graph-owned buffers.
-    let storage_ptr = Arc::as_ptr(tensor.storage_arc()) as *mut prelude_core::tensor::Storage;
-    let storage_mut = &mut *storage_ptr;
-    let cuda = as_cuda_mut(storage_mut, "update_tensor")
-        .map_err(|e| EngineError::Internal(format!("update_tensor: {e}")))?;
-    let slice = T::as_cuda_slice_mut(&mut cuda.slice)
-        .map_err(|e| EngineError::Internal(format!("as_cuda_slice_mut: {e}")))?;
-    stream
-        .memcpy_htod(data, slice)
-        .map_err(|e| EngineError::Internal(format!("memcpy_htod: {e}")))?;
+    // Safety: single GPU worker thread, no concurrent access to these graph-owned buffers.
+    // Use raw CUDA memcpy with the device pointer from the tensor's CudaSlice.
+    // We only need a read lock — the GPU write doesn't mutate the Rust struct.
+    let (guard, _layout) = tensor.storage_and_layout();
+    match &*guard {
+        prelude_core::tensor::Storage::Cuda(cs) => {
+            let slice = <T as candle_core::cuda_backend::CudaDType>::as_cuda_slice(cs)
+                .map_err(|e| EngineError::Internal(format!("as_cuda_slice: {e}")))?;
+            let (dev_ptr, _g) = slice.device_ptr(stream);
+            let raw_stream = stream.cu_stream();
+            cudarc::driver::result::memcpy_htod_async(dev_ptr, data, raw_stream)
+                .map_err(|e| EngineError::Internal(format!("memcpy_htod: {e}")))?;
+        }
+        _ => return Err(EngineError::Internal("update_tensor: expected CUDA storage".into())),
+    }
     Ok(())
 }
 
@@ -397,7 +404,9 @@ impl DecodeGraphCache {
     }
 
     fn get_stream(device: &Device) -> Result<Arc<CudaStream>, EngineError> {
-        crate::device::cuda_stream(device.ordinal())
-            .map_err(|e| EngineError::Internal(format!("cuda_stream: {e}")))
+        let cuda_dev = device
+            .as_cuda_device()
+            .map_err(|e| EngineError::Internal(format!("as_cuda_device: {e}")))?;
+        Ok(cuda_dev.cuda_stream())
     }
 }
