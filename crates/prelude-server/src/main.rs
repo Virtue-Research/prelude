@@ -237,7 +237,7 @@ fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
         max_prefill_tokens: cli.max_prefill_tokens,
         max_total_tokens: cli.max_total_tokens,
         decode_reservation_cap: cli.decode_reservation_cap,
-        mixed_chunked: cli.chunked_prefill,
+        chunked_prefill: cli.chunked_prefill,
         ..SchedulerConfig::default()
     };
     info!(
