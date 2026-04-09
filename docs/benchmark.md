@@ -32,6 +32,11 @@ uv pip install "genai-bench @ git+https://github.com/rucnyz/genai-bench.git"
 docker pull lmsysorg/sglang:latest
 docker pull vllm/vllm-openai:latest
 ```
+For B300:
+```
+docker pull lmsysorg/sglang:latest-cu130
+docker tag lmsysorg/sglang:latest-cu130 lmsysorg/sglang:latest
+```
 
 ### 4. Verify
 
