@@ -130,10 +130,7 @@ start_engine() {
     local cvd="${CUDA_VISIBLE_DEVICES:-0}"
     case "$engine" in
         prelude)
-            # Enable CUDA graph for decode (OUTPUT_TOKENS > 1) — reduces kernel launch overhead
-            local cuda_graph_flag=""
-            [ "${OUTPUT_TOKENS:-1}" -gt 1 ] && cuda_graph_flag="PRELUDE_CUDA_GRAPH=1"
-            env PRELUDE_DEVICE="$DEVICE" RUST_LOG="${RUST_LOG:-warn}" $cuda_graph_flag "$PRELUDE_BIN" \
+            env PRELUDE_DEVICE="$DEVICE" RUST_LOG="${RUST_LOG:-warn}" "$PRELUDE_BIN" \
                 --host 0.0.0.0 --port "$port" --model "$MODEL" --dtype bf16 & ;;
         prelude-gguf)
             env PRELUDE_DEVICE=cpu RUST_LOG="${RUST_LOG:-warn}" "$PRELUDE_BIN" \
@@ -229,14 +226,15 @@ mkdir -p "$RESULTS_DIR"
 echo "engine,device,startup_s,ttft_s,tpot_s,e2e_latency_s,input_tps,output_tps,rpm" > "$CSV_FILE"
 
 # Parse args
-FILTER=""; target="all"
+FILTER=""; TARGETS=()
 for arg in "$@"; do
     case "$arg" in
         --cpu) FILTER="cpu" ;; --gpu) FILTER="gpu" ;;
         -*) err "Unknown flag: $arg"; exit 1 ;;
-        *) target="$arg" ;;
+        *) TARGETS+=("$arg") ;;
     esac
 done
+[ ${#TARGETS[@]} -eq 0 ] && TARGETS=("all")
 
 log "Config: model=$MODEL traffic=$TRAFFIC concurrency=$CONCURRENCY gpu=$HAS_GPU"
 [ -n "$CPU_NAME" ] && log "CPU: $CPU_NAME"
@@ -247,17 +245,12 @@ echo ""
 GPU_ENGINES=(prelude vllm.rs vllm sglang)
 CPU_ENGINES=(prelude prelude-gguf llama.cpp vllm-cpu sglang-cpu)
 
-if [ "$target" = "all" ]; then
-    [ "$FILTER" != "gpu" ] && for e in "${CPU_ENGINES[@]}"; do run_engine "$e" cpu; done
-    [ "$FILTER" != "cpu" ] && [ "$HAS_GPU" = true ] && for e in "${GPU_ENGINES[@]}"; do
-        [ "$e" = "prelude" ] && run_engine "$e" "cuda:0" || run_engine "$e" gpu
-    done
-else
-    # Single engine
+run_single_engine() {
+    local target="$1"
     if [ -z "${ENGINES[$target]+x}" ]; then
         err "Unknown engine: $target"
         echo "Available: ${!ENGINES[*]}"
-        exit 1
+        return 1
     fi
     IFS='|' read -r _ _ _ gpu_only _ <<< "${ENGINES[$target]}"
     if [ "$FILTER" = "gpu" ] || { [ "$FILTER" = "" ] && [ "$gpu_only" = "yes" ]; }; then
@@ -270,6 +263,17 @@ else
         run_engine "$target" cpu
         [ "$HAS_GPU" = true ] && { [ "$target" = "prelude" ] && run_engine "$target" "cuda:0" || run_engine "$target" gpu; }
     fi
+}
+
+if [ "${TARGETS[0]}" = "all" ]; then
+    [ "$FILTER" != "gpu" ] && for e in "${CPU_ENGINES[@]}"; do run_engine "$e" cpu; done
+    [ "$FILTER" != "cpu" ] && [ "$HAS_GPU" = true ] && for e in "${GPU_ENGINES[@]}"; do
+        [ "$e" = "prelude" ] && run_engine "$e" "cuda:0" || run_engine "$e" gpu
+    done
+else
+    for target in "${TARGETS[@]}"; do
+        run_single_engine "$target"
+    done
 fi
 
 python3 "$SCRIPT_DIR/bench_utils.py" print-summary \
