@@ -119,9 +119,7 @@ check_engine() {
             [ -f "$LLAMA_CPP_BIN" ] || { echo "llama-server not found ($LLAMA_CPP_BIN)"; return 1; }
             [ -f "$GGUF_MODEL" ] || { echo "GGUF not found ($GGUF_MODEL)"; return 1; } ;;
         vllm|vllm-cpu|sglang|sglang-cpu)
-            local img="${DOCKER_IMAGES[$engine]}"
-            log "Pulling $img ..." >&2
-            docker pull "$img" >&2 || { echo "docker pull failed: $img"; return 1; } ;;
+            ;; # Docker images are pulled in run_engine before start
     esac
     return 0
 }
@@ -181,6 +179,13 @@ run_engine() {
 
     [ "$gpu_only" = "yes" ] && [ "$DEVICE" = "cpu" ] && return
     local reason; reason=$(check_engine "$engine") || { warn "Skipping $display: $reason"; return; }
+
+    # Pull Docker image if needed (outside subshell so output goes to terminal)
+    local img="${DOCKER_IMAGES[$engine]:-}"
+    if [ -n "$img" ]; then
+        log "Pulling $img ..."
+        docker pull "$img" || { warn "Skipping $display: docker pull failed"; return; }
+    fi
 
     log "Starting $display (device=$DEVICE) on port $port ..."
     start_engine "$engine" "$port"
