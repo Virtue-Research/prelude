@@ -7,6 +7,7 @@
 #   ./benchmark/bench.sh sglang --gpu      # SGLang GPU only
 #   ./benchmark/bench.sh --gpu             # all GPU engines
 #   ./benchmark/bench.sh --cpu             # all CPU engines
+#   ./benchmark/bench.sh --gpu --cu12      # use CUDA 12 Docker images (default: CUDA 13)
 #
 # Environment:
 #   MODEL  INPUT_TOKENS  OUTPUT_TOKENS  CONCURRENCY  MAX_REQUESTS  CUDA_VISIBLE_DEVICES
@@ -230,6 +231,10 @@ FILTER=""; TARGETS=()
 for arg in "$@"; do
     case "$arg" in
         --cpu) FILTER="cpu" ;; --gpu) FILTER="gpu" ;;
+        --cu12)
+            DOCKER_IMAGES[vllm]="vllm/vllm-openai:latest"
+            DOCKER_IMAGES[sglang]="lmsysorg/sglang:latest"
+            ;;
         -*) err "Unknown flag: $arg"; exit 1 ;;
         *) TARGETS+=("$arg") ;;
     esac
