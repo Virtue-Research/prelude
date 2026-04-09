@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::tensor::{DType, Device, Tensor};
 use tracing::info;
@@ -14,7 +14,7 @@ use crate::engine::{CommonModelConfig, EngineError, PagedKvPool, RuntimeCaps};
 pub struct CacheManager {
     pub(crate) prefix_cache: Option<Mutex<PrefixKvCache>>,
     pub paged_pool: Option<PagedKvPool>,
-    pub(crate) block_manager: Option<Mutex<crate::cache::block_manager::BlockManager>>,
+    pub(crate) block_manager: Option<Arc<Mutex<crate::cache::block_manager::BlockManager>>>,
     pub deltanet_pool: Option<Mutex<DeltaNetPool>>,
 }
 
@@ -66,6 +66,11 @@ impl CacheManager {
         }
     }
 
+    /// Get a shared reference to the block manager (for giving to the Scheduler).
+    pub fn block_manager_arc(&self) -> Option<Arc<Mutex<crate::cache::block_manager::BlockManager>>> {
+        self.block_manager.clone()
+    }
+
     // ── Init helpers (read from CacheConfig, not env vars) ───────────────
 
     /// Create a prefix cache if enabled by config.
@@ -107,7 +112,7 @@ impl CacheManager {
     ) -> Result<
         (
             Option<PagedKvPool>,
-            Option<Mutex<crate::cache::block_manager::BlockManager>>,
+            Option<Arc<Mutex<crate::cache::block_manager::BlockManager>>>,
         ),
         EngineError,
     > {
@@ -233,7 +238,7 @@ impl CacheManager {
             block_size: paged_block_size,
         };
         let bm = crate::cache::block_manager::BlockManager::new(paged_blocks, paged_block_size);
-        Ok((Some(pool), Some(Mutex::new(bm))))
+        Ok((Some(pool), Some(Arc::new(Mutex::new(bm)))))
     }
 
     /// Initialize a DeltaNet state pool for hybrid models (Qwen3.5, Qwen3-Next).

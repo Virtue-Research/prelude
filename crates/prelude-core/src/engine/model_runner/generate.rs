@@ -58,6 +58,8 @@ impl Engine {
             all_greedy,
             force_varlen: self.engine_config.runtime.force_varlen_prefill,
             prefix_reuse,
+            computed_lens: vec![],
+            existing_block_tables: vec![],
         }
     }
 

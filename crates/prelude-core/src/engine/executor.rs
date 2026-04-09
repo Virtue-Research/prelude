@@ -73,14 +73,34 @@ pub struct ModelOutput {
 
 /// What the Executor should run. Built by the scheduling loop from
 /// `ArSequenceState` + `SchedulerStep`, then passed to `submit()`.
+/// Per-request info for a unified mixed forward batch.
+#[derive(Debug)]
+pub struct StepRequest {
+    /// Tokens to process this step (chunk for prefill, 1 for decode).
+    pub tokens: Vec<u32>,
+    /// Total KV context length (including tokens from previous chunks + this step's tokens).
+    pub context_len: usize,
+    /// Starting position for this request's new tokens.
+    pub position_start: usize,
+    /// Block table (accumulated from previous chunks).
+    pub block_table: Vec<u32>,
+    /// Is this a prefill final chunk? (needs first-token processing in AR loop)
+    pub is_prefill_final: bool,
+    /// Is this a partial prefill chunk? (discard sampled token)
+    pub is_prefill_partial: bool,
+    /// DeltaNet pool slot.
+    pub deltanet_slot: Option<u32>,
+    /// Whether to compute per-token prompt logprobs (for PPL / echo).
+    pub prompt_logprobs: Option<u32>,
+}
+
 pub enum ForwardBatch {
-    /// Prefill: process full prompt sequences (generation).
-    /// Contains prepared requests with token IDs, sampling params, etc.
-    Prefill {
-        items: Vec<super::PreparedGenerateRequest>,
+    /// Unified mixed batch: prefill chunks (Q=chunk_len) + decode (Q=1)
+    /// in a single forward pass. Used by chunked-prefill scheduler.
+    Mixed {
+        requests: Vec<StepRequest>,
     },
-    /// Decode: generate one token per active sequence (Q=1).
-    /// Each entry is (pending_token, position, block_table).
+    /// Pure decode batch (Q=1 for all): eligible for CUDA graph replay.
     Decode {
         tokens: Vec<u32>,
         positions: Vec<usize>,
@@ -183,7 +203,7 @@ mod tests {
             batch: ForwardBatch,
         ) -> Result<ExecutionHandle, EngineError> {
             let (batch_size, item_seq_counts) = match &batch {
-                ForwardBatch::Prefill { items } => (items.len(), vec![]),
+                ForwardBatch::Mixed { requests } => (requests.len(), vec![]),
                 ForwardBatch::Decode { tokens, .. } => (tokens.len(), vec![]),
                 ForwardBatch::OneShot { token_groups, .. } => {
                     let counts: Vec<usize> = token_groups.iter().map(|g| g.len()).collect();
@@ -212,7 +232,7 @@ mod tests {
 
     #[test]
     fn submit_recv_prefill() {
-        let output = submit_recv(&TestExecutor { vocab_size: 100 }, ForwardBatch::Prefill { items: vec![] }).unwrap();
+        let output = submit_recv(&TestExecutor { vocab_size: 100 }, ForwardBatch::Mixed { requests: vec![] }).unwrap();
         assert_eq!(output.logits.dims(), &[0, 100]);
     }
 

@@ -5,6 +5,7 @@ mod classify;
 mod embed;
 mod generate;
 mod paged_decode;
+mod paged_mixed;
 mod paged_prefill;
 mod prefill_output;
 mod prefill;

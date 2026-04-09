@@ -95,7 +95,9 @@ pub struct Sequence {
     pub arrival_time: Instant,
     pub priority: Option<i64>,
     pub kv_computed_len: usize,
-    pub block_table: Vec<usize>,
+    /// Real GPU block IDs (authoritative source, managed by scheduler).
+    pub block_table: Vec<u32>,
+    pub deltanet_slot: Option<u32>,
     pub preempt_count: u32,
 }
 
@@ -123,6 +125,7 @@ impl Sequence {
             priority,
             kv_computed_len: 0,
             block_table: Vec::new(),
+            deltanet_slot: None,
             preempt_count: 0,
         }
     }
@@ -176,7 +179,12 @@ pub struct SchedulerConfig {
     pub max_batch_size: usize,
     pub max_batch_wait_ms: u64,
     pub max_running_requests: usize,
-    pub max_prefill_tokens: usize,
+    /// Per-step total token budget (prefill + decode combined).
+    /// This is the primary knob controlling chunked prefill granularity.
+    pub max_num_batched_tokens: usize,
+    /// Per-request prefill token cap (like vLLM's long_prefill_token_threshold).
+    /// 0 means no per-request cap (only limited by max_num_batched_tokens).
+    pub long_prefill_token_threshold: usize,
     pub max_total_tokens: usize,
     pub decode_reservation_cap: usize,
     pub new_token_ratio: f32,
@@ -184,6 +192,8 @@ pub struct SchedulerConfig {
     pub new_token_ratio_decay: f32,
     pub policy: SchedulePolicy,
     pub chunked_prefill: bool,
+    /// KV cache block size (tokens per block). 0 = no block-level tracking.
+    pub block_size: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -192,7 +202,8 @@ impl Default for SchedulerConfig {
             max_batch_size: 32,
             max_batch_wait_ms: 5,
             max_running_requests: 256,
-            max_prefill_tokens: 8192,
+            max_num_batched_tokens: 8192,
+            long_prefill_token_threshold: 0,
             max_total_tokens: 32768,
             decode_reservation_cap: 4096,
             new_token_ratio: 0.4,
@@ -200,6 +211,7 @@ impl Default for SchedulerConfig {
             new_token_ratio_decay: 0.002,
             policy: SchedulePolicy::Fcfs,
             chunked_prefill: false,
+            block_size: 16,
         }
     }
 }
@@ -208,14 +220,17 @@ impl Default for SchedulerConfig {
 #[derive(Debug)]
 pub struct SchedulerStep {
     pub prefill_request_ids: Vec<String>,
+    /// How many tokens to process for each prefill request (parallel to prefill_request_ids).
+    pub prefill_chunk_lens: Vec<usize>,
     pub decode_request_ids: Vec<String>,
     pub forward_mode: ForwardMode,
 }
 
 impl SchedulerStep {
-    pub fn prefill(prefill_request_ids: Vec<String>) -> Self {
+    pub fn prefill(prefill_request_ids: Vec<String>, prefill_chunk_lens: Vec<usize>) -> Self {
         Self {
             prefill_request_ids,
+            prefill_chunk_lens,
             decode_request_ids: Vec::new(),
             forward_mode: ForwardMode::Prefill,
         }
@@ -224,14 +239,20 @@ impl SchedulerStep {
     pub fn decode(decode_request_ids: Vec<String>) -> Self {
         Self {
             prefill_request_ids: Vec::new(),
+            prefill_chunk_lens: Vec::new(),
             decode_request_ids,
             forward_mode: ForwardMode::Decode,
         }
     }
 
-    pub fn mixed(prefill_request_ids: Vec<String>, decode_request_ids: Vec<String>) -> Self {
+    pub fn mixed(
+        prefill_request_ids: Vec<String>,
+        prefill_chunk_lens: Vec<usize>,
+        decode_request_ids: Vec<String>,
+    ) -> Self {
         Self {
             prefill_request_ids,
+            prefill_chunk_lens,
             decode_request_ids,
             forward_mode: ForwardMode::Mixed,
         }
@@ -247,6 +268,11 @@ pub struct Scheduler {
     pub(crate) effective_new_token_ratio: f32,
     pub(crate) tokens_in_use: usize,
     pub(crate) step_count: u64,
+    /// Available KV cache blocks for admission checks.
+    /// Synced from block_manager at the start of each scheduling step.
+    pub(crate) available_blocks: usize,
+    /// Shared block manager (primary owner; CacheManager holds clone for prefix ops).
+    block_manager: Option<std::sync::Arc<std::sync::Mutex<super::BlockManager>>>,
 }
 
 impl Scheduler {
@@ -260,6 +286,44 @@ impl Scheduler {
             effective_new_token_ratio: ratio,
             tokens_in_use: 0,
             step_count: 0,
+            available_blocks: usize::MAX,
+            block_manager: None,
+        }
+    }
+
+    /// Attach a shared block manager (called once during ScheduledEngine init).
+    pub fn set_block_manager(
+        &mut self,
+        bm: std::sync::Arc<std::sync::Mutex<super::BlockManager>>,
+    ) {
+        self.block_manager = Some(bm);
+    }
+
+    /// Sync available_blocks from the block manager before scheduling.
+    pub fn sync_available_blocks(&mut self) {
+        if let Some(ref bm) = self.block_manager {
+            if let Ok(bm) = bm.lock() {
+                self.available_blocks = bm.available();
+            }
+        }
+    }
+
+    /// Allocate a single KV cache block. Returns None if exhausted.
+    pub fn allocate_block(&self) -> Option<u32> {
+        self.block_manager.as_ref()?.lock().ok()?.allocate()
+    }
+
+    /// Allocate blocks for `num_tokens` tokens. Returns None if not enough blocks.
+    pub fn allocate_blocks_for_tokens(&self, num_tokens: usize) -> Option<Vec<u32>> {
+        self.block_manager.as_ref()?.lock().ok()?.allocate_for_tokens(num_tokens)
+    }
+
+    /// Free blocks back to the pool.
+    pub fn free_blocks(&self, block_table: &[u32]) {
+        if let Some(ref bm) = self.block_manager {
+            if let Ok(mut bm) = bm.lock() {
+                bm.free(block_table);
+            }
         }
     }
 
@@ -299,6 +363,7 @@ impl Scheduler {
 
     pub fn schedule_step(&mut self) -> Option<SchedulerStep> {
         self.step_count += 1;
+        self.sync_available_blocks();
         self.drain_finished();
 
         if self.config.chunked_prefill {
@@ -343,8 +408,17 @@ impl Scheduler {
         for mut sequence in self.running.drain(..) {
             if deferred.contains(sequence.request_id.as_str()) {
                 self.tokens_in_use = self.tokens_in_use.saturating_sub(sequence.input_ids.len());
+                if !sequence.block_table.is_empty() {
+                    if let Some(ref bm) = self.block_manager {
+                        if let Ok(mut bm) = bm.lock() {
+                            bm.free(&sequence.block_table);
+                        }
+                    }
+                }
                 sequence.status = SequenceStatus::Waiting;
                 sequence.kv_computed_len = 0;
+                sequence.block_table.clear();
+                sequence.deltanet_slot = None;
                 returned.push(sequence);
             } else {
                 kept.push(sequence);
@@ -379,5 +453,15 @@ impl Scheduler {
     #[inline]
     pub fn has_work(&self) -> bool {
         !self.waiting_queue.is_empty() || !self.running.is_empty()
+    }
+
+    /// Get an immutable reference to a running sequence by ID.
+    pub fn get_sequence(&self, request_id: &str) -> Option<&Sequence> {
+        self.running.iter().find(|s| s.request_id == request_id)
+    }
+
+    /// Get a mutable reference to a running sequence by ID.
+    pub fn get_sequence_mut(&mut self, request_id: &str) -> Option<&mut Sequence> {
+        self.running.iter_mut().find(|s| s.request_id == request_id)
     }
 }

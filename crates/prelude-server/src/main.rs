@@ -63,10 +63,17 @@ struct Cli {
 
     #[arg(
         long,
-        default_value_t = 4096,
-        help = "Max prefill tokens per scheduling step"
+        default_value_t = 8192,
+        help = "Per-step total token budget (prefill + decode combined)"
     )]
-    max_prefill_tokens: usize,
+    max_num_batched_tokens: usize,
+
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Per-request prefill token cap (0 = no cap, only limited by per-step budget)"
+    )]
+    long_prefill_token_threshold: usize,
 
     #[arg(
         long,
@@ -234,7 +241,8 @@ fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
         max_batch_size: cli.max_batch_size,
         max_batch_wait_ms: cli.max_batch_wait_ms,
         max_running_requests: cli.max_running_requests,
-        max_prefill_tokens: cli.max_prefill_tokens,
+        max_num_batched_tokens: cli.max_num_batched_tokens,
+        long_prefill_token_threshold: cli.long_prefill_token_threshold,
         max_total_tokens: cli.max_total_tokens,
         decode_reservation_cap: cli.decode_reservation_cap,
         chunked_prefill: cli.chunked_prefill,
@@ -244,7 +252,7 @@ fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
         max_batch_size = scheduler_config.max_batch_size,
         max_batch_wait_ms = scheduler_config.max_batch_wait_ms,
         max_running = scheduler_config.max_running_requests,
-        max_prefill_tokens = scheduler_config.max_prefill_tokens,
+        max_num_batched_tokens = scheduler_config.max_num_batched_tokens,
         max_total_tokens = scheduler_config.max_total_tokens,
         decode_reservation_cap = scheduler_config.decode_reservation_cap,
         "scheduler enabled"

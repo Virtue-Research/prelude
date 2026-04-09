@@ -179,6 +179,12 @@ pub(crate) struct PrefillPlan {
     pub(crate) all_greedy: bool,
     pub(crate) force_varlen: bool,
     pub(crate) prefix_reuse: Option<PrefixReuseCandidate>,
+    /// Per-request: tokens already in KV cache from previous chunks.
+    /// Empty = standard full prefill (no chunking).
+    pub(crate) computed_lens: Vec<usize>,
+    /// Per-request: block tables from previous chunks.
+    /// Empty = standard full prefill (no prior blocks).
+    pub(crate) existing_block_tables: Vec<Vec<u32>>,
 }
 
 /// Read-only prefix reuse resolved against the current paged prefix cache state.
