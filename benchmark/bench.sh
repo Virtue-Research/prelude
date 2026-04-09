@@ -184,7 +184,7 @@ run_engine() {
     local img="${DOCKER_IMAGES[$engine]:-}"
     if [ -n "$img" ]; then
         log "Pulling $img ..."
-        docker pull "$img" || { warn "Skipping $display: docker pull failed"; return; }
+        docker pull --progress=auto "$img" || { warn "Skipping $display: docker pull failed"; return; }
     fi
 
     log "Starting $display (device=$DEVICE) on port $port ..."
