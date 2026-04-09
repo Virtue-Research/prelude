@@ -35,7 +35,7 @@ pub const DEFAULT_CUDA_GRAPH_MAX_BS: usize = 32;
 pub const DEFAULT_PAGED_BLOCK_SIZE: usize = 128;
 pub const DEFAULT_PREFIX_BLOCK_SIZE: usize = 64;
 pub const DEFAULT_DELTANET_POOL_SLOTS: u32 = 8;
-pub const DEFAULT_TEMPERATURE: f32 = 0.7;
+pub const DEFAULT_TEMPERATURE: f32 = 1.0;
 pub const DEFAULT_TOP_P: f32 = 1.0;
 pub const DEFAULT_MAX_NEW_TOKENS: u32 = 4096;
 
