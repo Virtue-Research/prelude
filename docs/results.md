@@ -65,6 +65,22 @@ MODEL=Qwen/Qwen3-8B CUDA_VISIBLE_DEVICES=4 INPUT_TOKENS=128 OUTPUT_TOKENS=32 MAX
 **Prelude vs vLLM**: 0.97x throughput, 0.80x TTFT, 12x faster startup.
 **Prelude vs SGLang**: 1.15x throughput, 0.45x TTFT, 10x faster startup.
 
+### Long-Context Decode (8192 in, 32 out, c=4, 400 requests)
+
+```bash
+MODEL=Qwen/Qwen3-8B CUDA_VISIBLE_DEVICES=4 INPUT_TOKENS=8192 OUTPUT_TOKENS=32 MAX_REQUESTS=400 CONCURRENCY=4 \
+  ./benchmark/bench.sh sglang prelude vllm --gpu
+```
+
+| Engine  | Startup(s) | TTFT(s) | TPOT(s) | E2E(s) | In tok/s | Out tok/s | RPM    |
+|---------|------------|---------|---------|--------|----------|-----------|--------|
+| Prelude | 4          | 0.5793  | 0.0209  | 1.2280 | 24,619.9 | 97.9      | 183.6  |
+| vLLM    | 48         | 0.6691  | 0.0173  | 1.2060 | 25,188.7 | 100.2     | 187.9  |
+| SGLang  | 40         | 0.6425  | 0.0186  | 1.2181 | 24,962.8 | 99.3      | 186.2  |
+
+**Prelude vs vLLM**: 0.98x throughput, 0.87x TTFT, 12x faster startup.
+**Prelude vs SGLang**: 0.99x throughput, 0.90x TTFT, 10x faster startup.
+
 ## H200 — Qwen/Qwen3-32B (BF16)
 
 ### Decode (128 in, 32 out, c=4, 400 requests)
