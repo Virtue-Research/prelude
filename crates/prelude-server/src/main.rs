@@ -85,7 +85,7 @@ struct Cli {
     #[arg(
         long,
         default_value_t = true,
-        help = "Enable chunked prefill: interleave prefill chunks with decode steps for lower TPOT"
+        help = "Enable chunked prefill: interleave prefill with decode steps for lower TPOT"
     )]
     chunked_prefill: bool,
 
