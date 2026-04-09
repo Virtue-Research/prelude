@@ -5,7 +5,7 @@ Run these checks before every release. All must pass.
 ## 1. Build (full features)
 
 ```bash
-cargo build -p prelude-server --release --features flashinfer-v4,onednn,deepgemm
+cargo build -p prelude-server --release --features full
 ```
 
 ## 2. Unit tests
@@ -52,7 +52,7 @@ Note: this suite uses only publicly resolvable models. The classify default is
 .venv/bin/python tests/accuracy/run_accuracy_test.py --variant cpu-bf16 \
   --server prelude --model Qwen/Qwen3-0.6B
 
-# GPU BF16 (flash-attn-v3 + paged-attn, with ScheduledEngine)
+# GPU BF16 (FlashInfer + paged-attn, with ScheduledEngine)
 CUDA_VISIBLE_DEVICES=<N> .venv/bin/python tests/accuracy/run_accuracy_test.py --variant gpu \
   --server prelude --model Qwen/Qwen3-0.6B
 ```
@@ -199,7 +199,7 @@ curl http://localhost:8099/v1/completions -d '{"model":"test","prompt":"Hello","
 § GGUF MoE Q4_K_M vs transformers F32, GPU: exact=1, close=7 (Q4 quantization drift larger than Q8, all pass bidir cross-containment).
 
 **GPU (no-sched)** = `PRELUDE_NO_SCHEDULER=1` with BF16 golden → tests model correctness without attention kernel differences.
-**GPU + Scheduler** = ScheduledEngine with flash-attn-v3 + paged-attn. Divergences are from different
+**GPU + Scheduler** = ScheduledEngine with FlashInfer + paged-attn. Divergences are from different
 attention backend numerics vs HF transformers, not model bugs. Logprobs now supported for bidirectional cross-containment.
 **GPU + Scheduler (batch)** = `--max-running-requests 4` → tests DeltaNet state pool batched decode.
 Results identical to single-request scheduler, confirming pool introduces zero accuracy regression.

@@ -94,25 +94,25 @@ Modular dispatch lives exclusively in `models/common/attn/mod.rs`. Model code
 has zero `#[cfg]` gates for attention -- adding a backend means one file in
 `attn/` and one dispatch branch in `mod.rs`.
 
-| Backend | Feature flag | GPU requirement | Key capabilities |
-|---|---|---|---|
-| FA4 | `flash-attn-v4` | SM80+ | Prefill + paged decode, AOT CuTeDSL |
-| FlashInfer | `flashinfer` | SM80+ (FA2) / SM90+ (FA3) | All attention paths, CUDA graph (32 graphs), plan caching |
-| FA3 | `flash-attn-v3` | SM90 (Hopper) | Legacy, replaced by FlashInfer |
-| FA2 | `flash-attn` | SM80+ | Legacy, replaced by FlashInfer |
-| CPU | (always available) | None | Tiled BF16 (AVX-512) + F32 matmul SDPA |
+| Backend | GPU requirement | Key capabilities |
+|---|---|---|
+| FA4 | SM80+ | Prefill + paged decode, AOT CuTeDSL |
+| FlashInfer | SM80+ (FA2) / SM90+ (FA3) | All attention paths, CUDA graph, plan caching |
+| CPU | None | Tiled BF16 (AVX-512) + F32 matmul SDPA |
 
-**Dispatch priority:** FA4 -> FlashInfer -> FA3 -> FA2 -> CPU.
-Recommended GPU build: `flashinfer-v4,onednn,deepgemm` (~98MB binary).
+**Dispatch priority:** FA4 -> FlashInfer -> CPU.
 
 ## 6. GEMM Backends
 
-| Backend   | Feature flag | Target   | Notes                                         |
-|-----------|-------------|----------|-----------------------------------------------|
-| cuBLAS    | `cuda`      | GPU      | Default GPU GEMM                              |
-| DeepGEMM  | `deepgemm`  | SM90+    | BF16, replaces cuBLAS. Decode 17%-2x faster   |
-| oneDNN    | `onednn`    | CPU      | BF16 + F32 GEMM, packed weights, static link  |
-| Built-in  | (default)   | CPU      | Fallback F32 GEMM when oneDNN is absent       |
+| Backend   | Target   | Notes                                         |
+|-----------|----------|-----------------------------------------------|
+| CUTLASS   | SM80+    | BF16/FP16/F32, AOT compiled for SM80/SM90     |
+| DeepGEMM  | SM90+    | BF16/FP8, tried first for SM90+, falls back to CUTLASS |
+| oneDNN    | CPU      | BF16 + F32 GEMM, packed weights, static link  |
+| Built-in  | CPU      | Fallback F32 GEMM when oneDNN is absent       |
+
+No cuBLAS dependency. GPU GEMM is registered via `candle_core::cuda_backend::gemm_dispatch`
+at startup; all `Tensor::matmul` on CUDA routes through DeepGEMM → CUTLASS.
 
 ## 7. KV Cache
 

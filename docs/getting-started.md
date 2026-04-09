@@ -17,31 +17,23 @@ oneDNN is auto-downloaded and statically linked on first build -- no manual setu
 
 ## Build
 
-Three main configurations:
+Two main configurations:
 
 ```bash
-# GPU — full stack (recommended): FlashInfer + FA4 + DeepGEMM + oneDNN
-cargo build -p prelude-server --release --features flashinfer-v4,onednn,deepgemm
+# GPU — full stack (recommended): all GPU backends
+cargo build -p prelude-server --release --features full
 
-# GPU — FlashInfer only (no FA4)
-cargo build -p prelude-server --release --features flashinfer,onednn
-
-# CPU only — oneDNN BF16 GEMM
-cargo build -p prelude-server --release --features onednn
+# CPU only
+cargo build -p prelude-server --release
 ```
 
-Feature flags cascade: `flashinfer`, `flash-attn-v4`, and `flash-attn` each imply `cuda`.
+| Feature | What it does |
+|---|---|
+| `full` | CPU + CUDA (FlashInfer, FA4, DeepGEMM, CUTLASS, quant-gemm, cuLA) |
+| `cuda` | CUDA GPU backends only |
+| `cpu` | CPU inference (default) |
 
-| Feature | What it does | GPU requirement |
-|---|---|---|
-| `flashinfer-v4` | FlashInfer + FA4 combined (recommended) | SM80+ |
-| `flashinfer` | FlashInfer AOT attention (FA2 SM80+ / FA3 SM90+) | SM80+ |
-| `flash-attn-v4` | FA4 CuTeDSL AOT attention | SM80+ |
-| `deepgemm` | DeepGEMM BF16 GEMM, replaces cuBLAS. 17-2x faster decode | SM90+ |
-| `onednn` | CPU BF16 GEMM via oneDNN | None (CPU) |
-| `cuda` | GPU fused ops + paged KV (implied by above) | Any CUDA |
-
-Attention dispatch priority: FA4 -> FlashInfer -> FA3 -> FA2 -> CPU.
+Attention dispatch priority: FA4 -> FlashInfer -> CPU.
 
 ## Run
 

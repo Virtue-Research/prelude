@@ -5,7 +5,7 @@ Fast LLM inference engine in Rust. OpenAI-compatible API for generation, classif
 ## 30-Second Start
 
 ```bash
-cargo build -p prelude-server --release --features flashinfer-v4,onednn,deepgemm
+cargo build -p prelude-server --release --features full
 ./target/release/prelude-server --model Qwen/Qwen3-0.6B
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \

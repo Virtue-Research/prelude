@@ -262,8 +262,8 @@ impl ArchSpec for MyModelArchSpec {
         RuntimeCaps {
             supports_kv_cache: task == TaskKind::Generate,
             supports_prefix_cache: false,
-            supports_paged_attn: cfg!(feature = "paged-attn") && cuda_safetensors,
-            supports_varlen: cfg!(feature = "flash-attn-v3") && cuda_safetensors,
+            supports_paged_attn: cfg!(feature = "cuda") && cuda_safetensors,
+            supports_varlen: cfg!(feature = "cuda") && cuda_safetensors,
             supports_deltanet: false,
             supports_cuda_graph: false,
             supports_varlen_cpu: false,
@@ -387,7 +387,7 @@ No array size to bump — it's a static slice.
 ### 1. Build and smoke test
 
 ```bash
-cargo build -p prelude-server --release --features flash-attn-v3
+cargo build -p prelude-server --release --features full
 ./target/release/prelude-server --model <your-model> --port 8001
 curl http://localhost:8001/health
 curl http://localhost:8001/v1/completions \
