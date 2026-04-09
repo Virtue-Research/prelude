@@ -49,12 +49,14 @@ All engines use the same `bench.sh` script. SGLang and vLLM run in Docker contai
 source .venv/bin/activate
 
 # Single engine
-CUDA_VISIBLE_DEVICES=2 ./benchmark/bench.sh prelude --gpu
-CUDA_VISIBLE_DEVICES=2 ./benchmark/bench.sh sglang --gpu
-CUDA_VISIBLE_DEVICES=2 ./benchmark/bench.sh vllm --gpu
+./benchmark/bench.sh prelude --gpu
+./benchmark/bench.sh sglang --gpu
 
-# All GPU engines at once
-CUDA_VISIBLE_DEVICES=2 ./benchmark/bench.sh --gpu
+# Multiple engines (run sequentially)
+./benchmark/bench.sh sglang prelude vllm --gpu
+
+# All GPU engines
+./benchmark/bench.sh --gpu
 
 # All CPU engines
 ./benchmark/bench.sh --cpu

@@ -1,62 +1,24 @@
 # Benchmark Results
 
-- **Date**: 2026-04-07
+- **Date**: 2026-04-09
 - **Model**: Qwen/Qwen3-0.6B (BF16)
 - **CPU**: AMD EPYC 9575F 64-Core Processor
-- **GPU**: NVIDIA H200 (single GPU, CUDA_VISIBLE_DEVICES=2)
-- **Tool**: genai-bench 0.0.3 (rucnyz fork)
-- **Engines**: Prelude (native), vLLM 0.18.0 (Docker), SGLang (Docker)
+- **GPU**: NVIDIA H200 (single GPU)
+- **Tool**: genai-bench (rucnyz fork)
+- **Engines**: Prelude (native), vLLM (Docker), SGLang (Docker)
 
-## Prefill-Only (128 in → 1 out, c=1, 100 requests)
-
-```bash
-CUDA_VISIBLE_DEVICES=2 INPUT_TOKENS=128 OUTPUT_TOKENS=1 MAX_REQUESTS=100 CONCURRENCY=1 \
-  ./benchmark/bench.sh <engine> --gpu
-```
-
-| Engine  | Startup(s) | TTFT(s) | E2E(s) | Input tok/s | Output tok/s | RPM    |
-|---------|------------|---------|--------|-------------|-------------|--------|
-| Prelude | 4          | 0.0068  | 0.0069 | 14,520.9    | 108.6       | 6,514.8 |
-| vLLM    | 60         | 0.0107  | 0.0108 | 9,926.3     | 74.2        | 4,452.4 |
-| SGLang  | 38         | 0.0407  | 0.0409 | 3,098.2     | 23.2        | 1,389.7 |
-
-**Prelude vs vLLM: 1.46x RPM, 1.57x lower TTFT, 15x faster startup**
-**Prelude vs SGLang: 4.69x RPM, 5.99x lower TTFT**
-
-## Decode (32 in → 32 out, c=4, 400 requests)
+## Decode (128 in, 32 out, c=4, 400 requests)
 
 ```bash
-CUDA_VISIBLE_DEVICES=2 INPUT_TOKENS=32 OUTPUT_TOKENS=32 MAX_REQUESTS=400 CONCURRENCY=4 \
-  ./benchmark/bench.sh <engine> --gpu
+CUDA_VISIBLE_DEVICES=4 INPUT_TOKENS=128 OUTPUT_TOKENS=32 MAX_REQUESTS=400 CONCURRENCY=4 \
+  ./benchmark/bench.sh sglang prelude vllm --gpu
 ```
 
-| Engine  | Startup(s) | TTFT(s) | TPOT(s) | E2E(s) | Output tok/s | RPM    |
-|---------|------------|---------|---------|--------|-------------|--------|
-| Prelude | 2          | 0.0135  | 0.0441  | 1.3800 | 92.0        | 172.5  |
-| vLLM    | 50         | 0.0215  | 0.0016  | 0.0705 | 1,713.8     | 3,213.5 |
+| Engine  | Startup(s) | TTFT(s) | TPOT(s) | E2E(s) | In tok/s | Out tok/s | RPM    |
+|---------|------------|---------|---------|--------|----------|-----------|--------|
+| Prelude | 2          | 0.0146  | 0.0021  | 0.0802 | 6,167.8  | 1,474.0   | 2,763.8|
+| vLLM    | 42         | 0.0309  | 0.0017  | 0.0833 | 5,979.2  | 1,430.4   | 2,682.0|
+| SGLang  | 34         | 0.0483  | 0.0018  | 0.1033 | 4,917.3  | 1,176.7   | 2,206.2|
 
-SGLang result missing (benchmark timed out).
-
-## Decode (128 in → 32 out, c=4, 400 requests)
-
-```bash
-CUDA_VISIBLE_DEVICES=2 INPUT_TOKENS=128 OUTPUT_TOKENS=32 MAX_REQUESTS=400 CONCURRENCY=4 \
-  ./benchmark/bench.sh <engine> --gpu
-```
-
-| Engine  | Startup(s) | TTFT(s) | TPOT(s) | E2E(s) | Output tok/s | RPM    |
-|---------|------------|---------|---------|--------|-------------|--------|
-| Prelude | 14         | 0.0178  | 0.0442  | 1.3888 | 91.4        | 171.3  |
-| vLLM    | 42         | 0.0295  | 0.0016  | 0.0803 | 1,474.5     | 2,764.8 |
-| SGLang  | 32         | 0.0669  | 0.0018  | 0.1236 | 983.5       | 1,844.0 |
-
-## Analysis
-
-**Prefill**: Prelude is fastest — 1.46x vLLM, 4.69x SGLang in RPM. TTFT of 6.8ms beats vLLM (10.7ms) and SGLang (40.7ms). Startup is 4s vs 60s/38s.
-
-**Decode**: Prelude TPOT of ~44ms is significantly slower than vLLM (1.6ms) and SGLang (1.8ms). This is a known issue — the decode path runs `batch_decode_paged` eagerly every step (6 tensor allocations + H2D copies per step). CUDA graph capture is implemented but blocked by a stream isolation issue (weight tensors created on a different stream than the capture stream). This is the top priority for performance work.
-
-## Notes
-
-- GPUs 0,1,4-7 were occupied during this run; only GPU 2 was idle.
-- Docker images: `vllm/vllm-openai:latest` (v0.18.0), `lmsysorg/sglang:latest`.
+**Prelude vs vLLM**: 1.03x throughput, 2.1x lower TTFT, 21x faster startup.
+**Prelude vs SGLang**: 1.25x throughput, 3.3x lower TTFT, 17x faster startup.
