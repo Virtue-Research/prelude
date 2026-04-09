@@ -90,7 +90,7 @@ pub struct CacheConfig {
     /// Explicit number of paged attention blocks (0 = auto from gpu_memory_utilization).
     pub paged_attn_blocks: usize,
     /// Fraction of free GPU memory to use for KV cache (vLLM-style).
-    /// Only used when paged_attn_blocks == 0. Default 0.6 (vLLM uses 0.9).
+    /// Only used when paged_attn_blocks == 0. Default 0.9 (same as vLLM).
     pub gpu_memory_utilization: f32,
     /// Max cached prefix blocks (0 = disabled).
     pub prefix_cache_blocks: usize,
@@ -108,7 +108,7 @@ impl CacheConfig {
                 128, // adjusted at runtime for FA4/FlashInfer by cache manager
             ),
             paged_attn_blocks: parse_env_usize("PRELUDE_PAGED_ATTN_BLOCKS", 0),
-            gpu_memory_utilization: 0.6,
+            gpu_memory_utilization: 0.9,
             prefix_cache_blocks: parse_env_usize("PRELUDE_PREFIX_CACHE_BLOCKS", 0),
             prefix_block_size: parse_env_usize("PRELUDE_PREFIX_BLOCK_SIZE", 64),
             deltanet_pool_slots: parse_env_u32("PRELUDE_DELTANET_POOL_SLOTS", 8),
