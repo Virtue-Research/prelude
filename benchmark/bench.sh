@@ -63,9 +63,9 @@ ENGINES=(
 # Docker image per engine (only for docker-type engines)
 declare -A DOCKER_IMAGES
 DOCKER_IMAGES=(
-    [vllm]="vllm/vllm-openai:latest"
+    [vllm]="vllm/vllm-openai:latest-cu130"
     [vllm-cpu]="vllm/vllm-openai:latest"
-    [sglang]="lmsysorg/sglang:latest"
+    [sglang]="lmsysorg/sglang:latest-cu130"
     [sglang-cpu]="lmsysorg/sglang:latest"
 )
 
@@ -140,20 +140,20 @@ start_engine() {
         vllm)
             docker run --rm --name vllm-bench --network=host --gpus all --ipc=host \
                 -v "$hf_cache:/root/.cache/huggingface" -e "CUDA_VISIBLE_DEVICES=$cvd" \
-                vllm/vllm-openai:latest --model "$MODEL" --port "$port" --host 0.0.0.0 & ;;
+                "$img" --model "$MODEL" --port "$port" --host 0.0.0.0 & ;;
         vllm-cpu)
             docker run --rm --name vllm-cpu-bench --network=host \
                 -v "$hf_cache:/root/.cache/huggingface" \
-                vllm/vllm-openai:latest --model "$MODEL" --port "$port" --host 0.0.0.0 --device cpu & ;;
+                "$img" --model "$MODEL" --port "$port" --host 0.0.0.0 --device cpu & ;;
         sglang)
             docker run --rm --name sglang-bench --network=host --gpus all --ipc=host --shm-size 32g \
                 -v "$hf_cache:/root/.cache/huggingface" -e "CUDA_VISIBLE_DEVICES=$cvd" \
-                lmsysorg/sglang:latest python3 -m sglang.launch_server \
+                "$img" python3 -m sglang.launch_server \
                     --model-path "$MODEL" --port "$port" --host 0.0.0.0 & ;;
         sglang-cpu)
             docker run --rm --name sglang-cpu-bench --network=host \
                 -v "$hf_cache:/root/.cache/huggingface" \
-                lmsysorg/sglang:latest python3 -m sglang.launch_server \
+                "$img" python3 -m sglang.launch_server \
                     --model-path "$MODEL" --port "$port" --host 0.0.0.0 \
                     --device cpu --disable-overlap-schedule & ;;
         llama.cpp)
