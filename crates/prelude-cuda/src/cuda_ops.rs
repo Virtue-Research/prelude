@@ -97,7 +97,10 @@ impl Ops for CudaOps {
 
     fn fused_add_rmsnorm(&self, residual: &Tensor, x: &Tensor, weight: &Tensor, eps: f32) -> Option<Result<(Tensor, Tensor)>> {
         if x.dtype() != DType::BF16 { return None; }
-        Some(crate::ops::rmsnorm::fused_add_rmsnorm(x, residual, weight, eps as f64))
+        // FlashInfer in-place: after call, x = rmsnorm(x + residual), residual = x + residual.
+        // Safe because residual flows linearly through layers (never branched).
+        Some(crate::attn::flashinfer::fi_fused_add_rmsnorm(x, residual, weight, eps as f64)
+            .map(|()| (residual.clone(), x.clone())))
     }
 
     fn fused_silu_mul(&self, gate: &Tensor, up: &Tensor) -> Option<Result<Tensor>> {

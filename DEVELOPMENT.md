@@ -165,18 +165,66 @@ RUST_LOG=debug ./target/release/prelude-server ...
 | `PRELUDE_DEFAULT_TEMPERATURE` | `0.7` | Default sampling temperature |
 | `PRELUDE_DEFAULT_MAX_TOKENS` | `4096` | Default max new tokens per request |
 
-### GPU profiling
+### GPU profiling (nsys)
+
+Use `benchmark/profile.sh` for automated kernel-level profiling with Nsight Systems:
 
 ```bash
-# NVTX markers (requires --features nvtx at build time)
-cargo build -p prelude-server --release --features full,nvtx
-nsys profile ./target/release/prelude-server --model Qwen/Qwen3-0.6B
+# Profile Prelude decode steps
+CUDA_VISIBLE_DEVICES=2 MODEL=Qwen/Qwen3-8B ./benchmark/profile.sh prelude
 
-# nsys on a running server (attach by PID)
+# Profile vLLM / SGLang (Docker, for comparison)
+CUDA_VISIBLE_DEVICES=2 MODEL=Qwen/Qwen3-8B ./benchmark/profile.sh vllm
+CUDA_VISIBLE_DEVICES=2 MODEL=Qwen/Qwen3-8B ./benchmark/profile.sh sglang
+
+# Disable CUDA graphs to see individual kernels (not graph launches)
+CUDA_VISIBLE_DEVICES=2 MODEL=Qwen/Qwen3-8B ./benchmark/profile.sh prelude --no-cuda-graph
+
+# Batched decode (matches benchmark concurrency)
+CUDA_VISIBLE_DEVICES=2 MODEL=Qwen/Qwen3-8B CONCURRENCY=4 NUM_REQUESTS=40 ./benchmark/profile.sh prelude
+
+# Re-analyze an existing report
+./benchmark/profile.sh stats bench_results/profile_*/prelude.nsys-rep
+```
+
+The script starts the engine under `nsys`, sends warmup + profiled requests, then prints:
+- **Kernel summary**: total GPU time per kernel, sorted by impact
+- **Memory ops**: CUDA memcpy/memset breakdown
+
+For NVTX markers (named regions in the nsys timeline), build with `--features nvtx`:
+
+```bash
+cargo build -p prelude-server --release --features full,nvtx
+CUDA_VISIBLE_DEVICES=2 MODEL=Qwen/Qwen3-8B ./benchmark/profile.sh
+```
+
+Open `.nsys-rep` files in Nsight Systems GUI for timeline analysis:
+
+```bash
+nsys-ui bench_results/profile_*/prelude.nsys-rep
+```
+
+Manual profiling (without the script):
+
+```bash
+# Profile a running server by PID
 nsys profile -p <PID> --trace=cuda --duration=10
 
 # Disable CUDA graphs for individual kernel visibility
 PRELUDE_CUDA_GRAPH_MAX_BS=0 ./target/release/prelude-server ...
+```
+
+For vLLM / SGLang, use their built-in profiling:
+
+```bash
+# vLLM: torch profiler
+docker run ... vllm/vllm-openai --profiler-config.profiler=torch \
+    --profiler-config.torch_profiler_dir=/tmp/vllm_profile
+
+# SGLang: per-step timing
+SGLANG_RECORD_STEP_TIME=true docker run ... sglang ...
+# SGLang: per-layer NVTX markers (use with nsys)
+docker run ... sglang ... --enable-layerwise-nvtx-marker
 ```
 
 ## Feature flags

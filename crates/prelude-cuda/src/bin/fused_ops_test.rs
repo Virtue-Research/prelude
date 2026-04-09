@@ -209,5 +209,70 @@ fn main() -> Result<()> {
             label, tokens, concat_us, split_us, split_copy_us, ratio);
     }
 
+    // ── fused_add_rmsnorm: ours vs FlashInfer ─────────────────
+    //
+    // Our kernel: allocates new output buffers (out_sum, out_norm)
+    // FlashInfer: in-place (modifies input + residual)
+
+    println!("\n= fused_add_rmsnorm: ours vs FlashInfer (decode shapes) =");
+    println!("{:<12} {:<8} {:>12} {:>12} {:>8}",
+        "model", "tokens", "ours(us)", "flashinfer(us)", "ratio");
+
+    // (label, tokens, hidden_size)
+    let norm_shapes = [
+        ("Qwen3-0.6B", 1,  1536),
+        ("Qwen3-0.6B", 4,  1536),
+        ("Qwen3-8B",   1,  4096),
+        ("Qwen3-8B",   4,  4096),
+        ("Qwen3-8B",   128, 4096),
+    ];
+
+    let warmup = 10;
+    let iters = 200;
+    let eps = 1e-6f32;
+
+    for (label, tokens, hidden) in norm_shapes {
+        let x = rand_gpu((tokens, hidden), &dev)?;
+        let residual = rand_gpu((tokens, hidden), &dev)?;
+        let weight = rand_gpu(hidden, &dev)?;
+
+        // Warmup both
+        for _ in 0..warmup {
+            let _ = ops.fused_add_rmsnorm(&residual, &x, &weight, eps);
+            // FlashInfer is in-place, needs fresh tensors each call for warmup
+            let x2 = rand_gpu((tokens, hidden), &dev)?;
+            let r2 = rand_gpu((tokens, hidden), &dev)?;
+            let _ = prelude_cuda::fi_fused_add_rmsnorm(&x2, &r2, &weight, eps as f64);
+        }
+        prelude_cuda::device::synchronize(&dev)?;
+
+        // Bench ours
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = must_fuse(ops.fused_add_rmsnorm(&residual, &x, &weight, eps), "fused_add_rmsnorm")?;
+        }
+        prelude_cuda::device::synchronize(&dev)?;
+        let ours_us = t0.elapsed().as_nanos() as f64 / iters as f64 / 1000.0;
+
+        // Bench FlashInfer (in-place, reuse same buffers — result is wrong but timing is valid)
+        let fi_x = rand_gpu((tokens, hidden), &dev)?;
+        let fi_r = rand_gpu((tokens, hidden), &dev)?;
+        for _ in 0..warmup {
+            prelude_cuda::fi_fused_add_rmsnorm(&fi_x, &fi_r, &weight, eps as f64)?;
+        }
+        prelude_cuda::device::synchronize(&dev)?;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            prelude_cuda::fi_fused_add_rmsnorm(&fi_x, &fi_r, &weight, eps as f64)?;
+        }
+        prelude_cuda::device::synchronize(&dev)?;
+        let fi_us = t0.elapsed().as_nanos() as f64 / iters as f64 / 1000.0;
+
+        let ratio = ours_us / fi_us;
+        println!("{:<12} {:<8} {:>11.1} {:>13.1} {:>7.2}x",
+            label, tokens, ours_us, fi_us, ratio);
+    }
+
     Ok(())
 }

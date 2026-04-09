@@ -931,23 +931,6 @@ fn paged_prefill_impl(
     Ok(out)
 }
 
-/// Paged prefill with raw GPU tensor metadata (used when PagedMeta is not available).
-#[allow(clippy::too_many_arguments)]
-fn paged_prefill(
-    q: &Tensor,
-    key_cache: &Tensor, value_cache: &Tensor,
-    cu_seqlens_q: &Tensor,
-    kv_indptr: &Tensor, kv_indices: &Tensor, kv_last_page_len: &Tensor,
-    block_size: usize, num_kv_heads: usize, head_dim: usize,
-    softmax_scale: f32,
-) -> Result<Tensor> {
-    paged_prefill_impl(
-        q, key_cache, value_cache, cu_seqlens_q,
-        None, Some(kv_indptr), Some(kv_indices), Some(kv_last_page_len),
-        block_size, num_kv_heads, head_dim, softmax_scale,
-    )
-}
-
 /// Paged prefill fast path: uses pre-computed PagedMeta with CPU data.
 #[allow(clippy::too_many_arguments)]
 fn paged_prefill_fast(
@@ -1141,6 +1124,82 @@ pub fn silu_and_mul(gate_up: &Tensor) -> Result<Tensor> {
         candle_core::op::BackpropOp::none(),
         false,
     ))
+}
+
+/// FlashInfer fused add + RMSNorm (in-place).
+/// Computes: input += residual; input = rmsnorm(input, weight, eps)
+/// Both input and residual are modified in-place.
+pub fn fi_fused_add_rmsnorm(input: &Tensor, residual: &Tensor, weight: &Tensor, eps: f64) -> Result<()> {
+    use candle_core::backend::BackendStorage;
+
+    let (in_storage, in_layout) = input.storage_and_layout();
+    let (res_storage, res_layout) = residual.storage_and_layout();
+    let (w_storage, w_layout) = weight.storage_and_layout();
+
+    let in_cuda = match &*in_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => bail!("fi_fused_add_rmsnorm: requires CUDA"),
+    };
+    let res_cuda = match &*res_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => bail!("fi_fused_add_rmsnorm: requires CUDA"),
+    };
+    let w_cuda = match &*w_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => bail!("fi_fused_add_rmsnorm: requires CUDA"),
+    };
+
+    if in_cuda.dtype() != DType::BF16 {
+        bail!("fi_fused_add_rmsnorm: requires BF16");
+    }
+
+    let dims = in_layout.dims();
+    let hidden = *dims.last().unwrap();
+    let tokens: usize = dims[..dims.len() - 1].iter().product();
+
+    let dev = in_cuda.device().clone();
+    let stream = dev.cuda_stream();
+    let did = device_id(input.device());
+
+    let reg = registry();
+    let fused_fn = reg.get_utility("fused_add_rmsnorm")
+        .ok_or_else(|| candle_core::Error::Msg("FlashInfer: fused_add_rmsnorm not found".into()))?;
+
+    let in_slice = in_cuda.as_cuda_slice::<bf16>()?.slice(in_layout.start_offset()..);
+    let in_ptr = in_slice.device_ptr(&stream).0 as *mut c_void;
+    let res_slice = res_cuda.as_cuda_slice::<bf16>()?.slice(res_layout.start_offset()..);
+    let res_ptr = res_slice.device_ptr(&stream).0 as *mut c_void;
+    let w_slice = w_cuda.as_cuda_slice::<bf16>()?.slice(w_layout.start_offset()..);
+    let w_ptr = w_slice.device_ptr(&stream).0 as *mut c_void;
+
+    let in_shape = [tokens as i64, hidden as i64];
+    let in_strides = contiguous_strides(&in_shape);
+    let w_shape = [hidden as i64];
+    let w_strides = [1i64];
+
+    let dl_in = make_gpu_dl(in_ptr, did, BF16_DT, &in_shape, &in_strides);
+    let dl_res = make_gpu_dl(res_ptr, did, BF16_DT, &in_shape, &in_strides);
+    let dl_w = make_gpu_dl(w_ptr, did, BF16_DT, &w_shape, &w_strides);
+
+    let raw_stream = unsafe { stream.cu_stream() } as *mut c_void;
+    reg.set_stream(did, raw_stream);
+
+    let args = [
+        TVMFFIAny::dltensor(&dl_in),
+        TVMFFIAny::dltensor(&dl_res),
+        TVMFFIAny::dltensor(&dl_w),
+        TVMFFIAny::float64(eps),
+        TVMFFIAny::bool_val(false), // enable_pdl
+    ];
+    unsafe {
+        reg.call(fused_fn, &args)
+            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer fused_add_rmsnorm: {e}")))?;
+    }
+
+    drop(in_storage);
+    drop(res_storage);
+    drop(w_storage);
+    Ok(())
 }
 
 // ── Integration test: tensors + real CUDA kernels ────────────

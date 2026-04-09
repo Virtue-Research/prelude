@@ -100,6 +100,7 @@ mod quant_backends;
 pub mod executor;
 
 pub use cuda_ops::cuda_ops;
+pub use attn::flashinfer::fi_fused_add_rmsnorm;
 
 // ── Sub-crate re-exports ────────────────────────────────────────────
 
