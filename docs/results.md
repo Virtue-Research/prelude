@@ -120,4 +120,4 @@ MODEL=Qwen/Qwen3-8B CUDA_VISIBLE_DEVICES=<N> INPUT_TOKENS=128 OUTPUT_TOKENS=32 M
 | vLLM    |            |         |         |        |          |           |        |
 | SGLang  |            |         |         |        |          |           |        |
 
-> **Note**: Docker images — vLLM: `vllm/vllm-openai:latest`, SGLang: `lmsysorg/sglang:latest-cu130` (CUDA 13.0, used for both H200 and B300).
+> **Note**: Docker images (CUDA 13, default): vLLM `vllm/vllm-openai:latest-cu130`, SGLang `lmsysorg/sglang:latest-cu130`. Use `--cu12` flag for CUDA 12 images.

@@ -111,9 +111,12 @@ Known HF reference PPL (BF16, WikiText-2 test, stride=1024):
 ### Benchmark
 
 ```bash
-# E2E server benchmark (decode throughput)
+# E2E server benchmark (decode throughput, CUDA 13 Docker images by default)
 CUDA_VISIBLE_DEVICES=2 MODEL=Qwen/Qwen3-8B INPUT_TOKENS=128 OUTPUT_TOKENS=32 \
-    MAX_REQUESTS=400 CONCURRENCY=4 ./benchmark/bench.sh prelude --gpu
+    MAX_REQUESTS=400 CONCURRENCY=4 ./benchmark/bench.sh prelude vllm sglang --gpu
+
+# Use CUDA 12 Docker images instead
+./benchmark/bench.sh vllm sglang --gpu --cu12
 
 # CPU kernel benchmarks (quantized, GEMM, attention, etc.)
 cargo run -p prelude-cpu --bin cpu_ops_bench --release
