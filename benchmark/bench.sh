@@ -120,8 +120,8 @@ check_engine() {
             [ -f "$GGUF_MODEL" ] || { echo "GGUF not found ($GGUF_MODEL)"; return 1; } ;;
         vllm|vllm-cpu|sglang|sglang-cpu)
             local img="${DOCKER_IMAGES[$engine]}"
-            log "Pulling $img ..."
-            docker pull "$img" || { echo "docker pull failed: $img"; return 1; } ;;
+            log "Pulling $img ..." >&2
+            docker pull "$img" >&2 || { echo "docker pull failed: $img"; return 1; } ;;
     esac
     return 0
 }
