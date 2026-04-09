@@ -58,12 +58,12 @@ MODEL=Qwen/Qwen3-8B CUDA_VISIBLE_DEVICES=4 INPUT_TOKENS=128 OUTPUT_TOKENS=32 MAX
 
 | Engine  | Startup(s) | TTFT(s) | TPOT(s) | E2E(s) | In tok/s | Out tok/s | RPM    |
 |---------|------------|---------|---------|--------|----------|-----------|--------|
-| Prelude | 4          | 0.0299  | 0.0060  | 0.2171 | 2,394.3  | 572.7     | 1,073.7|
-| vLLM    | 46         | 0.0324  | 0.0054  | 0.1990 | 2,628.3  | 628.8     | 1,179.0|
-| SGLang  | 40         | 0.0637  | 0.0056  | 0.2384 | 2,179.6  | 521.6     | 978.0  |
+| Prelude | 4          | 0.0270  | 0.0057  | 0.2023 | 2,547.2  | 608.7     | 1,141.4|
+| vLLM    | 46         | 0.0337  | 0.0053  | 0.1991 | 2,627.7  | 628.7     | 1,178.9|
+| SGLang  | 40         | 0.0601  | 0.0056  | 0.2344 | 2,221.6  | 531.6     | 996.7  |
 
-**Prelude vs vLLM**: 0.91x throughput, 0.92x TTFT, 12x faster startup.
-**Prelude vs SGLang**: 1.10x throughput, 0.47x TTFT, 10x faster startup.
+**Prelude vs vLLM**: 0.97x throughput, 0.80x TTFT, 12x faster startup.
+**Prelude vs SGLang**: 1.15x throughput, 0.45x TTFT, 10x faster startup.
 
 ## H200 — Qwen/Qwen3-32B (BF16)
 
