@@ -41,9 +41,9 @@ MODEL=Qwen/Qwen3-8B CUDA_VISIBLE_DEVICES=4 INPUT_TOKENS=128 OUTPUT_TOKENS=1 MAX_
 
 | Engine  | Startup(s) | TTFT(s) | E2E(s) | In tok/s | RPM    |
 |---------|------------|---------|--------|----------|--------|
-| Prelude |            |         |        |          |        |
-| vLLM    |            |         |        |          |        |
-| SGLang  |            |         |        |          |        |
+| Prelude | 4          | 0.0133  | 0.0134 | 8,068.4  | 3,619.2|
+| vLLM    | 48         | 0.0149  | 0.0150 | 7,336.9  | 3,290.5|
+| SGLang  | 40         | 0.0309  | 0.0310 | 3,922.3  | 1,759.2|
 
 ### Decode (128 in, 32 out, c=4, 400 requests)
 
