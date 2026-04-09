@@ -13,38 +13,18 @@ crates/
 │       ├── main.rs                                # Worker::from_settings() → DistributedRuntime → endpoint.start()
 │       └── lib.rs                                 # impl AsyncEngine for PreludeBackend (wraps Engine)
 │
-├── prelude-core/                                  # Core: ops, models, engine, scheduler (pure Rust, CubeCL)
+├── prelude-core/                                  # Core: ops, models, engine, scheduler
 │   └── src/
 │       ├── lib.rs                                 # pub use engine::Engine;
 │       │
 │       ├── ops/                                   # Op trait definitions + built-in implementations
 │       │   ├── mod.rs                             # register_backend(), select_ops(), thread-local Ops context
-│       │   ├── traits/                            # Trait definitions — the shared contract
-│       │   │   ├── mod.rs                         # re-exports all traits
-│       │   │   ├── bundle.rs                      # OpsBundle — flat API (ops.exp, ops.rms_norm, ops.fused_add_rmsnorm)
-│       │   │   │                                  #   Fused ops: try device kernel → fallback to composed
-│       │   │   ├── tensor_ops.rs                  # trait TensorOps — base() delegation, device overrides only what it needs
-│       │   │   ├── attention.rs                   # trait AttentionOps, VarlenParams, PagedParams, MaskType
-│       │   │   ├── kv_cache.rs                    # trait KvCacheOps, CacheSlotSpec
-│       │   │   ├── gemm.rs                        # trait GemmOps (quantized_matmul, grouped_gemm — no plain matmul)
-│       │   │   ├── norm.rs                        # trait NormOps (rms_norm, layer_norm, group_norm)
-│       │   │   ├── activation.rs                  # trait ActivationOps (silu, gelu, softmax, sigmoid)
-│       │   │   ├── conv.rs                        # trait ConvOps (conv1d, conv2d, conv_transpose1d)
-│       │   │   ├── comm.rs                        # trait CommOps (all_reduce, all_gather, all_to_all)
-│       │   │   ├── fused.rs                       # trait FusedOps — all methods return Option, default None
-│       │   │   └── session.rs                     # trait OpsSession (begin/end_forward)
-│       │   ├── composed/                          # ComposedOps — default impls via TensorOps composition
-│       │   │   ├── mod.rs                         # ComposedOps struct + Activation/Gemm/stubs
-│       │   │   ├── attention.rs                   # varlen SDPA (matmul + softmax, causal, GQA)
-│       │   │   ├── conv.rs                        # conv1d/conv2d (im2col + matmul), conv_transpose1d
-│       │   │   └── norm.rs                        # rms_norm, layer_norm, group_norm
-│       │   └── primitives/                        # TensorOps implementation via CubeCL
-│       │       ├── mod.rs                         # CubeCLTensorOps<R: Runtime> + default_cpu_ops()
-│       │       ├── elementwise.rs                 # Op family traits + LinearView kernels (burn-cubecl pattern)
-│       │       ├── reduce.rs                      # cubek::reduce wrapper
-│       │       └── matmul.rs                      # cubek::matmul wrapper
+│       │   └── traits/                            # Trait definitions — the shared contract
+│       │       ├── mod.rs                         # re-exports all traits
+│       │       ├── ops.rs                         # unified Ops trait — flat API, fused ops return Option
+│       │       └── attention.rs                   # VarlenParams, PagedParams, MaskType
 │       │
-│       ├── tensor/                                # Own tensor library (Storage, Layout, DType, Device, Error)
+│       ├── tensor/                                # Re-exports candle-core types (Tensor, DType, Device, etc.)
 │       │
 │       ├── engine/                                # Engine — the public API + execution loops
 │       │   ├── mod.rs                             # pub struct Engine, trait InferenceEngine
@@ -232,9 +212,8 @@ crates/
     `TensorOps` uses `base()` delegation: device backends override only what they need.
   - `composed/` — `ComposedOps`: default impls for NormOps, ActivationOps, ConvOps, AttentionOps
     by composing TensorOps primitives. Pure logic, no device dependency.
-  - `primitives/` — `CubeCLTensorOps<R: Runtime>`: TensorOps via CubeCL. Element-wise ops use
-    burn-cubecl patterns (op family traits, LinearView, launch_unchecked). Reduce/matmul via cubek.
-    CubeCL CPU runtime serves as lowest-priority fallback.
+  - Basic tensor ops (matmul, element-wise, cast, reduce) are handled by candle-core natively.
+    The Ops trait only covers fused/inference-specific ops that candle doesn't provide.
 
 - **`prelude-core/src/models/commons/`** — shared weight containers and utilities.
   `Linear`, `RmsNorm`, `Embedding`, `RotaryEmbedding`, context structs (`BatchAttnContext`,
@@ -297,8 +276,8 @@ Run loop            calls              Scheduler (core, pure CPU scheduling deci
 Executor            calls              Model code (prepare tensors → model.forward())
 Model code          calls              OpsBundle flat API (ops.rms_norm, ops.varlen_attention, ...)
 OpsBundle           dispatches to      ComposedOps (default) or device overrides (CudaOps, ...)
-ComposedOps         composes           TensorOps primitives → norm, conv, attention, activation
-TensorOps           implemented by     CubeCL primitives (CUDA/ROCm/Vulkan/Metal/CPU) or XLA (TPU)
+ComposedOps         composes           candle tensor ops → norm, conv, attention, activation
+Basic tensor ops    provided by        candle-core (CUDA + CPU backends, registered GEMM dispatch)
 Fused ops           try device kernel  → auto-fallback to composed ops (transparent to model)
 Device ops          dispatches to      Kernel libraries (FA4, FlashInfer, DeepGEMM, CUTLASS, CK, ...)
 ```
@@ -385,23 +364,16 @@ all devices without model-level branching.
 
 ```
 prelude-server (binary, standalone HTTP server — zero device-specific code)
-    ├── prelude-core                  (OpsBundle, ComposedOps, CubeCLTensorOps<R>, models, engine, scheduler)
-    │       ├── cubecl                    (pure Rust: IR + TensorOps primitives, generic over runtime)
-    │       ├── cubek                     (pure Rust: pre-built CubeCL kernels for reduce + matmul)
+    ├── prelude-core                  (Ops trait, models, engine, scheduler)
+    │       ├── candle-core               (tensor backend: storage, matmul, basic ops)
+    │       ├── candle-nn                 (softmax, rotary emb, etc.)
     │       └── llguidance                (constrained decoding, pure Rust)
     ├── plugins/prelude-mooncake      (impl KvTransfer, wraps Mooncake Transfer Engine C API)
-    ├── prelude-cuda                  (feature-gated, additive — hot-path overrides + Executor)
+    ├── prelude-cuda                  (feature-gated, additive — fused ops + Executor)
     │       ├── prelude-core
-    │       ├── cubecl (features = ["cuda"])   (enables CubeCL CUDA runtime for TensorOps)
+    │       ├── candle-core (features = ["cuda"])
     │       ├── fa4/, flashinfer/, deepgemm/, cutlass-gemm/, quant-gemm/, cula/
     │       └── (each sub-crate compiles from third_party/)
-    ├── prelude-rocm                  (feature-gated, additive)
-    │       ├── prelude-core
-    │       ├── cubecl (features = ["hip"])
-    │       └── ck/, aiter/, rccl/, uccl-ep/
-    └── prelude-tpu                   (feature-gated — XLATensorOps + hot-path overrides)
-            ├── prelude-core              (uses ComposedOps, same pattern as all other backends)
-            └── pjrt C API               (XLA runtime, dlopen libpjrt_tpu.so)
 
 prelude-dynamo (binary, NVIDIA Dynamo backend — alternative entry point)
     ├── prelude-core                  (same core library, used as library)
@@ -419,16 +391,15 @@ third_party/                          (git submodules, source only — not Cargo
 ```
 
 **Key rules:**
-- `prelude-core` compiles NO C++ and has NO device types (`DeviceType` enum, `has_nvidia_gpu()` etc.).
-  It depends on CubeCL (pure Rust) for TensorOps primitives and llguidance (pure Rust) for
-  constrained decoding. `ComposedOps` composes TensorOps primitives into higher-level ops —
-  pure logic, no device dependency. CubeCL's CPU runtime serves as fallback when no device crate is linked.
+- `prelude-core` depends on candle-core (Rust tensor library) for basic tensor ops and
+  llguidance (pure Rust) for constrained decoding. The `cuda` feature is gated — CPU-only
+  builds don't pull in CUDA types. `ComposedOps` composes candle tensor ops into higher-level
+  ops — pure logic. `bare_ops()` provides minimal Ops defaults as lowest-priority fallback.
 - Device crates register Ops + Executor via explicit `register()` calls at startup with priority/probe.
-- `TensorOps` uses `base()` delegation: device backends override only hot-path methods, rest auto-delegates.
-- `OpsBundle` flat API: models call `ops.xxx()` for everything. Fused ops have built-in fallback.
-  All backends follow the same pattern: provide TensorOps primitives + override hot-path ops.
-  ComposedOps handles the rest. TensorOps primitives come from CubeCL (CUDA/ROCm/Vulkan/Metal/CPU,
-  enabled via feature flag) or XLA (TPU, in prelude-tpu). Any op at any level can be overridden.
+- Ops trait: flat API, models call `ops.xxx()` for fused/inference-specific ops. Basic ops
+  (matmul, cast, element-wise) go through candle-core directly. GEMM dispatch is registered
+  to route candle's matmul through CUTLASS/DeepGEMM.
+- Fused ops return `Option` — `None` auto-falls back to composed defaults.
 - Engine calls `select_backend()` internally — picks highest-priority backend whose `probe()` returns true.
 - Device features are **additive**, not exclusive — `--features cuda,rocm` builds both.
 - NCCL/RCCL are **dlopen'd** at runtime (not statically linked), avoiding symbol conflicts.
@@ -468,7 +439,7 @@ Metal and CUDA/ROCm cannot coexist in one binary (macOS SDK vs Linux GPU toolcha
 prelude-server            →  standalone binary: Engine::new(config), Axum HTTP, zero device code
 prelude-dynamo            →  Dynamo backend binary: wraps Engine as AsyncEngine, links dynamo-runtime
 plugins/prelude-mooncake  →  impl KvTransfer via Mooncake Transfer Engine (feature-gated, multi-node only)
-prelude-core/ops          →  OpsBundle (flat API) + ComposedOps + primitives/ (CubeCL + cubek)
+prelude-core/ops          →  Ops trait (flat API) + composed defaults (candle tensor ops)
 prelude-core/engine       →  Engine, Executor trait, run loops, Sampler, GrammarManager (llguidance)
 prelude-core/models       →  self-contained models (call ops.xxx()), layers/ (Linear, Embedding, RoPE)
 prelude-core/scheduler    →  ArScheduler, BlockManager, PrefixCache, DeltaNetPool

@@ -39,7 +39,7 @@ Model code compiles identically in all targets — only the `OpsBundle` implemen
   - GEMM: DeepGEMM (vendored) → CUTLASS (vendored, header-only) → no fallback needed
   - Attention: FA4 (vendored, TVM AOT) → FlashInfer (vendored, AOT)
   - Conv: CUTLASS conv (vendored) or custom CUDA/HIP kernels
-  - Norm/activation/element-wise: ComposedOps via CubeCL TensorOps (JIT-compiled at first run, cached)
+  - Norm/activation/element-wise: fused CUDA PTX kernels (AOT-compiled) or candle-core basic ops
 - **ROCm follows the same pattern**: CK (header-only, vendored) for GEMM + attention,
   aiter kernels (vendored, AOT) for flash attention. All compiled with hipcc at build time,
   runtime only needs libamdhip64.so from the driver package.

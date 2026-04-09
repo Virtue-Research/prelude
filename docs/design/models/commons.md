@@ -55,7 +55,7 @@ prelude-cuda/
 └── ops/                  # CUDA kernel wrappers (rmsnorm, rope, kv_cache, moe, gemm)
 
 prelude-cpu/
-├��─ cpu_ops.rs            # base() → CubeCL CPU, override specific ops (GGUF quant, oneDNN GEMM)
+├��─ cpu_ops.rs            # base() → CPU Ops: override specific ops (GGUF quant, oneDNN GEMM)
 └── linear_backends.rs    # QuantFormat registration (Q4_0, Q4_K via inventory)
 ```
 

@@ -29,11 +29,11 @@
 | Sequence parallelism | `CommOps::reduce_scatter` + `all_gather` around local attention |
 | Multi-LoRA serving | `FusedOps::fused_lora_matmul` (BGMV/Punica), fallback to per-adapter matmul |
 | LoRA + fusion | `Linear` is parameter carrier; `ops.qkv_projection(x, weights, lora_state)` handles fused QKV+LoRA kernel → fallback to separate matmul+LoRA. All decision logic in OpsBundle, Linear just passes weights. |
-| TensorOps primitives | CubeCL (CUDA/ROCm/Vulkan/Metal/CPU) or XLA (TPU). Element-wise via `#[cube]` op family traits, reduce/matmul via cubek |
-| ComposedOps | Composes TensorOps primitives → NormOps, ActivationOps, ConvOps, AttentionOps defaults. All backends |
+| Basic tensor ops | candle-core (CUDA + CPU backends). Matmul routes through registered GEMM dispatch (CUTLASS/DeepGEMM) |
+| ComposedOps | Composes candle tensor ops → NormOps, ActivationOps, AttentionOps defaults. All backends inherit |
 | OpsBundle flat API | `ops.exp()`, `ops.rms_norm()`, `ops.varlen_attention()`, `ops.fused_add_rmsnorm()` — single layer, no nesting |
 | Fused fallback | `ops.fused_add_rmsnorm()` tries device kernel → auto-fallback to composed add + rms_norm |
-| TensorOps base() | Device backends: `fn base() -> &dyn TensorOps`, override only what you need, rest auto-delegates |
+| Candle tensor backend | candle-core handles basic tensor ops (matmul, cast, element-wise). Device crates register GEMM dispatch and override fused ops |
 | Hot-path overrides | Device crates override: GEMM (CUTLASS/CK), Attention (FlashInfer/aiter/Pallas), KV cache |
 | Constrained decoding | llguidance (pure Rust, Earley parser, ~50μs/token, MIT license) |
 | RL: GPU precision | Batch invariance + FP32 logprob + TIS algorithmic correction |
