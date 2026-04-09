@@ -110,13 +110,21 @@ unsafe fn update_tensor<T: GpuDType + candle_core::cuda_backend::CudaDType>(
     Ok(())
 }
 
+/// CPU-side data computed during buffer update, reused for FlashInfer plan
+/// to avoid redundant GPU→CPU copies.
+struct CpuBatchData {
+    cu_seqlens_k: Vec<u32>,
+    block_tables: Vec<Vec<u32>>,
+}
+
 /// Update all pre-allocated buffers from the current decode batch.
+/// Returns CPU-side data for reuse by FlashInfer plan computation.
 fn update_buffers(
     buffers: &DecodeGraphBuffers,
     seqs: &[OwnedBatchDecodeSeq],
     block_size: usize,
     stream: &Arc<CudaStream>,
-) -> Result<(), EngineError> {
+) -> Result<CpuBatchData, EngineError> {
     let bs = seqs.len();
     debug_assert_eq!(bs, buffers.batch_size);
 
@@ -141,13 +149,17 @@ fn update_buffers(
 
     let max_blocks = buffers.max_blocks;
     let mut flat_bt: Vec<u32> = Vec::with_capacity(bs * max_blocks);
+    let per_seq_bt: Vec<Vec<u32>> = seqs.iter().map(|s| s.block_table.clone()).collect();
     for s in seqs {
         flat_bt.extend_from_slice(&s.block_table);
         flat_bt.resize(flat_bt.len() + max_blocks - s.block_table.len(), 0);
     }
     unsafe { update_tensor(&buffers.block_tables, &flat_bt, stream)? };
 
-    Ok(())
+    Ok(CpuBatchData {
+        cu_seqlens_k: cu_k,
+        block_tables: per_seq_bt,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -259,12 +271,14 @@ impl DecodeGraphCache {
             Err(e) => return Some(Err(e)),
         };
 
-        // Update input buffers
-        if let Err(e) = update_buffers(&captured.buffers, seqs, self.block_size, &stream) {
-            return Some(Err(e));
-        }
+        // Update input buffers (returns CPU-side data for plan reuse)
+        let cpu_data = match update_buffers(&captured.buffers, seqs, self.block_size, &stream) {
+            Ok(d) => d,
+            Err(e) => return Some(Err(e)),
+        };
 
-        // Pre-compute FlashInfer plan outside the graph
+        // Pre-compute FlashInfer plan outside the graph.
+        // Uses CPU-side data from update_buffers to avoid GPU→CPU syncs.
         {
             let pool = match engine.cache.paged_pool.as_ref() {
                 Some(p) => p,
@@ -274,13 +288,12 @@ impl DecodeGraphCache {
             let num_qo_heads = engine.executor.config.num_attention_heads;
             let head_dim = engine.executor.config.head_dim;
 
-            if let Err(e) = crate::attn::flashinfer::precompute_paged_plan_graphed(
+            if let Err(e) = crate::attn::flashinfer::precompute_paged_plan_graphed_cpu(
                 (bs, num_qo_heads, head_dim),
                 &key_caches[0],
-                &captured.buffers.cu_seqlens_q,
-                &captured.buffers.block_tables,
-                &captured.buffers.cu_seqlens_k,
-                1.0 / (head_dim as f32).sqrt(),
+                &cpu_data.cu_seqlens_k,
+                &cpu_data.block_tables,
+                self.block_size,
                 &captured.buffers.fi_indptr,
                 &captured.buffers.fi_indices,
                 &captured.buffers.fi_last_page_len,

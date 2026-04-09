@@ -155,6 +155,156 @@ pub fn precompute_paged_plan_graphed(
     )
 }
 
+/// Graph-replay fast path: compute FlashInfer plan from CPU-side data directly.
+/// Avoids all GPU→CPU synchronization (no to_vec1/to_vec2 D2H copies).
+pub fn precompute_paged_plan_graphed_cpu(
+    q_shape: (usize, usize, usize),
+    key_cache: &Tensor,
+    cu_seqlens_k_cpu: &[u32],
+    block_tables_cpu: &[Vec<u32>],
+    block_size: usize,
+    fi_indptr: &Tensor,
+    fi_indices: &Tensor,
+    fi_last_page_len: &Tensor,
+) -> Result<()> {
+    let (batch_size, num_qo_heads, head_dim) = q_shape;
+    let (_, _, num_kv_heads, _) = key_cache.shape().dims4()?;
+
+    let stream = cb::tensor_stream(key_cache)?;
+    let did = device_id(key_cache.device());
+    let raw_stream = stream.cu_stream() as *mut c_void;
+
+    // Compute FlashInfer metadata from CPU data (no D2H needed)
+    let bs = block_size as i32;
+    let mut indptr = vec![0i32; batch_size + 1];
+    let mut indices = Vec::new();
+    let mut last_page = Vec::with_capacity(batch_size);
+    let mut kv_lens = Vec::with_capacity(batch_size);
+
+    for i in 0..batch_size {
+        let kv_len = (cu_seqlens_k_cpu[i + 1] as i32) - (cu_seqlens_k_cpu[i] as i32);
+        kv_lens.push(kv_len);
+        let np = (kv_len + bs - 1) / bs;
+        indptr[i + 1] = indptr[i] + np;
+        for &idx in block_tables_cpu[i].iter().take(np as usize) {
+            indices.push(idx as i32);
+        }
+        let rem = kv_len % bs;
+        last_page.push(if rem == 0 { bs } else { rem });
+    }
+
+    // Upload metadata to pre-allocated GPU tensors via cudaMemcpyAsync
+    {
+        use candle_core::backend::BackendStorage;
+        fn gpu_ptr(t: &Tensor, stream: &std::sync::Arc<CudaStream>) -> Result<*mut c_void> {
+            let (storage, layout) = t.storage_and_layout();
+            let cuda = match &*storage {
+                candle_core::Storage::Cuda(s) => s,
+                _ => bail!("requires CUDA"),
+            };
+            let slice = cuda.as_cuda_slice::<i32>()?.slice(layout.start_offset()..);
+            let (ptr, _) = slice.device_ptr(stream);
+            Ok(ptr as u64 as *mut c_void)
+        }
+
+        let ip_ptr = gpu_ptr(fi_indptr, &stream)?;
+        let rc = unsafe { cudaMemcpyAsync(
+            ip_ptr, indptr.as_ptr() as *const c_void,
+            indptr.len() * 4, CUDA_MEMCPY_HOST_TO_DEVICE, raw_stream,
+        ) };
+        if rc != 0 { bail!("cudaMemcpyAsync indptr failed: {rc}"); }
+
+        if !indices.is_empty() {
+            let ix_ptr = gpu_ptr(fi_indices, &stream)?;
+            let rc = unsafe { cudaMemcpyAsync(
+                ix_ptr, indices.as_ptr() as *const c_void,
+                indices.len() * 4, CUDA_MEMCPY_HOST_TO_DEVICE, raw_stream,
+            ) };
+            if rc != 0 { bail!("cudaMemcpyAsync indices failed: {rc}"); }
+        }
+
+        let lp_ptr = gpu_ptr(fi_last_page_len, &stream)?;
+        let rc = unsafe { cudaMemcpyAsync(
+            lp_ptr, last_page.as_ptr() as *const c_void,
+            last_page.len() * 4, CUDA_MEMCPY_HOST_TO_DEVICE, raw_stream,
+        ) };
+        if rc != 0 { bail!("cudaMemcpyAsync last_page_len failed: {rc}"); }
+    }
+
+    // cu_seqlens_q for decode: [0, 1, 2, ..., bs] (Q=1 per seq)
+    let cuq_cpu: Vec<i32> = (0..=batch_size as i32).collect();
+    let total_q = batch_size;
+
+    let reg = registry();
+    let backend = reg.default_backend();
+    let variant = reg
+        .get_prefill(&PrefillKey {
+            dtype: dtype_to_kernel(key_cache.dtype()),
+            head_dim_qk: head_dim as u32, head_dim_vo: head_dim as u32,
+            sliding_window: false, logits_soft_cap: false,
+            backend,
+        })
+        .ok_or_else(|| prelude_core::tensor::Error::Msg(format!("FlashInfer: no {backend:?} prefill variant")))?;
+
+    let ws_guard = get_workspace(did)?;
+    let ws = ws_guard.as_ref().unwrap();
+
+    let is_fa3 = matches!(backend, prelude_flashinfer::Backend::FA3);
+
+    let fws: [i64; 1] = [FLOAT_WS_BYTES as i64];
+    let iws: [i64; 1] = [INT_WS_BYTES as i64];
+    let pws: [i64; 1] = [PINNED_WS_BYTES as i64];
+    let cuq_s: [i64; 1] = [(batch_size + 1) as i64];
+    let ip_s: [i64; 1] = [(batch_size + 1) as i64];
+    let kvl_s: [i64; 1] = [batch_size as i64];
+
+    let fws_st = contiguous_strides(&fws);
+    let iws_st = contiguous_strides(&iws);
+    let pws_st = contiguous_strides(&pws);
+    let cuq_st = contiguous_strides(&cuq_s);
+    let ip_st = contiguous_strides(&ip_s);
+    let kvl_st = contiguous_strides(&kvl_s);
+
+    let dl_fws = make_gpu_dl(ws.float_ws, did, U8_DT, &fws, &fws_st);
+    let dl_iws = make_gpu_dl(ws.int_ws, did, U8_DT, &iws, &iws_st);
+    let dl_pws = make_cpu_dl(ws.pinned_ws, U8_DT, &pws, &pws_st);
+    let dl_cuq_cpu = make_cpu_dl(cuq_cpu.as_ptr() as *mut c_void, I32_DT, &cuq_s, &cuq_st);
+    let dl_ip_cpu = make_cpu_dl(indptr.as_ptr() as *mut c_void, I32_DT, &ip_s, &ip_st);
+    let dl_kvl_cpu = make_cpu_dl(kv_lens.as_ptr() as *mut c_void, I32_DT, &kvl_s, &kvl_st);
+
+    reg.set_stream(did, raw_stream);
+
+    let mut plan_args = vec![
+        TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws), TVMFFIAny::dltensor(&dl_pws),
+        TVMFFIAny::dltensor(&dl_cuq_cpu), TVMFFIAny::dltensor(&dl_ip_cpu), TVMFFIAny::dltensor(&dl_kvl_cpu),
+        TVMFFIAny::int64(total_q as i64), TVMFFIAny::int64(batch_size as i64),
+        TVMFFIAny::int64(num_qo_heads as i64), TVMFFIAny::int64(num_kv_heads as i64),
+        TVMFFIAny::int64(block_size as i64),
+        TVMFFIAny::bool_val(false),
+        TVMFFIAny::int64(head_dim as i64), TVMFFIAny::int64(head_dim as i64),
+        TVMFFIAny::bool_val(true), // causal
+        TVMFFIAny::int64(-1),      // window_left
+    ];
+    append_fa2_plan_tail(&mut plan_args, is_fa3);
+
+    let pi = unsafe {
+        reg.call(variant.plan, &plan_args)
+            .map_err(|e| prelude_core::tensor::Error::Msg(format!("FlashInfer precompute plan: {e}")))?
+    };
+
+    drop(ws_guard);
+
+    PLAN_CACHE.with(|c| {
+        *c.borrow_mut() = Some(PlanCache {
+            ragged_plan: None,
+            decode_plan: None,
+            paged_prefill_plan: Some(pi),
+            paged_metadata: None,
+        });
+    });
+    Ok(())
+}
+
 /// Allocate pre-allocated FlashInfer metadata buffers for CUDA graph.
 /// Returns (indptr, indices, last_page_len) with fixed GPU addresses
 /// that survive across graph capture and replay.

@@ -11,7 +11,6 @@
 pub const PTX_ADD: &str = include_str!(concat!(env!("OUT_DIR"), "/add.ptx"));
 pub const PTX_SILU_MUL: &str = include_str!(concat!(env!("OUT_DIR"), "/silu_mul.ptx"));
 pub const PTX_RMSNORM: &str = include_str!(concat!(env!("OUT_DIR"), "/rmsnorm.ptx"));
-pub const PTX_ADD_RMSNORM: &str = include_str!(concat!(env!("OUT_DIR"), "/add_rmsnorm.ptx"));
 pub const PTX_QKNORM_ROPE: &str = include_str!(concat!(env!("OUT_DIR"), "/qknorm_rope.ptx"));
 pub const PTX_MOE_ROUTING: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_routing.ptx"));
 pub const PTX_MOE_GATEUP: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_gateup.ptx"));
@@ -38,7 +37,6 @@ pub const PTX_SORT: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_sort.p
 pub const MOD_ADD: &str = "elementwise_add";
 pub const MOD_SILU_MUL: &str = "elementwise_silu_mul";
 pub const MOD_RMSNORM: &str = "normalization_rmsnorm";
-pub const MOD_ADD_RMSNORM: &str = "normalization_add_rmsnorm";
 pub const MOD_QKNORM_ROPE: &str = "rope_qknorm";
 pub const MOD_MOE_ROUTING: &str = "moe_routing";
 pub const MOD_MOE_GATEUP: &str = "moe_gateup";
