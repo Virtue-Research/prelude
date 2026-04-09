@@ -110,8 +110,8 @@ struct Cli {
 
     #[arg(
         long,
-        default_value_t = 0.9,
-        help = "Fraction of free GPU memory for KV cache (0.0-1.0, default 0.9). \
+        default_value_t = prelude_core::config::DEFAULT_GPU_MEMORY_UTILIZATION,
+        help = "Fraction of free GPU memory for KV cache (0.0-1.0). \
                 Ignored when PRELUDE_PAGED_ATTN_BLOCKS is set explicitly."
     )]
     gpu_memory_utilization: f32,
