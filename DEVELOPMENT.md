@@ -133,12 +133,36 @@ cargo run -p prelude-cuda --bin fused_ops_test --release
 
 ## Feature flags
 
+### prelude-server
+
 | Feature | Effect |
 |---------|--------|
-| `cpu`   | CPU inference (oneDNN, AVX-512 kernels) |
-| `cuda`  | CUDA inference (all GPU backends: FlashInfer, FA4, CUTLASS, DeepGEMM, quant-gemm, cuLA) |
-| `full`  | cpu + cuda |
+| `cpu`   | CPU inference (default). Enables oneDNN BF16 GEMM + AVX-512 fused kernels. |
+| `cuda`  | CUDA inference. All GPU kernel crates are compiled: FlashInfer, FA4, CUTLASS, DeepGEMM, quant-gemm, cuLA. |
+| `full`  | `cpu` + `cuda`. Recommended for GPU machines. |
 
-Server features are in `crates/prelude-server/Cargo.toml`. GPU kernel crates
-(deepgemm, cutlass-gemm, flashinfer, fa4, quant-gemm) are always compiled when
-`cuda` is enabled — no separate feature flags.
+```bash
+cargo build -p prelude-server --release --features full   # GPU
+cargo build -p prelude-server --release                    # CPU only (default)
+```
+
+### prelude-core
+
+| Feature | Effect |
+|---------|--------|
+| `cuda`  | Enable CUDA tensor backend (candle-core/cuda). Implied by server's `cuda`. |
+| `hf_tokenizer` | HuggingFace tokenizer support via `tokenizers` crate. |
+| `nvtx`  | NVIDIA NVTX profiling markers. Build with `--features nvtx` to enable. |
+| `test-cuda` | Enable NVIDIA GPU in unit tests. |
+| `test-amd`  | (planned) AMD GPU in tests. |
+| `test-metal` | (planned) Apple GPU in tests. |
+| `test-tpu`  | (planned) TPU in tests. |
+
+### prelude-cpu
+
+| Feature | Effect |
+|---------|--------|
+| `onednn` | oneDNN BF16/F32 GEMM (default). Auto-downloads and statically links oneDNN. |
+
+GPU kernel crates (deepgemm, cutlass-gemm, flashinfer, fa4, quant-gemm, cula)
+have no user-facing feature flags — they are always compiled when `cuda` is enabled.
