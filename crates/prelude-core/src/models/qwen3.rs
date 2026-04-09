@@ -351,6 +351,11 @@ impl GatedMlp {
         let bs = BatchState::no_lora();
         if let Some(ref gup) = self.gate_up_proj {
             let gate_up = gup.forward(x, &bs, ops)?;
+            // Try silu_mul_concat: splits [tokens, 2*dim] internally, avoids narrow+copy
+            if let Some(r) = ops.silu_mul_concat(&gate_up) {
+                return self.down_proj.forward(&r?, &bs, ops);
+            }
+            // Fallback: narrow (triggers contiguous copy) + separate silu_mul
             let dims = gate_up.dims();
             let dim = dims[dims.len() - 1] / 2;
             let gate = gate_up.narrow(dims.len() - 1, 0, dim)?;

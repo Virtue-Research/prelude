@@ -178,6 +178,10 @@ pub trait Ops: Send + Sync {
     fn fused_add_rmsnorm(&self, _residual: &Tensor, _x: &Tensor, _weight: &Tensor, _eps: f32) -> Option<Result<(Tensor, Tensor)>> { None }
     fn fused_silu_mul(&self, _gate: &Tensor, _up: &Tensor) -> Option<Result<Tensor>> { None }
     fn fused_gelu_mul(&self, _gate: &Tensor, _up: &Tensor) -> Option<Result<Tensor>> { None }
+    /// `silu(gate) * up` on a concatenated `[tokens, 2*dim]` tensor.
+    /// Splits the last dimension internally. Returns `[tokens, dim]`.
+    /// Avoids the narrow+contiguous copy that separate gate/up tensors need.
+    fn silu_mul_concat(&self, _gate_up: &Tensor) -> Option<Result<Tensor>> { None }
     fn fused_qknorm_rope(&self, _q: &Tensor, _k: &Tensor, _qw: &Tensor, _kw: &Tensor, _cos: &Tensor, _sin: &Tensor, _pos: &Tensor, _eps: f32) -> Option<Result<(Tensor, Tensor)>> { None }
     fn fused_knorm_rope_cache_write(&self, _k: &Tensor, _v: &Tensor, _kw: &Tensor, _cos: &Tensor, _sin: &Tensor, _pos: &Tensor, _kc: &Tensor, _vc: &Tensor, _sm: &Tensor, _eps: f32) -> Option<Result<()>> { None }
     fn fused_add(&self, _a: &Tensor, _b: &Tensor) -> Option<Result<Tensor>> { None }

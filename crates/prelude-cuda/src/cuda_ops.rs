@@ -105,6 +105,11 @@ impl Ops for CudaOps {
         Some(crate::ops::elementwise::fused_silu_mul(gate, up))
     }
 
+    fn silu_mul_concat(&self, gate_up: &Tensor) -> Option<Result<Tensor>> {
+        if gate_up.dtype() != DType::BF16 { return None; }
+        Some(crate::attn::flashinfer::silu_and_mul(gate_up))
+    }
+
     fn fused_add(&self, a: &Tensor, b: &Tensor) -> Option<Result<Tensor>> {
         if a.dtype() == DType::BF16 && b.dtype() == DType::BF16 {
             Some(crate::ops::elementwise::vectorized_add(a, b))

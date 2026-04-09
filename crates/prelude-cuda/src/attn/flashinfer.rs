@@ -1071,6 +1071,78 @@ fn convert_paged_metadata_into(
     })
 }
 
+// ── Utility kernels (activation fusions) ─────────────────────────────
+
+/// `silu(gate) * up` on a concatenated `[tokens, 2*dim]` BF16 tensor.
+/// Returns `[tokens, dim]`. Uses FlashInfer's `silu_and_mul` kernel which
+/// splits the last dimension internally, avoiding narrow+contiguous copy.
+pub fn silu_and_mul(gate_up: &Tensor) -> Result<Tensor> {
+    use candle_core::backend::BackendStorage;
+    use candle_core::cuda_backend::WrapErr;
+
+    let (gu_storage, gu_layout) = gate_up.storage_and_layout();
+    let gu_cuda = match &*gu_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => bail!("silu_and_mul: requires CUDA"),
+    };
+    if gu_cuda.dtype() != DType::BF16 {
+        bail!("silu_and_mul: requires BF16");
+    }
+
+    let dims = gu_layout.dims();
+    if dims.is_empty() || dims[dims.len() - 1] % 2 != 0 {
+        bail!("silu_and_mul: last dim must be even, got {:?}", dims);
+    }
+    let half_dim = dims[dims.len() - 1] / 2;
+    let tokens: usize = dims[..dims.len() - 1].iter().product();
+    let out_elems = tokens * half_dim;
+
+    let dev = gu_cuda.device().clone();
+    let stream = dev.cuda_stream();
+    let did = device_id(gate_up.device());
+
+    let reg = registry();
+    let silu_fn = reg.get_utility("silu_and_mul")
+        .ok_or_else(|| candle_core::Error::Msg("FlashInfer: silu_and_mul not found".into()))?;
+
+    // Input DLTensor: [tokens, 2*dim]
+    let gu_slice = gu_cuda.as_cuda_slice::<bf16>()?.slice(gu_layout.start_offset()..);
+    let gu_ptr = gu_slice.device_ptr(&stream).0 as *mut c_void;
+    let in_shape = [tokens as i64, (half_dim * 2) as i64];
+    let in_strides = contiguous_strides(&in_shape);
+    let dl_in = make_gpu_dl(gu_ptr, did, BF16_DT, &in_shape, &in_strides);
+
+    // Output: [tokens, dim]
+    let out = unsafe { dev.alloc::<bf16>(out_elems) }?;
+    let out_ptr = out.device_ptr(&stream).0 as *mut c_void;
+    let out_shape = [tokens as i64, half_dim as i64];
+    let out_strides = contiguous_strides(&out_shape);
+    let dl_out = make_gpu_dl(out_ptr, did, BF16_DT, &out_shape, &out_strides);
+
+    let raw_stream = unsafe { stream.cu_stream() } as *mut c_void;
+    reg.set_stream(did, raw_stream);
+
+    let args = [
+        TVMFFIAny::dltensor(&dl_out),
+        TVMFFIAny::dltensor(&dl_in),
+        TVMFFIAny::bool_val(false), // enable_pdl
+    ];
+    unsafe {
+        reg.call(silu_fn, &args)
+            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer silu_and_mul: {e}")))?;
+    }
+
+    drop(gu_storage);
+
+    let out_storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(out_storage),
+        (tokens, half_dim),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
+}
+
 // ── Integration test: tensors + real CUDA kernels ────────────
 #[cfg(test)]
 mod tests {
