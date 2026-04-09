@@ -138,7 +138,7 @@ pub fn precompute_paged_plan(
 /// always reference the same GPU addresses between capture and replay.
 ///
 /// SGLang reference: `flashinfer_backend.py` lines 568-571 (paged_kv_*_buffer).
-pub fn precompute_paged_plan_graphed(
+pub fn precompute_paged_plan_capture(
     q_shape: (usize, usize, usize),
     key_cache: &Tensor,
     cu_seqlens_q: &Tensor,
@@ -157,7 +157,7 @@ pub fn precompute_paged_plan_graphed(
 
 /// Graph-replay fast path: compute FlashInfer plan from CPU-side data directly.
 /// Avoids all GPU→CPU synchronization (no to_vec1/to_vec2 D2H copies).
-pub fn precompute_paged_plan_graphed_cpu(
+pub fn precompute_paged_plan_replay(
     q_shape: (usize, usize, usize),
     key_cache: &Tensor,
     cu_seqlens_k_cpu: &[u32],
@@ -320,7 +320,7 @@ pub fn allocate_fi_graph_meta(
     ))
 }
 
-/// Shared implementation for precompute_paged_plan / precompute_paged_plan_graphed.
+/// Shared implementation for precompute_paged_plan / precompute_paged_plan_capture.
 ///
 /// When `graph_buffers` is Some, metadata is written into pre-allocated GPU tensors
 /// via cudaMemcpyAsync (for CUDA graph address stability).

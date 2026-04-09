@@ -288,7 +288,7 @@ impl DecodeGraphCache {
             let num_qo_heads = engine.executor.config.num_attention_heads;
             let head_dim = engine.executor.config.head_dim;
 
-            if let Err(e) = crate::attn::flashinfer::precompute_paged_plan_graphed_cpu(
+            if let Err(e) = crate::attn::flashinfer::precompute_paged_plan_replay(
                 (bs, num_qo_heads, head_dim),
                 &key_caches[0],
                 &cpu_data.cu_seqlens_k,
@@ -376,7 +376,7 @@ impl DecodeGraphCache {
         {
             let num_qo_heads = engine.executor.config.num_attention_heads;
             let head_dim = engine.executor.config.head_dim;
-            crate::attn::flashinfer::precompute_paged_plan_graphed(
+            crate::attn::flashinfer::precompute_paged_plan_capture(
                 (batch_size, num_qo_heads, head_dim),
                 &key_caches[0],
                 &buffers.cu_seqlens_q,
