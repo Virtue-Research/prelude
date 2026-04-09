@@ -84,6 +84,13 @@ struct Cli {
 
     #[arg(
         long,
+        default_value_t = true,
+        help = "Enable chunked prefill: interleave prefill chunks with decode steps for lower TPOT"
+    )]
+    chunked_prefill: bool,
+
+    #[arg(
+        long,
         value_enum,
         default_value_t = CliTaskOverride::Auto,
         help = "Force model task detection: auto, classify, embedding, or generation"
@@ -230,6 +237,7 @@ fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
         max_prefill_tokens: cli.max_prefill_tokens,
         max_total_tokens: cli.max_total_tokens,
         decode_reservation_cap: cli.decode_reservation_cap,
+        mixed_chunked: cli.chunked_prefill,
         ..SchedulerConfig::default()
     };
     info!(
