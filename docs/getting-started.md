@@ -164,7 +164,7 @@ curl -s http://localhost:8000/v1/models
 
 **CMake version too old for oneDNN.** oneDNN requires CMake >= 3.18. On Ubuntu 20.04, install via `pip install cmake` or use the Kitware PPA.
 
-**CUDA out of memory.** Lower `--gpu-memory-utilization` (default 0.4). This controls the fraction of free GPU memory used for paged KV cache.
+**CUDA out of memory.** Lower `--gpu-memory-utilization` (default 0.9). This controls the fraction of free GPU memory used for paged KV cache.
 
 ## Next steps
 

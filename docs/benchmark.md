@@ -12,7 +12,7 @@
 
 ```bash
 # GPU (recommended)
-cargo build -p prelude-server --release --features cuda
+cargo build -p prelude-server --release --features full
 
 # CPU only
 cargo build -p prelude-server --release
@@ -109,9 +109,26 @@ MODEL=Qwen/Qwen3-0.6B INPUT_TOKENS=64 OUTPUT_TOKENS=64 \
     --model Qwen/Qwen3-0.6B
 ```
 
+## Profiling
+
+Use `benchmark/profile.sh` for nsys kernel-level profiling (same env vars as bench.sh):
+
+```bash
+# Profile all three engines
+CUDA_VISIBLE_DEVICES=2 MODEL=Qwen/Qwen3-8B MAX_REQUESTS=40 CONCURRENCY=4 \
+  ./benchmark/profile.sh prelude vllm sglang --gpu
+
+# Disable CUDA graphs for individual kernel visibility
+./benchmark/profile.sh prelude --gpu --no-cuda-graph
+
+# Re-analyze existing report
+./benchmark/profile.sh stats bench_results/profile_*/prelude.nsys-rep
+```
+
 ## Notes
 
 - SGLang and vLLM run inside Docker — no pip install needed
+- Default Docker images use CUDA 13 (`cu130`). Use `--cu12` flag for CUDA 12 images
 - `CUDA_VISIBLE_DEVICES` is passed into the Docker container automatically
 - HuggingFace model cache (`~/.cache/huggingface`) is mounted into containers
 - CPU benchmarks are slow — use small traffic like `D(16,16)` and few requests

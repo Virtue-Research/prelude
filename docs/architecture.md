@@ -130,7 +130,9 @@ across requests.
 
 **CUDA graph decode** (`cuda_graph.rs`): Optional graph capture for decode steps.
 FlashInfer mode: 32 graphs (no seqlen bucketing), ~750ms warmup. Pre-allocated
-metadata buffers for address stability across capture/replay.
+metadata buffers for address stability across capture/replay. Graph replay path
+uses CPU-side data directly for FlashInfer plan computation, avoiding GPU→CPU
+synchronization between decode steps.
 
 ## 8. CPU Optimization
 

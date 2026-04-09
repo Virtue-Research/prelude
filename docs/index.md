@@ -23,7 +23,6 @@ curl http://localhost:8000/v1/chat/completions \
 | Understand how the engine works internally | [Architecture](architecture.md) |
 | Run performance benchmarks | [Benchmarking](benchmark.md) |
 | See latest benchmark results | [Results](results.md) |
-| Understand FlashInfer integration | [FlashInfer](flashinfer-integration.md) |
 | Add a new model architecture | [Skill: Adding a Model](skills/adding-a-model.md) |
 
 ## Key Features
@@ -43,12 +42,16 @@ curl http://localhost:8000/v1/chat/completions \
 crates/
   prelude-server/        HTTP server (axum), OpenAI-compatible routes
   prelude-core/          Engine, scheduler, models, attention backends, KV cache
-  prelude-flashinfer/    FlashInfer AOT kernels (128 variants, SM80+/SM90+)
-  prelude-flash-attn-v4/ Flash Attention v4 AOT kernels (SM80+)
-  prelude-ggml-quants/   llama.cpp FFI for GGUF inference
-  prelude-deepgemm/      DeepGEMM BF16 GEMM (SM90+)
-  onednn-ffi/            oneDNN FFI for CPU BF16 GEMM
-benchmark/               Benchmark suite (bench.sh + bench_utils.py)
-tests/                   Accuracy and integration tests
+  prelude-cpu/           CPU kernels (AVX-512, oneDNN BF16 GEMM)
+  prelude-cuda/          GPU backend — contains all GPU kernel sub-crates:
+    flashinfer/          FlashInfer AOT kernels (attention, norm, activation, sampling)
+    fa4/                 Flash Attention v4 AOT kernels (SM80+)
+    deepgemm/            DeepGEMM BF16/FP8 GEMM (SM90+)
+    cutlass-gemm/        CUTLASS BF16 GEMM (SM80+)
+    quant-gemm/          Quantized GEMM kernels
+    cula/                cuLA (custom CUDA linear algebra)
+    tvm-ffi/             TVM FFI for FlashInfer kernel dispatch
+benchmark/               Benchmark + profiling (bench.sh, profile.sh)
+tests/                   Accuracy tests (PPL, logprobs)
 docs/                    This documentation
 ```
