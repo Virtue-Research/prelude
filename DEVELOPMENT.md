@@ -131,6 +131,51 @@ cargo run -p prelude-quant-gemm --example bench_kernel --release
 cargo run -p prelude-cuda --bin fused_ops_test --release
 ```
 
+## Debugging
+
+### Log levels
+
+Server uses `tracing` (writes to stderr). Control via `RUST_LOG`:
+
+```bash
+# Default: info level for server + core
+RUST_LOG=prelude_server=info,prelude_core=info
+
+# Debug a specific module
+RUST_LOG=prelude_cuda::ops::gemm=debug ./target/release/prelude-server ...
+
+# Trace everything (very verbose)
+RUST_LOG=debug ./target/release/prelude-server ...
+```
+
+### Runtime env vars
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `PRELUDE_SYNC_TIMING` | `false` | Enable GPU synchronization for per-step timing |
+| `PRELUDE_CUDA_GRAPH_MAX_BS` | `32` | Max batch size for CUDA graph capture. Set to `0` to disable CUDA graphs. |
+| `PRELUDE_FORCE_VARLEN_PREFILL` | `false` | Force varlen (non-paged) prefill path |
+| `PRELUDE_FUSED_KV_CACHE_WRITE` | `0` | Enable fused KV cache write kernel |
+| `PRELUDE_PAGED_ATTN_BLOCKS` | auto | Override number of KV cache blocks (0 = auto from GPU memory) |
+| `PRELUDE_PAGED_BLOCK_SIZE` | auto | Override KV cache block size (default: 128 with FlashInfer) |
+| `PRELUDE_PREFIX_CACHE_BLOCKS` | `0` | Number of blocks reserved for prefix cache |
+| `PRELUDE_DEFAULT_TEMPERATURE` | `0.7` | Default sampling temperature |
+| `PRELUDE_DEFAULT_MAX_TOKENS` | `4096` | Default max new tokens per request |
+
+### GPU profiling
+
+```bash
+# NVTX markers (requires --features nvtx at build time)
+cargo build -p prelude-server --release --features full,nvtx
+nsys profile ./target/release/prelude-server --model Qwen/Qwen3-0.6B
+
+# nsys on a running server (attach by PID)
+nsys profile -p <PID> --trace=cuda --duration=10
+
+# Disable CUDA graphs for individual kernel visibility
+PRELUDE_CUDA_GRAPH_MAX_BS=0 ./target/release/prelude-server ...
+```
+
 ## Feature flags
 
 ### prelude-server
