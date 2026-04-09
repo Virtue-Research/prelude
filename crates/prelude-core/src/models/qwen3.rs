@@ -90,19 +90,14 @@ impl Qwen3Attention {
 
         // Fused QKV: merge q_proj+k_proj+v_proj weights into single GEMM (saves 2 GEMM calls/layer)
         let qkv_proj = {
-            let qw = q_proj.weight();
-            if qw.device().is_cpu() && qw.dtype() == DType::BF16 {
-                let merged_w =
-                    Tensor::cat(&[qw, k_proj.weight(), v_proj.weight()], 0)?;
-                match Linear::from_weight(merged_w, None) {
-                    Ok(l) => Some(l),
-                    Err(e) => {
-                        tracing::warn!("Failed to create fused qkv_proj: {e}");
-                        None
-                    }
+            let merged_w =
+                Tensor::cat(&[q_proj.weight(), k_proj.weight(), v_proj.weight()], 0)?;
+            match Linear::from_weight(merged_w, None) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    tracing::warn!("Failed to create fused qkv_proj: {e}");
+                    None
                 }
-            } else {
-                None
             }
         };
 
