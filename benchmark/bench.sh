@@ -121,7 +121,7 @@ check_engine() {
         vllm|vllm-cpu|sglang|sglang-cpu)
             local img="${DOCKER_IMAGES[$engine]}"
             log "Pulling $img ..."
-            docker pull "$img" -q || { echo "docker pull failed: $img"; return 1; } ;;
+            docker pull "$img" || { echo "docker pull failed: $img"; return 1; } ;;
     esac
     return 0
 }
