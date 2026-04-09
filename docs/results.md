@@ -1,12 +1,16 @@
 # Benchmark Results
 
-- **Date**: 2026-04-09
-- **CPU**: AMD EPYC 9575F 64-Core Processor
-- **GPU**: NVIDIA H200 (single GPU)
 - **Tool**: genai-bench (rucnyz fork)
 - **Engines**: Prelude (native), vLLM (Docker), SGLang (Docker)
 
-## Qwen/Qwen3-0.6B (BF16)
+| Setup | CPU | GPU |
+|-------|-----|-----|
+| H200  | AMD EPYC 9575F 64-Core | NVIDIA H200 (single GPU) |
+| B300  | Intel Xeon 6776P | NVIDIA B300 SXM6 AC (single GPU) |
+
+---
+
+## H200 — Qwen/Qwen3-0.6B (BF16)
 
 ### Prefill-Only (128 in, 1 out, c=1, 100 requests)
 
@@ -30,7 +34,7 @@
 **Prelude vs vLLM**: 1.03x throughput, 2.1x lower TTFT, 21x faster startup.
 **Prelude vs SGLang**: 1.25x throughput, 3.3x lower TTFT, 17x faster startup.
 
-## Qwen/Qwen3-8B (BF16)
+## H200 — Qwen/Qwen3-8B (BF16)
 
 ### Prefill-Only (128 in, 1 out, c=1, 100 requests)
 
@@ -57,3 +61,63 @@ MODEL=Qwen/Qwen3-8B CUDA_VISIBLE_DEVICES=4 INPUT_TOKENS=128 OUTPUT_TOKENS=32 MAX
 | Prelude | 4          | 0.0305  | 0.0068  | 0.2427 | 2,139.3  | 511.6     | 959.2  |
 | vLLM    | 48         | 0.0284  | 0.0053  | 0.1936 | 2,689.3  | 642.6     | 1,204.8|
 | SGLang  | 44         | 0.0563  | 0.0057  | 0.2328 | 2,225.0  | 532.0     | 997.5  |
+
+---
+
+## B300 — Qwen/Qwen3-0.6B (BF16)
+
+### Prefill-Only (128 in, 1 out, c=1, 100 requests)
+
+```bash
+MODEL=Qwen/Qwen3-0.6B CUDA_VISIBLE_DEVICES=<N> INPUT_TOKENS=128 OUTPUT_TOKENS=1 MAX_REQUESTS=100 CONCURRENCY=1 \
+  ./benchmark/bench.sh prelude vllm sglang --gpu
+```
+
+| Engine  | Startup(s) | TTFT(s) | E2E(s) | In tok/s | RPM    |
+|---------|------------|---------|--------|----------|--------|
+| Prelude |            |         |        |          |        |
+| vLLM    |            |         |        |          |        |
+| SGLang  |            |         |        |          |        |
+
+### Decode (128 in, 32 out, c=4, 400 requests)
+
+```bash
+MODEL=Qwen/Qwen3-0.6B CUDA_VISIBLE_DEVICES=<N> INPUT_TOKENS=128 OUTPUT_TOKENS=32 MAX_REQUESTS=400 CONCURRENCY=4 \
+  ./benchmark/bench.sh prelude vllm sglang --gpu
+```
+
+| Engine  | Startup(s) | TTFT(s) | TPOT(s) | E2E(s) | In tok/s | Out tok/s | RPM    |
+|---------|------------|---------|---------|--------|----------|-----------|--------|
+| Prelude |            |         |         |        |          |           |        |
+| vLLM    |            |         |         |        |          |           |        |
+| SGLang  |            |         |         |        |          |           |        |
+
+## B300 — Qwen/Qwen3-8B (BF16)
+
+### Prefill-Only (128 in, 1 out, c=1, 100 requests)
+
+```bash
+MODEL=Qwen/Qwen3-8B CUDA_VISIBLE_DEVICES=<N> INPUT_TOKENS=128 OUTPUT_TOKENS=1 MAX_REQUESTS=100 CONCURRENCY=1 \
+  ./benchmark/bench.sh prelude vllm sglang --gpu
+```
+
+| Engine  | Startup(s) | TTFT(s) | E2E(s) | In tok/s | RPM    |
+|---------|------------|---------|--------|----------|--------|
+| Prelude |            |         |        |          |        |
+| vLLM    |            |         |        |          |        |
+| SGLang  |            |         |        |          |        |
+
+### Decode (128 in, 32 out, c=4, 400 requests)
+
+```bash
+MODEL=Qwen/Qwen3-8B CUDA_VISIBLE_DEVICES=<N> INPUT_TOKENS=128 OUTPUT_TOKENS=32 MAX_REQUESTS=400 CONCURRENCY=4 \
+  ./benchmark/bench.sh prelude vllm sglang --gpu
+```
+
+| Engine  | Startup(s) | TTFT(s) | TPOT(s) | E2E(s) | In tok/s | Out tok/s | RPM    |
+|---------|------------|---------|---------|--------|----------|-----------|--------|
+| Prelude |            |         |         |        |          |           |        |
+| vLLM    |            |         |         |        |          |           |        |
+| SGLang  |            |         |         |        |          |           |        |
+
+> **Note**: B300 Docker images — vLLM: `vllm/vllm-openai:latest`, SGLang: `lmsysorg/sglang:latest-cu130` (CUDA 13.0 required for SM_120).
