@@ -319,7 +319,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 [[package]]
 name = "candle-core"
 version = "0.10.2"
-source = "git+https://github.com/rucnyz/candle?branch=prelude#ca1762142ef4a69ae3b0103200bff819c312e418"
+source = "git+https://github.com/rucnyz/candle?branch=prelude#cbac31e34296d9e2662b41c23cb5a4ae37814286"
 dependencies = [
  "byteorder",
  "candle-kernels",
@@ -345,7 +345,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.10.2"
-source = "git+https://github.com/rucnyz/candle?branch=prelude#ca1762142ef4a69ae3b0103200bff819c312e418"
+source = "git+https://github.com/rucnyz/candle?branch=prelude#cbac31e34296d9e2662b41c23cb5a4ae37814286"
 dependencies = [
  "cudaforge",
 ]
@@ -353,7 +353,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.10.2"
-source = "git+https://github.com/rucnyz/candle?branch=prelude#ca1762142ef4a69ae3b0103200bff819c312e418"
+source = "git+https://github.com/rucnyz/candle?branch=prelude#cbac31e34296d9e2662b41c23cb5a4ae37814286"
 dependencies = [
  "candle-core",
  "half",
@@ -368,7 +368,7 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.10.2"
-source = "git+https://github.com/rucnyz/candle?branch=prelude#ca1762142ef4a69ae3b0103200bff819c312e418"
+source = "git+https://github.com/rucnyz/candle?branch=prelude#cbac31e34296d9e2662b41c23cb5a4ae37814286"
 dependencies = [
  "ug",
  "ug-cuda",

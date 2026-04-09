@@ -347,18 +347,19 @@ impl GatedMlp {
         Ok(Self { gate_proj, up_proj, down_proj, gate_up_proj })
     }
 
-    fn forward(&self, ctx: &BatchState, ops: &dyn crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, ops: &dyn crate::ops::Ops) -> Result<Tensor> {
+        let bs = BatchState::no_lora();
         if let Some(ref gup) = self.gate_up_proj {
-            let gate_up = gup.forward(x, ctx, ops)?;
+            let gate_up = gup.forward(x, &bs, ops)?;
             let dims = gate_up.dims();
             let dim = dims[dims.len() - 1] / 2;
             let gate = gate_up.narrow(dims.len() - 1, 0, dim)?;
             let up = gate_up.narrow(dims.len() - 1, dim, dim)?;
-            return self.down_proj.forward(&ops.silu_mul(&gate, &up)?, ctx, ops);
+            return self.down_proj.forward(&ops.silu_mul(&gate, &up)?, &bs, ops);
         }
-        let gate = self.gate_proj.forward(x, ctx, ops)?;
-        let up = self.up_proj.forward(x, ctx, ops)?;
-        self.down_proj.forward(&ops.silu_mul(&gate, &up)?, ctx, ops)
+        let gate = self.gate_proj.forward(x, &bs, ops)?;
+        let up = self.up_proj.forward(x, &bs, ops)?;
+        self.down_proj.forward(&ops.silu_mul(&gate, &up)?, &bs, ops)
     }
 }
 
@@ -370,9 +371,8 @@ impl GatedMlp {
 struct DecoderLayer {
     self_attn: Qwen3Attention,
     mlp: GatedMlp,
-    ln1_weight: Tensor,
-    ln2_weight: Tensor,
-    rms_norm_eps: f32,
+    input_layernorm: RmsNorm,
+    post_attention_layernorm: RmsNorm,
 }
 
 impl DecoderLayer {
@@ -384,24 +384,26 @@ impl DecoderLayer {
     ) -> Result<Self> {
         let self_attn = Qwen3Attention::new(cfg, rotary, vb.pp("self_attn"))?;
         let mlp = GatedMlp::new(cfg, vb.pp("mlp"))?;
-        let ln1_weight = RmsNorm::load(vb.pp("input_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?.weight().clone();
-        let ln2_weight = RmsNorm::load(vb.pp("post_attention_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?.weight().clone();
-        Ok(Self { self_attn, mlp, ln1_weight, ln2_weight, rms_norm_eps: cfg.rms_norm_eps as f32 })
+        let input_layernorm = RmsNorm::load(vb.pp("input_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let post_attention_layernorm = RmsNorm::load(vb.pp("post_attention_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        Ok(Self { self_attn, mlp, input_layernorm, post_attention_layernorm })
     }
 
-    fn forward(&self, x: &Tensor, ctx: &LayerAttnContext) -> Result<Tensor> {
+    fn forward(&self, hidden: &Tensor, residual: Option<&Tensor>, ctx: &LayerAttnContext) -> Result<(Tensor, Tensor)> {
         let ops = ctx.ops;
-        let h = ops.rms_norm(x, &self.ln1_weight, self.rms_norm_eps)?;
-        let h = self.self_attn.forward(&h, ctx)?;
-        let (x_res, h2) = ops.add_rmsnorm(x, &h, &self.ln2_weight, self.rms_norm_eps)?;
-        ops.add_or_fused(&x_res, &self.mlp.forward(&BatchState::no_lora(), ops, &h2)?)
+        let (residual, hidden) = self.input_layernorm.forward_residual(hidden, residual, ops)?;
+        let hidden = self.self_attn.forward(&hidden, ctx)?;
+        let (residual, hidden) = self.post_attention_layernorm.forward_residual(&hidden, Some(&residual), ops)?;
+        let hidden = self.mlp.forward(&hidden, ops)?;
+        Ok((hidden, residual))
     }
 
-    fn forward_with_cache(&mut self, ops: &dyn crate::ops::Ops, x: &Tensor, position_offset: usize) -> Result<Tensor> {
-        let h = ops.rms_norm(x, &self.ln1_weight, self.rms_norm_eps)?;
-        let h = self.self_attn.forward_with_cache(&h, position_offset)?;
-        let (x_res, h2) = ops.add_rmsnorm(x, &h, &self.ln2_weight, self.rms_norm_eps)?;
-        ops.add_or_fused(&x_res, &self.mlp.forward(&BatchState::no_lora(), ops, &h2)?)
+    fn forward_with_cache(&mut self, hidden: &Tensor, residual: Option<&Tensor>, ops: &dyn crate::ops::Ops, position_offset: usize) -> Result<(Tensor, Tensor)> {
+        let (residual, hidden) = self.input_layernorm.forward_residual(hidden, residual, ops)?;
+        let hidden = self.self_attn.forward_with_cache(&hidden, position_offset)?;
+        let (residual, hidden) = self.post_attention_layernorm.forward_residual(&hidden, Some(&residual), ops)?;
+        let hidden = self.mlp.forward(&hidden, ops)?;
+        Ok((hidden, residual))
     }
 
     fn reset_kv_cache(&mut self) {
@@ -418,8 +420,6 @@ struct Model {
     embed_tokens: Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
-    norm_weight: Tensor,
-    rms_norm_eps: f64,
 }
 
 impl Model {
@@ -453,13 +453,10 @@ impl Model {
             )?);
         }
         let norm = RmsNorm::load(norm_vb, cfg.hidden_size, cfg.rms_norm_eps)?;
-        let norm_weight = norm.weight().clone();
         Ok(Self {
             embed_tokens,
             layers,
             norm,
-            norm_weight,
-            rms_norm_eps: cfg.rms_norm_eps,
         })
     }
 
@@ -475,17 +472,22 @@ impl Model {
         input_ids: &Tensor,
         position_offset: usize,
     ) -> Result<Tensor> {
-        let mut h = self.embed_tokens.forward(input_ids)?;
+        let mut hidden = self.embed_tokens.forward(input_ids)?;
+        let mut residual: Option<Tensor> = None;
         for (_i, layer) in self.layers.iter_mut().enumerate() {
-            nvtx_push!("layer[{}]", i);
-            h = layer.forward_with_cache(ops, &h, position_offset)?;
+            nvtx_push!("layer[{}]", _i);
+            let (h, r) = layer.forward_with_cache(&hidden, residual.as_ref(), ops, position_offset)?;
+            hidden = h;
+            residual = Some(r);
             nvtx_pop!();
         }
-        ops.rms_norm(&h, &self.norm_weight, self.rms_norm_eps as f32)
+        let (_, normed) = self.norm.forward_residual(&hidden, residual.as_ref(), ops)?;
+        Ok(normed)
     }
 
     fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> Result<Tensor> {
-        let mut h = self.embed_tokens.forward(packed_input)?;
+        let mut hidden = self.embed_tokens.forward(packed_input)?;
+        let mut residual: Option<Tensor> = None;
         for (i, layer) in self.layers.iter_mut().enumerate() {
             nvtx_push!("layer[{}]", i);
             let layer_kv = ctx.paged_kv.map(|kv| kv.layer(i));
@@ -496,10 +498,13 @@ impl Model {
                 position_ids: ctx.position_ids,
                 paged_kv: layer_kv.as_ref(),
             };
-            h = layer.forward(&h, &layer_ctx)?;
+            let (h, r) = layer.forward(&hidden, residual.as_ref(), &layer_ctx)?;
+            hidden = h;
+            residual = Some(r);
             nvtx_pop!();
         }
-        ctx.ops.rms_norm(&h, &self.norm_weight, self.rms_norm_eps as f32)
+        let (_, normed) = self.norm.forward_residual(&hidden, residual.as_ref(), ctx.ops)?;
+        Ok(normed)
     }
 }
 

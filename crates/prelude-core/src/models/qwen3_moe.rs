@@ -360,18 +360,19 @@ impl GatedMlp {
         Ok(Self { gate_proj, up_proj, down_proj, gate_up_proj })
     }
 
-    fn forward(&self, ctx: &BatchState, ops: &dyn crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, ops: &dyn crate::ops::Ops) -> Result<Tensor> {
+        let bs = BatchState::no_lora();
         if let Some(ref gup) = self.gate_up_proj {
-            let gate_up = gup.forward(x, ctx, ops)?;
+            let gate_up = gup.forward(x, &bs, ops)?;
             let dims = gate_up.dims();
             let dim = dims[dims.len() - 1] / 2;
             let gate = gate_up.narrow(dims.len() - 1, 0, dim)?;
             let up = gate_up.narrow(dims.len() - 1, dim, dim)?;
-            return self.down_proj.forward(&ops.silu_mul(&gate, &up)?, ctx, ops);
+            return self.down_proj.forward(&ops.silu_mul(&gate, &up)?, &bs, ops);
         }
-        let gate = self.gate_proj.forward(x, ctx, ops)?;
-        let up = self.up_proj.forward(x, ctx, ops)?;
-        self.down_proj.forward(&ops.silu_mul(&gate, &up)?, ctx, ops)
+        let gate = self.gate_proj.forward(x, &bs, ops)?;
+        let up = self.up_proj.forward(x, &bs, ops)?;
+        self.down_proj.forward(&ops.silu_mul(&gate, &up)?, &bs, ops)
     }
 }
 
@@ -386,7 +387,7 @@ enum MoeFeedForward {
 impl MoeFeedForward {
     fn forward_2d(&self, ops: &dyn crate::ops::Ops, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Mlp(mlp) => mlp.forward(&BatchState::no_lora(), ops, x),
+            Self::Mlp(mlp) => mlp.forward(x, ops),
             Self::SparseMoe(moe) => moe.forward_varlen(ops, x),
         }
     }
@@ -398,9 +399,8 @@ impl MoeFeedForward {
 struct MoeDecoderLayer {
     self_attn: Qwen3Attention,
     feed_forward: MoeFeedForward,
-    ln1_weight: Tensor,
-    ln2_weight: Tensor,
-    rms_norm_eps: f32,
+    input_layernorm: RmsNorm,
+    post_attention_layernorm: RmsNorm,
 }
 
 impl MoeDecoderLayer {
@@ -422,21 +422,19 @@ impl MoeDecoderLayer {
             MoeFeedForward::Mlp(GatedMlp::new(&dense_cfg, vb.pp("mlp"))?)
         };
 
-        let ln1_weight = vb.pp("input_layernorm").get(cfg.hidden_size, "weight")?;
-        let ln2_weight = vb.pp("post_attention_layernorm").get(cfg.hidden_size, "weight")?;
+        let input_layernorm = RmsNorm::load(vb.pp("input_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let post_attention_layernorm = RmsNorm::load(vb.pp("post_attention_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
 
-        Ok(Self {
-            self_attn, feed_forward, ln1_weight, ln2_weight,
-            rms_norm_eps: cfg.rms_norm_eps as f32,
-        })
+        Ok(Self { self_attn, feed_forward, input_layernorm, post_attention_layernorm })
     }
 
-    fn forward(&self, x: &Tensor, ctx: &LayerAttnContext) -> Result<Tensor> {
+    fn forward(&self, hidden: &Tensor, residual: Option<&Tensor>, ctx: &LayerAttnContext) -> Result<(Tensor, Tensor)> {
         let ops = ctx.ops;
-        let h = ops.rms_norm(x, &self.ln1_weight, self.rms_norm_eps)?;
-        let h = self.self_attn.forward(&h, ctx)?;
-        let (x_res, h2) = ops.add_rmsnorm(x, &h, &self.ln2_weight, self.rms_norm_eps)?;
-        ops.add_or_fused(&x_res, &self.feed_forward.forward_2d(ops, &h2)?)
+        let (residual, hidden) = self.input_layernorm.forward_residual(hidden, residual, ops)?;
+        let hidden = self.self_attn.forward(&hidden, ctx)?;
+        let (residual, hidden) = self.post_attention_layernorm.forward_residual(&hidden, Some(&residual), ops)?;
+        let hidden = self.feed_forward.forward_2d(ops, &hidden)?;
+        Ok((hidden, residual))
     }
 }
 
@@ -447,8 +445,6 @@ struct MoeModel {
     embed_tokens: Embedding,
     layers: Vec<MoeDecoderLayer>,
     norm: RmsNorm,
-    norm_weight: Tensor,
-    rms_norm_eps: f64,
 }
 
 impl MoeModel {
@@ -470,15 +466,9 @@ impl MoeModel {
             layers.push(MoeDecoderLayer::new(i, cfg, rotary.clone(), vb_l.pp(i))?);
         }
 
-        let norm_weight = vb.pp("model.norm").get(cfg.hidden_size, "weight")?;
+        let norm = RmsNorm::load(vb.pp("model.norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
 
-        Ok(Self {
-            embed_tokens,
-            layers,
-            norm: RmsNorm::from_weight(norm_weight.clone(), cfg.rms_norm_eps),
-            norm_weight,
-            rms_norm_eps: cfg.rms_norm_eps,
-        })
+        Ok(Self { embed_tokens, layers, norm })
     }
 
     fn clear_kv_cache(&mut self) {
@@ -486,7 +476,8 @@ impl MoeModel {
     }
 
     fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> Result<Tensor> {
-        let mut h = self.embed_tokens.forward(packed_input)?;
+        let mut hidden = self.embed_tokens.forward(packed_input)?;
+        let mut residual: Option<Tensor> = None;
         for (i, layer) in self.layers.iter_mut().enumerate() {
             let layer_kv = ctx.paged_kv.map(|kv| kv.layer(i));
             let layer_ctx = LayerAttnContext {
@@ -496,9 +487,12 @@ impl MoeModel {
                 position_ids: ctx.position_ids,
                 paged_kv: layer_kv.as_ref(),
             };
-            h = layer.forward(&h, &layer_ctx)?;
+            let (h, r) = layer.forward(&hidden, residual.as_ref(), &layer_ctx)?;
+            hidden = h;
+            residual = Some(r);
         }
-        ctx.ops.rms_norm(&h, &self.norm_weight, self.rms_norm_eps as f32)
+        let (_, normed) = self.norm.forward_residual(&hidden, residual.as_ref(), ctx.ops)?;
+        Ok(normed)
     }
 }
 
