@@ -33,8 +33,8 @@ The image includes: Rust stable, CUDA 12.8 toolkit, cmake, llama.cpp (for benchm
 | Rust (stable) | 1.85+   | All builds          |
 | CMake         | >= 3.18 | oneDNN (CPU builds) |
 | CUDA Toolkit  | >= 12.x | GPU builds          |
-| Python 3      | 3.10+   | PyTorch reference tests |
-| PyTorch       | 2.x     | PyTorch reference tests |
+| Python 3      | 3.10+   | Accuracy tests      |
+| PyTorch       | 2.x     | Accuracy tests (HF reference) |
 
 oneDNN is auto-downloaded and statically linked on first build.
 
@@ -44,7 +44,7 @@ oneDNN is auto-downloaded and statically linked on first build.
 uv venv .venv --python 3.12 --seed
 source .venv/bin/activate
 
-uv pip install transformers torch requests numpy cmake nvidia-cutlass
+uv pip install transformers torch requests numpy cmake nvidia-cutlass datasets
 ```
 
 ### Build
@@ -62,69 +62,11 @@ cargo check --workspace --all-targets
 
 ## Testing
 
-### Architecture
-
-Tests are organized in two layers:
-
-1. **prelude-core** (`tests/tensor_ops.rs`, 97 tests): Correctness tests with **PyTorch reference**. Covers all TensorOps primitives (unary, binary, reduce, matmul, cast, etc.) and composed ops (rmsnorm, softmax, attention patterns). Tested across F32/BF16/F16 dtypes.
-
-2. **prelude-cpu** (`src/ops/*/tests`, 169 tests): CPU kernel tests. Validates AVX-512/oneDNN optimized kernels against scalar reference implementations. Covers rmsnorm, attention, RoPE, SiLU×Mul, quantized GEMM.
-
-prelude-cpu is a dev-dependency of prelude-core, so `cargo test -p prelude-core` automatically links prelude-cpu's high-level ops (AVX-512 rmsnorm, attention, etc.) via `#[ctor]` auto-registration. The PyTorch reference tests cover the full stack from model ops down to device kernels.
-
-### Dual TensorOps backends
-
-prelude-core has two parallel TensorOps implementations (temporary, for A/B validation):
-
-- **CubeCL backend** (`cubecl_backend/`): CubeCL runtime, `Storage::CubeCL`. Default.
-- **Device backend** (`device_backend/`): Pure Rust, `Storage::Device`. Reference implementation.
-
-Controlled by `PRELUDE_TENSOR_BACKEND` env var:
-
-```bash
-# Test with CubeCL backend (default)
-cargo test -p prelude-core
-
-# Test with Device backend
-PRELUDE_TENSOR_BACKEND=device cargo test -p prelude-core
-
-# Test both backends (CI should run both)
-PRELUDE_TENSOR_BACKEND=cubecl cargo test -p prelude-core
-PRELUDE_TENSOR_BACKEND=device cargo test -p prelude-core
-```
-
-Both backends must pass the same 97 PyTorch-validated tests.
-
-### Device selection
-
-CPU tests always run. Device tests enabled via features:
-
-```bash
-# CPU only (default)
-cargo test -p prelude-core
-
-# CPU + NVIDIA GPU
-cargo test -p prelude-core --features test-cuda
-
-# CPU + AMD GPU (planned)
-cargo test -p prelude-core --features test-amd
-
-# CPU + Apple GPU (planned)
-cargo test -p prelude-core --features test-metal
-
-# CPU + TPU (planned)
-cargo test -p prelude-core --features test-tpu
-
-# All available devices
-cargo test -p prelude-core --features test-cuda,test-amd,test-metal,test-tpu
-```
-
 ### Running tests
 
 ```bash
-# ── Core library (PyTorch reference, both backends) ──────────
-cargo test -p prelude-core                                  # CubeCL backend, CPU
-PRELUDE_TENSOR_BACKEND=device cargo test -p prelude-core    # Device backend, CPU
+# ── Core library (PyTorch reference) ────────────────────────
+cargo test -p prelude-core
 
 # ── CPU kernels (AVX-512, oneDNN, quantized) ─────────────────
 cargo test -p prelude-cpu
@@ -135,11 +77,44 @@ cargo test -p prelude-deepgemm --release
 cargo test -p prelude-flashinfer --release
 cargo test -p prelude-flash-attn-v4 --release
 cargo test -p prelude-quant-gemm --release
+cargo test -p prelude-cula --release
 ```
+
+### Accuracy (WikiText PPL)
+
+Validates inference precision against HuggingFace transformers, same method as
+[vLLM's generation_ppl_test](https://github.com/vllm-project/vllm/tree/main/tests/models/language/generation_ppl_test).
+Pass criteria: server PPL within 1% of HF (one-sided — only fails if server is worse).
+
+```bash
+# Full test (computes HF reference PPL, takes a few minutes)
+CUDA_VISIBLE_DEVICES=2 python3 tests/accuracy/test_ppl.py \
+    --binary target/release/prelude-server \
+    --model Qwen/Qwen3-8B
+
+# Skip HF computation with known reference PPL
+CUDA_VISIBLE_DEVICES=2 python3 tests/accuracy/test_ppl.py \
+    --binary target/release/prelude-server \
+    --model Qwen/Qwen3-0.6B --hf-ppl 23.864
+
+# Connect to a running server
+python3 tests/accuracy/test_ppl.py \
+    --server http://localhost:8000 \
+    --model Qwen/Qwen3-0.6B --hf-ppl 23.864
+```
+
+Known HF reference PPL (BF16, WikiText-2 test, stride=1024):
+| Model | HF PPL |
+|-------|--------|
+| Qwen/Qwen3-0.6B | 23.864 |
 
 ### Benchmark
 
 ```bash
+# E2E server benchmark (decode throughput)
+CUDA_VISIBLE_DEVICES=2 MODEL=Qwen/Qwen3-8B INPUT_TOKENS=128 OUTPUT_TOKENS=32 \
+    MAX_REQUESTS=400 CONCURRENCY=4 ./benchmark/bench.sh prelude --gpu
+
 # CPU kernel benchmarks (quantized, GEMM, attention, etc.)
 cargo run -p prelude-cpu --bin cpu_ops_bench --release
 cargo run -p prelude-cpu --bin cpu_ops_bench --release -- quant
@@ -151,22 +126,19 @@ cargo run -p prelude-deepgemm --example bench_kernel --release
 cargo run -p prelude-flashinfer --example bench_kernel --release
 cargo run -p prelude-flash-attn-v4 --example bench_kernel --release
 cargo run -p prelude-quant-gemm --example bench_kernel --release
+
+# Fused ops (silu_mul_concat vs fused_silu_mul, model shapes)
+cargo run -p prelude-cuda --bin fused_ops_test --release
 ```
 
 ## Feature flags
 
-| Feature        | Effect                              |
-|----------------|--------------------------------------|
-| `cuda`         | GPU support (includes cutlass-gemm)  |
-| `deepgemm`     | DeepGEMM SM90+ BF16 fast path       |
-| `flash-attn-v4`| FlashAttention v4 (CuTeDSL)         |
-| `flashinfer`   | FlashInfer attention backend         |
-| `flashinfer-v4`| FlashInfer + FA4 combined            |
-| `paged-attn`   | Paged KV cache attention             |
-| `hf_tokenizer` | HuggingFace tokenizer support        |
-| `test-cuda`    | Enable NVIDIA GPU in tests           |
-| `test-amd`     | Enable AMD GPU in tests (planned)    |
-| `test-metal`   | Enable Apple GPU in tests (planned)  |
-| `test-tpu`     | Enable TPU in tests (planned)        |
+| Feature | Effect |
+|---------|--------|
+| `cpu`   | CPU inference (oneDNN, AVX-512 kernels) |
+| `cuda`  | CUDA inference (all GPU backends: FlashInfer, FA4, CUTLASS, DeepGEMM, quant-gemm, cuLA) |
+| `full`  | cpu + cuda |
 
-CPU features (oneDNN, quantized kernels) are always compiled — no feature flag needed.
+Server features are in `crates/prelude-server/Cargo.toml`. GPU kernel crates
+(deepgemm, cutlass-gemm, flashinfer, fa4, quant-gemm) are always compiled when
+`cuda` is enabled — no separate feature flags.
