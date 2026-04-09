@@ -1,88 +1,73 @@
 ## Model Code Pattern
 
-Models compose modules for common patterns and call raw ops for model-specific logic.
-Linear projections use the unified `Linear` struct — TP, quantization, and LoRA are
-configured at load time and invisible to forward code.
+Models are self-contained (like vLLM): each model file defines its own structs and forward
+logic, 1:1 mapping to HuggingFace transformers. Inference details (paged attention, fused
+kernels, CUDA graph) are hidden inside shared layer abstractions.
+
+### Decoder Layer (vLLM-style residual threading)
 
 ```rust
-// prelude-core/src/models/ — LLM attention layer
+// prelude-core/src/models/qwen3.rs — DecoderLayer
 
-fn forward(&self, x: &Tensor, ctx: &BatchState, ops: &OpsBundle, kv: &PagedKvCtx) -> Result<Tensor> {
-    let (residual, h) = models::commons::residual_norm(x, &self.residual, &self.ln1, eps, ops)?;
-
-    // Linear handles TP + quant + LoRA internally
-    let qkv = self.qkv_proj.forward(&h, ctx, ops)?;
-    let (q, k, v) = models::commons::split_qkv(&qkv, num_heads_per_rank, num_kv_heads_per_rank);
-
-    // Fused QK-norm + RoPE (module handles fusion internally)
-    let (q, k) = models::commons::qk_norm_rope(&q, &k, &self.qw, &self.kw, cos, sin, pos, eps, ops)?;
-
-    // KV cache + attention (raw ops)
-    ops.reshape_and_cache(&k, &v, &kv.cache_k, &kv.cache_v, &kv.slots)?;
-    let o = ops.paged_attention(&q, &kv.cache_k, &kv.cache_v, &paged_params)?;
-    let h = self.o_proj.forward(&o, ctx, ops)?;
-
-    let (residual, h) = models::commons::residual_norm(&residual, &h, &self.ln2, eps, ops)?;
-    let h = models::commons::gated_mlp(&h, &self.gate, &self.up, &self.down, ops)?;
-    Ok((&residual + &h)?)
+fn forward(&self, hidden: &Tensor, residual: Option<&Tensor>, ctx: &LayerAttnContext)
+    -> Result<(Tensor, Tensor)>
+{
+    let ops = ctx.ops;
+    // RmsNorm.forward_residual: fused add+norm when residual is Some
+    let (residual, hidden) = self.input_layernorm.forward_residual(hidden, residual, ops)?;
+    let hidden = self.self_attn.forward(&hidden, ctx)?;
+    let (residual, hidden) = self.post_attention_layernorm.forward_residual(&hidden, Some(&residual), ops)?;
+    let hidden = self.mlp.forward(&hidden, ops)?;
+    Ok((hidden, residual))
 }
 ```
 
-```rust
-// prelude-core/src/models/flux.rs — Diffusion self-attention, same AttentionOps
+### Model Backbone (residual chain)
 
-fn forward(&self, x: &Tensor, ctx: &BatchState, ops: &OpsBundle) -> Result<Tensor> {
-    let qkv = self.qkv_proj.forward(x, ctx, ops)?;
-    let (q, k, v) = models::commons::split_qkv(&qkv, num_heads, num_heads);
-    let params = VarlenParams { mask: MaskType::Bidirectional, .. };
-    ops.varlen_attention(&q, &k, &v, &params)
+```rust
+// prelude-core/src/models/qwen3.rs — Model
+
+fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> Result<Tensor> {
+    let mut hidden = self.embed_tokens.forward(packed_input)?;
+    let mut residual: Option<Tensor> = None;
+    for (i, layer) in self.layers.iter_mut().enumerate() {
+        let layer_ctx = ctx.layer(i);
+        let (h, r) = layer.forward(&hidden, residual.as_ref(), &layer_ctx)?;
+        hidden = h;
+        residual = Some(r);
+    }
+    let (_, normed) = self.norm.forward_residual(&hidden, residual.as_ref(), ctx.ops)?;
+    Ok(normed)
 }
 ```
 
+### Where kernels are hidden
+
+- **`RmsNorm.forward_residual()`** — calls `ops.rms_norm()` / `ops.add_rmsnorm()` → fused CUDA PTX
+- **`self_attn.forward()`** — internally does QKV proj → qknorm+rope → KV cache write → paged attention (FA4/FlashInfer)
+- **`mlp.forward()`** — gate/up proj → `ops.silu_mul()` (fused PTX) → down proj
+- **`Linear.forward()`** — `Tensor::matmul()` → registered GEMM dispatch → CUTLASS/DeepGEMM
+
+Model code never calls fused kernels directly — all dispatch is inside the layer abstractions.
+
+### KV Sharing (Gemma4 YOCO-style)
+
+Shared layers reuse source layer's K/V. No new kernel — pure model-level routing.
+
 ```rust
-// prelude-core/src/models/ — KV sharing (Gemma4 YOCO-style)
-// Shared layers reuse source layer's K/V. No new kernel — pure model-level routing.
-
-fn forward(&self, x: &Tensor, ops: &OpsBundle, kv: &PagedKvCtx, shared_kv: Option<(&Tensor, &Tensor)>) -> Result<Tensor> {
-    let q = self.q_proj.forward(&h, ctx, ops)?;
-    let q = ops.rms_norm(&q, &self.q_norm_weight, eps)?;
-    let q = rope(&q, cos, sin)?;
-
+fn forward(&self, x: &Tensor, ops: &dyn Ops, kv: &PagedKvCtx, shared_kv: Option<(&Tensor, &Tensor)>)
+    -> Result<Tensor>
+{
+    let q = self.q_proj.forward(&h, &bs, ops)?;
     let (k, v) = if let Some((sk, sv)) = shared_kv {
         (sk.clone(), sv.clone())   // Shared: reuse source layer's K/V
     } else {
-        let k = self.k_proj.forward(&h, ctx, ops)?;  // Non-shared: compute K/V
-        let k = ops.rms_norm(&k, &self.k_norm_weight, eps)?;
-        let k = rope(&k, cos, sin)?;
-        let v = self.v_norm.forward(&self.v_proj.forward(&h, ctx, ops)?)?;
+        // Non-shared: compute K/V, write cache
+        let k = self.k_proj.forward(&h, &bs, ops)?;
+        let v = self.v_proj.forward(&h, &bs, ops)?;
+        ops.reshape_and_cache(&k, &v, &kv.cache_k, &kv.cache_v, &kv.slots)?;
         (k, v)
     };
-
-    if !is_shared {
-        ops.reshape_and_cache(&k, &v, &kv.cache_k, &kv.cache_v, &kv.slots)?;  // Write cache
-    }
-    // Shared layers skip reshape_and_cache — cache is aliased to source layer's cache.
     ops.paged_attention(&q, &kv.cache_k, &kv.cache_v, &paged_params)?
-}
-
-// Engine side: CacheManager aliases cache tensors for shared layers.
-// model.kv_cache_sharing() returns [None, None, ..., Some(13), Some(13), ..., Some(14), ...]
-// cache[15] = cache[13].clone()  (Arc pointer copy, same underlying memory)
-```
-
-```rust
-// prelude-core/src/models/ — Diffusion cross-attention, Q from decoder, K/V from encoder
-
-fn forward(&self, x: &Tensor, context: &Tensor, ctx: &BatchState, ops: &OpsBundle) -> Result<Tensor> {
-    let q = self.q_proj.forward(x, ctx, ops)?;
-    let k = self.k_proj.forward(context, ctx, ops)?;
-    let v = self.v_proj.forward(context, ctx, ops)?;
-    let params = VarlenParams {
-        cu_seqlens_q: /* decoder seqlens */,
-        cu_seqlens_k: /* encoder seqlens */,
-        mask: MaskType::Bidirectional,
-        ..
-    };
-    ops.varlen_attention(&q, &k, &v, &params)
 }
 ```
