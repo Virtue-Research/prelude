@@ -353,16 +353,18 @@ impl RmsNormGated {
         let x = x.reshape(new_shape.as_slice())?;
         let z = z.reshape(new_shape.as_slice())?;
 
-        // RMS norm on last dimension (head_dim), matching reference: compute
-        // the norm in F32, multiply by the F32 weight in F32, then cast back
-        // for the gate. Weight is stored in F32 so keep the multiply in F32.
+        // Match HF `Qwen3_5MoeRMSNormGated`: normalize in F32, apply weight in
+        // F32, compute SiLU(gate) in F32, do the final gate multiply in F32,
+        // and only cast the result back at the very end.
         let x_f32 = x.to_dtype(DType::F32)?;
         let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
         let normed = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
         let normed = normed.broadcast_mul(&self.weight)?; // F32 × F32
-        let normed = normed.to_dtype(x.dtype())?;
-        let gate = ops.silu(&z)?;
-        let result = normed.broadcast_mul(&gate)?;
+        let gate_f32 = z.to_dtype(DType::F32)?;
+        let silu_gate = ops.silu(&gate_f32)?;
+        let result = normed
+            .broadcast_mul(&silu_gate)?
+            .to_dtype(x.dtype())?;
 
         // Reshape back to [..., num_heads * head_dim]
         result.reshape(orig_shape)
@@ -798,11 +800,23 @@ impl Qwen3_5Attention {
             false,
         )?;
 
-        // Qwen3.5 uses residual RMSNorm: output = norm(x) * (1 + weight)
-        let q_norm_weight = (vb.pp("q_norm").get(cfg.head_dim, "weight")? + 1.0)?;
+        // Qwen3.5 uses residual RMSNorm: output = norm(x) * (1 + weight). HF
+        // casts weight to F32 before the `1 +` and the final multiply, so small
+        // weight values aren't crushed by BF16 rounding near 1.0. Match that by
+        // materialising `(1 + weight)` in F32 and letting `ops.rms_norm` fall
+        // through to the composed F32 path when it sees an F32 weight.
+        let q_norm_weight = (vb
+            .pp("q_norm")
+            .get(cfg.head_dim, "weight")?
+            .to_dtype(DType::F32)?
+            + 1.0)?;
         let q_norm = RmsNorm::from_weight(q_norm_weight.clone(), cfg.rms_norm_eps);
 
-        let k_norm_weight = (vb.pp("k_norm").get(cfg.head_dim, "weight")? + 1.0)?;
+        let k_norm_weight = (vb
+            .pp("k_norm")
+            .get(cfg.head_dim, "weight")?
+            .to_dtype(DType::F32)?
+            + 1.0)?;
         let k_norm = RmsNorm::from_weight(k_norm_weight.clone(), cfg.rms_norm_eps);
 
 
@@ -1261,6 +1275,9 @@ pub(super) struct Qwen3_5DecoderLayer {
 }
 
 /// Free function to run DeltaNet on packed varlen input (avoids borrow conflicts).
+/// Prefill (len > 1) clears state per-sequence so fresh requests start from
+/// zero; decode (len == 1) reuses the layer's transient `recurrent_state` so
+/// the single-request path still accumulates history across decode steps.
 fn deltanet_varlen(
     gdn: &mut Qwen3_5GatedDeltaNet,
     packed: &Tensor,
@@ -1270,6 +1287,9 @@ fn deltanet_varlen(
     let mut outputs = Vec::new();
     let mut offset = 0usize;
     for &len in seq_lens {
+        if len > 1 {
+            gdn.clear_state();
+        }
         let seq = packed.narrow(0, offset, len)?.unsqueeze(0)?; // [1, L, D]
         let out = gdn.forward(&seq, 0, ops)?; // [1, L, D]
         outputs.push(out.squeeze(0)?); // [L, D]
@@ -1325,9 +1345,18 @@ impl Qwen3_5DecoderLayer {
         rope: PartialRotaryEmbedding,
         vb: VarBuilder,
     ) -> Result<Self> {
-        // Qwen3.5 uses residual RMSNorm: output = norm(x) * (1 + weight)
-        let ln1_weight = (vb.pp("input_layernorm").get(cfg.hidden_size, "weight")? + 1.0)?;
-        let ln2_weight = (vb.pp("post_attention_layernorm").get(cfg.hidden_size, "weight")? + 1.0)?;
+        // Qwen3.5 uses residual RMSNorm: output = norm(x) * (1 + weight). See
+        // `Qwen3_5Attention::new` for why this is computed in F32.
+        let ln1_weight = (vb
+            .pp("input_layernorm")
+            .get(cfg.hidden_size, "weight")?
+            .to_dtype(DType::F32)?
+            + 1.0)?;
+        let ln2_weight = (vb
+            .pp("post_attention_layernorm")
+            .get(cfg.hidden_size, "weight")?
+            .to_dtype(DType::F32)?
+            + 1.0)?;
 
         let token_mixer = match cfg.layer_type(layer_idx) {
             LayerType::LinearAttention => {
@@ -1451,8 +1480,13 @@ impl Qwen3_5Model {
             layers.push(Qwen3_5DecoderLayer::new(cfg, idx, rope, vb_l.pp(idx))?);
         }
 
-        // Qwen3.5 uses residual RMSNorm: output = norm(x) * (1 + weight)
-        let norm_weight = (vb_m.pp("norm").get(cfg.hidden_size, "weight")? + 1.0)?;
+        // Qwen3.5 uses residual RMSNorm: output = norm(x) * (1 + weight). See
+        // `Qwen3_5Attention::new` for why this is computed in F32.
+        let norm_weight = (vb_m
+            .pp("norm")
+            .get(cfg.hidden_size, "weight")?
+            .to_dtype(DType::F32)?
+            + 1.0)?;
         let norm = RmsNorm::from_weight(norm_weight.clone(), cfg.rms_norm_eps);
 
         Ok(Self {

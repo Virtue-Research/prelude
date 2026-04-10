@@ -39,10 +39,12 @@ impl Ops for CudaOps {
     // ── Normalization (CUDA kernels) ──────────────────────────────
 
     fn rms_norm(&self, x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
-        if x.dtype() == DType::BF16 {
+        // Fast kernel only supports matching BF16 weight — F32 weight falls through
+        // to the composed path, which casts weight to F32 and does the mul in F32
+        // (matches HF reference for models that carry small `+1` residual weights).
+        if x.dtype() == DType::BF16 && weight.dtype() == DType::BF16 {
             return crate::ops::rmsnorm::fast_rmsnorm(x, weight, eps as f64);
         }
-        // Non-BF16: use composed fallback
         prelude_core::ops::traits::norm::rms_norm(x, weight, eps)
     }
 
@@ -106,6 +108,10 @@ impl Ops for CudaOps {
 
     fn fused_add_rmsnorm(&self, residual: &Tensor, x: &Tensor, weight: &Tensor, eps: f32) -> Option<Result<(Tensor, Tensor)>> {
         if x.dtype() != DType::BF16 { return None; }
+        // FlashInfer's fused kernel applies weight in BF16; fall through to the
+        // composed path when weight is F32 so the multiply happens in F32 (HF
+        // parity for models with small `+1` residual norm weights).
+        if weight.dtype() != DType::BF16 { return None; }
         // FlashInfer in-place: after call, x = rmsnorm(x + residual), residual = x + residual.
         // Safe because residual flows linearly through layers (never branched).
         Some(crate::attn::flashinfer::fi_fused_add_rmsnorm(x, residual, weight, eps as f64)
