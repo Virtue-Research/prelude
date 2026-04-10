@@ -283,25 +283,33 @@ fn compile_dsl_kernels(
 
     build_log!("[DSL] AOT compiling for {:?}...", target_archs);
 
-    let workers = env::var("PRELUDE_CULA_WORKERS").unwrap_or_else(|_| {
-        let n = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        n.min(8).to_string()
-    });
+    // Force workers=1: each DSL kernel's compile step touches CUDA (for SM
+    // detection, tensor setup, etc.), and forking after CUDA init blows up
+    // with "Cannot re-initialize CUDA in forked subprocess". Pickling the
+    // compile_worker across a ProcessPool spawn also breaks when the script
+    // is executed via runpy. Single-worker is slower but actually works.
+    let workers = env::var("PRELUDE_CULA_WORKERS").unwrap_or_else(|_| "1".to_string());
 
     // Monkey-patch assert_blackwell/assert_hopper so AOT cross-compilation works
     // regardless of the host GPU. The target arch comes from CUTE_DSL_ARCH env var.
+    // The first positional arg is the absolute path to the script — we pop it so
+    // argparse inside the script only sees --output-dir / -j flags, then exec
+    // the script with __file__ pointed at the real path.
+    // `runpy.run_path(..., run_name='__main__')` loads the script as if it
+    // were executed as `python compile_kernels.py ...`, so `ProcessPoolExecutor`
+    // can pickle top-level functions like `_compile_worker` — exec(compile(...))
+    // with a hand-rolled globals dict breaks that lookup.
     let bootstrap = r#"
-import sys, os
+import sys, os, runpy
 arch = int(''.join(c for c in os.environ.get('CUTE_DSL_ARCH','sm_90a').split('_')[1] if c.isdigit()))
 major, minor = arch // 10, arch % 10
 import cula.utils
 cula.utils.get_device_sm_version = lambda device=None: (major, minor)
 cula.utils.assert_blackwell = lambda device=None: None
 cula.utils.assert_hopper = lambda device=None: None
-sys.argv = ['compile_kernels.py'] + sys.argv[1:]
-exec(open(sys.argv[0]).read())
+script_path = sys.argv[1]
+sys.argv = [script_path] + sys.argv[2:]
+runpy.run_path(script_path, run_name='__main__')
 "#;
 
     // Compile for each target arch
@@ -310,12 +318,17 @@ exec(open(sys.argv[0]).read())
         let arch_dir = kernels_dir.join(arch);
         let _ = std::fs::create_dir_all(&arch_dir);
 
+        // We used to set PYTHONPATH=third_party/cuLA to pick up local changes
+        // without reinstalling the venv, but that causes `import cula` to
+        // resolve to the source tree, which is missing the compiled
+        // `cula.cudac` C extension (which only lives in site-packages). Drop
+        // the override and rely on `ensure_python_env` to keep the venv in
+        // sync with the source tree.
         let output = Command::new(&python)
             .arg("-c").arg(bootstrap)
             .arg(&script)
             .arg("--output-dir").arg(&arch_dir)
             .args(["-j", &workers])
-            .env("PYTHONPATH", cula_dir)
             .env("CUTE_DSL_ARCH", format!("{arch}a"))
             .output();
 
@@ -395,41 +408,56 @@ fn link_dsl_kernel_objects(kernels_dir: &Path, out_dir: &Path) {
 fn generate_dispatch_code(kernels_dir: &Path, out_dir: &Path, has_kernels: bool) {
     let dispatch_path = out_dir.join("cula_dsl_dispatch.rs");
 
+    let stub = "pub(crate) fn lookup_dsl(_kernel_type: &str, _key: &str, _arch: u32) \
+                -> Option<crate::dsl::TVMSafeCallFn> { None }\n";
+
     if !has_kernels {
-        std::fs::write(
-            &dispatch_path,
-            "pub(crate) fn lookup_dsl(_kernel_type: &str, _key: &str, _arch: u32) \
-             -> Option<crate::dsl::TVMSafeCallFn> { None }\n",
-        ).unwrap();
+        std::fs::write(&dispatch_path, stub).unwrap();
         return;
     }
 
-    let manifest_path = kernels_dir.join("manifest.json");
-    let manifest_str = match std::fs::read_to_string(&manifest_path) {
-        Ok(s) => s,
-        Err(_) => {
-            std::fs::write(
-                &dispatch_path,
-                "pub(crate) fn lookup_dsl(_kernel_type: &str, _key: &str, _arch: u32) \
-                 -> Option<crate::dsl::TVMSafeCallFn> { None }\n",
-            ).unwrap();
-            return;
+    // Each target arch writes its own manifest at `dsl_kernels/<arch>/manifest.json`.
+    // Walk the per-arch manifests and merge variants into one dispatch table
+    // keyed on (name, arch).
+    let mut variants: Vec<serde_json::Value> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(kernels_dir) {
+        for entry in entries.flatten() {
+            let arch_dir = entry.path();
+            if !arch_dir.is_dir() { continue; }
+            let manifest_path = arch_dir.join("manifest.json");
+            let Ok(manifest_str) = std::fs::read_to_string(&manifest_path) else { continue };
+            let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&manifest_str) else { continue };
+            let Some(arr) = manifest["variants"].as_array() else { continue };
+            variants.extend(arr.iter().cloned());
         }
-    };
+    }
+    // Fall back to the old single-manifest layout for compatibility.
+    if variants.is_empty() {
+        let manifest_path = kernels_dir.join("manifest.json");
+        if let Ok(manifest_str) = std::fs::read_to_string(&manifest_path) {
+            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&manifest_str) {
+                if let Some(arr) = manifest["variants"].as_array() {
+                    variants.extend(arr.iter().cloned());
+                }
+            }
+        }
+    }
 
-    let manifest: serde_json::Value = serde_json::from_str(&manifest_str)
-        .expect("Failed to parse cuLA manifest.json");
-    let variants = manifest["variants"].as_array()
-        .expect("manifest.json missing 'variants' array");
+    if variants.is_empty() {
+        std::fs::write(&dispatch_path, stub).unwrap();
+        return;
+    }
 
     let mut code = String::new();
     writeln!(code, "// AUTO-GENERATED by build.rs — do not edit").unwrap();
     writeln!(code).unwrap();
 
-    // Extern declarations
+    // Extern declarations — de-dup by symbol in case two manifests list the same kernel.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     writeln!(code, "unsafe extern \"C\" {{").unwrap();
-    for variant in variants {
+    for variant in &variants {
         let symbol = variant["symbol"].as_str().unwrap();
+        if !seen.insert(symbol.to_string()) { continue; }
         writeln!(
             code,
             "    fn {symbol}(handle: *mut std::ffi::c_void, args: *const crate::dsl::TVMFFIAny, \
@@ -439,17 +467,20 @@ fn generate_dispatch_code(kernels_dir: &Path, out_dir: &Path, has_kernels: bool)
     writeln!(code, "}}").unwrap();
     writeln!(code).unwrap();
 
-    // Lookup by name
+    // Lookup by (name, arch). Arch is the SM major×10+minor the kernel was
+    // compiled for. Runtime caller passes the detected GPU arch and we match
+    // exact-equal.
     writeln!(
         code,
-        "pub(crate) fn lookup_dsl(_kernel_type: &str, key: &str, _arch: u32) \
+        "pub(crate) fn lookup_dsl(_kernel_type: &str, key: &str, arch: u32) \
          -> Option<crate::dsl::TVMSafeCallFn> {{"
     ).unwrap();
-    writeln!(code, "    match key {{").unwrap();
-    for variant in variants {
+    writeln!(code, "    match (key, arch) {{").unwrap();
+    for variant in &variants {
         let name = variant["name"].as_str().unwrap();
         let symbol = variant["symbol"].as_str().unwrap();
-        writeln!(code, "        \"{name}\" => Some({symbol}),").unwrap();
+        let arch = variant["arch"].as_u64().unwrap_or(0);
+        writeln!(code, "        (\"{name}\", {arch}) => Some({symbol}),").unwrap();
     }
     writeln!(code, "        _ => None,").unwrap();
     writeln!(code, "    }}").unwrap();
@@ -647,8 +678,11 @@ fn ensure_python_env(out_dir: &Path) -> Result<String, String> {
 
 fn check_cula_importable(python: &str) -> bool {
     if python.is_empty() { return false; }
+    // Also require cula.kda.kda_decode (added in the KDA decode PR) — if it's
+    // missing, the installed venv is stale and must be reinstalled from the
+    // updated source tree.
     Command::new(python)
-        .args(["-c", "import cula; import cutlass"])
+        .args(["-c", "import cula; import cutlass; from cula.kda import kda_decode"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)

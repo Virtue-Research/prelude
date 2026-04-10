@@ -76,6 +76,19 @@ class FwdOSpec:
     persistent: bool
 
 
+@dataclass
+class KdaDecodeSpec:
+    """KDA single-token decode (CuTe DSL, Hopper+)."""
+    H: int     # query heads
+    HV: int    # value heads (equal to H for MHA, >H for GQA)
+    K: int     # head_k_dim (must equal TILE_K=128 per the kernel)
+    V: int     # head_v_dim
+    variant: str  # one of: small_dense, small_varlen, large_dense, large_varlen
+    use_qk_l2norm: bool
+    softplus_beta: float = 1.0
+    softplus_threshold: float = 20.0
+
+
 # ---------------------------------------------------------------------------
 # Compilation functions
 # ---------------------------------------------------------------------------
@@ -176,6 +189,130 @@ def compile_chunk_delta_h(spec: ChunkDeltaHSpec, arch: int, output_dir: Path):
         return None
 
 
+def compile_kda_decode(spec: KdaDecodeSpec, arch: int, output_dir: Path):
+    """AOT-compile one kda_decode variant to a .o file.
+
+    The launcher (`run_small_batch`, `run_large_batch`, etc. in
+    `cula.kda.kda_decode`) deletes `B`, `T`, `K`, `use_initial_state`,
+    `cu_seqlens` inside the jit body, so the compiled kernel can serve any
+    batch size / pool size at runtime. We only need to specialize on
+    (variant, H, HV, V, use_qk_l2norm) plus the scalar constants.
+    """
+    import importlib
+
+    parts = [
+        "cula_kda_decode",
+        spec.variant,
+        f"h{spec.H}",
+        f"hv{spec.HV}",
+        f"v{spec.V}",
+    ]
+    if spec.use_qk_l2norm:
+        parts.append("l2norm")
+    parts.append(f"sm{arch}")
+    name = "_".join(parts)
+    obj_path = output_dir / f"{name}.o"
+
+    if obj_path.exists():
+        print(f"  {name}: already exists, skipping")
+        return _result(name, arch, obj_path, "kda_decode", spec.__dict__)
+
+    print(f"  Compiling {name}...")
+    try:
+        import cutlass.cute as cute
+        import cuda.bindings.driver as cuda_drv
+        import torch
+        from cutlass.cute.runtime import from_dlpack
+
+        kda_decode_mod = importlib.import_module("cula.kda.kda_decode")
+        TILE_K = kda_decode_mod.TILE_K
+        assert spec.K == TILE_K, f"kda_decode kernel requires K={TILE_K}, got K={spec.K}"
+
+        run_small, run_small_varlen, run_large, run_large_varlen = \
+            kda_decode_mod._create_jit_functions()
+        variant_map = {
+            "small_dense":  (run_small,         False),
+            "small_varlen": (run_small_varlen,  True),
+            "large_dense":  (run_large,         False),
+            "large_varlen": (run_large_varlen,  True),
+        }
+        kernel_func, is_varlen = variant_map[spec.variant]
+
+        # Placeholder tensors — shapes match the launcher's expected layouts.
+        # The launcher reads the runtime batch size from `h0_indices` and the
+        # pool size from `h0_source`, so fixed placeholder dims work.
+        N_placeholder = 1
+        pool_placeholder = 1
+        if is_varlen:
+            q = torch.zeros(1, N_placeholder, spec.H,  spec.K, dtype=torch.bfloat16, device="cuda")
+            k = torch.zeros(1, N_placeholder, spec.H,  spec.K, dtype=torch.bfloat16, device="cuda")
+            v = torch.zeros(1, N_placeholder, spec.HV, spec.V, dtype=torch.bfloat16, device="cuda")
+            a = torch.zeros(N_placeholder, spec.HV, spec.K, dtype=torch.bfloat16, device="cuda")
+            b = torch.zeros(N_placeholder, spec.HV,          dtype=torch.bfloat16, device="cuda")
+            o = torch.zeros(1, N_placeholder, spec.HV, spec.V, dtype=torch.bfloat16, device="cuda")
+        else:
+            q = torch.zeros(N_placeholder, 1, spec.H,  spec.K, dtype=torch.bfloat16, device="cuda")
+            k = torch.zeros(N_placeholder, 1, spec.H,  spec.K, dtype=torch.bfloat16, device="cuda")
+            v = torch.zeros(N_placeholder, 1, spec.HV, spec.V, dtype=torch.bfloat16, device="cuda")
+            a = torch.zeros(N_placeholder, 1, spec.HV, spec.K, dtype=torch.bfloat16, device="cuda")
+            b = torch.zeros(N_placeholder, 1, spec.HV,          dtype=torch.bfloat16, device="cuda")
+            o = torch.zeros(N_placeholder, 1, spec.HV, spec.V, dtype=torch.bfloat16, device="cuda")
+        A_log    = torch.zeros(spec.HV,             dtype=torch.float32, device="cuda")
+        dt_bias  = torch.zeros(spec.HV, spec.K,     dtype=torch.float32, device="cuda")
+        h0_src   = torch.zeros(pool_placeholder, spec.HV, spec.V, spec.K,
+                               dtype=torch.float32, device="cuda")
+        h0_idx   = torch.zeros(N_placeholder,       dtype=torch.int32,   device="cuda")
+        cu_sql   = torch.zeros(N_placeholder + 1,   dtype=torch.int32,   device="cuda")
+
+        cu_sql_t = from_dlpack(cu_sql,  assumed_align=16)
+        q_t      = from_dlpack(q,       assumed_align=16)
+        k_t      = from_dlpack(k,       assumed_align=16)
+        v_t      = from_dlpack(v,       assumed_align=16)
+        a_t      = from_dlpack(a,       assumed_align=16)
+        b_t      = from_dlpack(b,       assumed_align=16)
+        A_log_t  = from_dlpack(A_log,   assumed_align=16)
+        dt_bias_t= from_dlpack(dt_bias, assumed_align=16)
+        h0_src_t = from_dlpack(h0_src,  assumed_align=16)
+        h0_idx_t = from_dlpack(h0_idx,  assumed_align=16)
+        o_t      = from_dlpack(o,       assumed_align=16)
+
+        stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
+
+        compiled = cute.compile(
+            kernel_func,
+            cu_sql_t, q_t, k_t, v_t, a_t, b_t, A_log_t, dt_bias_t, h0_src_t, h0_idx_t, o_t,
+            softplus_beta=spec.softplus_beta,
+            softplus_threshold=spec.softplus_threshold,
+            scale=spec.K ** -0.5,
+            B=1 if is_varlen else N_placeholder,
+            T=N_placeholder if is_varlen else 1,
+            H=spec.H, HV=spec.HV, K=spec.K, V=spec.V,
+            use_initial_state=True,
+            use_qk_l2norm=spec.use_qk_l2norm,
+            stream=stream,
+        )
+
+        # New cutlass-dsl API: `file_path` is the OUTPUT DIRECTORY and
+        # `file_name` is the basename (without extension). It writes
+        # `{file_path}/{file_name}.o` + `.h` next to each other.
+        compiled.export_to_c(file_path=str(output_dir), file_name=name)
+        if not obj_path.exists():
+            # Some DSL versions name the output differently; search for a .o
+            # containing the name.
+            candidates = list(output_dir.glob(f"{name}*.o"))
+            if candidates:
+                candidates[0].rename(obj_path)
+        print(f"    Exported .o: {obj_path} ({obj_path.stat().st_size // 1024}KB)")
+        _verify_symbol(obj_path, name)
+        return _result(name, arch, obj_path, "kda_decode", spec.__dict__)
+
+    except Exception as e:
+        print(f"    ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 def compile_fwd_o(spec: FwdOSpec, arch: int, output_dir: Path):
     parts = [
         "cula_fwd_o",
@@ -260,6 +397,7 @@ def build_variant_matrix(arch: int, prototype: bool = False):
     la_prefill = []
     delta_h = []
     fwd_o_specs = []
+    kda_decode_specs = []
 
     for H in num_heads_list:
         for D in head_dims:
@@ -283,17 +421,26 @@ def build_variant_matrix(arch: int, prototype: bool = False):
                             H=H, K=D, V=D, chunk_size=cs, scale=1.0,
                             is_varlen=varlen, persistent=persistent,
                         ))
+        # KDA decode: one kernel per (H, HV=H, K=128, V=128) × 4 variants.
+        # Kernel launcher reads runtime batch size / pool size from tensors,
+        # so we only specialize on head counts + variant.
+        for variant in ("small_dense", "small_varlen", "large_dense", "large_varlen"):
+            kda_decode_specs.append(KdaDecodeSpec(
+                H=H, HV=H, K=128, V=128, variant=variant, use_qk_l2norm=True,
+            ))
 
-    result = {
-        "chunk_delta_h": delta_h,
-        "fwd_o": fwd_o_specs,
-    }
-    # Lightning Attention prefill requires SM100+ (Blackwell CuTe DSL).
-    # Only include when targeting SM100+.
+    # KDA decode works on Hopper+ (the CuTe DSL kernel targets SM90+).
+    result = {"kda_decode": kda_decode_specs}
+
+    # chunk_delta_h and fwd_o use tcgen05 ops → SM100+ only.
+    # Lightning Attention prefill also requires SM100+.
     if arch >= 100:
+        result["chunk_delta_h"] = delta_h
+        result["fwd_o"] = fwd_o_specs
         result["lightning_prefill"] = la_prefill
     else:
-        print(f"  Note: skipping lightning_prefill (requires SM100+, target is SM{arch})")
+        print(f"  Note: skipping chunk_delta_h/fwd_o/lightning_prefill "
+              f"(require SM100+, target is SM{arch})")
 
     return result
 
@@ -344,6 +491,8 @@ def _compile_worker(task):
         return compile_chunk_delta_h(spec, arch, output_dir)
     elif kernel_type == "fwd_o":
         return compile_fwd_o(spec, arch, output_dir)
+    elif kernel_type == "kda_decode":
+        return compile_kda_decode(spec, arch, output_dir)
     return None
 
 
