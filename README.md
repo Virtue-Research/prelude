@@ -6,8 +6,6 @@
   Fast LLM inference engine in Rust.
 </p>
 
----
-
 ## Performance
 
 **GPU (H200, Qwen3-4B)**
