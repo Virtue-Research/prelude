@@ -324,7 +324,14 @@ pub(super) struct RmsNormGated {
 
 impl RmsNormGated {
     pub(super) fn new(head_dim: usize, num_heads: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        let weight = vb.get(head_dim, "weight")?;
+        // Qwen3.5-35B-A3B stores this weight as F32 in the checkpoint; compute
+        // it in F32 to avoid precision loss in the DeltaNet output scaling.
+        let weight = vb.get_with_hints_dtype(
+            head_dim,
+            "weight",
+            Default::default(),
+            DType::F32,
+        )?;
         Ok(Self {
             weight,
             eps,
@@ -346,11 +353,14 @@ impl RmsNormGated {
         let x = x.reshape(new_shape.as_slice())?;
         let z = z.reshape(new_shape.as_slice())?;
 
-        // RMS norm on last dimension (head_dim)
+        // RMS norm on last dimension (head_dim), matching reference: compute
+        // the norm in F32, multiply by the F32 weight in F32, then cast back
+        // for the gate. Weight is stored in F32 so keep the multiply in F32.
         let x_f32 = x.to_dtype(DType::F32)?;
         let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
         let normed = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let normed = normed.to_dtype(x.dtype())?.broadcast_mul(&self.weight)?;
+        let normed = normed.broadcast_mul(&self.weight)?; // F32 × F32
+        let normed = normed.to_dtype(x.dtype())?;
         let gate = ops.silu(&z)?;
         let result = normed.broadcast_mul(&gate)?;
 
@@ -423,7 +433,14 @@ impl Qwen3_5GatedDeltaNet {
         let conv_weight = conv_weight_raw.squeeze(1)?;
 
         let dt_bias = vb.get(cfg.linear_num_value_heads, "dt_bias")?;
-        let a_log = vb.get(cfg.linear_num_value_heads, "A_log")?;
+        // `A_log` is stored as F32 in Qwen3.5-35B-A3B checkpoints and is always
+        // consumed in F32; load it in native precision to avoid the BF16 truncation.
+        let a_log = vb.get_with_hints_dtype(
+            cfg.linear_num_value_heads,
+            "A_log",
+            Default::default(),
+            DType::F32,
+        )?;
 
         let norm = RmsNormGated::new(
             cfg.linear_value_head_dim,
@@ -1155,10 +1172,12 @@ impl Qwen3_5SparseMoeBlock {
     fn forward_2d(&self, ops: &dyn crate::ops::Ops, xs: &Tensor) -> Result<Tensor> {
         let (_n_tokens, hidden_dim) = xs.dims2()?;
 
-        // Router: softmax → topk → gather weights
+        // Router: softmax in F32 (to match reference `softmax(..., dtype=float32)`)
+        // over 256 experts — BF16 softmax loses too much precision at this width.
         let router_logits = xs.apply(&self.gate)?;
-        let last_dim = router_logits.rank() - 1;
-        let routing_weights = ops.softmax(&router_logits, last_dim)?;
+        let router_logits_f32 = router_logits.to_dtype(DType::F32)?;
+        let last_dim = router_logits_f32.rank() - 1;
+        let routing_weights = ops.softmax(&router_logits_f32, last_dim)?;
 
         let experts_per_tok = routing_weights
             .arg_sort_last_dim(false)?
