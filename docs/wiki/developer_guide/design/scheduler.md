@@ -176,7 +176,7 @@ Output: SchedulerStep { prefill_request_ids, decode_request_ids, forward_mode }
        move seq → finished
 
 2. SELECT MODE
-   if mixed_chunked:  goto MIXED
+   if chunked_prefill:  goto MIXED
    elif waiting_queue non-empty:  goto PREFILL
    else:  goto DECODE
 
@@ -221,7 +221,7 @@ Output: SchedulerStep { prefill_request_ids, decode_request_ids, forward_mode }
 
 9. return SchedulerStep { prefill: [], decode: running, mode: Decode }
 
-── MIXED (mixed_chunked=true) ───────────────────────────────────────────────
+── MIXED (chunked_prefill=true) ─────────────────────────────────────────────
 10. Run steps 3–5 (admit new prefills) + step 7 (ensure decode capacity)
     return SchedulerStep { prefill: to_prefill, decode: running, mode: Mixed }
 
@@ -298,9 +298,9 @@ Four knobs, all configurable via CLI:
 
 ### Chunked Prefill
 
-> **Planned — not yet implemented.**
+When `--chunked-prefill` is enabled (on by default), the scheduler runs `get_mixed_batch()` each step, admitting new prefills alongside running decode sequences. This interleaves prefill and decode to keep TTFT bounded under load.
 
-When a prompt is longer than `max_prefill_tokens`, the intended behavior is to split it across multiple steps, interleaving with decode sequences to keep TTFT bounded. Currently the code breaks at the head-of-line guard (`if prompt_len > prefill_budget: break`) rather than splitting. The `mixed_chunked` flag enables prefill + decode in the same batch but does not yet split individual prompts across steps.
+Note: individual prompts longer than `max_prefill_tokens` are not yet split across steps — the head-of-line guard (`if prompt_len > prefill_budget: break`) still applies. Splitting oversized prompts across multiple steps is a planned future improvement.
 
 ### Prefix Cache Integration
 

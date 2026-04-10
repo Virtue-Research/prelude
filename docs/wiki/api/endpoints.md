@@ -80,7 +80,7 @@ curl http://localhost:8000/v1/chat/completions \
 | `messages` | object[] | yes | — | Array of `{"role", "content"}` objects. Roles: `system`, `user`, `assistant` |
 | `max_completion_tokens` | int | no | `4096` | Max tokens to generate (preferred name) |
 | `max_tokens` | int | no | `4096` | Alias for `max_completion_tokens` (deprecated by OpenAI) |
-| `temperature` | float | no | `0.7` | Sampling temperature (0 = greedy) |
+| `temperature` | float | no | `1.0` | Sampling temperature (0 = greedy) |
 | `top_p` | float | no | `1.0` | Nucleus sampling threshold |
 | `stop` | string[] | no | — | Stop sequences |
 | `stream` | bool | no | `false` | Enable SSE streaming |
@@ -177,7 +177,7 @@ curl http://localhost:8000/v1/completions \
 | `model` | string | yes | — | Model ID |
 | `prompt` | string or string[] | yes | — | Input text. A string array sends a batch |
 | `max_tokens` | int | no | `4096` | Max tokens to generate |
-| `temperature` | float | no | `0.7` | Sampling temperature (0 = greedy) |
+| `temperature` | float | no | `1.0` | Sampling temperature (0 = greedy) |
 | `top_p` | float | no | `1.0` | Nucleus sampling threshold |
 | `stop` | string[] | no | — | Stop sequences |
 | `stream` | bool | no | `false` | Enable SSE streaming (single prompt only) |

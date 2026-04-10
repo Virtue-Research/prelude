@@ -117,7 +117,7 @@ Applied when a request does not specify the parameter.
 
 | Variable | Default | Description |
 |---|---|---|
-| `PRELUDE_DEFAULT_TEMPERATURE` | `0.7` | Default sampling temperature |
+| `PRELUDE_DEFAULT_TEMPERATURE` | `1.0` | Default sampling temperature |
 | `PRELUDE_DEFAULT_TOP_P` | `1.0` | Default top-p nucleus sampling |
 | `PRELUDE_DEFAULT_MAX_TOKENS` | `4096` | Default max new tokens when `max_tokens` is not in the request |
 
