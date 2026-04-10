@@ -46,7 +46,10 @@ fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> Resu
 - **`RmsNorm.forward_residual()`** — calls `ops.rms_norm()` / `ops.add_rmsnorm()` → fused CUDA PTX
 - **`self_attn.forward()`** — internally does QKV proj → qknorm+rope → KV cache write → paged attention (FA4/FlashInfer)
 - **`mlp.forward()`** — gate/up proj → `ops.silu_mul()` (fused PTX) → down proj
-- **`Linear.forward()`** — `Tensor::matmul()` → registered GEMM dispatch → CUTLASS/DeepGEMM
+- **`Linear.forward()`** — delegates to the active `LinearBackend` impl (`DenseLinear` →
+  `Tensor::matmul()` → registered GEMM dispatch → DeepGEMM/CUTLASS; `OnednnLinear` → oneDNN
+  packed GEMM; `Q4_0Linear` / `Q4KLinear` / `GpuQuantLinear` → quantized matmul). Backend
+  is picked at load time from the checkpoint format
 
 Model code never calls fused kernels directly — all dispatch is inside the layer abstractions.
 

@@ -174,21 +174,21 @@ impl Drop for OnednnF32PackedWeight {
     }
 }
 
-// ── OnednnLinear: drop-in replacement for prelude_core::models::commons::linear::NaiveLinear ──────────
+// ── OnednnLinear: drop-in replacement for prelude_core::models::commons::linear::DenseLinear ──────────
 
 /// Drop-in Linear layer that dispatches BF16/F32 CPU to oneDNN packed GEMM,
-/// falling back to naive implementation for other dtypes/devices.
+/// falling back to dense implementation for other dtypes/devices.
 #[derive(Clone, Debug)]
 pub struct OnednnLinear {
-    naive_linear: prelude_core::models::commons::linear::NaiveLinear,
+    dense_linear: prelude_core::models::commons::linear::DenseLinear,
     brgemm_packed: Option<Arc<BrgemmPackedWeight>>,
     f32_packed: Option<Arc<OnednnF32PackedWeight>>,
 }
 
 impl OnednnLinear {
-    /// Wrap a `prelude_core::models::commons::linear::NaiveLinear`. If BF16 or F32 CPU, pre-packs weights for oneDNN.
+    /// Wrap a `prelude_core::models::commons::linear::DenseLinear`. If BF16 or F32 CPU, pre-packs weights for oneDNN.
     /// Also packs brgemm VNNI weights and AMX VNNI weights if available.
-    pub fn new(linear: prelude_core::models::commons::linear::NaiveLinear) -> Result<Self> {
+    pub fn new(linear: prelude_core::models::commons::linear::DenseLinear) -> Result<Self> {
         init(); // ensure oneDNN engine/stream exist
         let w = linear.weight();
 
@@ -241,7 +241,7 @@ impl OnednnLinear {
         };
 
         Ok(Self {
-            naive_linear: linear,
+            dense_linear: linear,
             brgemm_packed,
             f32_packed,
         })
@@ -249,7 +249,7 @@ impl OnednnLinear {
 
     /// Access the underlying weight tensor.
     pub fn weight(&self) -> &Tensor {
-        self.naive_linear.weight()
+        self.dense_linear.weight()
     }
 
     /// Access the brgemm packed weight (if available) for fused operations.
@@ -279,7 +279,7 @@ impl Module for OnednnLinear {
             let out = if let Some(ref brg) = self.brgemm_packed {
                 brgemm_gemm_forward(&flat, brg, m, brg.k, brg.n)?
             } else {
-                let w = self.naive_linear.weight();
+                let w = self.dense_linear.weight();
                 let (n, k) = w.dims2()?;
                 cpu_gemm_forward(&flat, w, m, k, n)?
             };
@@ -305,7 +305,7 @@ impl Module for OnednnLinear {
                 (x.contiguous()?, m)
             };
 
-            let w = self.naive_linear.weight();
+            let w = self.dense_linear.weight();
             let (n, k) = w.dims2()?;
             let out = f32_linear_forward(&flat, w, m, k, n)?;
 
@@ -315,13 +315,13 @@ impl Module for OnednnLinear {
             return Ok(out);
         }
 
-        self.naive_linear.forward(x)
+        self.dense_linear.forward(x)
     }
 }
 
 impl prelude_core::models::commons::linear::LinearBackend for OnednnLinear {
     fn name(&self) -> &str { "cpu/onednn" }
-    fn weight(&self) -> Option<&Tensor> { Some(self.naive_linear.weight()) }
+    fn weight(&self) -> Option<&Tensor> { Some(self.dense_linear.weight()) }
     fn clone_box(&self) -> Box<dyn prelude_core::models::commons::linear::LinearBackend> { Box::new(self.clone()) }
     fn as_any(&self) -> &dyn std::any::Any { self }
 }

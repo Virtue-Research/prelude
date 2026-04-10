@@ -37,7 +37,7 @@ fn to_ggml_type(dtype: GgmlDType) -> Option<prelude_quant_gemm::GgmlType> {
 /// Forward pass: activations are quantized to Q8_1 on GPU, then tiled MMQ
 /// or MMVQ is used for the matmul.
 #[derive(Debug, Clone)]
-struct GpuQuantizedWeight {
+struct GpuQuantLinear {
     /// Raw quantized weight bytes on GPU, as a U8 Tensor.
     gpu_weights: Tensor,
     ggml_type: prelude_quant_gemm::GgmlType,
@@ -45,7 +45,7 @@ struct GpuQuantizedWeight {
     k: usize,
 }
 
-impl Module for GpuQuantizedWeight {
+impl Module for GpuQuantLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = x.to_dtype(DType::BF16)?;
         let x_dims = x.shape().dims();
@@ -78,7 +78,7 @@ impl Module for GpuQuantizedWeight {
     }
 }
 
-impl LinearBackend for GpuQuantizedWeight {
+impl LinearBackend for GpuQuantLinear {
     fn name(&self) -> &str { "gpu/quant-gemm" }
     fn is_quantized(&self) -> bool { true }
     fn clone_box(&self) -> Box<dyn LinearBackend> { Box::new(self.clone()) }
@@ -115,7 +115,7 @@ impl QuantFormat for GpuQuantFormat {
         let gpu_data = unsafe { stream.clone_htod(qtensor.data()) }.ce()?;
         let gpu_weights = device::tensor_from_cuda(gpu_data, dev, (qtensor.data().len(),));
 
-        Ok(Box::new(GpuQuantizedWeight {
+        Ok(Box::new(GpuQuantLinear {
             gpu_weights,
             ggml_type,
             n,

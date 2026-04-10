@@ -98,6 +98,10 @@ pub(crate) fn fused_qkv_projection(
         let qkv_out = qkv.forward(x, ctx, ops)?;
         let q_size = num_heads * head_dim;
         let kv_size = num_kv_heads * head_dim;
+        // narrow creates non-contiguous views (stride[0] = N_fused > q_size).
+        // Q/K are consumed by stride-aware fused_qknorm_rope.
+        // V is consumed by stride-aware scatter_kv_cache_flash on the paged path.
+        // For the rare non-paged varlen path, the attention wrapper contiguous-ifies.
         let q = qkv_out
             .narrow(1, 0, q_size)?
             .reshape((total, num_heads, head_dim))?;

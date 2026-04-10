@@ -15,7 +15,7 @@
 
 use crate::tensor::{DType, Device, Module, Result, Tensor, D};
 use crate::models::commons::embedding::Embedding;
-use crate::models::commons::linear::NaiveLinear;
+use crate::models::commons::linear::DenseLinear;
 use crate::loading::var_builder::VarBuilder;
 
 use crate::models::commons::{
@@ -1000,13 +1000,13 @@ impl Qwen3_5Mlp {
 // ── Sparse MoE Block ────────────────────────────────────────────────────
 
 struct Qwen3_5SparseMoeBlock {
-    gate: NaiveLinear, // [num_experts, hidden_size]
+    gate: DenseLinear, // [num_experts, hidden_size]
     // Fused expert weights: gate_up [E, 2*inter, hidden], down [E, hidden, inter]
     experts_gate_up: Tensor,
     experts_down: Tensor,
     moe_intermediate_size: usize,
     shared_expert: Option<Qwen3_5Mlp>,
-    shared_expert_gate: Option<NaiveLinear>, // [1, hidden_size]
+    shared_expert_gate: Option<DenseLinear>, // [1, hidden_size]
     num_experts_per_tok: usize,
     norm_topk_prob: bool,
 }
@@ -1020,7 +1020,7 @@ impl Qwen3_5SparseMoeBlock {
         let gate = {
             let gvb = vb.pp("gate");
             let w = gvb.get((num_experts, cfg.hidden_size), "weight")?;
-            NaiveLinear::new(w, None)
+            DenseLinear::new(w, None)
         };
 
         // Load fused expert weights: [num_experts, 2*inter, hidden] and [num_experts, hidden, inter]
@@ -1052,7 +1052,7 @@ impl Qwen3_5SparseMoeBlock {
             Some({
                 let gvb = vb.pp("shared_expert_gate");
                 let w = gvb.get((1, cfg.hidden_size), "weight")?;
-                NaiveLinear::new(w, None)
+                DenseLinear::new(w, None)
             })
         } else {
             None

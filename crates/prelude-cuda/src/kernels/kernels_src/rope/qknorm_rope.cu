@@ -18,16 +18,17 @@
 // Lane 0-15 handle dims [0, D/2), lane 16-31 handle dims [D/2, D).
 // Each lane holds D/32 consecutive elements. XOR with 16 swaps partners.
 extern "C" __global__ void fused_qknorm_rope_bf16(
-    const __nv_bfloat16* __restrict__ input,     // [n_rows, D]
+    const __nv_bfloat16* __restrict__ input,     // [total_tokens, num_heads, D] (token dim may be non-contig)
     const __nv_bfloat16* __restrict__ weight,    // [D] norm weight
     const __nv_bfloat16* __restrict__ cos_table, // [max_seq_len, D/2]
     const __nv_bfloat16* __restrict__ sin_table, // [max_seq_len, D/2]
     const uint32_t* __restrict__ pos_ids,        // [total_tokens]
-    __nv_bfloat16* __restrict__ output,          // [n_rows, D]
+    __nv_bfloat16* __restrict__ output,          // [n_rows, D] (always contiguous)
     uint32_t n_rows,        // total_tokens * num_heads
     uint32_t num_heads,
     uint32_t d,             // head_dim (must be multiple of 64, <= 256)
-    float eps
+    float eps,
+    uint32_t token_stride   // stride between tokens in input (num_heads*d when contiguous)
 ) {
     const uint32_t warp_id = threadIdx.x / 32;
     const uint32_t lane_id = threadIdx.x % 32;
@@ -38,9 +39,10 @@ extern "C" __global__ void fused_qknorm_rope_bf16(
     const uint32_t half_d = d / 2;
     const uint32_t epl = d / 32;   // elements per lane (4 for D=128)
     const uint32_t token = row / num_heads;
+    const uint32_t head = row % num_heads;
     const uint32_t pos = pos_ids[token];
 
-    const __nv_bfloat16* in_row = input + (uint64_t)row * d;
+    const __nv_bfloat16* in_row = input + (uint64_t)token * token_stride + (uint64_t)head * d;
     __nv_bfloat16* out_row = output + (uint64_t)row * d;
     const uint32_t dim_start = lane_id * epl;
 

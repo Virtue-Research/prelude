@@ -72,7 +72,7 @@ Build the model layers and implement the forward pass:
 
 ```rust
 pub struct MyModelForCausalLM {
-    embed_tokens: prelude_core::modules::embedding::Embedding,
+    embed_tokens: prelude_core::models::commons::embedding::Embedding,
     layers: Vec<MyDecoderLayer>,
     norm: RmsNorm,
     lm_head: Linear,

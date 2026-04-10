@@ -75,7 +75,7 @@ crates/
 │           ├── mod.rs                             # trait ModelForward, model_config! macro
 │           ├── layers/                            # Shared building blocks (weight containers + utilities)
 │           │   ├── mod.rs                         # Context structs (BatchAttnContext, PagedKvContext, etc.)
-│           │   ├── linear.rs                      # Linear, RmsNorm, NaiveLinear, QuantFormat registry
+│           │   ├── linear.rs                      # Linear, RmsNorm, DenseLinear, QuantFormat registry
 │           │   ├── embedding.rs                   # Embedding (vocab → hidden)
 │           │   └── attn_utils.rs                  # RotaryEmbedding, qknorm_rope_varlen, attention dispatch
 │           ├── registry.rs                        # ModelRegistry: inventory-based auto-registration (ArchSpec trait)
@@ -301,12 +301,25 @@ structs, 1:1 mapping to HuggingFace transformers. Models call `ops.xxx()` direct
 Shared weight containers (`Linear`, `Embedding`, `RotaryEmbedding`) live in `models/commons/`.
 **When a new fused kernel is added, OpsBundle is updated once — all models benefit automatically.**
 
-**Design principle: `Linear` is a parameter carrier, OpsBundle is the decision maker.**
-`Linear` holds weights + optional LoRA state. When fusion is needed (e.g. fused QKV+LoRA projection),
-`Linear` passes its weights to OpsBundle (`ops.qkv_projection(x, weights, lora_state)`), and
-OpsBundle handles fused/fallback/device dispatch. All decision logic lives in OpsBundle, never
-in `Linear` or model code. This ensures LoRA, quantization, and fusion work transparently across
-all devices without model-level branching.
+**Two polymorphism axes, two trait systems:**
+
+- **`LinearBackend`** (weight-format axis) — `Linear` is a front-end wrapper over
+  `Box<dyn LinearBackend>`. The backend is chosen at construction time based on what the
+  checkpoint contains (fp dense, GGUF Q4_0, GGUF Q4_K, GPU quant-gemm, oneDNN). Model code only
+  sees the concrete `Linear` type and doesn't know which backend is loaded. Current impls:
+  `DenseLinear` (prelude-core, fp16/bf16/f32), `OnednnLinear` (prelude-cpu), `Q4_0Linear` /
+  `Q4KLinear` (prelude-cpu, GGUF), `GpuQuantLinear` (prelude-cuda, GGUF via quant-gemm).
+
+- **`Ops`** (device / kernel-backend axis) — a `&'static dyn Ops` singleton is resolved per
+  device at startup. Provides fused kernels and attention dispatch. Attention kernel selection
+  (FA4 → FlashInfer → composed SDPA) is a fallback chain inside `Ops.varlen_attention`, not
+  another trait layer.
+
+Attention and MLP deliberately don't have analogous `AttentionBackend` / `MlpBackend` traits.
+Weight format is the only runtime-variable axis for a given model, and it only affects the matmul
+step — so only Linear needs backend polymorphism. Attention and MLP are concrete structs per
+model (like PyTorch's `LlamaAttention` / `LlamaMLP`); different models get different structs, not
+different implementations of a shared trait.
 
 ## Document Index
 

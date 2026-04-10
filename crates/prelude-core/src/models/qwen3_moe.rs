@@ -4,7 +4,7 @@ use crate::tensor::{DType, Device, Module, Result, Tensor, D};
 use crate::loading::var_builder::VarBuilder;
 use crate::models::commons::activation::Activation;
 use crate::models::commons::embedding::Embedding;
-use crate::models::commons::linear::NaiveLinear;
+use crate::models::commons::linear::DenseLinear;
 use crate::models::config::Qwen3Config;
 
 // Shared layer primitives (extracted from qwen3 into reusable modules)
@@ -115,7 +115,7 @@ fn count_tokens_per_expert(sorted_expert_ids: &Tensor, num_experts: usize, devic
 
 #[derive(Debug, Clone)]
 struct Qwen3SparseMoeBlock {
-    gate: NaiveLinear,
+    gate: DenseLinear,
     experts: Vec<Qwen3MoeExpert>,
     // Stacked expert weights for fused GEMM [num_experts, N, K]
     gate_w: Option<Tensor>,
@@ -130,7 +130,7 @@ impl Qwen3SparseMoeBlock {
         let gate = {
             let gvb = vb.pp("gate");
             let w = gvb.get((cfg.num_experts, cfg.hidden_size), "weight")?;
-            NaiveLinear::new(w, None)
+            DenseLinear::new(w, None)
         };
         let mut experts = Vec::with_capacity(cfg.num_experts);
         let vb_e = vb.pp("experts");

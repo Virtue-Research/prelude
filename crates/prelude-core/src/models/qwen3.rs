@@ -89,24 +89,18 @@ impl Qwen3Attention {
         )?;
 
         // Fused QKV: merge q_proj+k_proj+v_proj weights into single GEMM (saves 2 GEMM calls/layer)
-        // TODO: unconditional fusion breaks prompt_logprobs (PPL regression).
-        //   Decode benchmarks pass, but forward_hidden_states path produces wrong
-        //   logits when fused QKV is active on GPU. Re-enable after root-causing.
-        let qkv_proj = {
-            let qw = q_proj.weight();
-            if qw.device().is_cpu() && qw.dtype() == DType::BF16 {
-                let merged_w =
-                    Tensor::cat(&[qw, k_proj.weight(), v_proj.weight()], 0)?;
-                match Linear::from_weight(merged_w, None) {
-                    Ok(l) => Some(l),
-                    Err(e) => {
-                        tracing::warn!("Failed to create fused qkv_proj: {e}");
-                        None
-                    }
+        let qkv_proj = if !q_proj.is_quantized() {
+            let merged_w =
+                Tensor::cat(&[q_proj.weight(), k_proj.weight(), v_proj.weight()], 0)?;
+            match Linear::from_weight(merged_w, None) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    tracing::warn!("Failed to create fused qkv_proj: {e}");
+                    None
                 }
-            } else {
-                None
             }
+        } else {
+            None
         };
 
         Ok(Self {

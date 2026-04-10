@@ -55,6 +55,46 @@ crates/prelude-cuda/src/
 | `fused_qknorm_rope` | `rope.rs` | Q/K per-head RMS norm + RoPE | Q/K + norm weight + cos/sin tables | Per-head |
 | `fused_knorm_rope_kv_write` | `kv_cache.rs` | K-norm + RoPE + paged KV cache write | K/V + norm weight + cos/sin + cache + slot_mapping | 256 threads (8 warps) |
 
+## Stride-aware contract for packed-layout kernels
+
+**Rule:** any custom CUDA kernel that consumes a `[num_tokens, num_heads, head_dim]`-style
+packed layout **must read strides from the candle layout and honor them**, never assume
+contiguous `row * d` indexing.
+
+Why: model code produces strided Q/K/V views from fused QKV narrow
+(`qkv_out.narrow(1, 0, q_size).reshape((total, H, D))`) without calling `.contiguous()`. The
+stride-0 element count is `N_fused = q_size + 2*kv_size`, not `H * D`. A kernel that indexes
+via `input + row * d` reads the wrong memory and silently corrupts output. We have been bitten
+by this (PPL jumped to 3221 before we caught it).
+
+The only constraint the stride-aware path imposes on callers is `stride(-1) == 1` (head_dim
+contiguous). Everything else is free. This matches vLLM's convention and FlashInfer / FA4's
+upstream C++ APIs.
+
+**Implementation pattern** (see `crates/prelude-cuda/src/kernels/kernels_src/rope/qknorm_rope.cu`
+and the scatter-write kernel in `kvcache/scatter_kv_cache.cu` for reference):
+
+1. Kernel signature takes `uint32_t token_stride` (or `key_stride` / `value_stride`) as an
+   explicit parameter.
+2. Row addressing uses `input + (uint64_t)token * token_stride + (uint64_t)head * d`.
+3. Rust wrapper extracts the stride from candle's layout:
+   ```rust
+   let token_stride = x_layout.stride()[0] as u32;
+   // ... pass to kernel launch
+   ```
+4. `debug_assert!(x_layout.stride()[2] == 1)` to catch non-stride-1 last dim at dev time.
+
+**FFI wrappers that take raw pointers** (FA4, FlashInfer) must still pass strides through
+`DLTensor.strides` — never hardcode `contiguous_strides(shape)`. Both upstream kernels read
+`q.stride(0) / q.stride(1)` at runtime; the binding's job is to forward the real stride from
+candle's layout. See `crates/prelude-cuda/fa4/src/lib.rs::fa4_varlen_fwd` and
+`crates/prelude-cuda/src/attn/flashinfer.rs::ragged_prefill` for reference.
+
+Kernels that currently comply: `fused_qknorm_rope_bf16`, `scatter_kv_cache_flash`,
+`fa4_varlen_fwd` / `fa4_varlen_paged_fwd`, `flashinfer::ragged_prefill` /
+`paged_prefill_fast` / `paged_decode`. New kernels joining this set must follow the same
+convention.
+
 ## Step-by-Step: Adding a New Kernel
 
 ### 1. Write the CUDA kernel

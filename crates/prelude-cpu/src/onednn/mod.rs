@@ -3,7 +3,7 @@
 //! This module wraps the `crates/onednn-ffi` shared library, providing:
 //! - Raw FFI bindings ([`ffi`])
 //! - Safe Rust wrappers for GEMM, fused SiLU×Mul, and packed-weight management ([`ops`])
-//! - [`OnednnLinear`]: drop-in replacement for `NaiveLinear` with oneDNN dispatch
+//! - [`OnednnLinear`]: drop-in replacement for `DenseLinear` with oneDNN dispatch
 //! - INT8 W8A8 quantized GEMM via brgemm micro-kernels
 //! - FP8 (E4M3) GEMM (requires AVX10.2 AMX-2 hardware)
 //! - Post-ops fusion (bias, GELU, ReLU) into brgemm output path

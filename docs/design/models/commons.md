@@ -1,22 +1,20 @@
 ## Models & Shared Layers
 
-> **Note:** `modules/` has been replaced by `models/commons/`. This document describes the current architecture.
-
 ### Architecture
 
-Models are **self-contained** (like vLLM): each model file defines its own structs and forward logic,
-1:1 mapping to HuggingFace transformers. Models call `ops.xxx()` directly for all compute.
+Models are **self-contained** (like vLLM): each model file defines its own structs and forward
+logic, 1:1 mapping to HuggingFace transformers. Models call `ops.xxx()` directly for all compute.
 
 Shared components live in `models/commons/` — only things that are **universally common**:
 
 ```
 models/
-├── layers/
-│   ├── linear.rs         # Linear (unified: quantized + float + LoRA), RmsNorm
-│   ├��─ embedding.rs      # Embedding lookup
-│   ├── attn_utils.rs     # RotaryEmbedding, attention dispatch helpers
-│   └── mod.rs            # Context structs (BatchAttnContext, PagedKvContext), utilities
-├── qwen3.rs              # Self-contained: Qwen3Attention, Qwen3MLP, Qwen3DecoderLayer
+├── commons/
+│   ├── linear.rs         # Linear front-end + LinearBackend trait + DenseLinear, RmsNorm
+│   ├── embedding.rs      # Embedding lookup
+│   ├── attn_utils.rs     # RotaryEmbedding, fused_qkv_projection helper
+│   └── mod.rs            # Context structs (BatchAttnContext, LayerAttnContext), utilities
+├── qwen3.rs              # Self-contained: Attention, GatedMlp, DecoderLayer
 ├── qwen3_5.rs            # Self-contained: gated attention, DeltaNet
 ├── qwen3_moe.rs          # Self-contained: SparseMoeBlock
 └── ...
@@ -24,10 +22,10 @@ models/
 
 ### Fusion Strategy
 
-Fusion is handled entirely in **OpsBundle** — model code never does if/else on fusion:
+Fusion is handled entirely in **Ops** — model code never does if/else on fusion:
 
 ```rust
-// Model code — clean, no branching. Kernels hidden inside layer abstractions.
+// Model code — clean, no branching. Kernels hidden inside Ops.
 let (residual, normed) = self.input_layernorm.forward_residual(hidden, residual, ops)?;
 let hidden = self.self_attn.forward(&normed, ctx)?;
 let hidden = self.mlp.forward(&hidden, ops)?;
@@ -35,37 +33,62 @@ let hidden = self.mlp.forward(&hidden, ops)?;
 
 Ops internally: try device fused kernel → auto-fallback to composed ops.
 
-### Linear as Parameter Carrier
+### Linear: front-end wrapper + `LinearBackend` trait
 
-`Linear` holds weights + optional LoRA state. All compute decisions (fused QKV, LoRA dispatch,
-quantization) are delegated to OpsBundle:
+`Linear` is the concrete type model code sees. Internally it holds `Box<dyn LinearBackend>`, and
+the backend is chosen at construction time from what the checkpoint contains:
 
 ```rust
-// Linear passes its weights to OpsBundle for compute
-ops.qkv_projection(x, &q.weight, &k.weight, &v.weight, lora_state)
+pub struct Linear { inner: Box<dyn LinearBackend> }
+
+impl Linear {
+    pub fn forward(&self, x: &Tensor, ctx: &BatchState, ops: &dyn Ops) -> Result<Tensor> {
+        self.inner.forward(x)  // delegates to the active backend
+    }
+}
 ```
 
-This ensures LoRA, quantization, and fusion work transparently across all devices.
+`LinearBackend` is the only backend trait in the model layer. It exists because weight format is
+the one dimension that genuinely varies at runtime for a given model (fp dense vs GGUF Q4_0 vs
+Q4_K vs FP8 vs future formats). Each backend handles its own weight storage and matmul kernel
+dispatch:
+
+| Backend          | Crate         | Format                                          |
+|------------------|---------------|-------------------------------------------------|
+| `DenseLinear`    | prelude-core  | fp16/bf16/f32 (routes via candle's `matmul`)    |
+| `OnednnLinear`   | prelude-cpu   | CPU BF16/F32 with oneDNN packed weights         |
+| `Q4_0Linear`     | prelude-cpu   | GGUF Q4_0                                       |
+| `Q4KLinear`      | prelude-cpu   | GGUF Q4_K                                       |
+| `GpuQuantLinear` | prelude-cuda  | GGUF Q4_0/Q4_1/Q5_*/Q8_0/Q2K-Q6K via quant-gemm |
+
+All impls `impl Module + impl LinearBackend`. `Module::forward` does the compute; the extra
+`LinearBackend` methods (`name`, `is_quantized`, `clone_box`, `as_any`) provide identity queries.
+
+**`Attention` and `GatedMlp` deliberately don't have analogous backend traits.** Their structure
+is fixed per model — different models get different structs (`Qwen3Attention`, `LlamaAttention`,
+...), not different implementations of a shared trait. Attention *kernel* selection (FA4 vs
+FlashInfer vs composed SDPA) lives inside `Ops.varlen_attention` / `Ops.paged_attention` as a
+runtime fallback chain, not another trait layer. See
+[`subsystem_independence.md`](../subsystem_independence.md) for the reasoning.
 
 ### Device Crate Integration
 
 ```
 prelude-cuda/
-├── cuda_ops.rs           # impl all op traits, hot-path kernels
-└── ops/                  # CUDA kernel wrappers (rmsnorm, rope, kv_cache, moe, gemm)
+├── cuda_ops.rs           # impl Ops trait, hot-path kernels
+├── ops/                  # CUDA kernel wrappers (rmsnorm, rope, kv_cache, moe, gemm)
+└── quant_backends.rs     # GpuQuantLinear (LinearBackend + QuantFormat registration)
 
 prelude-cpu/
-├��─ cpu_ops.rs            # base() → CPU Ops: override specific ops (GGUF quant, oneDNN GEMM)
-└── linear_backends.rs    # QuantFormat registration (Q4_0, Q4_K via inventory)
+├── cpu_ops.rs            # impl Ops trait: CPU primitives + override specific ops
+├── linear_backends.rs    # OnednnLinearFactory, Q4_0Linear, Q4KLinear (LinearBackend + QuantFormat)
+└── onednn/               # oneDNN wrapper: OnednnLinear (LinearBackend impl)
 ```
 
-Device crates provide `OpsBundle` via builder pattern:
-```rust
-OpsBundle::from_all(composed)       // ComposedOps as base
-    .with_tensor(cuda.clone())      // override TensorOps with CUDA kernels
-    .with_attn(flash_attn)          // override attention with FlashAttn
-    .with_session(cuda_session)     // override session for CUDA graphs
-```
+Device crates register their `Ops` singleton via `register()` at startup. `LinearBackend` impls
+register themselves via `inventory::submit!` — `Linear::from_qtensor(qtensor)` walks the registry
+to find a handler for the GGML dtype, and `Linear::from_dense(dense)` on CPU consults
+`CpuLinearFactoryEntry` to wrap with `OnednnLinear` when available.
 
 ### Testing Strategy
 

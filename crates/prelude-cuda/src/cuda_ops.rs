@@ -70,9 +70,11 @@ impl Ops for CudaOps {
     fn attn_name(&self) -> &str { "cuda" }
 
     fn varlen_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, params: &VarlenParams) -> Result<Tensor> {
+        // All three backends are stride-aware on Q/K/V (requires only stride(-1) == 1):
+        // FA4 reads strides from DLTensor, FlashInfer reads q.stride(0)/stride(1) in
+        // its C++ wrapper, and the composed SDPA fallback materializes via to_dtype.
         if let Some(r) = try_fa4_varlen(q, k, v, params) { return r; }
         if let Some(r) = try_flashinfer_varlen(q, k, v, params) { return r; }
-        // Ultimate fallback: composed matmul SDPA
         prelude_core::ops::traits::attention::varlen_attention(q, k, v, params)
     }
 

@@ -162,6 +162,7 @@ fn varlen_paged_inner(
         let pt_ptr = cuda_ptr!(block_tables, u32);
 
         let q_shape: [i64; 3] = [total_q as i64, num_heads_q as i64, head_dim as i64];
+        let q_strides: Vec<i64> = q.layout().stride().iter().map(|&s| s as i64).collect();
         let k_shape: [i64; 4] = [
             key_cache.dim(0)? as i64,
             key_cache.dim(1)? as i64,
@@ -192,7 +193,7 @@ fn varlen_paged_inner(
                 cu_q_ptr as *mut c_void,
                 seqused_k_ptr as *mut c_void,
                 pt_ptr as *mut c_void,
-                &q_shape, &k_shape, &k_shape, &o_shape, &lse_shape,
+                &q_shape, &q_strides, &k_shape, &k_shape, &o_shape, &lse_shape,
                 &cu_q_shape, &seqused_k_shape, &pt_shape,
                 device_id,
                 None, None, // no window
@@ -262,9 +263,10 @@ fn call_fa4_vsplit(
     half_dim: usize,
 ) -> Result<Tensor> {
     let _num_kv_heads = v.dim(1)?;
-    // V: [total_k, num_kv_heads, head_dim] → split last dim
-    let v_lo = v.narrow(2, 0, half_dim)?.contiguous()?;
-    let v_hi = v.narrow(2, half_dim, half_dim)?.contiguous()?;
+    // V: [total_k, num_kv_heads, head_dim] → split last dim.
+    // Narrow preserves stride(-1)=1, and FA4 is stride-aware, so no contiguous needed.
+    let v_lo = v.narrow(2, 0, half_dim)?;
+    let v_hi = v.narrow(2, half_dim, half_dim)?;
 
     let o_lo = call_fa4_inner_vsplit(registry, func, q, k, &v_lo, cu_seqlens_q, cu_seqlens_k,
         softmax_scale, window_left, window_right, total_q, num_heads_q, head_dim, num_heads_k, half_dim)?;
@@ -323,6 +325,10 @@ fn call_fa4_inner_vsplit(
         let lse_shape: [i64; 2] = [num_heads_q as i64, total_q as i64];
         let cu_shape: [i64; 1] = [cu_seqlens_q.dim(0)? as i64];
 
+        let q_strides: Vec<i64> = q.layout().stride().iter().map(|&s| s as i64).collect();
+        let k_strides: Vec<i64> = k.layout().stride().iter().map(|&s| s as i64).collect();
+        let v_strides: Vec<i64> = v.layout().stride().iter().map(|&s| s as i64).collect();
+
         let device_id = q.device().ordinal() as i32;
 
         unsafe {
@@ -337,7 +343,10 @@ fn call_fa4_inner_vsplit(
                 raw_stream,
                 cu_q_ptr as *mut c_void,
                 cu_k_ptr as *mut c_void,
-                &q_shape, &k_shape, &v_shape, &o_shape, &lse_shape, &cu_shape,
+                &q_shape, &q_strides,
+                &k_shape, &k_strides,
+                &v_shape, &v_strides,
+                &o_shape, &lse_shape, &cu_shape,
                 device_id,
                 window_left, window_right,
                 None, None, // no seqused
@@ -397,6 +406,10 @@ fn call_fa4_inner(
         let lse_shape: [i64; 2] = [num_heads_q as i64, total_q as i64];
         let cu_shape: [i64; 1] = [cu_seqlens_q.dim(0)? as i64];
 
+        let q_strides: Vec<i64> = q.layout().stride().iter().map(|&s| s as i64).collect();
+        let k_strides: Vec<i64> = k.layout().stride().iter().map(|&s| s as i64).collect();
+        let v_strides: Vec<i64> = v.layout().stride().iter().map(|&s| s as i64).collect();
+
         let device_id = q.device().ordinal() as i32;
 
         unsafe {
@@ -411,7 +424,10 @@ fn call_fa4_inner(
                 raw_stream,
                 cu_q_ptr as *mut c_void,
                 cu_k_ptr as *mut c_void,
-                &q_shape, &k_shape, &v_shape, &o_shape, &lse_shape, &cu_shape,
+                &q_shape, &q_strides,
+                &k_shape, &k_strides,
+                &v_shape, &v_strides,
+                &o_shape, &lse_shape, &cu_shape,
                 device_id,
                 window_left, window_right,
                 None, None, // no seqused

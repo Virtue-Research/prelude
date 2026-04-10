@@ -674,8 +674,16 @@ fn ragged_prefill(
     let fws_st = contiguous_strides(&fws);
     let iws_st = contiguous_strides(&iws);
     let cus_st = contiguous_strides(&cus);
-    let qs_st = contiguous_strides(&qs);
-    let ks_st = contiguous_strides(&ks);
+    // Q/K/V strides come from candle layouts so strided views (e.g. from fused
+    // QKV narrow) are supported. FlashInfer kernels read strides from DLTensor.
+    let qs_st: Vec<i64> = q.layout().stride().iter().map(|&s| s as i64).collect();
+    let ks_st: Vec<i64> = k.layout().stride().iter().map(|&s| s as i64).collect();
+    let vs_st: Vec<i64> = v.layout().stride().iter().map(|&s| s as i64).collect();
+    debug_assert_eq!(qs_st.last().copied(), Some(1), "FlashInfer requires Q stride(-1) == 1");
+    debug_assert_eq!(ks_st.last().copied(), Some(1), "FlashInfer requires K stride(-1) == 1");
+    debug_assert_eq!(vs_st.last().copied(), Some(1), "FlashInfer requires V stride(-1) == 1");
+    // Output is freshly allocated, always contiguous.
+    let os_st = contiguous_strides(&qs);
 
     let dl_fws = make_gpu_dl(ws.float_ws, did, U8_DT, &fws, &fws_st);
     let dl_iws = make_gpu_dl(ws.int_ws, did, U8_DT, &iws, &iws_st);
@@ -684,8 +692,8 @@ fn ragged_prefill(
     let dl_cuk_gpu = make_gpu_dl(cu_k_gpu, did, I32_DT, &cus, &cus_st);
     let dl_q = make_gpu_dl(q_ptr, did, BF16_DT, &qs, &qs_st);
     let dl_k = make_gpu_dl(k_ptr, did, BF16_DT, &ks, &ks_st);
-    let dl_v = make_gpu_dl(v_ptr, did, BF16_DT, &ks, &ks_st);
-    let dl_o = make_gpu_dl(o_ptr, did, BF16_DT, &qs, &qs_st);
+    let dl_v = make_gpu_dl(v_ptr, did, BF16_DT, &ks, &vs_st);
+    let dl_o = make_gpu_dl(o_ptr, did, BF16_DT, &qs, &os_st);
 
     reg.set_stream(did, raw_stream);
 
@@ -852,7 +860,10 @@ fn paged_decode(
     let ip_st = contiguous_strides(&ip_s);
     let ix_st = contiguous_strides(&ix_s);
     let lp_st = contiguous_strides(&lp_s);
-    let qs_st = contiguous_strides(&qs);
+    // Q may be a strided view (fused QKV narrow); K/V caches are contiguous allocs.
+    let qs_st: Vec<i64> = q.layout().stride().iter().map(|&s| s as i64).collect();
+    debug_assert_eq!(qs_st.last().copied(), Some(1), "FlashInfer requires Q stride(-1) == 1");
+    let os_st = contiguous_strides(&qs);
     let kvs_st = contiguous_strides(&kvs);
     let es_st: [i64; 1] = [1];
 
@@ -866,7 +877,7 @@ fn paged_decode(
     let dl_q = make_gpu_dl(q_ptr, did, BF16_DT, &qs, &qs_st);
     let dl_k = make_gpu_dl(k_ptr, did, BF16_DT, &kvs, &kvs_st);
     let dl_v = make_gpu_dl(v_ptr, did, BF16_DT, &kvs, &kvs_st);
-    let dl_o = make_gpu_dl(o_ptr, did, BF16_DT, &qs, &qs_st);
+    let dl_o = make_gpu_dl(o_ptr, did, BF16_DT, &qs, &os_st);
     let dl_eq = make_gpu_dl(std::ptr::null_mut(), did, BF16_DT, &es, &es_st);
     let dl_ek = make_gpu_dl(std::ptr::null_mut(), did, BF16_DT, &es, &es_st);
 
@@ -983,7 +994,10 @@ fn paged_prefill_impl(
     let ip_st = contiguous_strides(&ip_s);
     let ix_st = contiguous_strides(&ix_s);
     let lp_st = contiguous_strides(&lp_s);
-    let qs_st = contiguous_strides(&qs);
+    // Q may be a strided view (fused QKV narrow); K/V caches are contiguous allocs.
+    let qs_st: Vec<i64> = q.layout().stride().iter().map(|&s| s as i64).collect();
+    debug_assert_eq!(qs_st.last().copied(), Some(1), "FlashInfer requires Q stride(-1) == 1");
+    let os_st = contiguous_strides(&qs);
     let kvs_st = contiguous_strides(&kvs);
 
     let dl_fws = make_gpu_dl(ws.float_ws, did, U8_DT, &fws, &fws_st);
@@ -995,7 +1009,7 @@ fn paged_prefill_impl(
     let dl_q = make_gpu_dl(q_ptr, did, BF16_DT, &qs, &qs_st);
     let dl_k = make_gpu_dl(k_ptr, did, BF16_DT, &kvs, &kvs_st);
     let dl_v = make_gpu_dl(v_ptr, did, BF16_DT, &kvs, &kvs_st);
-    let dl_o = make_gpu_dl(o_ptr, did, BF16_DT, &qs, &qs_st);
+    let dl_o = make_gpu_dl(o_ptr, did, BF16_DT, &qs, &os_st);
 
     reg.set_stream(did, raw_stream);
 

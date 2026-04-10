@@ -40,3 +40,7 @@ prelude-cula = { path = "cula" }
 [[bin]]
 name = "fused_ops_test"
 path = "src/bin/fused_ops_test.rs"
+
+[[bin]]
+name = "bench_kernel"
+path = "src/bin/bench_kernel.rs"
