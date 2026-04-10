@@ -89,13 +89,43 @@ impl DeltaNetPool {
     }
 
     /// Allocate a slot for a new request. Returns `None` if the pool is exhausted.
+    ///
+    /// The slot's per-layer recurrent and conv state is zeroed before the slot
+    /// is handed out so the caller sees a clean state (matches vLLM / SGLang
+    /// semantics — requests that reuse a previously freed slot must not see
+    /// stale state from the previous occupant).
     pub fn allocate(&mut self) -> Option<u32> {
-        self.free_slots.pop_front()
+        let slot = self.free_slots.pop_front()?;
+        if let Err(e) = self.reset_slot(slot) {
+            // Put the slot back and surface the failure as "no slot". This
+            // keeps the signature Option<u32>; the zero-fill is a tiny
+            // slice_set per layer and should never realistically fail.
+            tracing::error!(?e, slot, "DeltaNetPool::allocate reset_slot failed");
+            self.free_slots.push_front(slot);
+            return None;
+        }
+        Some(slot)
     }
 
     /// Free a slot when a request finishes or is preempted.
     pub fn free(&mut self, slot: u32) {
         self.free_slots.push_back(slot);
+    }
+
+    /// Zero the recurrent and conv state at `slot` across every DeltaNet layer.
+    /// Uses `slice_set`, which goes through candle's interior-mutable storage
+    /// and so only needs `&self`.
+    pub fn reset_slot(&self, slot: u32) -> Result<()> {
+        let slot = slot as usize;
+        for rs in &self.recurrent_states {
+            let zero = Tensor::zeros(&rs.dims()[1..], rs.dtype(), rs.device())?;
+            rs.slice_set(&zero.unsqueeze(0)?, 0, slot)?;
+        }
+        for cs in &self.conv_states {
+            let zero = Tensor::zeros(&cs.dims()[1..], cs.dtype(), cs.device())?;
+            cs.slice_set(&zero.unsqueeze(0)?, 0, slot)?;
+        }
+        Ok(())
     }
 
     /// Number of available (unallocated) slots.

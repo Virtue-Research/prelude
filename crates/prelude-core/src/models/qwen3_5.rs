@@ -1274,10 +1274,13 @@ pub(super) struct Qwen3_5DecoderLayer {
     rms_norm_eps: f32,
 }
 
-/// Free function to run DeltaNet on packed varlen input (avoids borrow conflicts).
-/// Prefill (len > 1) clears state per-sequence so fresh requests start from
-/// zero; decode (len == 1) reuses the layer's transient `recurrent_state` so
-/// the single-request path still accumulates history across decode steps.
+/// Free function to run DeltaNet on packed varlen input WITHOUT the pool
+/// (single-batch prefill-only path, e.g. `prefill_pipeline` on servers that
+/// have no DeltaNet pool wired up). State is cleared per sequence so each
+/// batch starts fresh and requests can't leak state into each other through
+/// `gdn`'s transient fields. Decode never lands here — the GPU decode runners
+/// always build `BatchAttnContext` with `deltanet_slots` populated, which
+/// takes `deltanet_varlen_pooled` instead.
 fn deltanet_varlen(
     gdn: &mut Qwen3_5GatedDeltaNet,
     packed: &Tensor,
@@ -1287,19 +1290,27 @@ fn deltanet_varlen(
     let mut outputs = Vec::new();
     let mut offset = 0usize;
     for &len in seq_lens {
-        if len > 1 {
-            gdn.clear_state();
-        }
+        gdn.clear_state();
         let seq = packed.narrow(0, offset, len)?.unsqueeze(0)?; // [1, L, D]
         let out = gdn.forward(&seq, 0, ops)?; // [1, L, D]
         outputs.push(out.squeeze(0)?); // [L, D]
         offset += len;
     }
+    gdn.clear_state();
     Tensor::cat(&outputs, 0) // [total_tokens, D]
 }
 
-/// Pooled varlen DeltaNet: process each sequence independently, scatter final state to pool.
-/// Used during prefill to initialize per-request state in the pool.
+/// Pooled varlen DeltaNet: for each sequence in the batch,
+///   1. load this request's recurrent + conv state from the pool slot,
+///   2. run the per-token delta rule / conv1d forward,
+///   3. write the updated state back to the same slot.
+///
+/// Works for both prefill (len > 1, starting from zero because
+/// `DeltaNetPool::allocate` zeros the slot) and decode (len == 1, reading the
+/// state left over from the previous decode step). `gdn`'s transient
+/// `recurrent_state` / `conv_state` fields are used as per-call scratch — we
+/// load into them before `gdn.forward` and clear them after we scatter back,
+/// so concurrent requests sharing the same layer struct don't leak state.
 fn deltanet_varlen_pooled(
     gdn: &mut Qwen3_5GatedDeltaNet,
     packed: &Tensor,
@@ -1312,29 +1323,40 @@ fn deltanet_varlen_pooled(
     let mut outputs = Vec::new();
     let mut offset = 0usize;
     for (i, &len) in seq_lens.iter().enumerate() {
-        gdn.clear_state();
+        let slot = slot_ids[i] as usize;
+
+        // Load this request's state from the pool into the layer scratch.
+        // Force contiguous so downstream ops (matmul, slice_set on write-back)
+        // see a dense layout. `get(slot)` strips the leading max_slots dim.
+        gdn.recurrent_state = Some(
+            pool.recurrent_states[dn_layer_idx]
+                .get(slot)?
+                .contiguous()?,
+        );
+        gdn.conv_state = Some(
+            pool.conv_states[dn_layer_idx]
+                .get(slot)?
+                .contiguous()?,
+        );
+
         let seq = packed.narrow(0, offset, len)?.unsqueeze(0)?; // [1, L, D]
         let out = gdn.forward(&seq, 0, ops)?; // [1, L, D]
         outputs.push(out.squeeze(0)?); // [L, D]
 
-        // Scatter final state to pool at this request's slot
+        // Scatter updated state back to the same slot. `slice_set` needs the
+        // src contiguous, and intermediate broadcasts in delta_rule_step can
+        // leave a non-contiguous layout, so materialize before write-back.
         if let Some(ref state) = gdn.recurrent_state {
-            pool.recurrent_states[dn_layer_idx].slice_set(
-                &state.unsqueeze(0)?,
-                0,
-                slot_ids[i] as usize,
-            )?;
+            let row = state.contiguous()?.unsqueeze(0)?.contiguous()?;
+            pool.recurrent_states[dn_layer_idx].slice_set(&row, 0, slot)?;
         }
         if let Some(ref state) = gdn.conv_state {
-            pool.conv_states[dn_layer_idx].slice_set(
-                &state.unsqueeze(0)?,
-                0,
-                slot_ids[i] as usize,
-            )?;
+            let row = state.contiguous()?.unsqueeze(0)?.contiguous()?;
+            pool.conv_states[dn_layer_idx].slice_set(&row, 0, slot)?;
         }
         offset += len;
     }
-    gdn.clear_state(); // State is now in the pool
+    gdn.clear_state(); // scratch is only valid within this call
     Tensor::cat(&outputs, 0) // [total_tokens, D]
 }
 

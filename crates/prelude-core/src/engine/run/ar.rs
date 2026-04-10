@@ -146,10 +146,11 @@ pub async fn ar_loop(
     let mut rx_open = true;
 
     loop {
+        let deltanet_pool_ref = engine.cache.deltanet_pool.as_ref();
         // ── Phase 1: Wait for at least one request if idle ─────────
         if !scheduler.has_work() {
             match rx.recv().await {
-                Some(msg) => handle_message(msg, &mut scheduler, &mut states),
+                Some(msg) => handle_message(msg, &mut scheduler, &mut states, deltanet_pool_ref),
                 None => { rx_open = false; }
             }
         }
@@ -157,7 +158,7 @@ pub async fn ar_loop(
         // ── Phase 2: Drain all pending messages (non-blocking) ─────
         loop {
             match rx.try_recv() {
-                Ok(msg) => handle_message(msg, &mut scheduler, &mut states),
+                Ok(msg) => handle_message(msg, &mut scheduler, &mut states, deltanet_pool_ref),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => { rx_open = false; break; }
             }
@@ -208,11 +209,12 @@ fn handle_message(
     msg: ArMessage,
     scheduler: &mut Scheduler,
     states: &mut HashMap<String, ArSequenceState>,
+    deltanet_pool: Option<&std::sync::Mutex<crate::cache::deltanet_pool::DeltaNetPool>>,
 ) {
     match msg {
         ArMessage::NewRequest { prepared, response } => {
             let request_id = prepared.request.request_id.clone();
-            let seq = Sequence::new(
+            let mut seq = Sequence::new(
                 request_id.clone(),
                 prepared.prompt_tokens.clone(),
                 SamplingParams::default(),
@@ -221,6 +223,25 @@ fn handle_message(
                 prepared.request.stop.token_ids.clone(),
                 None,
             );
+            // Allocate a DeltaNet pool slot for hybrid models before queueing.
+            // `allocate` zeros the slot so a fresh request always starts from
+            // clean recurrent + conv state; `release_resources` frees it when
+            // the sequence finishes.
+            if let Some(pool_mutex) = deltanet_pool {
+                if let Ok(mut pool) = pool_mutex.lock() {
+                    match pool.allocate() {
+                        Some(slot) => {
+                            seq.deltanet_slot = Some(slot);
+                        }
+                        None => {
+                            tracing::warn!(
+                                rid = %request_id,
+                                "DeltaNet pool exhausted — request will run without per-request state isolation"
+                            );
+                        }
+                    }
+                }
+            }
             scheduler.add_request(seq);
             let max_new_tokens = prepared.max_new;
             states.insert(request_id, ArSequenceState {
@@ -682,6 +703,7 @@ mod tests {
             },
             &mut scheduler,
             &mut states,
+            None,
         );
 
         assert_eq!(scheduler.num_waiting(), 1);
@@ -702,6 +724,7 @@ mod tests {
             },
             &mut scheduler,
             &mut states,
+            None,
         );
         assert_eq!(scheduler.num_waiting(), 1);
 
@@ -709,6 +732,7 @@ mod tests {
             ArMessage::Abort("r1".into()),
             &mut scheduler,
             &mut states,
+            None,
         );
         assert!(states.is_empty());
     }
