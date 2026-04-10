@@ -326,6 +326,19 @@ pub struct ChatMessageOut {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Matches vLLM's `ChatMessage.reasoning` field (the old name
+    /// `reasoning_content` is marked deprecated in current vLLM HEAD —
+    /// see `vllm/entrypoints/openai/chat_completion/protocol.py` line 64
+    /// and `vllm/entrypoints/chat_utils.py` line 330). When the model was
+    /// prompted with a thinking-mode chat template (e.g. Qwen3.5's
+    /// template emits `<think>\n`), the model output is split on
+    /// `</think>`: everything before goes in `reasoning`, everything
+    /// after in `content`. If the model never closed the `<think>` block
+    /// within the generation budget, `content` is empty and the entire
+    /// output lives in `reasoning`. `None` means the server didn't
+    /// attempt a split (non-reasoning model).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 // ── Health / Models ──
