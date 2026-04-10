@@ -31,7 +31,11 @@ pub struct DeltaNetPoolConfig {
 /// Unlike the paged KV cache (which grows with sequence length), DeltaNet state
 /// is fixed-size per layer per request. A simple free-list slot allocator suffices.
 pub struct DeltaNetPool {
-    /// Per DeltaNet layer: `[max_slots, num_v_heads, head_k_dim, head_v_dim]` in F32.
+    /// Per DeltaNet layer: `[max_slots, num_v_heads, head_v_dim, head_k_dim]`
+    /// in F32. Note the (V, K) order — this matches cuLA's `kda_decode` state
+    /// contract (`h0_source.shape == (pool_size, HV, V, K)`) so the fused
+    /// batched decode kernel can read/write pool slots directly via slot
+    /// indices without a transpose copy.
     pub recurrent_states: Vec<Tensor>,
     /// Per DeltaNet layer: `[max_slots, conv_dim, conv_kernel - 1]` in model dtype.
     pub conv_states: Vec<Tensor>,
@@ -64,8 +68,8 @@ impl DeltaNetPool {
                 (
                     max_slots as usize,
                     cfg.num_v_heads,
-                    cfg.head_k_dim,
                     cfg.head_v_dim,
+                    cfg.head_k_dim,
                 ),
                 DType::F32,
                 device,

@@ -172,6 +172,30 @@ impl Ops for CudaOps {
         Some(crate::ops::moe::moe_gemm_wmma(input, weights, &Some(topk_weights.clone()), sorted_token_ids, sorted_expert_ids, topk, is_prefill))
     }
 
+    fn kda_decode_batched(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        a_raw: &Tensor,
+        b_raw: &Tensor,
+        a_log: &Tensor,
+        dt_bias: &Tensor,
+        pool_state: &Tensor,
+        slot_ids: &Tensor,
+    ) -> Option<Result<Tensor>> {
+        // The wrapper returns Ok(None) when no compiled variant matches the
+        // GPU arch or model dims — lift that into `None` at the Ops layer so
+        // the caller can fall back cleanly.
+        match crate::attn::kda_decode::try_decode(
+            q, k, v, a_raw, b_raw, a_log, dt_bias, pool_state, slot_ids,
+        ) {
+            Ok(Some(out)) => Some(Ok(out)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
     // ── Session ───────────────────────────────────────────────────
 
     fn begin_forward(&self) {

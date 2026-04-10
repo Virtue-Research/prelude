@@ -229,7 +229,7 @@ struct Qwen3NextGatedDeltaNet {
     out_proj: Linear,
     // State
     conv_state: Option<Tensor>,      // [conv_dim, kernel-1]
-    recurrent_state: Option<Tensor>, // [num_v_heads, k_dim, v_dim] in f32
+    recurrent_state: Option<Tensor>, // [num_v_heads, v_dim, k_dim] in f32
     // Config
     num_k_heads: usize,
     num_v_heads: usize,
@@ -447,10 +447,13 @@ impl Qwen3NextGatedDeltaNet {
         // beta = sigmoid(b)
         let beta = ops.sigmoid(b)?;
 
-        // Initialize recurrent state if needed
+        // Initialize recurrent state if needed. Shape (V, K) matches
+        // `DeltaNetPool`'s `[slots, HV, V, K]` layout, so the pooled varlen
+        // writer in this file can scatter `recurrent_state` into a pool row
+        // without transposing.
         if self.recurrent_state.is_none() {
             self.recurrent_state = Some(Tensor::zeros(
-                (self.num_v_heads, self.head_k_dim, self.head_v_dim),
+                (self.num_v_heads, self.head_v_dim, self.head_k_dim),
                 DType::F32,
                 device,
             )?);
@@ -468,14 +471,14 @@ impl Qwen3NextGatedDeltaNet {
         let scale = (self.head_k_dim as f64).powf(-0.5);
         let q_f32 = (q_f32 * scale)?;
 
-        // 1. Decay the state: state *= exp(g)
+        // 1. Decay the state: state *= exp(g). state is [V_heads, v_dim, k_dim].
         let decay = g_f32.exp()?.reshape((self.num_v_heads, 1, 1))?;
         let state_decayed = state.broadcast_mul(&decay)?;
 
-        // 2. Delta correction: v -= state^T @ k (prediction error)
-        // prediction = state^T @ k: [V_heads, v_dim, k_dim] @ [V_heads, k_dim, 1] -> [V_heads, v_dim]
+        // 2. Delta correction: v -= state @ k (prediction error)
+        // prediction[h, v] = Σ_k state[h, v, k] * k[h, k]
+        // state: [V_heads, v_dim, k_dim], k.unsqueeze(2): [V_heads, k_dim, 1]
         let prediction = state_decayed
-            .transpose(1, 2)? // [V_heads, v_dim, k_dim]
             .matmul(&k_f32.unsqueeze(2)?)? // [V_heads, v_dim, 1]
             .squeeze(2)?; // [V_heads, v_dim]
         let v_residual = (v_f32 - prediction)?;
@@ -483,13 +486,13 @@ impl Qwen3NextGatedDeltaNet {
         // 3. Gate the residual: v_gated = v_residual * beta
         let v_gated = v_residual.broadcast_mul(&beta_f32.unsqueeze(1)?)?;
 
-        // 4. Update state: state += outer(k, v_gated)
-        let outer = k_f32.unsqueeze(2)?.matmul(&v_gated.unsqueeze(1)?)?;
+        // 4. Update state: state += outer(v_gated, k)
+        // outer[h, v, k] = v_gated[h, v] * k[h, k]
+        let outer = v_gated.unsqueeze(2)?.matmul(&k_f32.unsqueeze(1)?)?;
         let new_state = (state_decayed + outer)?;
 
-        // 5. Output = state^T @ q (with scale applied to q above)
+        // 5. Output[h, v] = Σ_k new_state[h, v, k] * q[h, k]
         let output = new_state
-            .transpose(1, 2)? // [V_heads, v_dim, k_dim]
             .matmul(&q_f32.unsqueeze(2)?)? // [V_heads, v_dim, 1]
             .squeeze(2)?; // [V_heads, v_dim]
 

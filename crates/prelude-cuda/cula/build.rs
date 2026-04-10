@@ -324,12 +324,19 @@ runpy.run_path(script_path, run_name='__main__')
         // `cula.cudac` C extension (which only lives in site-packages). Drop
         // the override and rely on `ensure_python_env` to keep the venv in
         // sync with the source tree.
+        //
+        // CUTE_DSL_ENABLE_TVM_FFI=1 makes the AOT `export_to_c` pipeline emit
+        // `__tvm_ffi_<name>` wrapper symbols around the MLIR/CUTLASS kernels.
+        // Without it, the .o contains only the raw `_cuda_init` /
+        // `_cutlass_...` / `_mlir_ciface_...` entry points and there's no
+        // stable callable for the dispatch table to reference.
         let output = Command::new(&python)
             .arg("-c").arg(bootstrap)
             .arg(&script)
             .arg("--output-dir").arg(&arch_dir)
             .args(["-j", &workers])
             .env("CUTE_DSL_ARCH", format!("{arch}a"))
+            .env("CUTE_DSL_ENABLE_TVM_FFI", "1")
             .output();
 
         match &output {

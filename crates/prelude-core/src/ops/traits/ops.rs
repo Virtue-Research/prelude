@@ -210,6 +210,43 @@ pub trait Ops: Send + Sync {
         _adapter_indices: &Tensor, _lora_scale: f32,
     ) -> Option<Result<Tensor>> { None }
 
+    /// Fused Gated DeltaNet (KDA) batched single-token decode.
+    ///
+    /// Runs the full delta rule step for an entire decode batch in one CUDA
+    /// kernel call. Each request's recurrent state lives in the pool at
+    /// `pool_state[slot_ids[i]]` and is updated in place. The kernel does
+    /// its own L2 norm on q/k and its own softplus-based gate computation,
+    /// so inputs are passed raw.
+    ///
+    /// Shapes (one token per request, `N` requests in the batch):
+    /// - `q`, `k`: `[N, H, K]` BF16
+    /// - `v`: `[N, HV, V]` BF16
+    /// - `a_raw`: `[N, HV]` BF16 (from `in_proj_a`)
+    /// - `b_raw`: `[N, HV]` BF16 (from `in_proj_b`)
+    /// - `a_log`: `[HV]` F32 (layer param)
+    /// - `dt_bias`: `[HV]` (any float dtype) — scalar per v-head
+    /// - `pool_state`: `[pool_size, HV, V, K]` F32 (read AND written)
+    /// - `slot_ids`: `[N]` U32 on the same device
+    ///
+    /// Returns `[N, HV, V]` BF16 on success.
+    ///
+    /// Returns `None` if no backend kernel is available for this GPU
+    /// architecture or `(H, HV, K, V)` combination, so the caller can
+    /// fall back to a sequential delta-rule loop.
+    #[allow(clippy::too_many_arguments)]
+    fn kda_decode_batched(
+        &self,
+        _q: &Tensor,
+        _k: &Tensor,
+        _v: &Tensor,
+        _a_raw: &Tensor,
+        _b_raw: &Tensor,
+        _a_log: &Tensor,
+        _dt_bias: &Tensor,
+        _pool_state: &Tensor,
+        _slot_ids: &Tensor,
+    ) -> Option<Result<Tensor>> { None }
+
     // ════════════════════════════════════════════════════════════════
     // Convenience: try fused → fallback to composed
     // ════════════════════════════════════════════════════════════════

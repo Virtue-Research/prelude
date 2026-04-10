@@ -264,17 +264,55 @@ def compile_kda_decode(spec: KdaDecodeSpec, arch: int, output_dir: Path):
         h0_idx   = torch.zeros(N_placeholder,       dtype=torch.int32,   device="cuda")
         cu_sql   = torch.zeros(N_placeholder + 1,   dtype=torch.int32,   device="cuda")
 
-        cu_sql_t = from_dlpack(cu_sql,  assumed_align=16)
-        q_t      = from_dlpack(q,       assumed_align=16)
-        k_t      = from_dlpack(k,       assumed_align=16)
-        v_t      = from_dlpack(v,       assumed_align=16)
-        a_t      = from_dlpack(a,       assumed_align=16)
-        b_t      = from_dlpack(b,       assumed_align=16)
-        A_log_t  = from_dlpack(A_log,   assumed_align=16)
-        dt_bias_t= from_dlpack(dt_bias, assumed_align=16)
-        h0_src_t = from_dlpack(h0_src,  assumed_align=16)
-        h0_idx_t = from_dlpack(h0_idx,  assumed_align=16)
-        o_t      = from_dlpack(o,       assumed_align=16)
+        # Mark the dims that vary at runtime as dynamic. Batch size `N` and
+        # pool_size must be dynamic or the TVM FFI wrapper bakes the
+        # placeholder values into the exported kernel as shape asserts.
+        # `mark_compact_shape_dynamic(mode=i, stride_order=...)` marks dim
+        # `i` dynamic while fixing the innermost stride-1 axis.
+        cu_sql_t = (
+            from_dlpack(cu_sql, assumed_align=16)
+            .mark_compact_shape_dynamic(mode=0, stride_order=cu_sql.dim_order())
+        )
+        if is_varlen:
+            # q/k/v/o are [1, N, H, K] or [1, N, HV, V] — dim 1 is the batch.
+            q_t = from_dlpack(q, assumed_align=16) \
+                .mark_compact_shape_dynamic(mode=1, stride_order=q.dim_order())
+            k_t = from_dlpack(k, assumed_align=16) \
+                .mark_compact_shape_dynamic(mode=1, stride_order=k.dim_order())
+            v_t = from_dlpack(v, assumed_align=16) \
+                .mark_compact_shape_dynamic(mode=1, stride_order=v.dim_order())
+            o_t = from_dlpack(o, assumed_align=16) \
+                .mark_compact_shape_dynamic(mode=1, stride_order=o.dim_order())
+            # a is [N, HV, K], b is [N, HV] — dim 0 is the batch.
+            a_t = from_dlpack(a, assumed_align=16) \
+                .mark_compact_shape_dynamic(mode=0, stride_order=a.dim_order())
+            b_t = from_dlpack(b, assumed_align=16) \
+                .mark_compact_shape_dynamic(mode=0, stride_order=b.dim_order())
+        else:
+            # dense layout: q/k/v/o = [N, 1, ...], a = [N, 1, HV, K], b = [N, 1, HV]
+            q_t = from_dlpack(q, assumed_align=16) \
+                .mark_compact_shape_dynamic(mode=0, stride_order=q.dim_order())
+            k_t = from_dlpack(k, assumed_align=16) \
+                .mark_compact_shape_dynamic(mode=0, stride_order=k.dim_order())
+            v_t = from_dlpack(v, assumed_align=16) \
+                .mark_compact_shape_dynamic(mode=0, stride_order=v.dim_order())
+            o_t = from_dlpack(o, assumed_align=16) \
+                .mark_compact_shape_dynamic(mode=0, stride_order=o.dim_order())
+            a_t = from_dlpack(a, assumed_align=16) \
+                .mark_compact_shape_dynamic(mode=0, stride_order=a.dim_order())
+            b_t = from_dlpack(b, assumed_align=16) \
+                .mark_compact_shape_dynamic(mode=0, stride_order=b.dim_order())
+        A_log_t = from_dlpack(A_log, assumed_align=16)
+        dt_bias_t = from_dlpack(dt_bias, assumed_align=16)
+        # h0_source: pool_size (dim 0) is dynamic, HV/V/K are fixed by spec.
+        h0_src_t = (
+            from_dlpack(h0_src, assumed_align=16)
+            .mark_compact_shape_dynamic(mode=0, stride_order=h0_src.dim_order())
+        )
+        h0_idx_t = (
+            from_dlpack(h0_idx, assumed_align=16)
+            .mark_compact_shape_dynamic(mode=0, stride_order=h0_idx.dim_order())
+        )
 
         stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -292,16 +330,14 @@ def compile_kda_decode(spec: KdaDecodeSpec, arch: int, output_dir: Path):
             stream=stream,
         )
 
-        # New cutlass-dsl API: `file_path` is the OUTPUT DIRECTORY and
-        # `file_name` is the basename (without extension). It writes
-        # `{file_path}/{file_name}.o` + `.h` next to each other.
-        compiled.export_to_c(file_path=str(output_dir), file_name=name)
-        if not obj_path.exists():
-            # Some DSL versions name the output differently; search for a .o
-            # containing the name.
-            candidates = list(output_dir.glob(f"{name}*.o"))
-            if candidates:
-                candidates[0].rename(obj_path)
+        # When CUTE_DSL_ENABLE_TVM_FFI=1 is set (in build.rs), `cute.compile`
+        # returns a `TVMFFIJitCompiledFunctionBase` whose `export_to_c` keeps
+        # the older kwargs: `object_file_path` + `function_name`. This matches
+        # the other compile_* functions in this file.
+        compiled.export_to_c(
+            object_file_path=str(obj_path),
+            function_name=name,
+        )
         print(f"    Exported .o: {obj_path} ({obj_path.stat().st_size // 1024}KB)")
         _verify_symbol(obj_path, name)
         return _result(name, arch, obj_path, "kda_decode", spec.__dict__)
@@ -421,13 +457,21 @@ def build_variant_matrix(arch: int, prototype: bool = False):
                             H=H, K=D, V=D, chunk_size=cs, scale=1.0,
                             is_varlen=varlen, persistent=persistent,
                         ))
-        # KDA decode: one kernel per (H, HV=H, K=128, V=128) × 4 variants.
+        # KDA decode: one kernel per (H, HV, K=128, V=128) × 4 variants.
         # Kernel launcher reads runtime batch size / pool size from tensors,
         # so we only specialize on head counts + variant.
         for variant in ("small_dense", "small_varlen", "large_dense", "large_varlen"):
+            # MHA: H == HV
             kda_decode_specs.append(KdaDecodeSpec(
                 H=H, HV=H, K=128, V=128, variant=variant, use_qk_l2norm=True,
             ))
+
+    # GQA variants we care about. Add as new models land.
+    # Qwen3.5-35B-A3B: linear_num_key_heads=16, linear_num_value_heads=32
+    for variant in ("small_dense", "small_varlen", "large_dense", "large_varlen"):
+        kda_decode_specs.append(KdaDecodeSpec(
+            H=16, HV=32, K=128, V=128, variant=variant, use_qk_l2norm=True,
+        ))
 
     # KDA decode works on Hopper+ (the CuTe DSL kernel targets SM90+).
     result = {"kda_decode": kda_decode_specs}

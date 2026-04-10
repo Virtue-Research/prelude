@@ -386,7 +386,7 @@ pub(super) struct Qwen3_5GatedDeltaNet {
     pub(super) out_proj: Linear,
     // State
     pub(super) conv_state: Option<Tensor>,      // [conv_dim, kernel-1]
-    pub(super) recurrent_state: Option<Tensor>, // [num_v_heads, k_dim, v_dim] in f32
+    pub(super) recurrent_state: Option<Tensor>, // [num_v_heads, v_dim, k_dim] in f32
     // Config
     pub(super) num_k_heads: usize,
     pub(super) num_v_heads: usize,
@@ -595,17 +595,22 @@ impl Qwen3_5GatedDeltaNet {
         // decay = exp(g)
         let decay = g.exp()?; // [num_v_heads]
 
-        // Initialize recurrent state if needed: [num_v_heads, head_k_dim, head_v_dim] in f32
+        // Initialize recurrent state if needed: [num_v_heads, head_v_dim, head_k_dim] in f32.
+        // Note the (V, K) order — matches `DeltaNetPool` and cuLA's `kda_decode`
+        // state contract, so the fused batched decode kernel can read/write
+        // pool slots directly without a transpose copy.
         if self.recurrent_state.is_none() {
             self.recurrent_state = Some(Tensor::zeros(
-                (self.num_v_heads, self.head_k_dim, self.head_v_dim),
+                (self.num_v_heads, self.head_v_dim, self.head_k_dim),
                 DType::F32,
                 device,
             )?);
         }
         let state = self.recurrent_state.as_ref().unwrap();
 
-        // Delta rule: state = state * decay + outer(k, beta * (v - state^T @ k))
+        // Delta rule: state = state * decay + outer(v', k)   where v' is the
+        // delta-corrected value. state is now [B, V, K] so the outer product
+        // between k (K-dim) and v' (V-dim) lands as state[b, v, k] += v'[b, v] * k[b, k].
         // decay: [num_v_heads] → [num_v_heads, 1, 1]
         let decay_3d = decay.reshape((self.num_v_heads, 1, 1))?;
         let state_decayed = state.broadcast_mul(&decay_3d)?;
@@ -620,17 +625,17 @@ impl Qwen3_5GatedDeltaNet {
         } else {
             k_f32
         };
-        // k_bcast: [num_v_heads, head_k_dim, 1] broadcastable over head_v_dim.
-        let k_bcast = k_expanded.reshape((self.num_v_heads, self.head_k_dim, 1))?;
+        // k_row: [num_v_heads, 1, head_k_dim] — broadcastable over head_v_dim.
+        let k_row = k_expanded.reshape((self.num_v_heads, 1, self.head_k_dim))?;
 
-        // Delta correction: v' = beta * (v - state_decayed^T @ k)
-        //   state_decayed: [B, head_k_dim, head_v_dim]
-        //   state_k[b, v]  = Σ_k state_decayed[b, k, v] * k[b, k]
+        // Delta correction: v' = beta * (v - state_decayed @ k)
+        //   state_decayed: [B, head_v_dim, head_k_dim]
+        //   state_k[b, v]  = Σ_k state_decayed[b, v, k] * k[b, k]
         // Implement as broadcast_mul + sum (a K=1 batched matmul would land in the
         // unsupported NN GEMM layout on CUTLASS).
         let state_k = state_decayed
-            .broadcast_mul(&k_bcast)?     // [B, head_k_dim, head_v_dim]
-            .sum(1)?;                     // [B, head_v_dim]
+            .broadcast_mul(&k_row)?       // [B, head_v_dim, head_k_dim]
+            .sum(2)?;                     // [B, head_v_dim]
         let v_f32 = v.to_dtype(DType::F32)?;
         let v_error = (v_f32 - state_k)?; // [num_v_heads, head_v_dim]
 
@@ -638,14 +643,14 @@ impl Qwen3_5GatedDeltaNet {
         let beta_2d = beta.reshape((self.num_v_heads, 1))?;
         let v_prime = v_error.broadcast_mul(&beta_2d)?; // [num_v_heads, head_v_dim]
 
-        // state += outer(k, v_prime)
-        //   outer[b, k, v] = k[b, k] * v'[b, v]  — pure broadcast, no GEMM.
-        let v_row = v_prime.reshape((self.num_v_heads, 1, self.head_v_dim))?;
-        let outer = k_bcast.broadcast_mul(&v_row)?;
+        // state += outer(v_prime, k)
+        //   outer[b, v, k] = v'[b, v] * k[b, k]  — pure broadcast, no GEMM.
+        let v_col = v_prime.reshape((self.num_v_heads, self.head_v_dim, 1))?;
+        let outer = v_col.broadcast_mul(&k_row)?;
         let state = (state_decayed + outer)?;
 
-        // output = state^T @ (q * scale): scale = 1/sqrt(head_k_dim)
-        //   out[b, v] = Σ_k state[b, k, v] * q[b, k] * scale
+        // output = state @ (q * scale): scale = 1/sqrt(head_k_dim)
+        //   out[b, v] = Σ_k state[b, v, k] * q[b, k] * scale
         let scale = (self.head_k_dim as f64).powf(-0.5);
         let q_f32 = (q.to_dtype(DType::F32)? * scale)?;
         let q_expanded = if kv_ratio > 1 {
@@ -656,10 +661,10 @@ impl Qwen3_5GatedDeltaNet {
         } else {
             q_f32
         };
-        let q_bcast = q_expanded.reshape((self.num_v_heads, self.head_k_dim, 1))?;
+        let q_row = q_expanded.reshape((self.num_v_heads, 1, self.head_k_dim))?;
         let out = state
-            .broadcast_mul(&q_bcast)?    // [B, head_k_dim, head_v_dim]
-            .sum(1)?;                    // [B, head_v_dim]
+            .broadcast_mul(&q_row)?      // [B, head_v_dim, head_k_dim]
+            .sum(2)?;                    // [B, head_v_dim]
         let out = out.to_dtype(v.dtype())?;
         let out = out.reshape((self.value_dim,))?;
 
@@ -1320,6 +1325,41 @@ fn deltanet_varlen_pooled(
     dn_layer_idx: usize,
     ops: &dyn crate::ops::Ops,
 ) -> Result<Tensor> {
+    // Fast path: when every request in the batch is a single decode token
+    // AND the fused cuLA `kda_decode` kernel is available for this model's
+    // shape, let one CUDA call handle the delta rule step for the whole
+    // batch. The kernel reads each request's recurrent state from the pool
+    // via slot indices and updates it in place.
+    //
+    // We must decide eligibility BEFORE running conv1d, because the fused
+    // path and the sequential fallback BOTH mutate the pool's conv_state.
+    // If we ran conv1d in the fused path and then fell through, the
+    // conv_state would be advanced twice (producing "Paris Paris Paris …"
+    // on repeat as the state drifts).
+    let all_decode = !seq_lens.is_empty() && seq_lens.iter().all(|&l| l == 1);
+    // The cuLA kda_decode launcher is specialized on (H, HV, K, V), so we
+    // enumerate the AOT-compiled variants here. Keep this in sync with
+    // `crates/prelude-cuda/cula/scripts/compile_kernels.py`.
+    let fused_supported = matches!(
+        (
+            gdn.num_k_heads,
+            gdn.num_v_heads,
+            gdn.head_k_dim,
+            gdn.head_v_dim,
+        ),
+        (32, 32, 128, 128)   // MHA H=32
+        | (64, 64, 128, 128) // MHA H=64
+        | (16, 32, 128, 128) // GQA H=16/HV=32 (Qwen3.5-35B-A3B)
+    );
+    let fused_eligible = all_decode && packed.device().is_cuda() && fused_supported;
+    if fused_eligible {
+        if let Some(out) = deltanet_decode_batched_fused(
+            gdn, packed, pool, slot_ids, dn_layer_idx, ops,
+        )? {
+            return Ok(out);
+        }
+    }
+
     let mut outputs = Vec::new();
     let mut offset = 0usize;
     for (i, &len) in seq_lens.iter().enumerate() {
@@ -1358,6 +1398,117 @@ fn deltanet_varlen_pooled(
     }
     gdn.clear_state(); // scratch is only valid within this call
     Tensor::cat(&outputs, 0) // [total_tokens, D]
+}
+
+/// Batched decode-only fast path: one fused cuLA kernel call per layer for
+/// the whole decode batch. Returns `Ok(None)` if the kernel can't be used
+/// (wrong GPU arch, shape mismatch, etc.) so the caller falls back to the
+/// sequential loop. Conv1d is still done sequentially per request — cuLA
+/// doesn't ship a batched conv1d_decode, and it's cheap enough not to be
+/// the bottleneck.
+fn deltanet_decode_batched_fused(
+    gdn: &mut Qwen3_5GatedDeltaNet,
+    packed: &Tensor,
+    pool: &mut crate::deltanet_pool::DeltaNetPool,
+    slot_ids: &[u32],
+    dn_layer_idx: usize,
+    ops: &dyn crate::ops::Ops,
+) -> Result<Option<Tensor>> {
+    // Only hybrid GPU paths pass through here, but guard anyway.
+    if !packed.device().is_cuda() {
+        return Ok(None);
+    }
+
+    let n = slot_ids.len();
+    if n == 0 {
+        return Ok(None);
+    }
+    // `packed` is `[total_tokens, hidden]` and all seq_lens == 1, so
+    // `total_tokens == n`. Fold the batch dim into the time dim for the
+    // projections: `gdn.in_proj_*` expect the existing `[B, L, hidden]`
+    // layout, so wrap `packed` as `[1, N, hidden]`.
+    let bst = BatchState::no_lora();
+    let x = packed.unsqueeze(0)?; // [1, N, hidden]
+
+    let qkv = gdn.in_proj_qkv.forward(&x, &bst, ops)?;   // [1, N, key*2+val]
+    let z   = gdn.in_proj_z  .forward(&x, &bst, ops)?;   // [1, N, value_dim]
+    let b_raw_full = gdn.in_proj_b.forward(&x, &bst, ops)?; // [1, N, HV]
+    let a_raw_full = gdn.in_proj_a.forward(&x, &bst, ops)?; // [1, N, HV]
+
+    let q_cat = qkv.narrow(D::Minus1, 0, gdn.key_dim)?;
+    let k_cat = qkv.narrow(D::Minus1, gdn.key_dim, gdn.key_dim)?;
+    let v_cat = qkv.narrow(D::Minus1, gdn.key_dim * 2, gdn.value_dim)?;
+    let qkv_for_conv = Tensor::cat(&[&q_cat, &k_cat, &v_cat], D::Minus1)?; // [1, N, conv_dim]
+    let qkv_for_conv_2d = qkv_for_conv.squeeze(0)?; // [N, conv_dim]
+
+    // ── Sequential conv1d_decode per request ───────────────────────
+    // cuLA doesn't expose a batched variant, so for each request we load
+    // its conv_state slice from the pool, run the one-token decode, then
+    // scatter the updated conv_state back. This step is tiny (kernel size
+    // = 4, conv_dim ≈ 8192) compared to the delta-rule step.
+    let device = packed.device();
+    let mut conv_outs: Vec<Tensor> = Vec::with_capacity(n);
+    for (i, &slot) in slot_ids.iter().enumerate() {
+        let slot_us = slot as usize;
+        gdn.conv_state = Some(
+            pool.conv_states[dn_layer_idx]
+                .get(slot_us)?
+                .contiguous()?,
+        );
+        let x_row = qkv_for_conv_2d.get(i)?.contiguous()?; // [conv_dim]
+        let out = gdn.conv1d_decode(&x_row)?; // [conv_dim]
+        conv_outs.push(out);
+        if let Some(ref state) = gdn.conv_state {
+            let row = state.contiguous()?.unsqueeze(0)?.contiguous()?;
+            pool.conv_states[dn_layer_idx].slice_set(&row, 0, slot_us)?;
+        }
+    }
+    gdn.conv_state = None;
+
+    // Stack conv outputs: [N, conv_dim]
+    let qkv_conv = Tensor::stack(&conv_outs, 0)?;
+    let qkv_conv = ops.silu(&qkv_conv)?;
+
+    // Split into q, k, v with head layout.
+    let q_flat = qkv_conv.narrow(D::Minus1, 0, gdn.key_dim)?;
+    let k_flat = qkv_conv.narrow(D::Minus1, gdn.key_dim, gdn.key_dim)?;
+    let v_flat = qkv_conv.narrow(D::Minus1, gdn.key_dim * 2, gdn.value_dim)?;
+    let q_nhk = q_flat.reshape((n, gdn.num_k_heads, gdn.head_k_dim))?.contiguous()?;
+    let k_nhk = k_flat.reshape((n, gdn.num_k_heads, gdn.head_k_dim))?.contiguous()?;
+    let v_nhv = v_flat.reshape((n, gdn.num_v_heads, gdn.head_v_dim))?.contiguous()?;
+
+    // Scalar-per-head a/b drop the batch-of-1 dim.
+    let a_2d = a_raw_full.squeeze(0)?.contiguous()?; // [N, HV]
+    let b_2d = b_raw_full.squeeze(0)?.contiguous()?; // [N, HV]
+
+    // Slot ids need to live on the device as an i32 tensor.
+    let slot_ids_gpu = Tensor::from_vec(slot_ids.to_vec(), (n,), device)?; // U32 on GPU
+
+    let decode_out = match ops.kda_decode_batched(
+        &q_nhk,
+        &k_nhk,
+        &v_nhv,
+        &a_2d,
+        &b_2d,
+        &gdn.a_log,
+        &gdn.dt_bias,
+        &pool.recurrent_states[dn_layer_idx],
+        &slot_ids_gpu,
+    ) {
+        Some(Ok(o)) => o,    // [N, HV, V]
+        Some(Err(e)) => return Err(e),
+        None => return Ok(None),
+    };
+
+    // Reshape into [1, N, value_dim] for the gated norm + out projection,
+    // matching what the sequential path hands to `gdn.norm.forward`.
+    let out_nhv = decode_out.reshape((n, gdn.value_dim))?;
+    let out_1nd = out_nhv.unsqueeze(0)?;
+
+    let z_cont = z.contiguous()?; // [1, N, value_dim]
+    let normed = gdn.norm.forward(&out_1nd, &z_cont, ops)?;
+    let projected = gdn.out_proj.forward(&normed, &bst, ops)?; // [1, N, hidden]
+    Ok(Some(projected.squeeze(0)?)) // [N, hidden]
 }
 
 impl Qwen3_5DecoderLayer {

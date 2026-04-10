@@ -2,6 +2,7 @@
 
 pub(crate) mod flash_v4;
 pub(crate) mod flashinfer;
+pub(crate) mod kda_decode;
 
 /// Determine FA4 tile_n (kBlockN) for paged KV cache TMA compatibility.
 pub(crate) fn fa4_tile_n(head_dim: usize, head_dim_v: usize) -> usize {
