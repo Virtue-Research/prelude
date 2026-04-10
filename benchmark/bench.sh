@@ -7,6 +7,7 @@
 #   ./benchmark/bench.sh sglang --gpu      # SGLang GPU only
 #   ./benchmark/bench.sh --gpu             # all GPU engines
 #   ./benchmark/bench.sh --cpu             # all CPU engines
+#   ./benchmark/bench.sh --gpu --cu12      # use CUDA 12 Docker images (default: CUDA 13)
 #
 # Environment:
 #   MODEL  INPUT_TOKENS  OUTPUT_TOKENS  CONCURRENCY  MAX_REQUESTS  CUDA_VISIBLE_DEVICES
@@ -63,9 +64,9 @@ ENGINES=(
 # Docker image per engine (only for docker-type engines)
 declare -A DOCKER_IMAGES
 DOCKER_IMAGES=(
-    [vllm]="vllm/vllm-openai:latest"
+    [vllm]="vllm/vllm-openai:latest-cu130"
     [vllm-cpu]="vllm/vllm-openai:latest"
-    [sglang]="lmsysorg/sglang:latest"
+    [sglang]="lmsysorg/sglang:latest-cu130"
     [sglang-cpu]="lmsysorg/sglang:latest"
 )
 
@@ -118,8 +119,7 @@ check_engine() {
             [ -f "$LLAMA_CPP_BIN" ] || { echo "llama-server not found ($LLAMA_CPP_BIN)"; return 1; }
             [ -f "$GGUF_MODEL" ] || { echo "GGUF not found ($GGUF_MODEL)"; return 1; } ;;
         vllm|vllm-cpu|sglang|sglang-cpu)
-            local img="${DOCKER_IMAGES[$engine]}"
-            docker image inspect "$img" >/dev/null 2>&1 || { echo "Docker image not found: $img (docker pull $img)"; return 1; } ;;
+            ;; # Docker images are pulled in run_engine before start
     esac
     return 0
 }
@@ -130,10 +130,7 @@ start_engine() {
     local cvd="${CUDA_VISIBLE_DEVICES:-0}"
     case "$engine" in
         prelude)
-            # Enable CUDA graph for decode (OUTPUT_TOKENS > 1) — reduces kernel launch overhead
-            local cuda_graph_flag=""
-            [ "${OUTPUT_TOKENS:-1}" -gt 1 ] && cuda_graph_flag="PRELUDE_CUDA_GRAPH=1"
-            env PRELUDE_DEVICE="$DEVICE" RUST_LOG="${RUST_LOG:-warn}" $cuda_graph_flag "$PRELUDE_BIN" \
+            env PRELUDE_DEVICE="$DEVICE" RUST_LOG="${RUST_LOG:-warn}" "$PRELUDE_BIN" \
                 --host 0.0.0.0 --port "$port" --model "$MODEL" --dtype bf16 & ;;
         prelude-gguf)
             env PRELUDE_DEVICE=cpu RUST_LOG="${RUST_LOG:-warn}" "$PRELUDE_BIN" \
@@ -143,20 +140,20 @@ start_engine() {
         vllm)
             docker run --rm --name vllm-bench --network=host --gpus all --ipc=host \
                 -v "$hf_cache:/root/.cache/huggingface" -e "CUDA_VISIBLE_DEVICES=$cvd" \
-                vllm/vllm-openai:latest --model "$MODEL" --port "$port" --host 0.0.0.0 & ;;
+                "$img" --model "$MODEL" --port "$port" --host 0.0.0.0 & ;;
         vllm-cpu)
             docker run --rm --name vllm-cpu-bench --network=host \
                 -v "$hf_cache:/root/.cache/huggingface" \
-                vllm/vllm-openai:latest --model "$MODEL" --port "$port" --host 0.0.0.0 --device cpu & ;;
+                "$img" --model "$MODEL" --port "$port" --host 0.0.0.0 --device cpu & ;;
         sglang)
             docker run --rm --name sglang-bench --network=host --gpus all --ipc=host --shm-size 32g \
                 -v "$hf_cache:/root/.cache/huggingface" -e "CUDA_VISIBLE_DEVICES=$cvd" \
-                lmsysorg/sglang:latest python3 -m sglang.launch_server \
+                "$img" python3 -m sglang.launch_server \
                     --model-path "$MODEL" --port "$port" --host 0.0.0.0 & ;;
         sglang-cpu)
             docker run --rm --name sglang-cpu-bench --network=host \
                 -v "$hf_cache:/root/.cache/huggingface" \
-                lmsysorg/sglang:latest python3 -m sglang.launch_server \
+                "$img" python3 -m sglang.launch_server \
                     --model-path "$MODEL" --port "$port" --host 0.0.0.0 \
                     --device cpu --disable-overlap-schedule & ;;
         llama.cpp)
@@ -182,6 +179,13 @@ run_engine() {
 
     [ "$gpu_only" = "yes" ] && [ "$DEVICE" = "cpu" ] && return
     local reason; reason=$(check_engine "$engine") || { warn "Skipping $display: $reason"; return; }
+
+    # Pull Docker image if needed (outside subshell so output goes to terminal)
+    local img="${DOCKER_IMAGES[$engine]:-}"
+    if [ -n "$img" ]; then
+        log "Pulling $img ..."
+        docker pull "$img" || { warn "Skipping $display: docker pull failed"; return; }
+    fi
 
     log "Starting $display (device=$DEVICE) on port $port ..."
     start_engine "$engine" "$port"
@@ -229,14 +233,19 @@ mkdir -p "$RESULTS_DIR"
 echo "engine,device,startup_s,ttft_s,tpot_s,e2e_latency_s,input_tps,output_tps,rpm" > "$CSV_FILE"
 
 # Parse args
-FILTER=""; target="all"
+FILTER=""; TARGETS=()
 for arg in "$@"; do
     case "$arg" in
         --cpu) FILTER="cpu" ;; --gpu) FILTER="gpu" ;;
+        --cu12)
+            DOCKER_IMAGES[vllm]="vllm/vllm-openai:latest"
+            DOCKER_IMAGES[sglang]="lmsysorg/sglang:latest"
+            ;;
         -*) err "Unknown flag: $arg"; exit 1 ;;
-        *) target="$arg" ;;
+        *) TARGETS+=("$arg") ;;
     esac
 done
+[ ${#TARGETS[@]} -eq 0 ] && TARGETS=("all")
 
 log "Config: model=$MODEL traffic=$TRAFFIC concurrency=$CONCURRENCY gpu=$HAS_GPU"
 [ -n "$CPU_NAME" ] && log "CPU: $CPU_NAME"
@@ -247,17 +256,12 @@ echo ""
 GPU_ENGINES=(prelude vllm.rs vllm sglang)
 CPU_ENGINES=(prelude prelude-gguf llama.cpp vllm-cpu sglang-cpu)
 
-if [ "$target" = "all" ]; then
-    [ "$FILTER" != "gpu" ] && for e in "${CPU_ENGINES[@]}"; do run_engine "$e" cpu; done
-    [ "$FILTER" != "cpu" ] && [ "$HAS_GPU" = true ] && for e in "${GPU_ENGINES[@]}"; do
-        [ "$e" = "prelude" ] && run_engine "$e" "cuda:0" || run_engine "$e" gpu
-    done
-else
-    # Single engine
+run_single_engine() {
+    local target="$1"
     if [ -z "${ENGINES[$target]+x}" ]; then
         err "Unknown engine: $target"
         echo "Available: ${!ENGINES[*]}"
-        exit 1
+        return 1
     fi
     IFS='|' read -r _ _ _ gpu_only _ <<< "${ENGINES[$target]}"
     if [ "$FILTER" = "gpu" ] || { [ "$FILTER" = "" ] && [ "$gpu_only" = "yes" ]; }; then
@@ -270,6 +274,17 @@ else
         run_engine "$target" cpu
         [ "$HAS_GPU" = true ] && { [ "$target" = "prelude" ] && run_engine "$target" "cuda:0" || run_engine "$target" gpu; }
     fi
+}
+
+if [ "${TARGETS[0]}" = "all" ]; then
+    [ "$FILTER" != "gpu" ] && for e in "${CPU_ENGINES[@]}"; do run_engine "$e" cpu; done
+    [ "$FILTER" != "cpu" ] && [ "$HAS_GPU" = true ] && for e in "${GPU_ENGINES[@]}"; do
+        [ "$e" = "prelude" ] && run_engine "$e" "cuda:0" || run_engine "$e" gpu
+    done
+else
+    for target in "${TARGETS[@]}"; do
+        run_single_engine "$target"
+    done
 fi
 
 python3 "$SCRIPT_DIR/bench_utils.py" print-summary \

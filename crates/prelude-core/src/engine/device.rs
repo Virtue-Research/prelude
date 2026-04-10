@@ -16,7 +16,7 @@ pub(crate) fn select_device(
 
     let device = match requested.as_str() {
         "cpu" => Device::Cpu,
-        "auto" => Device::Cuda(0),
+        "auto" => Device::new_cuda(0).map_err(|e| EngineError::Internal(format!("CUDA init: {e}")))?,
         s if s.starts_with("cuda:") => {
             let ordinal = s
                 .trim_start_matches("cuda:")
@@ -24,9 +24,9 @@ pub(crate) fn select_device(
                 .map_err(|e| {
                     EngineError::InvalidRequest(format!("invalid PRELUDE_DEVICE: {e}"))
                 })?;
-            Device::Cuda(ordinal)
+            Device::new_cuda(ordinal).map_err(|e| EngineError::Internal(format!("CUDA init: {e}")))?
         }
-        "cuda" => Device::Cuda(0),
+        "cuda" => Device::new_cuda(0).map_err(|e| EngineError::Internal(format!("CUDA init: {e}")))?,
         other => {
             return Err(EngineError::InvalidRequest(format!(
                 "invalid PRELUDE_DEVICE '{other}', expected auto|cpu|cuda|cuda:N"

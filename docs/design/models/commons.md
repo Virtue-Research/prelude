@@ -27,13 +27,13 @@ models/
 Fusion is handled entirely in **OpsBundle** — model code never does if/else on fusion:
 
 ```rust
-// Model code — clean, no branching
-let (residual, normed) = ops.fused_add_rmsnorm(&residual, &h, &weight, eps)?;
-let (q, k) = ops.qknorm_rope_and_cache(&q, &k, &v, ..., paged_kv)?;
-let activated = ops.fused_silu_mul(&gate, &up)?;
+// Model code — clean, no branching. Kernels hidden inside layer abstractions.
+let (residual, normed) = self.input_layernorm.forward_residual(hidden, residual, ops)?;
+let hidden = self.self_attn.forward(&normed, ctx)?;
+let hidden = self.mlp.forward(&hidden, ops)?;
 ```
 
-OpsBundle internally: try device fused kernel → auto-fallback to composed ops.
+Ops internally: try device fused kernel → auto-fallback to composed ops.
 
 ### Linear as Parameter Carrier
 
@@ -55,7 +55,7 @@ prelude-cuda/
 └── ops/                  # CUDA kernel wrappers (rmsnorm, rope, kv_cache, moe, gemm)
 
 prelude-cpu/
-├��─ cpu_ops.rs            # base() → CubeCL CPU, override specific ops (GGUF quant, oneDNN GEMM)
+├��─ cpu_ops.rs            # base() → CPU Ops: override specific ops (GGUF quant, oneDNN GEMM)
 └── linear_backends.rs    # QuantFormat registration (Q4_0, Q4_K via inventory)
 ```
 

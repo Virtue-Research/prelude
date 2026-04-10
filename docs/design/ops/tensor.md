@@ -1,160 +1,77 @@
 ## Tensor Type
 
-The `Tensor` is the fundamental data structure. It is a **thin handle** — holds a device
-pointer, shape, and dtype. No computation methods. All computation goes through `OpsBundle`.
+`Tensor` is backed by **candle-core** (from our fork `rucnyz/candle`, `prelude` branch).
+We re-export candle's types as our tensor API — basic tensor ops (matmul, reshape, cast,
+element-wise, etc.) go through candle's zero-overhead dispatch. Custom inference ops
+(fused kernels, paged attention) go through the Ops trait.
 
 ```rust
-// prelude-core/src/tensor.rs
+// prelude-core/src/tensor/mod.rs — re-exports from candle-core
 
-pub struct Tensor {
-    data: TensorData,             // device memory (opaque pointer)
-    shape: Vec<usize>,            // e.g., [batch, seq_len, hidden_dim]
-    dtype: DType,                 // BF16, FP16, FP32, FP8, U8, U32, I64
-    strides: Vec<usize>,          // for non-contiguous views
-}
-
-/// Opaque device memory. Tensor doesn't know which device — the Ops impl does.
-enum TensorData {
-    Owned(DeviceBuffer),          // owns the memory, drops when Tensor drops
-    View { base: Arc<Tensor>, offset: usize },  // view into another tensor, no copy
-}
-
-/// Device-allocated memory buffer. Created by device crate, opaque to prelude-core.
-pub struct DeviceBuffer {
-    ptr: *mut u8,                 // device pointer (CUDA/HIP/CPU/Metal address)
-    len: usize,                   // bytes
-    drop_fn: Option<Box<dyn FnOnce(*mut u8)>>,  // device-specific deallocation
-}
+pub use candle_core::{
+    Tensor, DType, Device, Shape, Layout, Error, Result, Module,
+    Storage, CpuStorage, D,
+};
+#[cfg(feature = "cuda")]
+pub use candle_core::{CudaDevice, CudaStorage};
 ```
 
-### What Tensor CAN do (metadata, no compute)
+Candle's `Tensor` internally holds `Arc<RwLock<Storage>>` + `Layout`. Storage is an enum
+over `CpuStorage` / `CudaStorage` / etc. Views (reshape, narrow, squeeze) share storage
+via Arc — no data copy.
+
+### Basic ops: candle handles natively
 
 ```rust
-impl Tensor {
-    // ── Shape queries ───────────────────────────────────
-    pub fn shape(&self) -> &[usize];
-    pub fn dims(&self) -> usize;              // number of dimensions
-    pub fn dim(&self, d: usize) -> usize;     // size of dimension d
-    pub fn elem_count(&self) -> usize;        // product of all dims
-    pub fn dtype(&self) -> DType;
-    pub fn is_contiguous(&self) -> bool;
-
-    // ── View operations (no data copy, just new metadata) ──
-    pub fn reshape(&self, shape: &[usize]) -> Result<Tensor>;
-    pub fn narrow(&self, dim: usize, start: usize, len: usize) -> Result<Tensor>;
-    pub fn squeeze(&self, dim: usize) -> Result<Tensor>;
-    pub fn unsqueeze(&self, dim: usize) -> Result<Tensor>;
-    pub fn transpose(&self, d1: usize, d2: usize) -> Result<Tensor>;
-    pub fn chunk(&self, n: usize, dim: usize) -> Result<Vec<Tensor>>;
-
-    // ── Raw pointer access (unsafe, for FFI to kernels) ──
-    pub fn as_ptr(&self) -> *const u8;
-    pub fn as_mut_ptr(&mut self) -> *mut u8;
-}
+tensor.matmul(&other)?          // → candle dispatch → registered GEMM (CUTLASS/DeepGEMM)
+tensor.add(&other)?             // → candle CUDA kernel
+tensor.to_dtype(DType::BF16)?   // → candle cast kernel
+tensor.contiguous()?            // → candle copy kernel if needed
+Tensor::zeros(shape, dtype, &device)?  // → candle allocation
 ```
 
-### What Tensor CANNOT do (computation → goes through Ops)
+GEMM dispatch is pluggable: `candle_core::cuda_backend::gemm_dispatch::register_gemm_dispatch()`
+routes all `Tensor::matmul()` on CUDA through our CUTLASS/DeepGEMM implementation.
+Registered once at startup when `CudaOps` is first accessed.
 
-```
-❌ tensor.matmul(&other)         →  ops.matmul(&a, &b)
-❌ tensor.softmax(dim)           →  ops.softmax(&x, dim)
-❌ tensor.add(&other)            →  element-wise via Ops or operator overload delegating to Ops
-❌ tensor.to_device(cuda)        →  device crate allocates + copies
-❌ tensor.to_dtype(bf16)         →  device crate handles cast kernel
-❌ Tensor::zeros(shape, device)  →  device crate allocates zeroed memory
-```
-
-**Why:** Computation requires knowing the device and dispatching to the right kernel.
-If `Tensor` could do `matmul()`, it would need to know about CudaOps/CpuOps — breaking
-the "prelude-core is device-agnostic" principle.
-
-### Memory Management
-
-**Allocation:** Device crates create Tensors via their own allocators.
+### Inference-specific ops: through Ops trait
 
 ```rust
-// prelude-cuda/src/cuda_ops.rs
-impl CudaOps {
-    pub fn alloc_tensor(&self, shape: &[usize], dtype: DType) -> Tensor {
-        let bytes = shape.iter().product::<usize>() * dtype.size_in_bytes();
-        let ptr = cuda_malloc(bytes);  // cudaMalloc
-        Tensor::from_device_buffer(DeviceBuffer {
-            ptr,
-            len: bytes,
-            drop_fn: Some(Box::new(|p| cuda_free(p))),  // cudaFree on drop
-        }, shape, dtype)
-    }
-}
+ops.rms_norm(&x, &weight, eps)              // fused CUDA kernel
+ops.fused_add_rmsnorm(&residual, &x, &w, eps)  // fused add + norm
+ops.varlen_attention(q, k, v, &params)      // FA4 / FlashInfer
+ops.paged_attention(q, kc, vc, &params)     // paged KV cache attention
+ops.fused_silu_mul(&gate, &up)              // fused activation
 ```
 
-**Deallocation:** Automatic via `Drop`. `DeviceBuffer::drop_fn` calls the device-specific
-free function (cudaFree, hipFree, free, etc.). Tensor doesn't know which — the closure captures it.
+### CUDA storage access pattern (for custom ops)
 
-**Views:** `narrow()`, `reshape()`, etc. create views that share the base Tensor's memory
-via `Arc<Tensor>`. The underlying memory is freed only when all views are dropped.
-
-**Transfer:** Moving data between devices (CPU → GPU, GPU → CPU) is a device crate operation:
+Fused CUDA ops access tensor storage directly via candle's API — zero-copy:
 
 ```rust
-// prelude-cuda/src/cuda_ops.rs
-impl CudaOps {
-    pub fn to_device(&self, tensor: &Tensor) -> Tensor {
-        let gpu_tensor = self.alloc_tensor(tensor.shape(), tensor.dtype());
-        cuda_memcpy_h2d(gpu_tensor.as_mut_ptr(), tensor.as_ptr(), tensor.byte_len());
-        gpu_tensor
-    }
-}
+let (storage, layout) = tensor.storage_and_layout();  // RwLock read guard
+let cuda = match &*storage {
+    Storage::Cuda(s) => s,
+    _ => bail!("requires CUDA"),
+};
+let dev = cuda.device().clone();              // candle CudaDevice
+let stream = dev.cuda_stream();               // the one CUDA stream
+let slice = cuda.as_cuda_slice::<T>()?;       // &CudaSlice<T>, no copy
+let ptr = slice.device_ptr(&stream);          // raw CUdeviceptr for FFI
+let out = unsafe { dev.alloc::<T>(n) }?;      // allocate output
+// ... launch kernel ...
+drop(storage);  // release read lock before creating output tensor
+let out_storage = CudaStorage::wrap_cuda_slice(out, dev);
+Tensor::from_storage(Storage::Cuda(out_storage), shape, BackpropOp::none(), false)
 ```
 
-### Element-wise Operators
-
-For ergonomics, `Tensor` supports `+`, `-`, `*`, `/` via Rust operator overloading.
-These delegate to a **thread-local Ops context** set by the engine before each forward pass:
-
-```rust
-impl std::ops::Add for &Tensor {
-    type Output = Result<Tensor>;
-    fn add(self, rhs: &Tensor) -> Result<Tensor> {
-        // Delegates to the current Ops context's element-wise add
-        with_current_ops(|ops| ops.elementwise_add(self, rhs))
-    }
-}
-```
-
-This is the ONLY place where Tensor indirectly touches Ops — and it's a convenience
-wrapper, not a fundamental coupling. Models can also call ops directly.
+One CUDA context, one stream — no registry, no fallback. Everything comes from the
+tensor's own `CudaDevice`.
 
 ### DType
 
-```rust
-// prelude-core/src/tensor.rs
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DType {
-    U8,          // packed quantized (TurboQuant, GGUF)
-    U32,
-    I16,         // some quantization formats
-    I32,         // integer indices
-    I64,
-    BF16,
-    F16,
-    F32,
-    F64,         // high-precision math
-    F8E4M3,     // FP8 (SM89+, gfx942+)
-}
-
-impl DType {
-    pub fn size_in_bytes(&self) -> usize {
-        match self {
-            U8 | F8E4M3 => 1,
-            I16 | BF16 | F16 => 2,
-            U32 | I32 | F32 => 4,
-            F8E4M3 | U8 => 1,
-            I64 => 8,
-        }
-    }
-}
-```
+Re-exported from candle-core: `U8`, `U32`, `I64`, `BF16`, `F16`, `F32`, `F64`.
+FP8 types are available via candle's `F8E4M3` when the candle fork supports it.
 
 ### BatchState
 
@@ -162,25 +79,23 @@ Per-batch runtime state passed to model forward and `Linear.forward`.
 Separate from `OpsBundle` (per-device, static) and model weights (per-model, static).
 
 ```rust
-// prelude-core/src/tensor.rs
-
 struct BatchState<'a> {
-    /// Per-token LoRA adapter index. [batch_size] mapping each token to its adapter.
-    /// -1 = no LoRA for this token. None = LoRA not active for this batch.
-    pub adapter_ids: Option<&'a Tensor>,
+    pub adapter_ids: Option<&'a Tensor>,  // per-token LoRA adapter index
 }
 ```
 
-`Linear.forward` reads `batch_state.adapter_ids` to decide whether to apply LoRA.
-If `None`, LoRA step is skipped entirely (zero overhead).
+### Why candle-core instead of own Tensor
 
-Models that don't use LoRA still receive `BatchState` but never inspect it — they just
-forward it to `Linear` and module functions. The engine constructs it before each
-forward pass with the current batch's adapter routing.
+The original design envisioned a thin `Tensor` handle with all computation through Ops.
+We switched to candle-core because:
 
-### Relation to prelude_core::tensor
+1. **Performance parity with origin** — origin uses candle-core directly. Matching the
+   tensor backend eliminates an entire class of overhead (storage conversion, D2D copies).
+2. **Mature CUDA backend** — candle handles matmul dispatch, memory management, dtype cast,
+   and basic ops with well-tested CUDA kernels.
+3. **Less code to maintain** — deleted ~1500 lines (own storage, layout, shape, error types).
 
-The codebase uses `prelude_core::tensor::Tensor` — a thin handle over own Storage + Layout.
-Device-specific storage (`CudaStorage`, `CpuStorage`) lives in the device crates
-(`prelude-cuda`, `prelude-core`). Computation is dispatched through the OpsBundle system,
-not bundled inside the Tensor itself.
+The trade-off: `prelude-core` now depends on candle-core (with optional CUDA feature).
+This means prelude-core is no longer fully device-agnostic at the type level. In practice
+this is fine — candle-core is a Rust library with no C++ in CPU-only mode, and the CUDA
+feature is gated behind `prelude-core/cuda`.

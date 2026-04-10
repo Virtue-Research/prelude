@@ -52,7 +52,11 @@ impl CpuFloat for half::bf16 {
     }
 
     fn tensor_to_vec(tensor: &Tensor) -> Result<Vec<Self>> {
-        Ok(tensor.as_slice::<Self>()?.to_vec())
+        let n = tensor.elem_count();
+        unsafe {
+            let ptr = super::tensor_raw_ptr::<Self>(tensor)?;
+            Ok(std::slice::from_raw_parts(ptr, n).to_vec())
+        }
     }
 
     fn vec_to_tensor(buf: Vec<Self>, shape: &[usize], device: &Device) -> Result<Tensor> {
@@ -75,7 +79,11 @@ impl CpuFloat for half::f16 {
     fn zero() -> Self { half::f16::ZERO }
 
     fn tensor_to_vec(tensor: &Tensor) -> Result<Vec<Self>> {
-        Ok(tensor.as_slice::<Self>()?.to_vec())
+        let n = tensor.elem_count();
+        unsafe {
+            let ptr = super::tensor_raw_ptr::<Self>(tensor)?;
+            Ok(std::slice::from_raw_parts(ptr, n).to_vec())
+        }
     }
 
     fn vec_to_tensor(buf: Vec<Self>, shape: &[usize], device: &Device) -> Result<Tensor> {
@@ -98,7 +106,11 @@ impl CpuFloat for f32 {
     fn zero() -> Self { 0.0 }
 
     fn tensor_to_vec(tensor: &Tensor) -> Result<Vec<Self>> {
-        Ok(tensor.as_slice::<Self>()?.to_vec())
+        let n = tensor.elem_count();
+        unsafe {
+            let ptr = super::tensor_raw_ptr::<Self>(tensor)?;
+            Ok(std::slice::from_raw_parts(ptr, n).to_vec())
+        }
     }
 
     fn vec_to_tensor(buf: Vec<Self>, shape: &[usize], device: &Device) -> Result<Tensor> {

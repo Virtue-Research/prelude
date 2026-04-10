@@ -12,7 +12,7 @@ pub fn varlen_attention(q: &Tensor, k: &Tensor, v: &Tensor, params: &VarlenParam
     let cu_k: Vec<u32> = params.cu_seqlens_k.to_vec1()?;
     let batch = cu_q.len() - 1;
     let orig_dtype = q.dtype();
-    let (n_hq, hd) = (q.shape().dims()[1], q.shape().dims()[2]);
+    let (n_hq, _hd) = (q.shape().dims()[1], q.shape().dims()[2]);
     let n_hkv = k.shape().dims()[1];
     let gqa = n_hq / n_hkv;
     // Full F32 computation for precision matching HF's FP32-accumulated matmul.
@@ -37,7 +37,7 @@ pub fn varlen_attention(q: &Tensor, k: &Tensor, v: &Tensor, params: &VarlenParam
             let vh = v_seq.narrow(1, hkv, 1)?.squeeze(1)?.contiguous()?;
             let scores = (qh.matmul(&kh.t()?)? * params.scale as f64)?;
             let scores = apply_mask_2d(&scores, &params.mask, sq, sk, q.device())?;
-            let w = scores.softmax(1)?;
+            let w = candle_nn::ops::softmax(&scores, 1)?;
             let out = w.matmul(&vh)?;
             head_outs.push(out.unsqueeze(1)?);
         }

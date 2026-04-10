@@ -106,10 +106,14 @@ impl QuantFormat for GpuQuantFormat {
         let dims = shape.dims();
         let (n, k) = (dims[0], dims[1]);
 
-        // Upload raw quantized bytes to GPU (default device 0)
-        let stream = device::cuda_stream(0)?;
+        // Upload raw quantized bytes to GPU
+        let cuda_dev = prelude_core::tensor::Device::new_cuda(0)
+            .map_err(|e| prelude_core::tensor::Error::Msg(format!("CUDA device: {e}")))?;
+        let dev = cuda_dev.as_cuda_device()
+            .map_err(|e| prelude_core::tensor::Error::Msg(format!("as_cuda_device: {e}")))?;
+        let stream = dev.cuda_stream();
         let gpu_data = unsafe { stream.clone_htod(qtensor.data()) }.ce()?;
-        let gpu_weights = device::tensor_from_cuda(gpu_data, stream, (qtensor.data().len(),));
+        let gpu_weights = device::tensor_from_cuda(gpu_data, dev, (qtensor.data().len(),));
 
         Ok(Box::new(GpuQuantizedWeight {
             gpu_weights,

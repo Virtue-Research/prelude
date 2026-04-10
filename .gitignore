@@ -10,6 +10,7 @@ benchmark/__pycache__/
 __pycache__/
 /models/
 benchmark/results/
+benchmark/e2e/results/
 crates/onednn-ffi/build
 onednn-ffi/buildCargo.lock
 *.o

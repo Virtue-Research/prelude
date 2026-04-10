@@ -5,8 +5,9 @@
 //!
 //! Supports both non-paged varlen (prefill) and paged KV (prefill + decode).
 
-use crate::device::{self as cb, DevicePtr};
-use prelude_core::tensor::{bail, DType, Result, Tensor};
+use crate::device::{self as cb};
+use cudarc::driver::DevicePtr;
+use prelude_core::tensor::{DType, DeviceExt, Result, Tensor};
 use half::bf16;
 use prelude_flash_attn_v4::{KernelDtype, KernelKey, KernelRegistry};
 use std::ffi::c_void;
@@ -84,7 +85,7 @@ pub fn try_varlen_paged(
     block_tables: &Tensor,
     cu_seqlens_q: &Tensor,
     seqused_k: &Tensor,
-    max_seqlen_q: usize, _max_seqlen_k: usize,
+    _max_seqlen_q: usize, _max_seqlen_k: usize,
     softmax_scale: f32,
 ) -> Option<Result<Tensor>> {
     if q.dtype() != DType::BF16 {
@@ -141,10 +142,13 @@ fn varlen_paged_inner(
 
         macro_rules! cuda_ptr {
             ($t:expr, $ty:ty) => {{
-                let (storage, layout) = cb::storage_and_layout(&$t);
-                let cuda = cb::as_cuda(&storage, "FA4")?;
-                let slice = cuda.as_slice::<$ty>()?.slice(layout.start_offset()..);
-                let (ptr, _guard) = unsafe { slice.device_ptr(&stream) };
+                let (storage, layout) = $t.storage_and_layout();
+                let cuda = match &*storage {
+                    candle_core::Storage::Cuda(s) => s,
+                    _ => candle_core::bail!("FA4: requires CUDA"),
+                };
+                let slice = cuda.as_cuda_slice::<$ty>()?.slice(layout.start_offset()..);
+                let (ptr, _guard) = slice.device_ptr(&stream);
                 ptr as u64
             }};
         }
@@ -257,7 +261,7 @@ fn call_fa4_vsplit(
     total_q: usize, num_heads_q: usize, head_dim: usize, num_heads_k: usize,
     half_dim: usize,
 ) -> Result<Tensor> {
-    let num_kv_heads = v.dim(1)?;
+    let _num_kv_heads = v.dim(1)?;
     // V: [total_k, num_kv_heads, head_dim] → split last dim
     let v_lo = v.narrow(2, 0, half_dim)?.contiguous()?;
     let v_hi = v.narrow(2, half_dim, half_dim)?.contiguous()?;
@@ -279,7 +283,7 @@ fn call_fa4_inner_vsplit(
     cu_seqlens_q: &Tensor, cu_seqlens_k: &Tensor,
     softmax_scale: f32,
     window_left: Option<i32>, window_right: Option<i32>,
-    total_q: usize, num_heads_q: usize, head_dim: usize, num_heads_k: usize,
+    total_q: usize, num_heads_q: usize, head_dim: usize, _num_heads_k: usize,
     head_dim_v: usize,
 ) -> Result<Tensor> {
     let stream = cb::tensor_stream(q)?;
@@ -291,10 +295,13 @@ fn call_fa4_inner_vsplit(
 
         macro_rules! cuda_ptr {
             ($t:expr, $ty:ty) => {{
-                let (storage, layout) = cb::storage_and_layout(&$t);
-                let cuda = cb::as_cuda(&storage, "FA4")?;
-                let slice = cuda.as_slice::<$ty>()?.slice(layout.start_offset()..);
-                let (ptr, _guard) = unsafe { slice.device_ptr(&stream) };
+                let (storage, layout) = $t.storage_and_layout();
+                let cuda = match &*storage {
+                    candle_core::Storage::Cuda(s) => s,
+                    _ => candle_core::bail!("FA4: requires CUDA"),
+                };
+                let slice = cuda.as_cuda_slice::<$ty>()?.slice(layout.start_offset()..);
+                let (ptr, _guard) = slice.device_ptr(&stream);
                 ptr as u64
             }};
         }
@@ -350,7 +357,7 @@ fn call_fa4_inner(
     cu_seqlens_q: &Tensor, cu_seqlens_k: &Tensor,
     softmax_scale: f32,
     window_left: Option<i32>, window_right: Option<i32>,
-    total_q: usize, num_heads_q: usize, head_dim: usize, num_heads_k: usize,
+    total_q: usize, num_heads_q: usize, _head_dim: usize, _num_heads_k: usize,
 ) -> Result<Tensor> {
     let stream = cb::tensor_stream(q)?;
     let out = Tensor::zeros(q.shape(), DType::BF16, q.device())?;
@@ -363,10 +370,13 @@ fn call_fa4_inner(
 
         macro_rules! cuda_ptr {
             ($t:expr, $ty:ty) => {{
-                let (storage, layout) = cb::storage_and_layout(&$t);
-                let cuda = cb::as_cuda(&storage, "FA4")?;
-                let slice = cuda.as_slice::<$ty>()?.slice(layout.start_offset()..);
-                let (ptr, _guard) = unsafe { slice.device_ptr(&stream) };
+                let (storage, layout) = $t.storage_and_layout();
+                let cuda = match &*storage {
+                    candle_core::Storage::Cuda(s) => s,
+                    _ => candle_core::bail!("FA4: requires CUDA"),
+                };
+                let slice = cuda.as_cuda_slice::<$ty>()?.slice(layout.start_offset()..);
+                let (ptr, _guard) = slice.device_ptr(&stream);
                 ptr as u64
             }};
         }

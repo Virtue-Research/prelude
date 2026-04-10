@@ -306,6 +306,33 @@ impl RmsNorm {
     pub fn eps(&self) -> f64 {
         self.eps
     }
+
+    /// Ops-accelerated RMS normalization (fused CUDA kernel when available).
+    pub fn forward_ops(&self, x: &Tensor, ops: &dyn crate::ops::Ops) -> Result<Tensor> {
+        ops.rms_norm(x, &self.weight, self.eps as f32)
+    }
+
+    /// Fused residual-add + RMS normalization (vLLM-style).
+    ///
+    /// - `residual = None` (first layer): returns `(hidden, rms_norm(hidden))`
+    /// - `residual = Some(r)`: returns `fused_add_rmsnorm(r, hidden, weight, eps)`
+    pub fn forward_residual(
+        &self,
+        hidden: &Tensor,
+        residual: Option<&Tensor>,
+        ops: &dyn crate::ops::Ops,
+    ) -> Result<(Tensor, Tensor)> {
+        match residual {
+            Some(res) => {
+                let (new_res, normed) = ops.add_rmsnorm(res, hidden, &self.weight, self.eps as f32)?;
+                Ok((new_res, normed))
+            }
+            None => {
+                let normed = ops.rms_norm(hidden, &self.weight, self.eps as f32)?;
+                Ok((hidden.clone(), normed))
+            }
+        }
+    }
 }
 
 impl Module for RmsNorm {

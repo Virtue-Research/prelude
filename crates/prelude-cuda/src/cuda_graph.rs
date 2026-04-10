@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cudarc::driver::CudaStream;
+use cudarc::driver::{CudaStream, DevicePtr};
 use prelude_core::tensor::{DType, Device, Tensor};
 
 use prelude_core::cache::block_manager::BlockManager;
@@ -17,7 +17,7 @@ use prelude_core::config::EngineConfig;
 use prelude_core::engine::{Engine, EngineError, OwnedBatchDecodeSeq};
 use prelude_core::models::commons::{BatchAttnContext, PagedKvBatchContext};
 
-use crate::device::{as_cuda_mut, CudaStorage, GpuDType};
+use crate::device::GpuDType;
 
 fn tensor_err(e: prelude_core::tensor::Error) -> EngineError {
     EngineError::Internal(format!("tensor: {e}"))
@@ -79,7 +79,10 @@ impl DecodeGraphBuffers {
 }
 
 /// Write host data into a pre-allocated GPU tensor without new allocation.
-unsafe fn update_tensor<T: GpuDType>(
+///
+/// Safety: caller must ensure no concurrent access to this tensor's storage.
+/// This is called from the single GPU worker thread for CUDA graph buffer updates.
+unsafe fn update_tensor<T: GpuDType + candle_core::cuda_backend::CudaDType>(
     tensor: &Tensor,
     data: &[T],
     stream: &Arc<CudaStream>,
@@ -89,25 +92,39 @@ unsafe fn update_tensor<T: GpuDType>(
         "update_tensor: data len {} exceeds tensor elem_count {}",
         data.len(), tensor.elem_count(),
     );
-    let mut guard = tensor.storage_rw().write()
-        .map_err(|_| EngineError::Internal("lock poisoned".into()))?;
-    let cuda = as_cuda_mut(&mut guard, "update_tensor")
-        .map_err(|e| EngineError::Internal(format!("update_tensor: {e}")))?;
-    let slice = T::as_cuda_slice_mut(&mut cuda.slice)
-        .map_err(|e| EngineError::Internal(format!("as_cuda_slice_mut: {e}")))?;
-    stream
-        .memcpy_htod(data, slice)
-        .map_err(|e| EngineError::Internal(format!("memcpy_htod: {e}")))?;
+    // Safety: single GPU worker thread, no concurrent access to these graph-owned buffers.
+    // Use raw CUDA memcpy with the device pointer from the tensor's CudaSlice.
+    // We only need a read lock — the GPU write doesn't mutate the Rust struct.
+    let (guard, _layout) = tensor.storage_and_layout();
+    match &*guard {
+        prelude_core::tensor::Storage::Cuda(cs) => {
+            let slice = <T as candle_core::cuda_backend::CudaDType>::as_cuda_slice(cs)
+                .map_err(|e| EngineError::Internal(format!("as_cuda_slice: {e}")))?;
+            let (dev_ptr, _g) = slice.device_ptr(stream);
+            let raw_stream = stream.cu_stream();
+            cudarc::driver::result::memcpy_htod_async(dev_ptr, data, raw_stream)
+                .map_err(|e| EngineError::Internal(format!("memcpy_htod: {e}")))?;
+        }
+        _ => return Err(EngineError::Internal("update_tensor: expected CUDA storage".into())),
+    }
     Ok(())
 }
 
+/// CPU-side data computed during buffer update, reused for FlashInfer plan
+/// to avoid redundant GPU→CPU copies.
+struct CpuBatchData {
+    cu_seqlens_k: Vec<u32>,
+    block_tables: Vec<Vec<u32>>,
+}
+
 /// Update all pre-allocated buffers from the current decode batch.
+/// Returns CPU-side data for reuse by FlashInfer plan computation.
 fn update_buffers(
     buffers: &DecodeGraphBuffers,
     seqs: &[OwnedBatchDecodeSeq],
     block_size: usize,
     stream: &Arc<CudaStream>,
-) -> Result<(), EngineError> {
+) -> Result<CpuBatchData, EngineError> {
     let bs = seqs.len();
     debug_assert_eq!(bs, buffers.batch_size);
 
@@ -132,13 +149,17 @@ fn update_buffers(
 
     let max_blocks = buffers.max_blocks;
     let mut flat_bt: Vec<u32> = Vec::with_capacity(bs * max_blocks);
+    let per_seq_bt: Vec<Vec<u32>> = seqs.iter().map(|s| s.block_table.clone()).collect();
     for s in seqs {
         flat_bt.extend_from_slice(&s.block_table);
         flat_bt.resize(flat_bt.len() + max_blocks - s.block_table.len(), 0);
     }
     unsafe { update_tensor(&buffers.block_tables, &flat_bt, stream)? };
 
-    Ok(())
+    Ok(CpuBatchData {
+        cu_seqlens_k: cu_k,
+        block_tables: per_seq_bt,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -250,12 +271,14 @@ impl DecodeGraphCache {
             Err(e) => return Some(Err(e)),
         };
 
-        // Update input buffers
-        if let Err(e) = update_buffers(&captured.buffers, seqs, self.block_size, &stream) {
-            return Some(Err(e));
-        }
+        // Update input buffers (returns CPU-side data for plan reuse)
+        let cpu_data = match update_buffers(&captured.buffers, seqs, self.block_size, &stream) {
+            Ok(d) => d,
+            Err(e) => return Some(Err(e)),
+        };
 
-        // Pre-compute FlashInfer plan outside the graph
+        // Pre-compute FlashInfer plan outside the graph.
+        // Uses CPU-side data from update_buffers to avoid GPU→CPU syncs.
         {
             let pool = match engine.cache.paged_pool.as_ref() {
                 Some(p) => p,
@@ -265,13 +288,12 @@ impl DecodeGraphCache {
             let num_qo_heads = engine.executor.config.num_attention_heads;
             let head_dim = engine.executor.config.head_dim;
 
-            if let Err(e) = crate::attn::flashinfer::precompute_paged_plan_graphed(
+            if let Err(e) = crate::attn::flashinfer::precompute_paged_plan_replay(
                 (bs, num_qo_heads, head_dim),
                 &key_caches[0],
-                &captured.buffers.cu_seqlens_q,
-                &captured.buffers.block_tables,
-                &captured.buffers.cu_seqlens_k,
-                1.0 / (head_dim as f32).sqrt(),
+                &cpu_data.cu_seqlens_k,
+                &cpu_data.block_tables,
+                self.block_size,
                 &captured.buffers.fi_indptr,
                 &captured.buffers.fi_indices,
                 &captured.buffers.fi_last_page_len,
@@ -354,7 +376,7 @@ impl DecodeGraphCache {
         {
             let num_qo_heads = engine.executor.config.num_attention_heads;
             let head_dim = engine.executor.config.head_dim;
-            crate::attn::flashinfer::precompute_paged_plan_graphed(
+            crate::attn::flashinfer::precompute_paged_plan_capture(
                 (batch_size, num_qo_heads, head_dim),
                 &key_caches[0],
                 &buffers.cu_seqlens_q,
@@ -395,7 +417,9 @@ impl DecodeGraphCache {
     }
 
     fn get_stream(device: &Device) -> Result<Arc<CudaStream>, EngineError> {
-        crate::device::cuda_stream(device.ordinal())
-            .map_err(|e| EngineError::Internal(format!("cuda_stream: {e}")))
+        let cuda_dev = device
+            .as_cuda_device()
+            .map_err(|e| EngineError::Internal(format!("as_cuda_device: {e}")))?;
+        Ok(cuda_dev.cuda_stream())
     }
 }

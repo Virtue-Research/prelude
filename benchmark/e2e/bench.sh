@@ -190,8 +190,8 @@ start_prelude() {
         [[ "${CPU_MODE}" == false ]] && cuda_env="CUDA_VISIBLE_DEVICES=${GPU}"
 
         # shellcheck disable=SC2086
-        env ${cuda_env} "${bin}" \
-            --model "${MODEL}" --host 0.0.0.0 --port "${PORT}" \
+        env ${cuda_env} RUST_LOG="${RUST_LOG:-warn}" "${bin}" \
+            --model "${MODEL}" --host 0.0.0.0 --port "${PORT}" --dtype bf16 \
             ${extra} &
         LOCAL_PID=$!
         echo "  Local PID: ${LOCAL_PID}"

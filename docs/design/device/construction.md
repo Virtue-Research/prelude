@@ -14,14 +14,14 @@ pub fn register() {
     prelude_core::ops::register_backend(OpsBackend {
         name: "cuda",
         priority: 100,                         // GPU backends: high priority
-        probe: || cuda_device(0).is_ok(),      // hardware detection in device crate
+        probe: || cuda_probe(0),               // hardware detection in device crate
         supports: |d| d.is_cuda(),
         create_ops: cuda_ops,
     });
     prelude_core::engine::executor::register_executor(ExecutorBackend {
         name: "cuda",
         priority: 100,
-        probe: || cuda_device(0).is_ok(),
+        probe: || cuda_probe(0),
         supports: |d| d.is_cuda(),
         create: |engine| Box::new(CudaExecutor::new(engine)),
     });
@@ -76,7 +76,7 @@ pub fn register_backend(entry: OpsBackend) {
 
 /// Select the best available backend for a device.
 /// Filters by supports(device), then by probe(), picks highest priority.
-/// Falls back to bare_ops() (Device or CubeCL backend) if nothing matches.
+/// Falls back to bare_ops() if nothing matches.
 pub fn select_ops(device: &Device) -> &'static dyn Ops {
     let lock = if device.is_cuda() { &RESOLVED_GPU } else { &RESOLVED_CPU };
     *lock.get_or_init(|| resolve_for(device))
@@ -157,26 +157,21 @@ symbol conflicts.
 
 ```
 prelude-server (binary)
-    ├── prelude-core               (Ops trait, models, engine — no C++, no device types)
-    │       ├── cubecl                 (pure Rust: IR + TensorOps primitives, generic over CubeRuntime)
+    ├── prelude-core               (Ops trait, models, engine)
+    │       ├── candle-core            (tensor backend: storage, matmul, basic ops)
+    │       ├── candle-nn              (softmax, rotary emb, etc.)
     │       └── llguidance             (constrained decoding, pure Rust)
     ├── prelude-cuda               (feature-gated, register() at startup)
     │       ├── prelude-core
-    │       ├── cubecl (features=["cuda"])  (CubeCL CUDA runtime for TensorOps)
-    │       └── fa4/, flashinfer/, deepgemm/, nccl/, uccl-ep/
-    ├── prelude-rocm               (feature-gated, register() at startup)
-    │       ├── prelude-core
-    │       ├── cubecl (features=["hip"])
-    │       └── ck/, aiter/, rccl/, uccl-ep/
-    └── prelude-tpu                (feature-gated, same pattern — XLATensorOps instead of CubeCL)
-            ├── prelude-core
-            └── pjrt C API (XLA runtime, dlopen libpjrt_tpu.so)
+    │       ├── candle-core (features=["cuda"])
+    │       └── fa4/, flashinfer/, deepgemm/, cutlass-gemm/, quant-gemm/
+    └── prelude-cpu                (feature-gated, register() at startup)
+            └── prelude-core
 ```
 
-`prelude-core` compiles no C++ and contains no device-specific types. It depends on CubeCL
-(pure Rust) for `CubeCLTensorOps<R: Runtime>` — a generic TensorOps implementation that
-device crates instantiate with their runtime. `bare_ops()` provides pure Rust primitives
-as the lowest-priority fallback. CubeCL's CPU runtime serves as an alternative.
+`prelude-core` depends on candle-core for the tensor type and basic ops. The `cuda` feature
+is gated — CPU-only builds don't pull in CUDA. `bare_ops()` provides minimal Ops defaults
+as the lowest-priority fallback (basic tensor ops still go through candle).
 
 **Why this design:**
 

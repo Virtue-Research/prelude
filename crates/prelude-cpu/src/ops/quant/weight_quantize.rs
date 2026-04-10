@@ -144,7 +144,7 @@ fn make_qx_quants(n: usize, nmax: i32, x: &[f32], ls: &mut [i8]) -> f32 {
         return 0.0;
     }
 
-    let mut iscale = -(nmax as f32) / max;
+    let iscale = -(nmax as f32) / max;
 
     // rmse_type = 1 path (weight = x*x)
     let mut sumlx = 0.0f32;

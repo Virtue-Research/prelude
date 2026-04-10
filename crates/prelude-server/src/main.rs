@@ -84,6 +84,13 @@ struct Cli {
 
     #[arg(
         long,
+        default_value_t = true,
+        help = "Enable chunked prefill: interleave prefill with decode steps for lower TPOT"
+    )]
+    chunked_prefill: bool,
+
+    #[arg(
+        long,
         value_enum,
         default_value_t = CliTaskOverride::Auto,
         help = "Force model task detection: auto, classify, embedding, or generation"
@@ -110,17 +117,13 @@ struct Cli {
 
     #[arg(
         long,
-        default_value_t = 0.4,
-        help = "Fraction of free GPU memory for KV cache (0.0-1.0, default 0.4). \
+        default_value_t = prelude_core::config::DEFAULT_GPU_MEMORY_UTILIZATION,
+        help = "Fraction of free GPU memory for KV cache (0.0-1.0). \
                 Ignored when PRELUDE_PAGED_ATTN_BLOCKS is set explicitly."
     )]
     gpu_memory_utilization: f32,
 
-    #[arg(
-        long,
-        default_value_t = true,
-        help = "CUDA graph capture for decode steps (default: true)"
-    )]
+    #[arg(long, default_value_t = true, help = "CUDA graph capture for decode steps (use --no-cuda-graph to disable)")]
     cuda_graph: bool,
 
     #[arg(long, default_value = "auto", help = "Device: auto, cpu, cuda, cuda:N")]
@@ -154,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
     prelude_cuda::register();
 
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 "prelude_server=info,prelude_core=info,tower_http=info".into()
@@ -233,6 +237,7 @@ fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
         max_prefill_tokens: cli.max_prefill_tokens,
         max_total_tokens: cli.max_total_tokens,
         decode_reservation_cap: cli.decode_reservation_cap,
+        chunked_prefill: cli.chunked_prefill,
         ..SchedulerConfig::default()
     };
     info!(

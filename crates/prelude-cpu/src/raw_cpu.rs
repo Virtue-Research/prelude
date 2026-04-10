@@ -646,7 +646,7 @@ pub(crate) unsafe fn raw_mlp_forward_f32(
     scratch: &mut RawScratchF32,
     input: *const f32,
     total: usize,
-    hidden_size: usize,
+    _hidden_size: usize,
     gate_up_pw: &OnednnF32PackedWeight,
     down_pw: &OnednnF32PackedWeight,
     output: *mut f32,
@@ -670,7 +670,7 @@ pub(crate) unsafe fn raw_mlp_forward_f32(
             #[cfg(target_arch = "x86_64")]
             if is_x86_feature_detected!("avx512f") {
                 use core::arch::x86_64::*;
-                let ones = _mm512_set1_ps(1.0);
+                let _ones = _mm512_set1_ps(1.0);
                 while i + 16 <= dim {
                     let gate = _mm512_loadu_ps(scratch.gate_up.as_ptr().add(base + i));
                     let up = _mm512_loadu_ps(scratch.gate_up.as_ptr().add(base + dim + i));

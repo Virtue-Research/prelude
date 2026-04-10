@@ -93,7 +93,7 @@ pub struct BatchAttnContext<'a> {
 
 // Re-exports for convenient use.
 pub(crate) use linear::{Linear, RmsNorm};
-pub(crate) use attn_utils::{fused_qkv_projection, RotaryEmbedding};
+pub(crate) use attn_utils::RotaryEmbedding;
 
 // ── Utility functions ───────────────────────────────────────────────────
 

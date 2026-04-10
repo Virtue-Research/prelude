@@ -183,7 +183,7 @@ pub struct SchedulerConfig {
     pub min_new_token_ratio: f32,
     pub new_token_ratio_decay: f32,
     pub policy: SchedulePolicy,
-    pub mixed_chunked: bool,
+    pub chunked_prefill: bool,
 }
 
 impl Default for SchedulerConfig {
@@ -199,7 +199,7 @@ impl Default for SchedulerConfig {
             min_new_token_ratio: 0.1,
             new_token_ratio_decay: 0.002,
             policy: SchedulePolicy::Fcfs,
-            mixed_chunked: false,
+            chunked_prefill: false,
         }
     }
 }
@@ -301,7 +301,7 @@ impl Scheduler {
         self.step_count += 1;
         self.drain_finished();
 
-        if self.config.mixed_chunked {
+        if self.config.chunked_prefill {
             return self.get_mixed_batch();
         }
 

@@ -160,9 +160,9 @@ fn test_decode_reservation_cap_is_configurable() {
 }
 
 #[test]
-fn test_mixed_chunked_emits_mixed_step() {
+fn test_chunked_prefill_emits_mixed_step() {
     let config = SchedulerConfig {
-        mixed_chunked: true,
+        chunked_prefill: true,
         ..Default::default()
     };
     let mut sched = Scheduler::new(config);

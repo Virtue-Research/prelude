@@ -230,12 +230,10 @@ def main():
                "--model", args.model, "--dtype", args.dtype]
         print(f"  Starting: {' '.join(cmd)}")
         print(f"  Env: PRELUDE_DEVICE={args.device}")
-        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         print(f"  Waiting for server...", end=" ", flush=True)
         if not wait_for_server(server_url):
-            print("TIMEOUT")
-            if proc.stdout:
-                print(proc.stdout.read().decode()[-2000:])
+            print("TIMEOUT (check server logs on stderr)")
             sys.exit(1)
         print("ready")
 

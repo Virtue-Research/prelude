@@ -55,7 +55,7 @@ pub fn cpu_silu_and_mul_inplace(input: Tensor) -> Result<Tensor> {
     }
     let dim = d2 / 2;
 
-    let data_ptr = unsafe { input.data_ptr_mut()? as *mut u16 };
+    let data_ptr = super::tensor_data_ptr_mut::<u16>(&input)?;
 
     silu_and_mul_bf16_inplace(data_ptr, n, dim);
     input.narrow(1, 0, dim)

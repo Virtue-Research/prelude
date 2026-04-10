@@ -33,8 +33,8 @@ The image includes: Rust stable, CUDA 12.8 toolkit, cmake, llama.cpp (for benchm
 | Rust (stable) | 1.85+   | All builds          |
 | CMake         | >= 3.18 | oneDNN (CPU builds) |
 | CUDA Toolkit  | >= 12.x | GPU builds          |
-| Python 3      | 3.10+   | PyTorch reference tests |
-| PyTorch       | 2.x     | PyTorch reference tests |
+| Python 3      | 3.10+   | Accuracy tests      |
+| PyTorch       | 2.x     | Accuracy tests (HF reference) |
 
 oneDNN is auto-downloaded and statically linked on first build.
 
@@ -44,7 +44,7 @@ oneDNN is auto-downloaded and statically linked on first build.
 uv venv .venv --python 3.12 --seed
 source .venv/bin/activate
 
-uv pip install transformers torch requests numpy cmake nvidia-cutlass
+uv pip install transformers torch requests numpy cmake nvidia-cutlass datasets
 ```
 
 ### Build
@@ -62,69 +62,11 @@ cargo check --workspace --all-targets
 
 ## Testing
 
-### Architecture
-
-Tests are organized in two layers:
-
-1. **prelude-core** (`tests/tensor_ops.rs`, 97 tests): Correctness tests with **PyTorch reference**. Covers all TensorOps primitives (unary, binary, reduce, matmul, cast, etc.) and composed ops (rmsnorm, softmax, attention patterns). Tested across F32/BF16/F16 dtypes.
-
-2. **prelude-cpu** (`src/ops/*/tests`, 169 tests): CPU kernel tests. Validates AVX-512/oneDNN optimized kernels against scalar reference implementations. Covers rmsnorm, attention, RoPE, SiLU×Mul, quantized GEMM.
-
-prelude-cpu is a dev-dependency of prelude-core, so `cargo test -p prelude-core` automatically links prelude-cpu's high-level ops (AVX-512 rmsnorm, attention, etc.) via `#[ctor]` auto-registration. The PyTorch reference tests cover the full stack from model ops down to device kernels.
-
-### Dual TensorOps backends
-
-prelude-core has two parallel TensorOps implementations (temporary, for A/B validation):
-
-- **CubeCL backend** (`cubecl_backend/`): CubeCL runtime, `Storage::CubeCL`. Default.
-- **Device backend** (`device_backend/`): Pure Rust, `Storage::Device`. Reference implementation.
-
-Controlled by `PRELUDE_TENSOR_BACKEND` env var:
-
-```bash
-# Test with CubeCL backend (default)
-cargo test -p prelude-core
-
-# Test with Device backend
-PRELUDE_TENSOR_BACKEND=device cargo test -p prelude-core
-
-# Test both backends (CI should run both)
-PRELUDE_TENSOR_BACKEND=cubecl cargo test -p prelude-core
-PRELUDE_TENSOR_BACKEND=device cargo test -p prelude-core
-```
-
-Both backends must pass the same 97 PyTorch-validated tests.
-
-### Device selection
-
-CPU tests always run. Device tests enabled via features:
-
-```bash
-# CPU only (default)
-cargo test -p prelude-core
-
-# CPU + NVIDIA GPU
-cargo test -p prelude-core --features test-cuda
-
-# CPU + AMD GPU (planned)
-cargo test -p prelude-core --features test-amd
-
-# CPU + Apple GPU (planned)
-cargo test -p prelude-core --features test-metal
-
-# CPU + TPU (planned)
-cargo test -p prelude-core --features test-tpu
-
-# All available devices
-cargo test -p prelude-core --features test-cuda,test-amd,test-metal,test-tpu
-```
-
 ### Running tests
 
 ```bash
-# ── Core library (PyTorch reference, both backends) ──────────
-cargo test -p prelude-core                                  # CubeCL backend, CPU
-PRELUDE_TENSOR_BACKEND=device cargo test -p prelude-core    # Device backend, CPU
+# ── Core library (PyTorch reference) ────────────────────────
+cargo test -p prelude-core
 
 # ── CPU kernels (AVX-512, oneDNN, quantized) ─────────────────
 cargo test -p prelude-cpu
@@ -135,11 +77,47 @@ cargo test -p prelude-deepgemm --release
 cargo test -p prelude-flashinfer --release
 cargo test -p prelude-flash-attn-v4 --release
 cargo test -p prelude-quant-gemm --release
+cargo test -p prelude-cula --release
 ```
+
+### Accuracy (WikiText PPL)
+
+Validates inference precision against HuggingFace transformers, same method as
+[vLLM's generation_ppl_test](https://github.com/vllm-project/vllm/tree/main/tests/models/language/generation_ppl_test).
+Pass criteria: server PPL within 1% of HF (one-sided — only fails if server is worse).
+
+```bash
+# Full test (computes HF reference PPL, takes a few minutes)
+CUDA_VISIBLE_DEVICES=2 python3 tests/accuracy/test_ppl.py \
+    --binary target/release/prelude-server \
+    --model Qwen/Qwen3-8B
+
+# Skip HF computation with known reference PPL
+CUDA_VISIBLE_DEVICES=2 python3 tests/accuracy/test_ppl.py \
+    --binary target/release/prelude-server \
+    --model Qwen/Qwen3-0.6B --hf-ppl 23.864
+
+# Connect to a running server
+python3 tests/accuracy/test_ppl.py \
+    --server http://localhost:8000 \
+    --model Qwen/Qwen3-0.6B --hf-ppl 23.864
+```
+
+Known HF reference PPL (BF16, WikiText-2 test, stride=1024):
+| Model | HF PPL |
+|-------|--------|
+| Qwen/Qwen3-0.6B | 23.864 |
 
 ### Benchmark
 
 ```bash
+# E2E server benchmark (decode throughput, CUDA 13 Docker images by default)
+CUDA_VISIBLE_DEVICES=2 MODEL=Qwen/Qwen3-8B INPUT_TOKENS=128 OUTPUT_TOKENS=32 \
+    MAX_REQUESTS=400 CONCURRENCY=4 ./benchmark/bench.sh prelude vllm sglang --gpu
+
+# Use CUDA 12 Docker images instead
+./benchmark/bench.sh vllm sglang --gpu --cu12
+
 # CPU kernel benchmarks (quantized, GEMM, attention, etc.)
 cargo run -p prelude-cpu --bin cpu_ops_bench --release
 cargo run -p prelude-cpu --bin cpu_ops_bench --release -- quant
@@ -151,22 +129,136 @@ cargo run -p prelude-deepgemm --example bench_kernel --release
 cargo run -p prelude-flashinfer --example bench_kernel --release
 cargo run -p prelude-flash-attn-v4 --example bench_kernel --release
 cargo run -p prelude-quant-gemm --example bench_kernel --release
+
+# Fused ops (silu_mul_concat vs fused_silu_mul, model shapes)
+cargo run -p prelude-cuda --bin fused_ops_test --release
+```
+
+## Debugging
+
+### Log levels
+
+Server uses `tracing` (writes to stderr). Control via `RUST_LOG`:
+
+```bash
+# Default: info level for server + core
+RUST_LOG=prelude_server=info,prelude_core=info
+
+# Debug a specific module
+RUST_LOG=prelude_cuda::ops::gemm=debug ./target/release/prelude-server ...
+
+# Trace everything (very verbose)
+RUST_LOG=debug ./target/release/prelude-server ...
+```
+
+### Runtime env vars
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `PRELUDE_SYNC_TIMING` | `false` | Enable GPU synchronization for per-step timing |
+| `PRELUDE_CUDA_GRAPH_MAX_BS` | `32` | Max batch size for CUDA graph capture. Set to `0` to disable CUDA graphs. |
+| `PRELUDE_FORCE_VARLEN_PREFILL` | `false` | Force varlen (non-paged) prefill path |
+| `PRELUDE_FUSED_KV_CACHE_WRITE` | `0` | Enable fused KV cache write kernel |
+| `PRELUDE_PAGED_ATTN_BLOCKS` | auto | Override number of KV cache blocks (0 = auto from GPU memory) |
+| `PRELUDE_PAGED_BLOCK_SIZE` | auto | Override KV cache block size (default: 128 with FlashInfer) |
+| `PRELUDE_PREFIX_CACHE_BLOCKS` | `0` | Number of blocks reserved for prefix cache |
+| `PRELUDE_DEFAULT_TEMPERATURE` | `0.7` | Default sampling temperature |
+| `PRELUDE_DEFAULT_MAX_TOKENS` | `4096` | Default max new tokens per request |
+
+### GPU profiling (nsys)
+
+Use `benchmark/profile.sh` for automated kernel-level profiling with Nsight Systems:
+
+```bash
+# Profile Prelude decode steps
+CUDA_VISIBLE_DEVICES=2 MODEL=Qwen/Qwen3-8B ./benchmark/profile.sh prelude
+
+# Profile vLLM / SGLang (Docker, for comparison)
+CUDA_VISIBLE_DEVICES=2 MODEL=Qwen/Qwen3-8B ./benchmark/profile.sh vllm
+CUDA_VISIBLE_DEVICES=2 MODEL=Qwen/Qwen3-8B ./benchmark/profile.sh sglang
+
+# Disable CUDA graphs to see individual kernels (not graph launches)
+CUDA_VISIBLE_DEVICES=2 MODEL=Qwen/Qwen3-8B ./benchmark/profile.sh prelude --no-cuda-graph
+
+# Batched decode (matches benchmark concurrency)
+CUDA_VISIBLE_DEVICES=2 MODEL=Qwen/Qwen3-8B CONCURRENCY=4 NUM_REQUESTS=40 ./benchmark/profile.sh prelude
+
+# Re-analyze an existing report
+./benchmark/profile.sh stats bench_results/profile_*/prelude.nsys-rep
+```
+
+The script starts the engine under `nsys`, sends warmup + profiled requests, then prints:
+- **Kernel summary**: total GPU time per kernel, sorted by impact
+- **Memory ops**: CUDA memcpy/memset breakdown
+
+For NVTX markers (named regions in the nsys timeline), build with `--features nvtx`:
+
+```bash
+cargo build -p prelude-server --release --features full,nvtx
+CUDA_VISIBLE_DEVICES=2 MODEL=Qwen/Qwen3-8B ./benchmark/profile.sh
+```
+
+Open `.nsys-rep` files in Nsight Systems GUI for timeline analysis:
+
+```bash
+nsys-ui bench_results/profile_*/prelude.nsys-rep
+```
+
+Manual profiling (without the script):
+
+```bash
+# Profile a running server by PID
+nsys profile -p <PID> --trace=cuda --duration=10
+
+# Disable CUDA graphs for individual kernel visibility
+PRELUDE_CUDA_GRAPH_MAX_BS=0 ./target/release/prelude-server ...
+```
+
+For vLLM / SGLang, use their built-in profiling:
+
+```bash
+# vLLM: torch profiler
+docker run ... vllm/vllm-openai --profiler-config.profiler=torch \
+    --profiler-config.torch_profiler_dir=/tmp/vllm_profile
+
+# SGLang: per-step timing
+SGLANG_RECORD_STEP_TIME=true docker run ... sglang ...
+# SGLang: per-layer NVTX markers (use with nsys)
+docker run ... sglang ... --enable-layerwise-nvtx-marker
 ```
 
 ## Feature flags
 
-| Feature        | Effect                              |
-|----------------|--------------------------------------|
-| `cuda`         | GPU support (includes cutlass-gemm)  |
-| `deepgemm`     | DeepGEMM SM90+ BF16 fast path       |
-| `flash-attn-v4`| FlashAttention v4 (CuTeDSL)         |
-| `flashinfer`   | FlashInfer attention backend         |
-| `flashinfer-v4`| FlashInfer + FA4 combined            |
-| `paged-attn`   | Paged KV cache attention             |
-| `hf_tokenizer` | HuggingFace tokenizer support        |
-| `test-cuda`    | Enable NVIDIA GPU in tests           |
-| `test-amd`     | Enable AMD GPU in tests (planned)    |
-| `test-metal`   | Enable Apple GPU in tests (planned)  |
-| `test-tpu`     | Enable TPU in tests (planned)        |
+### prelude-server
 
-CPU features (oneDNN, quantized kernels) are always compiled — no feature flag needed.
+| Feature | Effect |
+|---------|--------|
+| `cpu`   | CPU inference (default). Enables oneDNN BF16 GEMM + AVX-512 fused kernels. |
+| `cuda`  | CUDA inference. All GPU kernel crates are compiled: FlashInfer, FA4, CUTLASS, DeepGEMM, quant-gemm, cuLA. |
+| `full`  | `cpu` + `cuda`. Recommended for GPU machines. |
+
+```bash
+cargo build -p prelude-server --release --features full   # GPU
+cargo build -p prelude-server --release                    # CPU only (default)
+```
+
+### prelude-core
+
+| Feature | Effect |
+|---------|--------|
+| `cuda`  | Enable CUDA tensor backend (candle-core/cuda). Implied by server's `cuda`. |
+| `hf_tokenizer` | HuggingFace tokenizer support via `tokenizers` crate. |
+| `nvtx`  | NVIDIA NVTX profiling markers. Build with `--features nvtx` to enable. |
+| `test-cuda` | Enable NVIDIA GPU in unit tests. |
+| `test-amd`  | (planned) AMD GPU in tests. |
+| `test-metal` | (planned) Apple GPU in tests. |
+| `test-tpu`  | (planned) TPU in tests. |
+
+### prelude-cpu
+
+| Feature | Effect |
+|---------|--------|
+| `onednn` | oneDNN BF16/F32 GEMM (default). Auto-downloads and statically links oneDNN. |
+
+GPU kernel crates (deepgemm, cutlass-gemm, flashinfer, fa4, quant-gemm, cula)
+have no user-facing feature flags — they are always compiled when `cuda` is enabled.

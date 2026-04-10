@@ -116,7 +116,6 @@ impl LinearBackend for QuantizedWeightQ4K {
 
 use prelude_core::models::commons::linear::{QuantFormat, QuantFormatEntry};
 use prelude_core::tensor::quantized::GgmlDType;
-use prelude_core::tensor::Device;
 
 struct CpuQ4_0Format;
 

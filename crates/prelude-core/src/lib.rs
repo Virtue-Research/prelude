@@ -1,4 +1,7 @@
 pub mod tensor;
+
+// Re-export candle's bail! macro at crate root for `crate::bail!()` usage.
+pub use candle_core::bail;
 pub mod config;
 pub mod constants;
 pub mod engine;

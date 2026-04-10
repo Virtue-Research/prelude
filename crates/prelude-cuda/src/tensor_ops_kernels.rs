@@ -5,20 +5,19 @@
 
 use std::sync::Arc;
 use cudarc::driver::{
-    CudaContext, CudaSlice, CudaStream, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg,
-    ValidAsZeroBits,
+    CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
 };
 use half::{bf16, f16};
 use prelude_core::tensor::{bail, CpuStorage, DType, Layout, Result, Shape};
 
 use crate::device::{
-    CuResultExt, CudaStorage, CudaStorageSlice, GpuDType, get_or_load_func, tensor_from_device,
+    CuResultExt, CudaStorage, CudaStorageSlice, GpuDType, get_or_load_func,
 };
 use crate::{
     MOD_UNARY, MOD_BINARY, MOD_CAST, MOD_REDUCE, MOD_INDEXING,
-    MOD_TERNARY, MOD_AFFINE, MOD_FILL, MOD_SORT,
+    MOD_TERNARY, MOD_AFFINE, MOD_SORT,
     PTX_UNARY, PTX_BINARY, PTX_CAST, PTX_REDUCE, PTX_INDEXING,
-    PTX_TERNARY, PTX_AFFINE, PTX_FILL, PTX_SORT,
+    PTX_TERNARY, PTX_AFFINE, PTX_SORT,
 };
 
 // ── Layout info helpers ──────────────────────────────────────────
@@ -26,7 +25,7 @@ use crate::{
 /// Upload dims + strides to GPU for strided kernel access.
 /// Returns None if the layout is contiguous (kernel can use fast path).
 fn layout_info(stream: &Arc<CudaStream>, layout: &Layout) -> Result<Option<CudaSlice<usize>>> {
-    if layout.is_contiguous() && layout.start_offset() == 0 {
+    if layout.is_contiguous() {
         return Ok(None);
     }
     let dims = layout.shape().dims();
@@ -44,8 +43,8 @@ fn binary_layout_info(
     lhs_layout: &Layout,
     rhs_layout: &Layout,
 ) -> Result<Option<CudaSlice<usize>>> {
-    let lhs_cont = lhs_layout.is_contiguous() && lhs_layout.start_offset() == 0;
-    let rhs_cont = rhs_layout.is_contiguous() && rhs_layout.start_offset() == 0;
+    let lhs_cont = lhs_layout.is_contiguous();
+    let rhs_cont = rhs_layout.is_contiguous();
     if lhs_cont && rhs_cont {
         return Ok(None);
     }
@@ -65,9 +64,9 @@ fn ternary_layout_info(
     t_layout: &Layout,
     f_layout: &Layout,
 ) -> Result<Option<CudaSlice<usize>>> {
-    let all_cont = cond_layout.is_contiguous() && cond_layout.start_offset() == 0
-        && t_layout.is_contiguous() && t_layout.start_offset() == 0
-        && f_layout.is_contiguous() && f_layout.start_offset() == 0;
+    let all_cont = cond_layout.is_contiguous()
+        && t_layout.is_contiguous()
+        && f_layout.is_contiguous();
     if all_cont {
         return Ok(None);
     }
@@ -1072,7 +1071,7 @@ pub fn launch_cat(
     let right_size: usize = out_dims[dim + 1..].iter().product();
 
     // Allocate output
-    let ctx = storages[0].0.device();
+    let _ctx = storages[0].0.device();
 
     macro_rules! dispatch {
         ($ty:ty, $variant:ident) => {{

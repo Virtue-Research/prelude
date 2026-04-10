@@ -562,22 +562,35 @@ fn bench_prefill(reg: &KernelRegistry, ws: &Workspace) {
 // ── Bench: Decode ────────────────────────────────────────────────────
 
 fn bench_decode(reg: &KernelRegistry, ws: &Workspace) {
-    println!("\n{:=<80}", "= Decode (paged, BF16) vs cuBLAS naive ");
-    println!("{:<8} {:<8} {:<6} {:<6} {:>10} {:>10} {:>8}",
-        "batch", "kv_len", "heads", "hdim", "FlashInfer", "cuBLAS", "speedup");
+    println!("\n{:=<100}", "= Decode (paged, BF16) vs cuBLAS naive ");
 
     let cublas = CuBlas::load().expect("failed to dlopen libcublas.so");
     let mut cublas_handle: cublasHandle_t = std::ptr::null_mut();
     unsafe { assert_eq!((cublas.create)(&mut cublas_handle), 0); }
 
-    let configs = [
-        (1, 512, 32, 128),
-        (8, 512, 32, 128),
-        (32, 512, 32, 128),
-        (64, 512, 32, 128),
+    // (batch_size, kv_len, num_qo_heads, num_kv_heads, head_dim, page_size, label)
+    let configs: Vec<(usize, usize, i64, i64, i64, i64, &str)> = vec![
+        // Original MHA configs (page_size=16)
+        (1,  512, 32, 32, 128, 16, "MHA"),
+        (8,  512, 32, 32, 128, 16, "MHA"),
+        (32, 512, 32, 32, 128, 16, "MHA"),
+        (64, 512, 32, 32, 128, 16, "MHA"),
+        // Qwen3-0.6B: 16 heads, 8 kv_heads, head_dim=64, block=128
+        (1,  128, 16,  8, 64, 128, "0.6B"),
+        (4,  128, 16,  8, 64, 128, "0.6B"),
+        // Qwen3-8B: 32 heads, 8 kv_heads, head_dim=128, block=128
+        (1,  128, 32,  8, 128, 128, "8B-short"),
+        (4,  128, 32,  8, 128, 128, "8B-short"),
+        (4,  512, 32,  8, 128, 128, "8B-mid"),
+        (4, 2048, 32,  8, 128, 128, "8B-long"),
     ];
 
-    for (batch_size, kv_len, num_heads, head_dim) in configs {
+    println!("{:<8} {:<8} {:<6} {:<6} {:<5} {:<5} {:>10} {:>10} {:>8}",
+        "batch", "kv_len", "qo_h", "kv_h", "hdim", "label", "FlashInfer", "cuBLAS", "speedup");
+
+    for (batch_size, kv_len, num_heads, num_kv_heads, head_dim, page_size, label) in &configs {
+        let (batch_size, kv_len, num_heads, num_kv_heads, head_dim, page_size) =
+            (*batch_size, *kv_len, *num_heads, *num_kv_heads, *head_dim, *page_size);
         let key = DecodeKey {
             dtype: KernelDtype::BF16,
             head_dim_qk: head_dim as u32, head_dim_vo: head_dim as u32,
@@ -585,13 +598,11 @@ fn bench_decode(reg: &KernelRegistry, ws: &Workspace) {
         };
         let variant = match reg.get_decode(&key) {
             Some(v) => v,
-            None => { println!("  Skipping: no variant"); continue; }
+            None => { println!("  Skipping head_dim={head_dim}: no variant"); continue; }
         };
 
-        let page_size = 16i64;
         let num_pages_per_seq = (kv_len as i64 + page_size - 1) / page_size;
         let total_pages = num_pages_per_seq * batch_size as i64;
-        let num_kv_heads = num_heads as i64;
 
         let q_elems = (batch_size as i64 * num_heads as i64 * head_dim as i64) as usize;
         let q = gpu_alloc(q_elems * 2);
@@ -720,8 +731,8 @@ fn bench_decode(reg: &KernelRegistry, ws: &Workspace) {
         });
 
         let speedup = cub_ms / fi_ms;
-        println!("{:<8} {:<8} {:<6} {:<6} {:>9.3}ms {:>9.3}ms {:>7.1}x",
-            batch_size, kv_len, num_heads, head_dim, fi_ms, cub_ms, speedup);
+        println!("{:<8} {:<8} {:<6} {:<6} {:<5} {:<5} {:>9.3}ms {:>9.3}ms {:>7.1}x",
+            batch_size, kv_len, num_heads, num_kv_heads, head_dim, label, fi_ms, cub_ms, speedup);
 
         unsafe {
             cudaFree(q); cudaFree(o); cudaFree(k_cache); cudaFree(v_cache);
@@ -775,72 +786,80 @@ fn bench_utilities(reg: &KernelRegistry) {
         unsafe { cudaFree(logits); cudaFree(out); cudaFree(ws_buf); }
     }
 
-    // RMSNorm
+    // RMSNorm + Fused Add RMSNorm — multiple shapes (decode + prefill)
+    // (tokens, hidden, label)
+    let norm_shapes: &[(i64, i64, &str)] = &[
+        (1,    1536, "Qwen3-0.6B"),
+        (1,    4096, "Qwen3-8B"),
+        (4,    4096, "Qwen3-8B"),
+        (128,  4096, "Qwen3-8B"),
+        (2048, 4096, "Qwen3-8B"),
+    ];
+
     if let Some(rmsnorm) = reg.get_utility("rmsnorm") {
-        let tokens = 2048i64;
-        let hidden = 4096i64;
-        let n = (tokens * hidden) as usize;
-        let input = gpu_alloc(n * 2);
-        let weight = gpu_alloc(hidden as usize * 2);
-        let output = gpu_alloc(n * 2);
+        for &(tokens, hidden, label) in norm_shapes {
+            let n = (tokens * hidden) as usize;
+            let input = gpu_alloc(n * 2);
+            let weight = gpu_alloc(hidden as usize * 2);
+            let output = gpu_alloc(n * 2);
 
-        let in_s = [tokens, hidden]; let in_st = strides(&in_s);
-        let w_s = [hidden]; let w_st = [1i64];
+            let in_s = [tokens, hidden]; let in_st = strides(&in_s);
+            let w_s = [hidden]; let w_st = [1i64];
 
-        let dl_out = gpu_dl(output, BF16_DT, &in_s, &in_st);
-        let dl_in = gpu_dl(input, BF16_DT, &in_s, &in_st);
-        let dl_w = gpu_dl(weight, BF16_DT, &w_s, &w_st);
+            let dl_out = gpu_dl(output, BF16_DT, &in_s, &in_st);
+            let dl_in = gpu_dl(input, BF16_DT, &in_s, &in_st);
+            let dl_w = gpu_dl(weight, BF16_DT, &w_s, &w_st);
 
-        unsafe { reg.set_stream(0, std::ptr::null_mut()); }
+            unsafe { reg.set_stream(0, std::ptr::null_mut()); }
 
-        let args = [
-            TVMFFIAny::dltensor(&dl_out), TVMFFIAny::dltensor(&dl_in),
-            TVMFFIAny::dltensor(&dl_w), TVMFFIAny::float64(1e-6),
-            TVMFFIAny::bool_val(false),
-        ];
+            let args = [
+                TVMFFIAny::dltensor(&dl_out), TVMFFIAny::dltensor(&dl_in),
+                TVMFFIAny::dltensor(&dl_w), TVMFFIAny::float64(1e-6),
+                TVMFFIAny::bool_val(false),
+            ];
 
-        let ms = cuda_bench(5, 100, || {
-            unsafe { reg.call(rmsnorm, &args).unwrap(); }
-        });
-        let gb = (n * 2 * 2 + hidden as usize * 2) as f64 / 1e9;
-        let bw = gb / (ms as f64 * 1e-3);
-        println!("  rmsnorm     ({tokens}×{hidden}): {ms:.3} ms, {bw:.1} GB/s");
+            let ms = cuda_bench(5, 200, || {
+                unsafe { reg.call(rmsnorm, &args).unwrap(); }
+            });
+            let gb = (n * 2 * 2 + hidden as usize * 2) as f64 / 1e9;
+            let bw = gb / (ms as f64 * 1e-3);
+            println!("  rmsnorm         {label:>11} ({tokens:>4}×{hidden}): {ms:.4} ms, {bw:.1} GB/s");
 
-        unsafe { cudaFree(input); cudaFree(weight); cudaFree(output); }
+            unsafe { cudaFree(input); cudaFree(weight); cudaFree(output); }
+        }
     }
 
-    // Fused Add RMSNorm
     if let Some(fused) = reg.get_utility("fused_add_rmsnorm") {
-        let tokens = 2048i64;
-        let hidden = 4096i64;
-        let n = (tokens * hidden) as usize;
-        let input = gpu_alloc(n * 2);
-        let residual = gpu_alloc(n * 2);
-        let weight = gpu_alloc(hidden as usize * 2);
+        for &(tokens, hidden, label) in norm_shapes {
+            let n = (tokens * hidden) as usize;
+            let input = gpu_alloc(n * 2);
+            let residual = gpu_alloc(n * 2);
+            let weight = gpu_alloc(hidden as usize * 2);
 
-        let in_s = [tokens, hidden]; let in_st = strides(&in_s);
-        let w_s = [hidden]; let w_st = [1i64];
+            let in_s = [tokens, hidden]; let in_st = strides(&in_s);
+            let w_s = [hidden]; let w_st = [1i64];
 
-        let dl_in = gpu_dl(input, BF16_DT, &in_s, &in_st);
-        let dl_res = gpu_dl(residual, BF16_DT, &in_s, &in_st);
-        let dl_w = gpu_dl(weight, BF16_DT, &w_s, &w_st);
+            let dl_in = gpu_dl(input, BF16_DT, &in_s, &in_st);
+            let dl_res = gpu_dl(residual, BF16_DT, &in_s, &in_st);
+            let dl_w = gpu_dl(weight, BF16_DT, &w_s, &w_st);
 
-        unsafe { reg.set_stream(0, std::ptr::null_mut()); }
+            unsafe { reg.set_stream(0, std::ptr::null_mut()); }
 
-        let args = [
-            TVMFFIAny::dltensor(&dl_in), TVMFFIAny::dltensor(&dl_res),
-            TVMFFIAny::dltensor(&dl_w), TVMFFIAny::float64(1e-6),
-            TVMFFIAny::bool_val(false),
-        ];
+            let args = [
+                TVMFFIAny::dltensor(&dl_in), TVMFFIAny::dltensor(&dl_res),
+                TVMFFIAny::dltensor(&dl_w), TVMFFIAny::float64(1e-6),
+                TVMFFIAny::bool_val(false),
+            ];
 
-        let ms = cuda_bench(5, 100, || {
-            unsafe { reg.call(fused, &args).unwrap(); }
-        });
-        let gb = (n * 2 * 3 + hidden as usize * 2) as f64 / 1e9; // read input+residual+weight, write input+residual
-        let bw = gb / (ms as f64 * 1e-3);
-        println!("  fused_add_rms ({tokens}×{hidden}): {ms:.3} ms, {bw:.1} GB/s");
+            let ms = cuda_bench(5, 200, || {
+                unsafe { reg.call(fused, &args).unwrap(); }
+            });
+            let gb = (n * 2 * 3 + hidden as usize * 2) as f64 / 1e9;
+            let bw = gb / (ms as f64 * 1e-3);
+            println!("  fused_add_rms   {label:>11} ({tokens:>4}×{hidden}): {ms:.4} ms, {bw:.1} GB/s");
 
-        unsafe { cudaFree(input); cudaFree(residual); cudaFree(weight); }
+            unsafe { cudaFree(input); cudaFree(residual); cudaFree(weight); }
+        }
     }
 
     // Activation fusions

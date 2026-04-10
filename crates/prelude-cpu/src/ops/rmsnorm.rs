@@ -316,7 +316,7 @@ fn rmsnorm_f32_impl(
 unsafe fn rmsnorm_f32_avx512(
     output: &mut [f32], input: &[f32], weight: &[f32],
     batch_size: usize, hidden_size: usize, eps: f32,
-) {
+) { unsafe {
     use core::arch::x86_64::*;
     let chunks = hidden_size / 16;
     let inv_n = 1.0f32 / hidden_size as f32;
@@ -351,7 +351,7 @@ unsafe fn rmsnorm_f32_avx512(
             output[off + j] = input[off + j] * weight[j] * scale;
         }
     }
-}
+}}
 
 /// Out-of-place fused residual-add + RMSNorm for BF16 data.
 ///
@@ -508,7 +508,7 @@ unsafe fn fused_add_rmsnorm_f32_oop_avx512(
     norm_out: &mut [f32], res_out: &mut [f32],
     weight: &[f32],
     batch_size: usize, hidden_size: usize, eps: f32,
-) {
+) { unsafe {
     use core::arch::x86_64::*;
 
     let chunks = hidden_size / 16;
@@ -555,7 +555,7 @@ unsafe fn fused_add_rmsnorm_f32_oop_avx512(
             norm_out[off + j] = added * weight[j] * scale;
         }
     }
-}
+}}
 
 // ── Implementation dispatch (feature detect once, loop inside) ──────────
 

@@ -15,8 +15,13 @@ fn must_fuse<T>(opt: Option<Result<T>>, name: &str) -> Result<T> {
     }
 }
 
+/// Generate random BF16 tensor on GPU (via CPU, since curand is removed).
+fn rand_gpu(shape: impl Into<prelude_core::tensor::Shape>, dev: &Device) -> Result<Tensor> {
+    Tensor::randn(0f64, 1.0, shape, &Device::Cpu)?.to_dtype(DType::BF16)?.to_device(dev)
+}
+
 fn main() -> Result<()> {
-    let dev = Device::Cuda(0);
+    let dev = Device::new_cuda(0)?;
     let ops = prelude_cuda::cuda_ops();
     let n = 1024 * 3072; // typical intermediate_size * seq
 
@@ -27,8 +32,8 @@ fn main() -> Result<()> {
     );
 
     // ── Test fused_silu_mul ─────────────────────────────────────
-    let gate = Tensor::randn(0f64, 1.0, n, &dev)?.to_dtype(DType::BF16)?;
-    let up = Tensor::randn(0f64, 1.0, n, &dev)?.to_dtype(DType::BF16)?;
+    let gate = rand_gpu(n, &dev)?;
+    let up = rand_gpu(n, &dev)?;
 
     // Reference: silu(gate) * up
     let silu_gate = gate.apply(&prelude_core::models::commons::activation::Activation::Silu)?;
@@ -55,8 +60,8 @@ fn main() -> Result<()> {
     );
 
     // ── Test vectorized_add ─────────────────────────────────────
-    let a = Tensor::randn(0f64, 1.0, n, &dev)?.to_dtype(DType::BF16)?;
-    let b = Tensor::randn(0f64, 1.0, n, &dev)?.to_dtype(DType::BF16)?;
+    let a = rand_gpu(n, &dev)?;
+    let b = rand_gpu(n, &dev)?;
 
     let ref_add = (&a + &b)?;
     let fused_add = must_fuse(ops.fused_add(&a, &b), "fused_add")?;
@@ -133,6 +138,116 @@ fn main() -> Result<()> {
         ref_add_us,
         ref_add_us / fused_add_us
     );
+
+    // ── silu_mul_concat vs fused_silu_mul (model shapes) ────
+    //
+    // silu_mul_concat:  takes [tokens, 2*dim], splits internally (FlashInfer kernel)
+    // fused_silu_mul:   takes separate gate, up tensors (our custom kernel)
+    //
+    // In the fused gate_up path, the "separate" approach needs narrow+contiguous
+    // copy first, so we measure that full pipeline too.
+
+    println!("\n= silu_mul_concat vs fused_silu_mul (model decode shapes) =");
+    println!("{:<12} {:<8} {:>12} {:>12} {:>12} {:>8}",
+        "model", "tokens", "concat(us)", "split(us)", "split+cp(us)", "concat/split");
+
+    // (label, tokens, intermediate_size)
+    let shapes = [
+        ("Qwen3-0.6B", 1,  3072),
+        ("Qwen3-0.6B", 4,  3072),
+        ("Qwen3-8B",   1,  12288),
+        ("Qwen3-8B",   4,  12288),
+        ("Qwen3-8B",   128, 12288),
+    ];
+
+    let warmup = 10;
+    let iters = 200;
+
+    for (label, tokens, intermediate) in shapes {
+        let dim2 = intermediate * 2;
+        let gate_up = rand_gpu((tokens, dim2), &dev)?;
+
+        // Pre-split (contiguous) gate and up for fused_silu_mul
+        let gate_c = rand_gpu((tokens, intermediate), &dev)?;
+        let up_c = rand_gpu((tokens, intermediate), &dev)?;
+
+        // Warmup
+        for _ in 0..warmup {
+            let _ = ops.silu_mul_concat(&gate_up);
+            let _ = ops.fused_silu_mul(&gate_c, &up_c);
+        }
+        prelude_cuda::device::synchronize(&dev)?;
+
+        // Bench silu_mul_concat (FlashInfer)
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = must_fuse(ops.silu_mul_concat(&gate_up), "silu_mul_concat")?;
+        }
+        prelude_cuda::device::synchronize(&dev)?;
+        let concat_us = t0.elapsed().as_nanos() as f64 / iters as f64 / 1000.0;
+
+        // Bench fused_silu_mul on pre-split contiguous tensors (best case, no copy)
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = must_fuse(ops.fused_silu_mul(&gate_c, &up_c), "fused_silu_mul")?;
+        }
+        prelude_cuda::device::synchronize(&dev)?;
+        let split_us = t0.elapsed().as_nanos() as f64 / iters as f64 / 1000.0;
+
+        // Bench narrow+contiguous+fused_silu_mul (actual path without silu_mul_concat)
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let g = gate_up.narrow(1, 0, intermediate)?.reshape((tokens, intermediate))?;
+            let u = gate_up.narrow(1, intermediate, intermediate)?.reshape((tokens, intermediate))?;
+            let _ = must_fuse(ops.fused_silu_mul(&g, &u), "fused_silu_mul")?;
+        }
+        prelude_cuda::device::synchronize(&dev)?;
+        let split_copy_us = t0.elapsed().as_nanos() as f64 / iters as f64 / 1000.0;
+
+        let ratio = concat_us / split_us;
+        println!("{:<12} {:<8} {:>11.1} {:>11.1} {:>11.1} {:>7.2}x",
+            label, tokens, concat_us, split_us, split_copy_us, ratio);
+    }
+
+    // ── fused_add_rmsnorm (FlashInfer in-place) ────────────────
+
+    println!("\n= fused_add_rmsnorm via FlashInfer (decode shapes) =");
+    println!("{:<12} {:<8} {:>12}",
+        "model", "tokens", "time(us)");
+
+    let norm_shapes = [
+        ("Qwen3-0.6B", 1,  1536),
+        ("Qwen3-0.6B", 4,  1536),
+        ("Qwen3-8B",   1,  4096),
+        ("Qwen3-8B",   4,  4096),
+        ("Qwen3-8B",   128, 4096),
+        ("Qwen3-32B",  1,  5120),
+        ("Qwen3-32B",  4,  5120),
+    ];
+
+    let warmup = 10;
+    let iters = 200;
+    let eps = 1e-6f32;
+
+    for (label, tokens, hidden) in norm_shapes {
+        let x = rand_gpu((tokens, hidden), &dev)?;
+        let residual = rand_gpu((tokens, hidden), &dev)?;
+        let weight = rand_gpu(hidden, &dev)?;
+
+        for _ in 0..warmup {
+            let _ = ops.fused_add_rmsnorm(&residual, &x, &weight, eps);
+        }
+        prelude_cuda::device::synchronize(&dev)?;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = must_fuse(ops.fused_add_rmsnorm(&residual, &x, &weight, eps), "fused_add_rmsnorm")?;
+        }
+        prelude_cuda::device::synchronize(&dev)?;
+        let us = t0.elapsed().as_nanos() as f64 / iters as f64 / 1000.0;
+
+        println!("{:<12} {:<8} {:>11.1}", label, tokens, us);
+    }
 
     Ok(())
 }

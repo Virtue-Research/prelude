@@ -1390,6 +1390,409 @@ fn decode_plan_and_run() {
     }
 }
 
+/// Multi-block, multi-batch decode with CPU reference.
+/// Mirrors the engine-path test (flashinfer_paged_decode_engine_path) but
+/// calls plan()+run() directly to isolate FlashInfer kernel correctness.
+///
+/// batch=2, GQA 16:8, block_size=128
+///   seq0: 50 tokens in 1 non-contiguous block (block 3)
+///   seq1: 200 tokens in 2 non-contiguous blocks (blocks 5, 1)
+#[test]
+fn decode_multiblock_batch() {
+    let reg = KernelRegistry::new();
+    let ws = Workspace::new();
+
+    let batch_size = 2i64;
+    let num_qo_heads = 16i64;
+    let num_kv_heads = 8i64;
+    let head_dim = 128i64;
+    let page_size = 128i64; // block_size
+    let total_blocks = 8i64;
+
+    let kv_lens: [i64; 2] = [50, 200];
+    let block_tables: [&[i32]; 2] = [&[3], &[5, 1]];
+
+    let key = DecodeKey {
+        dtype: KernelDtype::BF16,
+        head_dim_qk: head_dim as u32,
+        head_dim_vo: head_dim as u32,
+        sliding_window: false,
+        logits_soft_cap: false,
+    };
+    let variant = reg.get_decode(&key).expect("Decode variant not found");
+
+    unsafe {
+        // ── Q: [batch, num_qo_heads, head_dim] ──
+        let q_elems = (batch_size * num_qo_heads * head_dim) as usize;
+        let q_bf16: Vec<u16> = (0..q_elems).map(|i| f32_to_bf16(0.01 * (i as f32 % 7.0))).collect();
+        let q_ptr = gpu_upload(&q_bf16);
+        let o_ptr = gpu_alloc(q_elems * 2);
+
+        // ── KV cache: [total_blocks, page_size, num_kv_heads, head_dim] ──
+        let cache_elems = (total_blocks * page_size * num_kv_heads * head_dim) as usize;
+        let mut k_flat = vec![0.0f32; cache_elems];
+        let mut v_flat = vec![0.0f32; cache_elems];
+
+        // Fill scattered blocks with deterministic positive data
+        let kv_stride = (num_kv_heads * head_dim) as usize;
+        for (seq_i, &kv_len) in kv_lens.iter().enumerate() {
+            let bt = block_tables[seq_i];
+            for t in 0..kv_len as usize {
+                let block_idx = bt[t / page_size as usize] as usize;
+                let block_off = t % page_size as usize;
+                let cache_base = (block_idx * page_size as usize + block_off) * kv_stride;
+                for i in 0..kv_stride {
+                    k_flat[cache_base + i] = 0.005 * (((seq_i * 1000 + t * kv_stride + i) % 11) as f32);
+                    v_flat[cache_base + i] = 0.01 * (((seq_i * 1000 + t * kv_stride + i) % 5) as f32) + 0.01;
+                }
+            }
+        }
+
+        let k_bf16: Vec<u16> = k_flat.iter().map(|&v| f32_to_bf16(v)).collect();
+        let v_bf16: Vec<u16> = v_flat.iter().map(|&v| f32_to_bf16(v)).collect();
+        let k_cache = gpu_upload(&k_bf16);
+        let v_cache = gpu_upload(&v_bf16);
+
+        // ── Page table metadata ──
+        // indptr: cumulative page count per seq
+        // seq0: 1 page, seq1: 2 pages → indptr = [0, 1, 3]
+        let kv_indptr: Vec<i32> = vec![0, 1, 3];
+        // indices: block IDs in order
+        let kv_indices: Vec<i32> = vec![3, 5, 1];
+        // last_page_len: tokens in last block
+        // seq0: 50 % 128 = 50, seq1: 200 % 128 = 72
+        let kv_last_page_len: Vec<i32> = vec![50, 72];
+
+        let kvi_ptr = gpu_upload(&kv_indices);
+        let kv_indptr_cpu = kv_indptr.clone();
+        let kv_indptr_gpu = gpu_upload(&kv_indptr);
+        let kv_last_gpu = gpu_upload(&kv_last_page_len);
+
+        // ── Build DLTensors ──
+        let (dl_fws, _fws_s, _fws_st) = ws.dl_float();
+        let (dl_iws, _iws_s, _iws_st) = ws.dl_int();
+        let (dl_pws, _pws_s, _pws_st) = ws.dl_pinned();
+
+        let indptr_s = [batch_size + 1];
+        let indptr_st = contiguous_strides(&indptr_s);
+        let dl_indptr_cpu = cpu_dl(kv_indptr_cpu.as_ptr() as *mut c_void, I32_DT, &indptr_s, &indptr_st);
+
+        let empty_s = [0i64];
+        let empty_st = [1i64];
+        let dl_eq = gpu_dl(std::ptr::null_mut(), BF16_DT, &empty_s, &empty_st);
+        let dl_ek = gpu_dl(std::ptr::null_mut(), BF16_DT, &empty_s, &empty_st);
+
+        reg.set_stream(0, std::ptr::null_mut());
+
+        // Plan
+        let plan_info = reg.call(variant.plan, &[
+            TVMFFIAny::dltensor(&dl_fws),
+            TVMFFIAny::dltensor(&dl_iws),
+            TVMFFIAny::dltensor(&dl_pws),
+            TVMFFIAny::dltensor(&dl_indptr_cpu),
+            TVMFFIAny::int64(batch_size),
+            TVMFFIAny::int64(num_qo_heads),
+            TVMFFIAny::int64(num_kv_heads),
+            TVMFFIAny::int64(page_size),
+            TVMFFIAny::bool_val(false),    // cuda_graph
+            TVMFFIAny::int64(-1),          // window_left
+            TVMFFIAny::float64(0.0),       // logits_soft_cap
+            TVMFFIAny::int64(head_dim),
+            TVMFFIAny::int64(head_dim),
+            TVMFFIAny::dltensor(&dl_eq),
+            TVMFFIAny::dltensor(&dl_ek),
+        ]).expect("Decode plan failed");
+
+        // Run
+        let q_s = [batch_size, num_qo_heads, head_dim];
+        let q_st = contiguous_strides(&q_s);
+        let kv_s = [total_blocks, page_size, num_kv_heads, head_dim];
+        let kv_st = contiguous_strides(&kv_s);
+        let kvi_s = [kv_indices.len() as i64];
+        let kvi_st = contiguous_strides(&kvi_s);
+        let kvlp_s = [batch_size];
+        let kvlp_st = contiguous_strides(&kvlp_s);
+        let kv_indptr_s = [batch_size + 1];
+        let kv_indptr_st = contiguous_strides(&kv_indptr_s);
+
+        let dl_q = gpu_dl(q_ptr, BF16_DT, &q_s, &q_st);
+        let dl_o = gpu_dl(o_ptr, BF16_DT, &q_s, &q_st);
+        let dl_k = gpu_dl(k_cache, BF16_DT, &kv_s, &kv_st);
+        let dl_v = gpu_dl(v_cache, BF16_DT, &kv_s, &kv_st);
+        let dl_kvi = gpu_dl(kvi_ptr, I32_DT, &kvi_s, &kvi_st);
+        let dl_kv_indptr = gpu_dl(kv_indptr_gpu, I32_DT, &kv_indptr_s, &kv_indptr_st);
+        let dl_kv_last = gpu_dl(kv_last_gpu, I32_DT, &kvlp_s, &kvlp_st);
+
+        let sm_scale = 1.0 / (head_dim as f64).sqrt();
+        reg.call(variant.run, &[
+            TVMFFIAny::dltensor(&dl_fws),
+            TVMFFIAny::dltensor(&dl_iws),
+            plan_info,
+            TVMFFIAny::dltensor(&dl_q),
+            TVMFFIAny::dltensor(&dl_k),
+            TVMFFIAny::dltensor(&dl_v),
+            TVMFFIAny::dltensor(&dl_kv_indptr),
+            TVMFFIAny::dltensor(&dl_kvi),
+            TVMFFIAny::dltensor(&dl_kv_last),
+            TVMFFIAny::dltensor(&dl_o),
+            TVMFFIAny::none(),              // lse
+            TVMFFIAny::int64(0),            // layout = NHD
+            TVMFFIAny::int64(-1),           // window_left
+            TVMFFIAny::bool_val(false),     // enable_pdl
+            TVMFFIAny::none(),              // alibi
+            TVMFFIAny::float64(0.0),        // logits_soft_cap
+            TVMFFIAny::float64(sm_scale),
+            TVMFFIAny::float64(1.0),        // rope_rcp_scale
+            TVMFFIAny::float64(1e4),        // rope_rcp_theta
+        ]).expect("Decode run failed");
+        cudaDeviceSynchronize();
+
+        // ── CPU reference ──
+        let out_bf16 = gpu_download::<u16>(o_ptr, q_elems);
+        let q_f32_rt: Vec<f32> = q_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
+
+        let qo_stride = (num_qo_heads * head_dim) as usize;
+        for (seq_i, &kv_len) in kv_lens.iter().enumerate() {
+            let bt = block_tables[seq_i];
+            let mut k_read = vec![0.0f32; kv_len as usize * kv_stride];
+            let mut v_read = vec![0.0f32; kv_len as usize * kv_stride];
+            for t in 0..kv_len as usize {
+                let block_idx = bt[t / page_size as usize] as usize;
+                let block_off = t % page_size as usize;
+                let cache_base = (block_idx * page_size as usize + block_off) * kv_stride;
+                for i in 0..kv_stride {
+                    k_read[t * kv_stride + i] = bf16_to_f32(k_bf16[cache_base + i]);
+                    v_read[t * kv_stride + i] = bf16_to_f32(v_bf16[cache_base + i]);
+                }
+            }
+
+            let q_start = seq_i * qo_stride;
+            let ref_out = cpu_attention_ref(
+                &q_f32_rt[q_start..q_start + qo_stride],
+                &k_read, &v_read,
+                num_qo_heads as usize, num_kv_heads as usize, head_dim as usize,
+                kv_len as usize, sm_scale as f32,
+            );
+
+            let gpu_start = seq_i * qo_stride;
+            let mut max_abs_err = 0.0f32;
+            let gpu_sum: f32 = (0..qo_stride).map(|i| bf16_to_f32(out_bf16[gpu_start + i]).abs()).sum();
+            let ref_sum: f32 = ref_out.iter().map(|v| v.abs()).sum();
+            for i in 0..qo_stride {
+                let g = bf16_to_f32(out_bf16[gpu_start + i]);
+                let err = (g - ref_out[i]).abs();
+                if err > max_abs_err { max_abs_err = err; }
+            }
+            println!("  seq {seq_i} (kv_len={kv_len}, blocks={}): max_abs_err={max_abs_err:.6}, ref_sum={ref_sum:.4}, gpu_sum={gpu_sum:.4}",
+                     bt.len());
+            assert!(gpu_sum > 0.001, "seq {seq_i}: GPU output is all zeros");
+            assert!(max_abs_err < 0.02, "seq {seq_i}: max_abs_err={max_abs_err:.6} exceeds threshold 0.02");
+        }
+
+        println!("Decode multiblock batch: PASS");
+
+        cudaFree(q_ptr); cudaFree(o_ptr);
+        cudaFree(k_cache); cudaFree(v_cache);
+        cudaFree(kvi_ptr); cudaFree(kv_indptr_gpu); cudaFree(kv_last_gpu);
+    }
+}
+
+/// Single-batch, multi-block decode to isolate batch_size vs block_count issue.
+/// batch=1, kv_len=200, page_size=16, many non-contiguous blocks, GQA 16:8
+#[test]
+fn decode_single_batch_multiblock() {
+    let reg = KernelRegistry::new();
+    let ws = Workspace::new();
+
+    let batch_size = 1i64;
+    let num_qo_heads = 16i64;
+    let num_kv_heads = 8i64;
+    let head_dim = 128i64;
+    let page_size = 16i64; // small page_size (same as passing test)
+    let total_blocks = 20i64;
+    let kv_len = 200i64;
+    // 200 / 16 = 12.5 → 13 pages needed, non-contiguous block IDs
+    let block_table: &[i32] = &[5, 1, 7, 3, 12, 0, 9, 15, 2, 10, 6, 18, 4];
+
+    let key = DecodeKey {
+        dtype: KernelDtype::BF16,
+        head_dim_qk: head_dim as u32,
+        head_dim_vo: head_dim as u32,
+        sliding_window: false,
+        logits_soft_cap: false,
+    };
+    let variant = reg.get_decode(&key).expect("Decode variant not found");
+
+    unsafe {
+        let q_elems = (batch_size * num_qo_heads * head_dim) as usize;
+        let q_bf16: Vec<u16> = (0..q_elems).map(|i| f32_to_bf16(0.01 * (i as f32 % 7.0))).collect();
+        let q_ptr = gpu_upload(&q_bf16);
+        let o_ptr = gpu_alloc(q_elems * 2);
+
+        let cache_elems = (total_blocks * page_size * num_kv_heads * head_dim) as usize;
+        let kv_stride = (num_kv_heads * head_dim) as usize;
+        let mut k_flat = vec![0.0f32; cache_elems];
+        let mut v_flat = vec![0.0f32; cache_elems];
+
+        for t in 0..kv_len as usize {
+            let block_idx = block_table[t / page_size as usize] as usize;
+            let block_off = t % page_size as usize;
+            let cache_base = (block_idx * page_size as usize + block_off) * kv_stride;
+            for i in 0..kv_stride {
+                k_flat[cache_base + i] = 0.005 * ((t * kv_stride + i) % 11) as f32;
+                v_flat[cache_base + i] = 0.01 * ((t * kv_stride + i) % 5) as f32 + 0.01;
+            }
+        }
+
+        let k_bf16: Vec<u16> = k_flat.iter().map(|&v| f32_to_bf16(v)).collect();
+        let v_bf16: Vec<u16> = v_flat.iter().map(|&v| f32_to_bf16(v)).collect();
+        let k_cache = gpu_upload(&k_bf16);
+        let v_cache = gpu_upload(&v_bf16);
+
+        // 200 / 16 = 12.5 → 13 pages, last_page_len = 200 % 16 = 8
+        let num_pages = ((kv_len + page_size - 1) / page_size) as usize;
+        let kv_indptr: Vec<i32> = vec![0, num_pages as i32];
+        let kv_indices: Vec<i32> = block_table[..num_pages].to_vec();
+        let rem = (kv_len % page_size) as i32;
+        let kv_last_page_len: Vec<i32> = vec![if rem == 0 { page_size as i32 } else { rem }];
+
+        let kvi_ptr = gpu_upload(&kv_indices);
+        let kv_indptr_cpu = kv_indptr.clone();
+        let kv_indptr_gpu = gpu_upload(&kv_indptr);
+        let kv_last_gpu = gpu_upload(&kv_last_page_len);
+
+        let (dl_fws, _fws_s, _fws_st) = ws.dl_float();
+        let (dl_iws, _iws_s, _iws_st) = ws.dl_int();
+        let (dl_pws, _pws_s, _pws_st) = ws.dl_pinned();
+
+        let indptr_s = [batch_size + 1];
+        let indptr_st = contiguous_strides(&indptr_s);
+        let dl_indptr_cpu = cpu_dl(kv_indptr_cpu.as_ptr() as *mut c_void, I32_DT, &indptr_s, &indptr_st);
+
+        let empty_s = [0i64];
+        let empty_st = [1i64];
+        let dl_eq = gpu_dl(std::ptr::null_mut(), BF16_DT, &empty_s, &empty_st);
+        let dl_ek = gpu_dl(std::ptr::null_mut(), BF16_DT, &empty_s, &empty_st);
+
+        reg.set_stream(0, std::ptr::null_mut());
+
+        let plan_info = reg.call(variant.plan, &[
+            TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws), TVMFFIAny::dltensor(&dl_pws),
+            TVMFFIAny::dltensor(&dl_indptr_cpu),
+            TVMFFIAny::int64(batch_size),
+            TVMFFIAny::int64(num_qo_heads), TVMFFIAny::int64(num_kv_heads),
+            TVMFFIAny::int64(page_size),
+            TVMFFIAny::bool_val(false), TVMFFIAny::int64(-1), TVMFFIAny::float64(0.0),
+            TVMFFIAny::int64(head_dim), TVMFFIAny::int64(head_dim),
+            TVMFFIAny::dltensor(&dl_eq), TVMFFIAny::dltensor(&dl_ek),
+        ]).expect("Decode plan failed");
+
+        let q_s = [batch_size, num_qo_heads, head_dim];
+        let q_st = contiguous_strides(&q_s);
+        let kv_s = [total_blocks, page_size, num_kv_heads, head_dim];
+        let kv_st = contiguous_strides(&kv_s);
+        let kvi_s = [kv_indices.len() as i64];
+        let kvi_st = contiguous_strides(&kvi_s);
+        let kvlp_s = [batch_size];
+        let kvlp_st = contiguous_strides(&kvlp_s);
+        let kv_indptr_s = [batch_size + 1];
+        let kv_indptr_st = contiguous_strides(&kv_indptr_s);
+
+        let dl_q = gpu_dl(q_ptr, BF16_DT, &q_s, &q_st);
+        let dl_o = gpu_dl(o_ptr, BF16_DT, &q_s, &q_st);
+        let dl_k = gpu_dl(k_cache, BF16_DT, &kv_s, &kv_st);
+        let dl_v = gpu_dl(v_cache, BF16_DT, &kv_s, &kv_st);
+        let dl_kvi = gpu_dl(kvi_ptr, I32_DT, &kvi_s, &kvi_st);
+        let dl_kv_indptr = gpu_dl(kv_indptr_gpu, I32_DT, &kv_indptr_s, &kv_indptr_st);
+        let dl_kv_last = gpu_dl(kv_last_gpu, I32_DT, &kvlp_s, &kvlp_st);
+
+        let sm_scale = 1.0 / (head_dim as f64).sqrt();
+        reg.call(variant.run, &[
+            TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws),
+            plan_info,
+            TVMFFIAny::dltensor(&dl_q),
+            TVMFFIAny::dltensor(&dl_k), TVMFFIAny::dltensor(&dl_v),
+            TVMFFIAny::dltensor(&dl_kv_indptr), TVMFFIAny::dltensor(&dl_kvi), TVMFFIAny::dltensor(&dl_kv_last),
+            TVMFFIAny::dltensor(&dl_o), TVMFFIAny::none(),
+            TVMFFIAny::int64(0), TVMFFIAny::int64(-1), TVMFFIAny::bool_val(false),
+            TVMFFIAny::none(), TVMFFIAny::float64(0.0), TVMFFIAny::float64(sm_scale),
+            TVMFFIAny::float64(1.0), TVMFFIAny::float64(1e4),
+        ]).expect("Decode run failed");
+        cudaDeviceSynchronize();
+
+        let out_bf16 = gpu_download::<u16>(o_ptr, q_elems);
+        let q_f32_rt: Vec<f32> = q_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
+
+        // Reconstruct contiguous K/V from scattered blocks
+        let mut k_read = vec![0.0f32; kv_len as usize * kv_stride];
+        let mut v_read = vec![0.0f32; kv_len as usize * kv_stride];
+        for t in 0..kv_len as usize {
+            let block_idx = block_table[t / page_size as usize] as usize;
+            let block_off = t % page_size as usize;
+            let cache_base = (block_idx * page_size as usize + block_off) * kv_stride;
+            for i in 0..kv_stride {
+                k_read[t * kv_stride + i] = bf16_to_f32(k_bf16[cache_base + i]);
+                v_read[t * kv_stride + i] = bf16_to_f32(v_bf16[cache_base + i]);
+            }
+        }
+
+        let ref_out = cpu_attention_ref(&q_f32_rt, &k_read, &v_read,
+            num_qo_heads as usize, num_kv_heads as usize, head_dim as usize,
+            kv_len as usize, sm_scale as f32);
+
+        let ref_sum: f32 = ref_out.iter().map(|v| v.abs()).sum();
+        let gpu_sum: f32 = out_bf16.iter().map(|&v| bf16_to_f32(v).abs()).sum();
+        let mut max_abs_err = 0.0f32;
+        for i in 0..q_elems {
+            let g = bf16_to_f32(out_bf16[i]);
+            let err = (g - ref_out[i]).abs();
+            if err > max_abs_err { max_abs_err = err; }
+        }
+        println!("  single-batch multiblock (kv_len={kv_len}): max_abs_err={max_abs_err:.6}, ref_sum={ref_sum:.4}, gpu_sum={gpu_sum:.4}");
+        assert!(gpu_sum > 0.001, "GPU output is all zeros (sum={gpu_sum})");
+        assert!(max_abs_err < 0.02, "max_abs_err={max_abs_err:.6} exceeds threshold 0.02");
+        println!("Decode single-batch multiblock: PASS");
+
+        cudaFree(q_ptr); cudaFree(o_ptr);
+        cudaFree(k_cache); cudaFree(v_cache);
+        cudaFree(kvi_ptr); cudaFree(kv_indptr_gpu); cudaFree(kv_last_gpu);
+    }
+}
+
+/// CPU attention reference for decode (single Q token attending to KV sequence).
+/// Handles GQA: num_qo_heads / num_kv_heads groups.
+fn cpu_attention_ref(
+    q: &[f32], k: &[f32], v: &[f32],
+    num_qo: usize, num_kv: usize, head_dim: usize, seq_len: usize, scale: f32,
+) -> Vec<f32> {
+    let gqa = num_qo / num_kv;
+    let mut out = vec![0.0f32; num_qo * head_dim];
+    for h in 0..num_qo {
+        let kh = h / gqa;
+        let mut scores = vec![0.0f32; seq_len];
+        for t in 0..seq_len {
+            let mut dot = 0.0f32;
+            for d in 0..head_dim {
+                dot += q[h * head_dim + d]
+                    * k[t * num_kv * head_dim + kh * head_dim + d];
+            }
+            scores[t] = dot * scale;
+        }
+        let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for s in &mut scores { *s = (*s - max_s).exp(); sum += *s; }
+        for s in &mut scores { *s /= sum; }
+        for d in 0..head_dim {
+            let mut val = 0.0f32;
+            for t in 0..seq_len {
+                val += scores[t] * v[t * num_kv * head_dim + kh * head_dim + d];
+            }
+            out[h * head_dim + d] = val;
+        }
+    }
+    out
+}
+
 #[test]
 fn rmsnorm_utility() {
     let reg = KernelRegistry::new();
@@ -3149,5 +3552,113 @@ fn pod_execution() {
         cudaFree(kv_indptr_p_gpu); cudaFree(kv_indices_p_gpu); cudaFree(kv_last_p_gpu); cudaFree(qo_indptr_p_gpu);
         cudaFree(kv_indptr_d_gpu); cudaFree(kv_indices_d_gpu); cudaFree(kv_last_d_gpu); cudaFree(qo_indptr_d_gpu);
         cudaFree(sched_ptr);
+    }
+}
+
+// ── fused_add_rmsnorm correctness ───────────────────────────────────
+
+/// CPU reference: fused add + rmsnorm.
+/// sum = x + residual; normed = sum / sqrt(mean(sum^2) + eps) * weight
+fn cpu_fused_add_rmsnorm(x: &[f32], residual: &[f32], weight: &[f32], eps: f64, tokens: usize, hidden: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut sum_out = vec![0.0f32; tokens * hidden];
+    let mut norm_out = vec![0.0f32; tokens * hidden];
+    for t in 0..tokens {
+        let off = t * hidden;
+        let mut ss = 0.0f64;
+        for i in 0..hidden {
+            let s = x[off + i] as f64 + residual[off + i] as f64;
+            sum_out[off + i] = s as f32;
+            ss += s * s;
+        }
+        let scale = 1.0 / (ss / hidden as f64 + eps).sqrt();
+        for i in 0..hidden {
+            norm_out[off + i] = (sum_out[off + i] as f64 * scale * weight[i] as f64) as f32;
+        }
+    }
+    (sum_out, norm_out)
+}
+
+#[test]
+fn fused_add_rmsnorm_correctness() {
+    let reg = KernelRegistry::new();
+    let fused = reg.get_utility("fused_add_rmsnorm")
+        .expect("fused_add_rmsnorm not found");
+
+    // Test shapes: (tokens, hidden)
+    let shapes = [(1, 1536), (4, 4096), (128, 4096)];
+
+    for (tokens, hidden) in shapes {
+        let n = tokens * hidden;
+        let eps = 1e-6f64;
+
+        // Generate random input data
+        let x_f32: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.01).sin() * 0.5)).collect();
+        let r_f32: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.007 + 1.0).cos() * 0.3)).collect();
+        let w_f32: Vec<f32> = (0..hidden).map(|i| 0.8 + (i as f32 * 0.003).sin() * 0.2).collect();
+
+        // CPU reference (in f32)
+        let (ref_sum, ref_norm) = cpu_fused_add_rmsnorm(&x_f32, &r_f32, &w_f32, eps, tokens, hidden);
+
+        // Convert to BF16 and upload
+        let x_bf16: Vec<u16> = x_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+        let r_bf16: Vec<u16> = r_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+        let w_bf16: Vec<u16> = w_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+
+        let x_gpu = gpu_upload(&x_bf16);
+        let r_gpu = gpu_upload(&r_bf16);
+        let w_gpu = gpu_upload(&w_bf16);
+
+        let in_s = [tokens as i64, hidden as i64];
+        let in_st = contiguous_strides(&in_s);
+        let w_s = [hidden as i64];
+        let w_st = vec![1i64];
+
+        let dl_x = gpu_dl(x_gpu, BF16_DT, &in_s, &in_st);
+        let dl_r = gpu_dl(r_gpu, BF16_DT, &in_s, &in_st);
+        let dl_w = gpu_dl(w_gpu, BF16_DT, &w_s, &w_st);
+
+        unsafe { reg.set_stream(0, std::ptr::null_mut()); }
+
+        // FlashInfer fused_add_rmsnorm is in-place:
+        // after call, x_gpu = rmsnorm(x+residual), r_gpu = x+residual
+        let args = [
+            TVMFFIAny::dltensor(&dl_x),
+            TVMFFIAny::dltensor(&dl_r),
+            TVMFFIAny::dltensor(&dl_w),
+            TVMFFIAny::float64(eps),
+            TVMFFIAny::bool_val(false),
+        ];
+        unsafe {
+            reg.call(fused, &args).unwrap();
+            cudaDeviceSynchronize();
+        }
+
+        // Download results
+        let out_norm_bf16: Vec<u16> = gpu_download(x_gpu, n);  // x now holds normed output
+        let out_sum_bf16: Vec<u16> = gpu_download(r_gpu, n);   // residual now holds sum
+
+        let out_norm: Vec<f32> = out_norm_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
+        let out_sum: Vec<f32> = out_sum_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
+
+        // Compare sum (x + residual)
+        let max_diff_sum: f32 = out_sum.iter().zip(ref_sum.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        // Compare normed output
+        let max_diff_norm: f32 = out_norm.iter().zip(ref_norm.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        // BF16 tolerance: ~0.8% relative error typical
+        let tol = 0.05;
+        assert!(max_diff_sum < tol,
+            "fused_add_rmsnorm sum mismatch ({tokens}×{hidden}): max_diff={max_diff_sum}");
+        assert!(max_diff_norm < tol,
+            "fused_add_rmsnorm norm mismatch ({tokens}×{hidden}): max_diff={max_diff_norm}");
+
+        println!("fused_add_rmsnorm ({tokens}×{hidden}): PASS (sum_diff={max_diff_sum:.6}, norm_diff={max_diff_norm:.6})");
+
+        unsafe { cudaFree(x_gpu); cudaFree(r_gpu); cudaFree(w_gpu); }
     }
 }

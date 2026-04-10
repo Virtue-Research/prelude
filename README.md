@@ -1,5 +1,9 @@
 <p align="center">
-  <h1 align="center"><strong>AGInfer</strong>: Fast LLM inference engine in Rust. Optimized for prefill throughput</h1> 
+  <img src="assets/Prelude_logo_readme.svg" alt="Prelude" width="600">
+</p>
+
+<p align="center">
+  Fast LLM inference engine in Rust.
 </p>
 
 ## Performance
@@ -105,9 +109,9 @@ Supports `logprobs`, `top_logprobs`, `prompt_logprobs`, `stop` sequences, and `s
 Request -> Continuous Batching Scheduler -> GPU Queue -> GPU Worker -> Response
 ```
 
-**Attention**: FA4 (prefill) -> FlashInfer (decode + CUDA graph) -> CPU fallback. One file per backend, zero `#[cfg]` in model code.
+**Attention**: FA4 (prefill + decode) -> FlashInfer (fallback) -> CPU fallback. CUDA graph decode. One file per backend, zero `#[cfg]` in model code.
 
-**GEMM**: DeepGEMM (SM90+, 2x cuBLAS) / cuBLAS / oneDNN (CPU BF16).
+**GEMM**: CUTLASS (SM80+) / DeepGEMM (SM90+ BF16) / oneDNN (CPU BF16). No cuBLAS dependency.
 
 **Runtime**: Paged KV cache, prefix caching, fused CUDA kernels (QKNorm+RoPE, SiLU*Mul, Add+RMSNorm), pure Rust AVX-512 CPU kernels.
 

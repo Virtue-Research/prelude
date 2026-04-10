@@ -442,22 +442,10 @@ If cache write were a "hint" inside `paged_attention`, step 1 couldn't exist as 
 
 ### TensorOps Dual Backend (Temporary)
 
-The `TensorOps` trait currently has two parallel implementations for CPU:
+Basic tensor operations (matmul, element-wise, cast, reduce) are handled by candle-core
+natively. The Ops trait only covers fused/inference-specific ops. There is no separate
+`TensorOps` trait — candle's `Tensor` type provides all basic operations directly.
 
-```
-ops/
-  traits/              — trait definitions (shared)
-  composed/            — ComposedOps fallbacks (shared, backend-agnostic)
-  cubecl_backend/      — CubeCLTensorOps: CubeCL runtime, Storage::CubeCL
-  device_backend/      — DeviceTensorOps: pure Rust, Storage::Device
-```
-
-**Why two:** We're validating CubeCL as our long-term compute backend. During this period, both implementations run the same test suite, selected by `PRELUDE_TENSOR_BACKEND` env var (`"device"` or `"cubecl"`, default `"device"`).
-
-**Rules:**
-- The two paths are completely isolated. No bridge code, no cross-storage conversion.
-- `Tensor::from_vec` creates the matching storage type based on the active backend.
-- `Tensor::data_ptr()` / `as_slice<T>()` / `as_mut_slice<T>()` dispatch through TensorOps — backend-agnostic API for device crates.
-- prelude-cpu's high-level ops (attention, rmsnorm, etc.) use only these generic APIs, never reference a specific backend.
-
-**End state:** Once CubeCL stabilizes, delete one backend, rename the survivor to `primitives/`, and remove the env var switch. The directory structure returns to a single `primitives/` folder. No other code changes needed — everything goes through TensorOps dispatch.
+GEMM dispatch is pluggable: CUDA registers CUTLASS/DeepGEMM via
+`candle_core::cuda_backend::gemm_dispatch::register_gemm_dispatch()` at startup.
+All `Tensor::matmul()` calls on CUDA route through this registered dispatch.

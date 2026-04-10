@@ -85,6 +85,7 @@ fn models() -> Vec<(&'static str, usize, usize, usize)> {
     vec![
         ("Qwen3-0.6B", 1024, 3072, 151936),
         ("Qwen3-8B", 4096, 11008, 151936),
+        ("Qwen3-32B", 5120, 25600, 151936),
     ]
 }
 

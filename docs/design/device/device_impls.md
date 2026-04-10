@@ -10,33 +10,28 @@ Both are registered at startup via `register()` with priority/probe. See [constr
 ### Tiered Ops Architecture
 
 ```
-Layer 1: TensorOps primitives (unary, binary, reduce, cast, contiguous, matmul, ...)
-          └── Provided by: CubeCL (CUDA/ROCm/Vulkan/Metal/CPU) or XLA (TPU)
+Layer 1: Basic tensor ops (matmul, unary, binary, reduce, cast, contiguous, ...)
+          └── Provided by: candle-core (CUDA + CPU backends)
 
-Layer 2: ComposedOps (prelude-core, pure composition, no device dependency)
-          └── Composes TensorOps → NormOps, ActivationOps, ConvOps defaults
+Layer 2: ComposedOps (prelude-core, pure composition using candle tensor methods)
+          └── Composes basic ops → NormOps, ActivationOps defaults
           └── e.g., rms_norm = sqr → mean → rsqrt → mul
 
 Layer 3: Device Ops (device crate, optimized overrides)
-          └── Override any op at any level: TensorOps, ComposedOps, or FusedOps
+          └── Override fused/inference-specific ops via Ops trait
 ```
 
 **What each device crate provides:**
 
-| | TensorOps primitives | Hot-path overrides | ComposedOps |
+| | Basic tensor ops | Hot-path overrides | ComposedOps |
 |--|---------------------|-------------------|------------|
-| **CUDA** | CubeCL `<CudaRuntime>` | CUTLASS/DeepGEMM, FlashInfer/FA4, NCCL | inherits from core |
-| **ROCm** | CubeCL `<HipRuntime>` | CK GEMM, aiter attention, RCCL | inherits from core |
-| **Vulkan** | CubeCL `<WgpuRuntime>` | SPIR-V flash attn, cooperative matmul | inherits from core |
-| **Metal** | CubeCL `<WgpuRuntime>` | MSL flash attn, simdgroup matmul | inherits from core |
-| **TPU** | XLA (`XLATensorOps`) | Pallas attention, XLA dot_general | inherits from core |
-| **CPU** | CubeCL `<CpuRuntime>` | oneDNN GEMM, AVX-512 attention | inherits from core |
+| **CUDA** | candle-core (CUDA backend + registered GEMM dispatch) | CUTLASS/DeepGEMM, FlashInfer/FA4, fused kernels | inherits from core |
+| **CPU** | candle-core (CPU backend) | oneDNN GEMM | inherits from core |
 
-**All backends follow the same pattern.** No exceptions. Each:
-1. Provides TensorOps primitives (CubeCL or XLA)
-2. Overrides hot-path ops (GEMM, Attention, KV cache)
-3. Optionally overrides FusedOps, NormOps, ActivationOps, quantized ops, or even individual TensorOps methods
-4. Inherits ComposedOps for everything else
+**All backends follow the same pattern.** Each:
+1. Gets basic tensor ops from candle-core (matmul routes through registered GEMM dispatch)
+2. Overrides hot-path ops via Ops trait (GEMM, Attention, KV cache, fused kernels)
+3. Inherits ComposedOps for everything else
 
 ComposedOps provides correct-but-slow defaults for quantized operations too:
 - `quantized_matmul`: dequantize weights to BF16/FP16, then standard matmul
@@ -50,7 +45,7 @@ Device crates override with native quantized kernels for performance:
 - CPU: AVX vec_dot on packed GGUF blocks
 
 **Adding a new device backend (e.g., ROCm):**
-- MUST implement: TensorOps (via `CubeCLTensorOps::<HipRuntime>`), GemmOps, AttentionOps, KvCacheOps, Executor
+- MUST implement: Ops trait overrides for GEMM, Attention, KV cache, plus Executor
 - SHOULD implement: FusedOps (fused_add_rmsnorm, fused_silu_mul for performance)
 - CAN skip: NormOps, ActivationOps, ConvOps — ComposedOps handles them automatically
 
@@ -59,71 +54,39 @@ Device crates override with native quantized kernels for performance:
 ```rust
 // prelude-cuda/src/cuda_ops.rs
 
-struct CudaOps {
-    fa4: Option<FA4Registry>,       // vendored, AOT-compiled
-    fi: FlashInferRegistry,          // vendored, AOT-compiled
-    deepgemm: Option<DeepGemmRegistry>,  // vendored, AOT-compiled
-    cutlass: Option<CutlassHandle>,  // vendored, header-only, AOT-compiled
-    fi_workspace: FlashInferWorkspace,
+pub struct CudaOps;  // unit struct — dispatch via function calls + static registries
+
+pub fn cuda_ops() -> &'static dyn Ops {
+    static OPS: LazyLock<CudaOps> = LazyLock::new(|| {
+        register_gpu_gemm();  // CUTLASS/DeepGEMM → candle's matmul dispatch
+        CudaOps
+    });
+    &*OPS
 }
 ```
 
 No cuBLAS, no cuDNN. All kernels are vendored and statically linked.
 Runtime dependency: NVIDIA driver only (libcuda.so).
 
-Dispatch logic is explicit if-else, not a capability system:
+Basic tensor ops (matmul, cast, element-wise) go through candle-core's CUDA backend.
+GEMM is registered via `candle_core::cuda_backend::gemm_dispatch::register_gemm_dispatch()`
+to route through CUTLASS/DeepGEMM. CudaOps only overrides fused/inference-specific ops:
 
 ```rust
-// prelude-cuda/src/attention.rs
-
-impl AttentionOps for CudaOps {
+impl Ops for CudaOps {
+    // Attention: FA4 → FlashInfer → composed SDPA fallback
     fn varlen_attention(&self, q, k, v, params) -> Result<Tensor> {
-        // FA4: best SM90+ prefill
-        if let Some(fa4) = &self.fa4 {
-            if let Some(func) = fa4.get(&fa4_key(q, k, params)) {
-                return fa4_varlen(fa4, func, q, k, v, params);
-            }
-        }
-        // FlashInfer: FA3 on SM90+, FA2 on SM80
-        fi_varlen(&self.fi, &self.fi_workspace, q, k, v, params)
+        if let Some(r) = try_fa4_varlen(q, k, v, params) { return r; }
+        if let Some(r) = try_flashinfer_varlen(q, k, v, params) { return r; }
+        prelude_core::ops::traits::attention::varlen_attention(q, k, v, params)
     }
 
-    fn paged_attention(&self, q, key_cache, value_cache, params) -> Result<Tensor> {
-        if params.max_seqlen_q == 1 {
-            // Decode: always FlashInfer (FA4 can't do Q=1)
-            return fi_paged_decode(&self.fi, &self.fi_workspace, q, key_cache, value_cache, params);
-        }
-        // Prefill over paged cache: try FA4, fallback FlashInfer
-        if let Some(fa4) = &self.fa4 {
-            if let Some(func) = fa4.get(&fa4_paged_key(q, params)) {
-                return fa4_paged(fa4, func, q, key_cache, value_cache, params);
-            }
-        }
-        fi_paged_prefill(&self.fi, &self.fi_workspace, q, key_cache, value_cache, params)
-    }
-}
-
-impl GemmOps for CudaOps {
-    fn matmul(&self, a, b) -> Result<Tensor> {
-        // DeepGEMM: SM90+ BF16/FP8
-        if let Some(dg) = &self.deepgemm {
-            if let Ok(out) = dg.try_gemm(a, b) { return Ok(out); }
-        }
-        // CUTLASS: SM80+ (vendored, no cuBLAS needed)
-        self.cutlass.gemm(a, b)
-    }
-}
-
-// CudaOps overrides all fusions — only lists the ones it supports.
-// Unlisted methods inherit the default `{ None }`.
-impl FusedOps for CudaOps {
-    fn fused_add_rmsnorm(&self, ..) -> Option<Result<..>> { Some(gpu::fused_add_rmsnorm(..)) }
-    fn fused_silu_mul(&self, ..) -> Option<Result<..>> { Some(gpu::fused_silu_mul(..)) }
-    fn fused_qknorm_rope(&self, ..) -> Option<Result<..>> { Some(gpu::fused_qknorm_rope(..)) }
-    fn fused_knorm_rope_cache_write(&self, ..) -> Option<Result<..>> { Some(gpu::fused_knorm_rope_kv_write(..)) }
-    fn fused_adaln_zero(&self, ..) -> Option<Result<..>> { Some(gpu::fused_adaln_zero(..)) }
-    fn fused_scale_shift(&self, ..) -> Option<Result<..>> { Some(gpu::fused_scale_shift(..)) }
-    fn fused_lora_matmul(&self, ..) -> Option<Result<..>> { Some(gpu::bgmv_lora(..)) }
+    // Fused ops: return Some to override, None to use composed fallback
+    fn fused_add_rmsnorm(..) -> Option<Result<..>> { Some(gpu::fused_add_rmsnorm(..)) }
+    fn fused_silu_mul(..) -> Option<Result<..>> { Some(gpu::fused_silu_mul(..)) }
+    fn fused_qknorm_rope(..) -> Option<Result<..>> { Some(gpu::fused_qknorm_rope(..)) }
+    fn fused_knorm_rope_cache_write(..) -> Option<Result<..>> { Some(gpu::fused_knorm_rope_kv_write(..)) }
+    fn fused_moe_routing(..) -> Option<Result<..>> { Some(gpu::fused_moe_routing(..)) }
 }
 ```
 

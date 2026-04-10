@@ -11,7 +11,7 @@
 //! Users call `tensor.exp()`, `tensor.matmul()` etc. — not `ops.exp()`.
 //! The trait only exposes methods that models need to call on ops directly.
 
-use crate::tensor::{DType, Device, Shape, Tensor, Result};
+use crate::tensor::{DType, Tensor, Result};
 
 // ── Op enums ───────────────────────────────────────────────────────
 
@@ -86,34 +86,16 @@ pub enum RemoteTarget {
 // ── The trait ──────────────────────────────────────────────────────
 
 pub trait Ops: Send + Sync {
-    /// Fallback implementation. Terminal backends (CubeCL, CUDA) return self.
+    /// Fallback implementation. Terminal backends (CUDA, etc.) return self.
     /// Device crates return the underlying backend.
     fn default_impl(&self) -> &dyn Ops;
 
     // ════════════════════════════════════════════════════════════════
-    // Tensor primitives — called by Tensor methods (tensor.exp() etc.)
-    // Users don't call these directly.
+    // Low-level pointers (needed by CUDA interop)
     // ════════════════════════════════════════════════════════════════
 
-    fn unary(&self, x: &Tensor, op: UnaryOp) -> Result<Tensor> { self.default_impl().unary(x, op) }
-    fn binary(&self, a: &Tensor, b: &Tensor, op: BinaryOp) -> Result<Tensor> { self.default_impl().binary(a, b, op) }
-    fn compare(&self, a: &Tensor, b: &Tensor, op: CompareOp) -> Result<Tensor> { self.default_impl().compare(a, b, op) }
-    fn reduce(&self, x: &Tensor, dim: usize, keepdim: bool, op: ReduceOp) -> Result<Tensor> { self.default_impl().reduce(x, dim, keepdim, op) }
-    fn cast(&self, x: &Tensor, dtype: DType) -> Result<Tensor> { self.default_impl().cast(x, dtype) }
-    fn contiguous(&self, x: &Tensor) -> Result<Tensor> { self.default_impl().contiguous(x) }
-    fn matmul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> { self.default_impl().matmul(a, b) }
-    fn to_device(&self, x: &Tensor, device: &Device) -> Result<Tensor> { self.default_impl().to_device(x, device) }
-    fn index_select(&self, x: &Tensor, indices: &Tensor, dim: usize) -> Result<Tensor> { self.default_impl().index_select(x, indices, dim) }
-    fn gather(&self, x: &Tensor, indices: &Tensor, dim: usize) -> Result<Tensor> { self.default_impl().gather(x, indices, dim) }
-    fn scatter_add(&self, x: &Tensor, indices: &Tensor, src: &Tensor, dim: usize) -> Result<Tensor> { self.default_impl().scatter_add(x, indices, src, dim) }
-    fn index_add(&self, x: &Tensor, indices: &Tensor, src: &Tensor, dim: usize) -> Result<Tensor> { self.default_impl().index_add(x, indices, src, dim) }
-    fn where_cond(&self, cond: &Tensor, on_true: &Tensor, on_false: &Tensor) -> Result<Tensor> { self.default_impl().where_cond(cond, on_true, on_false) }
-    fn cat(&self, tensors: &[&Tensor], dim: usize) -> Result<Tensor> { self.default_impl().cat(tensors, dim) }
-    fn affine(&self, x: &Tensor, mul: f64, add: f64) -> Result<Tensor> { self.default_impl().affine(x, mul, add) }
-    fn zeros(&self, shape: &Shape, dtype: DType, device: &Device) -> Result<Tensor> { self.default_impl().zeros(shape, dtype, device) }
-    fn sort_last_dim(&self, x: &Tensor, asc: bool) -> Result<(Tensor, Tensor)> { self.default_impl().sort_last_dim(x, asc) }
-    unsafe fn data_ptr(&self, x: &Tensor) -> Result<*const u8> { self.default_impl().data_ptr(x) }
-    unsafe fn data_ptr_mut(&self, x: &Tensor) -> Result<*mut u8> { self.default_impl().data_ptr_mut(x) }
+    unsafe fn data_ptr(&self, x: &Tensor) -> Result<*const u8> { unsafe { self.default_impl().data_ptr(x) }}
+    unsafe fn data_ptr_mut(&self, x: &Tensor) -> Result<*mut u8> { unsafe { self.default_impl().data_ptr_mut(x) }}
 
     // ════════════════════════════════════════════════════════════════
     // Normalization — models call ops.rms_norm() directly
@@ -127,15 +109,12 @@ pub trait Ops: Send + Sync {
     // Activation — models call ops.silu(), ops.softmax() etc.
     // ════════════════════════════════════════════════════════════════
 
-    fn silu(&self, x: &Tensor) -> Result<Tensor> { x.silu() }
+    fn silu(&self, x: &Tensor) -> Result<Tensor> { candle_nn::ops::silu(x) }
     fn gelu(&self, x: &Tensor) -> Result<Tensor> { x.gelu() }
     fn gelu_approximate(&self, x: &Tensor) -> Result<Tensor> { x.gelu_erf() }
-    fn softmax(&self, x: &Tensor, dim: usize) -> Result<Tensor> { x.softmax(dim) }
-    fn sigmoid(&self, x: &Tensor) -> Result<Tensor> { (x.neg()?.exp()? + 1.0)?.recip() }
-    fn log_softmax(&self, x: &Tensor, dim: usize) -> Result<Tensor> {
-        let shifted = x.broadcast_sub(&x.max_keepdim(dim)?)?;
-        shifted.broadcast_sub(&shifted.exp()?.sum_keepdim(dim)?.log()?)
-    }
+    fn softmax(&self, x: &Tensor, dim: usize) -> Result<Tensor> { candle_nn::ops::softmax(x, dim) }
+    fn sigmoid(&self, x: &Tensor) -> Result<Tensor> { candle_nn::ops::sigmoid(x) }
+    fn log_softmax(&self, x: &Tensor, dim: usize) -> Result<Tensor> { candle_nn::ops::log_softmax(x, dim) }
 
     // ════════════════════════════════════════════════════════════════
     // Convolution
@@ -199,6 +178,10 @@ pub trait Ops: Send + Sync {
     fn fused_add_rmsnorm(&self, _residual: &Tensor, _x: &Tensor, _weight: &Tensor, _eps: f32) -> Option<Result<(Tensor, Tensor)>> { None }
     fn fused_silu_mul(&self, _gate: &Tensor, _up: &Tensor) -> Option<Result<Tensor>> { None }
     fn fused_gelu_mul(&self, _gate: &Tensor, _up: &Tensor) -> Option<Result<Tensor>> { None }
+    /// `silu(gate) * up` on a concatenated `[tokens, 2*dim]` tensor.
+    /// Splits the last dimension internally. Returns `[tokens, dim]`.
+    /// Avoids the narrow+contiguous copy that separate gate/up tensors need.
+    fn silu_mul_concat(&self, _gate_up: &Tensor) -> Option<Result<Tensor>> { None }
     fn fused_qknorm_rope(&self, _q: &Tensor, _k: &Tensor, _qw: &Tensor, _kw: &Tensor, _cos: &Tensor, _sin: &Tensor, _pos: &Tensor, _eps: f32) -> Option<Result<(Tensor, Tensor)>> { None }
     fn fused_knorm_rope_cache_write(&self, _k: &Tensor, _v: &Tensor, _kw: &Tensor, _cos: &Tensor, _sin: &Tensor, _pos: &Tensor, _kc: &Tensor, _vc: &Tensor, _sm: &Tensor, _eps: f32) -> Option<Result<()>> { None }
     fn fused_add(&self, _a: &Tensor, _b: &Tensor) -> Option<Result<Tensor>> { None }
@@ -270,8 +253,8 @@ pub trait Ops: Send + Sync {
         let q_sin = sin.index_select(position_ids, 0)?;
         let (total, hq, d) = q_normed.dims3()?;
         let hk = k_normed.dim(1)?;
-        let q_out = q_normed.reshape((1, total, hq, d))?.rope_thd(&q_cos, &q_sin)?.reshape((total, hq, d))?;
-        let k_out = k_normed.reshape((1, total, hk, d))?.rope_thd(&q_cos, &q_sin)?.reshape((total, hk, d))?;
+        let q_out = rope_thd(&q_normed.reshape((1, total, hq, d))?, &q_cos, &q_sin)?.reshape((total, hq, d))?;
+        let k_out = rope_thd(&k_normed.reshape((1, total, hk, d))?, &q_cos, &q_sin)?.reshape((total, hk, d))?;
         if let Some((kc, vc, sm)) = kv_cache { self.reshape_and_cache(&k_out, v, kc, vc, sm)?; }
         Ok((q_out, k_out))
     }
@@ -285,6 +268,9 @@ pub trait Ops: Send + Sync {
     fn precompute_paged_plan(&self, _q_shape: (usize, usize, usize), _kc: &Tensor, _csq: &Tensor, _bt: &Tensor, _csk: &Tensor, _scale: f32) -> Result<()> { Ok(()) }
     fn gpu_free_memory(&self) -> Option<usize> { None }
 }
+
+/// Re-export candle-nn rope_thd for use in default implementations.
+pub use candle_nn::rotary_emb::rope_thd;
 
 #[cfg(test)]
 mod tests {

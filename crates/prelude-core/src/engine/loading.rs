@@ -7,13 +7,13 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use super::weight_loader::VarBuilder;
-use crate::tensor::{DType, Device, Tensor};
+use crate::tensor::{DType, Device};
 use fastokens::Tokenizer;
 
 use crate::cache::manager::CacheManager;
 use crate::config::EngineConfig;
 use crate::engine::{
-    CommonModelConfig, EmbeddingActivation, EmbeddingDenseLayerSpec, EmbeddingNormalization,
+    EmbeddingActivation, EmbeddingDenseLayerSpec, EmbeddingNormalization,
     EmbeddingPooling, EmbeddingSemantics, Engine, EngineError, ModelDescriptor, ModelExecutor,
     ModelVariant, ResolvedModelConfig, RuntimeCaps, TaskKind, TaskOverride, WeightsBackend,
     tensor_err, has_remote_file, init_runtime, load_model_config,
@@ -223,7 +223,7 @@ impl Engine {
 /// 3. Fall back to stripping `-GGUF` suffix from repo_id.
 fn resolve_gguf_tokenizer_repo(
     repo_id: &str,
-    repo: &hf_hub::api::sync::ApiRepo,
+    _repo: &hf_hub::api::sync::ApiRepo,
     gguf_path: &Path,
 ) -> String {
     // Check if tokenizer.json exists next to GGUF or in repo

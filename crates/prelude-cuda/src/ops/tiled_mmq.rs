@@ -5,7 +5,9 @@
 //!
 //! Use this for M > 1 (prefill). For M = 1 (decode), use `mmvq` instead.
 
-use crate::device::{self as cb, CuResultExt, DevicePtr};
+use candle_core::backend::BackendStorage;
+use candle_core::cuda_backend::WrapErr;
+use cudarc::driver::DevicePtr;
 use prelude_core::tensor::{bail, DType, Result, Tensor};
 use std::ffi::c_void;
 
@@ -25,17 +27,24 @@ pub fn tiled_mmq(
     k: usize,
     weight_type: prelude_quant_gemm::GgmlType,
 ) -> Result<Tensor> {
-    let stream = cb::tensor_stream(activations)?;
+    let (w_storage, w_layout) = quantized_weights.storage_and_layout();
+    let w_cuda = match &*w_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("tiled_mmq: weights requires CUDA"),
+    };
 
-    let (w_storage, w_layout) = cb::storage_and_layout(&quantized_weights);
-    let w_cuda = cb::as_cuda(&w_storage, "tiled_mmq: weights")?;
-
-    let (a_storage, _a_layout) = cb::storage_and_layout(&activations);
-    let a_cuda = cb::as_cuda(&a_storage, "tiled_mmq: activations")?;
+    let (a_storage, _a_layout) = activations.storage_and_layout();
+    let a_cuda = match &*a_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("tiled_mmq: activations requires CUDA"),
+    };
 
     if a_cuda.dtype() != DType::BF16 {
         bail!("tiled_mmq: activations must be BF16, got {:?}", a_cuda.dtype());
     }
+
+    let dev = a_cuda.device().clone();
+    let stream = dev.cuda_stream();
 
     // Get raw CUDA stream
     let raw_stream = unsafe { stream.cu_stream() } as *const c_void;
@@ -45,12 +54,12 @@ pub fn tiled_mmq(
     let ne00_padded = ((k + 511) / 512) * 512;
     let mmq_x_max = 128; // SM75+ (Turing MMA); safe upper bound
     let q8_buf_size = m * ne00_padded * 36 / 32 + mmq_x_max * 144;
-    let q8_buffer = unsafe { stream.alloc::<u8>(q8_buf_size) }.ce()?;
+    let q8_buffer = unsafe { dev.alloc::<u8>(q8_buf_size) }?;
 
     // Get raw device pointers (use device stream for all)
-    let w_slice = w_cuda.as_slice::<u8>()?.slice(w_layout.start_offset()..);
-    let a_slice = a_cuda.as_slice::<half::bf16>()?;
-    let output = unsafe { stream.alloc::<f32>(m * n) }.ce()?;
+    let w_slice = w_cuda.as_cuda_slice::<u8>()?.slice(w_layout.start_offset()..);
+    let a_slice = a_cuda.as_cuda_slice::<half::bf16>()?;
+    let output = unsafe { dev.alloc::<f32>(m * n) }?;
 
     let w_ptr = w_slice.device_ptr(&stream).0 as *const c_void;
     let a_ptr = a_slice.device_ptr(&stream).0 as *const c_void;
@@ -81,5 +90,11 @@ pub fn tiled_mmq(
     drop(w_storage);
     drop(a_storage);
 
-    Ok(cb::tensor_from_cuda(output, stream, (m, n)))
+    let out_storage = candle_core::CudaStorage::wrap_cuda_slice(output, dev);
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(out_storage),
+        (m, n),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
 }
