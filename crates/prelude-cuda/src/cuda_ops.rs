@@ -91,8 +91,15 @@ impl Ops for CudaOps {
     }
 
     fn paged_block_size_hint(&self, head_dim: usize) -> usize {
-        // FlashInfer is the paged fallback, use its alignment requirements
-        if head_dim == 256 { 64 } else { 128 }
+        // Prefer block_size == FA4 tile_n so `paged_non_tma=false` and the
+        // compiled TMA paged kernels are eligible. Fall through to the
+        // FlashInfer-compatible value for head_dim combinations FA4 doesn't
+        // cover.
+        match head_dim {
+            128 => 128,
+            256 => crate::attn::fa4_tile_n(head_dim, head_dim), // 80 for head_dim=256
+            _ => 128,
+        }
     }
 
     // ── Fused ops (CUDA kernels) ─────────────────────────────────

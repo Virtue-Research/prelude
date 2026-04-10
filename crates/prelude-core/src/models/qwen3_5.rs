@@ -128,6 +128,10 @@ impl<'de> serde::Deserialize<'de> for Qwen3_5Config {
     {
         let raw: serde_json::Value = serde::Deserialize::deserialize(deserializer)?;
 
+        // `tie_word_embeddings` can live at the top level (Qwen3.5-35B-A3B) or
+        // inside `text_config` (dense Qwen3.5 variants). Read top-level first.
+        let top_tie = raw.get("tie_word_embeddings").and_then(|v| v.as_bool());
+
         // If this is a VL model with text_config, extract the sub-object
         let text_val = if let Some(tc) = raw.get("text_config") {
             tc.clone()
@@ -155,6 +159,18 @@ impl<'de> serde::Deserialize<'de> for Qwen3_5Config {
                 })
         });
 
+        // Extract partial_rotary_factor: try direct field, then nested in rope_parameters
+        // (Qwen3.5-35B-A3B stores it there; dense variants store it flat).
+        let partial_rotary_factor = r.partial_rotary_factor.or_else(|| {
+            r.rope_parameters
+                .as_ref()
+                .and_then(|v| v.get("partial_rotary_factor"))
+                .and_then(|b| b.as_f64())
+        });
+
+        // tie_word_embeddings fallback: top-level JSON → text_config field → default false.
+        let tie_word_embeddings = top_tie.unwrap_or(r.tie_word_embeddings);
+
         Ok(Qwen3_5Config {
             vocab_size: resolve_or_warn!(r.vocab_size, 248320, "vocab_size", MODEL),
             hidden_size: resolve_or_warn!(r.hidden_size, 2048, "hidden_size", MODEL),
@@ -166,7 +182,7 @@ impl<'de> serde::Deserialize<'de> for Qwen3_5Config {
             max_position_embeddings: resolve_or_warn!(r.max_position_embeddings, 262144, "max_position_embeddings", MODEL),
             rms_norm_eps: resolve_or_warn!(r.rms_norm_eps, 1e-6, "rms_norm_eps", MODEL),
             rope_theta: resolve_or_warn!(rope_theta, 10_000_000.0, "rope_theta", MODEL),
-            partial_rotary_factor: resolve_or_warn!(r.partial_rotary_factor, 0.25, "partial_rotary_factor", MODEL),
+            partial_rotary_factor: resolve_or_warn!(partial_rotary_factor, 0.25, "partial_rotary_factor", MODEL),
             full_attention_interval: resolve_or_warn!(r.full_attention_interval, 4, "full_attention_interval", MODEL),
             attn_output_gate: resolve_or_warn!(r.attn_output_gate, true, "attn_output_gate", MODEL),
             linear_num_key_heads: resolve_or_warn!(r.linear_num_key_heads, 16, "linear_num_key_heads", MODEL),
@@ -174,7 +190,7 @@ impl<'de> serde::Deserialize<'de> for Qwen3_5Config {
             linear_key_head_dim: resolve_or_warn!(r.linear_key_head_dim, 128, "linear_key_head_dim", MODEL),
             linear_value_head_dim: resolve_or_warn!(r.linear_value_head_dim, 128, "linear_value_head_dim", MODEL),
             linear_conv_kernel_dim: resolve_or_warn!(r.linear_conv_kernel_dim, 4, "linear_conv_kernel_dim", MODEL),
-            tie_word_embeddings: r.tie_word_embeddings,
+            tie_word_embeddings,
             num_experts: r.num_experts,
             num_experts_per_tok: r.num_experts_per_tok,
             moe_intermediate_size: r.moe_intermediate_size,
@@ -232,14 +248,19 @@ pub(super) struct PartialRotaryEmbedding {
 impl PartialRotaryEmbedding {
     pub(super) fn new(cfg: &Qwen3_5Config, dtype: DType, device: &Device) -> Result<Self> {
         let rotary_dim = cfg.rotary_dim();
+        let half = rotary_dim / 2;
         let inv_freq: Vec<f32> = (0..rotary_dim)
             .step_by(2)
             .map(|i| 1.0 / cfg.rope_theta.powf(i as f64 / rotary_dim as f64) as f32)
             .collect();
-        let inv_freq = Tensor::new(inv_freq, device)?;
+        // Build the [L, D/2] frequency table via broadcast_mul instead of a K=1
+        // matmul (CUTLASS/DeepGEMM only support TN layout; a literal outer-product
+        // matmul falls through to an unsupported NN kernel).
+        let inv_freq = Tensor::from_vec(inv_freq, (1, half), device)?.to_dtype(DType::F32)?;
         let positions = Tensor::arange(0u32, cfg.max_position_embeddings as u32, device)?
-            .to_dtype(DType::F32)?;
-        let freqs = positions.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?;
+            .to_dtype(DType::F32)?
+            .reshape((cfg.max_position_embeddings, 1))?;
+        let freqs = positions.broadcast_mul(&inv_freq)?;
         let cos = freqs.cos()?.to_dtype(dtype)?;
         let sin = freqs.sin()?.to_dtype(dtype)?;
         Ok(Self {
@@ -580,14 +601,17 @@ impl Qwen3_5GatedDeltaNet {
         } else {
             k_f32
         };
-        let k_col = k_expanded.unsqueeze(D::Minus1)?; // [num_v_heads, head_k_dim, 1]
+        // k_bcast: [num_v_heads, head_k_dim, 1] broadcastable over head_v_dim.
+        let k_bcast = k_expanded.reshape((self.num_v_heads, self.head_k_dim, 1))?;
 
         // Delta correction: v' = beta * (v - state_decayed^T @ k)
-        // state_decayed^T @ k: [num_v_heads, head_v_dim, head_k_dim] @ [num_v_heads, head_k_dim, 1]
+        //   state_decayed: [B, head_k_dim, head_v_dim]
+        //   state_k[b, v]  = Σ_k state_decayed[b, k, v] * k[b, k]
+        // Implement as broadcast_mul + sum (a K=1 batched matmul would land in the
+        // unsupported NN GEMM layout on CUTLASS).
         let state_k = state_decayed
-            .transpose(1, 2)?
-            .matmul(&k_col)?
-            .squeeze(D::Minus1)?; // [num_v_heads, head_v_dim]
+            .broadcast_mul(&k_bcast)?     // [B, head_k_dim, head_v_dim]
+            .sum(1)?;                     // [B, head_v_dim]
         let v_f32 = v.to_dtype(DType::F32)?;
         let v_error = (v_f32 - state_k)?; // [num_v_heads, head_v_dim]
 
@@ -596,11 +620,13 @@ impl Qwen3_5GatedDeltaNet {
         let v_prime = v_error.broadcast_mul(&beta_2d)?; // [num_v_heads, head_v_dim]
 
         // state += outer(k, v_prime)
-        let v_row = v_prime.unsqueeze(1)?; // [num_v_heads, 1, head_v_dim]
-        let outer = k_col.matmul(&v_row)?;
+        //   outer[b, k, v] = k[b, k] * v'[b, v]  — pure broadcast, no GEMM.
+        let v_row = v_prime.reshape((self.num_v_heads, 1, self.head_v_dim))?;
+        let outer = k_bcast.broadcast_mul(&v_row)?;
         let state = (state_decayed + outer)?;
 
         // output = state^T @ (q * scale): scale = 1/sqrt(head_k_dim)
+        //   out[b, v] = Σ_k state[b, k, v] * q[b, k] * scale
         let scale = (self.head_k_dim as f64).powf(-0.5);
         let q_f32 = (q.to_dtype(DType::F32)? * scale)?;
         let q_expanded = if kv_ratio > 1 {
@@ -611,9 +637,10 @@ impl Qwen3_5GatedDeltaNet {
         } else {
             q_f32
         };
-        let q_col = q_expanded.unsqueeze(D::Minus1)?; // [num_v_heads, head_k_dim, 1]
-        let out = state.transpose(1, 2)?.matmul(&q_col)?; // [num_v_heads, head_v_dim, 1]
-        let out = out.squeeze(D::Minus1)?; // [num_v_heads, head_v_dim]
+        let q_bcast = q_expanded.reshape((self.num_v_heads, self.head_k_dim, 1))?;
+        let out = state
+            .broadcast_mul(&q_bcast)?    // [B, head_k_dim, head_v_dim]
+            .sum(1)?;                    // [B, head_v_dim]
         let out = out.to_dtype(v.dtype())?;
         let out = out.reshape((self.value_dim,))?;
 
@@ -801,12 +828,18 @@ impl Qwen3_5Attention {
         let k = self.k_proj.forward(x, &bs, ctx.ops)?;
         let v = self.v_proj.forward(x, &bs, ctx.ops)?;
 
-        // Split Q and gate
+        // Split Q and gate. `narrow` yields a strided view over the packed
+        // `[Q | gate]` tensor; downstream fused kernels (rms_norm, RoPE) assume
+        // contiguous input and can hit misaligned-address errors on strided data,
+        // so materialize here.
         let (q, gate) = if self.attn_output_gate {
             let q_and_gate = q_raw.reshape((total_tokens, self.num_heads, self.head_dim * 2))?;
-            let q = q_and_gate.narrow(D::Minus1, 0, self.head_dim)?;
+            let q = q_and_gate
+                .narrow(D::Minus1, 0, self.head_dim)?
+                .contiguous()?;
             let gate = q_and_gate
                 .narrow(D::Minus1, self.head_dim, self.head_dim)?
+                .contiguous()?
                 .reshape((total_tokens, self.num_heads * self.head_dim))?;
             (q, Some(gate))
         } else {
@@ -833,6 +866,11 @@ impl Qwen3_5Attention {
 
         // Partial RoPE
         let (q, k) = self.rope.apply_varlen(&q, &k, ctx.position_ids)?;
+        // FA4 / FlashInfer require stride(-1) == 1. `apply_varlen` goes through
+        // `Tensor::cat` which can leave a non-row-stride layout; force contig.
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
 
         // Attention dispatch: paged KV cache or plain varlen
         let softmax_scale = self.softmax_scale as f32;
@@ -1006,7 +1044,10 @@ struct Qwen3_5SparseMoeBlock {
     experts_down: Tensor,
     moe_intermediate_size: usize,
     shared_expert: Option<Qwen3_5Mlp>,
-    shared_expert_gate: Option<DenseLinear>, // [1, hidden_size]
+    /// Shared-expert gating weight `[hidden_size]` (raw, not wrapped as Linear).
+    /// We apply it as `(x * w).sum(-1, keepdim)` because a degenerate `out_dim=1`
+    /// matmul lands on an NN GEMM layout that CUTLASS/DeepGEMM don't support.
+    shared_expert_gate_weight: Option<Tensor>,
     num_experts_per_tok: usize,
     norm_topk_prob: bool,
 }
@@ -1048,12 +1089,10 @@ impl Qwen3_5SparseMoeBlock {
             None
         };
 
-        let shared_expert_gate = if shared_expert.is_some() {
-            Some({
-                let gvb = vb.pp("shared_expert_gate");
-                let w = gvb.get((1, cfg.hidden_size), "weight")?;
-                DenseLinear::new(w, None)
-            })
+        let shared_expert_gate_weight = if shared_expert.is_some() {
+            // Stored as `[1, hidden]` in the checkpoint; flatten to `[hidden]`.
+            let gvb = vb.pp("shared_expert_gate");
+            Some(gvb.get((1, cfg.hidden_size), "weight")?.squeeze(0)?)
         } else {
             None
         };
@@ -1064,7 +1103,7 @@ impl Qwen3_5SparseMoeBlock {
             experts_down,
             moe_intermediate_size,
             shared_expert,
-            shared_expert_gate,
+            shared_expert_gate_weight,
             num_experts_per_tok,
             norm_topk_prob: cfg.norm_topk_prob,
         })
@@ -1158,8 +1197,10 @@ impl Qwen3_5SparseMoeBlock {
         // Shared expert
         if let Some(ref shared) = self.shared_expert {
             let shared_out = shared.forward(ops, xs)?;
-            let shared_out = if let Some(ref gate) = self.shared_expert_gate {
-                let gate_val = ops.sigmoid(&xs.apply(gate)?)?; // [n, 1]
+            let shared_out = if let Some(ref gate_w) = self.shared_expert_gate_weight {
+                // logit[n] = Σ_h xs[n, h] * gate_w[h]
+                let logits = xs.broadcast_mul(&gate_w.unsqueeze(0)?)?.sum_keepdim(D::Minus1)?;
+                let gate_val = ops.sigmoid(&logits)?; // [n, 1]
                 shared_out.broadcast_mul(&gate_val)?
             } else {
                 shared_out
@@ -1841,15 +1882,18 @@ pub mod gguf {
             // Build PartialRotaryEmbedding from GGUF config
             let build_rope = |dtype: DType| -> Result<super::PartialRotaryEmbedding> {
                 let rotary_dim = config.rotary_dim();
+                let half = rotary_dim / 2;
                 let inv_freq: Vec<f32> = (0..rotary_dim)
                     .step_by(2)
                     .map(|i| 1.0 / config.rope_theta.powf(i as f64 / rotary_dim as f64) as f32)
                     .collect();
-                let inv_freq = Tensor::new(inv_freq, device)?;
+                let inv_freq =
+                    Tensor::from_vec(inv_freq, (1, half), device)?.to_dtype(DType::F32)?;
                 let positions =
                     Tensor::arange(0u32, config.max_position_embeddings as u32, device)?
-                        .to_dtype(DType::F32)?;
-                let freqs = positions.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?;
+                        .to_dtype(DType::F32)?
+                        .reshape((config.max_position_embeddings, 1))?;
+                let freqs = positions.broadcast_mul(&inv_freq)?;
                 let cos = freqs.cos()?.to_dtype(dtype)?;
                 let sin = freqs.sin()?.to_dtype(dtype)?;
                 Ok(super::PartialRotaryEmbedding {

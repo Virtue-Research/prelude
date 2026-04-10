@@ -64,6 +64,12 @@ fn cuda_probe() -> bool {
 
 /// Register GPU ops and executor. Call once at startup.
 pub fn register() {
+    // Install the GEMM dispatch immediately so that any model-construction
+    // matmul (e.g. RoPE inv_freq * positions) that runs before the first
+    // `cuda_ops()` lookup still goes through our dispatch.
+    if cuda_probe() {
+        crate::ops::gemm::register_gpu_gemm();
+    }
     prelude_core::ops::register_backend(prelude_core::ops::OpsBackend {
         name: "cuda",
         priority: 100,
