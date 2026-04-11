@@ -247,47 +247,6 @@ pub trait Ops: Send + Sync {
         _slot_ids: &Tensor,
     ) -> Option<Result<Tensor>> { None }
 
-    /// Fused Gated DeltaNet (KDA) varlen prefill on SM90.
-    ///
-    /// Drives the cuLA CUTLASS warp-specialized TMA kernel for the full KDA
-    /// forward pass (delta rule + gated decay) over a packed variable-length
-    /// batch. The kernel handles the recurrence + Q@K^T + score@V fusion in
-    /// one launch — orders of magnitude faster than a per-token Rust loop
-    /// for long prefills.
-    ///
-    /// The caller is responsible for all gate preprocessing: `alpha` must
-    /// already be `chunk_local_cumsum(gate) * RCP_LN2` with chunk_size=64
-    /// (matches the kernel's internal chunk tiling). Q and K must already be
-    /// L2-normalized if the model requires it.
-    ///
-    /// Shapes (`T = total_seqlen` across all requests, packed as batch-1):
-    /// - `q`, `k`: `[T, num_k_heads, head_dim]` BF16
-    /// - `v`: `[T, num_heads, head_dim]` BF16
-    /// - `alpha`: `[T, num_heads, head_dim]` F32 (chunk-cumsummed, scaled)
-    /// - `beta`: `[T, num_heads]` F32 (already sigmoid-applied)
-    /// - `cu_seqlens`: `[num_seqs+1]` I32 on the same device
-    /// - `initial_state`: optional `[num_seqs, num_heads, head_dim, head_dim]` F32
-    ///
-    /// Returns `(output, final_state)`:
-    /// - `output`: `[T, num_heads, head_dim]` BF16
-    /// - `final_state`: `[num_seqs, num_heads, head_dim, head_dim]` F32
-    ///
-    /// Returns `None` when the backend can't serve this call (non-CUDA,
-    /// non-Hopper arch, unsupported head shapes), so the caller can fall
-    /// back to a composed implementation.
-    #[allow(clippy::too_many_arguments)]
-    fn kda_prefill_varlen(
-        &self,
-        _q: &Tensor,
-        _k: &Tensor,
-        _v: &Tensor,
-        _alpha: &Tensor,
-        _beta: &Tensor,
-        _cu_seqlens: &Tensor,
-        _initial_state: Option<&Tensor>,
-        _scale: f32,
-    ) -> Option<Result<(Tensor, Tensor)>> { None }
-
     /// Fused Gated DeltaNet (GDN) varlen prefill — matches FLA's
     /// `chunk_gated_delta_rule` semantics (Qwen3-next / Qwen3.5 family).
     ///
