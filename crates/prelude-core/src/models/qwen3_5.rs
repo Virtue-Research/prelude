@@ -404,7 +404,14 @@ impl Qwen3_5GatedDeltaNet {
         let value_dim = cfg.value_dim();
         let conv_dim = cfg.conv_dim();
 
-        // Split projections: QKV separate from Z, B, A
+        // Split projections: QKV separate from Z, B, A. We intentionally
+        // do NOT fuse these four into a single matmul — the fused output
+        // dim would be `2*key_dim + value_dim + value_dim + 2*num_v_heads`
+        // (e.g. 12352 for Qwen3.5-35B-A3B) which has an awkward prime
+        // factor for GEMM tile alignment, and empirically runs ~20%
+        // slower on Hopper than the 4 separate projections whose
+        // individual output dims (8192, 4096, 32, 32) each hit clean
+        // tile boundaries for DeepGEMM / CUTLASS.
         let in_proj_qkv = Linear::load(
             vb.pp("in_proj_qkv"),
             cfg.hidden_size,
@@ -491,19 +498,15 @@ impl Qwen3_5GatedDeltaNet {
         assert_eq!(b, 1, "Qwen3.5 DeltaNet only supports batch_size=1");
         let bst = BatchState::no_lora();
 
-        // Project with split projections
+        // Split projections. See the comment in `new()` for why the
+        // four are kept separate rather than fused into one matmul.
         let qkv = self.in_proj_qkv.forward(x, &bst, ops)?; // [1, L, key_dim*2 + value_dim]
         let z = self.in_proj_z.forward(x, &bst, ops)?; // [1, L, value_dim]
         let b_param = self.in_proj_b.forward(x, &bst, ops)?; // [1, L, num_v_heads]
         let a_param = self.in_proj_a.forward(x, &bst, ops)?; // [1, L, num_v_heads]
 
-        // Split QKV: simple concat layout [Q(key_dim) | K(key_dim) | V(value_dim)]
-        let q_cat = qkv.narrow(D::Minus1, 0, self.key_dim)?;
-        let k_cat = qkv.narrow(D::Minus1, self.key_dim, self.key_dim)?;
-        let v_cat = qkv.narrow(D::Minus1, self.key_dim * 2, self.value_dim)?;
-
-        // QKV goes through conv1d, Z does not
-        let qkv_for_conv = Tensor::cat(&[&q_cat, &k_cat, &v_cat], D::Minus1)?; // [B, L, conv_dim]
+        // `qkv` already has the `[Q | K | V]` layout conv1d wants.
+        let qkv_for_conv = qkv; // [B, L, conv_dim]
 
         // Apply causal conv1d. Both `conv1d_decode` and `conv1d_prefill`
         // fuse the SiLU activation into the kernel (fast path) or the
@@ -1792,10 +1795,7 @@ fn deltanet_decode_batched_fused(
     let b_raw_full = gdn.in_proj_b.forward(&x, &bst, ops)?; // [1, N, HV]
     let a_raw_full = gdn.in_proj_a.forward(&x, &bst, ops)?; // [1, N, HV]
 
-    let q_cat = qkv.narrow(D::Minus1, 0, gdn.key_dim)?;
-    let k_cat = qkv.narrow(D::Minus1, gdn.key_dim, gdn.key_dim)?;
-    let v_cat = qkv.narrow(D::Minus1, gdn.key_dim * 2, gdn.value_dim)?;
-    let qkv_for_conv = Tensor::cat(&[&q_cat, &k_cat, &v_cat], D::Minus1)?; // [1, N, conv_dim]
+    let qkv_for_conv = qkv; // [1, N, conv_dim]
     let qkv_for_conv_2d = qkv_for_conv.squeeze(0)?; // [N, conv_dim]
 
     // ── Sequential conv1d_decode per request ───────────────────────
@@ -2506,7 +2506,11 @@ pub mod gguf {
     
                 // Token mixer
                 let token_mixer = if config.is_recurrent(i) {
-                    // DeltaNet layer
+                    // DeltaNet layer. We keep the four input
+                    // projections split rather than fusing into one
+                    // matmul — see the comment in
+                    // `Qwen3_5GatedDeltaNet::new` (safetensors loader)
+                    // for the GEMM tile-alignment rationale.
                     let in_proj_qkv = Self::load_linear(
                         &ct,
                         reader,
