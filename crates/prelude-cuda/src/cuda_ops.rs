@@ -196,6 +196,26 @@ impl Ops for CudaOps {
         }
     }
 
+    fn kda_prefill_varlen(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        alpha: &Tensor,
+        beta: &Tensor,
+        cu_seqlens: &Tensor,
+        initial_state: Option<&Tensor>,
+        scale: f32,
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        match crate::attn::kda_prefill::try_prefill(
+            q, k, v, alpha, beta, cu_seqlens, initial_state, scale,
+        ) {
+            Ok(Some(pair)) => Some(Ok(pair)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
     // ── Session ───────────────────────────────────────────────────
 
     fn begin_forward(&self) {

@@ -300,6 +300,7 @@ fn kda_prefill_sm90_basic() {
                 total_seq as i64,
                 scale, true, // safe_gate required
                 detect_sm_count(),
+                0, // num_k_heads = 0 → MHA
             ).unwrap();
         }
     }
@@ -398,6 +399,7 @@ fn kda_prefill_sm90_varlen() {
                 total_seq as i64,
                 scale, true,
                 detect_sm_count(),
+                0, // num_k_heads = 0 → MHA
             ).unwrap();
         }
     }
@@ -478,6 +480,7 @@ fn kda_prefill_sm90_perf() {
                     cup, wp,
                     1, h as i32, d as i32, total_seq as i64,
                     scale, true, detect_sm_count(),
+                    0, // num_k_heads = 0 → MHA
                 ).unwrap();
             }
         };
