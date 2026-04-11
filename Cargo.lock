@@ -384,6 +384,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "causal-conv1d"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tracing",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2695,6 +2703,7 @@ version = "0.1.0"
 dependencies = [
  "bc-mimalloc",
  "candle-core",
+ "causal-conv1d",
  "cudarc 0.19.4",
  "cula",
  "cutlass-gemm",

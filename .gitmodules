@@ -22,3 +22,6 @@
 [submodule "third_party/oneDNN"]
 	path = third_party/oneDNN
 	url = https://github.com/uxlfoundation/oneDNN.git
+[submodule "third_party/causal-conv1d"]
+	path = third_party/causal-conv1d
+	url = https://github.com/Dao-AILab/causal-conv1d.git

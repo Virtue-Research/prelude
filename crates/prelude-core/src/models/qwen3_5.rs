@@ -505,17 +505,16 @@ impl Qwen3_5GatedDeltaNet {
         // QKV goes through conv1d, Z does not
         let qkv_for_conv = Tensor::cat(&[&q_cat, &k_cat, &v_cat], D::Minus1)?; // [B, L, conv_dim]
 
-        // Apply causal conv1d
+        // Apply causal conv1d. Both `conv1d_decode` and `conv1d_prefill`
+        // fuse the SiLU activation into the kernel (fast path) or the
+        // fallback loop, so we don't apply a separate SiLU here.
         let qkv_conv = if seq_len == 1 {
-            self.conv1d_decode(&qkv_for_conv.squeeze(0)?.squeeze(0)?)?
+            self.conv1d_decode(&qkv_for_conv.squeeze(0)?.squeeze(0)?, ops)?
                 .unsqueeze(0)?
                 .unsqueeze(0)?
         } else {
-            self.conv1d_prefill(&qkv_for_conv)?
+            self.conv1d_prefill(&qkv_for_conv, ops)?
         };
-
-        // Apply SiLU activation after conv
-        let qkv_conv = ops.silu(&qkv_conv)?;
 
         // Split into q, k, v
         let q = qkv_conv.narrow(D::Minus1, 0, self.key_dim)?;
@@ -805,27 +804,66 @@ impl Qwen3_5GatedDeltaNet {
     }
 
     /// Causal conv1d for a single token (decode step).
-    fn conv1d_decode(&mut self, x: &Tensor) -> Result<Tensor> {
+    ///
+    /// Prefers the fused `Ops::causal_conv1d_update` kernel (Dao-AILab
+    /// mamba kernel), falls back to a broadcast+sum in-place update
+    /// loop on non-CUDA / unsupported-width devices. Always fuses the
+    /// SiLU tail so callers must NOT apply SiLU on top.
+    fn conv1d_decode(&mut self, x: &Tensor, ops: &dyn crate::ops::Ops) -> Result<Tensor> {
         // x: [conv_dim]
         let device = x.device();
         let dtype = x.dtype();
+        let pad_len = self.conv_kernel - 1;
 
+        // Lazy-init conv_state. The fast path expects `[B, D, W-1]`;
+        // the fallback keeps the 2-D `[D, W-1]` layout the old code used.
         if self.conv_state.is_none() {
             self.conv_state = Some(Tensor::zeros(
-                (self.conv_dim, self.conv_kernel - 1),
+                (self.conv_dim, pad_len),
                 dtype,
                 device,
             )?);
         }
-        let state = self.conv_state.as_ref().unwrap();
 
-        // state: [conv_dim, kernel-1] (the kernel-1 most recent inputs).
-        // For the dot product we want [conv_dim, kernel]: [old state | current_input].
+        // Fast path: Ops::causal_conv1d_update
+        //   wants `x: [B=1, D]`, `conv_state: [B=1, D, W-1]`,
+        //   `weight: [D, W]`, returns `[B=1, D]`.
+        //
+        // Important: Dao's update kernel mutates `conv_state` in
+        // place. If the state tensor we hand it aliases some OTHER
+        // tensor's storage (e.g. `deltanet_varlen_pooled` loads the
+        // state as a view into `pool.conv_states[layer]`), that other
+        // tensor would be silently mutated too, and a later
+        // `slice_set` write-back from our owned copy would refuse with
+        // "cannot use slice_set when self and src share their
+        // storage". Force a fresh allocation with `x + 0` so the
+        // kernel's in-place update lands on our own buffer.
+        let x_bd = x.unsqueeze(0)?; // [1, conv_dim]
+        let state_flat = self.conv_state.as_ref().unwrap();
+        let state_fresh = (state_flat + 0.0f64)?.contiguous()?; // [conv_dim, W-1] fresh
+        let state_bd = state_fresh.unsqueeze(0)?.contiguous()?;  // [1, conv_dim, W-1]
+        if let Some(res) = ops.causal_conv1d_update(
+            &x_bd,
+            &state_bd,
+            &self.conv_weight,
+            None,
+            /*silu_activation=*/ true,
+        ) {
+            let out_bd = res?; // [1, conv_dim]
+            // `state_bd` was mutated in place. Save it back to
+            // `self.conv_state` — squeezed to our 2-D on-disk layout.
+            self.conv_state = Some(state_bd.squeeze(0)?.contiguous()?);
+            return out_bd.squeeze(0);
+        }
+
+        // ── Fallback: manual shift + broadcast * sum ────────────────
+        let state = self.conv_state.as_ref().unwrap();
         let x_col = x.unsqueeze(D::Minus1)?; // [conv_dim, 1]
         let full_window = Tensor::cat(&[state, &x_col], 1)?; // [conv_dim, kernel]
-        let out = (full_window * &self.conv_weight)?.sum(D::Minus1)?; // [conv_dim]
+        let out_raw = (full_window * &self.conv_weight)?.sum(D::Minus1)?; // [conv_dim]
+        // Manual SiLU fusion parity with the fast path.
+        let out = ops.silu(&out_raw)?;
 
-        // Shift state left and append new input
         let new_state = if self.conv_kernel > 2 {
             let kept = state.narrow(1, 1, self.conv_kernel - 2)?;
             Tensor::cat(&[kept, x_col], 1)?
@@ -837,44 +875,108 @@ impl Qwen3_5GatedDeltaNet {
     }
 
     /// Causal conv1d for a full sequence (prefill).
-    fn conv1d_prefill(&mut self, x: &Tensor) -> Result<Tensor> {
+    ///
+    /// Prefers Dao-AILab's `causal_conv1d_fn` (fused kernel, SiLU fused
+    /// in) and falls back to a per-kernel-position shift+sum loop on
+    /// non-CUDA / unsupported-width paths.
+    fn conv1d_prefill(&mut self, x: &Tensor, ops: &dyn crate::ops::Ops) -> Result<Tensor> {
         // x: [1, L, conv_dim]
         let (b, seq_len, _) = x.dims3()?;
         let device = x.device();
         let dtype = x.dtype();
-
-        // Transpose to [1, conv_dim, L] for conv
-        let x_t = x.transpose(1, 2)?; // [1, conv_dim, L]
-
-        // Left-pad with zeros (or existing conv_state)
         let pad_len = self.conv_kernel - 1;
+
+        // Transpose to `[B, D, L]` for the Dao-AILab kernel convention.
+        let x_t = x.transpose(1, 2)?.contiguous()?; // [1, conv_dim, L]
+
+        // Left-context state: saved from a prior chunk, or zeros.
+        // Fast-path shape is `[B, D, W-1]`, same as what we store.
+        let init_3d = if let Some(ref state) = self.conv_state {
+            Some(state.unsqueeze(0)?.contiguous()?) // [1, conv_dim, W-1]
+        } else {
+            None
+        };
+
+        // ── Fast path: Ops::causal_conv1d_fn ─────────────────────────
+        //
+        // Fuses SiLU so the caller must NOT apply SiLU on top.
+        if let Some(res) = ops.causal_conv1d_fn(
+            &x_t,
+            &self.conv_weight,
+            None,
+            init_3d.as_ref(),
+            /*silu_activation=*/ true,
+        ) {
+            let result_t = res?; // [1, conv_dim, L]
+            let result = result_t.transpose(1, 2)?.contiguous()?; // [1, L, conv_dim]
+
+            // Save the last `W-1` raw inputs as the new conv_state.
+            let x_t_2d = x_t.squeeze(0)?; // [conv_dim, L]
+            if seq_len >= pad_len {
+                self.conv_state = Some(
+                    x_t_2d
+                        .narrow(1, seq_len - pad_len, pad_len)?
+                        .contiguous()?,
+                );
+            } else {
+                let old = if let Some(ref state) = self.conv_state {
+                    state.narrow(1, seq_len, pad_len - seq_len)?
+                } else {
+                    Tensor::zeros((self.conv_dim, pad_len - seq_len), dtype, device)?
+                };
+                self.conv_state = Some(Tensor::cat(&[old, x_t_2d], 1)?.contiguous()?);
+            }
+            return Ok(result);
+        }
+
+        // ── Fallback: per-kernel-position shift + sum loop ───────────
+        //
+        // For each `k_i ∈ 0..width`, the output contribution at time
+        // `t` is `weight[:, k_i] * padded[:, t + k_i]`. We accumulate
+        // across the 4 kernel offsets with simple tensor ops (no
+        // matmul → CUDA-safe even when the CUTLASS wrapper can't serve
+        // the NN-mode GEMM candle's conv1d path would emit).
         let prefix = if let Some(ref state) = self.conv_state {
-            state.unsqueeze(0)?
+            state.unsqueeze(0)?.contiguous()?
         } else {
             Tensor::zeros((b, self.conv_dim, pad_len), dtype, device)?
         };
-        let padded = Tensor::cat(&[prefix, x_t.clone()], 2)?; // [1, conv_dim, pad+L]
+        let padded = Tensor::cat(&[&prefix, &x_t], 2)?.contiguous()?; // [1, D, L+W-1]
 
-        // Manual conv1d: slide window of size kernel over padded
-        let mut outputs = Vec::with_capacity(seq_len);
-        for t in 0..seq_len {
-            let window = padded.narrow(2, t, self.conv_kernel)?; // [1, conv_dim, kernel]
-            let out = (window.squeeze(0)? * &self.conv_weight)?.sum(D::Minus1)?; // [conv_dim]
-            outputs.push(out);
+        let mut acc: Option<Tensor> = None;
+        for k_i in 0..self.conv_kernel {
+            let shifted = padded.narrow(2, k_i, seq_len)?; // [1, D, L]
+            // weight[:, k_i] → [D], reshape to [1, D, 1] for broadcast.
+            let w_slice = self
+                .conv_weight
+                .narrow(1, k_i, 1)?
+                .reshape((1, self.conv_dim, 1))?;
+            let term = shifted.broadcast_mul(&w_slice)?;
+            acc = Some(match acc {
+                None => term,
+                Some(a) => (a + term)?,
+            });
         }
-        let result = Tensor::stack(&outputs, 0)?.unsqueeze(0)?; // [1, L, conv_dim]
+        let out_t = acc.unwrap(); // [1, D, L]
+        // Fuse SiLU here so the caller can drop its separate silu call.
+        let out_t = ops.silu(&out_t)?;
+        let result = out_t.transpose(1, 2)?.contiguous()?; // [1, L, conv_dim]
 
-        // Save last kernel-1 inputs as conv_state
-        let x_t_2d = x_t.squeeze(0)?; // [conv_dim, L]
+        // Save state, same as fast path.
+        let x_t_2d = x_t.squeeze(0)?;
         if seq_len >= pad_len {
-            self.conv_state = Some(x_t_2d.narrow(1, seq_len - pad_len, pad_len)?);
+            self.conv_state = Some(
+                x_t_2d
+                    .narrow(1, seq_len - pad_len, pad_len)?
+                    .contiguous()?,
+            );
         } else {
             let old = if let Some(ref state) = self.conv_state {
                 state.narrow(1, seq_len, pad_len - seq_len)?
             } else {
                 Tensor::zeros((self.conv_dim, pad_len - seq_len), dtype, device)?
             };
-            self.conv_state = Some(Tensor::cat(&[old, x_t_2d], 1)?);
+            self.conv_state = Some(Tensor::cat(&[old, x_t_2d], 1)?.contiguous()?);
         }
 
         Ok(result)
@@ -1711,7 +1813,8 @@ fn deltanet_decode_batched_fused(
                 .contiguous()?,
         );
         let x_row = qkv_for_conv_2d.get(i)?.contiguous()?; // [conv_dim]
-        let out = gdn.conv1d_decode(&x_row)?; // [conv_dim]
+        // conv1d_decode now fuses the SiLU in, so no separate silu below.
+        let out = gdn.conv1d_decode(&x_row, ops)?; // [conv_dim]
         conv_outs.push(out);
         if let Some(ref state) = gdn.conv_state {
             let row = state.contiguous()?.unsqueeze(0)?.contiguous()?;
@@ -1720,9 +1823,8 @@ fn deltanet_decode_batched_fused(
     }
     gdn.conv_state = None;
 
-    // Stack conv outputs: [N, conv_dim]
+    // Stack conv outputs: [N, conv_dim] (SiLU already applied per-token).
     let qkv_conv = Tensor::stack(&conv_outs, 0)?;
-    let qkv_conv = ops.silu(&qkv_conv)?;
 
     // Split into q, k, v with head layout.
     let q_flat = qkv_conv.narrow(D::Minus1, 0, gdn.key_dim)?;

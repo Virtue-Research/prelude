@@ -32,6 +32,7 @@ deepgemm       = { workspace = true }
 cutlass-gemm   = { workspace = true }
 quant-gemm     = { workspace = true }
 cula           = { workspace = true, features = ["dsl"] }
+causal-conv1d  = { workspace = true }
 tvm-static-ffi = { workspace = true }
 
 # gpu_ops_bench temporarily disabled — needs migration from candle_core

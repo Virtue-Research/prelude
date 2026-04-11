@@ -196,6 +196,40 @@ impl Ops for CudaOps {
         }
     }
 
+    fn causal_conv1d_fn(
+        &self,
+        x: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        initial_states: Option<&Tensor>,
+        silu_activation: bool,
+    ) -> Option<Result<Tensor>> {
+        match crate::attn::causal_conv1d::try_fwd(
+            x, weight, bias, initial_states, silu_activation,
+        ) {
+            Ok(Some(t)) => Some(Ok(t)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    fn causal_conv1d_update(
+        &self,
+        x: &Tensor,
+        conv_state: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        silu_activation: bool,
+    ) -> Option<Result<Tensor>> {
+        match crate::attn::causal_conv1d::try_update(
+            x, conv_state, weight, bias, silu_activation,
+        ) {
+            Ok(Some(t)) => Some(Ok(t)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
     fn gdn_prefill_varlen(
         &self,
         q: &Tensor,

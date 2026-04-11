@@ -247,6 +247,69 @@ pub trait Ops: Send + Sync {
         _slot_ids: &Tensor,
     ) -> Option<Result<Tensor>> { None }
 
+    /// Fused short causal 1D convolution (Dao-AILab causal-conv1d).
+    ///
+    /// Runs the same kernel Mamba / Mamba-2 / Qwen3-next / Qwen3.5
+    /// DeltaNet rely on for the depthwise conv that precedes the
+    /// recurrent state update. The whole sequence is processed in one
+    /// CUDA launch per call (instead of our `broadcast * weight + sum`
+    /// per-token fallback loop).
+    ///
+    /// Layout is `[batch, dim, seqlen]` (channel-before-time) — note
+    /// that this is NOT the `[batch, seqlen, dim]` our Qwen3.5 model
+    /// uses elsewhere. The caller transposes.
+    ///
+    /// Shapes:
+    /// - `x`: `[batch, dim, seqlen]` BF16/F16/F32
+    /// - `weight`: `[dim, width]` depthwise filter, same dtype class as `x`
+    /// - `bias`: optional `[dim]`
+    /// - `initial_states`: optional `[batch, dim, width - 1]` — the
+    ///   left-context state saved from a previous chunk of the same
+    ///   stream. Pass `None` for a fresh start (kernel treats as zeros).
+    /// - `silu_activation`: if true, fuse a SiLU at the tail.
+    ///
+    /// Returns the output `[batch, dim, seqlen]` in the same dtype as
+    /// `x`. The caller is responsible for saving the last `width - 1`
+    /// positions of the raw input `x` as the new conv_state for the
+    /// next chunk.
+    ///
+    /// Returns `None` when the backend can't serve the call (non-CUDA,
+    /// unsupported dtype, or `width > 4` — upstream's specialization
+    /// matrix).
+    #[allow(clippy::too_many_arguments)]
+    fn causal_conv1d_fn(
+        &self,
+        _x: &Tensor,
+        _weight: &Tensor,
+        _bias: Option<&Tensor>,
+        _initial_states: Option<&Tensor>,
+        _silu_activation: bool,
+    ) -> Option<Result<Tensor>> { None }
+
+    /// Single-token decode step for causal conv1d. Reads the tail of
+    /// `conv_state`, computes the output at the new token, and updates
+    /// `conv_state` in place by shifting left and appending the new
+    /// input.
+    ///
+    /// Shapes:
+    /// - `x`: `[batch, dim]` BF16/F16/F32 (single token)
+    /// - `conv_state`: `[batch, dim, width - 1]` **updated in place**
+    /// - `weight`: `[dim, width]` depthwise filter
+    /// - `bias`: optional `[dim]`
+    ///
+    /// Returns the output `[batch, dim]`.
+    ///
+    /// Returns `None` when the backend can't serve the call.
+    #[allow(clippy::too_many_arguments)]
+    fn causal_conv1d_update(
+        &self,
+        _x: &Tensor,
+        _conv_state: &Tensor,
+        _weight: &Tensor,
+        _bias: Option<&Tensor>,
+        _silu_activation: bool,
+    ) -> Option<Result<Tensor>> { None }
+
     /// Fused Gated DeltaNet (GDN) varlen prefill — matches FLA's
     /// `chunk_gated_delta_rule` semantics (Qwen3-next / Qwen3.5 family).
     ///
