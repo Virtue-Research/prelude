@@ -522,10 +522,6 @@ impl Qwen3_5GatedDeltaNet {
         let k = qkv_conv.narrow(D::Minus1, self.key_dim, self.key_dim)?;
         let v = qkv_conv.narrow(D::Minus1, self.key_dim * 2, self.value_dim)?;
 
-        // Process each timestep
-        let device = x.device();
-        let mut outputs = Vec::with_capacity(seq_len);
-
         // Squeeze batch dim: [1, L, dim] -> [L, dim]
         let q = q.get(0)?;
         let k = k.get(0)?;
@@ -533,19 +529,16 @@ impl Qwen3_5GatedDeltaNet {
         let b_param = b_param.get(0)?;
         let a_param = a_param.get(0)?;
 
-        for t in 0..seq_len {
-            let q_t = q.get(t)?.contiguous()?; // [key_dim]
-            let k_t = k.get(t)?.contiguous()?; // [key_dim]
-            let v_t = v.get(t)?.contiguous()?; // [value_dim]
-            let b_t = b_param.get(t)?.contiguous()?; // [num_v_heads]
-            let a_t = a_param.get(t)?.contiguous()?; // [num_v_heads]
-
-            let out_t = self.delta_rule_step(&q_t, &k_t, &v_t, &b_t, &a_t, device, ops)?;
-            outputs.push(out_t);
-        }
-
-        // Stack outputs: [1, L, value_dim]
-        let output = Tensor::stack(&outputs, 0)?.unsqueeze(0)?;
+        // Batched delta-rule prefill. For seq_len==1 we still go through this
+        // path; the single-step "loop" is cheap and keeps the hot code in one
+        // place. The heavy lift (L2 norm, GQA expand, gating/beta, cast-to-F32)
+        // is done once over the whole sequence, then the recurrence runs with
+        // three real batched matmuls per step instead of broadcast_mul+sum.
+        let device = x.device();
+        let output = self.delta_rule_prefill(
+            &q, &k, &v, &b_param, &a_param, device, ops,
+        )?
+        .unsqueeze(0)?;
 
         // Reshape z for gated norm: [1, L, value_dim]
         let z = z.contiguous()?;
@@ -555,121 +548,128 @@ impl Qwen3_5GatedDeltaNet {
         self.out_proj.forward(&normed, &bst, ops)
     }
 
-    /// Single-step delta rule update (batched across all v_heads).
-    fn delta_rule_step(
+    /// Batched delta-rule prefill for a full sequence.
+    ///
+    /// Inputs are all 2D (seq_len as dim 0), output is [T, value_dim].
+    /// Does the L2 norm / GQA expand / gating / beta in a single batched pass
+    /// over all tokens, then runs the recurrence loop with three batched
+    /// matmuls per step:
+    ///
+    ///   state_decayed @ k_col        → delta correction
+    ///   v_prime @ k_row^T            → outer update
+    ///   state @ q_col                → output
+    ///
+    /// Replaces an older per-step `broadcast_mul + sum(2)` implementation
+    /// that launched ~15 kernels per token and allocated a fresh 2 MB
+    /// intermediate each time — catastrophic at 1 K-token prefill × 30
+    /// DeltaNet layers.
+    fn delta_rule_prefill(
         &mut self,
-        q: &Tensor, // [key_dim]
-        k: &Tensor, // [key_dim]
-        v: &Tensor, // [value_dim]
-        b: &Tensor, // [num_v_heads]
-        a: &Tensor, // [num_v_heads]
+        q_in: &Tensor, // [T, key_dim]
+        k_in: &Tensor, // [T, key_dim]
+        v_in: &Tensor, // [T, value_dim]
+        b_in: &Tensor, // [T, num_v_heads]
+        a_in: &Tensor, // [T, num_v_heads]
         device: &Device,
         ops: &dyn crate::ops::Ops,
     ) -> Result<Tensor> {
-        let kv_ratio = self.num_v_heads / self.num_k_heads;
+        let t = q_in.dim(0)?;
+        let hv = self.num_v_heads;
+        let hk = self.num_k_heads;
+        let kdim = self.head_k_dim;
+        let vdim = self.head_v_dim;
+        let kv_ratio = hv / hk;
+        let out_dtype = v_in.dtype();
 
-        // L2-normalize q and k per head, scale q by 1/sqrt(head_k_dim)
-        let q = q.reshape((self.num_k_heads, self.head_k_dim))?;
+        // ── Batched precompute (one kernel each, over the whole sequence) ──
+
+        // q, k: [T, key_dim] → [T, HK, K] → L2 norm → F32 → (GQA expand) → [T, HV, K]
+        let q = q_in.reshape((t, hk, kdim))?;
         let q = l2_normalize_last_dim(&q)?;
-        let k = k.reshape((self.num_k_heads, self.head_k_dim))?;
+        let k = k_in.reshape((t, hk, kdim))?;
         let k = l2_normalize_last_dim(&k)?;
 
-        // v: [num_v_heads, head_v_dim]
-        let v = v.reshape((self.num_v_heads, self.head_v_dim))?;
+        let expand_heads = |x: &Tensor| -> Result<Tensor> {
+            if kv_ratio > 1 {
+                x.to_dtype(DType::F32)?
+                    .unsqueeze(2)?
+                    .expand((t, hk, kv_ratio, kdim))?
+                    .reshape((t, hv, kdim))?
+                    .contiguous()
+            } else {
+                x.to_dtype(DType::F32)?.contiguous()
+            }
+        };
+        let k_all = expand_heads(&k)?; // [T, HV, K] f32
+        let scale = (kdim as f64).powf(-0.5);
+        let q_all = (expand_heads(&q)? * scale)?; // [T, HV, K] f32
 
-        // Gating computation (all in f32 for numerical stability)
-        let dt_bias = self.dt_bias.to_dtype(DType::F32)?;
-        let a_log = self.a_log.to_dtype(DType::F32)?;
-        let a_f32 = a.to_dtype(DType::F32)?;
-        let b_f32 = b.to_dtype(DType::F32)?;
+        // v: [T, value_dim] → [T, HV, V] f32
+        let v_all = v_in
+            .reshape((t, hv, vdim))?
+            .to_dtype(DType::F32)?
+            .contiguous()?;
 
-        // g = -exp(A_log) * softplus(a + dt_bias) per head
-        let neg_a_exp = a_log.exp()?.neg()?;
-        let a_plus_dt = (a_f32 + dt_bias)?;
+        // Gating: decay[t, hv] = exp(-exp(a_log[hv]) * softplus(a[t, hv] + dt_bias[hv]))
+        // All shapes are [HV] scalar-per-head except `a_in` which is [T, HV].
+        let dt_bias_f32 = self.dt_bias.to_dtype(DType::F32)?;
+        let a_log_f32 = self.a_log.to_dtype(DType::F32)?;
+        let neg_a_exp = a_log_f32.exp()?.neg()?; // [HV]
+        let a_f32 = a_in.to_dtype(DType::F32)?; // [T, HV]
+        let a_plus_dt = a_f32.broadcast_add(&dt_bias_f32)?; // [T, HV]
         let softplus_val = softplus(&a_plus_dt)?;
-        let g = (neg_a_exp * softplus_val)?; // [num_v_heads]
+        let g = softplus_val.broadcast_mul(&neg_a_exp)?; // [T, HV]
+        let decay_all = g.exp()?; // [T, HV]
 
-        // beta = sigmoid(b) per head
-        let beta = ops.sigmoid(&b_f32)?; // [num_v_heads]
+        // beta = sigmoid(b) — [T, HV] f32
+        let beta_all = ops.sigmoid(&b_in.to_dtype(DType::F32)?)?;
 
-        // decay = exp(g)
-        let decay = g.exp()?; // [num_v_heads]
-
-        // Initialize recurrent state if needed: [num_v_heads, head_v_dim, head_k_dim] in f32.
-        // Note the (V, K) order — matches `DeltaNetPool` and cuLA's `kda_decode`
-        // state contract, so the fused batched decode kernel can read/write
-        // pool slots directly without a transpose copy.
+        // ── State init ─────────────────────────────────────────────────────
         if self.recurrent_state.is_none() {
-            self.recurrent_state = Some(Tensor::zeros(
-                (self.num_v_heads, self.head_v_dim, self.head_k_dim),
-                DType::F32,
-                device,
-            )?);
+            self.recurrent_state = Some(Tensor::zeros((hv, vdim, kdim), DType::F32, device)?);
         }
-        let state = self.recurrent_state.as_ref().unwrap();
+        let mut state = self.recurrent_state.take().unwrap();
 
-        // Delta rule: state = state * decay + outer(v', k)   where v' is the
-        // delta-corrected value. state is now [B, V, K] so the outer product
-        // between k (K-dim) and v' (V-dim) lands as state[b, v, k] += v'[b, v] * k[b, k].
-        // decay: [num_v_heads] → [num_v_heads, 1, 1]
-        let decay_3d = decay.reshape((self.num_v_heads, 1, 1))?;
-        let state_decayed = state.broadcast_mul(&decay_3d)?;
+        // ── Sequential recurrence loop (minimal per-step work) ─────────────
+        let mut outputs = Vec::with_capacity(t);
+        for i in 0..t {
+            let k_row = k_all.get(i)?.contiguous()?; // [HV, K]
+            let v_row = v_all.get(i)?; // [HV, V]
+            let q_row = q_all.get(i)?.contiguous()?; // [HV, K]
+            let decay = decay_all.get(i)?; // [HV]
+            let beta = beta_all.get(i)?; // [HV]
 
-        // k: [num_k_heads, head_k_dim] → expand to [num_v_heads, head_k_dim]
-        let k_f32 = k.to_dtype(DType::F32)?;
-        let k_expanded = if kv_ratio > 1 {
-            k_f32
-                .unsqueeze(1)?
-                .expand((self.num_k_heads, kv_ratio, self.head_k_dim))?
-                .reshape((self.num_v_heads, self.head_k_dim))?
-        } else {
-            k_f32
-        };
-        // k_row: [num_v_heads, 1, head_k_dim] — broadcastable over head_v_dim.
-        let k_row = k_expanded.reshape((self.num_v_heads, 1, self.head_k_dim))?;
+            // state *= decay.unsqueeze(-1).unsqueeze(-1)
+            let decay_3d = decay.reshape((hv, 1, 1))?;
+            let state_decayed = state.broadcast_mul(&decay_3d)?;
 
-        // Delta correction: v' = beta * (v - state_decayed @ k)
-        //   state_decayed: [B, head_v_dim, head_k_dim]
-        //   state_k[b, v]  = Σ_k state_decayed[b, v, k] * k[b, k]
-        // Implement as broadcast_mul + sum (a K=1 batched matmul would land in the
-        // unsupported NN GEMM layout on CUTLASS).
-        let state_k = state_decayed
-            .broadcast_mul(&k_row)?       // [B, head_v_dim, head_k_dim]
-            .sum(2)?;                     // [B, head_v_dim]
-        let v_f32 = v.to_dtype(DType::F32)?;
-        let v_error = (v_f32 - state_k)?; // [num_v_heads, head_v_dim]
+            // state_k = state_decayed @ k_row.unsqueeze(-1) → [HV, V, 1] → [HV, V]
+            let k_col = k_row.unsqueeze(D::Minus1)?; // [HV, K, 1]
+            let state_k = state_decayed.matmul(&k_col)?.squeeze(D::Minus1)?;
 
-        // beta: [num_v_heads] → [num_v_heads, 1]
-        let beta_2d = beta.reshape((self.num_v_heads, 1))?;
-        let v_prime = v_error.broadcast_mul(&beta_2d)?; // [num_v_heads, head_v_dim]
+            // v_error = v_row - state_k; v_prime = beta * v_error
+            let v_err = (v_row - state_k)?;
+            let beta_col = beta.unsqueeze(D::Minus1)?; // [HV, 1]
+            let v_prime = v_err.broadcast_mul(&beta_col)?; // [HV, V]
 
-        // state += outer(v_prime, k)
-        //   outer[b, v, k] = v'[b, v] * k[b, k]  — pure broadcast, no GEMM.
-        let v_col = v_prime.reshape((self.num_v_heads, self.head_v_dim, 1))?;
-        let outer = v_col.broadcast_mul(&k_row)?;
-        let state = (state_decayed + outer)?;
+            // outer = v_prime.unsqueeze(-1) @ k_row.unsqueeze(-2) → [HV, V, K]
+            let v_col = v_prime.unsqueeze(D::Minus1)?; // [HV, V, 1]
+            let k_row_bmm = k_row.unsqueeze(D::Minus2)?; // [HV, 1, K]
+            let outer = v_col.matmul(&k_row_bmm)?;
 
-        // output = state @ (q * scale): scale = 1/sqrt(head_k_dim)
-        //   out[b, v] = Σ_k state[b, v, k] * q[b, k] * scale
-        let scale = (self.head_k_dim as f64).powf(-0.5);
-        let q_f32 = (q.to_dtype(DType::F32)? * scale)?;
-        let q_expanded = if kv_ratio > 1 {
-            q_f32
-                .unsqueeze(1)?
-                .expand((self.num_k_heads, kv_ratio, self.head_k_dim))?
-                .reshape((self.num_v_heads, self.head_k_dim))?
-        } else {
-            q_f32
-        };
-        let q_row = q_expanded.reshape((self.num_v_heads, 1, self.head_k_dim))?;
-        let out = state
-            .broadcast_mul(&q_row)?      // [B, head_v_dim, head_k_dim]
-            .sum(2)?;                    // [B, head_v_dim]
-        let out = out.to_dtype(v.dtype())?;
-        let out = out.reshape((self.value_dim,))?;
+            state = (state_decayed + outer)?;
+
+            // out = state @ q_col → [HV, V]
+            let q_col = q_row.unsqueeze(D::Minus1)?; // [HV, K, 1]
+            let out = state.matmul(&q_col)?.squeeze(D::Minus1)?;
+            outputs.push(out);
+        }
 
         self.recurrent_state = Some(state);
-        Ok(out)
+
+        // Stack outputs: [T, HV, V] → [T, value_dim] → caller dtype
+        let out_stacked = Tensor::stack(&outputs, 0)?; // [T, HV, V]
+        out_stacked.reshape((t, self.value_dim))?.to_dtype(out_dtype)
     }
 
     /// Causal conv1d for a single token (decode step).
@@ -1189,7 +1189,7 @@ impl Qwen3_5SparseMoeBlock {
     }
 
     fn forward_2d(&self, ops: &dyn crate::ops::Ops, xs: &Tensor) -> Result<Tensor> {
-        let (_n_tokens, hidden_dim) = xs.dims2()?;
+        let (n_tokens, hidden_dim) = xs.dims2()?;
 
         // Router: softmax in F32 (to match reference `softmax(..., dtype=float32)`)
         // over 256 experts — BF16 softmax loses too much precision at this width.
@@ -1210,27 +1210,11 @@ impl Qwen3_5SparseMoeBlock {
             topk_weights = topk_weights.broadcast_div(&topk_weights.sum_keepdim(D::Minus1)?)?;
         }
 
-        // Sequential expert dispatch (CPU path)
-        let topk_weights_vec: Vec<Vec<f32>> = topk_weights.to_vec2()?;
-        let experts_per_tok_vec: Vec<Vec<u32>> = experts_per_tok.to_vec2()?;
-
-        let n_tokens = topk_weights_vec.len();
-        let mut routed_out = Tensor::zeros((n_tokens, hidden_dim), xs.dtype(), xs.device())?;
-
-        for t in 0..n_tokens {
-            let x_t = xs.get(t)?.unsqueeze(0)?; // [1, hidden]
-            let mut acc = Tensor::zeros((1, hidden_dim), DType::F32, xs.device())?;
-            for k in 0..self.num_experts_per_tok {
-                let expert_idx = experts_per_tok_vec[t][k] as usize;
-                let weight = topk_weights_vec[t][k];
-                let expert_out = self
-                    .expert_forward(expert_idx, &x_t, ops)?
-                    .to_dtype(DType::F32)?;
-                acc = (acc + (expert_out * weight as f64)?)?;
-            }
-            let acc = acc.to_dtype(xs.dtype())?;
-            routed_out = routed_out.slice_assign(&[t..t + 1, 0..hidden_dim], &acc)?;
-        }
+        let mut routed_out = if xs.device().is_cuda() {
+            self.forward_fused(ops, xs, &topk_weights, &experts_per_tok, n_tokens, hidden_dim)?
+        } else {
+            self.forward_sequential_cpu(ops, xs, &topk_weights, &experts_per_tok, hidden_dim)?
+        };
 
         // Shared expert
         if let Some(ref shared) = self.shared_expert {
@@ -1248,6 +1232,145 @@ impl Qwen3_5SparseMoeBlock {
 
         Ok(routed_out)
     }
+
+    /// Fused MoE dispatch (CUDA fast path).
+    ///
+    /// One `grouped_gemm` over the stacked `[E, 2*inter, hidden]` gate_up
+    /// weight handles all experts in a single kernel, then `silu_mul_concat`
+    /// fuses the activation, then `fused_moe_gemm` applies the down projection
+    /// with topk-weighted accumulation. This replaces a sequential
+    /// `for t { for k in 0..topk { two tiny matmuls } }` loop that did two
+    /// D2H syncs per layer via `to_vec2()` and launched ~`n_tokens * topk * 2`
+    /// tiny GEMMs — catastrophic for a 40-layer 256-expert top-8 model.
+    fn forward_fused(
+        &self,
+        ops: &dyn crate::ops::Ops,
+        xs: &Tensor,
+        topk_weights: &Tensor,
+        experts_per_tok: &Tensor,
+        n_tokens: usize,
+        hidden_dim: usize,
+    ) -> Result<Tensor> {
+        let (sorted_expert_ids, sorted_token_ids) =
+            sort_expert_assignments(experts_per_tok, xs.device())?;
+
+        let is_prefill = n_tokens > 1;
+        // `num_tokens_per_expert` is unused by the current CUDA grouped_gemm
+        // kernel (it derives offsets internally), but keep the arg for trait
+        // compatibility. Reuse `sorted_expert_ids` as the sentinel to avoid an
+        // extra D2H sync via count_tokens_per_expert.
+        let counts_sentinel = &sorted_expert_ids;
+
+        // Single grouped GEMM against fused [E, 2*inter, hidden] → [N*topk, 2*inter]
+        let gate_up = ops.grouped_gemm(
+            xs,
+            &self.experts_gate_up,
+            &sorted_token_ids,
+            &sorted_expert_ids,
+            counts_sentinel,
+        )?;
+
+        // silu(gate) * up — prefer fused concat path that avoids a narrow+copy
+        let inter = self.moe_intermediate_size;
+        let down_input = match ops.silu_mul_concat(&gate_up) {
+            Some(r) => r?,
+            None => {
+                let gate = gate_up.narrow(D::Minus1, 0, inter)?.contiguous()?;
+                let up = gate_up.narrow(D::Minus1, inter, inter)?.contiguous()?;
+                ops.silu_mul(&gate, &up)?
+            }
+        };
+
+        // Down projection with fused topk weighted accumulation.
+        let ys = match ops.fused_moe_gemm(
+            &down_input,
+            &self.experts_down,
+            topk_weights,
+            &sorted_token_ids,
+            &sorted_expert_ids,
+            self.num_experts_per_tok,
+            is_prefill,
+        ) {
+            Some(r) => r?,
+            None => {
+                // Fallback: unweighted grouped_gemm + manual weighted sum.
+                let raw = ops.grouped_gemm(
+                    &down_input,
+                    &self.experts_down,
+                    &sorted_token_ids,
+                    &sorted_expert_ids,
+                    counts_sentinel,
+                )?;
+                let raw = raw.reshape((n_tokens, self.num_experts_per_tok, hidden_dim))?;
+                let w = topk_weights.unsqueeze(D::Minus1)?;
+                return (raw * w)?.sum(D::Minus2);
+            }
+        };
+
+        ys.reshape((n_tokens, self.num_experts_per_tok, hidden_dim))?
+            .sum(D::Minus2)
+    }
+
+    /// CPU fallback: sequential per-token expert dispatch. Kept for
+    /// correctness when the CUDA fused path is unavailable.
+    fn forward_sequential_cpu(
+        &self,
+        ops: &dyn crate::ops::Ops,
+        xs: &Tensor,
+        topk_weights: &Tensor,
+        experts_per_tok: &Tensor,
+        hidden_dim: usize,
+    ) -> Result<Tensor> {
+        let topk_weights_vec: Vec<Vec<f32>> = topk_weights.to_vec2()?;
+        let experts_per_tok_vec: Vec<Vec<u32>> = experts_per_tok.to_vec2()?;
+
+        let n_tokens = topk_weights_vec.len();
+        let mut routed_out = Tensor::zeros((n_tokens, hidden_dim), xs.dtype(), xs.device())?;
+
+        for t in 0..n_tokens {
+            let x_t = xs.get(t)?.unsqueeze(0)?;
+            let mut acc = Tensor::zeros((1, hidden_dim), DType::F32, xs.device())?;
+            for k in 0..self.num_experts_per_tok {
+                let expert_idx = experts_per_tok_vec[t][k] as usize;
+                let weight = topk_weights_vec[t][k];
+                let expert_out = self
+                    .expert_forward(expert_idx, &x_t, ops)?
+                    .to_dtype(DType::F32)?;
+                acc = (acc + (expert_out * weight as f64)?)?;
+            }
+            let acc = acc.to_dtype(xs.dtype())?;
+            routed_out = routed_out.slice_assign(&[t..t + 1, 0..hidden_dim], &acc)?;
+        }
+        Ok(routed_out)
+    }
+}
+
+/// Sort topk expert assignments so that all tokens routed to the same expert
+/// are contiguous in the output. Returns `(sorted_expert_ids, sorted_token_ids)`
+/// both as flat `[num_tokens * topk]` u32 tensors. The `sorted_token_ids[i]`
+/// gives the original flat assignment index (token * topk + k) for the i-th
+/// entry in the sorted expert stream, which is what `grouped_gemm` expects.
+fn sort_expert_assignments(
+    experts_per_tok: &Tensor,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let flat = experts_per_tok.flatten_all()?;
+    let n = flat.elem_count();
+
+    if n <= 1024 && device.is_cuda() {
+        let flat_2d = flat.reshape((1, n))?;
+        let (sorted_vals, sorted_idx) = flat_2d.sort_last_dim(true)?;
+        return Ok((sorted_vals.flatten_all()?, sorted_idx.flatten_all()?));
+    }
+
+    let flat_vec = flat.to_vec1::<u32>()?;
+    let mut indices: Vec<u32> = (0..n as u32).collect();
+    indices.sort_by_key(|&i| flat_vec[i as usize]);
+    let sorted_expert_ids: Vec<u32> = indices.iter().map(|&i| flat_vec[i as usize]).collect();
+    Ok((
+        Tensor::from_vec(sorted_expert_ids, (n,), device)?,
+        Tensor::from_vec(indices, (n,), device)?,
+    ))
 }
 
 pub(super) enum MlpVariant {
