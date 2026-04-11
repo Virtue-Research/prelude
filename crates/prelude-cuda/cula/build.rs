@@ -1,42 +1,87 @@
-//! Build script for prelude-cula: cuLA linear attention kernels.
+//! Build script for the `cula` crate — Rust bindings to cuLA linear attention kernels.
 //!
 //! Phase 1: Compile C++ CUTLASS 3.x kernels (SM90/SM100) via nvcc → static archive.
 //! Phase 2: AOT compile CuTe DSL kernels via Python → .o files → static archive.
 //! Phase 3: Generate Rust dispatch code from manifest.json.
+//!
+//! Source layout discovery:
+//!   - cuLA sources:    $CULA_ROOT     (default: $CARGO_WORKSPACE/third_party/cuLA)
+//!   - CUTLASS headers: $CUTLASS_ROOT  (default: $CARGO_WORKSPACE/third_party/cutlass)
+//!   - CUDA toolkit:    $CUDA_PATH     (default: /usr/local/cuda or /opt/cuda)
+//!
+//! The workspace-root fallback keeps zero-config builds inside prelude; the env
+//! vars let this crate build standalone by pointing at checkouts elsewhere.
 
 use std::env;
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-include!("../../../build_log.rs");
+// Workspace helpers are inlined below rather than `include!`-ed from a parent
+// file, so this crate can be built standalone (outside the prelude workspace).
+macro_rules! build_log {
+    ($($arg:tt)*) => {{
+        let _msg = format!($($arg)*);
+        eprintln!("  [{}] {_msg}", env!("CARGO_PKG_NAME"));
+        println!("cargo:warning={}", _msg);
+    }};
+}
+
+/// Watch a git submodule's HEAD so we rebuild when the submodule pointer moves.
+/// Walks up from `CARGO_MANIFEST_DIR` looking for a `.git` directory; this means
+/// the crate must live inside a git checkout that has `third_party/<name>` as a
+/// submodule. When run outside such a workspace the function is a no-op and the
+/// build just relies on explicit env vars / Cargo.toml rerun-if triggers.
+fn track_submodule(name: &str) {
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let mut dir = manifest.as_path();
+    loop {
+        if dir.join(".git").is_dir() {
+            let head = dir.join(format!(".git/modules/third_party/{name}/HEAD"));
+            if head.exists() {
+                println!("cargo:rerun-if-changed={}", head.display());
+            }
+            return;
+        }
+        match dir.parent() {
+            Some(p) => dir = p,
+            None => return,
+        }
+    }
+}
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/cula_wrapper.cu");
     println!("cargo:rerun-if-changed=scripts/compile_kernels.py");
+    println!("cargo:rerun-if-env-changed=CULA_ROOT");
+    println!("cargo:rerun-if-env-changed=CUTLASS_ROOT");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
     track_submodule("cuLA");
     track_submodule("cutlass");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let workspace_root = manifest_dir.join("../../..");
 
-    // Ensure submodules
-    let cula_dir = workspace_root.join("third_party/cuLA");
-    if !cula_dir.join("csrc/kda/sm90/prefill_kernel.hpp").exists() {
-        panic!(
-            "third_party/cuLA submodule not found or incomplete.\n\
-             Run: git submodule update --init third_party/cuLA"
-        );
-    }
-    let cutlass_dir = workspace_root.join("third_party/cutlass");
-    if !cutlass_dir.join("include/cutlass/cutlass.h").exists() {
-        panic!(
-            "third_party/cutlass submodule not found or incomplete.\n\
-             Run: git submodule update --init third_party/cutlass"
-        );
-    }
+    // Source discovery:
+    //   - `CULA_ROOT`    overrides cuLA source path (marker: csrc/kda/sm90/prefill_kernel.hpp)
+    //   - `CUTLASS_ROOT` overrides CUTLASS include path (marker: include/cutlass/cutlass.h)
+    // Fall back to the prelude workspace layout
+    // (crates/prelude-cuda/cula → ../../.. = workspace root) so the common case
+    // is zero-config.
+    let workspace_root = manifest_dir.join("../../..");
+    let cula_dir = locate_source(
+        "CULA_ROOT",
+        "cuLA",
+        "csrc/kda/sm90/prefill_kernel.hpp",
+        &workspace_root.join("third_party/cuLA"),
+    );
+    let cutlass_dir = locate_source(
+        "CUTLASS_ROOT",
+        "cutlass",
+        "include/cutlass/cutlass.h",
+        &workspace_root.join("third_party/cutlass"),
+    );
 
     let cuda_path = find_cuda();
     let nvcc = cuda_path.join("bin/nvcc");
@@ -47,11 +92,13 @@ fn main() {
 
     // ── Phase 1 (nvcc C++) and Phase 2 (Python DSL) run in parallel ──
     //
-    //   Phase 1: nvcc compiles C++ CUTLASS kernels (uses GPU compiler)
-    //   Phase 2: Python compiles CuTe DSL kernels (uses Python + cutlass-dsl)
+    //   Phase 1: nvcc compiles C++ CUTLASS kernels (uses GPU compiler). Always on.
+    //   Phase 2: Python compiles CuTe DSL kernels (uses Python + cutlass-dsl).
+    //            Gated behind the `dsl` cargo feature (on by default).
     //
     // They share no state and use different tools → safe to parallelize.
 
+    let dsl_enabled = env::var("CARGO_FEATURE_DSL").is_ok();
     let kernels_dir = out_dir.join("dsl_kernels");
 
     // Build target arch list: SM90 always, plus higher archs if nvcc supports them.
@@ -59,12 +106,18 @@ fn main() {
     if sm100 { dsl_archs.push("sm_100".to_string()); }
     // Future: if sm120 { dsl_archs.push("sm_120".to_string()); }
 
-    // Spawn Phase 2 in a background thread (it may take minutes for venv setup)
+    // Spawn Phase 2 in a background thread (it may take minutes for venv setup).
+    // When the `dsl` feature is off, the thread just skips the Python build and
+    // we emit a stub dispatch table later.
     let dsl_kernels_dir = kernels_dir.clone();
     let dsl_manifest_dir = manifest_dir.clone();
     let dsl_cula_dir = cula_dir.clone();
     let dsl_out_dir = out_dir.clone();
     let dsl_handle = std::thread::spawn(move || {
+        if !dsl_enabled {
+            build_log!("[DSL] feature disabled, skipping Python AOT compile");
+            return false;
+        }
         compile_dsl_kernels(&dsl_kernels_dir, &dsl_manifest_dir, &dsl_cula_dir, &dsl_out_dir, &dsl_archs)
     });
 
@@ -525,6 +578,36 @@ fn nvcc_supports_sm100(nvcc: &Path) -> bool {
         .output()
         .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("compute_100"))
         .unwrap_or(false)
+}
+
+/// Resolve a C++ dependency root from an env var override (first choice) or a
+/// workspace fallback (second choice). `marker` is a relative file that must
+/// exist inside the resolved directory; we use it as a sanity check and surface
+/// a helpful error instead of silently compiling with broken include paths.
+fn locate_source(env_var: &str, name: &str, marker: &str, fallback: &Path) -> PathBuf {
+    let chosen = match env::var(env_var) {
+        Ok(p) if !p.is_empty() => PathBuf::from(p),
+        _ => fallback.to_path_buf(),
+    };
+    if !chosen.join(marker).exists() {
+        let hint = if env::var(env_var).is_ok() {
+            format!(
+                "{env_var}={} points at a directory that is missing `{marker}`. \
+                 Check that it really is a {name} checkout.",
+                chosen.display()
+            )
+        } else {
+            format!(
+                "Expected {name} at {} (missing `{marker}`). Either run \
+                 `git submodule update --init third_party/{name}` inside the \
+                 prelude workspace, or set {env_var}=/path/to/{name} to build \
+                 this crate standalone.",
+                chosen.display()
+            )
+        };
+        panic!("{hint}");
+    }
+    chosen
 }
 
 fn find_cuda() -> PathBuf {

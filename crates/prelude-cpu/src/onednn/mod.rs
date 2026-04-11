@@ -1,7 +1,6 @@
 //! oneDNN integration for BF16/F32/INT8/FP8 CPU GEMM and brgemm micro-kernels.
 //!
-//! This module wraps the `crates/onednn-ffi` shared library, providing:
-//! - Raw FFI bindings ([`ffi`])
+//! This module layers on top of the standalone `onednn-ffi` crate, adding:
 //! - Safe Rust wrappers for GEMM, fused SiLU×Mul, and packed-weight management ([`ops`])
 //! - [`OnednnLinear`]: drop-in replacement for `DenseLinear` with oneDNN dispatch
 //! - INT8 W8A8 quantized GEMM via brgemm micro-kernels
@@ -10,7 +9,12 @@
 //!
 //! Only available when the `onednn` feature is enabled.
 
-pub mod ffi;
+// Re-export the external `onednn-ffi` crate as `super::ffi` so the existing
+// `ops.rs` path (`super::ffi::onednn_init()`) keeps working after the
+// extraction. Tests and downstream code should still go through the safe
+// wrappers in `ops` rather than touching the raw FFI directly.
+pub use onednn_ffi as ffi;
+
 pub mod ops;
 
 // Re-export key public items so callers can use `crate::onednn::init`, etc.

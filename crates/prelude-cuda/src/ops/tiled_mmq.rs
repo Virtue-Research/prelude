@@ -1,6 +1,6 @@
 //! GPU tiled MMQ: high-performance quantized matrix multiply for prefill.
 //!
-//! Wraps `prelude-quant-gemm` (vendored from llama.cpp) to provide tiled
+//! Wraps `quant-gemm` (vendored from llama.cpp) to provide tiled
 //! shared-memory MMQ with DP4A + tensor core support.
 //!
 //! Use this for M > 1 (prefill). For M = 1 (decode), use `mmvq` instead.
@@ -25,7 +25,7 @@ pub fn tiled_mmq(
     m: usize,
     n: usize,
     k: usize,
-    weight_type: prelude_quant_gemm::GgmlType,
+    weight_type: quant_gemm::GgmlType,
 ) -> Result<Tensor> {
     let (w_storage, w_layout) = quantized_weights.storage_and_layout();
     let w_cuda = match &*w_storage {
@@ -68,7 +68,7 @@ pub fn tiled_mmq(
 
     // Step 1: Quantize activations BF16 → Q8_1_MMQ
     unsafe {
-        prelude_quant_gemm::quantize_q8_1(
+        quant_gemm::quantize_q8_1(
             a_ptr, q8_ptr,
             m as i64, k as i64,
             weight_type,
@@ -78,7 +78,7 @@ pub fn tiled_mmq(
 
     // Step 2: Tiled MMQ (compute_cap=0 → auto-detect in C++ side)
     unsafe {
-        prelude_quant_gemm::mul_mat_q(
+        quant_gemm::mul_mat_q(
             w_ptr, q8_ptr as *const c_void, out_ptr,
             m as i64, n as i64, k as i64,
             weight_type,

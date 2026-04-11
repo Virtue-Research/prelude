@@ -1,11 +1,20 @@
-//! TVM FFI runtime types — shared by FA4, FlashInfer, and cuLA kernel crates.
+//! Minimal ABI for calling statically-linked CuTeDSL / cutlass-dsl AOT
+//! kernels from Rust.
 //!
-//! Provides:
+//! Scope (deliberately narrow):
 //! - DLPack types (`DLDevice`, `DLDataType`, `DLTensor`)
-//! - TVM FFI types (`TVMFFIAny`, `TVMSafeCallFn`)
-//! - Error helper for extracting TVM error messages
+//! - TVM FFI "Any" packed value (`TVMFFIAny`)
+//! - TVM `SafeCall` function signature (`TVMSafeCallFn`)
+//! - Helper `call_tvm_ffi(func, args)` that invokes a statically-linked
+//!   `__tvm_ffi_<name>` symbol and extracts the error message on failure.
 //!
-//! The C++ tvm_ffi library is compiled once by this crate's build.rs.
+//! This crate does NOT provide a TVM runtime, function registry, or object
+//! system — that is the job of the upstream `tvm-ffi` crate, which uses
+//! dynamic loading (`libtvm_ffi.so`). The two crates serve different use
+//! cases and can coexist.
+//!
+//! The C++ tvm_ffi library is compiled once by this crate's build.rs so the
+//! error-retrieval helper has a C ABI to call into.
 
 use std::ffi::c_void;
 
@@ -108,30 +117,49 @@ impl TVMFFIAny {
 // ── Error helper ────────────────────────────────────────────────────
 
 unsafe extern "C" {
-    fn prelude_tvm_get_last_error(out_len: *mut usize) -> *const u8;
+    fn tvm_static_ffi_get_last_error(out_len: *mut usize) -> *const u8;
 }
 
 /// Call a TVM FFI function and convert errors to a Rust Result.
 ///
 /// Returns Ok(()) on success, Err(String) with the TVM error message on failure.
+///
+/// # Safety
+/// The caller must ensure `func` is a valid TVM SafeCall function pointer and
+/// that the lifetimes of all `TVMFFIAny` contents in `args` outlive the call.
 pub unsafe fn call_tvm_ffi(
     func: TVMSafeCallFn,
     args: &[TVMFFIAny],
 ) -> Result<(), String> {
     let mut ret = TVMFFIAny::none();
-    let rc = func(
-        std::ptr::null_mut(),
-        args.as_ptr(),
-        args.len() as i32,
-        &mut ret,
-    );
+    // SAFETY: caller contract on `func` being a valid SafeCall entry point
+    // and on `args` outliving the call.
+    let rc = unsafe {
+        func(
+            std::ptr::null_mut(),
+            args.as_ptr(),
+            args.len() as i32,
+            &mut ret,
+        )
+    };
     if rc == 0 {
         Ok(())
     } else {
-        let mut msg_len: usize = 0;
-        let msg_ptr = prelude_tvm_get_last_error(&mut msg_len);
+        // SAFETY: `tvm_static_ffi_get_last_error` returns a pointer into
+        // TVM's thread-local error state, valid until the next TVM call on
+        // this thread. We read it into an owned String immediately.
+        let (msg_ptr, msg_len) = unsafe {
+            let mut len: usize = 0;
+            let p = tvm_static_ffi_get_last_error(&mut len);
+            (p, len)
+        };
         let msg = if !msg_ptr.is_null() && msg_len > 0 {
-            std::str::from_utf8_unchecked(std::slice::from_raw_parts(msg_ptr, msg_len)).to_string()
+            // SAFETY: valid UTF-8 slice owned by TVM's thread-local buffer,
+            // copied into an owned String before the next FFI call.
+            unsafe {
+                std::str::from_utf8_unchecked(std::slice::from_raw_parts(msg_ptr, msg_len))
+                    .to_string()
+            }
         } else {
             format!("TVM FFI call failed (rc={rc})")
         };

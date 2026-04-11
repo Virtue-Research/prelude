@@ -23,15 +23,16 @@ tracing.workspace = true
 bc-mimalloc.workspace = true
 inventory = "0.3"
 
-# Always compiled — runtime dispatch selects the best kernel
-prelude-flash-attn-v4 = { path = "fa4" }
-prelude-flashinfer = { path = "flashinfer" }
-
-prelude-deepgemm = { path = "deepgemm" }
-prelude-cutlass-gemm = { path = "cutlass-gemm" }
-prelude-quant-gemm = { path = "quant-gemm" }
-prelude-cula = { path = "cula" }
-prelude-tvm-ffi = { path = "tvm-ffi" }
+# Kernel crates — all independently publishable, referenced through
+# `[workspace.dependencies]` dual specs so they stay path-linked locally but
+# fall back to crates.io versions if someone consumes them standalone.
+flash-attn-v4  = { workspace = true }
+flashinfer     = { workspace = true }
+deepgemm       = { workspace = true }
+cutlass-gemm   = { workspace = true }
+quant-gemm     = { workspace = true }
+cula           = { workspace = true, features = ["dsl"] }
+tvm-static-ffi = { workspace = true }
 
 # gpu_ops_bench temporarily disabled — needs migration from candle_core
 # [[bin]]

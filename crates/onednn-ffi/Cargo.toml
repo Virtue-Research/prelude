@@ -1,0 +1,17 @@
+[package]
+name = "onednn-ffi"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+license = "Apache-2.0"
+description = "Minimal Rust bindings to Intel oneDNN (matmul + brgemm micro-kernels) with a rayon-backed threadpool adapter. Static link, no libdnnl.so at runtime."
+repository = "https://github.com/uxlfoundation/oneDNN"
+
+[lib]
+name = "onednn_ffi"
+path = "src/lib.rs"
+
+[dependencies]
+# oneDNN's THREADPOOL runtime calls back into Rust to schedule parallel work.
+# rayon is what the adapter (`rayon_parallel_for` in src/lib.rs) forwards to.
+rayon = "1.11.0"

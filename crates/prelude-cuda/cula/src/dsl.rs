@@ -5,9 +5,9 @@
 
 use std::ffi::c_void;
 
-// ── TVM FFI types (from shared prelude-tvm-ffi crate) ───────────────
+// ── TVM FFI types (from shared tvm-static-ffi crate) ────────────────
 
-pub use prelude_tvm_ffi::{
+pub use tvm_static_ffi::{
     DLDevice, DLDataType, DLTensor, TVMFFIAny, TVMSafeCallFn,
     KDLCUDA, KDLBFLOAT, KDLFLOAT, KDLINT,
 };

@@ -3,10 +3,10 @@
 //! Compares FA4 GPU output against a naive CPU attention reference implementation.
 //! Uses deterministic sin/cos input patterns for reproducibility.
 //!
-//! Run: cargo test -p prelude-flash-attn-v4 --release --test correctness
+//! Run: cargo test -p flash-attn-v4 --release --test correctness
 
 use half::{bf16, f16};
-use prelude_flash_attn_v4::{KernelDtype, KernelKey, KernelRegistry};
+use flash_attn_v4::{KernelDtype, KernelKey, KernelRegistry};
 use std::ffi::c_void;
 
 // ── CUDA FFI ────────────────────────────────────────────────────────
@@ -291,7 +291,7 @@ fn run_test(
 
     let result = unsafe {
         let stream = new_stream();
-        prelude_flash_attn_v4::fa4_varlen_fwd(
+        flash_attn_v4::fa4_varlen_fwd(
             &registry, func,
             q_gpu, k_gpu, v_gpu, o_gpu,
             std::ptr::null_mut(),
@@ -456,7 +456,7 @@ fn run_test_paged(
     registry2.set_stream(0, stream);
 
     let result = unsafe {
-        prelude_flash_attn_v4::fa4_varlen_paged_fwd(
+        flash_attn_v4::fa4_varlen_paged_fwd(
             &registry2, func,
             q_gpu, k_cache_gpu, v_cache_gpu, o_gpu,
             std::ptr::null_mut(),
@@ -707,7 +707,7 @@ fn test_fa4_determinism() {
         unsafe { cudaMemset(o_gpu, 0, q_elems * 2); }
 
         unsafe {
-            prelude_flash_attn_v4::fa4_varlen_fwd(
+            flash_attn_v4::fa4_varlen_fwd(
                 &registry, func,
                 q_gpu, k_gpu, v_gpu, o_gpu,
                 std::ptr::null_mut(),

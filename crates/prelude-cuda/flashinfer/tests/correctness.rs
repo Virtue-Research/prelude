@@ -3,8 +3,8 @@
 //! Validates prefill, decode, MLA, and utility kernel outputs against
 //! CPU reference implementations.
 
-use prelude_flashinfer::types::*;
-use prelude_flashinfer::*;
+use flashinfer::types::*;
+use flashinfer::*;
 use std::ffi::c_void;
 
 // ── CUDA FFI ─────────────────────────────────────────────────────────
@@ -2018,7 +2018,7 @@ fn cascade_merge_state() {
             backend: Backend::FA2,
         },
     ];
-    let cascade = prelude_flashinfer::cascade::CascadeAttention::new(&reg, &keys)
+    let cascade = flashinfer::cascade::CascadeAttention::new(&reg, &keys)
         .expect("Cascade kernels not found");
 
     let n = 4i64;   // tokens

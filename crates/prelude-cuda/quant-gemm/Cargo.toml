@@ -1,9 +1,14 @@
 [package]
-name = "prelude-quant-gemm"
+name = "quant-gemm"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "GPU quantized matrix multiply (GGUF formats). MMVQ for decode, tiled MMQ for prefill."
+description = "GPU quantized matrix multiply for GGUF weight formats. Vendored from llama.cpp, exposes tiled MMQ (prefill) and MMVQ (decode) through a thin Rust FFI."
+repository = "https://github.com/ggml-org/llama.cpp"
+
+[lib]
+name = "quant_gemm"
+path = "src/lib.rs"
 
 [dependencies]
 cudarc = { version = "0.19.4", features = ["std", "cuda-version-from-build-system", "f16"] }

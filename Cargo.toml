@@ -10,6 +10,7 @@ members = [
     "crates/prelude-cuda/fa4",
     "crates/prelude-cuda/quant-gemm",
     "crates/prelude-cuda/cula",
+    "crates/onednn-ffi",
 ]
 resolver = "2"
 
@@ -49,12 +50,19 @@ uuid = { version = "1.22.0", features = ["v4", "serde"] }
 candle-core = { git = "https://github.com/rucnyz/candle", branch = "prelude" }
 candle-nn = { git = "https://github.com/rucnyz/candle", branch = "prelude" }
 prelude-cuda = { path = "crates/prelude-cuda" }
-prelude-flash-attn-v4 = { path = "crates/prelude-cuda/fa4" }
-prelude-deepgemm = { path = "crates/prelude-cuda/deepgemm" }
-prelude-cutlass-gemm = { path = "crates/prelude-cuda/cutlass-gemm" }
-prelude-flashinfer = { path = "crates/prelude-cuda/flashinfer" }
-prelude-quant-gemm = { path = "crates/prelude-cuda/quant-gemm" }
-prelude-cula = { path = "crates/prelude-cuda/cula" }
+
+# Kernel crates. Each entry uses the { version, path } dual spec so that:
+#   * local workspace builds resolve through `path` (fast iteration)
+#   * `cargo publish` strips the path and keeps only the version
+#   * external consumers cloning a single crate fall back to crates.io
+tvm-static-ffi = { version = "0.1.0", path = "crates/prelude-cuda/tvm-ffi" }
+cula           = { version = "0.1.0", path = "crates/prelude-cuda/cula" }
+flash-attn-v4  = { version = "0.1.0", path = "crates/prelude-cuda/fa4" }
+deepgemm       = { version = "0.1.0", path = "crates/prelude-cuda/deepgemm" }
+cutlass-gemm   = { version = "0.1.0", path = "crates/prelude-cuda/cutlass-gemm" }
+flashinfer     = { version = "0.1.0", path = "crates/prelude-cuda/flashinfer" }
+quant-gemm     = { version = "0.1.0", path = "crates/prelude-cuda/quant-gemm" }
+onednn-ffi     = { version = "0.1.0", path = "crates/onednn-ffi" }
 
 # Tokenization & model loading
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }

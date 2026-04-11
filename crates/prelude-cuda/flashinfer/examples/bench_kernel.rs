@@ -1,6 +1,6 @@
 //! Benchmark FlashInfer attention kernels vs cuBLAS naive baseline.
 //!
-//! Run: cargo run -p prelude-flashinfer --example bench_kernel --release
+//! Run: cargo run -p flashinfer --example bench_kernel --release
 //!
 //! cuBLAS baseline = two cublasGemmStridedBatchedEx calls (Q@K^T + S@V).
 //! This is what candle does without FlashInfer: no fused softmax, no causal
@@ -9,8 +9,8 @@
 //!   - cuBLAS doesn't fuse softmax (+30% overhead not counted)
 //!   - cuBLAS computes full attention (FlashInfer skips half for causal)
 
-use prelude_flashinfer::types::*;
-use prelude_flashinfer::*;
+use flashinfer::types::*;
+use flashinfer::*;
 use std::ffi::c_void;
 use std::time::Instant;
 

@@ -1,6 +1,30 @@
-# prelude-flash-attn-v4
+# flash-attn-v4
 
-Flash Attention v4 (CuTeDSL AOT) integration for Prelude. Supports prefill, paged KV decode, multi-arch (SM90/SM100/SM120+).
+Rust bindings to [Flash Attention v4](https://github.com/Dao-AILab/flash-attention) (CuTeDSL AOT). Supports prefill, paged KV decode, multi-arch (SM90/SM100/SM120+). Statically linked — no libtorch / libpython runtime dependency.
+
+## Scope
+
+This crate is one of several "-rs" wrappers around upstream CUDA kernel
+libraries. It compiles the upstream CuTeDSL kernel sources to `.o` at
+build time and exposes them through a small Rust FFI using the
+[`tvm-static-ffi`](../tvm-ffi) SafeCall convention.
+
+| | |
+|---|---|
+| Upstream | [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention) |
+| Dispatch | Runtime lookup by `KernelKey` → direct call into a statically-linked `__tvm_ffi_<variant>` symbol |
+| Arch | SM80+ (SM90, SM100, SM120 tested) — multi-arch fat binaries supported |
+| Runtime deps | cudart_static, libbacktrace, stdc++ — **no libtorch, no Python** |
+
+### Environment variable overrides
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FA4_ROOT` or workspace `third_party/flash-attention` | `$WORKSPACE/third_party/flash-attention` | Upstream source checkout |
+| `PRELUDE_FA4_ARCHS` | detected SM arch | Comma-separated SM targets for multi-arch builds |
+| `CUDA_PATH` | `/opt/cuda` or `/usr/local/cuda` | CUDA toolkit root |
+
+
 
 ## Current State
 
@@ -74,7 +98,7 @@ cargo build --features flash-attn-v4
 ```bash
 # Correctness: FA4 output vs naive CPU attention reference
 # Tests are #[ignore] by default (require GPU + compiled kernels)
-cargo test --manifest-path crates/prelude-flash-attn-v4/Cargo.toml \
+cargo test --manifest-path crates/flash-attn-v4/Cargo.toml \
     --test correctness -- --ignored --nocapture
 
 # Test cases: single/multi seq, GQA 2/4/8, noncausal, window, hdim 64/256, determinism
@@ -85,7 +109,7 @@ cargo test --manifest-path crates/prelude-flash-attn-v4/Cargo.toml \
 
 ```bash
 # Kernel-level microbenchmark (CUDA events for accurate GPU timing)
-cargo run -p prelude-flash-attn-v4 --bin bench_kernel --release
+cargo run -p flash-attn-v4 --bin bench_kernel --release
 
 # Config: FA4_BENCH_WARMUP=5, FA4_BENCH_REPEATS=20
 # Sweeps seq_len 128–8192, reports median/min/max latency + tokens/s + TFLOPS

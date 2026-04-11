@@ -1,13 +1,14 @@
 [package]
-name = "prelude-tvm-ffi"
+name = "tvm-static-ffi"
 version = "0.1.0"
 edition = "2024"
 build = "build.rs"
-description = "TVM FFI runtime library — shared by FA4, FlashInfer, and cuLA kernel crates."
+description = "Minimal ABI for calling statically-linked CuTeDSL / cutlass-dsl AOT kernels from Rust (TVM SafeCall convention + DLPack types). Not a TVM runtime — complements apache/tvm-ffi's dynamic loading model."
 license = "Apache-2.0"
+repository = "https://github.com/apache/tvm-ffi"
 
 [lib]
-name = "prelude_tvm_ffi"
+name = "tvm_static_ffi"
 path = "src/lib.rs"
 
 [build-dependencies]

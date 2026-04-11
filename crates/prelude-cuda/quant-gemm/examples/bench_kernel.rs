@@ -1,13 +1,13 @@
 //! Quantized GEMM benchmark: MMVQ (decode M=1) + Tiled MMQ (prefill M>1).
 //!
-//! Run: cargo run -p prelude-quant-gemm --example bench_kernel --release
+//! Run: cargo run -p quant-gemm --example bench_kernel --release
 
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Instant;
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, ValidAsZeroBits};
-use prelude_quant_gemm::GgmlType;
+use quant_gemm::GgmlType;
 
 // ── GPU context ─────────────────────────────────────────────────────────
 
@@ -165,7 +165,7 @@ fn bench_mmvq(t: GgmlType, n: usize, k: usize, gpu: &Gpu) -> f64 {
         let (wp, _g1) = d_w.device_ptr(&gpu.stream);
         let (qp, _g2) = d_q8.device_ptr(&gpu.stream);
         let (yp, _g3) = d_y.device_ptr_mut(&gpu.stream);
-        prelude_quant_gemm::mul_mat_vec_q(
+        quant_gemm::mul_mat_vec_q(
             wp as *const c_void, qp as *const c_void, yp as *mut f32,
             n as i64, k as i64, t, gpu.stream_ptr(),
         );
@@ -193,11 +193,11 @@ fn bench_mmq(t: GgmlType, m: usize, n: usize, k: usize, gpu: &Gpu) -> f64 {
         let (qp, _g2) = d_q8.device_ptr_mut(&gpu.stream);
         let (wp, _g3) = d_w.device_ptr(&gpu.stream);
         let (yp, _g4) = d_y.device_ptr_mut(&gpu.stream);
-        prelude_quant_gemm::quantize_q8_1(
+        quant_gemm::quantize_q8_1(
             xp as *const c_void, qp as *mut c_void,
             m as i64, k as i64, t, gpu.stream_ptr(),
         );
-        prelude_quant_gemm::mul_mat_q(
+        quant_gemm::mul_mat_q(
             wp as *const c_void, qp as *const c_void, yp as *mut f32,
             m as i64, n as i64, k as i64, t, 0, gpu.stream_ptr(),
         );

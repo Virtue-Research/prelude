@@ -83,7 +83,7 @@ FlashInfer's `plan()` runs once per forward pass and is cached across all transf
 | Crate | `crates/prelude-cuda/fa4/` |
 | Target | SM80+ |
 
-Uses the same TVM FFI infrastructure as FlashInfer (shared via `prelude-tvm-ffi`). Calls build DLPack `DLTensor` argument arrays and dispatch via TVM's function registry.
+Uses the same TVM FFI infrastructure as FlashInfer (shared via `tvm-static-ffi`). Calls build DLPack `DLTensor` argument arrays and dispatch via TVM's function registry.
 
 Key entry points: `fa4_varlen_fwd()` (non-paged prefill), `fa4_varlen_paged_fwd()` (paged decode).
 

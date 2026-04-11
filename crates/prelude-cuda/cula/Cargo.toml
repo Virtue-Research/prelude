@@ -1,18 +1,27 @@
 [package]
-name = "prelude-cula"
+name = "cula"
 version = "0.1.0"
 edition = "2024"
 build = "build.rs"
 license = "Apache-2.0"
-description = "cuLA linear attention kernels (CUTLASS 3.x + CuTe DSL) for Prelude."
+description = "Rust bindings to cuLA linear-attention CUDA kernels (CUTLASS 3.x + CuTe DSL). Statically linked, no libtorch dependency."
+repository = "https://github.com/inclusionAI/cuLA"
 
 [lib]
-name = "prelude_cula"
+name = "cula"
 path = "src/lib.rs"
+
+[features]
+default = ["dsl"]
+# `dsl` enables the CuTeDSL dispatch path (kda_decode, chunk_delta_h, fwd_o,
+# lightning_prefill etc.) which relies on __tvm_ffi_<name> AOT symbols and the
+# `tvm-static-ffi` crate. Disable it if you only want the C++ kernel shims
+# (Hopper KDA prefill, Blackwell chunk_intra / recomp_wu).
+dsl = ["dep:tvm-static-ffi"]
 
 [dependencies]
 tracing = "0.1"
-prelude-tvm-ffi = { path = "../tvm-ffi" }
+tvm-static-ffi = { workspace = true, optional = true }
 
 [dev-dependencies]
 cudarc = { version = "0.19.4", features = ["std", "cuda-version-from-build-system", "f16"] }

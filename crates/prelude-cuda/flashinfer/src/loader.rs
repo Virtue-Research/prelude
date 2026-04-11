@@ -142,7 +142,7 @@ unsafe extern "C" {
         device_type: i32, device_id: i32,
         stream: *mut c_void, out_original: *mut *mut c_void,
     ) -> i32;
-    fn prelude_tvm_get_last_error(out_len: *mut usize) -> *const u8;
+    fn tvm_static_ffi_get_last_error(out_len: *mut usize) -> *const u8;
 }
 
 const CUDA_DEV_ATTR_MAJOR: i32 = 75;
@@ -241,7 +241,7 @@ impl KernelRegistry {
             let detail = unsafe {
                 // Try to get TVM FFI error message first
                 let mut msg_len: usize = 0;
-                let msg_ptr = prelude_tvm_get_last_error(&mut msg_len);
+                let msg_ptr = tvm_static_ffi_get_last_error(&mut msg_len);
                 let tvm_msg = if !msg_ptr.is_null() && msg_len > 0 {
                     String::from_utf8_lossy(std::slice::from_raw_parts(msg_ptr, msg_len)).into_owned()
                 } else {

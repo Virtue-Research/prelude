@@ -50,7 +50,7 @@ pub(crate) unsafe fn gemm_dispatch_impl(
     //
     if dtype == 0 && batch == 1 && transa && !transb {
         // Swap: DeepGEMM A=input(b), B=weight(a), M=tokens(n), N=features(m)
-        let ret = prelude_deepgemm::bf16_gemm(
+        let ret = deepgemm::bf16_gemm(
             b as *mut c_void, a as *mut c_void, d,
             n, m, k, stream as *mut c_void,
         );
@@ -64,7 +64,7 @@ pub(crate) unsafe fn gemm_dispatch_impl(
 
     // CUTLASS fallback (SM80+, handles BF16/FP16/F32)
     {
-        let ret = prelude_cutlass_gemm::gemm_dispatch(
+        let ret = cutlass_gemm::gemm_dispatch(
             a, b, d, m, n, k, batch, lda, ldb, ldd,
             stride_a, stride_b, stride_d,
             transa, transb, dtype, stream,

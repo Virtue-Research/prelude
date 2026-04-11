@@ -72,12 +72,12 @@ cargo test -p prelude-core
 cargo test -p prelude-cpu
 
 # ── GPU kernel correctness ───────────────────────────────────
-cargo test -p prelude-cutlass-gemm --release
-cargo test -p prelude-deepgemm --release
-cargo test -p prelude-flashinfer --release
-cargo test -p prelude-flash-attn-v4 --release
-cargo test -p prelude-quant-gemm --release
-cargo test -p prelude-cula --release
+cargo test -p cutlass-gemm --release
+cargo test -p deepgemm --release
+cargo test -p flashinfer --release
+cargo test -p flash-attn-v4 --release
+cargo test -p quant-gemm --release
+cargo test -p cula --release
 ```
 
 ### Accuracy (WikiText PPL)
@@ -124,11 +124,11 @@ cargo run -p prelude-cpu --bin cpu_ops_bench --release -- quant
 cargo run -p prelude-cpu --bin cpu_ops_bench --release -- gemm
 
 # GPU kernel benchmarks
-cargo run -p prelude-cutlass-gemm --example bench_kernel --release
-cargo run -p prelude-deepgemm --example bench_kernel --release
-cargo run -p prelude-flashinfer --example bench_kernel --release
-cargo run -p prelude-flash-attn-v4 --example bench_kernel --release
-cargo run -p prelude-quant-gemm --example bench_kernel --release
+cargo run -p cutlass-gemm --example bench_kernel --release
+cargo run -p deepgemm --example bench_kernel --release
+cargo run -p flashinfer --example bench_kernel --release
+cargo run -p flash-attn-v4 --example bench_kernel --release
+cargo run -p quant-gemm --example bench_kernel --release
 
 # Fused ops (silu_mul_concat vs fused_silu_mul, model shapes)
 cargo run -p prelude-cuda --bin fused_ops_test --release

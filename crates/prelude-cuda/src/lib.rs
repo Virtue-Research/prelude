@@ -108,9 +108,9 @@ pub use attn::flashinfer::fi_fused_add_rmsnorm;
 
 // ── Sub-crate re-exports ────────────────────────────────────────────
 
-pub use prelude_deepgemm;
-pub use prelude_cutlass_gemm;
-pub use prelude_flash_attn_v4;
-pub use prelude_flashinfer;
-pub use prelude_quant_gemm;
-pub use prelude_cula;
+pub use cula;
+pub use cutlass_gemm;
+pub use deepgemm;
+pub use flash_attn_v4;
+pub use flashinfer;
+pub use quant_gemm;

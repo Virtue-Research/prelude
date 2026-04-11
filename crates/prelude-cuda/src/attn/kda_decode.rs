@@ -16,7 +16,7 @@ use candle_core::backend::BackendStorage;
 use cudarc::driver::DevicePtr;
 use half::bf16;
 use prelude_core::tensor::{bail, DType, DeviceExt, Result, Tensor, D};
-use prelude_cula::dsl::{
+use cula::dsl::{
     DLDataType, DLDevice, DLTensor, DslKernelRegistry, TVMFFIAny,
     KDLBFLOAT, KDLCUDA, KDLFLOAT, KDLINT,
 };
@@ -328,11 +328,11 @@ pub(crate) fn try_decode(
     ];
 
     // Use `call_tvm_ffi` directly rather than `DslKernelRegistry::call_kernel`,
-    // because the helper in `prelude-cula` masks the real TVM error with
+    // because the helper in `cula` masks the real TVM error with
     // "TVM FFI internal failure" when the kernel didn't touch CUDA. We
     // want the actual message that TVM FFI stashed via TVMFFIErrorSet.
     unsafe {
-        prelude_tvm_ffi::call_tvm_ffi(kernel, &args)
+        tvm_static_ffi::call_tvm_ffi(kernel, &args)
             .map_err(|e| candle_core::Error::Msg(format!("cuLA kda_decode: {e}")))?;
     }
 

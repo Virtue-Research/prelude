@@ -3,7 +3,7 @@
 //! Each test allocates GPU memory via cudarc, runs cuLA KDA prefill, and compares
 //! against a CPU F64 reference implementing the gated delta rule recurrence.
 //!
-//! Run:  cargo test -p prelude-cula --release
+//! Run:  cargo test -p cula --release
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -287,7 +287,7 @@ fn kda_prefill_sm90_basic() {
         let wp = ptr_mut(&mut workspace_gpu, &gpu.stream) as *mut u8;
 
         unsafe {
-            prelude_cula::kda_fwd_prefill_sm90(
+            cula::kda_fwd_prefill_sm90(
                 gpu.stream_ptr(),
                 op, sp,
                 qp, kp, vp,
@@ -387,7 +387,7 @@ fn kda_prefill_sm90_varlen() {
         let wp = ptr_mut(&mut workspace_gpu, &gpu.stream) as *mut u8;
 
         unsafe {
-            prelude_cula::kda_fwd_prefill_sm90(
+            cula::kda_fwd_prefill_sm90(
                 gpu.stream_ptr(),
                 op, sp,
                 qp, kp, vp,
@@ -471,7 +471,7 @@ fn kda_prefill_sm90_perf() {
             let sp = ptr_mut(&mut state_gpu, &gpu.stream) as *mut f32;
             let wp = ptr_mut(&mut workspace_gpu, &gpu.stream) as *mut u8;
             unsafe {
-                prelude_cula::kda_fwd_prefill_sm90(
+                cula::kda_fwd_prefill_sm90(
                     gpu.stream_ptr(),
                     op, sp, qp, kp, vp,
                     None, Some(ap), Some(bp),

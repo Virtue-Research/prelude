@@ -1,8 +1,8 @@
 //! Minimal FFI test: call FlashInfer prefill plan + ragged_run directly.
-//! Run: cd crates/prelude-flashinfer && cargo run --example test_ffi --release
+//! Run: cargo run -p flashinfer --bin test_ffi --release
 
-use prelude_flashinfer::types::*;
-use prelude_flashinfer::*;
+use flashinfer::types::*;
+use flashinfer::*;
 use std::ffi::c_void;
 
 unsafe extern "C" {

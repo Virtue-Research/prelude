@@ -1,8 +1,14 @@
-//! Build script for prelude-tvm-ffi.
+//! Build script for `tvm-static-ffi`.
 //!
-//! Compiles the vendored TVM FFI C++ runtime from third_party/tvm-ffi.
-//! This is shared by FA4, FlashInfer, and cuLA kernel crates — compiled once,
-//! linked into the final binary once.
+//! Compiles the vendored TVM FFI C++ runtime from third_party/tvm-ffi so
+//! that the Rust crate can extract error messages after a SafeCall failure.
+//! Shared by FA4, FlashInfer, and cuLA kernel crates — compiled once, linked
+//! into the final binary once.
+//!
+//! Source discovery:
+//!   - `$TVM_FFI_ROOT` overrides the tvm-ffi source path (defaults to
+//!     `$CARGO_WORKSPACE/third_party/tvm-ffi`, for zero-config workspace
+//!     builds).
 //!
 //! Also compiles:
 //! - libbacktrace (required by tvm-ffi's backtrace.cc)
@@ -14,20 +20,32 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 fn main() -> Result<()> {
+    println!("cargo:rerun-if-env-changed=TVM_FFI_ROOT");
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
-    // tvm-ffi lives in workspace third_party/
-    let workspace_root = manifest_dir
-        .parent().unwrap()  // crates/prelude-cuda/
-        .parent().unwrap()  // crates/
-        .parent().unwrap(); // workspace root
-    let tvm_ffi_dir = workspace_root.join("third_party/tvm-ffi");
+
+    // `TVM_FFI_ROOT` overrides the source directory so this crate can be
+    // built outside the prelude workspace. The fallback walks up three levels
+    // to the workspace root and picks `third_party/tvm-ffi`.
+    let tvm_ffi_dir = match env::var("TVM_FFI_ROOT") {
+        Ok(p) if !p.is_empty() => PathBuf::from(p),
+        _ => {
+            let workspace_root = manifest_dir
+                .parent().unwrap()  // crates/prelude-cuda/
+                .parent().unwrap()  // crates/
+                .parent().unwrap(); // workspace root
+            workspace_root.join("third_party/tvm-ffi")
+        }
+    };
     let tvm_src = tvm_ffi_dir.join("src");
     let tvm_include = tvm_ffi_dir.join("include");
     let dlpack_include = tvm_ffi_dir.join("3rdparty/dlpack/include");
 
     if !tvm_src.exists() {
         anyhow::bail!(
-            "third_party/tvm-ffi not found. Run: git submodule update --init third_party/tvm-ffi"
+            "tvm-ffi source not found at {}. Either run `git submodule update \
+             --init third_party/tvm-ffi` inside the prelude workspace, or set \
+             TVM_FFI_ROOT=/path/to/tvm-ffi to build this crate standalone.",
+            tvm_ffi_dir.display(),
         );
     }
 
@@ -40,7 +58,7 @@ fn main() -> Result<()> {
         })
         .collect();
 
-    eprintln!("prelude-tvm-ffi: compiling {} C++ source files", cc_files.len());
+    eprintln!("tvm-static-ffi: compiling {} C++ source files", cc_files.len());
 
     let mut build = cc::Build::new();
     build
@@ -74,6 +92,15 @@ fn main() -> Result<()> {
         .context("Failed to compile vendored tvm_ffi")?;
 
     // ── Phase 3: Link cuda_dialect_runtime_static.a ────────────────
+    // This archive is materialised by the FA4 build's Python venv (which
+    // cuda-dialect builds from CuTeDSL sources). We walk the workspace's
+    // `target/fa4-venv` to find it; if the consumer doesn't have FA4 set up
+    // this simply does nothing and the runtime pieces that needed it stay
+    // unlinkable — which is fine for pure DSL-less consumers.
+    let workspace_root = manifest_dir
+        .parent().unwrap()  // crates/prelude-cuda/
+        .parent().unwrap()  // crates/
+        .parent().unwrap(); // workspace root
     let venv_dir = workspace_root.join("target/fa4-venv");
     if let Some(p) = find_file_recursive(&venv_dir, "libcuda_dialect_runtime_static.a") {
         println!("cargo:rustc-link-search=native={}", p.parent().unwrap().display());

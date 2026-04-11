@@ -2,7 +2,6 @@
 name = "prelude-cpu"
 version = "0.1.0"
 edition = "2024"
-build = "build.rs"
 description = "CPU device implementation for Prelude inference engine."
 license = "Apache-2.0"
 
@@ -12,7 +11,9 @@ path = "src/lib.rs"
 
 [features]
 default = ["onednn"]
-onednn = []
+# Enable the oneDNN-backed CPU ops path. Pulls in the standalone `onednn-ffi`
+# crate, which in turn CMake-builds oneDNN as a static library.
+onednn = ["dep:onednn-ffi"]
 
 [dependencies]
 prelude-core = { path = "../prelude-core" }
@@ -24,6 +25,7 @@ tokio = { workspace = true, features = ["sync", "rt"] }
 tracing.workspace = true
 bc-mimalloc.workspace = true
 inventory = "0.3"
+onednn-ffi = { workspace = true, optional = true }
 
 [[bin]]
 name = "cpu_ops_bench"

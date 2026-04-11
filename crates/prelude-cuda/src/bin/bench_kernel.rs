@@ -144,7 +144,7 @@ fn main() -> Result<()> {
     for m in [1i32, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024] {
         let n = 24576i32;
         let k = 4096i32;
-        let cfg = prelude_deepgemm::query_config(m, n, k);
+        let cfg = deepgemm::query_config(m, n, k);
         // Try a real launch via Tensor::matmul + measure
         let x = rand_bf16((m as usize, k as usize), &dev)?;
         let w = rand_bf16((n as usize, k as usize), &dev)?;
@@ -163,7 +163,7 @@ fn main() -> Result<()> {
     for m in [1i32, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024] {
         let n = 12288i32;
         let k = 4096i32;
-        let cfg = prelude_deepgemm::query_config(m, n, k);
+        let cfg = deepgemm::query_config(m, n, k);
         let x = rand_bf16((m as usize, k as usize), &dev)?;
         let w = rand_bf16((n as usize, k as usize), &dev)?;
         let us = time_us(&dev, || { let _ = x.matmul(&w.t()?)?; Ok(()) }, 50)?;

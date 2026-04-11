@@ -1,14 +1,14 @@
 //! FlashInfer attention backend (SM80+ via FA2, SM90+ via FA3).
 //!
-//! Wraps `prelude_flashinfer` crate with the plan-then-run API.
+//! Wraps the `flashinfer` crate with the plan-then-run API.
 //! Workspace buffers are allocated once per device and reused.
 
 use crate::device::{self as cb, DevicePtr};
 use cudarc::driver::CudaStream;
 use prelude_core::tensor::{bail, DType, Device, DeviceExt, Result, Tensor};
 use half::bf16;
-use prelude_flashinfer::types::*;
-use prelude_flashinfer::{DecodeKey, KernelDtype, KernelRegistry, MaskMode, PrefillKey};
+use flashinfer::types::*;
+use flashinfer::{DecodeKey, KernelDtype, KernelRegistry, MaskMode, PrefillKey};
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
@@ -249,7 +249,7 @@ pub fn precompute_paged_plan_replay(
     let ws_guard = get_workspace(did)?;
     let ws = ws_guard.as_ref().unwrap();
 
-    let is_fa3 = matches!(backend, prelude_flashinfer::Backend::FA3);
+    let is_fa3 = matches!(backend, flashinfer::Backend::FA3);
 
     let fws: [i64; 1] = [FLOAT_WS_BYTES as i64];
     let iws: [i64; 1] = [INT_WS_BYTES as i64];
@@ -361,7 +361,7 @@ fn precompute_paged_plan_impl(
     let ws_guard = get_workspace(did)?;
     let ws = ws_guard.as_ref().unwrap();
 
-    let is_fa3 = matches!(backend, prelude_flashinfer::Backend::FA3);
+    let is_fa3 = matches!(backend, flashinfer::Backend::FA3);
 
     // CPU data — no GPU→CPU copies needed for indptr/kv_lens (from PagedMeta)
     let cuq_cpu: Vec<i32> = cu_seqlens_q.to_vec1::<u32>()?.iter().map(|&v| v as i32).collect();
@@ -645,7 +645,7 @@ fn ragged_prefill(
         .map(|v| (v, backend))
         .or_else(|| {
             // FA3 doesn't have this variant — try FA2
-            let fb = prelude_flashinfer::Backend::FA2;
+            let fb = flashinfer::Backend::FA2;
             reg.get_prefill(&prefill_key(fb)).map(|v| (v, fb))
         })
         .ok_or_else(|| prelude_core::tensor::Error::Msg(format!("FlashInfer: no prefill variant for head_dim={head_dim}")))?;
@@ -697,7 +697,7 @@ fn ragged_prefill(
 
     reg.set_stream(did, raw_stream);
 
-    let is_fa3 = matches!(backend, prelude_flashinfer::Backend::FA3);
+    let is_fa3 = matches!(backend, flashinfer::Backend::FA3);
 
     // Check plan cache — skip expensive plan + GPU→CPU copies if cached
     let cached = PLAN_CACHE.with(|c| c.borrow().as_ref().and_then(|pc| pc.ragged_plan));
@@ -1013,7 +1013,7 @@ fn paged_prefill_impl(
 
     reg.set_stream(did, raw_stream);
 
-    let is_fa3 = matches!(backend, prelude_flashinfer::Backend::FA3);
+    let is_fa3 = matches!(backend, flashinfer::Backend::FA3);
 
     // Check plan cache — skip plan + GPU→CPU copies if cached
     let cached = PLAN_CACHE.with(|c| c.borrow().as_ref().and_then(|pc| pc.paged_prefill_plan));

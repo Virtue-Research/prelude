@@ -1,6 +1,6 @@
 //! DeepGEMM BF16/FP8 GEMM performance benchmark — DeepGEMM vs cuBLAS/cuBLASLt.
 //!
-//! Run:  cargo run -p prelude-deepgemm --example bench_kernel --release
+//! Run:  cargo run -p deepgemm --example bench_kernel --release
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -106,7 +106,7 @@ fn deepgemm_bf16(
     let (wp, _g2) = weight.device_ptr(&gpu.stream);
     let (op, _g3) = output.device_ptr_mut(&gpu.stream);
     unsafe {
-        if let Err(e) = prelude_deepgemm::bf16_gemm(
+        if let Err(e) = deepgemm::bf16_gemm(
             ip as *mut c_void, wp as *mut c_void, op as *mut c_void,
             m as i32, n as i32, k as i32,
             gpu.stream_ptr(),
@@ -182,7 +182,7 @@ fn bench_bf16(gpu: &Gpu) {
                 let mut out = gpu.alloc_zeros::<half::bf16>(m * *n);
 
                 // Query kernel config for display
-                let (bm, bn, stages, _smem) = prelude_deepgemm::query_config(
+                let (bm, bn, stages, _smem) = deepgemm::query_config(
                     m as i32, *n as i32, *k as i32,
                 );
 
@@ -267,7 +267,7 @@ fn deepgemm_fp8(
     let (sap, _g4) = sfa.device_ptr(&gpu.stream);
     let (sbp, _g5) = sfb.device_ptr(&gpu.stream);
     unsafe {
-        prelude_deepgemm::fp8_gemm(
+        deepgemm::fp8_gemm(
             ip as *mut c_void, wp as *mut c_void, op as *mut c_void,
             sap as *mut c_void, sbp as *mut c_void,
             m as i32, n as i32, k as i32,
@@ -400,7 +400,7 @@ fn bench_fp8_1d1d(gpu: &Gpu) {
                 let (sfbp, _) = sfb_gpu.device_ptr(&gpu.stream);
                 let (op, _) = out_f32.device_ptr_mut(&gpu.stream);
                 unsafe {
-                    prelude_deepgemm::fp8_gemm_1d1d(
+                    deepgemm::fp8_gemm_1d1d(
                         ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
                         sfap as *mut c_void, sfbp as *mut c_void,
                         m as i32, n as i32, k as i32,
@@ -454,7 +454,7 @@ fn deepgemm_grouped(
     let (op, _g3) = output.device_ptr_mut(&gpu.stream);
     let (lp, _g4) = layout.device_ptr(&gpu.stream);
     unsafe {
-        prelude_deepgemm::m_grouped_bf16_gemm(
+        deepgemm::m_grouped_bf16_gemm(
             ip as *mut c_void, wp as *mut c_void, op as *mut c_void,
             lp as *mut c_void,
             m as i32, n as i32, k as i32,
@@ -500,7 +500,7 @@ fn bench_fp8(gpu: &Gpu) {
                 let sfb_gpu = gpu.upload(&sfb);
                 let mut out_bf16_dg = gpu.alloc_zeros::<half::bf16>(m * *n);
 
-                let (bm, bn, stages, _) = prelude_deepgemm::query_fp8_config(m as i32, *n as i32, *k as i32);
+                let (bm, bn, stages, _) = deepgemm::query_fp8_config(m as i32, *n as i32, *k as i32);
 
                 let dg_us = bench_us(|| {
                     deepgemm_fp8(&input_dg, &weight_dg, &mut out_bf16_dg, &sfa_gpu, &sfb_gpu, m, *n, *k, gpu);
@@ -580,7 +580,7 @@ fn bench_grouped(gpu: &Gpu) {
         let layout_gpu = gpu.upload(&layout_data);
         let mut out_grouped = gpu.alloc_zeros::<half::bf16>(total_m * n);
 
-        let (bm, bn, stages, _) = prelude_deepgemm::query_grouped_config(
+        let (bm, bn, stages, _) = deepgemm::query_grouped_config(
             total_m as i32, n as i32, k as i32,
         );
 
@@ -686,7 +686,7 @@ fn bench_grouped_fp8(gpu: &Gpu) {
             let (lp, _) = layout_gpu.device_ptr(&gpu.stream);
             let (op, _) = out_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
-                prelude_deepgemm::m_grouped_fp8_gemm(
+                deepgemm::m_grouped_fp8_gemm(
                     ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
                     sfap as *mut c_void, sfbp as *mut c_void,
                     lp as *mut c_void,
@@ -766,7 +766,7 @@ fn bench_masked(gpu: &Gpu) {
             let (mp, _) = mask_gpu.device_ptr(&gpu.stream);
             let (op, _) = out_masked.device_ptr_mut(&gpu.stream);
             unsafe {
-                prelude_deepgemm::m_grouped_masked_bf16_gemm(
+                deepgemm::m_grouped_masked_bf16_gemm(
                     ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
                     mp as *mut c_void,
                     padded_m as i32, n as i32, k as i32,
@@ -849,7 +849,7 @@ fn bench_masked_fp8(gpu: &Gpu) {
             let (mp, _) = mask_gpu.device_ptr(&gpu.stream);
             let (op, _) = out_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
-                prelude_deepgemm::m_grouped_masked_fp8_gemm(
+                deepgemm::m_grouped_masked_fp8_gemm(
                     ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
                     sfap as *mut c_void, sfbp as *mut c_void,
                     mp as *mut c_void,
@@ -916,7 +916,7 @@ fn bench_acc(gpu: &Gpu) {
             let (cp, _) = c_gpu.device_ptr(&gpu.stream);
             let (dp, _) = d_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
-                prelude_deepgemm::bf16_gemm_acc(
+                deepgemm::bf16_gemm_acc(
                     ap as *mut c_void, bp as *mut c_void,
                     cp as *mut c_void, dp as *mut c_void,
                     m as i32, n as i32, k as i32,
@@ -954,7 +954,7 @@ fn bench_mqa_logits(gpu: &Gpu) {
         "seq_len", "kv_len", "H", "D", "us", "Gflops");
     println!("{}", "-".repeat(50));
 
-    let (num_sms, _) = prelude_deepgemm::query_device();
+    let (num_sms, _) = deepgemm::query_device();
 
     // DeepSeek V3 config: num_heads=32, head_dim=64
     let configs: Vec<(usize, usize, usize, usize)> = vec![
@@ -975,7 +975,7 @@ fn bench_mqa_logits(gpu: &Gpu) {
     for &(seq_len, seq_len_kv, num_heads, head_dim) in &configs {
         let q_data = rand_u8(seq_len * num_heads * head_dim);
         let kv_data = rand_u8(seq_len_kv * head_dim);
-        let tma_slkv = prelude_deepgemm::get_tma_aligned_size(seq_len_kv as i32, 4) as usize;
+        let tma_slkv = deepgemm::get_tma_aligned_size(seq_len_kv as i32, 4) as usize;
         let mut kv_scales_data = vec![1.0f32; tma_slkv];
         for i in 0..seq_len_kv { kv_scales_data[i] = 1.0; }
         let weights_data = rand_f32(seq_len * num_heads);
@@ -999,7 +999,7 @@ fn bench_mqa_logits(gpu: &Gpu) {
             let (kep, _) = ke_gpu.device_ptr(&gpu.stream);
             let (lp, _) = logits_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
-                prelude_deepgemm::fp8_mqa_logits(
+                deepgemm::fp8_mqa_logits(
                     qp as *mut c_void, kvp as *mut c_void,
                     kvsp as *mut c_void, wp as *mut c_void,
                     ksp as *mut c_void, kep as *mut c_void,
@@ -1030,7 +1030,7 @@ fn bench_mqa_logits(gpu: &Gpu) {
         let (cp, _) = ctx_gpu.device_ptr(&gpu.stream);
         let (mp, _) = meta_gpu.device_ptr_mut(&gpu.stream);
         unsafe {
-            prelude_deepgemm::paged_mqa_metadata(
+            deepgemm::paged_mqa_metadata(
                 cp as *mut c_void, mp as *mut c_void,
                 batch as i32, 1, false, 256, num_sms,
                 gpu.stream_ptr(),
@@ -1052,7 +1052,7 @@ fn bench_mqa_logits(gpu: &Gpu) {
         let (kep, _) = ke_gpu.device_ptr(&gpu.stream);
         let (lp, _) = logits_gpu2.device_ptr_mut(&gpu.stream);
         unsafe {
-            prelude_deepgemm::clean_logits(
+            deepgemm::clean_logits(
                 ksp as *mut c_void, kep as *mut c_void,
                 lp as *mut c_void,
                 batch as i32, seq_kv as i32, seq_kv as i32, 1,
@@ -1134,7 +1134,7 @@ fn bench_einsum(gpu: &Gpu) {
                 let (bp, _) = b_gpu.device_ptr(&gpu.stream);
                 let (dp, _) = d_gpu.device_ptr_mut(&gpu.stream);
                 unsafe {
-                    prelude_deepgemm::einsum(
+                    deepgemm::einsum(
                         ap as *mut c_void, bp as *mut c_void, dp as *mut c_void,
                         *m as i32, *n as i32, *k as i32, s as i32,
                         gpu.stream_ptr(),

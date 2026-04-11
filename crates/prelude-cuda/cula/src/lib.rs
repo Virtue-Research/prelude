@@ -1,15 +1,25 @@
-//! cuLA linear attention kernels — statically linked, no PyTorch dependency.
+//! Rust bindings to cuLA linear-attention CUDA kernels. Statically linked,
+//! no libtorch / libpython runtime dependency.
 //!
-//! C++ CUTLASS 3.x kernels (direct nvcc compilation):
+//! Two kernel paths, gated by feature flags:
+//!
+//! * **C++ CUTLASS kernels** (always enabled, compiled directly via nvcc):
 //!   - SM90: KDA fused prefill (varlen, bf16)
 //!   - SM100: KDA chunked intra-attention + recompute W/U
 //!
-//! CuTe DSL kernels (AOT compiled, TVM FFI):
+//! * **CuTe DSL kernels** (feature = `dsl`, on by default):
 //!   - Lightning Attention prefill (chunkwise decay)
 //!   - Lightning Attention decode (single token)
 //!   - Chunk delta-H (inter-chunk state update)
 //!   - Forward output computation
+//!   - KDA decode (single token, varlen / dense, up to 4-way GQA)
+//!
+//!   These are AOT-compiled into `.o` files via Python + `cute.compile(...)`
+//!   and called through the `TVMSafeCallFn` convention, which is why the
+//!   `dsl` feature pulls in `tvm-static-ffi`. Disable the feature to skip the
+//!   Python build step and drop the tvm-static-ffi dependency.
 
+#[cfg(feature = "dsl")]
 pub mod dsl;
 
 use std::ffi::c_void;
