@@ -710,7 +710,14 @@ fn gdn_prefill_smoke() {
     unsafe {
         reg.set_stream(0, std::ptr::null_mut());
         // gdn_prefill(output, output_state, q, k, v, cu_seqlens,
-        //             input_state?, alpha?, beta?, scale, workspace)
+        //             input_state?, alpha?, beta?, scale, workspace,
+        //             state_checkpoints?, checkpoint_cu_starts?,
+        //             checkpoint_every_n_tokens)
+        //
+        // The last three are for flashinfer upstream a1166dc's state
+        // checkpointing feature. We don't use checkpointing so they're
+        // None/None/0 — matches the compile_kernels.py AOT decision to
+        // specialize every variant on `enable_checkpointing=false`.
         let args = [
             TVMFFIAny::dltensor(&dl_o),
             TVMFFIAny::dltensor(&dl_state),
@@ -723,6 +730,9 @@ fn gdn_prefill_smoke() {
             TVMFFIAny::dltensor(&dl_beta),  // beta
             TVMFFIAny::float64(0.0),        // scale (0 = auto: 1/sqrt(head_dim))
             TVMFFIAny::dltensor(&dl_ws),
+            TVMFFIAny::none(),              // state_checkpoints (unused)
+            TVMFFIAny::none(),              // checkpoint_cu_starts (unused)
+            TVMFFIAny::int64(0),            // checkpoint_every_n_tokens
         ];
         reg.call(gdn, &args).expect("gdn_prefill call failed");
         cudaDeviceSynchronize();

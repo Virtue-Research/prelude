@@ -1868,18 +1868,31 @@ def main():
             sm90_modules.append(vinfo)
             return len(sources)
 
-        # gen_gdn_prefill_sm90_module: 32 kernel instantiations via jinja
+        # gen_gdn_prefill_sm90_module: 64 kernel instantiations via jinja
+        # NOTE: upstream a1166dc added a 6th template bool `enable_checkpointing`
+        # (commit 08ab45d, state checkpointing in chunk_gated_delta_rule). We
+        # compile both variants so the runtime dispatcher in
+        # `prefill_kernel_delta_rule_sm90.cu::launch_delta_rule_prefill_kernel`
+        # can pick based on `checkpoint_every_n_tokens > 0`. Compiling only
+        # one side produces a link error when the other branch of the
+        # `DISPATCH_GBAI` macro references an un-instantiated template.
         gdn_instances = []
         for dtype in ["half", "nv_bfloat16"]:
             for is_gva in ["false", "true"]:
                 for needs_beta in ["false", "true"]:
                     for needs_alpha in ["false", "true"]:
                         for init_state in ["false", "true"]:
-                            params = dict(dtype=dtype, is_gva=is_gva, needs_beta=needs_beta,
-                                          needs_alpha=needs_alpha, init_state=init_state)
-                            fname = (f"gdn_prefill_kernel_{dtype}_g{is_gva}"
-                                     f"b{needs_beta}a{needs_alpha}i{init_state}.cu")
-                            gdn_instances.append((params, fname))
+                            for enable_checkpointing in ["false", "true"]:
+                                params = dict(dtype=dtype, is_gva=is_gva,
+                                              needs_beta=needs_beta,
+                                              needs_alpha=needs_alpha,
+                                              init_state=init_state,
+                                              enable_checkpointing=enable_checkpointing)
+                                ckpt_tag = "c1" if enable_checkpointing == "true" else "c0"
+                                fname = (f"gdn_prefill_kernel_{dtype}_g{is_gva}"
+                                         f"b{needs_beta}a{needs_alpha}i{init_state}"
+                                         f"{ckpt_tag}.cu")
+                                gdn_instances.append((params, fname))
         n = _add_sm90_jinja(
             "fi_gdn", "gdn", "gdn_prefill_sm90_kernel_inst.jinja",
             gdn_instances,
@@ -1887,7 +1900,7 @@ def main():
             None, ["gdn_prefill"],
             ["-DFLAT_SM90A_ENABLED"],
         )
-        print(f"  SM90 GDN: {n} sources (32 jinja instantiations)")
+        print(f"  SM90 GDN: {n} sources (64 jinja instantiations)")
 
         # gen_gemm_sm90_module: 6 dtype pair instantiations via jinja
         cutlass_dtype_map = {
