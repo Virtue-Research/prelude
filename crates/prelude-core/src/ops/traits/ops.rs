@@ -288,6 +288,48 @@ pub trait Ops: Send + Sync {
         _scale: f32,
     ) -> Option<Result<(Tensor, Tensor)>> { None }
 
+    /// Fused Gated DeltaNet (GDN) varlen prefill — matches FLA's
+    /// `chunk_gated_delta_rule` semantics (Qwen3-next / Qwen3.5 family).
+    ///
+    /// Drives FlashInfer's SM90 `gdn_prefill` CUTLASS warp-specialized TMA
+    /// kernel. The kernel consumes **scalar-per-head linear-space decay**:
+    /// unlike the KDA kernel, there's no chunk cumsum, no `RCP_LN2`
+    /// rescaling, and no `safe_gate` clamp — the caller just computes
+    /// `alpha = exp(-exp(A_log) * softplus(a + dt_bias))` and hands it in.
+    ///
+    /// Shapes (`T = total_seqlen` across all requests, packed as batch-1;
+    /// `num_sab_heads = max(num_q_heads, num_v_heads)`):
+    /// - `q`: `[T, num_q_heads, head_dim]` BF16
+    /// - `k`: `[T, num_k_heads, head_dim]` BF16
+    /// - `v`: `[T, num_v_heads, head_dim]` BF16
+    /// - `alpha`: `[T, num_sab_heads]` F32 (already = exp(per-step g))
+    /// - `beta`:  `[T, num_sab_heads]` F32 (already = sigmoid(raw))
+    /// - `cu_seqlens`: `[num_seqs+1]` **I64** (note: not I32 like KDA)
+    /// - `initial_state`: optional `[num_seqs, num_sab_heads, head_dim, head_dim]` F32
+    ///
+    /// Supports both:
+    /// - **GQA** (`num_q > num_v`, with `num_k == num_v`)
+    /// - **GVA** (`num_v > num_q`, with `num_q == num_k`) — Qwen3.5's layout
+    ///
+    /// Returns `(output, final_state)`:
+    /// - `output`: `[T, num_sab_heads, head_dim]` BF16
+    /// - `final_state`: `[num_seqs, num_sab_heads, head_dim, head_dim]` F32
+    ///
+    /// Returns `None` when the backend can't serve this call (non-CUDA,
+    /// non-SM90 arch, head_dim != 128, or kernel wasn't AOT-compiled).
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_prefill_varlen(
+        &self,
+        _q: &Tensor,
+        _k: &Tensor,
+        _v: &Tensor,
+        _alpha: &Tensor,
+        _beta: &Tensor,
+        _cu_seqlens: &Tensor,
+        _initial_state: Option<&Tensor>,
+        _scale: f32,
+    ) -> Option<Result<(Tensor, Tensor)>> { None }
+
     // ════════════════════════════════════════════════════════════════
     // Convenience: try fused → fallback to composed
     // ════════════════════════════════════════════════════════════════

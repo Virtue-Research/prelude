@@ -190,20 +190,30 @@ fn archive_objects(kernels_dir: &Path, out_dir: &Path) -> Result<bool> {
     }
 
     let archive = out_dir.join("libflashinfer_kernels.a");
-    if !archive.exists() {
-        build_log!("creating archive ({} objects)", obj_files.len());
-        // Use `q` (quick append) not `r` (replace) — multiple variants have
-        // identically named .o files (e.g. batch_decode.o) and `r` would
-        // keep only the last one, losing symbols from other variants.
-        let mut cmd = Command::new("ar");
-        cmd.arg("qcs").arg(&archive);
-        for obj in &obj_files {
-            cmd.arg(obj);
-        }
-        let status = cmd.status().context("ar failed")?;
-        if !status.success() {
-            anyhow::bail!("ar qcs failed");
-        }
+    // Always recreate the archive. `ar q` only ever appends, so if we
+    // kept an old archive around after a `.o` list changed (a kernel was
+    // added, removed, or its template params expanded) the stale .o
+    // entries would linger alongside the fresh ones and their static
+    // TVM-FFI constructors would win at runtime — which is exactly how
+    // a signature-mismatched gdn_prefill slipped into a release build
+    // once. Rebuilding from the current `walkdir` pass every time
+    // costs a fraction of a second and keeps the archive canonical.
+    if archive.exists() {
+        std::fs::remove_file(&archive)
+            .with_context(|| format!("failed to remove stale {:?}", archive))?;
+    }
+    build_log!("creating archive ({} objects)", obj_files.len());
+    // Use `q` (quick append) not `r` (replace) — multiple variants have
+    // identically named .o files (e.g. batch_decode.o) and `r` would
+    // keep only the last one, losing symbols from other variants.
+    let mut cmd = Command::new("ar");
+    cmd.arg("qcs").arg(&archive);
+    for obj in &obj_files {
+        cmd.arg(obj);
+    }
+    let status = cmd.status().context("ar failed")?;
+    if !status.success() {
+        anyhow::bail!("ar qcs failed");
     }
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());

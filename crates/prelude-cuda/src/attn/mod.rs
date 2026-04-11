@@ -2,6 +2,7 @@
 
 pub(crate) mod flash_v4;
 pub(crate) mod flashinfer;
+pub(crate) mod gdn_prefill;
 pub(crate) mod kda_decode;
 pub(crate) mod kda_prefill;
 

@@ -580,20 +580,13 @@ impl Qwen3_5GatedDeltaNet {
         let vdim = self.head_v_dim;
         let out_dtype = v_in.dtype();
 
-        // Fast path: cuLA fused SM90 prefill kernel. KDA pins head_k_dim ==
-        // head_v_dim so the kernel's single "head_dim" param applies to both.
-        //
-        // Opt-in via PRELUDE_KDA_PREFILL_FAST=1 because our wrapping of the
-        // cuLA SM90 kernel for Qwen3.5's scalar-per-head gate requires
-        // clamping g to [-5, 0] before the chunk cumsum — a small deviation
-        // from HF's unclamped reference. Measured PPL impact on WikiText-2
-        // is <0.001 over 30k tokens but we keep it opt-in until the upstream
-        // kernel grows a non-safe-gate variant.
-        let fast_enabled = std::env::var("PRELUDE_KDA_PREFILL_FAST")
-            .map(|v| v != "0")
-            .unwrap_or(false);
-        if fast_enabled && device.is_cuda() && kdim == vdim && kdim == 128 {
-            if let Some(out) = self.delta_rule_prefill_cula(
+        // Fast path: FlashInfer SM90 `gdn_prefill` kernel — the one
+        // Qwen3.5 / Qwen3-next / FLA's `chunk_gated_delta_rule` were
+        // designed for. Scalar-per-head linear-space decay, no chunk
+        // cumsum / no safe_gate clamp — bit-exact (within BF16) to the
+        // HF reference.
+        if device.is_cuda() && kdim == vdim && kdim == 128 {
+            if let Some(out) = self.delta_rule_prefill_gdn(
                 q_in, k_in, v_in, b_in, a_in, device, ops,
             )? {
                 return Ok(out.to_dtype(out_dtype)?);
@@ -711,16 +704,18 @@ impl Qwen3_5GatedDeltaNet {
         out_stacked.reshape((t, self.value_dim))?.to_dtype(out_dtype)
     }
 
-    /// cuLA-backed KDA prefill fast path.
+    /// FlashInfer-backed GDN prefill fast path for Qwen3.5 DeltaNet.
     ///
-    /// Preprocesses the gate on the Rust side (softplus + a_log + chunk-local
-    /// cumsum + `RCP_LN2` scale, broadcast across the key dim) so the kernel
-    /// sees the same `alpha` tensor its Triton-wrapped Python path produces,
-    /// then calls `Ops::kda_prefill_varlen`.
+    /// This matches HF transformers' `chunk_gated_delta_rule` semantics
+    /// bit-for-bit (modulo BF16 rounding): scalar-per-head **linear-space**
+    /// decay `alpha = exp(-exp(A_log) * softplus(a + dt_bias))`, no
+    /// `RCP_LN2` rescaling, no `safe_gate` clamp, no per-element broadcast.
+    /// The kernel's internal delta-rule math is the same one Qwen3.5 was
+    /// trained against.
     ///
     /// Returns `Ok(None)` when the backend can't serve the call (non-SM90,
     /// shape mismatch, kernel not compiled); callers fall back.
-    fn delta_rule_prefill_cula(
+    fn delta_rule_prefill_gdn(
         &mut self,
         q_in: &Tensor,
         k_in: &Tensor,
@@ -730,97 +725,54 @@ impl Qwen3_5GatedDeltaNet {
         device: &Device,
         ops: &dyn crate::ops::Ops,
     ) -> Result<Option<Tensor>> {
-        const CHUNK_SIZE: usize = 64;
-        // log2(e) — matches `fla.ops.utils.constant.RCP_LN2`, used to
-        // convert the log-space gate into log2 space so the kernel can use
-        // `exp2` instead of `exp` inside its delta accumulation.
-        const RCP_LN2_F64: f64 = 1.442_695_040_888_963_4;
-
         let t = q_in.dim(0)?;
         let hk = self.num_k_heads;
         let hv = self.num_v_heads;
         let kdim = self.head_k_dim;
+        let vdim = self.head_v_dim;
+        // FlashInfer uses `num_sab_heads = max(num_q, num_v)` for the
+        // state / gate / output head axis. Qwen3.5 is GVA (num_v > num_k),
+        // so alpha/beta/output live on the V-head axis.
+        debug_assert!(hv >= hk, "Qwen3.5 DeltaNet is GVA: num_v >= num_k");
 
-        // ── Q, K: L2-normalize in BF16 (kernel consumes BF16 Q/K) ────────
+        // ── Q, K: L2-normalize in BF16 on the Q/K physical head count ────
+        // (GVA: hq == hk == num_k_heads = 16 for A3B)
         let q_bf16 = l2_normalize_last_dim(&q_in.reshape((t, hk, kdim))?)?
             .to_dtype(DType::BF16)?
             .contiguous()?;
         let k_bf16 = l2_normalize_last_dim(&k_in.reshape((t, hk, kdim))?)?
             .to_dtype(DType::BF16)?
             .contiguous()?;
-        let v_bf16 = v_in.reshape((t, hv, kdim))?.to_dtype(DType::BF16)?.contiguous()?;
+        let v_bf16 = v_in
+            .reshape((t, hv, vdim))?
+            .to_dtype(DType::BF16)?
+            .contiguous()?;
 
-        // ── Scalar-per-head gate in F32, shape [T, HV] ───────────────────
+        // ── Linear-space decay alpha = exp(g_scalar), shape [T, HV] ──────
+        // g_scalar = -exp(A_log) * softplus(a + dt_bias). HF's reference
+        // computes this in F32 — we do the same.
         let dt_bias_f32 = self.dt_bias.to_dtype(DType::F32)?;
         let a_log_f32 = self.a_log.to_dtype(DType::F32)?;
         let neg_exp_a = a_log_f32.exp()?.neg()?; // [HV]
         let a_f32 = a_in.to_dtype(DType::F32)?;
         let a_plus_dt = a_f32.broadcast_add(&dt_bias_f32)?;
         let g_soft = softplus(&a_plus_dt)?;
-        // Clamp per-step gate to cuLA's "safe_gate" numerical range. Qwen3.5
-        // natively uses unclamped `-exp(A_log) * softplus(a + dt_bias)` which
-        // can hit magnitudes of ~1300 per step; feeding that to cuLA's SM90
-        // kernel (which assumes `safe_gate` — roughly `g >= -5`) produces
-        // NaN via internal `exp2` overflow on the score/state fusion path.
-        // Clamping to `[-5, 0]` matches upstream FLA's `lower_bound=-5` path
-        // and in our measurements costs <0.001 PPL on Qwen3.5-35B-A3B.
-        let g_scalar = g_soft.broadcast_mul(&neg_exp_a)?.clamp(-5.0f32, 0.0f32)?;
-
-        // ── Chunk-local cumsum along T, scale by RCP_LN2 ─────────────────
-        // Pad T to a multiple of CHUNK_SIZE with zeros (outside-of-range
-        // values are not read by the kernel, which honors cu_seqlens).
-        //
-        // We avoid `Tensor::cumsum`: candle's CUDA impl expands into a
-        // `broadcast_matmul` with a triangular ones matrix, which hits a
-        // non-TN orientation the cutlass-gemm wrapper doesn't currently
-        // support. Hillis-Steele parallel prefix sum does the same job in
-        // `log2(CHUNK_SIZE)` elementwise adds and no GEMM.
-        let pad = (CHUNK_SIZE - t % CHUNK_SIZE) % CHUNK_SIZE;
-        let g_padded = if pad > 0 {
-            let zeros = Tensor::zeros((pad, hv), DType::F32, device)?;
-            Tensor::cat(&[&g_scalar, &zeros], 0)?
-        } else {
-            g_scalar
-        };
-        let nc = (t + pad) / CHUNK_SIZE;
-        // Reshape so the cumsum axis is last: [NC, CS, HV] → [NC, HV, CS].
-        let g_chunked = g_padded
-            .reshape((nc, CHUNK_SIZE, hv))?
-            .transpose(1, 2)?
-            .contiguous()?; // [NC, HV, CS]
-        let mut g_cum = g_chunked;
-        let mut step = 1usize;
-        while step < CHUNK_SIZE {
-            let keep = g_cum.narrow(D::Minus1, 0, CHUNK_SIZE - step)?;
-            let shifted = keep.pad_with_zeros(D::Minus1, step, 0)?; // left-pad
-            g_cum = (g_cum + shifted)?;
-            step *= 2;
-        }
-        // Back to [NC*CS, HV] and trim the padding tail.
-        let g_cum_flat = g_cum
-            .transpose(1, 2)? // [NC, CS, HV]
-            .contiguous()?
-            .reshape(((nc * CHUNK_SIZE), hv))?
-            .narrow(0, 0, t)?;
-        let g_scaled = (g_cum_flat * RCP_LN2_F64)?; // [T, HV]
-
-        // Broadcast scalar gate across K: the kernel expects per-key-dim
-        // alpha `[T, HV, K]`, and a scalar-per-head gate is the degenerate
-        // case `alpha[..k] = alpha[..0]`.
-        let alpha = g_scaled
-            .unsqueeze(D::Minus1)?
-            .broadcast_as((t, hv, kdim))?
-            .contiguous()?; // [T, HV, K] f32
+        let g_scalar = g_soft.broadcast_mul(&neg_exp_a)?; // [T, HV]
+        let alpha = g_scalar.exp()?.contiguous()?; // [T, HV] f32 linear decay
 
         // ── Beta: sigmoid in F32 over [T, HV] ────────────────────────────
-        let beta = ops.sigmoid(&b_in.to_dtype(DType::F32)?)?.contiguous()?;
+        let beta = ops
+            .sigmoid(&b_in.to_dtype(DType::F32)?)?
+            .contiguous()?; // [T, HV] f32
 
-        // ── cu_seqlens = [0, T] for a single packed sequence ─────────────
-        let cu_seqlens = Tensor::from_vec(vec![0i32, t as i32], (2,), device)?;
+        // ── cu_seqlens = [0, T] for a single packed sequence (I64) ───────
+        // Note: flashinfer expects I64, unlike cuLA's I32.
+        let cu_seqlens = Tensor::from_vec(vec![0i64, t as i64], (2,), device)?;
 
-        // ── Initial state: [1, HV, V, K] f32 or None ─────────────────────
+        // ── Initial state: [1, HV, D, D] f32 or None ─────────────────────
         // Our own recurrent state is stored [HV, V, K]; the kernel wants a
-        // leading num_seqs=1 dim.
+        // leading num_seqs=1 dim. Pull it out of `self` so the fallback
+        // can restore it on the backend-declined branch.
         let initial_state = self.recurrent_state.take();
         let initial_state_4d = match initial_state.as_ref() {
             Some(s) => Some(s.unsqueeze(0)?.contiguous()?),
@@ -830,22 +782,25 @@ impl Qwen3_5GatedDeltaNet {
         let scale = (kdim as f32).powf(-0.5);
 
         // ── Launch ───────────────────────────────────────────────────────
-        let Some(result) = ops.kda_prefill_varlen(
+        let Some(result) = ops.gdn_prefill_varlen(
             &q_bf16, &k_bf16, &v_bf16,
             &alpha, &beta, &cu_seqlens,
             initial_state_4d.as_ref(), scale,
         ) else {
-            // Backend declined — restore recurrent_state so the fallback
-            // path picks up where we left off.
+            // Backend declined — restore recurrent_state so the composed
+            // fallback picks up where we left off.
             self.recurrent_state = initial_state;
             return Ok(None);
         };
         let (out, final_state) = result?;
 
-        // Save the updated recurrent state: [1, HV, V, K] → [HV, V, K].
+        // Save the updated recurrent state: [1, HV, D, D] → [HV, D, D].
+        // Note: kernel returns `[num_seqs, num_sab_heads, head_dim, head_dim]`
+        // which for Qwen3.5 is `[1, HV, D, D]` with `D == head_k_dim == head_v_dim`.
         self.recurrent_state = Some(final_state.squeeze(0)?.contiguous()?);
 
-        // out is [T, HV, V] BF16. Fold HV*V back into value_dim.
+        // out is [T, HV, D] BF16 (num_sab_heads == hv for GVA). Fold HV*D
+        // back into value_dim.
         Ok(Some(out.reshape((t, self.value_dim))?))
     }
 
