@@ -20,8 +20,10 @@ no runtime `dlopen`, no Python interpreter, no torch process.
 ### Current kernels
 
 - **SM90** (Hopper)
-  - `kda_fwd_prefill_sm90` — fused KDA forward prefill, now with
-    multi-value GQA (see [rucnyz/cuLA feat/sm90-gqa](https://github.com/rucnyz/cuLA/tree/feat/sm90-gqa))
+  - `kda_fwd_prefill_sm90` — fused KDA forward prefill (MHA only).
+    A multi-value GQA extension lives on the draft fork PR
+    [`rucnyz/cuLA feat/sm90-gqa`](https://github.com/rucnyz/cuLA/tree/feat/sm90-gqa);
+    this crate does not depend on it.
   - KDA decode, chunk_delta_h, fwd_o, lightning_prefill (CuTeDSL)
 - **SM100 / SM103** (Blackwell)
   - `chunk_kda_fwd_intra_sm100`, `chunk_kda_fwd_recomp_wu_sm100`

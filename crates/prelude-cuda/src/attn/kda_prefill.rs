@@ -4,7 +4,12 @@
 //! Wraps the SM90 `cula::kda_fwd_prefill_sm90` C-shim. The upstream kernel
 //! supports both plain MHA and KDA's "multi-value" GQA flavor (Q/K share
 //! `num_k_heads`, V and the recurrent state have the larger `num_heads`).
-//! Qwen3.5-35B-A3B uses the GQA flavor (num_k_heads=16, num_v_heads=32).
+//!
+//! NOTE: upstream `inclusionAI/cuLA` currently only supports plain MHA
+//! (`num_q_heads == num_k_heads == num_v_heads`). Multi-value GQA lives on
+//! the `feat/sm90-gqa` fork PR and is not part of the shim this crate
+//! links against — we return `Ok(None)` on GVA shapes so callers fall
+//! back. Qwen3.5-A3B is GVA and therefore never hits this kernel.
 //!
 //! Gate preprocessing (softplus + A_log + chunk-cumsum + RCP_LN2 scale) is
 //! done by the caller in Rust via candle ops — the kernel takes the already
@@ -100,8 +105,10 @@ pub(crate) fn try_prefill(
     if d != dk || d != dv {
         bail!("kda_prefill: q/k/v head_dim mismatch: {d} / {dk} / {dv}");
     }
-    if hv % hk != 0 {
-        bail!("kda_prefill: num_heads ({hv}) must be a multiple of num_k_heads ({hk})");
+    // Upstream cuLA (without the sm90-gqa fork PR) only supports MHA.
+    // GVA/GQA shapes fall back to the caller's native path.
+    if hk != hv {
+        return Ok(None);
     }
     // cuLA launcher is specialized on D = 128 tile.
     if d != 128 {
@@ -207,9 +214,8 @@ pub(crate) fn try_prefill(
     };
 
     // ── Launch ──────────────────────────────────────────────────────
-    let hk_i32 = hk as i32;
-    let num_k_heads = if hk == hv { 0 } else { hk_i32 };
-
+    // Upstream cuLA is MHA-only — we've already returned None for GVA
+    // shapes above, so hk == hv here.
     unsafe {
         cula::kda_fwd_prefill_sm90(
             stream_ptr,
@@ -230,7 +236,6 @@ pub(crate) fn try_prefill(
             scale,
             true, // safe_gate — the only path compiled in cuLA SM90
             sm_count,
-            num_k_heads,
         )
         .map_err(candle_core::Error::msg)?;
     }

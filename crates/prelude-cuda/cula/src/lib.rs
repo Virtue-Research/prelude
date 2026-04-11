@@ -46,7 +46,6 @@ unsafe extern "C" {
         scale: f32,
         safe_gate: i32,
         sm_count: i32,
-        num_k_heads: i32,
     ) -> i32;
 
     fn cula_chunk_kda_fwd_intra_sm100(
@@ -94,15 +93,13 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-/// KDA fused prefill on SM90 (Hopper).
+/// KDA fused prefill on SM90 (Hopper). MHA only — Q, K, V must share the
+/// same head count. Upstream `inclusionAI/cuLA` does not currently carry
+/// multi-value GQA support; see the `feat/sm90-gqa` fork PR for that.
 ///
-/// Supports plain MHA (Q, K, V all `num_heads`) and KDA multi-value GQA
-/// (Q/K `num_k_heads`, V/state `num_heads`, `num_heads % num_k_heads == 0`).
-/// Pass `num_k_heads = 0` or `num_k_heads = num_heads` for MHA.
-///
-/// Q/K: bf16 `[packed_seq, num_k_heads, D]`, V: bf16 `[packed_seq, num_heads, D]`,
-/// cu_seqlens: i32 `[num_seqs+1]`. Output: bf16 `[packed_seq, num_heads, D]`,
-/// output_state: f32 `[num_seqs, num_heads, D, D]`.
+/// Q/K/V: bf16 `[packed_seq, num_heads, D]`, cu_seqlens: i32 `[num_seqs+1]`.
+/// Output: bf16 `[packed_seq, num_heads, D]`, output_state: f32
+/// `[num_seqs, num_heads, D, D]`.
 ///
 /// # Safety
 /// All pointers must be valid CUDA device pointers on the same device.
@@ -126,7 +123,6 @@ pub unsafe fn kda_fwd_prefill_sm90(
     scale: f32,
     safe_gate: bool,
     sm_count: i32,
-    num_k_heads: i32,
 ) -> Result<(), String> {
     let ret = unsafe {
         cula_kda_fwd_prefill_sm90(
@@ -140,7 +136,7 @@ pub unsafe fn kda_fwd_prefill_sm90(
             cu_seqlens,
             workspace,
             num_seqs, num_heads, head_size, total_seqlen,
-            scale, safe_gate as i32, sm_count, num_k_heads,
+            scale, safe_gate as i32, sm_count,
         )
     };
     match ret {

@@ -28,8 +28,7 @@ extern "C" int cula_kda_fwd_prefill_sm90(
     int64_t total_seqlen,
     float scale,
     int safe_gate,
-    int32_t sm_count,
-    int32_t num_k_heads)
+    int32_t sm_count)
 {
     using bf16 = cute::bfloat16_t;
     using Sm90 = cutlass::arch::Sm90;
@@ -52,8 +51,7 @@ extern "C" int cula_kda_fwd_prefill_sm90(
         total_seqlen,
         scale,
         static_cast<bool>(safe_gate),
-        sm_count,
-        num_k_heads);
+        sm_count);
 
     return 0;
 }
