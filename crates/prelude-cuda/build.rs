@@ -40,6 +40,7 @@ fn main() {
         ("elementwise", "add.cu", "add"),
         ("elementwise", "silu_mul.cu", "silu_mul"),
         ("normalization", "rmsnorm.cu", "rmsnorm"),
+        ("normalization", "rmsnorm_gated.cu", "rmsnorm_gated"),
         ("rope", "qknorm_rope.cu", "qknorm_rope"),
         ("moe", "routing.cu", "moe_routing"),
         ("moe", "gateup.cu", "moe_gateup"),

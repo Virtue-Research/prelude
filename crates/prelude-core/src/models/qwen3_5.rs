@@ -353,20 +353,24 @@ impl RmsNormGated {
         let x = x.reshape(new_shape.as_slice())?;
         let z = z.reshape(new_shape.as_slice())?;
 
-        // Match HF `Qwen3_5MoeRMSNormGated`: normalize in F32, apply weight in
-        // F32, compute SiLU(gate) in F32, do the final gate multiply in F32,
-        // and only cast the result back at the very end.
-        let x_f32 = x.to_dtype(DType::F32)?;
-        let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
-        let normed = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let normed = normed.broadcast_mul(&self.weight)?; // F32 × F32
-        let gate_f32 = z.to_dtype(DType::F32)?;
-        let silu_gate = ops.silu(&gate_f32)?;
-        let result = normed
-            .broadcast_mul(&silu_gate)?
-            .to_dtype(x.dtype())?;
+        // Flatten to 2D [...*num_heads, head_dim] for the fused kernel
+        let flat_rows = x.elem_count() / self.head_dim;
+        let x_2d = x.reshape((flat_rows, self.head_dim))?;
+        let z_2d = z.reshape((flat_rows, self.head_dim))?;
 
-        // Reshape back to [..., num_heads * head_dim]
+        // Fused: RMSNorm(x) * weight * SiLU(gate) in one kernel
+        let result = if let Some(r) = ops.rmsnorm_gated(&x_2d, &z_2d, &self.weight, self.eps as f32) {
+            r?
+        } else {
+            // Decomposed fallback (CPU or non-BF16)
+            let x_f32 = x_2d.to_dtype(DType::F32)?;
+            let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
+            let normed = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+            let normed = normed.broadcast_mul(&self.weight)?;
+            let silu_gate = ops.silu(&z_2d.to_dtype(DType::F32)?)?;
+            normed.broadcast_mul(&silu_gate)?.to_dtype(x.dtype())?
+        };
+
         result.reshape(orig_shape)
     }
 }

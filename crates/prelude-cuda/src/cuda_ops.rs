@@ -63,6 +63,13 @@ impl Ops for CudaOps {
         Some(crate::ops::moe::moe_sort_experts_gpu(expert_ids))
     }
 
+    fn rmsnorm_gated(&self, x: &Tensor, gate: &Tensor, weight: &Tensor, eps: f32) -> Option<Result<Tensor>> {
+        if x.dtype() == DType::BF16 && weight.dtype() == DType::F32 {
+            return Some(crate::ops::rmsnorm::fast_rmsnorm_gated(x, gate, weight, eps as f64));
+        }
+        None
+    }
+
     fn swap_moe_gate_up(&self, w1: &Tensor, inter: usize) -> Option<Result<()>> {
         Some(crate::ops::moe::swap_gate_up_inplace(w1, inter))
     }

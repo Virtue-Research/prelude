@@ -11,6 +11,7 @@
 pub const PTX_ADD: &str = include_str!(concat!(env!("OUT_DIR"), "/add.ptx"));
 pub const PTX_SILU_MUL: &str = include_str!(concat!(env!("OUT_DIR"), "/silu_mul.ptx"));
 pub const PTX_RMSNORM: &str = include_str!(concat!(env!("OUT_DIR"), "/rmsnorm.ptx"));
+pub const PTX_RMSNORM_GATED: &str = include_str!(concat!(env!("OUT_DIR"), "/rmsnorm_gated.ptx"));
 pub const PTX_QKNORM_ROPE: &str = include_str!(concat!(env!("OUT_DIR"), "/qknorm_rope.ptx"));
 pub const PTX_MOE_ROUTING: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_routing.ptx"));
 pub const PTX_MOE_GATEUP: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_gateup.ptx"));

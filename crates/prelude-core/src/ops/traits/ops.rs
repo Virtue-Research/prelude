@@ -193,6 +193,10 @@ pub trait Ops: Send + Sync {
     /// Default: returns None (caller falls back to CPU sort).
     fn moe_sort_experts(&self, _expert_ids: &Tensor) -> Option<Result<(Tensor, Tensor)>> { None }
 
+    /// Fused RMSNorm + SiLU gate: output = RMSNorm(x, weight) * SiLU(gate).
+    /// Used by GatedDeltaNet's per-head norm. x/gate: BF16, weight: F32.
+    fn rmsnorm_gated(&self, _x: &Tensor, _gate: &Tensor, _weight: &Tensor, _eps: f32) -> Option<Result<Tensor>> { None }
+
     /// In-place swap of gate/up halves for CUTLASS Swiglu. Call once at load time.
     fn swap_moe_gate_up(&self, _w1: &Tensor, _inter: usize) -> Option<Result<()>> { None }
 
