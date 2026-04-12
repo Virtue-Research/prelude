@@ -12,16 +12,28 @@ Usage (called automatically by build.rs):
     PYTHONPATH=/path/to/cuLA \
     CUTE_DSL_ARCH=sm_90a \
         python3 compile_kernels.py [--output-dir ../kernels] [-j N]
+
+Shared helpers (symbol verification, manifest IO, parallel runner,
+standard argparse) live in `prelude-kernelbuild/scripts/dsl_driver.py`
+which we import via the `PRELUDE_KB_SCRIPTS_DIR` env var that
+`build.rs` sets.
 """
 
-import argparse
-import json
 import os
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+# Load the shared driver helpers — see prelude_kernelbuild::scripts_dir().
+sys.path.insert(0, os.environ["PRELUDE_KB_SCRIPTS_DIR"])
+from dsl_driver import (  # noqa: E402
+    compute_script_hash,
+    run_parallel,
+    standard_argparse,
+    verify_symbol,
+    write_manifest,
+)
 
 
 def get_arch_from_env():
@@ -130,7 +142,7 @@ def compile_lightning_prefill(spec: LightningPrefillSpec, arch: int, output_dir:
             function_name=name,
         )
         print(f"    Exported .o: {obj_path} ({obj_path.stat().st_size // 1024}KB)")
-        _verify_symbol(obj_path, name)
+        verify_symbol(obj_path, name)
         return _result(name, arch, obj_path, "lightning_prefill", spec.__dict__)
 
     except Exception as e:
@@ -179,7 +191,7 @@ def compile_chunk_delta_h(spec: ChunkDeltaHSpec, arch: int, output_dir: Path):
             function_name=name,
         )
         print(f"    Exported .o: {obj_path} ({obj_path.stat().st_size // 1024}KB)")
-        _verify_symbol(obj_path, name)
+        verify_symbol(obj_path, name)
         return _result(name, arch, obj_path, "chunk_delta_h", spec.__dict__)
 
     except Exception as e:
@@ -339,7 +351,7 @@ def compile_kda_decode(spec: KdaDecodeSpec, arch: int, output_dir: Path):
             function_name=name,
         )
         print(f"    Exported .o: {obj_path} ({obj_path.stat().st_size // 1024}KB)")
-        _verify_symbol(obj_path, name)
+        verify_symbol(obj_path, name)
         return _result(name, arch, obj_path, "kda_decode", spec.__dict__)
 
     except Exception as e:
@@ -389,7 +401,7 @@ def compile_fwd_o(spec: FwdOSpec, arch: int, output_dir: Path):
             function_name=name,
         )
         print(f"    Exported .o: {obj_path} ({obj_path.stat().st_size // 1024}KB)")
-        _verify_symbol(obj_path, name)
+        verify_symbol(obj_path, name)
         return _result(name, arch, obj_path, "fwd_o", spec.__dict__)
 
     except Exception as e:
@@ -504,29 +516,6 @@ def _result(name, arch, obj_path, kernel_type, params):
     }
 
 
-def _verify_symbol(obj_path, name):
-    try:
-        result = subprocess.run(
-            ["nm", "-g", str(obj_path)],
-            capture_output=True, text=True, timeout=10,
-        )
-        expected = f"__tvm_ffi_{name}"
-        if expected in result.stdout:
-            print(f"    Symbol OK: {expected}")
-        elif "__tvm_ffi_func" in result.stdout:
-            print(f"    WARNING: found __tvm_ffi_func, renaming to {expected}")
-            subprocess.run([
-                "objcopy",
-                f"--redefine-sym=__tvm_ffi_func={expected}",
-                str(obj_path),
-            ], check=True, timeout=10)
-            print(f"    Renamed OK")
-        else:
-            print(f"    WARNING: neither {expected} nor __tvm_ffi_func found")
-    except Exception as e:
-        print(f"    Symbol check skipped: {e}")
-
-
 def _compile_worker(task):
     kernel_type, spec, arch, output_dir = task
     if kernel_type == "lightning_prefill":
@@ -545,13 +534,11 @@ def _compile_worker(task):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="AOT compile cuLA CuTe DSL kernels")
-    parser.add_argument("--output-dir", type=Path,
-                        default=Path(__file__).parent.parent / "kernels")
-    parser.add_argument("--arch", type=int, default=None)
-    parser.add_argument("--prototype", action="store_true",
-                        help="Minimal variant set for testing")
-    parser.add_argument("-j", "--workers", type=int, default=1)
+    parser = standard_argparse(
+        description="AOT compile cuLA CuTe DSL kernels",
+        default_output_dir=Path(__file__).parent.parent / "kernels",
+        default_workers=1,
+    )
     args = parser.parse_args()
 
     arch = args.arch or get_arch_from_env()
@@ -565,7 +552,8 @@ def main():
 
     variants = build_variant_matrix(arch, prototype=args.prototype)
 
-    # Flatten into task list
+    # Flatten { kernel_type: [specs] } into tasks that `_compile_worker`
+    # can dispatch on.
     tasks = []
     for kernel_type, specs in variants.items():
         for spec in specs:
@@ -573,40 +561,14 @@ def main():
 
     print(f"Compiling {len(tasks)} kernel variants (workers={args.workers})...\n")
 
-    if args.workers > 1:
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-        results = []
-        with ProcessPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(_compile_worker, t): t for t in tasks}
-            for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    results.append(result)
-    else:
-        results = []
-        for task in tasks:
-            result = _compile_worker(task)
-            if result:
-                results.append(result)
+    results = run_parallel(tasks, _compile_worker, max_workers=args.workers)
 
-    # Write manifest
-    import hashlib
-    script_hash = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
-
-    manifest = {
-        "archs": [arch],
-        "variants": results,
-        "script_hash": script_hash,
-    }
-    try:
-        import cutlass
-        manifest["cutlass_version"] = cutlass.__version__
-    except (ImportError, AttributeError):
-        pass
-
-    manifest_path = args.output_dir / "manifest.json"
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
+    write_manifest(
+        manifest_path=args.output_dir / "manifest.json",
+        variants=results,
+        script_hash=compute_script_hash(Path(__file__)),
+        archs=[arch],
+    )
 
     print(f"\n=== Results: {len(results)}/{len(tasks)} compiled for SM{arch} ===")
     by_type = {}

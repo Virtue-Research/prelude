@@ -307,6 +307,10 @@ fn ensure_kernels(
             .env("CUTE_DSL_ARCH", format!("{arch}a"))
             .env("FA_CLC", "0")
             .env("FA_DISABLE_2CTA", "0")
+            // Expose the shared dsl_driver helpers to the compile
+            // script. See prelude_kernelbuild::scripts_dir() for the
+            // resolution mechanism.
+            .env("PRELUDE_KB_SCRIPTS_DIR", prelude_kernelbuild::scripts_dir())
             .status()
             .context("Failed to run FA4 compile script")?;
 

@@ -18,15 +18,24 @@ Usage (called automatically by build.rs):
         python3 compile_kernels.py [--output-dir ../kernels] [--prototype]
 """
 
-import argparse
-import json
 import os
-import subprocess
 import sys
 import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+# Shared helpers from prelude-kernelbuild — symbol verification,
+# manifest IO, parallel runner, standard argparse. Loaded via the
+# PRELUDE_KB_SCRIPTS_DIR env var set by build.rs.
+sys.path.insert(0, os.environ["PRELUDE_KB_SCRIPTS_DIR"])
+from dsl_driver import (  # noqa: E402
+    compute_script_hash,
+    run_parallel,
+    standard_argparse,
+    verify_symbol,
+    write_manifest,
+)
 
 
 def _patch_flash_attn_import():
@@ -221,7 +230,7 @@ def compile_variant(spec: VariantSpec, arch: int, output_dir: Path):
         )
         print(f"    Exported .o: {obj_path} ({obj_path.stat().st_size // 1024}KB)")
 
-        _verify_symbol(obj_path, name)
+        verify_symbol(obj_path, name)
 
         cache.cache.clear()
 
@@ -232,31 +241,6 @@ def compile_variant(spec: VariantSpec, arch: int, output_dir: Path):
         import traceback
         traceback.print_exc()
         return None
-
-
-def _verify_symbol(obj_path, name):
-    """Verify the .o has __tvm_ffi_{name} and NOT __tvm_ffi_func."""
-    try:
-        result = subprocess.run(
-            ["nm", "-g", str(obj_path)],
-            capture_output=True, text=True, timeout=10,
-        )
-        symbols = result.stdout
-        expected = f"__tvm_ffi_{name}"
-        if expected in symbols:
-            print(f"    Symbol OK: {expected}")
-        elif "__tvm_ffi_func" in symbols:
-            print(f"    WARNING: found __tvm_ffi_func, renaming to {expected}")
-            subprocess.run([
-                "objcopy",
-                f"--redefine-sym=__tvm_ffi_func={expected}",
-                str(obj_path),
-            ], check=True, timeout=10)
-            print(f"    Renamed OK")
-        else:
-            print(f"    WARNING: neither {expected} nor __tvm_ffi_func found in symbols")
-    except Exception as e:
-        print(f"    Symbol check skipped: {e}")
 
 
 def _variant_result(spec: VariantSpec, name: str, pack_gqa: bool, arch: int, obj_path: Path):
@@ -406,19 +390,6 @@ def build_variant_matrix(arch: int, prototype=False):
     return variants
 
 
-def load_existing_manifest(output_dir):
-    """Load existing manifest to support incremental multi-arch compilation."""
-    manifest_path = output_dir / "manifest.json"
-    if manifest_path.exists():
-        try:
-            with open(manifest_path) as f:
-                data = json.load(f)
-            return data.get("variants", [])
-        except (json.JSONDecodeError, KeyError):
-            pass
-    return []
-
-
 def _compile_worker(task):
     """Worker function for parallel compilation. Runs in a subprocess."""
     spec, arch, output_dir = task
@@ -426,16 +397,11 @@ def _compile_worker(task):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AOT compile FA4 kernels")
-    parser.add_argument("--output-dir", type=Path,
-                        default=Path(__file__).parent.parent / "kernels")
-    parser.add_argument("--arch", type=int, default=None,
-                        help="SM arch (e.g. 90, 120). Default: auto-detect from env")
-    parser.add_argument("--prototype", action="store_true",
-                        help="Single variant (hdim128, bf16, causal)")
-    parser.add_argument("-j", "--workers", type=int, default=1,
-                        help="Parallel workers (default: 1). Each worker is a subprocess "
-                             "with its own CUDA context and compile cache.")
+    parser = standard_argparse(
+        description="AOT compile FA4 kernels",
+        default_output_dir=Path(__file__).parent.parent / "kernels",
+        default_workers=1,
+    )
     args = parser.parse_args()
 
     arch = args.arch or get_arch_from_env()
@@ -448,7 +414,11 @@ def main():
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    existing = load_existing_manifest(args.output_dir)
+    # Multi-arch incremental: keep variants from other archs already in
+    # the manifest so that compiling sm_100 after sm_90 doesn't drop
+    # the existing sm_90 entries.
+    from dsl_driver import load_existing_manifest  # noqa: E402
+    existing = load_existing_manifest(args.output_dir / "manifest.json")
     other_arch_variants = [v for v in existing if v.get("arch") != arch]
 
     variants = build_variant_matrix(arch, prototype=args.prototype)
@@ -456,42 +426,18 @@ def main():
     print(f"Compiling {len(variants)} kernel variants for SM{arch} (workers={args.workers})...\n")
 
     tasks = [(spec, arch, args.output_dir) for spec in variants]
-
-    if args.workers > 1:
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-        results = []
-        with ProcessPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(_compile_worker, t): t for t in tasks}
-            for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    results.append(result)
-    else:
-        results = []
-        for spec in variants:
-            result = compile_variant(spec, arch, args.output_dir)
-            if result:
-                results.append(result)
+    results = run_parallel(tasks, _compile_worker, max_workers=args.workers)
 
     # Merge: other archs + this arch
     all_variants = other_arch_variants + results
     all_archs = sorted(set(v["arch"] for v in all_variants))
 
-    # Store script hash for build.rs change detection
-    import hashlib
-    script_content = Path(__file__).read_bytes()
-    script_hash = hashlib.sha256(script_content).hexdigest()[:16]
-
-    manifest = {"archs": all_archs, "variants": all_variants, "script_hash": script_hash}
-    try:
-        import cutlass
-        manifest["cutlass_version"] = cutlass.__version__
-    except (ImportError, AttributeError):
-        pass
-
-    manifest_path = args.output_dir / "manifest.json"
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
+    write_manifest(
+        manifest_path=args.output_dir / "manifest.json",
+        variants=all_variants,
+        script_hash=compute_script_hash(Path(__file__)),
+        archs=all_archs,
+    )
 
     # Summary
     n_paged = sum(1 for v in results if v.get("paged"))

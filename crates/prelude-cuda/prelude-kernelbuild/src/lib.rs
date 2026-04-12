@@ -36,3 +36,20 @@ pub mod venv;
 
 // Re-export the log macro at crate root for convenient `use`.
 pub use crate::log::__build_log_inner as _build_log_inner;
+
+/// Absolute path to this crate's `scripts/` directory, which contains
+/// the shared `dsl_driver.py` module that consumer compile scripts
+/// import. Consumer build scripts should call this from their
+/// `build.rs` and pass the result as the `PRELUDE_KB_SCRIPTS_DIR` env
+/// var when spawning their Python compile script, so the script can
+/// `sys.path.insert(0, os.environ["PRELUDE_KB_SCRIPTS_DIR"])` before
+/// importing.
+///
+/// Resolved via `CARGO_MANIFEST_DIR` at the build-support library's
+/// compile time — so the path is baked into the consumer crate's
+/// `build.rs` binary and always points at a concrete checkout of
+/// prelude-kernelbuild regardless of where the consumer lives in the
+/// workspace.
+pub fn scripts_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts")
+}

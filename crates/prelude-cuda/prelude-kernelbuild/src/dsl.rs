@@ -43,6 +43,7 @@ use std::process::Command;
 
 use crate::build_log;
 use crate::nvcc::file_hash;
+use crate::scripts_dir;
 
 /// Spec for a single DSL compile invocation. Construct, pass to
 /// [`run`], and optionally inspect the returned bool to decide whether
@@ -187,6 +188,13 @@ pub fn run(spec: &DslCompile<'_>) -> Result<bool, String> {
             .arg("--output-dir")
             .arg(&arch_dir)
             .args(["-j", spec.workers]);
+
+        // Expose prelude-kernelbuild's `scripts/` directory to the
+        // compile script so it can import the shared `dsl_driver`
+        // helpers (symbol verification, manifest IO, script-hash
+        // invalidation, parallel runner). Scripts that don't need the
+        // helpers can simply not import them.
+        cmd.env("PRELUDE_KB_SCRIPTS_DIR", scripts_dir());
 
         for (k, v) in spec.env {
             cmd.env(k, v);
