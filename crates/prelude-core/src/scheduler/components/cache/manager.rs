@@ -29,6 +29,7 @@ impl CacheManager {
         runtime_caps: &RuntimeCaps,
         cache_config: &CacheConfig,
         kv_sharing: &[Option<usize>],
+        peak_activation_bytes: usize,
     ) -> Result<Self, EngineError> {
         let prefix_cache = if runtime_caps.supports_prefix_cache {
             Self::init_prefix_cache(device, model_config.num_hidden_layers, cache_config)
@@ -37,7 +38,7 @@ impl CacheManager {
         };
 
         let (paged_pool, block_manager) = if runtime_caps.supports_paged_attn {
-            Self::init_paged_pool(model_config, dtype, device, cache_config, kv_sharing)?
+            Self::init_paged_pool(model_config, dtype, device, cache_config, kv_sharing, peak_activation_bytes)?
         } else {
             (None, None)
         };
@@ -109,6 +110,7 @@ impl CacheManager {
         device: &Device,
         cache_config: &CacheConfig,
         kv_sharing: &[Option<usize>],
+        peak_activation_bytes: usize,
     ) -> Result<
         (
             Option<PagedKvPool>,
@@ -142,8 +144,18 @@ impl CacheManager {
         let num_shared = kv_sharing.iter().filter(|s| s.is_some()).count();
         let num_physical_kv_layers = num_layers - num_shared;
 
-        // Auto-size: when paged_attn_blocks == 0, use gpu_memory_utilization fraction
-        // of free GPU memory (vLLM-style). Override with PRELUDE_PAGED_ATTN_BLOCKS=N.
+        // Auto-size: when paged_attn_blocks == 0, use the vLLM formula:
+        //
+        //   available_kv = total_gpu * utilization - weights - peak_activation
+        //   num_blocks = available_kv / bytes_per_block
+        //
+        // Before this change, we used `free * utilization` which didn't
+        // account for activation memory. For large-vocab MoE models
+        // (Qwen3.5-35B-A3B: vocab=248K, lm_head output ~8 GB at 8192
+        // tokens) the 10% reserve was insufficient → OOM during first
+        // forward pass.
+        //
+        // Override with PRELUDE_PAGED_ATTN_BLOCKS=N for manual control.
         let paged_blocks = if cache_config.paged_attn_blocks > 0 {
             cache_config.paged_attn_blocks
         } else {
@@ -154,24 +166,38 @@ impl CacheManager {
                 } else { 0 };
                 v1 + flash
             };
-            // Use physical layer count for memory calculation (shared layers don't cost extra).
             let total_bytes_per_block = bytes_per_block_per_layer * num_physical_kv_layers;
 
-            let free_bytes = cuda_free_memory(device).unwrap_or(0);
+            let ops = crate::ops::select_ops(device);
+            let total_bytes = ops.gpu_total_memory().unwrap_or(0);
+            let free_bytes = ops.gpu_free_memory().unwrap_or(0);
             let utilization = cache_config.gpu_memory_utilization;
-            let usable = (free_bytes as f64 * utilization as f64) as usize;
+
+            // vLLM formula:
+            //   requested = total * utilization
+            //   non_kv = weights_memory + peak_activation
+            //   available = requested - non_kv
+            let weights_bytes = total_bytes.saturating_sub(free_bytes);
+            let requested = (total_bytes as f64 * utilization as f64) as usize;
+            let non_kv = weights_bytes + peak_activation_bytes;
+            let available_for_kv = requested.saturating_sub(non_kv);
+
             let auto_blocks = if total_bytes_per_block > 0 {
-                (usable / total_bytes_per_block).max(16)
+                (available_for_kv / total_bytes_per_block).max(16)
             } else {
                 256
             };
             info!(
                 auto_blocks,
+                total_gpu_mb = total_bytes / (1024 * 1024),
                 free_gpu_mb = free_bytes / (1024 * 1024),
+                weights_mb = weights_bytes / (1024 * 1024),
+                peak_activation_mb = peak_activation_bytes / (1024 * 1024),
+                available_for_kv_mb = available_for_kv / (1024 * 1024),
                 gpu_memory_utilization = utilization,
                 bytes_per_block = total_bytes_per_block,
                 num_physical_kv_layers,
-                "auto-sized paged KV cache from free GPU memory"
+                "auto-sized paged KV cache (vLLM formula)"
             );
             auto_blocks
         };

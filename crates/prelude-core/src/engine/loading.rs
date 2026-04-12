@@ -273,7 +273,7 @@ fn load_safetensor_parts(
     // constructors can read cache/runtime settings via global accessors.
     crate::config::init_global_config(&engine_config);
 
-    let built = build_model_variant(
+    let mut built = build_model_variant(
         &resolved,
         vb,
         embedding_modules.as_ref(),
@@ -286,6 +286,28 @@ fn load_safetensor_parts(
 
     // Read KV sharing map from model before moving it into the executor.
     let kv_sharing = built.model.kv_cache_sharing();
+
+    // ── Activation memory profiling (vLLM-style) ──────────────────
+    //
+    // Before sizing the KV cache, run a dummy forward pass to measure
+    // peak GPU memory consumed by activations. This is the same
+    // approach vLLM uses in `determine_available_memory`:
+    //
+    //   available_kv = total * utilization - weights - peak_activation
+    //
+    // Without this, the 10% reserve from `gpu_memory_utilization=0.9`
+    // can be insufficient for large-vocab MoE models (Qwen3.5-35B-A3B
+    // needs ~8 GB for the lm_head matmul alone at 8192 tokens).
+    let peak_activation_bytes = if device.is_cuda() {
+        profile_peak_activation(
+            &mut built.model,
+            &device,
+            &common_config,
+            dtype,
+        ).unwrap_or(0)
+    } else {
+        0
+    };
 
     let executor = ModelExecutor {
         model: Mutex::new(built.model),
@@ -304,6 +326,7 @@ fn load_safetensor_parts(
         &executor.runtime_caps,
         &engine_config.cache,
         &kv_sharing,
+        peak_activation_bytes,
     )?;
 
     tracing::info!(
@@ -729,6 +752,103 @@ fn download_tokenizer(model_id: &str) -> Result<Tokenizer, EngineError> {
         .map_err(|e| EngineError::Internal(format!("failed to download tokenizer.json: {e}")))?;
     Tokenizer::from_file(tokenizer_path.as_path())
         .map_err(|e| EngineError::Internal(format!("failed to load tokenizer: {e}")))
+}
+
+/// Profile peak GPU activation memory via a dummy forward pass.
+///
+/// Mirrors vLLM's `determine_available_memory` approach: measures the
+/// GPU memory consumed by a single forward pass with
+/// `max_num_batched_tokens` tokens, so the KV cache auto-sizer can
+/// subtract this from available memory instead of using a fixed 10%
+/// reserve that's insufficient for large-vocab MoE models.
+///
+/// Since our forward requires a full `BatchAttnContext` (which in turn
+/// requires the KV cache we're trying to size — circular dependency),
+/// we use `forward_with_cache` (the simpler non-paged path) with a
+/// dummy input. This exercises the full model (all layers + lm_head)
+/// without needing a paged KV cache.
+///
+/// Returns 0 on any failure — the caller falls back to the old
+/// heuristic (which works for small models; only large-vocab MoE
+/// models hit the edge case).
+fn profile_peak_activation(
+    model: &mut ModelVariant,
+    device: &Device,
+    config: &crate::engine::CommonModelConfig,
+    dtype: DType,
+) -> Result<usize, EngineError> {
+    use crate::tensor::Tensor;
+
+    let ops = crate::ops::select_ops(device);
+
+    let free_before = ops.gpu_free_memory().unwrap_or(0);
+    let total = ops.gpu_total_memory().unwrap_or(0);
+    if free_before == 0 || total == 0 {
+        return Ok(0);
+    }
+
+    // Use a representative token count. vLLM uses max_num_batched_tokens
+    // (default 8192). We use a smaller count (2048) to avoid OOM during
+    // profiling itself — the per-token activation cost scales linearly,
+    // so we can extrapolate.
+    let profile_tokens = 2048usize;
+    let max_tokens = 8192usize; // scheduler's max_num_batched_tokens default
+
+    tracing::info!(
+        profile_tokens,
+        free_before_mb = free_before / (1024 * 1024),
+        "profiling peak activation memory"
+    );
+
+    // Run a dummy forward through the model's cached path (doesn't need
+    // paged KV cache — uses simple per-layer KV caching internally).
+    let dummy_input = Tensor::zeros(
+        (1, profile_tokens),
+        crate::tensor::DType::U32,
+        device,
+    ).map_err(tensor_err)?;
+
+    // forward_with_cache runs through all layers + lm_head, producing
+    // [1, profile_tokens, vocab_size] logits — this is the peak
+    // activation consumer.
+    if let Some(m) = model.as_kv_cache_model() {
+        let _logits = m.forward_with_cache(&dummy_input, 0).map_err(tensor_err)?;
+        // logits are alive → peak memory is captured by cudaMemGetInfo
+        let free_during = ops.gpu_free_memory().unwrap_or(free_before);
+        let peak_at_profile = free_before.saturating_sub(free_during);
+
+        // Extrapolate to max_tokens (linear scaling for attention +
+        // lm_head, which dominate activation memory).
+        let peak_at_max = if profile_tokens > 0 {
+            peak_at_profile * max_tokens / profile_tokens
+        } else {
+            0
+        };
+
+        // Clear KV cache state from the profiling run so it doesn't
+        // persist into actual inference.
+        drop(_logits);
+        model.clear_kv_cache();
+
+        tracing::info!(
+            peak_at_profile_mb = peak_at_profile / (1024 * 1024),
+            peak_at_max_mb = peak_at_max / (1024 * 1024),
+            profile_tokens,
+            max_tokens,
+            "activation profiling complete"
+        );
+
+        Ok(peak_at_max)
+    } else {
+        // Model doesn't support forward_with_cache (unusual).
+        // Fall back to config-based estimate.
+        let lm_head_bytes = max_tokens * config.vocab_size * dtype.size_in_bytes();
+        tracing::info!(
+            lm_head_mb = lm_head_bytes / (1024 * 1024),
+            "using config-based activation estimate (no KV cache model)"
+        );
+        Ok(lm_head_bytes)
+    }
 }
 
 pub(crate) struct BuiltModel {

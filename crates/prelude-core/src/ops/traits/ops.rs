@@ -485,6 +485,7 @@ pub trait Ops: Send + Sync {
     fn end_forward(&self) {}
     fn precompute_paged_plan(&self, _q_shape: (usize, usize, usize), _kc: &Tensor, _csq: &Tensor, _bt: &Tensor, _csk: &Tensor, _scale: f32) -> Result<()> { Ok(()) }
     fn gpu_free_memory(&self) -> Option<usize> { None }
+    fn gpu_total_memory(&self) -> Option<usize> { None }
 }
 
 /// Re-export candle-nn rope_thd for use in default implementations.

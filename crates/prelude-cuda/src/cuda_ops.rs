@@ -294,6 +294,11 @@ impl Ops for CudaOps {
         let (mut free, mut total) = (0usize, 0usize);
         if unsafe { cudaMemGetInfo(&mut free, &mut total) } == 0 { Some(free) } else { None }
     }
+    fn gpu_total_memory(&self) -> Option<usize> {
+        unsafe extern "C" { fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32; }
+        let (mut free, mut total) = (0usize, 0usize);
+        if unsafe { cudaMemGetInfo(&mut free, &mut total) } == 0 { Some(total) } else { None }
+    }
 }
 
 // ── Attention dispatch helpers ─────────────────────────────────────
