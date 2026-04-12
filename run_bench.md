@@ -44,7 +44,7 @@ Default workflow. Ours always runs fresh, baselines are cached.
 ./benchmark/microbench/run.sh --all --force    # force re-run baselines
 
 # Remote (clone repo first to get run.sh + baseline scripts)
-git clone -b refactor https://github.com/Virtue-Research/prelude.git && cd prelude
+git clone --recursive -b refactor https://github.com/Virtue-Research/prelude.git && cd prelude
 ./benchmark/microbench/run.sh --all
 ```
 
