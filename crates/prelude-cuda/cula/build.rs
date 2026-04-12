@@ -145,9 +145,6 @@ fn main() {
     // ── Phase 3: archive + dispatch codegen ─────────────────────────
     if has_dsl_kernels {
         let objects = archive::collect_obj_files(&kernels_dir);
-        // cuLA's compile script mangles variant parameters into the
-        // .o basename (e.g. `cula_kda_decode_small_varlen_h16_...`),
-        // so Replace mode is correct — every object is uniquely named.
         let _ = archive::archive_and_whole_link(
             &objects,
             &out_dir,
@@ -155,6 +152,9 @@ fn main() {
             ArMode::Replace,
         )
         .map_err(|e| panic!("{e}"));
+        // cuda_dialect_runtime_static is linked through tvm-static-ffi
+        // (which whole-archives it). Don't link it again here — fat LTO
+        // would see duplicate symbols.
     }
     generate_dispatch_code(&kernels_dir, &out_dir, has_dsl_kernels);
 
@@ -315,7 +315,7 @@ fn compile_dsl_kernels(
     // stable callable for the dispatch table.
     let env: [(&str, String); 1] = [("CUTE_DSL_ENABLE_TVM_FFI", "1".to_string())];
 
-    dsl::run(&DslCompile {
+    let ok = dsl::run(&DslCompile {
         python: &python,
         script: &script,
         kernels_dir,
@@ -327,7 +327,9 @@ fn compile_dsl_kernels(
         label: "cuLA",
         sticky_failure: true,
     })
-    .unwrap_or(false)
+    .unwrap_or(false);
+
+    ok
 }
 
 /// Provision (or reuse) the cuLA venv with torch + flash-linear-attention

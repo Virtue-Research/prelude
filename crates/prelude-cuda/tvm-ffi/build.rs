@@ -91,23 +91,14 @@ fn main() -> Result<()> {
         .try_compile("tvm_ffi_static")
         .context("Failed to compile vendored tvm_ffi")?;
 
-    // ── Phase 3: Link cuda_dialect_runtime_static.a ────────────────
-    // This archive is materialised by the FA4 build's Python venv (which
-    // cuda-dialect builds from CuTeDSL sources). We walk the workspace's
-    // `target/fa4-venv` to find it; if the consumer doesn't have FA4 set up
-    // this simply does nothing and the runtime pieces that needed it stay
-    // unlinkable — which is fine for pure DSL-less consumers.
-    let workspace_root = manifest_dir
-        .parent().unwrap()  // crates/prelude-cuda/
-        .parent().unwrap()  // crates/
-        .parent().unwrap(); // workspace root
-    let venv_dir = workspace_root.join("target/fa4-venv");
-    if let Some(p) = find_file_recursive(&venv_dir, "libcuda_dialect_runtime_static.a") {
-        println!("cargo:rustc-link-search=native={}", p.parent().unwrap().display());
-        println!("cargo:rustc-link-lib=static:+whole-archive=cuda_dialect_runtime_static");
-    }
+    // NOTE: cuda_dialect_runtime_static.a (the MLIR-generated shim for
+    // _cudaGetDevice etc.) is linked from prelude-cuda's build.rs, NOT
+    // here. tvm-static-ffi builds BEFORE the cuLA/FA4 crates that create
+    // the Python venvs where the .a lives, so searching for it here is a
+    // build-order race: works on warm builds (venv from previous build
+    // still on disk), fails on fresh clones.
 
-    // ── Phase 4: Link CUDA runtime ─────────────────────────────────
+    // ── Phase 3: Link CUDA runtime ─────────────────────────────────
     for candidate in [
         "/opt/cuda/targets/x86_64-linux/lib",
         "/opt/cuda/lib64",

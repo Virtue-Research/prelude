@@ -222,6 +222,63 @@ impl PythonVenv {
     }
 }
 
+/// Locate the `nvidia_cutlass_dsl` package's `lib/` directory inside a
+/// Python environment. Returns the path to the directory containing
+/// `libcuda_dialect_runtime_static.a` — which must be linked by any
+/// crate whose `.o` files were produced by `cute.compile → export_to_c`
+/// (both cuLA and FA4 DSL kernels need it).
+///
+/// The `cuda_dialect_runtime` library provides the MLIR-generated shims
+/// (`_cudaGetDevice`, `cuda_dialect_init_library_once`, etc.) that the
+/// CuTeDSL code generator emits as external references. Without it, fat
+/// LTO builds fail with ~500 undefined symbols from
+/// `libcula_dsl_kernels.a` / `libfa4_kernels.a`.
+///
+/// `python` is the venv's Python binary (typically from
+/// `PythonVenv::python_path()`). Returns `None` if the package isn't
+/// installed or the lib dir doesn't exist.
+pub fn find_cutlass_dsl_lib(python: &Path) -> Option<PathBuf> {
+    let output = Command::new(python)
+        .args(["-c", "import nvidia_cutlass_dsl; print(nvidia_cutlass_dsl.__path__[0])"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let pkg_root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let lib_dir = pkg_root.join("lib");
+    if lib_dir.join("libcuda_dialect_runtime_static.a").exists() {
+        Some(lib_dir)
+    } else {
+        None
+    }
+}
+
+/// Emit `cargo:rustc-link-*` directives to link the
+/// `cuda_dialect_runtime_static` library from the cutlass-dsl package.
+/// Call this after DSL kernel `.o` files have been archived.
+///
+/// Returns `true` if the library was found and the directives were
+/// emitted, `false` if the library wasn't found (caller should decide
+/// whether to warn or error).
+pub fn link_cutlass_dsl_runtime(python: &Path) -> bool {
+    if let Some(lib_dir) = find_cutlass_dsl_lib(python) {
+        println!("cargo:rustc-link-search=native={}", lib_dir.display());
+        println!("cargo:rustc-link-lib=static=cuda_dialect_runtime_static");
+        build_log!(
+            "linked libcuda_dialect_runtime_static.a from {}",
+            lib_dir.display()
+        );
+        true
+    } else {
+        build_log!(
+            "WARNING: nvidia_cutlass_dsl lib/ not found — cuda_dialect_runtime \
+             will be missing, dist/LTO builds may fail with undefined symbols"
+        );
+        false
+    }
+}
+
 /// Options for a single [`PythonVenv::pip_install`] call. Default is an
 /// empty struct — opt into extras via the builder methods.
 #[derive(Debug, Default, Clone, Copy)]

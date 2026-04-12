@@ -58,10 +58,17 @@ fn main() -> Result<()> {
 
     // Phase 3: Archive the .o files and generate the dispatch table.
     let objects = archive::collect_obj_files(&kernels_dir);
-    // FA4 kernels have unique basenames per variant (fa4_fwd_hdim64_...)
-    // so replace-in-place is correct and the cheapest option.
-    let has_kernels = archive::archive_and_whole_link(&objects, &out_dir, "fa4_kernels", ArMode::Replace)
-        .map_err(anyhow::Error::msg)?;
+    let has_kernels = archive::archive_and_whole_link(
+        &objects,
+        &out_dir,
+        "fa4_kernels",
+        ArMode::Replace,
+    )
+    .map_err(anyhow::Error::msg)?;
+
+    // cuda_dialect_runtime_static is linked through tvm-static-ffi
+    // (which whole-archives it). Don't link it again here — fat LTO
+    // would see duplicate symbols.
 
     generate_dispatch_code(&kernels_dir, &out_dir, has_kernels)?;
 

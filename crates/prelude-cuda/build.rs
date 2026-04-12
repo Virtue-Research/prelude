@@ -144,4 +144,85 @@ fn main() {
         // linking cudart_static just for this one .a file.
         link_cuda_runtime_dynamic(&cuda_root);
     }
+
+    // ── Phase 3: Link cuda_dialect_runtime_static.a ─────────────────
+    //
+    // The MLIR-generated .o files in cuLA/FA4's DSL kernel archives
+    // reference `_cudaGetDevice`, `cuda_dialect_init_library_once`, etc.
+    // These are provided by `libcuda_dialect_runtime_static.a` which
+    // ships inside the `nvidia_cutlass_dsl` Python package.
+    //
+    // This MUST happen in prelude-cuda's build.rs (not tvm-static-ffi's)
+    // because prelude-cuda builds AFTER cuLA and FA4, so their Python
+    // venvs (where the .a lives) are guaranteed to exist. tvm-static-ffi
+    // builds BEFORE them and would race on a fresh clone.
+    //
+    // Search both the cuLA venv and the FA4 venv — whichever exists
+    // first wins (they install the same cutlass-dsl version).
+    link_cuda_dialect_runtime(&out_dir, std::path::Path::new(&manifest_dir));
+}
+
+fn link_cuda_dialect_runtime(out_dir: &std::path::Path, manifest_dir: &std::path::Path) {
+    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
+
+    // Candidate venv locations — cuLA's venv is inside its OUT_DIR,
+    // FA4's is at a stable workspace-level path.
+    let fa4_venv = workspace_root.join("target/fa4-venv");
+
+    // Also scan cuLA's OUT_DIR-based venv. We can't know the exact
+    // hash Cargo picks, but we can walk the build dir.
+    let candidates: Vec<std::path::PathBuf> = vec![
+        fa4_venv,
+    ];
+
+    // Also look in cuLA build dirs
+    let cula_build_dir = workspace_root.join("target");
+    for profile in ["debug", "release", "dist"] {
+        let build_dir = cula_build_dir.join(profile).join("build");
+        if let Ok(entries) = std::fs::read_dir(&build_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("cula-") || name_str.starts_with("prelude-cula-") {
+                    let venv = entry.path().join("out/cula-venv");
+                    if venv.exists() {
+                        let lib = venv.join("lib/python3.12/site-packages/nvidia_cutlass_dsl/lib");
+                        if lib.join("libcuda_dialect_runtime_static.a").exists() {
+                            println!("cargo:rustc-link-search=native={}", lib.display());
+                            println!("cargo:rustc-link-lib=static:+whole-archive=cuda_dialect_runtime_static");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Check FA4 venv
+    for candidate in &candidates {
+        if let Some(found) = find_file_recursive(candidate, "libcuda_dialect_runtime_static.a") {
+            println!("cargo:rustc-link-search=native={}", found.parent().unwrap().display());
+            println!("cargo:rustc-link-lib=static:+whole-archive=cuda_dialect_runtime_static");
+            return;
+        }
+    }
+
+    // Not found — warn but don't fail. CPU-only builds won't have it.
+    eprintln!("  [prelude-cuda] WARNING: libcuda_dialect_runtime_static.a not found; \
+               dist/LTO builds with CuTeDSL kernels may fail to link");
+}
+
+fn find_file_recursive(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_file_recursive(&path, name) {
+                return Some(found);
+            }
+        } else if path.file_name().is_some_and(|n| n == name) {
+            return Some(path);
+        }
+    }
+    None
 }
