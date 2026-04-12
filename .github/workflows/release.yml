@@ -103,10 +103,81 @@ jobs:
           echo "Binary: $(du -h prelude-server | cut -f1)"
           echo "Compressed: $(du -h prelude-server.gz | cut -f1)"
 
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-binary
+          path: release/
+
+  build-windows:
+    runs-on: windows-2022
+    steps:
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.16
+        with:
+          cuda: '12.8.0'
+          method: 'network'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install sccache
+        uses: mozilla/sccache-action@v0.0.7
+
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Python + jinja2
+        run: |
+          pip install jinja2
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: windows-cargo-
+
+      - name: Build (dist profile)
+        run: |
+          cargo build --profile dist -p prelude-server --features full
+          echo "=== sccache stats ==="
+          sccache --show-stats
+
+      - name: Prepare release assets
+        run: |
+          New-Item -ItemType Directory -Force -Path release
+          Copy-Item target/dist/prelude-server.exe release/
+          cd release
+          Get-FileHash prelude-server.exe -Algorithm SHA256 | Format-Table -AutoSize > SHA256SUMS-windows.txt
+          Compress-Archive prelude-server.exe prelude-server-windows.zip
+          Write-Host "Binary: $((Get-Item prelude-server.exe).Length / 1MB) MB"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-binary
+          path: release/
+
+  publish:
+    needs: [build, build-windows]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/prelude-server.gz
-            release/SHA256SUMS
+            artifacts/linux-binary/prelude-server.gz
+            artifacts/linux-binary/SHA256SUMS
+            artifacts/windows-binary/prelude-server-windows.zip
+            artifacts/windows-binary/SHA256SUMS-windows.txt
           generate_release_notes: true

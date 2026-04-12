@@ -92,7 +92,11 @@ impl PythonVenv {
     /// `python3 -m venv` when uv isn't on PATH. If a venv already lives
     /// at this path (i.e. `bin/python3` exists) it's reused as-is.
     pub fn ensure(venv_dir: &Path) -> Result<Self, String> {
-        let python = venv_dir.join("bin/python3");
+        let python = if cfg!(target_os = "windows") {
+            venv_dir.join("Scripts/python.exe")
+        } else {
+            venv_dir.join("bin/python3")
+        };
         let has_uv = has_uv();
 
         if !python.exists() {
@@ -169,7 +173,11 @@ impl PythonVenv {
             c.args(["pip", "install", "--python", &venv_python_str]);
             c
         } else {
-            let pip = self.venv_dir.join("bin/pip");
+            let pip = if cfg!(target_os = "windows") {
+                self.venv_dir.join("Scripts/pip.exe")
+            } else {
+                self.venv_dir.join("bin/pip")
+            };
             let mut c = Command::new(pip);
             c.arg("install");
             c

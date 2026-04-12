@@ -94,21 +94,43 @@ pub fn archive_and_whole_link(
             .map_err(|e| format!("failed to remove stale {}: {e}", archive_path.display()))?;
     }
 
-    let ar_flags = match mode {
-        ArMode::Replace => "rcs",
-        ArMode::Append => "qcs",
-    };
-
-    let mut cmd = Command::new("ar");
-    cmd.arg(ar_flags).arg(&archive_path);
-    for obj in objects {
-        cmd.arg(obj);
+    #[cfg(not(target_os = "windows"))]
+    {
+        let ar_flags = match mode {
+            ArMode::Replace => "rcs",
+            ArMode::Append => "qcs",
+        };
+        let mut cmd = Command::new("ar");
+        cmd.arg(ar_flags).arg(&archive_path);
+        for obj in objects {
+            cmd.arg(obj);
+        }
+        let status = cmd
+            .status()
+            .map_err(|e| format!("ar spawn failed: {e}"))?;
+        if !status.success() {
+            return Err(format!("ar failed to create lib{lib_name}.a"));
+        }
     }
-    let status = cmd
-        .status()
-        .map_err(|e| format!("ar spawn failed: {e}"))?;
-    if !status.success() {
-        return Err(format!("ar failed to create lib{lib_name}.a"));
+
+    #[cfg(target_os = "windows")]
+    {
+        // Windows: use lib.exe (MSVC archiver). Mode is always
+        // replace — lib.exe doesn't have an append-only mode, but
+        // since we rebuild from scratch each time (Append mode
+        // removes stale archives above) this is equivalent.
+        let _ = mode; // suppress unused warning
+        let mut cmd = Command::new("lib");
+        cmd.arg(format!("/OUT:{}", archive_path.display()));
+        for obj in objects {
+            cmd.arg(obj);
+        }
+        let status = cmd
+            .status()
+            .map_err(|e| format!("lib.exe spawn failed: {e}"))?;
+        if !status.success() {
+            return Err(format!("lib.exe failed to create {}", archive_path.display()));
+        }
     }
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());

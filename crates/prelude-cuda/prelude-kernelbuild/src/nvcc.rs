@@ -42,8 +42,12 @@ use crate::build_log;
 // ─────────────────────────────────────────────────────────────────────
 
 /// Locate the CUDA toolkit root. Checks `CUDA_HOME`, then `CUDA_PATH`,
-/// then common install paths (`/usr/local/cuda`, `/opt/cuda`), and finally
-/// panics with a clear error if none are found.
+/// then platform-specific default install paths, and panics with a clear
+/// error if none are found.
+///
+/// Platform defaults:
+///   Linux:   `/usr/local/cuda`, `/opt/cuda`
+///   Windows: `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*`
 pub fn find_cuda() -> PathBuf {
     if let Ok(p) = env::var("CUDA_HOME") {
         return PathBuf::from(p);
@@ -51,22 +55,46 @@ pub fn find_cuda() -> PathBuf {
     if let Ok(p) = env::var("CUDA_PATH") {
         return PathBuf::from(p);
     }
-    for p in ["/usr/local/cuda", "/opt/cuda"] {
-        if Path::new(p).join("bin/nvcc").exists() {
-            return PathBuf::from(p);
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        for p in ["/usr/local/cuda", "/opt/cuda"] {
+            if Path::new(p).join("bin/nvcc").exists() {
+                return PathBuf::from(p);
+            }
         }
     }
+
+    #[cfg(target_os = "windows")]
+    {
+        let base = Path::new(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA");
+        if base.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(base) {
+                let mut versions: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.join("bin/nvcc.exe").exists())
+                    .collect();
+                versions.sort();
+                if let Some(latest) = versions.pop() {
+                    return latest;
+                }
+            }
+        }
+    }
+
     panic!(
         "CUDA toolkit not found. Set CUDA_HOME or CUDA_PATH to point at \
-         a directory containing bin/nvcc."
+         a directory containing bin/nvcc{}.",
+        if cfg!(target_os = "windows") { ".exe" } else { "" }
     );
 }
 
-/// Return the nvcc path for a given CUDA root, panicking with a clear
-/// message if nvcc is missing. Every consumer crate does this exact check;
-/// centralizing it gives uniform error messages.
+/// Return the nvcc binary path for a given CUDA root. On Windows the
+/// binary is `bin/nvcc.exe`.
 pub fn nvcc_path(cuda_root: &Path) -> PathBuf {
-    let nvcc = cuda_root.join("bin/nvcc");
+    let name = if cfg!(target_os = "windows") { "bin/nvcc.exe" } else { "bin/nvcc" };
+    let nvcc = cuda_root.join(name);
     if !nvcc.exists() {
         panic!(
             "nvcc not found at {}. Is CUDA_HOME/CUDA_PATH pointing at a \
@@ -96,7 +124,14 @@ pub fn detect_compute_cap() -> Option<u32> {
         }
     }
 
-    let output = Command::new("nvidia-smi")
+    // nvidia-smi is in PATH on Linux; on Windows it lives in the
+    // driver directory and may or may not be in PATH.
+    let smi = if cfg!(target_os = "windows") {
+        "nvidia-smi.exe"
+    } else {
+        "nvidia-smi"
+    };
+    let output = Command::new(smi)
         .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
         .output()
         .ok()?;
@@ -214,33 +249,57 @@ pub fn file_hash(path: &Path) -> Option<String> {
 // ─────────────────────────────────────────────────────────────────────
 
 /// Emit the `cargo:rustc-link-*` directives every kernel crate needs to
-/// pull in the CUDA runtime + its standard companion libs (rt, dl, stdc++).
-/// Prefers the static runtime (`libcudart_static.a`) so the consumer
-/// binary doesn't need `libcudart.so` at runtime.
+/// pull in the CUDA runtime + its standard companion libs. Prefers the
+/// static runtime so the consumer binary doesn't need the CUDA runtime
+/// shared library at run time.
+///
+/// Platform-specific:
+///   Linux:   `libcudart_static.a` + `-lrt -ldl -lstdc++`
+///   Windows: `cudart_static.lib` (no rt/dl, stdc++ is MSVC CRT)
 pub fn link_cuda_runtime_static(cuda_path: &Path) {
-    let cuda_lib = cuda_path.join("lib64");
-    if cuda_lib.exists() {
-        println!("cargo:rustc-link-search=native={}", cuda_lib.display());
-    }
-    let cuda_targets_lib = cuda_path.join("targets/x86_64-linux/lib");
-    if cuda_targets_lib.exists() {
-        println!("cargo:rustc-link-search=native={}", cuda_targets_lib.display());
-    }
+    emit_cuda_lib_search_paths(cuda_path);
     println!("cargo:rustc-link-lib=static=cudart_static");
-    println!("cargo:rustc-link-lib=dylib=rt");
-    println!("cargo:rustc-link-lib=dylib=dl");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        println!("cargo:rustc-link-lib=dylib=rt");
+        println!("cargo:rustc-link-lib=dylib=dl");
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
 }
 
 /// Dynamic variant of [`link_cuda_runtime_static`] — links against
-/// `libcudart.so`. Only used by the top-level `prelude-cuda` build (which
-/// already depends on libcudart being available for cudarc's runtime).
+/// `libcudart.so` / `cudart.lib`. Only used by the top-level
+/// `prelude-cuda` build (which already depends on the dynamic runtime
+/// for cudarc).
 pub fn link_cuda_runtime_dynamic(cuda_path: &Path) {
-    let cuda_lib = cuda_path.join("lib64");
-    if cuda_lib.exists() {
-        println!("cargo:rustc-link-search=native={}", cuda_lib.display());
-    }
+    emit_cuda_lib_search_paths(cuda_path);
     println!("cargo:rustc-link-lib=dylib=cudart");
+}
+
+/// Emit `cargo:rustc-link-search=native=` for the CUDA lib directories
+/// that exist on this platform.
+fn emit_cuda_lib_search_paths(cuda_path: &Path) {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let cuda_lib = cuda_path.join("lib64");
+        if cuda_lib.exists() {
+            println!("cargo:rustc-link-search=native={}", cuda_lib.display());
+        }
+        let cuda_targets_lib = cuda_path.join("targets/x86_64-linux/lib");
+        if cuda_targets_lib.exists() {
+            println!("cargo:rustc-link-search=native={}", cuda_targets_lib.display());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Windows CUDA Toolkit: lib/x64/ holds .lib files
+        let cuda_lib = cuda_path.join("lib/x64");
+        if cuda_lib.exists() {
+            println!("cargo:rustc-link-search=native={}", cuda_lib.display());
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -393,7 +452,9 @@ pub fn compile_cu_to_obj(nvcc: &Path, opts: &ObjCompile<'_>) {
         .arg(opts.opt_level.as_deref().unwrap_or("-O3"))
         .arg("--expt-relaxed-constexpr")
         .arg("--expt-extended-lambda");
-    if opts.fpic {
+    // -fPIC is Linux-only (ELF position-independent code). Windows
+    // COFF is always position-independent so the flag doesn't exist.
+    if opts.fpic && !cfg!(target_os = "windows") {
         cmd.arg("-Xcompiler").arg("-fPIC");
     }
     for g in &opts.gencodes {
