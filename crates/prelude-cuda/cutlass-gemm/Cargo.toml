@@ -17,3 +17,4 @@ float8 = "0.7.0"
 rand = "0.10.0"
 
 [build-dependencies]
+prelude-kernelbuild = { workspace = true }

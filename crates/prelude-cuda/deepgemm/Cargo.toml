@@ -13,6 +13,9 @@ path = "src/lib.rs"
 
 [dependencies]
 
+[build-dependencies]
+prelude-kernelbuild = { workspace = true }
+
 [dev-dependencies]
 cudarc = { version = "0.19.4", features = ["std", "cuda-version-from-build-system", "f16", "cublas", "cublaslt"] }
 half = "2.7.1"

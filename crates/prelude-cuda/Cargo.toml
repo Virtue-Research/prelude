@@ -13,6 +13,9 @@ path = "src/lib.rs"
 [features]
 default = []
 
+[build-dependencies]
+prelude-kernelbuild = { workspace = true }
+
 [dependencies]
 prelude-core = { path = "../prelude-core", features = ["cuda"] }
 candle-core = { workspace = true, features = ["cuda"] }

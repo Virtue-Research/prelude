@@ -11,6 +11,7 @@ members = [
     "crates/prelude-cuda/quant-gemm",
     "crates/prelude-cuda/cula",
     "crates/prelude-cuda/causal-conv1d",
+    "crates/prelude-cuda/prelude-kernelbuild",
     "crates/onednn-ffi",
 ]
 resolver = "2"
@@ -65,6 +66,9 @@ flashinfer     = { version = "0.1.0", path = "crates/prelude-cuda/flashinfer" }
 quant-gemm     = { version = "0.1.0", path = "crates/prelude-cuda/quant-gemm" }
 causal-conv1d  = { version = "0.1.0", path = "crates/prelude-cuda/causal-conv1d" }
 onednn-ffi     = { version = "0.1.0", path = "crates/onednn-ffi" }
+
+# Build-support library — used from kernel crates' build.rs only, not runtime.
+prelude-kernelbuild = { version = "0.1.0", path = "crates/prelude-cuda/prelude-kernelbuild" }
 
 # Tokenization & model loading
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }

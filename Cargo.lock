@@ -726,6 +726,7 @@ dependencies = [
  "cudarc 0.19.4",
  "float8",
  "half",
+ "prelude-kernelbuild",
  "rand 0.10.0",
 ]
 
@@ -785,6 +786,7 @@ version = "0.1.0"
 dependencies = [
  "cudarc 0.19.4",
  "half",
+ "prelude-kernelbuild",
  "rand 0.10.0",
 ]
 
@@ -2715,10 +2717,21 @@ dependencies = [
  "half",
  "inventory",
  "prelude-core",
+ "prelude-kernelbuild",
  "quant-gemm",
  "tokio",
  "tracing",
  "tvm-static-ffi",
+]
+
+[[package]]
+name = "prelude-kernelbuild"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

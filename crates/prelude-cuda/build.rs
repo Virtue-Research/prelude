@@ -1,26 +1,38 @@
-fn main() {
-    // ── Compile custom CUDA kernels to PTX (loaded at runtime via cudarc) ──
-    use std::path::PathBuf;
-    use std::process::Command;
-    use std::sync::Arc;
+//! Build script for `prelude-cuda`: compiles the custom in-tree CUDA
+//! kernels under `src/kernels/kernels_src/` and the standalone MOE WMMA
+//! static lib. CUDA toolkit discovery, compute-cap detection, and nvcc
+//! invocation all live in `prelude_kernelbuild::nvcc`.
+//!
+//! Two output artifacts:
+//!
+//!   1. A set of `.ptx` files (one per kernel) placed in `OUT_DIR`, loaded
+//!      at runtime via cudarc's `get_or_load_custom_func`. These are
+//!      framework-agnostic — each is a single `.cu → .ptx` via nvcc.
+//!
+//!   2. `libmoe_wmma.a` — a static lib built from `candle/moe_wmma.cu`
+//!      that gets whole-archive linked into prelude-cuda so the WMMA
+//!      intrinsics are callable through FFI. This one needs `-fPIC` and
+//!      links `libcudart.so` dynamically (we already depend on cudarc's
+//!      dylib lookup for all the PTX kernels anyway).
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use prelude_kernelbuild::nvcc::{
+    compile_cu_to_obj, compile_cu_to_ptx, detect_compute_cap, find_cuda, link_cuda_runtime_dynamic,
+    nvcc_path, ObjCompile, PtxCompile,
+};
+
+fn main() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let kernels_dir = PathBuf::from(&manifest_dir).join("src/kernels/kernels_src");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
-    // Find nvcc
-    let cuda_root = std::env::var("CUDA_HOME")
-        .or_else(|_| std::env::var("CUDA_PATH"))
-        .unwrap_or_else(|_| "/usr/local/cuda".to_string());
-    let nvcc = PathBuf::from(&cuda_root).join("bin/nvcc");
+    let cuda_root = find_cuda();
+    let nvcc = nvcc_path(&cuda_root);
 
-    // Detect GPU compute capability, default to sm_80 (Ampere)
+    // Default to sm_80 when no GPU is visible (cross-compile on CI).
     let compute_cap = detect_compute_cap().unwrap_or(80);
-    let arch_flag = format!("-arch=sm_{compute_cap}");
-
-    // Include paths for common headers (our own + candle's)
-    let include_flag = format!("-I{}", kernels_dir.display());
-    let candle_include_flag = format!("-I{}", kernels_dir.join("candle").display());
 
     // Define kernel modules: (category, filename, output_name)
     let kernel_modules = [
@@ -61,122 +73,74 @@ fn main() {
         println!("cargo:rerun-if-changed={}", kernel_src.display());
     }
 
-    // Compile all PTX kernels in parallel
+    // ── Phase 1: PTX kernels (parallel nvcc --ptx invocations) ──────
     let nvcc = Arc::new(nvcc);
-    let arch_flag = Arc::new(arch_flag);
-    let include_flag = Arc::new(include_flag);
-    let candle_include_flag = Arc::new(candle_include_flag);
+    let kernels_dir_arc = Arc::new(kernels_dir.clone());
+    let out_dir_arc = Arc::new(out_dir.clone());
 
-    let handles: Vec<_> = kernel_modules.iter().map(|&(category, filename, output_name)| {
-        let kernels_dir = kernels_dir.clone();
-        let out_dir = out_dir.clone();
-        let nvcc = nvcc.clone();
-        let arch_flag = arch_flag.clone();
-        let include_flag = include_flag.clone();
-        let candle_include_flag = candle_include_flag.clone();
-        std::thread::spawn(move || {
-            let kernel_src = kernels_dir.join(category).join(filename);
-            let ptx_path = out_dir.join(format!("{output_name}.ptx"));
-            let mut args = vec![
-                "--ptx".to_string(),
-                kernel_src.to_str().unwrap().to_string(),
-                "-o".to_string(),
-                ptx_path.to_str().unwrap().to_string(),
-                arch_flag.to_string(),
-                include_flag.to_string(),
-                "-O3".to_string(),
-                "--use_fast_math".to_string(),
-                "--expt-relaxed-constexpr".to_string(),
-            ];
-            // Candle kernels need C++ std library for sort.cu templates
-            if category == "candle" {
-                args.push(candle_include_flag.to_string());
-                args.push("-std=c++17".to_string());
-            }
-            let status = Command::new(&*nvcc)
-                .args(&args)
-                .status()
-                .unwrap_or_else(|e| panic!("Failed to run nvcc at {}: {}", nvcc.display(), e));
-            assert!(status.success(), "nvcc PTX compilation of {filename} failed");
+    let handles: Vec<_> = kernel_modules
+        .iter()
+        .map(|&(category, filename, output_name)| {
+            let nvcc = nvcc.clone();
+            let kernels_dir = kernels_dir_arc.clone();
+            let out_dir = out_dir_arc.clone();
+            std::thread::spawn(move || {
+                let src = kernels_dir.join(category).join(filename);
+                let ptx = out_dir.join(format!("{output_name}.ptx"));
+
+                // `common/` headers live one level above the per-category
+                // subdir (e.g. `elementwise/add.cu` includes
+                // `common/common.cuh`). Pass the kernels root as -I so the
+                // relative include resolves.
+                let mut opts = PtxCompile::new(&src, &ptx, compute_cap)
+                    .include(kernels_dir.as_ref().clone());
+
+                // Candle-ported kernels use C++ templates (sort.cu) and need
+                // the candle/ include dir on top of the root.
+                if category == "candle" {
+                    opts = opts
+                        .include(kernels_dir.join("candle"))
+                        .extra_flag("-std=c++17");
+                }
+
+                compile_cu_to_ptx(&nvcc, &opts);
+            })
         })
-    }).collect();
+        .collect();
 
     for h in handles {
-        h.join().expect("nvcc compilation thread panicked");
+        h.join().expect("nvcc PTX compilation thread panicked");
     }
 
-    // ── Compile MOE WMMA kernel to static library (FFI, not PTX) ──
-    {
-        let moe_src = kernels_dir.join("candle").join("moe_wmma.cu");
+    // ── Phase 2: MOE WMMA static lib (FFI, not PTX) ─────────────────
+    let moe_src = kernels_dir.join("candle").join("moe_wmma.cu");
+    if moe_src.exists() {
+        println!("cargo:rerun-if-changed={}", moe_src.display());
+
         let moe_obj = out_dir.join("moe_wmma.o");
-        if moe_src.exists() {
-            let candle_inc = format!("-I{}", kernels_dir.join("candle").display());
-            let mut moe_args = vec![
-                "-c",
-                moe_src.to_str().unwrap(),
-                "-o",
-                moe_obj.to_str().unwrap(),
-                &arch_flag,
-                &candle_inc,
-                "-O3",
-                "--use_fast_math",
-                "--expt-relaxed-constexpr",
-                "-std=c++17",
-                "-Xcompiler", "-fPIC",
-            ];
-            if compute_cap < 80 {
-                moe_args.push("-DNO_BF16_KERNEL");
-            }
-            let status = Command::new(&*nvcc)
-                .args(&moe_args)
-                .status()
-                .unwrap_or_else(|e| panic!("Failed to compile moe_wmma.cu: {e}"));
-            assert!(status.success(), "nvcc compilation of moe_wmma.cu failed");
-
-            // Create static library
-            let moe_lib = out_dir.join("libmoe_wmma.a");
-            let status = Command::new("ar")
-                .args(["rcs", moe_lib.to_str().unwrap(), moe_obj.to_str().unwrap()])
-                .status()
-                .unwrap_or_else(|e| panic!("Failed to create libmoe_wmma.a: {e}"));
-            assert!(status.success(), "ar failed for moe_wmma");
-
-            println!("cargo:rustc-link-search=native={}", out_dir.display());
-            println!("cargo:rustc-link-lib=static=moe_wmma");
-            // Need to link CUDA runtime for the WMMA intrinsics
-            println!("cargo:rustc-link-lib=dylib=cudart");
-            println!("cargo:rerun-if-changed={}", moe_src.display());
+        let mut opts = ObjCompile::new(&moe_src, &moe_obj)
+            .include(kernels_dir.join("candle"))
+            .gencode(format!("-arch=sm_{compute_cap}"))
+            .cpp_std("-std=c++17");
+        if compute_cap < 80 {
+            opts = opts.define("-DNO_BF16_KERNEL");
         }
-    }
-}
+        compile_cu_to_obj(&nvcc, &opts);
 
-fn detect_compute_cap() -> Option<u32> {
-    if let Ok(arch_list) = std::env::var("CUDA_ARCH_LIST") {
-        if let Some(cap) = arch_list
-            .split(',')
-            .filter_map(|s| {
-                let s = s.trim().replace('.', "");
-                s.parse::<u32>().ok()
-            })
-            .max()
-        {
-            return Some(cap);
-        }
-    }
+        // Archive the single object into libmoe_wmma.a so the linker
+        // treats it as a normal static lib dependency.
+        let moe_lib = out_dir.join("libmoe_wmma.a");
+        let status = std::process::Command::new("ar")
+            .args(["rcs", moe_lib.to_str().unwrap(), moe_obj.to_str().unwrap()])
+            .status()
+            .unwrap_or_else(|e| panic!("Failed to create libmoe_wmma.a: {e}"));
+        assert!(status.success(), "ar failed for moe_wmma");
 
-    let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+        println!("cargo:rustc-link-search=native={}", out_dir.display());
+        println!("cargo:rustc-link-lib=static=moe_wmma");
+        // Dynamic libcudart is fine here — cudarc's dylib lookup already
+        // requires it at runtime, so we don't gain anything by statically
+        // linking cudart_static just for this one .a file.
+        link_cuda_runtime_dynamic(&cuda_root);
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .next()?
-        .trim()
-        .replace('.', "")
-        .parse::<u32>()
-        .ok()
 }
