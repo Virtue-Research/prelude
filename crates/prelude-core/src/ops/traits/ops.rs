@@ -345,6 +345,47 @@ pub trait Ops: Send + Sync {
         _head_dim: usize,
     ) -> Option<Result<(Tensor, Tensor, Tensor, Tensor, Tensor)>> { None }
 
+    /// Fused gather + log_softmax for prompt_logprobs extraction.
+    ///
+    /// Computes, for each row `t` of `logits`, the numerically-stable
+    /// log-probability of `target_ids[t]`:
+    ///
+    /// ```text
+    /// out[t] = logits[t, target_ids[t]] - logsumexp(logits[t])
+    /// ```
+    ///
+    /// Mirrors vLLM's fused Triton kernel
+    /// (`vllm/v1/worker/gpu/sample/logprob.py::_topk_log_softmax_kernel`):
+    /// two full-vocab reads + one tiny scalar write per token, with
+    /// **no `[T, V]` log_softmax temporary materialised**. For
+    /// Qwen3.5-35B-A3B's `T=1024, V≈152K` that saves ~622 MB of GPU
+    /// allocation and ~2.5× of HBM traffic vs the naive "log_softmax
+    /// then index_select" path.
+    ///
+    /// ## Inputs
+    /// - `logits`: `[num_tokens, vocab_size]` BF16 or F32. Reduction
+    ///   always happens in F32 internally regardless of input dtype
+    ///   (a ~150K-wide logsumexp in BF16 loses precision).
+    /// - `target_ids`: `[num_tokens]` U32 — the token index to gather
+    ///   per row. Out-of-range ids return `-inf` (safety clamp).
+    ///
+    /// ## Output
+    /// `[num_tokens]` F32 — one logprob per row.
+    ///
+    /// ## Backend semantics
+    /// `None` means the backend declines to serve the call (CPU
+    /// backend, unsupported dtype). Returns `Some(Ok(_))` on success
+    /// and `Some(Err(_))` on kernel launch failure. The caller is
+    /// expected to have a fallback path (e.g. the naive
+    /// `log_softmax` + `gather` on-device) when `None` is returned.
+    fn gather_log_softmax(
+        &self,
+        _logits: &Tensor,
+        _target_ids: &Tensor,
+    ) -> Option<Result<Tensor>> {
+        None
+    }
+
     /// Fused Gated DeltaNet (GDN) varlen prefill — matches FLA's
     /// `chunk_gated_delta_rule` semantics (Qwen3-next / Qwen3.5 family).
     ///

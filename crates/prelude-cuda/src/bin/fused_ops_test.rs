@@ -410,5 +410,122 @@ fn main() -> Result<()> {
         );
     }
 
+    // ── gather_log_softmax (vLLM-aligned fused prompt_logprobs) ─────
+    //
+    // Correctness: compare against candle's `log_softmax` + `gather`
+    // reference path. Qwen3.5-35B-A3B shape: [1024 tokens, 151_936
+    // vocab]. We test both BF16 and F32 logits.
+    println!("\n= gather_log_softmax (Qwen3.5-35B-A3B shape) =");
+    {
+        use prelude_core::tensor::D;
+
+        let num_tokens = 1024usize;
+        let vocab_size = 151_936usize;
+
+        // Random logits. We intentionally keep the dynamic range small
+        // so the reference softmax path doesn't NaN — the fused kernel
+        // handles larger ranges fine since it does max subtraction
+        // correctly, but the reference path will overflow in BF16 with
+        // spikier inputs.
+        let logits_f32 = Tensor::randn(0f64, 1.0, (num_tokens, vocab_size), &Device::Cpu)?
+            .to_device(&dev)?
+            .to_dtype(DType::F32)?;
+        let logits_bf16 = logits_f32.to_dtype(DType::BF16)?;
+
+        // Random target ids in [0, vocab_size).
+        let target_host: Vec<u32> = (0..num_tokens)
+            .map(|i| ((i * 7919) % vocab_size) as u32)
+            .collect();
+        let target = Tensor::from_vec(target_host.clone(), (num_tokens,), &dev)?;
+
+        // Reference: per-row log_softmax via `x - logsumexp(x, keepdim)`,
+        // then gather. Inlined because prelude-cuda doesn't depend on
+        // candle_nn and we don't want to pull it in just for the test
+        // scaffold.
+        let ref_log_softmax = |x: &Tensor| -> Result<Tensor> {
+            let x_f32 = x.to_dtype(DType::F32)?;
+            let max = x_f32.max_keepdim(D::Minus1)?;
+            let shifted = x_f32.broadcast_sub(&max)?;
+            let exp = shifted.exp()?;
+            let sum = exp.sum_keepdim(D::Minus1)?;
+            let lse = sum.log()?.broadcast_add(&max)?;
+            x_f32.broadcast_sub(&lse)
+        };
+        let reference_logprobs = |logits: &Tensor| -> Result<Vec<f32>> {
+            let log_probs = ref_log_softmax(logits)?;
+            let idx = target.reshape((num_tokens, 1))?;
+            let gathered = log_probs.gather(&idx, 1)?;
+            Ok(gathered.flatten_all()?.to_vec1::<f32>()?)
+        };
+
+        for (label, logits, tol) in [
+            ("F32", &logits_f32, 1e-4f32),
+            ("BF16", &logits_bf16, 5e-2f32), // BF16 input, F32 reduction
+        ] {
+            let ref_lp = reference_logprobs(logits)?;
+            let fused_tensor = must_fuse(
+                ops.gather_log_softmax(logits, &target),
+                "gather_log_softmax",
+            )?;
+            let fused_lp: Vec<f32> = fused_tensor.to_vec1()?;
+
+            let max_diff: f32 = ref_lp
+                .iter()
+                .zip(fused_lp.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            let mean_abs: f32 =
+                ref_lp.iter().map(|x| x.abs()).sum::<f32>() / ref_lp.len() as f32;
+            println!(
+                "  {label}: max_diff={max_diff:.6e} mean_abs={mean_abs:.4} relative={:.6e}",
+                max_diff / mean_abs.max(1e-8)
+            );
+            if max_diff > tol {
+                bail!(
+                    "gather_log_softmax {label} correctness failed: max_diff={max_diff:.6e} > tol={tol:.6e}"
+                );
+            }
+        }
+
+        // ── Perf: fused kernel vs candle reference path ────────────
+        let bench_fused = || -> Result<()> {
+            let _ = ops.gather_log_softmax(&logits_bf16, &target);
+            Ok(())
+        };
+        let bench_ref = || -> Result<()> {
+            let lp = ref_log_softmax(&logits_bf16)?;
+            let _ = lp.gather(&target.reshape((num_tokens, 1))?, 1)?;
+            Ok(())
+        };
+
+        // Warmup
+        for _ in 0..10 {
+            bench_fused()?;
+            bench_ref()?;
+        }
+        prelude_cuda::device::synchronize(&dev)?;
+
+        let iters = 50;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            bench_fused()?;
+        }
+        prelude_cuda::device::synchronize(&dev)?;
+        let fused_us = t0.elapsed().as_nanos() as f64 / iters as f64 / 1000.0;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            bench_ref()?;
+        }
+        prelude_cuda::device::synchronize(&dev)?;
+        let ref_us = t0.elapsed().as_nanos() as f64 / iters as f64 / 1000.0;
+
+        println!(
+            "  perf [T={num_tokens} V={vocab_size}]: fused={fused_us:.1} us, ref={ref_us:.1} us, speedup={:.1}x",
+            ref_us / fused_us
+        );
+    }
+
     Ok(())
 }

@@ -247,6 +247,16 @@ impl Ops for CudaOps {
         ))
     }
 
+    fn gather_log_softmax(
+        &self,
+        logits: &Tensor,
+        target_ids: &Tensor,
+    ) -> Option<Result<Tensor>> {
+        Some(crate::ops::gather_log_softmax::gather_log_softmax(
+            logits, target_ids,
+        ))
+    }
+
     fn gdn_prefill_varlen(
         &self,
         q: &Tensor,

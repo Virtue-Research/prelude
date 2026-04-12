@@ -22,6 +22,8 @@ pub const PTX_SCATTER_KV_CACHE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/scatter_kv_cache.ptx"));
 pub const PTX_GDN_POST_CONV: &str =
     include_str!(concat!(env!("OUT_DIR"), "/gdn_post_conv.ptx"));
+pub const PTX_GATHER_LOG_SOFTMAX: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/gather_log_softmax.ptx"));
 
 // ── General-purpose PTX kernels (ported from candle-kernels) ────
 pub const PTX_UNARY: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_unary.ptx"));
@@ -47,6 +49,7 @@ pub const MOD_KV_APPEND: &str = "kvcache_kv_append";
 pub const MOD_KNORM_ROPE_KV_WRITE: &str = "kvcache_knorm_rope_kv_write";
 pub const MOD_SCATTER_KV_CACHE: &str = "kvcache_scatter_kv_cache";
 pub const MOD_GDN_POST_CONV: &str = "gdn_post_conv";
+pub const MOD_GATHER_LOG_SOFTMAX: &str = "logprobs_gather_log_softmax";
 
 // ── General-purpose module names ────────────────────────────────
 pub const MOD_UNARY: &str = "candle_unary";

@@ -171,31 +171,83 @@ impl Engine {
                 .map_err(tensor_err)?;
             let last_logits = lm.compute_logits(&last_hidden).map_err(tensor_err)?;
 
-            // Extract per-token logprobs for prefill requests from hidden states.
+            // Extract per-token logprobs for prefill requests from hidden
+            // states.
+            //
+            // Pre-history: this loop used to materialise the full
+            // `[q_len, vocab_size]` log_softmax matrix on the GPU, copy
+            // ALL of it to the CPU via `to_vec2::<f32>()`, and then index
+            // into it position-by-position. For Qwen3.5-35B-A3B with
+            // q_len=1024 and vocab_size≈151_936 that's ~622 MB of D2H
+            // traffic per chunk — 291 chunks of a full WikiText-2 run
+            // was ~180 GB of pointless PCIe bandwidth and a ton of heap
+            // churn from allocating 1024 inner `Vec<f32>`s per chunk.
+            // Only the `q_len - 1` entries indexed by the next-token
+            // IDs are actually used.
+            //
+            // Fix: route through `ops.gather_log_softmax`, which on CUDA
+            // dispatches to a fused PTX kernel that mirrors vLLM's
+            // `_topk_log_softmax_kernel` — two full-vocab reads, one
+            // tiny scalar write per token, **no `[T, V]` log_softmax
+            // temporary materialised**. The D2H copy shrinks from 622
+            // MB to ~4 KB per chunk. For backends that don't implement
+            // the fused op (returns `None`) we fall through to an
+            // on-device gather-after-log_softmax path that still keeps
+            // D2H at O(q_len) but materialises the full matrix.
+            let hidden_device = hidden.device().clone();
             let mut all_logprobs: Vec<Option<Vec<f32>>> = Vec::with_capacity(num_requests);
             let mut token_offset = 0usize;
             for req in requests.iter() {
                 let q_len = req.tokens.len();
                 if req.prompt_logprobs.is_some() && q_len > 1 {
-                    // Compute logits for all tokens in this prefill span
-                    let span_hidden = hidden.narrow(0, token_offset, q_len).map_err(tensor_err)?;
-                    let span_logits = lm.compute_logits(&span_hidden).map_err(tensor_err)?;
-                    let span_logits_f32 = span_logits.to_dtype(DType::F32).map_err(tensor_err)?;
-                    // log_softmax for logprobs
-                    let log_probs = candle_nn::ops::log_softmax(&span_logits_f32, crate::tensor::D::Minus1)
+                    // Span of hidden states corresponding to this
+                    // request's prefill tokens. Drop the last position —
+                    // it has no "next token" to look up.
+                    let span_hidden = hidden
+                        .narrow(0, token_offset, q_len - 1)
                         .map_err(tensor_err)?;
-                    // Extract logprob of each next token: logprob[pos] = log_probs[pos, token[pos+1]]
-                    let log_probs_cpu = log_probs.to_vec2::<f32>().map_err(tensor_err)?;
-                    let mut token_logprobs = Vec::with_capacity(q_len - 1);
-                    for pos in 0..q_len - 1 {
-                        let next_tok = req.tokens[pos + 1] as usize;
-                        let lp = if next_tok < log_probs_cpu[pos].len() {
-                            log_probs_cpu[pos][next_tok]
-                        } else {
-                            f32::NEG_INFINITY
-                        };
-                        token_logprobs.push(lp);
-                    }
+                    let span_logits = lm.compute_logits(&span_hidden).map_err(tensor_err)?;
+
+                    // Next-token ids as a `[q_len - 1]` U32 tensor on
+                    // the same device as the logits.
+                    let next_tokens: Vec<u32> =
+                        req.tokens[1..q_len].iter().copied().collect();
+                    let target_ids =
+                        Tensor::from_vec(next_tokens, (q_len - 1,), &hidden_device)
+                            .map_err(tensor_err)?;
+
+                    let token_logprobs_tensor = match self
+                        .executor
+                        .ops
+                        .gather_log_softmax(&span_logits, &target_ids)
+                    {
+                        Some(res) => res.map_err(tensor_err)?,
+                        None => {
+                            // Fallback: materialise the full log_softmax
+                            // on the device, gather on GPU, tiny D2H.
+                            // Slower than the fused kernel (allocates a
+                            // full `[q_len - 1, vocab] F32` temp) but
+                            // still keeps D2H at O(q_len).
+                            let span_logits_f32 = span_logits
+                                .to_dtype(DType::F32)
+                                .map_err(tensor_err)?;
+                            let log_probs = candle_nn::ops::log_softmax(
+                                &span_logits_f32,
+                                crate::tensor::D::Minus1,
+                            )
+                            .map_err(tensor_err)?;
+                            let idx = target_ids
+                                .reshape((q_len - 1, 1))
+                                .map_err(tensor_err)?;
+                            log_probs
+                                .gather(&idx, 1)
+                                .map_err(tensor_err)?
+                                .flatten_all()
+                                .map_err(tensor_err)?
+                        }
+                    };
+                    let token_logprobs =
+                        token_logprobs_tensor.to_vec1::<f32>().map_err(tensor_err)?;
                     all_logprobs.push(Some(token_logprobs));
                 } else {
                     all_logprobs.push(None);
