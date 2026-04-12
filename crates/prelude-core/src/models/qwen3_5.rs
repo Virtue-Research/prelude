@@ -2282,7 +2282,7 @@ pub(crate) mod meta {
                 supports_paged_attn: device.is_cuda() && is_safetensors,
                 supports_varlen: device.is_cuda() && is_safetensors,
                 supports_deltanet: true,
-                supports_cuda_graph: false,
+                supports_cuda_graph: device.is_cuda() && is_safetensors,
             }
         }
 
