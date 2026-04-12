@@ -174,11 +174,8 @@ impl<'de> serde::Deserialize<'de> for Qwen3_5Config {
         Ok(Qwen3_5Config {
             vocab_size: resolve_or_warn!(r.vocab_size, 248320, "vocab_size", MODEL),
             hidden_size: resolve_or_warn!(r.hidden_size, 2048, "hidden_size", MODEL),
-            // MoE models don't have intermediate_size — they use
-            // moe_intermediate_size + shared_expert_intermediate_size.
-            // vLLM's Qwen3_5MoeTextConfig omits the field entirely.
-            intermediate_size: r.intermediate_size.unwrap_or(6144),
-            num_hidden_layers: resolve_or_warn!(r.num_hidden_layers, 40, "num_hidden_layers", MODEL),
+            intermediate_size: resolve_or_warn!(r.intermediate_size, 6144, "intermediate_size", MODEL),
+            num_hidden_layers: resolve_or_warn!(r.num_hidden_layers, 24, "num_hidden_layers", MODEL),
             num_attention_heads: resolve_or_warn!(r.num_attention_heads, 16, "num_attention_heads", MODEL),
             num_key_value_heads: resolve_or_warn!(r.num_key_value_heads, 2, "num_key_value_heads", MODEL),
             head_dim: resolve_or_warn!(r.head_dim, 256, "head_dim", MODEL),
@@ -189,7 +186,7 @@ impl<'de> serde::Deserialize<'de> for Qwen3_5Config {
             full_attention_interval: resolve_or_warn!(r.full_attention_interval, 4, "full_attention_interval", MODEL),
             attn_output_gate: resolve_or_warn!(r.attn_output_gate, true, "attn_output_gate", MODEL),
             linear_num_key_heads: resolve_or_warn!(r.linear_num_key_heads, 16, "linear_num_key_heads", MODEL),
-            linear_num_value_heads: resolve_or_warn!(r.linear_num_value_heads, 32, "linear_num_value_heads", MODEL),
+            linear_num_value_heads: resolve_or_warn!(r.linear_num_value_heads, 16, "linear_num_value_heads", MODEL),
             linear_key_head_dim: resolve_or_warn!(r.linear_key_head_dim, 128, "linear_key_head_dim", MODEL),
             linear_value_head_dim: resolve_or_warn!(r.linear_value_head_dim, 128, "linear_value_head_dim", MODEL),
             linear_conv_kernel_dim: resolve_or_warn!(r.linear_conv_kernel_dim, 4, "linear_conv_kernel_dim", MODEL),
@@ -198,10 +195,7 @@ impl<'de> serde::Deserialize<'de> for Qwen3_5Config {
             num_experts_per_tok: r.num_experts_per_tok,
             moe_intermediate_size: r.moe_intermediate_size,
             shared_expert_intermediate_size: r.shared_expert_intermediate_size,
-            // vLLM: getattr(config, "norm_topk_prob", True) — default True
-            // when not in config. Don't warn since this is the expected
-            // default for Qwen3.5 MoE models.
-            norm_topk_prob: r.norm_topk_prob.unwrap_or(true),
+            norm_topk_prob: resolve_or_warn!(r.norm_topk_prob, true, "norm_topk_prob", MODEL),
         })
     }
 }
