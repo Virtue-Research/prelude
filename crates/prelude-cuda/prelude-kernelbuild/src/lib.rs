@@ -16,9 +16,9 @@
 //!   wheel index detection, importability checks.
 //! * [`dispatch`] — TVM-FFI dispatch-table codegen: manifest parsing,
 //!   extern-block emission, stub generators for when no kernels compile.
-//!
-//! More modules (`dsl`, `archive`) land in follow-up commits as each
-//! consumer's build.rs is migrated.
+//! * [`archive`] — `.o` collection, `ar rcs` + whole-archive linking.
+//! * [`dsl`] — CuTeDSL compile driver: per-arch Python invocation,
+//!   script-hash cache invalidation, sticky failure markers.
 //!
 //! ## Design constraints
 //!
@@ -29,6 +29,7 @@
 
 pub mod archive;
 pub mod dispatch;
+pub mod dsl;
 pub mod log;
 pub mod nvcc;
 pub mod venv;

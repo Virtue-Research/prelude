@@ -33,8 +33,9 @@ use std::process::Command;
 use prelude_kernelbuild::archive;
 use prelude_kernelbuild::build_log;
 use prelude_kernelbuild::dispatch;
+use prelude_kernelbuild::dsl::{self, DslCompile, CULA_BOOTSTRAP};
 use prelude_kernelbuild::nvcc::{
-    compile_cu_to_obj, file_hash, find_cuda, link_cuda_runtime_static, locate_source, nvcc_path,
+    compile_cu_to_obj, find_cuda, link_cuda_runtime_static, locate_source, nvcc_path,
     nvcc_supports_sm100, track_submodule, ObjCompile,
 };
 use prelude_kernelbuild::venv::{detect_torch_cuda_index, InstallOpts, PythonVenv};
@@ -265,13 +266,12 @@ fn compile_cpp_kernels(
 // ─────────────────────────────────────────────────────────────────────
 //
 // Runs `scripts/compile_kernels.py` inside a provisioned venv. The
-// script itself owns all the per-kernel knowledge (variant matrix,
-// placeholder tensors, `cute.compile` → `export_to_c` calls); this
-// function just handles venv + caching + per-arch invocation. That
-// last bit still has to stay per-crate today because the cuLA compile
-// script needs specific env vars and a cuLA-specific bootstrap
-// monkey-patch; step 4 of the refactor will lift that into a shared
-// dsl compile driver.
+// compile driver itself (cache check, per-arch Python spawn, sticky
+// failure marker) lives in `prelude_kernelbuild::dsl`; this thin
+// wrapper exists purely to provision the cuLA-specific venv (torch
+// first, then flash-linear-attention, then cuLA from source) and
+// hand its python binary + the cuLA bootstrap snippet off to the
+// shared driver.
 
 fn compile_dsl_kernels(
     kernels_dir: &Path,
@@ -281,43 +281,6 @@ fn compile_dsl_kernels(
     target_archs: &[String],
 ) -> bool {
     let script = manifest_dir.join("scripts/compile_kernels.py");
-
-    // Cache hit: if the per-arch manifest was written by a script with
-    // the same hash as the one we'd run now, trust the cache.
-    if let Some(hash) = file_hash(&script) {
-        if kernels_dir.join("manifest.json").exists() && has_obj_files(kernels_dir) {
-            let manifest_str = std::fs::read_to_string(kernels_dir.join("manifest.json"))
-                .unwrap_or_default();
-            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&manifest_str) {
-                let stored = manifest
-                    .get("script_hash")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if stored == hash {
-                    build_log!("[DSL] using cached kernels");
-                    return true;
-                }
-                build_log!("[DSL] compile_kernels.py changed, recompiling...");
-                clear_obj_files(kernels_dir);
-            }
-        }
-    }
-
-    // Sticky failure marker: if the previous build tried and failed
-    // with the same script, don't re-run nvcc on every `cargo build`.
-    let fail_marker = kernels_dir.join(".dsl_compile_failed");
-    if let Some(hash) = file_hash(&script) {
-        if fail_marker.exists() {
-            let stored = std::fs::read_to_string(&fail_marker).unwrap_or_default();
-            if stored.trim() == hash {
-                build_log!("[DSL] skipping (previously failed, script unchanged)");
-                return false;
-            }
-        }
-    }
-
-    build_log!("[DSL] attempting AOT compilation...");
-
     if !script.exists() {
         build_log!("[DSL] no compile script, skipping DSL kernels");
         return false;
@@ -331,126 +294,32 @@ fn compile_dsl_kernels(
         }
     };
 
-    build_log!("[DSL] AOT compiling for {:?}...", target_archs);
-
     // Force workers=1: each DSL kernel's compile step touches CUDA
     // (for SM detection, tensor setup, etc.), and forking after CUDA
     // init blows up with "Cannot re-initialize CUDA in forked
     // subprocess". Single-worker is slower but actually works.
     let workers = env::var("PRELUDE_CULA_WORKERS").unwrap_or_else(|_| "1".to_string());
 
-    // Monkey-patch assert_blackwell/assert_hopper so AOT
-    // cross-compilation works regardless of the host GPU. The target
-    // arch comes from CUTE_DSL_ARCH. `runpy.run_path` launches the
-    // script as if it were invoked directly so `_compile_worker` can
-    // be pickled by a ProcessPool inside the script.
-    let bootstrap = r#"
-import sys, os, runpy
-arch = int(''.join(c for c in os.environ.get('CUTE_DSL_ARCH','sm_90a').split('_')[1] if c.isdigit()))
-major, minor = arch // 10, arch % 10
-import cula.utils
-cula.utils.get_device_sm_version = lambda device=None: (major, minor)
-cula.utils.assert_blackwell = lambda device=None: None
-cula.utils.assert_hopper = lambda device=None: None
-script_path = sys.argv[1]
-sys.argv = [script_path] + sys.argv[2:]
-runpy.run_path(script_path, run_name='__main__')
-"#;
+    // CUTE_DSL_ENABLE_TVM_FFI=1 makes `export_to_c` emit
+    // `__tvm_ffi_<name>` wrappers around the MLIR/CUTLASS kernels.
+    // Without it the .o has only the raw `_cuda_init` /
+    // `_cutlass_...` / `_mlir_ciface_...` entry points and there's no
+    // stable callable for the dispatch table.
+    let env: [(&str, String); 1] = [("CUTE_DSL_ENABLE_TVM_FFI", "1".to_string())];
 
-    for arch in target_archs {
-        build_log!("[DSL] compiling for {arch}...");
-        let arch_dir = kernels_dir.join(arch);
-        let _ = std::fs::create_dir_all(&arch_dir);
-
-        // CUTE_DSL_ENABLE_TVM_FFI=1 makes `export_to_c` emit
-        // `__tvm_ffi_<name>` wrappers around the MLIR/CUTLASS kernels.
-        // Without it the .o has only the raw `_cuda_init` /
-        // `_cutlass_...` / `_mlir_ciface_...` entry points and there's
-        // no stable callable for the dispatch table.
-        let output = Command::new(&python)
-            .arg("-c")
-            .arg(bootstrap)
-            .arg(&script)
-            .arg("--output-dir")
-            .arg(&arch_dir)
-            .args(["-j", &workers])
-            .env("CUTE_DSL_ARCH", format!("{arch}a"))
-            .env("CUTE_DSL_ENABLE_TVM_FFI", "1")
-            .output();
-
-        match &output {
-            Ok(o) if o.status.success() => {
-                build_log!("[DSL] {arch} succeeded");
-            }
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                build_log!("[DSL] {arch} failed (exit code: {:?})", o.status.code());
-                for line in stderr
-                    .lines()
-                    .rev()
-                    .take(10)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                {
-                    build_log!("[DSL]   {line}");
-                }
-                if !stdout.is_empty() {
-                    for line in stdout
-                        .lines()
-                        .rev()
-                        .take(5)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                    {
-                        build_log!("[DSL]   [stdout] {line}");
-                    }
-                }
-            }
-            Err(e) => {
-                build_log!("[DSL] failed to run script: {e}");
-            }
-        }
-    }
-
-    let success = has_obj_files(kernels_dir);
-    if !success {
-        if let Some(hash) = file_hash(&script) {
-            let _ = std::fs::create_dir_all(kernels_dir);
-            let _ = std::fs::write(&fail_marker, &hash);
-        }
-    }
-    success
-}
-
-fn has_obj_files(dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.extension().is_some_and(|x| x == "o") {
-            return true;
-        }
-        if p.is_dir() && has_obj_files(&p) {
-            return true;
-        }
-    }
-    false
-}
-
-fn clear_obj_files(dir: &Path) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.extension().is_some_and(|x| x == "o") {
-                let _ = std::fs::remove_file(&p);
-            }
-        }
-    }
-    let _ = std::fs::remove_file(dir.join("manifest.json"));
+    dsl::run(&DslCompile {
+        python: &python,
+        script: &script,
+        kernels_dir,
+        target_archs,
+        workers: &workers,
+        env: &env,
+        arch_env_var: "CUTE_DSL_ARCH",
+        bootstrap: Some(CULA_BOOTSTRAP),
+        label: "cuLA",
+        sticky_failure: true,
+    })
+    .unwrap_or(false)
 }
 
 /// Provision (or reuse) the cuLA venv with torch + flash-linear-attention

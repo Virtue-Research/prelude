@@ -186,6 +186,25 @@ fn ensure_fa4_source(workspace_root: &Path) -> Result<PathBuf> {
     Ok(fa4_src)
 }
 
+/// Provision the FA4 venv and run the compile script per target
+/// arch. FA4's layout differs from cuLA's in two ways that keep it
+/// from using the shared `prelude_kernelbuild::dsl` driver:
+///
+///   * All archs write `.o` files into a flat `kernels_dir` (not
+///     per-arch subdirectories). The same directory is populated
+///     incrementally across invocations.
+///   * Each arch needs a *set* of env vars (`FLASH_ATTENTION_ARCH`,
+///     `FLASH_ATTENTION_FAKE_TENSOR`, `FA_CLC`, `FA_DISABLE_2CTA`,
+///     `CUTE_DSL_ARCH`, `PYTHONPATH`) rather than a single
+///     `CUTE_DSL_ARCH=smXXa`, so the driver's per-arch-env-var hook
+///     isn't a clean fit.
+///
+/// Forcing those into the driver would add a `flat_output` +
+/// callback-shaped env strategy for marginal reuse. cuLA is the only
+/// current consumer of the shared driver; if a future crate lands
+/// with FA4's flat-output pattern we revisit then. The cache check
+/// and sticky-failure logic still stay inline here but are small
+/// enough not to matter.
 fn ensure_kernels(
     kernels_dir: &Path,
     manifest_dir: &Path,
@@ -195,7 +214,8 @@ fn ensure_kernels(
     let script = manifest_dir.join("scripts/compile_kernels.py");
     let current_hash = file_hash(&script).unwrap_or_default();
 
-    // Check if we already have compiled kernels that match the current script
+    // Cache hit: script hash hasn't changed since the last successful
+    // build.
     if kernels_dir.join("manifest.json").exists() {
         let has_objs = std::fs::read_dir(kernels_dir)
             .ok()
@@ -247,6 +267,7 @@ fn ensure_kernels(
     let python = ensure_fa4_python_env(venv_dir)?;
 
     // Collect target archs: local GPU + PRELUDE_FA4_ARCHS env var
+    // override. Falls back to sm_90 for headless build hosts.
     let mut archs = Vec::new();
     if let Ok(local) = detect_gpu_arch() {
         archs.push(local.clone());
@@ -263,16 +284,15 @@ fn ensure_kernels(
         archs.push("sm_90".to_string());
     }
 
-    // Compile for each target arch
+    let workers = env::var("PRELUDE_FA4_WORKERS").unwrap_or_else(|_| {
+        let num_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        num_cpus.min(8).to_string()
+    });
+
     for arch in &archs {
         build_log!("FA4 AOT compiling for {arch}...");
-
-        let workers = env::var("PRELUDE_FA4_WORKERS").unwrap_or_else(|_| {
-            let num_cpus = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1);
-            num_cpus.min(8).to_string()
-        });
 
         let status = Command::new(&python)
             .arg(&script)
@@ -293,7 +313,6 @@ fn ensure_kernels(
         }
     }
 
-    // Verify at least some kernels were produced
     let has_objs = std::fs::read_dir(kernels_dir)
         .ok()
         .into_iter()
