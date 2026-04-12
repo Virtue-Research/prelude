@@ -109,31 +109,30 @@ impl Engine {
         )
     }
 
-    // Cleaned -- Reviewed by Minzhou
-    pub fn from_hf_hub_with_task(
+    pub async fn from_hf_hub_with_task(
         repo_id: &str,
         task_override: TaskOverride,
         engine_config: EngineConfig,
     ) -> Result<Self, EngineError> {
-        let api = hf_hub::api::sync::Api::new()
+        let api = hf_hub::api::tokio::Api::new()
             .map_err(|e| EngineError::Internal(format!("failed to init hf-hub api: {e}")))?;
         let repo = api.model(repo_id.to_string());
 
         tracing::info!(repo = repo_id, "downloading model from HuggingFace Hub");
 
         // Try config.json — if missing, this might be a GGUF-only repo
-        let config_path = match repo.get("config.json") {
+        let config_path = match repo.get("config.json").await {
             Ok(path) => path,
             Err(_) => {
                 tracing::info!("config.json not found, checking for GGUF files");
-                return Self::from_hf_hub_gguf(repo_id, &repo, task_override, engine_config);
+                return Self::from_hf_hub_gguf(repo_id, &repo, task_override, engine_config).await;
             }
         };
-        let tokenizer_path = repo.get("tokenizer.json").map_err(|e| {
+        let tokenizer_path = repo.get("tokenizer.json").await.map_err(|e| {
             EngineError::Internal(format!("failed to download tokenizer.json: {e}"))
         })?;
 
-        let weight_files = load_safetensor_filenames(&repo)?;
+        let weight_files = load_safetensor_filenames(&repo).await?;
 
         let (device, dtype) = select_device(&engine_config.runtime)?;
         init_runtime(&device, &engine_config.runtime);
@@ -145,7 +144,7 @@ impl Engine {
             parse_model_config_for_source(
                 &content,
                 task_override,
-                has_remote_file(&repo, "config_sentence_transformers.json"),
+                has_remote_file(&repo, "config_sentence_transformers.json").await,
             )?
         };
         let embedding_modules = load_embedding_modules_from_repo(
@@ -154,7 +153,7 @@ impl Engine {
             resolved.task,
             DType::F32,
             &device,
-        )?;
+        ).await?;
 
         let vb = load_var_builder_from_filenames(&weight_files, dtype, &device)?;
         let tokenizer = load_tokenizer_file(&tokenizer_path)?;
@@ -173,14 +172,15 @@ impl Engine {
 
     /// Load a GGUF model from an HF Hub repo that contains .gguf files but no config.json.
     /// Auto-selects the best GGUF file (prefers Q8_0 > Q4_K_M > largest).
-    fn from_hf_hub_gguf(
+    async fn from_hf_hub_gguf(
         repo_id: &str,
-        repo: &hf_hub::api::sync::ApiRepo,
+        repo: &hf_hub::api::tokio::ApiRepo,
         task_override: TaskOverride,
         engine_config: EngineConfig,
     ) -> Result<Self, EngineError> {
         let info = repo
             .info()
+            .await
             .map_err(|e| EngineError::Internal(format!("failed to get repo info: {e}")))?;
 
         let gguf_files: Vec<&str> = info
@@ -196,7 +196,6 @@ impl Engine {
             )));
         }
 
-        // Select best GGUF: prefer Q8_0 > Q4_K_M > first available
         let selected = gguf_files
             .iter()
             .find(|f| f.contains("Q8_0"))
@@ -208,10 +207,10 @@ impl Engine {
 
         let gguf_path = repo
             .get(selected)
+            .await
             .map_err(|e| EngineError::Internal(format!("failed to download {selected}: {e}")))?;
 
-        // Resolve tokenizer: try this repo first, then infer base model from GGUF metadata
-        let tokenizer_model_id = resolve_gguf_tokenizer_repo(repo_id, repo, &gguf_path);
+        let tokenizer_model_id = resolve_gguf_tokenizer_repo(repo_id, &gguf_path);
 
         load_gguf(&gguf_path, tokenizer_model_id, task_override, engine_config)
     }
@@ -223,7 +222,6 @@ impl Engine {
 /// 3. Fall back to stripping `-GGUF` suffix from repo_id.
 fn resolve_gguf_tokenizer_repo(
     repo_id: &str,
-    _repo: &hf_hub::api::sync::ApiRepo,
     gguf_path: &Path,
 ) -> String {
     // Check if tokenizer.json exists next to GGUF or in repo
@@ -462,8 +460,8 @@ fn load_embedding_modules_from_dir(
     )
 }
 
-fn load_embedding_modules_from_repo(
-    repo: &hf_hub::api::sync::ApiRepo,
+async fn load_embedding_modules_from_repo(
+    repo: &hf_hub::api::tokio::ApiRepo,
     arch_name: &str,
     task: TaskKind,
     dtype: DType,
@@ -473,7 +471,7 @@ fn load_embedding_modules_from_repo(
         return Ok(None);
     }
 
-    let modules_path = match repo.get("modules.json") {
+    let modules_path = match repo.get("modules.json").await {
         Ok(path) => path,
         Err(err) => {
             tracing::warn!(error = %err, "failed to resolve embedding modules.json");
@@ -481,11 +479,23 @@ fn load_embedding_modules_from_repo(
         }
     };
 
+    // Pre-download any files the embedding modules need, then use the
+    // sync loader with local paths. This keeps the download async
+    // while the file parsing stays sync (it's CPU-bound anyway).
     load_embedding_modules_from_file(
         &modules_path,
         |relative| {
-            repo.get(relative).map_err(|err| {
-                EngineError::Internal(format!("failed to download {relative}: {err}"))
+            // Block on the async download — we're inside a sync closure
+            // called from the embedding module parser. Since we're already
+            // on a tokio runtime, use Handle::current().block_on().
+            let repo = repo.clone();
+            let relative = relative.to_string();
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    repo.get(&relative).await.map_err(|err| {
+                        EngineError::Internal(format!("failed to download {relative}: {err}"))
+                    })
+                })
             })
         },
         dtype,

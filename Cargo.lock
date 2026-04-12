@@ -2661,6 +2661,7 @@ dependencies = [
  "candle-nn",
  "chrono",
  "fastokens",
+ "futures-util",
  "half",
  "hf-hub",
  "inventory",
