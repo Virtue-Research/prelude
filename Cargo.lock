@@ -708,13 +708,11 @@ name = "cula"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cc",
  "cudarc 0.19.4",
  "half",
- "hex",
+ "prelude-kernelbuild",
  "rand 0.10.0",
  "serde_json",
- "sha2",
  "tracing",
  "tvm-static-ffi",
 ]
@@ -1021,9 +1019,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "half",
- "hex",
+ "prelude-kernelbuild",
  "serde_json",
- "sha2",
  "tracing",
  "tvm-static-ffi",
 ]

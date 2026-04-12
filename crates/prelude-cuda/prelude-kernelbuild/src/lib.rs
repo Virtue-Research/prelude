@@ -12,9 +12,13 @@
 //! * [`nvcc`] — CUDA toolkit discovery, arch probing, single-file nvcc
 //!   compile helpers for `.cu → .ptx` and `.cu → .o`, CUDA runtime linking,
 //!   workspace/submodule helpers.
+//! * [`venv`] — Python virtualenv provisioning, `uv`/pip wrapping, CUDA
+//!   wheel index detection, importability checks.
+//! * [`dispatch`] — TVM-FFI dispatch-table codegen: manifest parsing,
+//!   extern-block emission, stub generators for when no kernels compile.
 //!
-//! More modules (`venv`, `dispatch`, `dsl`, `archive`) land in follow-up
-//! commits as each consumer's build.rs is migrated.
+//! More modules (`dsl`, `archive`) land in follow-up commits as each
+//! consumer's build.rs is migrated.
 //!
 //! ## Design constraints
 //!
@@ -23,8 +27,11 @@
 //! pull in `tokio`, `clap`, or anything else that would balloon build-time
 //! compile costs across the workspace.
 
+pub mod archive;
+pub mod dispatch;
 pub mod log;
 pub mod nvcc;
+pub mod venv;
 
 // Re-export the log macro at crate root for convenient `use`.
 pub use crate::log::__build_log_inner as _build_log_inner;
