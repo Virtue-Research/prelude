@@ -115,7 +115,7 @@ jobs:
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.30
         with:
-          cuda: '12.8.0'
+          cuda: '13.2.0'
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
