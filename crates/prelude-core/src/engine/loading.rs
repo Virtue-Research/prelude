@@ -787,12 +787,10 @@ fn profile_peak_activation(
         return Ok(0);
     }
 
-    // Use a representative token count. vLLM uses max_num_batched_tokens
-    // (default 8192). We use a smaller count (2048) to avoid OOM during
-    // profiling itself — the per-token activation cost scales linearly,
-    // so we can extrapolate.
-    let profile_tokens = 2048usize;
-    let max_tokens = 8192usize; // scheduler's max_num_batched_tokens default
+    // Profile at the actual max_num_batched_tokens (8192), same as vLLM.
+    // This avoids linear extrapolation errors from non-linear costs
+    // (attention workspace, MoE dispatch buffers).
+    let profile_tokens = 8192usize;
 
     tracing::info!(
         profile_tokens,
@@ -815,34 +813,22 @@ fn profile_peak_activation(
         let _logits = m.forward_with_cache(&dummy_input, 0).map_err(tensor_err)?;
         // logits are alive → peak memory is captured by cudaMemGetInfo
         let free_during = ops.gpu_free_memory().unwrap_or(free_before);
-        let peak_at_profile = free_before.saturating_sub(free_during);
+        let peak_activation = free_before.saturating_sub(free_during);
 
-        // Extrapolate to max_tokens (linear scaling for attention +
-        // lm_head, which dominate activation memory).
-        let peak_at_max = if profile_tokens > 0 {
-            peak_at_profile * max_tokens / profile_tokens
-        } else {
-            0
-        };
-
-        // Clear KV cache state from the profiling run so it doesn't
-        // persist into actual inference.
         drop(_logits);
         model.clear_kv_cache();
 
         tracing::info!(
-            peak_at_profile_mb = peak_at_profile / (1024 * 1024),
-            peak_at_max_mb = peak_at_max / (1024 * 1024),
+            peak_activation_mb = peak_activation / (1024 * 1024),
             profile_tokens,
-            max_tokens,
             "activation profiling complete"
         );
 
-        Ok(peak_at_max)
+        Ok(peak_activation)
     } else {
         // Model doesn't support forward_with_cache (unusual).
         // Fall back to config-based estimate.
-        let lm_head_bytes = max_tokens * config.vocab_size * dtype.size_in_bytes();
+        let lm_head_bytes = profile_tokens * config.vocab_size * dtype.size_in_bytes();
         tracing::info!(
             lm_head_mb = lm_head_bytes / (1024 * 1024),
             "using config-based activation estimate (no KV cache model)"
