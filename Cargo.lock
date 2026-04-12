@@ -1030,11 +1030,9 @@ name = "flashinfer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cc",
- "hex",
+ "prelude-kernelbuild",
  "serde",
  "serde_json",
- "sha2",
  "tracing",
  "tvm-static-ffi",
 ]

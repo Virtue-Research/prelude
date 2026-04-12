@@ -25,7 +25,7 @@ use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use prelude_kernelbuild::archive;
+use prelude_kernelbuild::archive::{self, ArMode};
 use prelude_kernelbuild::build_log;
 use prelude_kernelbuild::dispatch;
 use prelude_kernelbuild::nvcc::{file_hash, track_submodule};
@@ -58,7 +58,9 @@ fn main() -> Result<()> {
 
     // Phase 3: Archive the .o files and generate the dispatch table.
     let objects = archive::collect_obj_files(&kernels_dir);
-    let has_kernels = archive::archive_and_whole_link(&objects, &out_dir, "fa4_kernels")
+    // FA4 kernels have unique basenames per variant (fa4_fwd_hdim64_...)
+    // so replace-in-place is correct and the cheapest option.
+    let has_kernels = archive::archive_and_whole_link(&objects, &out_dir, "fa4_kernels", ArMode::Replace)
         .map_err(anyhow::Error::msg)?;
 
     generate_dispatch_code(&kernels_dir, &out_dir, has_kernels)?;

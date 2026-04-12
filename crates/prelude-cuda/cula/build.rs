@@ -30,7 +30,7 @@ use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use prelude_kernelbuild::archive;
+use prelude_kernelbuild::archive::{self, ArMode};
 use prelude_kernelbuild::build_log;
 use prelude_kernelbuild::dispatch;
 use prelude_kernelbuild::dsl::{self, DslCompile, CULA_BOOTSTRAP};
@@ -145,8 +145,16 @@ fn main() {
     // ── Phase 3: archive + dispatch codegen ─────────────────────────
     if has_dsl_kernels {
         let objects = archive::collect_obj_files(&kernels_dir);
-        let _ = archive::archive_and_whole_link(&objects, &out_dir, "cula_dsl_kernels")
-            .map_err(|e| panic!("{e}"));
+        // cuLA's compile script mangles variant parameters into the
+        // .o basename (e.g. `cula_kda_decode_small_varlen_h16_...`),
+        // so Replace mode is correct — every object is uniquely named.
+        let _ = archive::archive_and_whole_link(
+            &objects,
+            &out_dir,
+            "cula_dsl_kernels",
+            ArMode::Replace,
+        )
+        .map_err(|e| panic!("{e}"));
     }
     generate_dispatch_code(&kernels_dir, &out_dir, has_dsl_kernels);
 

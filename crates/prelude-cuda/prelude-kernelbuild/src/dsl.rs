@@ -38,7 +38,7 @@
 //! short-circuit via a warning instead of re-running the compile.
 //! Touching the compile script clears the marker.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use crate::build_log;

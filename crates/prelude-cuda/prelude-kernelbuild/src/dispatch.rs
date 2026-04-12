@@ -181,5 +181,5 @@ pub fn stub_lookup(fn_signature: &str) -> String {
 /// so `cargo build` warnings tell the user something useful. Called by
 /// consumer build.rs after emitting the code.
 pub fn log_generated(crate_label: &str, variant_count: usize) {
-    build_log!("{crate_label} DSL: generated dispatch with {variant_count} variants");
+    build_log!("{crate_label}: generated dispatch with {variant_count} variants");
 }
