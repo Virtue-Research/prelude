@@ -17,19 +17,20 @@ use cudarc::driver::DevicePtr;
 use half::bf16;
 use prelude_core::tensor::{bail, DType, DeviceExt, Result, Tensor, D};
 use cula::dsl::{
-    DLDataType, DLDevice, DLTensor, DslKernelRegistry, TVMFFIAny,
-    KDLBFLOAT, KDLCUDA, KDLFLOAT, KDLINT,
+    DLDataType, DLDevice, DLTensor, DslKernelRegistry, TVMFFIAny, KDLBFLOAT, KDLCUDA, KDLFLOAT,
+    KDLINT,
 };
 use std::ffi::c_void;
-use std::sync::OnceLock;
 
 const BF16_DT: DLDataType = DLDataType { code: KDLBFLOAT, bits: 16, lanes: 1 };
 const F32_DT: DLDataType = DLDataType { code: KDLFLOAT, bits: 32, lanes: 1 };
 const I32_DT: DLDataType = DLDataType { code: KDLINT, bits: 32, lanes: 1 };
 
+/// Delegate to cuLA's own singleton registry — cuLA knows which
+/// `lookup_dsl` function to bind to, so we don't duplicate the
+/// `OnceLock` dance here.
 fn registry() -> &'static DslKernelRegistry {
-    static REG: OnceLock<DslKernelRegistry> = OnceLock::new();
-    REG.get_or_init(DslKernelRegistry::new)
+    cula::dsl::registry()
 }
 
 fn contiguous_strides(shape: &[i64]) -> Vec<i64> {

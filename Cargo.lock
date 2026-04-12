@@ -710,11 +710,11 @@ dependencies = [
  "anyhow",
  "cudarc 0.19.4",
  "half",
+ "prelude-cutedsl",
  "prelude-kernelbuild",
  "rand 0.10.0",
  "serde_json",
  "tracing",
- "tvm-static-ffi",
 ]
 
 [[package]]
@@ -2717,6 +2717,14 @@ dependencies = [
  "prelude-kernelbuild",
  "quant-gemm",
  "tokio",
+ "tracing",
+ "tvm-static-ffi",
+]
+
+[[package]]
+name = "prelude-cutedsl"
+version = "0.1.0"
+dependencies = [
  "tracing",
  "tvm-static-ffi",
 ]
