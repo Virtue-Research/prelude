@@ -605,10 +605,17 @@ fn finish_state(engine: &Engine, mut state: ArSequenceState, finish_reason: Fini
     }
 }
 
-fn fail_state(_engine: &Engine, state: ArSequenceState, error: EngineError) {
+fn fail_state(_engine: &Engine, mut state: ArSequenceState, error: EngineError) {
+    state.ensure_started();
     match state.response {
-        ResponseChannel::Complete(tx) => { let _ = tx.send(Err(error)); }
-        ResponseChannel::Stream(_) => {} // Dropping sender closes the stream
+        ResponseChannel::Complete(tx) => {
+            let _ = tx.send(Err(error));
+        }
+        ResponseChannel::Stream(tx) => {
+            let _ = tx.send(StreamEvent::Error {
+                message: error.to_string(),
+            });
+        }
     }
 }
 
