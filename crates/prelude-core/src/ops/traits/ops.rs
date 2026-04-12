@@ -310,6 +310,41 @@ pub trait Ops: Send + Sync {
         _silu_activation: bool,
     ) -> Option<Result<Tensor>> { None }
 
+    /// Fused post-conv1d prep for Qwen3.5 / Qwen3-next DeltaNet.
+    ///
+    /// Collapses ~20 candle ops per layer (QKV narrow, L2 norm Q/K,
+    /// softplus + A_log gate computation, sigmoid beta) into a single
+    /// CUDA kernel launch.
+    ///
+    /// Inputs (all on the same device):
+    /// - `mixed_qkv`: `[L, 2*HK*D + HV*D]` BF16, the output of the
+    ///   causal_conv1d kernel with channel layout `[Q | K | V]`
+    /// - `a_raw`, `b_raw`: `[L, HV]` BF16 — raw scalar gate inputs
+    ///   from the in_proj_a / in_proj_b projections
+    /// - `a_log`: `[HV]` F32 — the learned log-decay parameter
+    /// - `dt_bias`: `[HV]` F32 — the learned delta-t bias
+    ///
+    /// Returns `(q, k, v, alpha, beta)`:
+    /// - `q, k`: `[L, HK, D]` BF16 L2-normalised over the last dim
+    /// - `v`: `[L, HV, D]` BF16 (raw slice out of `mixed_qkv`)
+    /// - `alpha`: `[L, HV]` F32, `= exp(-exp(A_log) * softplus(a + dt_bias))`
+    /// - `beta`: `[L, HV]` F32, `= sigmoid(b_raw)`
+    ///
+    /// Returns `None` when the backend can't serve the call (non-CUDA
+    /// device, unsupported head_dim, or PTX not loaded).
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_post_conv(
+        &self,
+        _mixed_qkv: &Tensor,
+        _a_raw: &Tensor,
+        _b_raw: &Tensor,
+        _a_log: &Tensor,
+        _dt_bias: &Tensor,
+        _num_k_heads: usize,
+        _num_v_heads: usize,
+        _head_dim: usize,
+    ) -> Option<Result<(Tensor, Tensor, Tensor, Tensor, Tensor)>> { None }
+
     /// Fused Gated DeltaNet (GDN) varlen prefill — matches FLA's
     /// `chunk_gated_delta_rule` semantics (Qwen3-next / Qwen3.5 family).
     ///

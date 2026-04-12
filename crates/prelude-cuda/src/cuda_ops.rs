@@ -230,6 +230,23 @@ impl Ops for CudaOps {
         }
     }
 
+    fn gdn_post_conv(
+        &self,
+        mixed_qkv: &Tensor,
+        a_raw: &Tensor,
+        b_raw: &Tensor,
+        a_log: &Tensor,
+        dt_bias: &Tensor,
+        num_k_heads: usize,
+        num_v_heads: usize,
+        head_dim: usize,
+    ) -> Option<Result<(Tensor, Tensor, Tensor, Tensor, Tensor)>> {
+        Some(crate::ops::gdn_post_conv::gdn_post_conv(
+            mixed_qkv, a_raw, b_raw, a_log, dt_bias,
+            num_k_heads, num_v_heads, head_dim,
+        ))
+    }
+
     fn gdn_prefill_varlen(
         &self,
         q: &Tensor,

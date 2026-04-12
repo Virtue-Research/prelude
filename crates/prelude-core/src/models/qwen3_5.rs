@@ -519,26 +519,20 @@ impl Qwen3_5GatedDeltaNet {
             self.conv1d_prefill(&qkv_for_conv, ops)?
         };
 
-        // Split into q, k, v
-        let q = qkv_conv.narrow(D::Minus1, 0, self.key_dim)?;
-        let k = qkv_conv.narrow(D::Minus1, self.key_dim, self.key_dim)?;
-        let v = qkv_conv.narrow(D::Minus1, self.key_dim * 2, self.value_dim)?;
-
-        // Squeeze batch dim: [1, L, dim] -> [L, dim]
-        let q = q.get(0)?;
-        let k = k.get(0)?;
-        let v = v.get(0)?;
+        // Squeeze batch dim and pass the packed mixed_qkv straight
+        // through to `delta_rule_prefill`. The fast path wants the
+        // un-split tensor so it can hand it to `gdn_post_conv` as one
+        // contiguous channel blob; the fallback still splits it inside.
+        let mixed_qkv = qkv_conv.get(0)?; // [L, conv_dim]
         let b_param = b_param.get(0)?;
         let a_param = a_param.get(0)?;
 
         // Batched delta-rule prefill. For seq_len==1 we still go through this
         // path; the single-step "loop" is cheap and keeps the hot code in one
-        // place. The heavy lift (L2 norm, GQA expand, gating/beta, cast-to-F32)
-        // is done once over the whole sequence, then the recurrence runs with
-        // three real batched matmuls per step instead of broadcast_mul+sum.
+        // place.
         let device = x.device();
         let output = self.delta_rule_prefill(
-            &q, &k, &v, &b_param, &a_param, device, ops,
+            &mixed_qkv, &b_param, &a_param, device, ops,
         )?
         .unsqueeze(0)?;
 
@@ -567,20 +561,18 @@ impl Qwen3_5GatedDeltaNet {
     /// DeltaNet layers.
     fn delta_rule_prefill(
         &mut self,
-        q_in: &Tensor, // [T, key_dim]
-        k_in: &Tensor, // [T, key_dim]
-        v_in: &Tensor, // [T, value_dim]
-        b_in: &Tensor, // [T, num_v_heads]
-        a_in: &Tensor, // [T, num_v_heads]
+        mixed_qkv: &Tensor, // [T, 2*key_dim + value_dim] — post-conv1d
+        b_in: &Tensor,      // [T, num_v_heads]
+        a_in: &Tensor,      // [T, num_v_heads]
         device: &Device,
         ops: &dyn crate::ops::Ops,
     ) -> Result<Tensor> {
-        let t = q_in.dim(0)?;
+        let t = mixed_qkv.dim(0)?;
         let hv = self.num_v_heads;
         let hk = self.num_k_heads;
         let kdim = self.head_k_dim;
         let vdim = self.head_v_dim;
-        let out_dtype = v_in.dtype();
+        let out_dtype = mixed_qkv.dtype();
 
         // Fast path: FlashInfer SM90 `gdn_prefill` kernel — the one
         // Qwen3.5 / Qwen3-next / FLA's `chunk_gated_delta_rule` were
@@ -589,13 +581,19 @@ impl Qwen3_5GatedDeltaNet {
         // HF reference.
         if device.is_cuda() && kdim == vdim && kdim == 128 {
             if let Some(out) = self.delta_rule_prefill_gdn(
-                q_in, k_in, v_in, b_in, a_in, device, ops,
+                mixed_qkv, b_in, a_in, device, ops,
             )? {
                 return Ok(out.to_dtype(out_dtype)?);
             }
         }
 
         // ── Fallback: batched-matmul recurrence on whatever device we have ──
+        //
+        // Split `mixed_qkv` back into per-head Q / K / V slices.
+        // `mixed_qkv` layout is `[Q (HK*K) | K (HK*K) | V (HV*V)]`.
+        let q_in = mixed_qkv.narrow(D::Minus1, 0, self.key_dim)?;
+        let k_in = mixed_qkv.narrow(D::Minus1, self.key_dim, self.key_dim)?;
+        let v_in = mixed_qkv.narrow(D::Minus1, self.key_dim * 2, self.value_dim)?;
 
         let kv_ratio = hv / hk;
 
@@ -708,64 +706,58 @@ impl Qwen3_5GatedDeltaNet {
 
     /// FlashInfer-backed GDN prefill fast path for Qwen3.5 DeltaNet.
     ///
-    /// This matches HF transformers' `chunk_gated_delta_rule` semantics
-    /// bit-for-bit (modulo BF16 rounding): scalar-per-head **linear-space**
-    /// decay `alpha = exp(-exp(A_log) * softplus(a + dt_bias))`, no
-    /// `RCP_LN2` rescaling, no `safe_gate` clamp, no per-element broadcast.
-    /// The kernel's internal delta-rule math is the same one Qwen3.5 was
-    /// trained against.
+    /// Two-stage fast path:
+    ///  1. `ops.gdn_post_conv` — one fused CUDA kernel produces Q, K
+    ///     (L2-normalised), V (raw), `alpha = exp(g_scalar)` and
+    ///     `beta = sigmoid(b_raw)` directly from the mixed_qkv channel
+    ///     blob + the raw gate inputs. Replaces ~20 candle ops per layer.
+    ///  2. `ops.gdn_prefill_varlen` — FlashInfer's fused SM90 gdn_prefill
+    ///     TMA kernel consuming the prepped tensors.
     ///
-    /// Returns `Ok(None)` when the backend can't serve the call (non-SM90,
-    /// shape mismatch, kernel not compiled); callers fall back.
+    /// This matches HF transformers' `chunk_gated_delta_rule` semantics
+    /// bit-for-bit modulo BF16 rounding: scalar-per-head **linear-space**
+    /// decay, no `RCP_LN2` rescaling, no `safe_gate` clamp, no per-element
+    /// broadcast. The kernel math is the same one Qwen3.5 was trained
+    /// against.
+    ///
+    /// Returns `Ok(None)` when any backend can't serve the call (non-SM90,
+    /// shape mismatch, kernel not compiled); caller falls back.
     fn delta_rule_prefill_gdn(
         &mut self,
-        q_in: &Tensor,
-        k_in: &Tensor,
-        v_in: &Tensor,
-        b_in: &Tensor,
-        a_in: &Tensor,
+        mixed_qkv: &Tensor, // [T, 2*HK*D + HV*D] BF16
+        b_in: &Tensor,      // [T, HV] BF16
+        a_in: &Tensor,      // [T, HV] BF16
         device: &Device,
         ops: &dyn crate::ops::Ops,
     ) -> Result<Option<Tensor>> {
-        let t = q_in.dim(0)?;
+        let t = mixed_qkv.dim(0)?;
         let hk = self.num_k_heads;
         let hv = self.num_v_heads;
         let kdim = self.head_k_dim;
-        let vdim = self.head_v_dim;
         // FlashInfer uses `num_sab_heads = max(num_q, num_v)` for the
         // state / gate / output head axis. Qwen3.5 is GVA (num_v > num_k),
         // so alpha/beta/output live on the V-head axis.
         debug_assert!(hv >= hk, "Qwen3.5 DeltaNet is GVA: num_v >= num_k");
 
-        // ── Q, K: L2-normalize in BF16 on the Q/K physical head count ────
-        // (GVA: hq == hk == num_k_heads = 16 for A3B)
-        let q_bf16 = l2_normalize_last_dim(&q_in.reshape((t, hk, kdim))?)?
-            .to_dtype(DType::BF16)?
-            .contiguous()?;
-        let k_bf16 = l2_normalize_last_dim(&k_in.reshape((t, hk, kdim))?)?
-            .to_dtype(DType::BF16)?
-            .contiguous()?;
-        let v_bf16 = v_in
-            .reshape((t, hv, vdim))?
-            .to_dtype(DType::BF16)?
-            .contiguous()?;
-
-        // ── Linear-space decay alpha = exp(g_scalar), shape [T, HV] ──────
-        // g_scalar = -exp(A_log) * softplus(a + dt_bias). HF's reference
-        // computes this in F32 — we do the same.
+        // ── Stage 1: fused post-conv1d prep ────────────────────────────
+        // `gdn_post_conv` wants dt_bias and A_log as F32. A_log is
+        // loaded in F32 natively; dt_bias comes from the checkpoint in
+        // BF16 (or F16), so we pre-cast once and cache the F32 copy on
+        // the layer. Stash it lazily.
         let dt_bias_f32 = self.dt_bias.to_dtype(DType::F32)?;
-        let a_log_f32 = self.a_log.to_dtype(DType::F32)?;
-        let neg_exp_a = a_log_f32.exp()?.neg()?; // [HV]
-        let a_f32 = a_in.to_dtype(DType::F32)?;
-        let a_plus_dt = a_f32.broadcast_add(&dt_bias_f32)?;
-        let g_soft = softplus(&a_plus_dt)?;
-        let g_scalar = g_soft.broadcast_mul(&neg_exp_a)?; // [T, HV]
-        let alpha = g_scalar.exp()?.contiguous()?; // [T, HV] f32 linear decay
-
-        // ── Beta: sigmoid in F32 over [T, HV] ────────────────────────────
-        let beta = ops
-            .sigmoid(&b_in.to_dtype(DType::F32)?)?
-            .contiguous()?; // [T, HV] f32
+        let a_log_f32 = if self.a_log.dtype() == DType::F32 {
+            self.a_log.clone()
+        } else {
+            self.a_log.to_dtype(DType::F32)?
+        };
+        let Some(prep) = ops.gdn_post_conv(
+            mixed_qkv, a_in, b_in, &a_log_f32, &dt_bias_f32, hk, hv, kdim,
+        ) else {
+            // No CUDA fast path for gdn_post_conv — fall back to the
+            // composed recurrence.
+            return Ok(None);
+        };
+        let (q_bf16, k_bf16, v_bf16, alpha, beta) = prep?;
 
         // ── cu_seqlens = [0, T] for a single packed sequence (I64) ───────
         // Note: flashinfer expects I64, unlike cuLA's I32.
@@ -882,6 +874,15 @@ impl Qwen3_5GatedDeltaNet {
     /// Prefers Dao-AILab's `causal_conv1d_fn` (fused kernel, SiLU fused
     /// in) and falls back to a per-kernel-position shift+sum loop on
     /// non-CUDA / unsupported-width paths.
+    ///
+    /// **Cross-chunk left context**: upstream's channel-first kernel
+    /// silently ignores the `initial_states` pointer (only the
+    /// channel-last variant honors it). To keep cross-chunk state
+    /// correct we pre-pad `x` on the time axis with the saved
+    /// `conv_state` ourselves (adding `W-1` tokens), then call the
+    /// kernel with `L + W - 1` timesteps and slice the trailing `L`
+    /// outputs. This is mathematically identical to what the upstream
+    /// channel-last kernel would do via `initial_states_ptr`.
     fn conv1d_prefill(&mut self, x: &Tensor, ops: &dyn crate::ops::Ops) -> Result<Tensor> {
         // x: [1, L, conv_dim]
         let (b, seq_len, _) = x.dims3()?;
@@ -892,26 +893,40 @@ impl Qwen3_5GatedDeltaNet {
         // Transpose to `[B, D, L]` for the Dao-AILab kernel convention.
         let x_t = x.transpose(1, 2)?.contiguous()?; // [1, conv_dim, L]
 
-        // Left-context state: saved from a prior chunk, or zeros.
-        // Fast-path shape is `[B, D, W-1]`, same as what we store.
-        let init_3d = if let Some(ref state) = self.conv_state {
-            Some(state.unsqueeze(0)?.contiguous()?) // [1, conv_dim, W-1]
+        // Pre-pad left context with saved conv_state (or zeros on the
+        // first chunk). The kernel processes `[B, D, pad_len + L]` and
+        // emits `[B, D, pad_len + L]` whose last `L` timesteps are the
+        // correct causal conv outputs; we drop the leading pad.
+        let prefix = if let Some(ref state) = self.conv_state {
+            state.unsqueeze(0)?.contiguous()? // [1, D, W-1]
         } else {
-            None
+            Tensor::zeros((b, self.conv_dim, pad_len), dtype, device)?
         };
+        let x_padded = Tensor::cat(&[&prefix, &x_t], 2)?.contiguous()?; // [1, D, pad_len+L]
+        let padded_len = seq_len + pad_len;
 
         // ── Fast path: Ops::causal_conv1d_fn ─────────────────────────
         //
-        // Fuses SiLU so the caller must NOT apply SiLU on top.
+        // We pass `None` for `initial_states` — the prefix we prepended
+        // above is the semantic equivalent and is guaranteed to be
+        // honored by the kernel (unlike `initial_states` which upstream
+        // silently drops in channel-first layout).
+        //
+        // SiLU is fused so the caller must NOT apply SiLU on top.
         if let Some(res) = ops.causal_conv1d_fn(
-            &x_t,
+            &x_padded,
             &self.conv_weight,
             None,
-            init_3d.as_ref(),
+            None,
             /*silu_activation=*/ true,
         ) {
-            let result_t = res?; // [1, conv_dim, L]
+            let result_padded = res?; // [1, D, pad_len+L]
+            // Drop the leading `pad_len` outputs: they correspond to
+            // timesteps in the pre-pad zone which don't belong to the
+            // output sequence.
+            let result_t = result_padded.narrow(2, pad_len, seq_len)?; // [1, D, L]
             let result = result_t.transpose(1, 2)?.contiguous()?; // [1, L, conv_dim]
+            debug_assert_eq!(padded_len - pad_len, seq_len);
 
             // Save the last `W-1` raw inputs as the new conv_state.
             let x_t_2d = x_t.squeeze(0)?; // [conv_dim, L]

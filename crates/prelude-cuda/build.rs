@@ -35,6 +35,7 @@ fn main() {
         ("kvcache", "append.cu", "kv_append"),
         ("kvcache", "knorm_rope_kv_write.cu", "knorm_rope_kv_write"),
         ("kvcache", "scatter_kv_cache.cu", "scatter_kv_cache"),
+        ("gdn", "post_conv.cu", "gdn_post_conv"),
         // General-purpose kernels (ported from candle-kernels for TensorOps)
         ("candle", "unary.cu", "candle_unary"),
         ("candle", "binary.cu", "candle_binary"),

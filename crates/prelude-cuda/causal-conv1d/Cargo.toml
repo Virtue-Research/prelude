@@ -16,3 +16,7 @@ tracing = "0.1"
 
 [build-dependencies]
 anyhow = "1"
+
+[dev-dependencies]
+cudarc = { version = "0.19.4", features = ["std", "cuda-version-from-build-system", "f16"] }
+half = "2.7.1"

@@ -388,6 +388,8 @@ name = "causal-conv1d"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cudarc 0.19.4",
+ "half",
  "tracing",
 ]
 

@@ -114,9 +114,27 @@ fn contiguous_dw(width: i64) -> (i64, i64) {
 
 /// Prefill-side fused causal conv1d.
 ///
-/// Shapes are `x/out: [B, D, L]` (channel-contiguous-before-time),
-/// `weight: [D, W]`, optional `bias: [D]`, optional
-/// `initial_states / final_states: [B, D, W-1]`.
+/// Shapes are `x/out: [B, D, L]` (channel-contiguous-before-time —
+/// i.e. `x_l_stride = 1`), `weight: [D, W]`, optional `bias: [D]`,
+/// optional `initial_states / final_states: [B, D, W-1]`.
+///
+/// ## Initial state caveat
+///
+/// Upstream's `causal_conv1d_fwd` dispatches on `is_channel_last =
+/// x.stride(1) == 1 && x.stride(2) > 1`. The channel-first kernel
+/// (what this shim targets with a standard row-major `[B, D, L]`
+/// input) **silently ignores** the `initial_states` pointer —
+/// `initial_states is only supported for channel last layout`
+/// (`causal_conv1d.cpp:213`). If you pass `Some(...)` for
+/// `initial_states` here the pointer is forwarded but the kernel
+/// never reads it, leaving the left context at zero.
+///
+/// Callers that actually need cross-chunk state (e.g. multi-chunk
+/// prefill where a long prompt is split) must either manually prepend
+/// the saved state to `x` (adding `W-1` tokens) or switch the whole
+/// pipeline to a channel-last layout. Qwen3.5 DeltaNet today only
+/// ever runs single-chunk prefill, so we pass `None` for safety and
+/// sidestep the trap.
 ///
 /// # Safety
 /// All pointers must be valid CUDA device pointers on the same device.
