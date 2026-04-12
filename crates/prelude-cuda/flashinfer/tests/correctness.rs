@@ -3287,3 +3287,111 @@ fn fused_add_rmsnorm_correctness() {
         unsafe { cudaFree(x_gpu); cudaFree(r_gpu); cudaFree(w_gpu); }
     }
 }
+
+// ── CUTLASS Fused MoE correctness ─────────────────────────────────
+
+#[test]
+fn cutlass_fused_moe_init() {
+    let reg = KernelRegistry::new();
+    if reg.get_utility("init").is_none() {
+        println!("CUTLASS fused MoE kernel not compiled — skipping test");
+        return;
+    }
+
+    let runner = flashinfer::moe::FusedMoeRunner::new()
+        .expect("Failed to create CUTLASS FusedMoeRunner");
+    println!("CUTLASS fused MoE runner created successfully");
+    drop(runner);
+}
+
+#[test]
+fn cutlass_fused_moe_execution() {
+    let reg = KernelRegistry::new();
+    if reg.get_utility("init").is_none() {
+        println!("CUTLASS fused MoE kernel not compiled — skipping test");
+        return;
+    }
+
+    let runner = flashinfer::moe::FusedMoeRunner::new()
+        .expect("Failed to create CUTLASS FusedMoeRunner");
+
+    // Qwen3.5-like dimensions: 32 tokens, 256 experts, top-8, inter=512, hidden=2048
+    let num_tokens = 32i64;
+    let num_experts = 256i64;
+    let top_k = 8i64;
+    let inter_size = 512i64;
+    let hidden_size = 2048i64;
+
+    // Create random input data
+    let input_elems = (num_tokens * hidden_size) as usize;
+    let w1_elems = (num_experts * 2 * inter_size * hidden_size) as usize;
+    let w2_elems = (num_experts * hidden_size * inter_size) as usize;
+    let expert_elems = (num_tokens * top_k) as usize;
+
+    // Input: BF16 random
+    let input_bf16: Vec<u16> = (0..input_elems).map(|i| f32_to_bf16(0.01 * ((i % 97) as f32 - 48.0))).collect();
+    // Weights: BF16 small random
+    let w1_bf16: Vec<u16> = (0..w1_elems).map(|i| f32_to_bf16(0.001 * ((i % 113) as f32 - 56.0))).collect();
+    let w2_bf16: Vec<u16> = (0..w2_elems).map(|i| f32_to_bf16(0.001 * ((i % 89) as f32 - 44.0))).collect();
+    // Expert indices: random in [0, num_experts)
+    let expert_ids: Vec<i32> = (0..expert_elems).map(|i| ((i * 37 + 13) % num_experts as usize) as i32).collect();
+    // Expert weights: uniform F32
+    let expert_weights: Vec<f32> = vec![1.0 / top_k as f32; expert_elems];
+    // Output: zeros
+    let output_bf16: Vec<u16> = vec![0u16; input_elems];
+
+    unsafe {
+        let input_ptr = gpu_upload(&input_bf16);
+        let w1_ptr = gpu_upload(&w1_bf16);
+        let w2_ptr = gpu_upload(&w2_bf16);
+        let expert_ids_ptr = gpu_upload(&expert_ids);
+        let expert_weights_ptr = gpu_upload(&expert_weights);
+        let output_ptr = gpu_upload(&output_bf16);
+
+        let output_s = [num_tokens, hidden_size];
+        let output_st = contiguous_strides(&output_s);
+        let input_s = [num_tokens, hidden_size];
+        let input_st = contiguous_strides(&input_s);
+        let expert_ids_s = [num_tokens, top_k];
+        let expert_ids_st = contiguous_strides(&expert_ids_s);
+        let expert_weights_s = [num_tokens, top_k];
+        let expert_weights_st = contiguous_strides(&expert_weights_s);
+        let w1_s = [num_experts, 2 * inter_size, hidden_size];
+        let w1_st = contiguous_strides(&w1_s);
+        let w2_s = [num_experts, hidden_size, inter_size];
+        let w2_st = contiguous_strides(&w2_s);
+
+        let dl_output = gpu_dl(output_ptr, BF16_DT, &output_s, &output_st);
+        let dl_input = gpu_dl(input_ptr, BF16_DT, &input_s, &input_st);
+        let dl_expert_ids = gpu_dl(expert_ids_ptr, I32_DT, &expert_ids_s, &expert_ids_st);
+        let dl_expert_weights = gpu_dl(expert_weights_ptr, FP32_DT, &expert_weights_s, &expert_weights_st);
+        let dl_w1 = gpu_dl(w1_ptr, BF16_DT, &w1_s, &w1_st);
+        let dl_w2 = gpu_dl(w2_ptr, BF16_DT, &w2_s, &w2_st);
+
+        reg.set_stream(0, std::ptr::null_mut());
+
+        runner.run_moe(
+            &dl_output, &dl_input,
+            &dl_expert_ids, &dl_expert_weights,
+            &dl_w1, &dl_w2,
+            1, 0, 1, 0,
+        ).expect("CUTLASS fused MoE run_moe failed");
+        cudaDeviceSynchronize();
+
+        let out_data = gpu_download::<u16>(output_ptr, input_elems);
+        let out_f32: Vec<f32> = out_data.iter().map(|&v| bf16_to_f32(v)).collect();
+
+        // Sanity: output should not be all zeros (MoE processed something)
+        let nonzero_count = out_f32.iter().filter(|&&v| v.abs() > 1e-6).count();
+        assert!(nonzero_count > input_elems / 2,
+            "CUTLASS fused MoE output mostly zeros: {nonzero_count}/{input_elems} nonzero");
+        assert!(out_f32.iter().all(|v| v.is_finite()),
+            "CUTLASS fused MoE output has NaN/Inf");
+
+        let out_sum: f32 = out_f32.iter().map(|v| v.abs()).sum::<f32>() / input_elems as f32;
+        println!("CUTLASS fused MoE ({num_tokens} tokens, {num_experts} experts, top-{top_k}): PASS (mean_abs={out_sum:.6}, nonzero={nonzero_count}/{input_elems})");
+
+        cudaFree(input_ptr); cudaFree(w1_ptr); cudaFree(w2_ptr);
+        cudaFree(expert_ids_ptr); cudaFree(expert_weights_ptr); cudaFree(output_ptr);
+    }
+}

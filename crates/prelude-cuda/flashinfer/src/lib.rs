@@ -14,6 +14,7 @@
 
 pub mod cascade;
 pub mod loader;
+pub mod moe;
 pub mod sparse;
 pub mod types;
 

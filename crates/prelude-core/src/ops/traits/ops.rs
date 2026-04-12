@@ -188,6 +188,27 @@ pub trait Ops: Send + Sync {
     fn fused_moe_routing(&self, _logits: &Tensor, _top_k: usize) -> Option<Result<(Tensor, Tensor, Tensor, Tensor)>> { None }
     fn fused_moe_gemm(&self, _input: &Tensor, _weights: &Tensor, _tw: &Tensor, _st: &Tensor, _se: &Tensor, _topk: usize, _prefill: bool) -> Option<Result<Tensor>> { None }
 
+    /// GPU-accelerated sort of expert assignments by expert ID.
+    /// Returns (sorted_expert_ids, sorted_token_ids) both as flat [n] U32 tensors.
+    /// Default: returns None (caller falls back to CPU sort).
+    fn moe_sort_experts(&self, _expert_ids: &Tensor) -> Option<Result<(Tensor, Tensor)>> { None }
+
+    /// In-place swap of gate/up halves for CUTLASS Swiglu. Call once at load time.
+    fn swap_moe_gate_up(&self, _w1: &Tensor, _inter: usize) -> Option<Result<()>> { None }
+
+    /// Fused MoE: routing permute → GEMM1 (gate_up) → Swiglu → GEMM2 (down) → unpermute.
+    /// Returns None when unavailable; caller falls back to composed ops
+    /// (grouped_gemm + silu_mul + fused_moe_gemm).
+    #[allow(clippy::too_many_arguments)]
+    fn cutlass_fused_moe(
+        &self,
+        _input: &Tensor,
+        _experts_per_tok: &Tensor,
+        _topk_weights: &Tensor,
+        _w1: &Tensor,
+        _w2: &Tensor,
+    ) -> Option<Result<Tensor>> { None }
+
     /// Fused Adaptive Layer Norm (AdaLN-Zero) for diffusion transformers.
     /// Computes: normed = layer_norm(x) * (1 + scale) + shift, gated = normed * gate.
     fn fused_adaln_zero(

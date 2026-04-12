@@ -368,7 +368,7 @@ fn generate_dispatch(kernels_dir: &Path, out_dir: &Path, has_kernels: bool) -> R
         if ![
             "page", "sampling", "norm", "rope", "cascade", "activation", "moe_routing", "fp4",
             "quantization", "fmha_sm100", "topk", "mla", "moe_utils", "moe", "gemm", "comm",
-            "gdn", "mamba",
+            "gdn", "mamba", "cutlass_moe",
         ]
         .contains(&v.kind.as_str())
         {

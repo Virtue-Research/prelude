@@ -112,12 +112,96 @@ impl TVMFFIAny {
     pub fn opaque_ptr(ptr: *mut c_void) -> Self {
         Self { type_index: KTVMFFI_OPAQUE_PTR, zero_padding: 0, v_union: ptr as u64 }
     }
+
+    /// Pack a DLDataType as a TVMFFIAny (for passing dtype arguments).
+    pub fn dlpack_dtype(dt: DLDataType) -> Self {
+        // DLDataType is 4 bytes (code:u8, bits:u8, lanes:u16).
+        // TVM FFI encodes it in the lower 32 bits of the int64 union.
+        let encoded = (dt.code as u64) | ((dt.bits as u64) << 8) | ((dt.lanes as u64) << 16);
+        Self { type_index: KTVMFFI_DLPACK_DTYPE, zero_padding: 0, v_union: encoded }
+    }
 }
+
+pub const KTVMFFI_DLPACK_DTYPE: i32 = 5;
 
 // ── Error helper ────────────────────────────────────────────────────
 
 unsafe extern "C" {
     fn tvm_static_ffi_get_last_error(out_len: *mut usize) -> *const u8;
+    pub fn tvm_static_ffi_register_cuda_allocator() -> i32;
+    fn tvm_static_ffi_module_call(
+        module_any: *const TVMFFIAny,
+        method_name: *const u8,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        ret: *mut TVMFFIAny,
+    ) -> i32;
+    fn tvm_static_ffi_object_dec_ref(any: *const TVMFFIAny);
+}
+
+// ── TVM Module handle ──────────────────────────────────────────────
+
+/// Opaque handle to a TVM Module object (e.g., FusedMoeRunner).
+/// Created by calling `call_tvm_ffi_ret` on an `__tvm_ffi_init` export.
+/// Methods are invoked via `module_call`.
+pub struct TVMModuleHandle {
+    any: TVMFFIAny,
+}
+
+impl TVMModuleHandle {
+    /// Call a method on this module.
+    ///
+    /// # Safety
+    /// The caller must ensure the lifetimes of all `TVMFFIAny` contents in `args`
+    /// outlive the call, and that `method_name` is a valid null-terminated string.
+    pub unsafe fn call(
+        &self,
+        method_name: &[u8], // must end with \0
+        args: &[TVMFFIAny],
+    ) -> Result<TVMFFIAny, String> {
+        let mut ret = TVMFFIAny::none();
+        let rc = unsafe {
+            tvm_static_ffi_module_call(
+                &self.any,
+                method_name.as_ptr(),
+                args.as_ptr(),
+                args.len() as i32,
+                &mut ret,
+            )
+        };
+        if rc == 0 {
+            Ok(ret)
+        } else {
+            Err(get_last_error())
+        }
+    }
+}
+
+impl Drop for TVMModuleHandle {
+    fn drop(&mut self) {
+        unsafe { tvm_static_ffi_object_dec_ref(&self.any) };
+    }
+}
+
+// SAFETY: The TVM Module's runMoe is internally mutex-protected.
+unsafe impl Send for TVMModuleHandle {}
+unsafe impl Sync for TVMModuleHandle {}
+
+/// Extract TVM error message from thread-local state.
+fn get_last_error() -> String {
+    let (msg_ptr, msg_len) = unsafe {
+        let mut len: usize = 0;
+        let p = tvm_static_ffi_get_last_error(&mut len);
+        (p, len)
+    };
+    if !msg_ptr.is_null() && msg_len > 0 {
+        unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(msg_ptr, msg_len))
+                .to_string()
+        }
+    } else {
+        "TVM FFI call failed".to_string()
+    }
 }
 
 /// Call a TVM FFI function and convert errors to a Rust Result.
@@ -132,37 +216,35 @@ pub unsafe fn call_tvm_ffi(
     args: &[TVMFFIAny],
 ) -> Result<(), String> {
     let mut ret = TVMFFIAny::none();
-    // SAFETY: caller contract on `func` being a valid SafeCall entry point
-    // and on `args` outliving the call.
     let rc = unsafe {
-        func(
-            std::ptr::null_mut(),
-            args.as_ptr(),
-            args.len() as i32,
-            &mut ret,
-        )
+        func(std::ptr::null_mut(), args.as_ptr(), args.len() as i32, &mut ret)
     };
-    if rc == 0 {
-        Ok(())
-    } else {
-        // SAFETY: `tvm_static_ffi_get_last_error` returns a pointer into
-        // TVM's thread-local error state, valid until the next TVM call on
-        // this thread. We read it into an owned String immediately.
-        let (msg_ptr, msg_len) = unsafe {
-            let mut len: usize = 0;
-            let p = tvm_static_ffi_get_last_error(&mut len);
-            (p, len)
-        };
-        let msg = if !msg_ptr.is_null() && msg_len > 0 {
-            // SAFETY: valid UTF-8 slice owned by TVM's thread-local buffer,
-            // copied into an owned String before the next FFI call.
-            unsafe {
-                std::str::from_utf8_unchecked(std::slice::from_raw_parts(msg_ptr, msg_len))
-                    .to_string()
-            }
-        } else {
-            format!("TVM FFI call failed (rc={rc})")
-        };
-        Err(msg)
-    }
+    if rc == 0 { Ok(()) } else { Err(get_last_error()) }
+}
+
+/// Call a TVM FFI function and return the result as a TVMFFIAny.
+///
+/// # Safety
+/// Same safety requirements as `call_tvm_ffi`.
+pub unsafe fn call_tvm_ffi_ret(
+    func: TVMSafeCallFn,
+    args: &[TVMFFIAny],
+) -> Result<TVMFFIAny, String> {
+    let mut ret = TVMFFIAny::none();
+    let rc = unsafe {
+        func(std::ptr::null_mut(), args.as_ptr(), args.len() as i32, &mut ret)
+    };
+    if rc == 0 { Ok(ret) } else { Err(get_last_error()) }
+}
+
+/// Call `__tvm_ffi_init` and wrap the returned Module object.
+///
+/// # Safety
+/// `func` must be a valid `__tvm_ffi_init` SafeCall function pointer.
+pub unsafe fn call_tvm_ffi_module(
+    func: TVMSafeCallFn,
+    args: &[TVMFFIAny],
+) -> Result<TVMModuleHandle, String> {
+    let any = unsafe { call_tvm_ffi_ret(func, args)? };
+    Ok(TVMModuleHandle { any })
 }

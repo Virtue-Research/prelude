@@ -1358,6 +1358,14 @@ impl Qwen3_5SparseMoeBlock {
             (num_experts, 2 * moe_intermediate_size, cfg.hidden_size),
             "gate_up_proj",
         )?;
+        // CUTLASS Swiglu expects [up|gate] order. Swap in-place at load time
+        // via the Ops trait (2MB GPU temp, done once).
+        if experts_gate_up.device().is_cuda() {
+            let ops = crate::ops::select_ops(experts_gate_up.device());
+            if let Some(result) = ops.swap_moe_gate_up(&experts_gate_up, moe_intermediate_size) {
+                result?;
+            }
+        }
         let experts_down = vb_experts.get(
             (num_experts, cfg.hidden_size, moe_intermediate_size),
             "down_proj",
@@ -1398,84 +1406,29 @@ impl Qwen3_5SparseMoeBlock {
     }
 
     fn forward(&self, ops: &dyn crate::ops::Ops, xs: &Tensor) -> Result<Tensor> {
-        let ndim = xs.dims().len();
-        if ndim == 2 {
-            return self.forward_2d(ops, xs);
-        }
-        let (b, seq_len, hidden_dim) = xs.dims3()?;
-        let xs_flat = xs.reshape(((), hidden_dim))?;
-        let result = self.forward_2d(ops, &xs_flat)?;
-        result.reshape((b, seq_len, hidden_dim))
-    }
-
-    fn expert_forward(&self, expert_idx: usize, x: &Tensor, ops: &dyn crate::ops::Ops) -> Result<Tensor> {
-        let gate_up_w = self.experts_gate_up.get(expert_idx)?; // [2*inter, hidden]
-        let down_w = self.experts_down.get(expert_idx)?; // [hidden, inter]
-        let inter = self.moe_intermediate_size;
-
-        if x.device().is_cpu() {
-            return self.expert_forward_matmul(x, &gate_up_w, &down_w, inter, ops);
-        }
-
-        let gate_up = x.matmul(&gate_up_w.t()?)?;
-        let gate = gate_up.narrow(D::Minus1, 0, inter)?;
-        let up = gate_up.narrow(D::Minus1, inter, inter)?;
-        let act = ops.silu(&gate)?;
-        let hidden = (act * up)?;
-        hidden.matmul(&down_w.t()?)
-    }
-
-    fn expert_forward_matmul(
-        &self, x: &Tensor, gate_up_w: &Tensor, down_w: &Tensor, inter: usize,
-        ops: &dyn crate::ops::Ops,
-    ) -> Result<Tensor> {
-        // gate_up GEMM: x @ gate_up_w^T
-        let gate_up = x.matmul(&gate_up_w.t()?)?;
-        let gate = gate_up.narrow(gate_up.dims().len() - 1, 0, inter)?;
-        let up = gate_up.narrow(gate_up.dims().len() - 1, inter, inter)?;
-        // SiLU(gate) * up
-        let silu_gate = ops.silu(&gate)?;
-        let hidden = (&silu_gate * &up)?;
-        // down GEMM: hidden @ down_w^T
-        hidden.matmul(&down_w.t()?)
-    }
-
-    fn forward_2d(&self, ops: &dyn crate::ops::Ops, xs: &Tensor) -> Result<Tensor> {
         let (n_tokens, hidden_dim) = xs.dims2()?;
 
-        // Router: softmax in F32 (to match reference `softmax(..., dtype=float32)`)
-        // over 256 experts — BF16 softmax loses too much precision at this width.
+        // Routing: fused kernel when available, decomposed fallback
         let router_logits = xs.apply(&self.gate)?;
-        let router_logits_f32 = router_logits.to_dtype(DType::F32)?;
-        let last_dim = router_logits_f32.rank() - 1;
-        let routing_weights = ops.softmax(&router_logits_f32, last_dim)?;
+        let (topk_weights, experts_per_tok) = self.compute_routing(ops, &router_logits, n_tokens)?;
 
-        let experts_per_tok = routing_weights
-            .arg_sort_last_dim(false)?
-            .narrow(D::Minus1, 0, self.num_experts_per_tok)?
-            .contiguous()?;
-        let mut topk_weights = routing_weights
-            .gather(&experts_per_tok, D::Minus1)?
-            .to_dtype(DType::F32)?;
-
-        if self.norm_topk_prob {
-            topk_weights = topk_weights.broadcast_div(&topk_weights.sum_keepdim(D::Minus1)?)?;
-        }
-
-        let mut routed_out = if xs.device().is_cuda() {
-            self.forward_fused(ops, xs, &topk_weights, &experts_per_tok, n_tokens, hidden_dim)?
+        // Expert dispatch: fused CUTLASS pipeline when available,
+        // composed grouped_gemm + silu_mul fallback
+        let mut routed_out = if let Some(r) = ops.cutlass_fused_moe(
+            xs, &experts_per_tok, &topk_weights,
+            &self.experts_gate_up, &self.experts_down,
+        ) {
+            r?
         } else {
-            self.forward_sequential_cpu(ops, xs, &topk_weights, &experts_per_tok, hidden_dim)?
+            self.forward_composed(ops, xs, &topk_weights, &experts_per_tok, n_tokens, hidden_dim)?
         };
 
-        // Shared expert
+        // 3. Shared expert
         if let Some(ref shared) = self.shared_expert {
             let shared_out = shared.forward(ops, xs)?;
             let shared_out = if let Some(ref gate_w) = self.shared_expert_gate_weight {
-                // logit[n] = Σ_h xs[n, h] * gate_w[h]
                 let logits = xs.broadcast_mul(&gate_w.unsqueeze(0)?)?.sum_keepdim(D::Minus1)?;
-                let gate_val = ops.sigmoid(&logits)?; // [n, 1]
-                shared_out.broadcast_mul(&gate_val)?
+                shared_out.broadcast_mul(&ops.sigmoid(&logits)?)?
             } else {
                 shared_out
             };
@@ -1483,6 +1436,35 @@ impl Qwen3_5SparseMoeBlock {
         }
 
         Ok(routed_out)
+    }
+
+    /// Routing: fused kernel on CUDA, decomposed on CPU.
+    fn compute_routing(
+        &self,
+        ops: &dyn crate::ops::Ops,
+        router_logits: &Tensor,
+        n_tokens: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        // Try fused routing (single CUDA kernel, F32 softmax internally)
+        if self.norm_topk_prob {
+            if let Some(result) = ops.fused_moe_routing(router_logits, self.num_experts_per_tok) {
+                let (tw, topk_ids, _, _) = result?;
+                return Ok((tw, topk_ids.reshape((n_tokens, self.num_experts_per_tok))?));
+            }
+        }
+        // Decomposed fallback (CPU, non-BF16, or norm_topk_prob=false)
+        let routing_weights = ops.softmax(&router_logits.to_dtype(DType::F32)?, router_logits.rank() - 1)?;
+        let experts_per_tok = routing_weights
+            .arg_sort_last_dim(false)?
+            .narrow(D::Minus1, 0, self.num_experts_per_tok)?
+            .contiguous()?;
+        let mut topk_weights = routing_weights
+            .gather(&experts_per_tok, D::Minus1)?
+            .to_dtype(DType::F32)?;
+        if self.norm_topk_prob {
+            topk_weights = topk_weights.broadcast_div(&topk_weights.sum_keepdim(D::Minus1)?)?;
+        }
+        Ok((topk_weights, experts_per_tok))
     }
 
     /// Fused MoE dispatch (CUDA fast path).
@@ -1494,7 +1476,7 @@ impl Qwen3_5SparseMoeBlock {
     /// `for t { for k in 0..topk { two tiny matmuls } }` loop that did two
     /// D2H syncs per layer via `to_vec2()` and launched ~`n_tokens * topk * 2`
     /// tiny GEMMs — catastrophic for a 40-layer 256-expert top-8 model.
-    fn forward_fused(
+    fn forward_composed(
         &self,
         ops: &dyn crate::ops::Ops,
         xs: &Tensor,
@@ -1503,8 +1485,13 @@ impl Qwen3_5SparseMoeBlock {
         n_tokens: usize,
         hidden_dim: usize,
     ) -> Result<Tensor> {
+        let flat = experts_per_tok.flatten_all()?;
         let (sorted_expert_ids, sorted_token_ids) =
-            sort_expert_assignments(experts_per_tok, xs.device())?;
+            if let Some(result) = ops.moe_sort_experts(&flat) {
+                result?
+            } else {
+                sort_expert_assignments(experts_per_tok, xs.device())?
+            };
 
         let is_prefill = n_tokens > 1;
         // `num_tokens_per_expert` is unused by the current CUDA grouped_gemm
@@ -1522,15 +1509,13 @@ impl Qwen3_5SparseMoeBlock {
             counts_sentinel,
         )?;
 
-        // silu(gate) * up — prefer fused concat path that avoids a narrow+copy
+        // Weights are in [up|gate] order (swapped for CUTLASS Swiglu at load time).
+        // silu(gate) * up: gate is second half, up is first half.
         let inter = self.moe_intermediate_size;
-        let down_input = match ops.silu_mul_concat(&gate_up) {
-            Some(r) => r?,
-            None => {
-                let gate = gate_up.narrow(D::Minus1, 0, inter)?.contiguous()?;
-                let up = gate_up.narrow(D::Minus1, inter, inter)?.contiguous()?;
-                ops.silu_mul(&gate, &up)?
-            }
+        let down_input = {
+            let up = gate_up.narrow(D::Minus1, 0, inter)?.contiguous()?;
+            let gate = gate_up.narrow(D::Minus1, inter, inter)?.contiguous()?;
+            ops.silu_mul(&gate, &up)?
         };
 
         // Down projection with fused topk weighted accumulation.
@@ -1563,38 +1548,6 @@ impl Qwen3_5SparseMoeBlock {
             .sum(D::Minus2)
     }
 
-    /// CPU fallback: sequential per-token expert dispatch. Kept for
-    /// correctness when the CUDA fused path is unavailable.
-    fn forward_sequential_cpu(
-        &self,
-        ops: &dyn crate::ops::Ops,
-        xs: &Tensor,
-        topk_weights: &Tensor,
-        experts_per_tok: &Tensor,
-        hidden_dim: usize,
-    ) -> Result<Tensor> {
-        let topk_weights_vec: Vec<Vec<f32>> = topk_weights.to_vec2()?;
-        let experts_per_tok_vec: Vec<Vec<u32>> = experts_per_tok.to_vec2()?;
-
-        let n_tokens = topk_weights_vec.len();
-        let mut routed_out = Tensor::zeros((n_tokens, hidden_dim), xs.dtype(), xs.device())?;
-
-        for t in 0..n_tokens {
-            let x_t = xs.get(t)?.unsqueeze(0)?;
-            let mut acc = Tensor::zeros((1, hidden_dim), DType::F32, xs.device())?;
-            for k in 0..self.num_experts_per_tok {
-                let expert_idx = experts_per_tok_vec[t][k] as usize;
-                let weight = topk_weights_vec[t][k];
-                let expert_out = self
-                    .expert_forward(expert_idx, &x_t, ops)?
-                    .to_dtype(DType::F32)?;
-                acc = (acc + (expert_out * weight as f64)?)?;
-            }
-            let acc = acc.to_dtype(xs.dtype())?;
-            routed_out = routed_out.slice_assign(&[t..t + 1, 0..hidden_dim], &acc)?;
-        }
-        Ok(routed_out)
-    }
 }
 
 /// Sort topk expert assignments so that all tokens routed to the same expert

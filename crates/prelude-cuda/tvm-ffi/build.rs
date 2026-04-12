@@ -82,6 +82,19 @@ fn main() -> Result<()> {
         build.file(&error_helper);
     }
 
+    // tvm_module_helper.cc — Rust-callable C bridge for TVM Module method calls
+    // Needs CUDA headers for the DLPack allocator.
+    let module_helper = manifest_dir.join("src/tvm_module_helper.cc");
+    if module_helper.exists() {
+        for cuda_inc in ["/usr/local/cuda/include", "/opt/cuda/include"] {
+            if std::path::Path::new(cuda_inc).exists() {
+                build.include(cuda_inc);
+                break;
+            }
+        }
+        build.file(&module_helper);
+    }
+
     // ── Phase 2: Compile libbacktrace ──────────────────────────────
     compile_libbacktrace(&tvm_ffi_dir)?;
 

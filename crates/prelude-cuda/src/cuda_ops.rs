@@ -59,6 +59,25 @@ impl Ops for CudaOps {
         crate::ops::moe::moe_gemm_wmma(input, weights, &None, sorted_token_ids, sorted_expert_ids, topk, num_tokens > 1)
     }
 
+    fn moe_sort_experts(&self, expert_ids: &Tensor) -> Option<Result<(Tensor, Tensor)>> {
+        Some(crate::ops::moe::moe_sort_experts_gpu(expert_ids))
+    }
+
+    fn swap_moe_gate_up(&self, w1: &Tensor, inter: usize) -> Option<Result<()>> {
+        Some(crate::ops::moe::swap_gate_up_inplace(w1, inter))
+    }
+
+    fn cutlass_fused_moe(
+        &self,
+        input: &Tensor,
+        experts_per_tok: &Tensor,
+        topk_weights: &Tensor,
+        w1: &Tensor,
+        w2: &Tensor,
+    ) -> Option<Result<Tensor>> {
+        Some(crate::ops::moe::cutlass_fused_moe_forward(input, experts_per_tok, topk_weights, w1, w2))
+    }
+
     // ── KV cache ──────────────────────────────────────────────────
 
     fn reshape_and_cache(&self, key: &Tensor, value: &Tensor, key_cache: &Tensor, value_cache: &Tensor, slot_mapping: &Tensor) -> Result<()> {

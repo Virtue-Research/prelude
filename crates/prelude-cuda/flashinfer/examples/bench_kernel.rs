@@ -1239,10 +1239,94 @@ fn main() {
     bench_gdn(&reg);
     bench_gemm(&reg);
     bench_topk(&reg);
+    bench_fused_moe(&reg);
 
     let ws = Workspace::new();
     bench_prefill(&reg, &ws);
     bench_decode(&reg, &ws);
 
     println!("\nDone.");
+}
+
+fn bench_fused_moe(reg: &KernelRegistry) {
+    if reg.get_utility("init").is_none() {
+        println!("\n{:=<80}", "= CUTLASS Fused MoE ");
+        println!("  not compiled — skipping");
+        return;
+    }
+
+    println!("\n{:=<80}", "= CUTLASS Fused MoE ");
+    let runner = match flashinfer::moe::FusedMoeRunner::new() {
+        Ok(r) => r,
+        Err(e) => { println!("  init failed: {e}"); return; }
+    };
+
+    // Qwen3.5-35B-A3B dimensions
+    let num_experts = 256i64;
+    let top_k = 8i64;
+    let inter_size = 512i64;
+    let hidden_size = 2048i64;
+
+    unsafe {
+        // Pre-allocate weights (shared across batch sizes)
+        let w1_elems = (num_experts * 2 * inter_size * hidden_size) as usize;
+        let w2_elems = (num_experts * hidden_size * inter_size) as usize;
+        let w1 = gpu_alloc(w1_elems * 2);
+        let w2 = gpu_alloc(w2_elems * 2);
+        cudaMemset(w1, 0, w1_elems * 2);
+        cudaMemset(w2, 0, w2_elems * 2);
+
+        let w1_s = [num_experts, 2 * inter_size, hidden_size];
+        let w1_st = strides(&w1_s);
+        let w2_s = [num_experts, hidden_size, inter_size];
+        let w2_st = strides(&w2_s);
+
+        reg.set_stream(0, std::ptr::null_mut());
+
+        for &batch in &[1i64, 4, 32, 128] {
+            let input_elems = (batch * hidden_size) as usize;
+            let expert_elems = (batch * top_k) as usize;
+
+            let input = gpu_alloc(input_elems * 2);
+            let output = gpu_alloc(input_elems * 2);
+            let expert_ids = gpu_alloc(expert_elems * 4);
+            let expert_weights = gpu_alloc(expert_elems * 4);
+            cudaMemset(input, 0, input_elems * 2);
+            cudaMemset(output, 0, input_elems * 2);
+            cudaMemset(expert_ids, 0, expert_elems * 4);
+            // Set expert_weights to 1/top_k
+            let ew: Vec<f32> = vec![1.0 / top_k as f32; expert_elems];
+            cudaMemcpy(expert_weights, ew.as_ptr() as *const c_void, expert_elems * 4, 1);
+
+            let out_s = [batch, hidden_size]; let out_st = strides(&out_s);
+            let in_s = [batch, hidden_size]; let in_st = strides(&in_s);
+            let eid_s = [batch, top_k]; let eid_st = strides(&eid_s);
+            let ew_s = [batch, top_k]; let ew_st = strides(&ew_s);
+
+            let dl_output = gpu_dl(output, BF16_DT, &out_s, &out_st);
+            let dl_input = gpu_dl(input, BF16_DT, &in_s, &in_st);
+            let dl_expert_ids = gpu_dl(expert_ids, I32_DT, &eid_s, &eid_st);
+            let dl_expert_weights = gpu_dl(expert_weights, FP32_DT, &ew_s, &ew_st);
+            let dl_w1 = gpu_dl(w1, BF16_DT, &w1_s, &w1_st);
+            let dl_w2 = gpu_dl(w2, BF16_DT, &w2_s, &w2_st);
+
+            let ms = cuda_bench(3, 50, || {
+                runner.run_moe(
+                    &dl_output, &dl_input,
+                    &dl_expert_ids, &dl_expert_weights,
+                    &dl_w1, &dl_w2,
+                    1, 0, 1, 0,
+                ).unwrap();
+            });
+            // Per 40 layers (Qwen3.5-35B-A3B)
+            let per_layer = ms;
+            let per_model = ms * 40.0;
+            println!("  batch={batch:4}  {per_layer:.3} ms/layer  ({per_model:.1} ms/40-layer model)");
+
+            cudaFree(input); cudaFree(output);
+            cudaFree(expert_ids); cudaFree(expert_weights);
+        }
+
+        cudaFree(w1); cudaFree(w2);
+    }
 }

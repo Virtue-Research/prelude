@@ -21,4 +21,22 @@ unsafe extern "C" {
         is_prefill: bool,
         stream: i64,
     );
+
+    /// In-place swap of gate/up halves in expert weights.
+    pub fn moe_swap_gate_up_inplace(
+        data: *mut c_void,
+        num_experts: i32,
+        inter: i32,
+        hidden: i32,
+        stream: i64,
+    );
+
+    /// GPU sort of expert assignments using thrust::sort_by_key.
+    pub fn moe_sort_expert_assignments(
+        expert_ids_in: *const u32,
+        n: i32,
+        sorted_experts: *mut u32,
+        sorted_tokens: *mut u32,
+        stream: i64,
+    );
 }

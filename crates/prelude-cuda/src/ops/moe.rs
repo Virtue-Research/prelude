@@ -3,7 +3,10 @@ use candle_core::cuda_backend::WrapErr;
 use cudarc::driver::{DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg};
 use prelude_core::tensor::{bail, DType, Result, Tensor};
 
+use crate::moe_ffi as ffi;
 use crate::{MOD_MOE_ROUTING, PTX_MOE_ROUTING};
+
+use std::sync::OnceLock;
 
 /// Helper: extract candle CUDA storage or bail.
 fn as_candle_cuda<'a>(
@@ -231,4 +234,195 @@ pub fn moe_gemm_wmma(
         DType::BF16 => cuda_fwd::<bf16>(input, weights, topk_weights, sorted_token_ids, experts_ids, topk, is_prefill),
         _ => bail!("moe_gemm only accepts f16/bf16 inputs"),
     }
+}
+
+/// GPU-accelerated sort of expert assignments using thrust::sort_by_key.
+/// Input:  expert_ids [n] U32 (flat, unsorted)
+/// Output: (sorted_expert_ids [n] U32, sorted_token_ids [n] U32)
+pub fn moe_sort_experts_gpu(expert_ids: &Tensor) -> Result<(Tensor, Tensor)> {
+    let n = expert_ids.elem_count();
+    let (storage, layout) = expert_ids.storage_and_layout();
+    let cuda = as_candle_cuda(&storage, "moe_sort_experts_gpu")?;
+    if cuda.dtype() != DType::U32 {
+        bail!("moe_sort_experts_gpu: requires U32 input, got {:?}", cuda.dtype());
+    }
+    let dev = cuda.device().clone();
+    let stream = dev.cuda_stream();
+    let src = cuda.as_cuda_slice::<u32>()?.slice(layout.start_offset()..);
+
+    let sorted_experts = unsafe { dev.alloc::<u32>(n) }?;
+    let sorted_tokens = unsafe { dev.alloc::<u32>(n) }?;
+
+    let cu_stream = stream.cu_stream() as i64;
+    unsafe {
+        ffi::moe_sort_expert_assignments(
+            src.device_ptr(&stream).0 as *const u32,
+            n as i32,
+            sorted_experts.device_ptr(&stream).0 as *mut u32,
+            sorted_tokens.device_ptr(&stream).0 as *mut u32,
+            cu_stream,
+        );
+    }
+
+    drop(storage);
+
+    let se_storage = candle_core::CudaStorage::wrap_cuda_slice(sorted_experts, dev.clone());
+    let st_storage = candle_core::CudaStorage::wrap_cuda_slice(sorted_tokens, dev);
+    let se = Tensor::from_storage(candle_core::Storage::Cuda(se_storage), (n,), candle_core::op::BackpropOp::none(), false);
+    let st = Tensor::from_storage(candle_core::Storage::Cuda(st_storage), (n,), candle_core::op::BackpropOp::none(), false);
+    Ok((se, st))
+}
+
+/// In-place swap gate/up halves in expert weights for CUTLASS Swiglu.
+/// Converts [E, gate|up, H] → [E, up|gate, H] using 2MB temp on GPU.
+/// Call once at model load time.
+pub fn swap_gate_up_inplace(w1: &Tensor, inter: usize) -> Result<()> {
+    let (storage, layout) = w1.storage_and_layout();
+    let cuda = as_candle_cuda(&storage, "swap_gate_up")?;
+    let dev = cuda.device().clone();
+    let stream = dev.cuda_stream();
+    let slice = cuda.as_cuda_slice::<half::bf16>()?;
+    let base = slice.device_ptr(&stream).0;
+    let offset = (layout.start_offset() * 2) as u64; // bf16 = 2 bytes
+    let data_ptr = (base + offset) as *mut std::ffi::c_void;
+    let dims = w1.dims();
+    let num_experts = dims[0] as i32;
+    let hidden = dims[2] as i32;
+    let cu_stream = unsafe { stream.cu_stream() } as i64;
+    unsafe {
+        ffi::moe_swap_gate_up_inplace(data_ptr, num_experts, inter as i32, hidden, cu_stream);
+    }
+    drop(storage);
+    Ok(())
+}
+
+// ── CUTLASS Fused MoE forward ─────────────────────────────────────
+
+/// Get or create the CUTLASS fused MoE runner singleton.
+fn get_cutlass_moe_runner() -> Option<&'static flashinfer::moe::FusedMoeRunner> {
+    static RUNNER: OnceLock<Option<flashinfer::moe::FusedMoeRunner>> = OnceLock::new();
+    RUNNER.get_or_init(|| {
+        match flashinfer::moe::FusedMoeRunner::new() {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!("CUTLASS fused MoE unavailable: {e}");
+                None
+            }
+        }
+    }).as_ref()
+}
+
+/// CUTLASS fused MoE forward: converts candle tensors to DLTensor and calls the runner.
+pub fn cutlass_fused_moe_forward(
+    input: &Tensor,            // [n_tokens, hidden] BF16
+    experts_per_tok: &Tensor,  // [n_tokens, topk] U32
+    topk_weights: &Tensor,     // [n_tokens, topk] F32
+    w1: &Tensor,               // [num_experts, 2*inter, hidden] BF16
+    w2: &Tensor,               // [num_experts, hidden, inter] BF16
+) -> Result<Tensor> {
+    use flashinfer::types::*;
+
+    let runner = get_cutlass_moe_runner()
+        .ok_or_else(|| candle_core::Error::Msg("CUTLASS fused MoE runner not available".into()))?;
+
+    let (n_tokens, hidden) = input.dims2()?;
+    let device = input.device();
+
+    // Allocate output tensor
+    let output = Tensor::zeros((n_tokens, hidden), input.dtype(), device)?;
+
+    // Ensure contiguous layout
+    let input = input.contiguous()?;
+    let experts_i32 = experts_per_tok.contiguous()?;
+    let topk_weights = topk_weights.contiguous()?;
+    let w2 = w2.contiguous()?;
+
+    // w1 must be in [up|gate] order (swapped at load time via swap_gate_up_inplace).
+    let w1 = w1.contiguous()?;
+
+    // Build DLTensors from candle tensors.
+    // Extracts the raw CUDA device pointer via candle's CudaStorage.
+    // Extract raw CUDA device pointer from a candle tensor.
+    // GPU device addresses are stable — the pointer remains valid after
+    // dropping the storage guard.
+    fn tensor_to_dl(t: &Tensor, shapes: &[i64], dt: DLDataType) -> Result<DLTensor> {
+        let (storage, layout) = t.storage_and_layout();
+        let cuda = as_candle_cuda(&storage, "cutlass_fused_moe")?;
+        let dev = cuda.device().clone();
+        let stream = dev.cuda_stream();
+        // CudaSlice::device_ptr returns the base of the RAW allocation.
+        // layout.start_offset() is the ELEMENT offset for this tensor's view.
+        let (base_ptr, elem_offset) = match t.dtype() {
+            DType::BF16 => {
+                let s = cuda.as_cuda_slice::<half::bf16>()?;
+                (s.device_ptr(&stream).0, layout.start_offset())
+            }
+            DType::F32 => {
+                let s = cuda.as_cuda_slice::<f32>()?;
+                (s.device_ptr(&stream).0, layout.start_offset())
+            }
+            DType::U32 => {
+                let s = cuda.as_cuda_slice::<u32>()?;
+                (s.device_ptr(&stream).0, layout.start_offset())
+            }
+            dt => bail!("cutlass_fused_moe: unsupported dtype {dt:?}"),
+        };
+        let data_ptr = base_ptr + (elem_offset * t.dtype().size_in_bytes()) as u64;
+        Ok(DLTensor {
+            data: data_ptr as *mut std::ffi::c_void,
+            device: DLDevice { device_type: KDLCUDA, device_id: 0 },
+            ndim: shapes.len() as i32,
+            dtype: dt,
+            shape: shapes.as_ptr(),
+            strides: std::ptr::null(),
+            byte_offset: 0,
+        })
+    }
+
+    let bf16_dt = DLDataType { code: KDLBFLOAT, bits: 16, lanes: 1 };
+    let f32_dt = DLDataType { code: KDLFLOAT, bits: 32, lanes: 1 };
+    let i32_dt = DLDataType { code: KDLINT, bits: 32, lanes: 1 };
+
+    let to_shape = |t: &Tensor| -> Vec<i64> { t.dims().iter().map(|&d| d as i64).collect() };
+
+    let out_shape = to_shape(&output);
+    let in_shape = to_shape(&input);
+    let ept_shape = to_shape(&experts_i32);
+    let tw_shape = to_shape(&topk_weights);
+    let w1_shape = to_shape(&w1);
+    let w2_shape = to_shape(&w2);
+
+    let dl_out = tensor_to_dl(&output, &out_shape, bf16_dt)?;
+    let dl_in = tensor_to_dl(&input, &in_shape, bf16_dt)?;
+    let dl_ept = tensor_to_dl(&experts_i32, &ept_shape, i32_dt)?;
+    let dl_tw = tensor_to_dl(&topk_weights, &tw_shape, f32_dt)?;
+    let dl_w1 = tensor_to_dl(&w1, &w1_shape, bf16_dt)?;
+    let dl_w2 = tensor_to_dl(&w2, &w2_shape, bf16_dt)?;
+
+    // Set CUDA stream for TVM-FFI (must match the stream used by the engine)
+    let registry = flashinfer::KernelRegistry::new();
+    let (storage, _) = input.storage_and_layout();
+    let cuda_storage = as_candle_cuda(&storage, "cutlass_fused_moe_stream")?;
+    let dev = cuda_storage.device().clone();
+    let stream = dev.cuda_stream();
+    let raw_stream = unsafe { stream.cu_stream() } as *mut std::ffi::c_void;
+    registry.set_stream(0, raw_stream);
+    drop(storage);
+
+    {
+        let (w1_stor, w1_layout) = w1.storage_and_layout();
+        let w1_off = w1_layout.start_offset();
+        drop(w1_stor);
+        tracing::debug!(
+            "CUTLASS MoE: n={n_tokens} h={hidden} w1={:?} w2={:?} \
+             w1_ptr={:?} w1_offset={w1_off}",
+            w1.dims(), w2.dims(), dl_w1.data,
+        );
+    }
+
+    unsafe {
+        runner.run_moe(&dl_out, &dl_in, &dl_ept, &dl_tw, &dl_w1, &dl_w2, 1, 0, 1, 0)
+    }.map_err(|e| candle_core::Error::Msg(format!("CUTLASS fused MoE failed: {e}")))?;
+
+    Ok(output)
 }
