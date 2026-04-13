@@ -510,20 +510,20 @@ pub trait Ops: Send + Sync {
     // their own kernels. CUDA leaves them as None.
     // ════════════════════════════════════════════════════════════════
 
-    fn hook_unary(&self, _x: &Tensor, _op: UnaryOp) -> Option<Result<Tensor>> { None }
-    fn hook_binary(&self, _a: &Tensor, _b: &Tensor, _op: BinaryOp) -> Option<Result<Tensor>> { None }
-    fn hook_matmul(&self, _a: &Tensor, _b: &Tensor) -> Option<Result<Tensor>> { None }
-    fn hook_contiguous(&self, _x: &Tensor) -> Option<Result<Tensor>> { None }
-    fn hook_to_dtype(&self, _x: &Tensor, _dtype: DType) -> Option<Result<Tensor>> { None }
-    fn hook_where_cond(&self, _cond: &Tensor, _on_true: &Tensor, _on_false: &Tensor) -> Option<Result<Tensor>> { None }
-    fn hook_index_select(&self, _x: &Tensor, _ids: &Tensor, _dim: usize) -> Option<Result<Tensor>> { None }
-    fn hook_gather(&self, _x: &Tensor, _ids: &Tensor, _dim: usize) -> Option<Result<Tensor>> { None }
-    fn hook_cat(&self, _tensors: &[&Tensor], _dim: usize) -> Option<Result<Tensor>> { None }
-    fn hook_reduce_sum(&self, _x: &Tensor, _dims: &[usize]) -> Option<Result<Tensor>> { None }
-    fn hook_reduce_max(&self, _x: &Tensor, _dims: &[usize]) -> Option<Result<Tensor>> { None }
-    fn hook_reduce_min(&self, _x: &Tensor, _dims: &[usize]) -> Option<Result<Tensor>> { None }
-    fn hook_affine(&self, _x: &Tensor, _mul: f64, _add: f64) -> Option<Result<Tensor>> { None }
-    fn hook_to_device(&self, _x: &Tensor, _device: &crate::tensor::Device) -> Option<Result<Tensor>> { None }
+    fn unary(&self, _x: &Tensor, _op: UnaryOp) -> Option<Result<Tensor>> { None }
+    fn binary(&self, _a: &Tensor, _b: &Tensor, _op: BinaryOp) -> Option<Result<Tensor>> { None }
+    fn matmul(&self, _a: &Tensor, _b: &Tensor) -> Option<Result<Tensor>> { None }
+    fn contiguous(&self, _x: &Tensor) -> Option<Result<Tensor>> { None }
+    fn to_dtype(&self, _x: &Tensor, _dtype: DType) -> Option<Result<Tensor>> { None }
+    fn where_cond(&self, _cond: &Tensor, _on_true: &Tensor, _on_false: &Tensor) -> Option<Result<Tensor>> { None }
+    fn index_select(&self, _x: &Tensor, _ids: &Tensor, _dim: usize) -> Option<Result<Tensor>> { None }
+    fn gather(&self, _x: &Tensor, _ids: &Tensor, _dim: usize) -> Option<Result<Tensor>> { None }
+    fn cat(&self, _tensors: &[&Tensor], _dim: usize) -> Option<Result<Tensor>> { None }
+    fn reduce_sum(&self, _x: &Tensor, _dims: &[usize]) -> Option<Result<Tensor>> { None }
+    fn reduce_max(&self, _x: &Tensor, _dims: &[usize]) -> Option<Result<Tensor>> { None }
+    fn reduce_min(&self, _x: &Tensor, _dims: &[usize]) -> Option<Result<Tensor>> { None }
+    fn affine(&self, _x: &Tensor, _mul: f64, _add: f64) -> Option<Result<Tensor>> { None }
+    fn to_device(&self, _x: &Tensor, _device: &crate::tensor::Device) -> Option<Result<Tensor>> { None }
 
     // ════════════════════════════════════════════════════════════════
     // Session lifecycle

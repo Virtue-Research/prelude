@@ -23,7 +23,7 @@ struct CountingOps;
 impl Ops for CountingOps {
     fn default_impl(&self) -> &dyn Ops { self }
 
-    fn hook_unary(&self, x: &Tensor, op: UnaryOp) -> Option<Result<Tensor>> {
+    fn unary(&self, x: &Tensor, op: UnaryOp) -> Option<Result<Tensor>> {
         UNARY_COUNT.fetch_add(1, Ordering::Relaxed);
         match op {
             // Override exp: return 42.0 filled tensor (proves hook ran)
@@ -40,7 +40,7 @@ impl Ops for CountingOps {
         }
     }
 
-    fn hook_binary(&self, a: &Tensor, b: &Tensor, op: BinaryOp) -> Option<Result<Tensor>> {
+    fn binary(&self, a: &Tensor, b: &Tensor, op: BinaryOp) -> Option<Result<Tensor>> {
         BINARY_COUNT.fetch_add(1, Ordering::Relaxed);
         match op {
             // Override add: return a * 2 + b * 3 (proves hook ran)
@@ -56,7 +56,7 @@ impl Ops for CountingOps {
         }
     }
 
-    fn hook_matmul(&self, _a: &Tensor, _b: &Tensor) -> Option<Result<Tensor>> {
+    fn matmul(&self, _a: &Tensor, _b: &Tensor) -> Option<Result<Tensor>> {
         MATMUL_COUNT.fetch_add(1, Ordering::Relaxed);
         None // fall through to candle's matmul
     }

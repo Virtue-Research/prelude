@@ -79,7 +79,7 @@ impl Ops for AmdOps {
     // ── CPU → AMD GPU transfer ──────────────────────────────────
 
     #[cfg(feature = "rocm")]
-    fn hook_to_device(&self, x: &Tensor, device: &candle_core::Device) -> Option<Result<Tensor>> {
+    fn to_device(&self, x: &Tensor, device: &candle_core::Device) -> Option<Result<Tensor>> {
         if !x.device().is_cpu() || !device.is_custom() { return None; }
         Some((|| -> Result<Tensor> {
             let dtype = x.dtype();
@@ -95,7 +95,7 @@ impl Ops for AmdOps {
     // ── GEMM ────────────────────────────────────────────────────
 
     #[cfg(feature = "rocm")]
-    fn hook_matmul(&self, a: &Tensor, b: &Tensor) -> Option<Result<Tensor>> {
+    fn matmul(&self, a: &Tensor, b: &Tensor) -> Option<Result<Tensor>> {
         if !a.device().is_custom() { return None; }
         if self.arch != GfxArch::Gfx1100 {
             return Some(Err(candle_core::Error::Msg(format!("AMD {:?}: matmul not supported", self.arch))));
@@ -117,7 +117,7 @@ impl Ops for AmdOps {
     // ── Unary elementwise ───────────────────────────────────────
 
     #[cfg(feature = "rocm")]
-    fn hook_unary(&self, x: &Tensor, op: UnaryOp) -> Option<Result<Tensor>> {
+    fn unary(&self, x: &Tensor, op: UnaryOp) -> Option<Result<Tensor>> {
         if !x.device().is_custom() || self.arch != GfxArch::Gfx1100 { return None; }
         let xb = self.buf(x)?;
         let n = x.elem_count();
@@ -137,7 +137,7 @@ impl Ops for AmdOps {
     // ── Binary elementwise ──────────────────────────────────────
 
     #[cfg(feature = "rocm")]
-    fn hook_binary(&self, a: &Tensor, b: &Tensor, op: BinaryOp) -> Option<Result<Tensor>> {
+    fn binary(&self, a: &Tensor, b: &Tensor, op: BinaryOp) -> Option<Result<Tensor>> {
         if !a.device().is_custom() || self.arch != GfxArch::Gfx1100 { return None; }
         let ab = self.buf(a)?;
         let bb = self.buf(b)?;
@@ -156,12 +156,12 @@ impl Ops for AmdOps {
 
     // ── Stubs ───────────────────────────────────────────────────
 
-    fn hook_contiguous(&self, x: &Tensor) -> Option<Result<Tensor>> {
+    fn contiguous(&self, x: &Tensor) -> Option<Result<Tensor>> {
         if !x.device().is_custom() { return None; }
         None // TODO: strided → contiguous copy kernel
     }
 
-    fn hook_to_dtype(&self, x: &Tensor, _dtype: DType) -> Option<Result<Tensor>> {
+    fn to_dtype(&self, x: &Tensor, _dtype: DType) -> Option<Result<Tensor>> {
         if !x.device().is_custom() { return None; }
         None // TODO: type conversion kernel
     }
