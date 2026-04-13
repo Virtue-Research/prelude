@@ -6,6 +6,7 @@
 //!   The Ops trait only covers fused/inference-specific ops.
 
 pub mod traits;
+mod hook_bridge;
 
 pub use traits::*;
 
@@ -114,12 +115,22 @@ pub fn with_ops<R>(ops: &'static dyn Ops, f: impl FnOnce() -> R) -> R {
 }
 
 pub fn forward_scope<R>(ops: &'static dyn Ops, f: impl FnOnce() -> R) -> R {
+    // Ensure TensorHook bridge is registered (once per thread).
+    install_hook();
     with_ops(ops, || {
         ops.begin_forward();
         let result = f();
         ops.end_forward();
         result
     })
+}
+
+/// Install the TensorHook bridge if not already set on this thread.
+/// This connects candle's tensor ops to prelude's Ops trait.
+fn install_hook() {
+    if candle_core::hook::get().is_none() {
+        candle_core::hook::set(Some(&hook_bridge::BRIDGE));
+    }
 }
 
 pub struct OpsGuard {
