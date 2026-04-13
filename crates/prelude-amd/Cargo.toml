@@ -1,0 +1,22 @@
+[package]
+name = "prelude-amd"
+version = "0.1.0"
+edition = "2024"
+description = "AMD GPU device implementation for Prelude inference engine."
+license = "Apache-2.0"
+
+[lib]
+name = "prelude_amd"
+path = "src/lib.rs"
+
+[features]
+default = ["rocm"]
+# Enable KFD runtime (requires /dev/kfd and AMD GPU)
+rocm = ["t0-gpu/rocm"]
+
+[dependencies]
+prelude-core = { path = "../prelude-core" }
+t0-gpu = { path = "/data/yuzhou/projects/t0-gpu", default-features = false }
+candle-core = { workspace = true }
+tracing.workspace = true
+half = { version = "2.7.1", features = ["bytemuck"] }

@@ -162,6 +162,8 @@ async fn main() -> anyhow::Result<()> {
     prelude_cpu::register();
     #[cfg(feature = "cuda")]
     prelude_cuda::register();
+    #[cfg(feature = "amd")]
+    prelude_amd::register();
 
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)

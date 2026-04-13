@@ -34,6 +34,7 @@ hf-hub.workspace = true
 prelude-core = { path = "../prelude-core", default-features = false }
 prelude-cpu = { path = "../prelude-cpu" }
 prelude-cuda = { path = "../prelude-cuda", optional = true }
+prelude-amd = { path = "../prelude-amd", optional = true }
 bc-mimalloc.workspace = true
 base64 = "0.22.1"
 minijinja = "2.18.0"
@@ -54,5 +55,7 @@ cuda = [
     "dep:prelude-cuda",
     "prelude-core/cuda",
 ]
+# AMD GPU inference — bare-metal KFD via t0-gpu (zero HIP/ROCm dependency)
+amd = ["dep:prelude-amd"]
 # Everything
 full = ["cpu", "cuda"]
