@@ -12,6 +12,7 @@
 mod amd_ops;
 mod device;
 pub mod storage;
+mod kernels;
 
 /// Register AMD ops and executor. Call once at startup.
 pub fn register() {

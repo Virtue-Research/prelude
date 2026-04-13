@@ -10,6 +10,12 @@ mod hook_bridge;
 
 pub use traits::*;
 
+/// Get a reference to the TensorHook bridge singleton.
+/// Used by tests to verify the hook mechanism.
+pub fn hook_bridge_ref() -> &'static dyn candle_core::TensorHook {
+    &hook_bridge::BRIDGE
+}
+
 // ── Device ops registry ────────────────────────────────────────────
 
 use std::sync::{Mutex, OnceLock};
