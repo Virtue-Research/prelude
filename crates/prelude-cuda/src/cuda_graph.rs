@@ -44,6 +44,8 @@ struct DecodeGraphBuffers {
     fi_indptr: Tensor,         // (bs+1,) I32
     fi_indices: Tensor,        // (bs * max_blocks,) I32
     fi_last_page_len: Tensor,  // (bs,) I32
+    // DeltaNet slot IDs — pre-allocated for hybrid models.
+    deltanet_slots: Option<Tensor>, // (bs,) U32
 }
 
 impl DecodeGraphBuffers {
@@ -51,6 +53,7 @@ impl DecodeGraphBuffers {
         batch_size: usize,
         max_blocks: usize,
         max_seqlen_k: usize,
+        has_deltanet: bool,
         device: &Device,
     ) -> Result<Self, EngineError> {
         let cu_q: Vec<u32> = (0..=batch_size as u32).collect();
@@ -59,6 +62,12 @@ impl DecodeGraphBuffers {
         let (fi_indptr, fi_indices, fi_last_page_len) =
             crate::attn::flashinfer::allocate_fi_graph_meta(batch_size, max_total_pages, device)
                 .map_err(tensor_err)?;
+
+        let deltanet_slots = if has_deltanet {
+            Some(Tensor::zeros((batch_size,), DType::U32, device).map_err(tensor_err)?)
+        } else {
+            None
+        };
 
         Ok(Self {
             batch_size,
@@ -74,6 +83,7 @@ impl DecodeGraphBuffers {
             fi_indptr,
             fi_indices,
             fi_last_page_len,
+            deltanet_slots,
         })
     }
 }
@@ -155,6 +165,12 @@ fn update_buffers(
         flat_bt.resize(flat_bt.len() + max_blocks - s.block_table.len(), 0);
     }
     unsafe { update_tensor(&buffers.block_tables, &flat_bt, stream)? };
+
+    // Update DeltaNet slot IDs if present
+    if let Some(ref dn_buf) = buffers.deltanet_slots {
+        let dn_slots: Vec<u32> = seqs.iter().map(|s| s.deltanet_slot.unwrap_or(0)).collect();
+        unsafe { update_tensor(dn_buf, &dn_slots, stream)? };
+    }
 
     Ok(CpuBatchData {
         cu_seqlens_k: cu_k,
@@ -250,11 +266,6 @@ impl DecodeGraphCache {
             return None;
         }
 
-        // Skip DeltaNet sequences (hybrid models)
-        if seqs.iter().any(|s| s.deltanet_slot.is_some()) {
-            return None;
-        }
-
         let captured = match self.graphs.get(&bs) {
             Some(c) => c,
             None => return None,
@@ -324,8 +335,9 @@ impl DecodeGraphCache {
         })?;
         let stream = Self::get_stream(device)?;
 
+        let has_deltanet = engine.cache.deltanet_pool.is_some();
         let max_blocks = (seqlen_budget + self.block_size - 1) / self.block_size;
-        let buffers = DecodeGraphBuffers::allocate(batch_size, max_blocks, seqlen_budget, device)?;
+        let buffers = DecodeGraphBuffers::allocate(batch_size, max_blocks, seqlen_budget, has_deltanet, device)?;
 
         let mut model = engine
             .executor
@@ -347,6 +359,12 @@ impl DecodeGraphCache {
                     cu_seqlens_k: &buffers.cu_seqlens_k,
                     max_seqlen_k: buffers.max_seqlen_k,
                 };
+                let mut dn_pool_guard = engine.cache.deltanet_pool.as_ref().map(|m| m.lock().unwrap());
+                let dn_pool_ref = dn_pool_guard.as_deref_mut();
+                let dn_slots_vec: Option<Vec<u32>> = buffers.deltanet_slots.as_ref().map(|t| {
+                    t.to_vec1::<u32>().unwrap_or_else(|_| vec![0u32; batch_size])
+                });
+                let dn_slots_ref = dn_slots_vec.as_deref();
                 let mut ctx = BatchAttnContext {
                     ops: engine.executor.ops,
                     cu_seqlens_q: &buffers.cu_seqlens_q,
@@ -354,8 +372,9 @@ impl DecodeGraphCache {
                     position_ids: &buffers.position_ids,
                     seq_lens: &buffers.q_seq_lens,
                     paged_kv: Some(&paged_kv),
-                    deltanet_pool: None,
-                    deltanet_slots: None,
+                    deltanet_pool: dn_pool_ref,
+                    deltanet_slots: dn_slots_ref,
+                    deltanet_slots_gpu: buffers.deltanet_slots.as_ref(),
                 };
                 if $manage { engine.executor.ops.begin_forward(); }
                 let result = $model

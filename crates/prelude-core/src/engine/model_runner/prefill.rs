@@ -252,6 +252,7 @@ impl Engine {
                                 paged_kv: Some(&paged_kv),
                                 deltanet_pool: None,
                                 deltanet_slots: None,
+                                deltanet_slots_gpu: None,
                             };
                             self.executor.ops.begin_forward();
                             let result = if need_hidden_states {
@@ -283,6 +284,7 @@ impl Engine {
                         paged_kv: None,
                         deltanet_pool: None,
                         deltanet_slots: None,
+                        deltanet_slots_gpu: None,
                     };
                     self.executor.ops.begin_forward();
                     let result = if need_hidden_states {

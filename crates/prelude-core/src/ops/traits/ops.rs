@@ -333,6 +333,7 @@ pub trait Ops: Send + Sync {
         _weight: &Tensor,
         _bias: Option<&Tensor>,
         _silu_activation: bool,
+        _conv_state_indices: Option<&Tensor>,
     ) -> Option<Result<Tensor>> { None }
 
     /// Fused post-conv1d prep for Qwen3.5 / Qwen3-next DeltaNet.
@@ -524,6 +525,35 @@ pub trait Ops: Send + Sync {
     fn reduce_min(&self, _x: &Tensor, _dims: &[usize]) -> Option<Result<Tensor>> { None }
     fn affine(&self, _x: &Tensor, _mul: f64, _add: f64) -> Option<Result<Tensor>> { None }
     fn to_device(&self, _x: &Tensor, _device: &crate::tensor::Device) -> Option<Result<Tensor>> { None }
+
+    // ════════════════════════════════════════════════════════════════
+    // Sampling
+    // ════════════════════════════════════════════════════════════════
+
+    /// Batched sampling from logits on GPU.
+    ///
+    /// Input: `logits` `[batch_size, vocab_size]` F32
+    /// Returns: `[batch_size]` I32 tensor of sampled token IDs (on GPU).
+    ///
+    /// `None` means the backend does not support GPU sampling;
+    /// caller falls back to per-sequence CPU sampling.
+    fn sample_from_logits(
+        &self,
+        _logits: &Tensor,
+        _deterministic: bool,
+    ) -> Option<Result<Tensor>> { None }
+
+    /// Batched top-k + top-p sampling from logits on GPU.
+    ///
+    /// Input: `logits` `[batch_size, vocab_size]` F32
+    /// Returns: `[batch_size]` I32 tensor of sampled token IDs (on GPU).
+    fn top_k_top_p_sample(
+        &self,
+        _logits: &Tensor,
+        _top_k: i64,
+        _top_p: f64,
+        _deterministic: bool,
+    ) -> Option<Result<Tensor>> { None }
 
     // ════════════════════════════════════════════════════════════════
     // Session lifecycle

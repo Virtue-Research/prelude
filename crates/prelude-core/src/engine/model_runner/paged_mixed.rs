@@ -153,6 +153,10 @@ impl Engine {
             paged_kv: Some(&paged_kv),
             deltanet_pool: dn_pool_ref,
             deltanet_slots: deltanet_slots.as_deref(),
+            deltanet_slots_gpu: {
+                // Create GPU tensor for DeltaNet slot IDs (needed for batched conv1d_update)
+                None // Eager path: deltanet_decode_batched_fused creates on-the-fly
+            },
         };
 
         let needs_prompt_logprobs = requests.iter().any(|r| r.prompt_logprobs.is_some());

@@ -802,7 +802,7 @@ mod tests {
         let ops = crate::ops::select_ops(device);
         let mut ctx = BatchAttnContext {
             ops, cu_seqlens_q: &cu, max_seqlen_q: seq_len, position_ids: &pos,
-            seq_lens: &seq_lens, paged_kv: None, deltanet_pool: None, deltanet_slots: None,
+            seq_lens: &seq_lens, paged_kv: None, deltanet_pool: None, deltanet_slots: None, deltanet_slots_gpu: None,
         };
         let logits = model.forward(&input, &mut ctx).unwrap();
         model.clear_kv_cache();

@@ -399,6 +399,7 @@ impl Engine {
                 paged_kv: None,
                 deltanet_pool: None,
                 deltanet_slots: None,
+                deltanet_slots_gpu: None,
             };
 
             let needs_prompt_logprobs = item.request.prompt_logprobs.is_some();

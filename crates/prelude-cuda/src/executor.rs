@@ -54,7 +54,7 @@ impl CudaExecutor {
                         let _ = work.result_tx.send(result);
                     }
                 });
-                tracing::info!("GPU executor worker exited");
+                tracing::debug!("GPU executor worker exited");
             })
             .expect("spawn GPU executor worker thread");
         Self { engine, work_tx, _worker: worker }
@@ -82,6 +82,9 @@ fn execute_work(
 ) -> Result<ModelOutput, EngineError> {
     match batch {
         ForwardBatch::Decode { tokens, positions, block_tables, deltanet_slots } => {
+            let bs = tokens.len();
+            let t0 = std::time::Instant::now();
+
             // Build OwnedBatchDecodeSeq for graph cache lookup
             let seqs: Vec<OwnedBatchDecodeSeq> = tokens.iter().enumerate().map(|(i, &token)| {
                 OwnedBatchDecodeSeq {
@@ -96,6 +99,8 @@ fn execute_work(
             // Try CUDA graph replay first
             if let Some(result) = graph_cache.try_replay(engine, &seqs) {
                 let logits = result?;
+                let elapsed_us = t0.elapsed().as_micros();
+                tracing::debug!(bs, elapsed_us, path = "cuda_graph", "decode step");
                 return Ok(ModelOutput {
                     logits,
                     item_seq_counts: vec![],
@@ -104,8 +109,17 @@ fn execute_work(
             }
 
             // Fallback to eager execution
-            engine.forward_batch(ForwardBatch::Decode { tokens, positions, block_tables, deltanet_slots })
+            let result = engine.forward_batch(ForwardBatch::Decode { tokens, positions, block_tables, deltanet_slots });
+            let elapsed_us = t0.elapsed().as_micros();
+            tracing::debug!(bs, elapsed_us, path = "eager", "decode step");
+            result
         }
-        other => engine.forward_batch(other),
+        other => {
+            let t0 = std::time::Instant::now();
+            let result = engine.forward_batch(other);
+            let elapsed_us = t0.elapsed().as_micros();
+            tracing::debug!(elapsed_us, path = "mixed", "forward step");
+            result
+        }
     }
 }

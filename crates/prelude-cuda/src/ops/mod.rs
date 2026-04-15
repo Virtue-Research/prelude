@@ -13,4 +13,5 @@ pub(crate) mod rmsnorm;
 pub(crate) mod rope;
 
 pub(crate) mod quant;
+pub(crate) mod sampling;
 pub(crate) mod tiled_mmq;

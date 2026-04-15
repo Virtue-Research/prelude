@@ -481,29 +481,70 @@ fn process_step_output(
         logit_row += 1;
     }
 
-    // ── Decode results ────────────────────────────────────────────
-    for request_id in &step.decode_request_ids {
-        let Some(state) = states.get_mut(request_id) else {
-            logit_row += 1;
-            continue;
+    // ── Decode results (batched GPU sampling) ──────────────────────
+    let num_decode = step.decode_request_ids.len();
+    if num_decode > 0 {
+        let decode_start_row = logit_row;
+
+        // Check if all decode sequences are greedy
+        let all_greedy = step.decode_request_ids.iter().all(|id| {
+            states.get(id).map(|s| s.is_greedy()).unwrap_or(true)
+        });
+
+        // Try batched GPU sampling for all-greedy decode batches
+        let batched_tokens: Option<Vec<u32>> = if all_greedy && num_decode > 1 {
+            // Slice the decode portion of logits: [num_decode, vocab_size]
+            output.logits
+                .narrow(0, decode_start_row, num_decode)
+                .ok()
+                .and_then(|decode_logits| {
+                    // Try GPU batched sampling first (deterministic = greedy)
+                    if let Some(result) = engine.executor.ops.sample_from_logits(&decode_logits, true) {
+                        match result {
+                            Ok(token_ids) => token_ids.to_vec1::<u32>().ok(),
+                            Err(_) => None,
+                        }
+                    } else {
+                        // Fallback: batched argmax on GPU, single D2H copy
+                        decode_logits
+                            .argmax(crate::tensor::D::Minus1)
+                            .and_then(|t| t.to_vec1::<u32>())
+                            .ok()
+                    }
+                })
+        } else {
+            None
         };
 
-        if let Ok(row) = output.logits.get(logit_row) {
-            let token = if state.is_greedy() {
-                row.argmax(crate::tensor::D::Minus1)
-                    .and_then(|t| t.to_scalar::<u32>())
-                    .unwrap_or(0)
-            } else if let Some(ref mut prepared) = state.prepared {
-                let row_f32 = row.to_dtype(crate::tensor::DType::F32).unwrap();
-                prepared.logits_processor.sample(&row_f32).unwrap_or(0)
+        for (i, request_id) in step.decode_request_ids.iter().enumerate() {
+            let Some(state) = states.get_mut(request_id) else {
+                logit_row += 1;
+                continue;
+            };
+
+            let token = if let Some(ref tokens) = batched_tokens {
+                // Use pre-computed batched result
+                tokens[i]
+            } else if let Ok(row) = output.logits.get(logit_row) {
+                // Per-sequence fallback (non-greedy or batch size 1)
+                if state.is_greedy() {
+                    row.argmax(crate::tensor::D::Minus1)
+                        .and_then(|t| t.to_scalar::<u32>())
+                        .unwrap_or(0)
+                } else if let Some(ref mut prepared) = state.prepared {
+                    let row_f32 = row.to_dtype(crate::tensor::DType::F32).unwrap();
+                    prepared.logits_processor.sample(&row_f32).unwrap_or(0)
+                } else {
+                    row.argmax(crate::tensor::D::Minus1)
+                        .and_then(|t| t.to_scalar::<u32>())
+                        .unwrap_or(0)
+                }
             } else {
-                row.argmax(crate::tensor::D::Minus1)
-                    .and_then(|t| t.to_scalar::<u32>())
-                    .unwrap_or(0)
+                0
             };
             process_single_token(engine, scheduler, state, request_id, token, None, &mut completed);
+            logit_row += 1;
         }
-        logit_row += 1;
     }
 
     for (request_id, finish_reason) in completed {
@@ -826,6 +867,7 @@ mod tests {
             ArMessage::NewRequest { prepared, response: ResponseChannel::Complete(tx) },
             &mut Scheduler::new(SchedulerConfig::default()),
             &mut states,
+            None,
         );
 
         assert!(states.get("r1").unwrap().prepared.is_some());

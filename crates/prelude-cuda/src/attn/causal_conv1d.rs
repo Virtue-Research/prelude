@@ -200,12 +200,19 @@ pub(crate) fn try_fwd(
 }
 
 /// Single-token decode step. `conv_state` is updated in place.
+///
+/// When `conv_state_indices` is `Some(&indices)`, `conv_state` is a pool
+/// tensor `[pool_size, dim, state_len]` and `indices` is `[batch]` I32
+/// mapping each batch element to its pool slot. The kernel indexes into
+/// the pool using these indices instead of assuming `conv_state` batch
+/// dim matches `x` batch dim.
 pub(crate) fn try_update(
     x: &Tensor,
     conv_state: &Tensor,
     weight: &Tensor,
     bias: Option<&Tensor>,
     silu_activation: bool,
+    conv_state_indices: Option<&Tensor>,
 ) -> Result<Option<Tensor>> {
     if !x.device().is_cuda() {
         return Ok(None);
@@ -221,10 +228,16 @@ pub(crate) fn try_update(
     }
 
     let (sb, sd, sl) = conv_state.dims3()?;
-    if sb != batch || sd != dim {
+    if conv_state_indices.is_none() && (sb != batch || sd != dim) {
         bail!(
             "causal_conv1d_update: conv_state shape {:?} doesn't match ({batch}, {dim}, *)",
             (sb, sd, sl)
+        );
+    }
+    if conv_state_indices.is_some() && sd != dim {
+        bail!(
+            "causal_conv1d_update: conv_state dim {:?} doesn't match x dim {dim}",
+            sd
         );
     }
 
@@ -316,6 +329,34 @@ pub(crate) fn try_update(
         _ => unreachable!("dtype_tag guarded above"),
     };
 
+    // Extract conv_state_indices GPU pointer if provided.
+    // Accepts both I32 and U32 tensors (same binary representation for slot values).
+    let indices_ptr: Option<*const i32> = match conv_state_indices {
+        Some(idx_tensor) => {
+            let idx_c = idx_tensor.contiguous()?;
+            let (idx_storage, idx_layout) = idx_c.storage_and_layout();
+            let idx_cuda = match &*idx_storage {
+                candle_core::Storage::Cuda(s) => s,
+                _ => bail!("causal_conv1d_update: conv_state_indices not on CUDA"),
+            };
+            let ptr = match idx_tensor.dtype() {
+                DType::U32 => {
+                    let idx_slice = idx_cuda.as_cuda_slice::<u32>()?.slice(idx_layout.start_offset()..);
+                    let (p, _guard) = idx_slice.device_ptr(&stream);
+                    p as u64 as *const i32 // safe: u32 and i32 same size, values < 2^31
+                }
+                DType::I64 => {
+                    bail!("causal_conv1d_update: conv_state_indices must be U32 or I32, got I64");
+                }
+                _ => {
+                    bail!("causal_conv1d_update: conv_state_indices must be U32, got {:?}", idx_tensor.dtype());
+                }
+            };
+            Some(ptr)
+        }
+        None => None,
+    };
+
     unsafe {
         ffi::causal_conv1d_update(
             stream_ptr,
@@ -324,6 +365,7 @@ pub(crate) fn try_update(
             w_ptr as *const c_void,
             bias_ptr.map(|p| p as *const c_void),
             out_ptr,
+            indices_ptr,
             batch as i32,
             dim as i32,
             width as i32,

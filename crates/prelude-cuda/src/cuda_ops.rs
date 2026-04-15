@@ -246,9 +246,10 @@ impl Ops for CudaOps {
         weight: &Tensor,
         bias: Option<&Tensor>,
         silu_activation: bool,
+        conv_state_indices: Option<&Tensor>,
     ) -> Option<Result<Tensor>> {
         match crate::attn::causal_conv1d::try_update(
-            x, conv_state, weight, bias, silu_activation,
+            x, conv_state, weight, bias, silu_activation, conv_state_indices,
         ) {
             Ok(Some(t)) => Some(Ok(t)),
             Ok(None) => None,
@@ -301,6 +302,26 @@ impl Ops for CudaOps {
             Ok(None) => None,
             Err(e) => Some(Err(e)),
         }
+    }
+
+    // ── Sampling ──────────────────────────────────────────────────
+
+    fn sample_from_logits(
+        &self,
+        logits: &Tensor,
+        deterministic: bool,
+    ) -> Option<Result<Tensor>> {
+        Some(crate::ops::sampling::sample_from_logits(logits, deterministic))
+    }
+
+    fn top_k_top_p_sample(
+        &self,
+        logits: &Tensor,
+        top_k: i64,
+        top_p: f64,
+        deterministic: bool,
+    ) -> Option<Result<Tensor>> {
+        Some(crate::ops::sampling::top_k_top_p_sample(logits, top_k, top_p, deterministic))
     }
 
     // ── Session ───────────────────────────────────────────────────

@@ -211,6 +211,7 @@ int cula_causal_conv1d_update(
     const void *weight,
     const void *bias,
     void *out,
+    const int32_t *conv_state_indices,
     int32_t batch,
     int32_t dim,
     int32_t seqlen,
@@ -263,7 +264,7 @@ int cula_causal_conv1d_update(
   params.out_ptr = out;
   params.conv_state_ptr = conv_state;
   params.cache_seqlens = nullptr;
-  params.conv_state_indices_ptr = nullptr;
+  params.conv_state_indices_ptr = const_cast<int32_t *>(conv_state_indices);
   params.seq_idx_ptr = nullptr;
 
   params.initial_states_ptr = nullptr;

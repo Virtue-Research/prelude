@@ -847,6 +847,7 @@ impl Qwen3_5GatedDeltaNet {
             &self.conv_weight,
             None,
             /*silu_activation=*/ true,
+            None, // conv_state_indices — single-seq decode, not pool-indexed
         ) {
             let out_bd = res?; // [1, conv_dim]
             // `state_bd` was mutated in place. Save it back to
@@ -1654,6 +1655,7 @@ fn deltanet_varlen_pooled(
     seq_lens: &[usize],
     pool: &mut crate::deltanet_pool::DeltaNetPool,
     slot_ids: &[u32],
+    slot_ids_gpu: Option<&Tensor>,
     dn_layer_idx: usize,
     ops: &dyn crate::ops::Ops,
 ) -> Result<Tensor> {
@@ -1686,7 +1688,7 @@ fn deltanet_varlen_pooled(
     let fused_eligible = all_decode && packed.device().is_cuda() && fused_supported;
     if fused_eligible {
         if let Some(out) = deltanet_decode_batched_fused(
-            gdn, packed, pool, slot_ids, dn_layer_idx, ops,
+            gdn, packed, pool, slot_ids, slot_ids_gpu, dn_layer_idx, ops,
         )? {
             return Ok(out);
         }
@@ -1743,6 +1745,7 @@ fn deltanet_decode_batched_fused(
     packed: &Tensor,
     pool: &mut crate::deltanet_pool::DeltaNetPool,
     slot_ids: &[u32],
+    slot_ids_gpu: Option<&Tensor>,
     dn_layer_idx: usize,
     ops: &dyn crate::ops::Ops,
 ) -> Result<Option<Tensor>> {
@@ -1770,33 +1773,57 @@ fn deltanet_decode_batched_fused(
     let qkv_for_conv = qkv; // [1, N, conv_dim]
     let qkv_for_conv_2d = qkv_for_conv.squeeze(0)?; // [N, conv_dim]
 
-    // ── Sequential conv1d_decode per request ───────────────────────
-    // cuLA doesn't expose a batched variant, so for each request we load
-    // its conv_state slice from the pool, run the one-token decode, then
-    // scatter the updated conv_state back. This step is tiny (kernel size
-    // = 4, conv_dim ≈ 8192) compared to the delta-rule step.
+    // ── Batched conv1d_decode via pool-indexed kernel ────────────────
+    // Uses `conv_state_indices` to let the kernel index directly into
+    // pool.conv_states[layer] (shape `[pool_size, conv_dim, state_len]`),
+    // eliminating the per-request CPU loop. One kernel launch for all N
+    // sequences, CUDA-graph compatible.
     let device = packed.device();
-    let mut conv_outs: Vec<Tensor> = Vec::with_capacity(n);
-    for (i, &slot) in slot_ids.iter().enumerate() {
-        let slot_us = slot as usize;
-        gdn.conv_state = Some(
-            pool.conv_states[dn_layer_idx]
-                .get(slot_us)?
-                .contiguous()?,
-        );
-        let x_row = qkv_for_conv_2d.get(i)?.contiguous()?; // [conv_dim]
-        // conv1d_decode now fuses the SiLU in, so no separate silu below.
-        let out = gdn.conv1d_decode(&x_row, ops)?; // [conv_dim]
-        conv_outs.push(out);
-        if let Some(ref state) = gdn.conv_state {
-            let row = state.contiguous()?.unsqueeze(0)?.contiguous()?;
-            pool.conv_states[dn_layer_idx].slice_set(&row, 0, slot_us)?;
+    // Use pre-allocated GPU tensor when available (CUDA graph compatible).
+    // Otherwise create on-the-fly (eager path, allocates memory).
+    let slot_ids_owned: Option<Tensor>;
+    let slot_ids_gpu: &Tensor = match slot_ids_gpu {
+        Some(t) => t,
+        None => {
+            slot_ids_owned = Some(Tensor::from_vec(slot_ids.to_vec(), (n,), device)?);
+            slot_ids_owned.as_ref().unwrap()
         }
-    }
-    gdn.conv_state = None;
-
-    // Stack conv outputs: [N, conv_dim] (SiLU already applied per-token).
-    let qkv_conv = Tensor::stack(&conv_outs, 0)?;
+    };
+    let qkv_conv = {
+        let x_bd = qkv_for_conv_2d.contiguous()?; // [N, conv_dim]
+        let pool_conv = &pool.conv_states[dn_layer_idx]; // [pool_size, conv_dim, state_len]
+        let sl = pool_conv.dim(2)?;
+        // causal_conv1d_update wants x: [N, dim, 1], conv_state: [pool, dim, sl]
+        // We need to check if the fused kernel path is available
+        if let Some(res) = ops.causal_conv1d_update(
+            &x_bd,                    // [N, conv_dim]
+            pool_conv,                // [pool_size, conv_dim, state_len]
+            &gdn.conv_weight,         // [conv_dim, width]
+            None,                     // bias
+            /*silu_activation=*/ true,
+            Some(slot_ids_gpu),       // conv_state_indices [N] U32 (reinterpreted as I32)
+        ) {
+            res? // [N, conv_dim]
+        } else {
+            // Fallback: per-request sequential (CPU loop, non-graph-compatible)
+            let mut conv_outs: Vec<Tensor> = Vec::with_capacity(n);
+            for (i, &slot) in slot_ids.iter().enumerate() {
+                let slot_us = slot as usize;
+                gdn.conv_state = Some(
+                    pool_conv.get(slot_us)?.contiguous()?,
+                );
+                let x_row = qkv_for_conv_2d.get(i)?.contiguous()?;
+                let out = gdn.conv1d_decode(&x_row, ops)?;
+                conv_outs.push(out);
+                if let Some(ref state) = gdn.conv_state {
+                    let row = state.contiguous()?.unsqueeze(0)?.contiguous()?;
+                    pool_conv.slice_set(&row, 0, slot_us)?;
+                }
+            }
+            gdn.conv_state = None;
+            Tensor::stack(&conv_outs, 0)?
+        }
+    };
 
     // Split into q, k, v with head layout.
     let q_flat = qkv_conv.narrow(D::Minus1, 0, gdn.key_dim)?;
@@ -1810,9 +1837,6 @@ fn deltanet_decode_batched_fused(
     let a_2d = a_raw_full.squeeze(0)?.contiguous()?; // [N, HV]
     let b_2d = b_raw_full.squeeze(0)?.contiguous()?; // [N, HV]
 
-    // Slot ids need to live on the device as an i32 tensor.
-    let slot_ids_gpu = Tensor::from_vec(slot_ids.to_vec(), (n,), device)?; // U32 on GPU
-
     let decode_out = match ops.kda_decode_batched(
         &q_nhk,
         &k_nhk,
@@ -1822,7 +1846,7 @@ fn deltanet_decode_batched_fused(
         &gdn.a_log,
         &gdn.dt_bias,
         &pool.recurrent_states[dn_layer_idx],
-        &slot_ids_gpu,
+        slot_ids_gpu,
     ) {
         Some(Ok(o)) => o,    // [N, HV, V]
         Some(Err(e)) => return Err(e),
@@ -1913,12 +1937,13 @@ impl Qwen3_5DecoderLayer {
         seq_lens: &[usize],
         pool: &mut crate::deltanet_pool::DeltaNetPool,
         slot_ids: &[u32],
+        slot_ids_gpu: Option<&Tensor>,
         dn_layer_idx: usize,
     ) -> Result<Tensor> {
         let h = ops.rms_norm(x, &self.ln1_weight, self.rms_norm_eps)?;
         let h = match &mut self.token_mixer {
             TokenMixer::LinearAttention(gdn) => {
-                deltanet_varlen_pooled(gdn, &h, seq_lens, pool, slot_ids, dn_layer_idx, ops)?
+                deltanet_varlen_pooled(gdn, &h, seq_lens, pool, slot_ids, slot_ids_gpu, dn_layer_idx, ops)?
             }
             TokenMixer::FullAttention(_) => {
                 crate::tensor::bail!("forward_with_paged_prefix_pooled called on FullAttention layer")
@@ -2035,6 +2060,7 @@ impl Qwen3_5Model {
                                 seq_lens,
                                 pool,
                                 slots,
+                                ctx.deltanet_slots_gpu,
                                 dn_layer_idx,
                             )?;
                         } else {
