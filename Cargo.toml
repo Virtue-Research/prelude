@@ -13,8 +13,12 @@ members = [
     "crates/prelude-cuda/causal-conv1d",
     "crates/prelude-cuda/prelude-kernelbuild",
     "crates/prelude-cuda/prelude-cutedsl",
-    "crates/prelude-amd",
     "crates/onednn-ffi",
+]
+exclude = [
+    # Excluded until upstream fixes broken `tests/t0_original` submodule entry
+    # in https://github.com/GeisYaO/t0-gpu (.gitmodules has no URL → cargo fetch fails).
+    "crates/prelude-amd",
 ]
 resolver = "2"
 

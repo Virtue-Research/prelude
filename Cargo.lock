@@ -2651,17 +2651,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "prelude-amd"
-version = "0.1.0"
-dependencies = [
- "candle-core",
- "half",
- "prelude-core",
- "t0-gpu",
- "tracing",
-]
-
-[[package]]
 name = "prelude-core"
 version = "0.1.0"
 dependencies = [
@@ -2768,7 +2757,6 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "prelude-amd",
  "prelude-core",
  "prelude-cpu",
  "prelude-cuda",
@@ -3649,10 +3637,6 @@ dependencies = [
  "core-foundation-sys",
  "libc",
 ]
-
-[[package]]
-name = "t0-gpu"
-version = "0.1.1"
 
 [[package]]
 name = "tempfile"

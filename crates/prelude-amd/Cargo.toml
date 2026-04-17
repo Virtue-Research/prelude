@@ -16,7 +16,10 @@ rocm = ["t0-gpu/rocm"]
 
 [dependencies]
 prelude-core = { path = "../prelude-core" }
-t0-gpu = { path = "/data/yuzhou/projects/t0-gpu", default-features = false }
-candle-core = { workspace = true }
-tracing.workspace = true
+t0-gpu = { git = "https://github.com/GeisYaO/t0-gpu", default-features = false }
+# Explicit (not `workspace = true`) so this crate can parse standalone — it's
+# excluded from the workspace (see root Cargo.toml) until the t0-gpu submodule
+# issue is resolved, which breaks `workspace.dependencies` inheritance.
+candle-core = { git = "https://github.com/rucnyz/candle", branch = "prelude" }
+tracing = "0.1.44"
 half = { version = "2.7.1", features = ["bytemuck"] }
