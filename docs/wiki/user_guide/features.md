@@ -2,7 +2,7 @@
 
 ## Continuous Batching
 
-AGInfer uses continuous batching: requests join and leave the batch dynamically at each decode step, rather than waiting for a fixed batch to complete. This maximizes GPU utilization under mixed load.
+Prelude uses continuous batching: requests join and leave the batch dynamically at each decode step, rather than waiting for a fixed batch to complete. This maximizes GPU utilization under mixed load.
 
 Two flags control batching behavior:
 
@@ -100,7 +100,7 @@ PRELUDE_CUDA_GRAPH_MAX_BS=64 ./target/release/prelude-server --model Qwen/Qwen3-
 
 ## Logprobs
 
-AGInfer can return log probabilities for generated tokens (output logprobs) and prompt tokens (prompt logprobs, a vLLM extension).
+Prelude can return log probabilities for generated tokens (output logprobs) and prompt tokens (prompt logprobs, a vLLM extension).
 
 ### Output logprobs (chat completions)
 
@@ -140,7 +140,7 @@ print(response.choices[0].prompt_logprobs)
 
 ## Attention Backends
 
-AGInfer compiles multiple attention kernels at build time and dispatches to the best available one at runtime:
+Prelude compiles multiple attention kernels at build time and dispatches to the best available one at runtime:
 
 **NVIDIA (CUDA)** — dispatch priority:
 
@@ -181,7 +181,7 @@ cargo build -p prelude-server --release --features flashinfer-v4,onednn,deepgemm
 
 ## Fused CUDA Kernels
 
-AGInfer includes fused kernels for common operation sequences, reducing memory bandwidth and kernel launch overhead:
+Prelude includes fused kernels for common operation sequences, reducing memory bandwidth and kernel launch overhead:
 
 - **QK-Norm + RoPE + KV cache write** — fuses Q/K normalization, rotary positional embedding, and KV cache scatter into a single kernel (enable with `PRELUDE_FUSED_KV_CACHE_WRITE=1`)
 - **SiLU × Mul** — fused gate activation for FFN layers
@@ -193,7 +193,7 @@ These are applied automatically when the CUDA backend is active.
 
 ## Quantization
 
-AGInfer supports quantized inference through the GGUF format. AGInfer does not support quantization of native models at this point.
+Prelude supports quantized inference through the GGUF format. Prelude does not support quantization of native models at this point.
 
 
 ### Supported Formats
@@ -230,7 +230,7 @@ All standard GGML quantization types are supported:
 ./target/release/prelude-server --model unsloth/Qwen3-4B-GGUF
 ```
 
-`--model` sets the name reported in API responses. When a Hub repo contains multiple GGUF files, AGInfer auto-selects using the preference order: **Q8_0 → Q4_K_M → first available file**.
+`--model` sets the name reported in API responses. When a Hub repo contains multiple GGUF files, Prelude auto-selects using the preference order: **Q8_0 → Q4_K_M → first available file**.
 
 ### Device Support
 
@@ -249,7 +249,7 @@ GGUF models run on both CPU and GPU with the same binary:
 
 ## Advanced features
 
-AGInfer supports non-AG decoding (e.g., difussion) and other features such as AF disaggregation, speculative decoding, KV scheduling is on the road map.
+Prelude supports non-AG decoding (e.g., difussion) and other features such as AF disaggregation, speculative decoding, KV scheduling is on the road map.
 
 ---
 

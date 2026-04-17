@@ -76,7 +76,7 @@
 }
 
 /* Make the homepage logo prominent. */
-.aginfer-home-logo {
+.prelude-home-logo {
   display: block;
   margin: 0.5rem auto 1rem;
   width: min(320px, 80%);

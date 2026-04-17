@@ -1,6 +1,6 @@
 # API Reference
 
-AGInfer exposes an OpenAI-compatible HTTP API. You can use any OpenAI-compatible client library by pointing `base_url` at your server.
+Prelude exposes an OpenAI-compatible HTTP API. You can use any OpenAI-compatible client library by pointing `base_url` at your server.
 
 **Base URL:** `http://<host>:<port>` (default `http://localhost:8000`)
 
@@ -48,7 +48,7 @@ All errors use a consistent JSON structure:
 
 ## Client Libraries
 
-AGInfer is compatible with the OpenAI SDK, vLLM, and SGLang clients.
+Prelude is compatible with the OpenAI SDK, vLLM, and SGLang clients.
 
 === "Python (OpenAI SDK)"
 

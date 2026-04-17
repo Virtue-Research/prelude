@@ -1,6 +1,6 @@
 # Serving and Deployment
 
-AGInfer runs as a single binary HTTP server exposing an OpenAI-compatible API. This page covers how to serve, deploy, and tune it for different environments. AGInfer currently supports online serving only — offline batch inference is on the roadmap.
+Prelude runs as a single binary HTTP server exposing an OpenAI-compatible API. This page covers how to serve, deploy, and tune it for different environments. Prelude currently supports online serving only — offline batch inference is on the roadmap.
 
 ## Basic Deployment
 
@@ -104,7 +104,7 @@ Requests without a valid key will receive a `401 Unauthorized` response.
 
 ## OpenAI-Compatible API
 
-AGInfer implements the OpenAI HTTP API, making it a drop-in replacement for vLLM and SGLang clients. For request examples across all endpoints (chat, completions, embeddings, classification) and the full parameter reference, see the [API Endpoints](../api/endpoints.md) page.
+Prelude implements the OpenAI HTTP API, making it a drop-in replacement for vLLM and SGLang clients. For request examples across all endpoints (chat, completions, embeddings, classification) and the full parameter reference, see the [API Endpoints](../api/endpoints.md) page.
 
 For quick curl and Python SDK examples to get your first request working, see [Getting Started → First Request](setup.md#first-request).
 
@@ -112,7 +112,7 @@ For quick curl and Python SDK examples to get your first request working, see [G
 
 <!-- (do we support multi-gpu) -->
 
-AGInfer currently runs on a single GPU per process. Native multi-GPU tensor parallelism (splitting one model across multiple GPUs) is on the roadmap. The options below achieve multi-GPU throughput by running independent single-GPU instances behind a load balancer.
+Prelude currently runs on a single GPU per process. Native multi-GPU tensor parallelism (splitting one model across multiple GPUs) is on the roadmap. The options below achieve multi-GPU throughput by running independent single-GPU instances behind a load balancer.
 
 ### Running multiple instances for higher throughput
 
@@ -148,12 +148,12 @@ See the [Features](features.md) page for advanced options that can improve infer
 ### Docker
 
 !!! note "No pre-built image yet"
-    A published image at `ghcr.io/opensage-agent/aginfer` is on the roadmap. For now, build the image locally from source.
+    A published image at `ghcr.io/Virtue-Research/prelude` is on the roadmap. For now, build the image locally from source.
 
 #### Building from source
 
 ```bash
-docker build -t aginfer:local .
+docker build -t prelude:local .
 ```
 
 #### GPU
@@ -163,7 +163,7 @@ docker run --gpus all \
   -p 8000:8000 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN \
-  aginfer:local \
+  prelude:local \
   --model Qwen/Qwen3-4B --port 8000
 ```
 
@@ -176,7 +176,7 @@ docker run \
   -p 8000:8000 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -e PRELUDE_DEVICE=cpu \
-  aginfer:local \
+  prelude:local \
   --model Qwen/Qwen3-0.6B --port 8000
 ```
 
@@ -184,7 +184,7 @@ docker run \
 
 Nginx load balancing support is on the roadmap.
 
-<!-- For higher throughput, run one AGInfer process per GPU and load balance across them with Nginx.
+<!-- For higher throughput, run one Prelude process per GPU and load balance across them with Nginx.
 
 #### Start one instance per GPU
 
@@ -199,7 +199,7 @@ CUDA_VISIBLE_DEVICES=1 ./target/release/prelude-server --model Qwen/Qwen3-4B --p
 #### Nginx config
 
 ```nginx
-upstream aginfer {
+upstream prelude {
     least_conn;
     server 127.0.0.1:8000 max_fails=3 fail_timeout=30s;
     server 127.0.0.1:8001 max_fails=3 fail_timeout=30s;
@@ -209,11 +209,11 @@ server {
     listen 80;
 
     location /health {
-        proxy_pass http://aginfer;
+        proxy_pass http://prelude;
     }
 
     location / {
-        proxy_pass http://aginfer;
+        proxy_pass http://prelude;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_read_timeout 300s;
@@ -232,7 +232,7 @@ Kubernetes deployment manifests are on the roadmap.
 
 ### TLS termination
 
-AGInfer does not handle TLS directly. Terminate TLS at the reverse proxy layer (Nginx, Caddy, or a cloud load balancer) and forward plain HTTP to the server.
+Prelude does not handle TLS directly. Terminate TLS at the reverse proxy layer (Nginx, Caddy, or a cloud load balancer) and forward plain HTTP to the server.
 
 Example Nginx TLS config:
 
@@ -250,7 +250,7 @@ server {
 <!-- 
 ### Network isolation
 
-In Kubernetes, restrict access to the AGInfer service using a `NetworkPolicy` so only authorized pods can reach the inference endpoint. -->
+In Kubernetes, restrict access to the Prelude service using a `NetworkPolicy` so only authorized pods can reach the inference endpoint. -->
 
 ## Monitoring and Observability
 

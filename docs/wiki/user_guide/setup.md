@@ -1,6 +1,6 @@
 # Getting Started
 
-This guide gets you from zero to a running AGInfer server with your first request.
+This guide gets you from zero to a running Prelude server with your first request.
 
 ## Prerequisites
 

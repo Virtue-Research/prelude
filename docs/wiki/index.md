@@ -1,8 +1,8 @@
-# AGInfer Documentation
+# Prelude Documentation
 
-Welcome to the AGInfer documentation!
+Welcome to the Prelude documentation!
 
-AGInfer is a high-performance LLM inference engine written in Rust, optimized for scheduling throughput, built on a modular design for extensibility to new architectures, and tailored for agentic serving workloads.
+Prelude is a high-performance LLM inference engine written in Rust, optimized for scheduling throughput, built on a modular design for extensibility to new architectures, and tailored for agentic serving workloads.
 
 ## 30-Second Start
 
@@ -22,8 +22,8 @@ curl http://localhost:8000/v1/chat/completions \
 ## Documentation Index
 
 ### User Guide
-- [Getting Started](user_guide/setup.md) — Build, install, and run AGInfer for the first time
-- [Serving and Deployment](user_guide/serving.md) — How to serve and deploy AGInfer
+- [Getting Started](user_guide/setup.md) — Build, install, and run Prelude for the first time
+- [Serving and Deployment](user_guide/serving.md) — How to serve and deploy Prelude
 - [Configuration](user_guide/configuration.md) — CLI flags and environment variable reference
 - [Supported Models](user_guide/supported-models.md) — Model compatibility matrix
 - [Features](user_guide/features.md) — Overview of supported features
@@ -62,7 +62,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 | Engine | Throughput (tok/s) | P50 Latency | P95 Latency |
 |--------|-------------------|-------------|-------------|
-| **AGInfer** | **95,590** | **15.4ms** | **21.1ms** |
+| **Prelude** | **95,590** | **15.4ms** | **21.1ms** |
 | vLLM | 68,780 | 18.1ms | 27.9ms |
 | SGLang | 77,700 | 20.8ms | 26.2ms |
 
@@ -79,4 +79,4 @@ GPU (H200, Qwen3-4B, 512-token inputs)
 - **Latest techniques** — Keep up with the latest techniques: CUDA graph decode, prefix caching, paged KV cache, speculative decoding, disaggregated prefill, and continuous batching
 ---
 
-*Check the [GitHub repository](https://github.com/opensage-agent/aginfer) for the latest code.*
+*Check the [GitHub repository](https://github.com/Virtue-Research/prelude) for the latest code.*

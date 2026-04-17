@@ -1,6 +1,6 @@
 # CLI Reference
 
-`prelude-server` starts the AGInfer HTTP server. It controls **how the server runs** — which model to load, which device to use, how the scheduler is tuned, and what auth to enforce. Once running, clients interact with it entirely through the [HTTP API](../api/index.md).
+`prelude-server` starts the Prelude HTTP server. It controls **how the server runs** — which model to load, which device to use, how the scheduler is tuned, and what auth to enforce. Once running, clients interact with it entirely through the [HTTP API](../api/index.md).
 
 <!-- ## CLI vs. API
 

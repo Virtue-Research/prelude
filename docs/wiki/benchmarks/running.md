@@ -1,6 +1,6 @@
 # Running Benchmarks
 
-AGInfer has two levels of benchmarking: **end-to-end serving benchmarks** (throughput and latency against a live server) and **micro-benchmarks** (kernel-level operator performance).
+Prelude has two levels of benchmarking: **end-to-end serving benchmarks** (throughput and latency against a live server) and **micro-benchmarks** (kernel-level operator performance).
 
 ## Prerequisites
 

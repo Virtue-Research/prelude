@@ -20,3 +20,6 @@ onednn-ffi/buildCargo.lock
 .cargo_vcs_info.json
 *.orig
 genai_bench.log
+
+# Internal analysis/design notes — not checked in.
+analysis/

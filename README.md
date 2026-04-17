@@ -1,5 +1,5 @@
 <p align="center">
-  <h1> AGInfer: Agent-native inference framework </h1>
+  <h1> Prelude: Agent-native inference framework </h1>
 </p>
 sure
 ## Quick Start

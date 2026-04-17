@@ -1,5 +1,5 @@
-site_name: OpenSage-Inference-AGInfer
-site_description: AGInfer Documentation — Fast LLM Inference Engine in Rust
+site_name: Prelude
+site_description: Prelude Documentation — Fast LLM Inference Engine in Rust
 
 # Documentation directory (where markdown files are)
 docs_dir: docs/wiki
@@ -8,14 +8,14 @@ docs_dir: docs/wiki
 site_dir: site
 
 # Repository information
-repo_url: https://github.com/opensage-agent/aginfer
-repo_name: aginfer
+repo_url: https://github.com/Virtue-Research/prelude
+repo_name: prelude
 
 # Theme
 theme:
   name: material
-  logo: assets/logos/aginfer-logo.svg
-  favicon: assets/logos/aginfer-favicon.svg
+  logo: assets/logos/prelude-logo.svg
+  favicon: assets/logos/prelude-favicon.svg
   palette:
     - scheme: default
       primary: custom
@@ -98,4 +98,4 @@ nav:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/opensage-agent/aginfer
+      link: https://github.com/Virtue-Research/prelude
