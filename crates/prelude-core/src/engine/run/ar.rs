@@ -465,6 +465,39 @@ fn process_step_output(
             prefill_result_idx += 1;
         }
 
+        // Populate prefix cache on the final chunk of a prefill, so future
+        // requests sharing the same prompt prefix can skip the full prefill.
+        //
+        // This was previously a dead write: the `prefill.rs` non-paged path
+        // populated the cache, but the paged hot path (`paged_mixed` +
+        // `batch_prefill_paged`) never did. Every request was a cache miss.
+        //
+        // We do it here in the AR loop because this is where we have both:
+        //   (a) the full prompt tokens (from `seq.input_ids`), and
+        //   (b) the finished block table (from `result.block_table`).
+        // Inside `batch_mixed_paged` only the per-step chunk is visible.
+        //
+        // The prefix cache takes its own ref count on the blocks, so they
+        // survive the post-decode free.
+        if is_final && engine.cache.prefix_cache.is_some() {
+            if let Some(seq) = scheduler.get_sequence(request_id) {
+                if let (Some(pool), Some(result)) = (
+                    engine.cache.paged_pool.as_ref(),
+                    output.prefill_results.get(prefill_result_idx.saturating_sub(1)),
+                ) {
+                    if !result.block_table.is_empty() && !seq.input_ids.is_empty() {
+                        if let Err(e) = engine.cache.try_prefix_cache_insert_paged_only(
+                            &seq.input_ids,
+                            &result.block_table,
+                            pool.block_size,
+                        ) {
+                            tracing::warn!("prefix cache insert (ar_loop) failed: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
         if is_final {
             // Final chunk: sample first token from logits
             if let Ok(row) = output.logits.get(logit_row) {
