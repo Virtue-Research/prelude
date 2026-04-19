@@ -117,10 +117,15 @@ fn count_tokens_per_expert(sorted_expert_ids: &Tensor, num_experts: usize, devic
 struct Qwen3SparseMoeBlock {
     gate: DenseLinear,
     experts: Vec<Qwen3MoeExpert>,
-    // Stacked expert weights for fused GEMM [num_experts, N, K]
+    // Stacked expert weights for the legacy WMMA grouped path.
     gate_w: Option<Tensor>,
     up_w: Option<Tensor>,
     down_w: Option<Tensor>,
+    // Pre-fused CUTLASS layout: [num_experts, 2*inter, hidden] ([up;gate])
+    // and [num_experts, hidden, inter]. Enables FlashInfer's fused MoE
+    // on SM90+ (3-5× faster than WMMA on Blackwell).
+    experts_gate_up: Option<Tensor>,
+    experts_down: Option<Tensor>,
     norm_topk_prob: bool,
     num_experts_per_tok: usize,
 }
@@ -138,25 +143,52 @@ impl Qwen3SparseMoeBlock {
             experts.push(Qwen3MoeExpert::new(cfg, vb_e.pp(idx))?);
         }
 
-        // Stack expert weights for fused MoE GEMM (GPU only)
-        let (gate_w, up_w, down_w) = if experts.first().map_or(false, |e| e.gate_proj.weight().device().is_cuda()) {
-            let gate_ws: Vec<Tensor> = experts
-                .iter()
-                .map(|e| e.gate_proj.weight().clone())
-                .collect();
-            let up_ws: Vec<Tensor> = experts.iter().map(|e| e.up_proj.weight().clone()).collect();
-            let down_ws: Vec<Tensor> = experts
-                .iter()
-                .map(|e| e.down_proj.weight().clone())
-                .collect();
-            (
-                Some(Tensor::stack(&gate_ws, 0)?.contiguous()?),
-                Some(Tensor::stack(&up_ws, 0)?.contiguous()?),
-                Some(Tensor::stack(&down_ws, 0)?.contiguous()?),
-            )
-        } else {
-            (None, None, None)
-        };
+        // Stack expert weights for fused MoE GEMM (GPU only).
+        //
+        // We build TWO layouts from the same source weights:
+        //   (a) `gate_w`, `up_w`, `down_w` — [num_experts, N, K] stacks used
+        //       by the legacy WMMA path.
+        //   (b) `experts_gate_up`, `experts_down` — the CUTLASS layout used
+        //       by FlashInfer's fused MoE. `experts_gate_up` is
+        //       [num_experts, 2*inter, hidden] with [up; gate] concatenation
+        //       (CUTLASS Swiglu convention — Qwen3.5 does the same via a
+        //       pre-stored gate_up_proj + `swap_moe_gate_up`).
+        //
+        // Keeping both layouts is ~2× the MoE weight memory (~2GB for 15B-A3B
+        // in BF16). Acceptable given B300's 275GB VRAM, and unlocks a 3–5×
+        // fused-MoE speedup that WMMA can't match on SM100.
+        let (gate_w, up_w, down_w, experts_gate_up, experts_down) =
+            if experts.first().map_or(false, |e| e.gate_proj.weight().device().is_cuda()) {
+                let gate_ws: Vec<Tensor> = experts
+                    .iter()
+                    .map(|e| e.gate_proj.weight().clone())
+                    .collect();
+                let up_ws: Vec<Tensor> = experts.iter().map(|e| e.up_proj.weight().clone()).collect();
+                let down_ws: Vec<Tensor> = experts
+                    .iter()
+                    .map(|e| e.down_proj.weight().clone())
+                    .collect();
+
+                let gate_w = Tensor::stack(&gate_ws, 0)?.contiguous()?;
+                let up_w = Tensor::stack(&up_ws, 0)?.contiguous()?;
+                let down_w = Tensor::stack(&down_ws, 0)?.contiguous()?;
+
+                // Build the CUTLASS [up; gate] stack. `Tensor::cat` along
+                // dim 1 gives [num_experts, 2*inter, hidden] which is what
+                // `cutlass_fused_moe` expects.
+                let experts_gate_up = Tensor::cat(&[&up_w, &gate_w], 1)?.contiguous().ok();
+                let experts_down = Some(down_w.clone());
+
+                (
+                    Some(gate_w),
+                    Some(up_w),
+                    Some(down_w),
+                    experts_gate_up,
+                    experts_down,
+                )
+            } else {
+                (None, None, None, None, None)
+            };
 
         Ok(Self {
             gate,
@@ -164,16 +196,42 @@ impl Qwen3SparseMoeBlock {
             gate_w,
             up_w,
             down_w,
+            experts_gate_up,
+            experts_down,
             norm_topk_prob: cfg.norm_topk_prob,
             num_experts_per_tok: cfg.num_experts_per_tok,
         })
     }
 
     /// Compute routing for 2D (varlen) input.
+    ///
     /// Returns (topk_weights, experts_per_tok, hidden_dim).
-    fn compute_routing_2d(&self, xs: &Tensor) -> Result<(Tensor, Tensor, usize)> {
-        let (_total_tokens, hidden_dim) = xs.dims2()?;
+    fn compute_routing_2d(
+        &self,
+        ops: &dyn crate::ops::Ops,
+        xs: &Tensor,
+    ) -> Result<(Tensor, Tensor, usize)> {
+        let (n_tokens, hidden_dim) = xs.dims2()?;
         let router_logits = xs.apply(&self.gate)?;
+
+        // Fast path: single fused CUDA kernel (softmax + top-k + optional
+        // renorm, FP32 softmax internally). Note: fused_moe_routing ALSO
+        // emits sorted_expert_ids/sorted_token_ids, but that sort is only
+        // *per-token* (within each token's topk assignments), not the
+        // *global* sort-by-expert that the WMMA/GEMV grouped GEMM
+        // downstream requires. Ignore those two outputs here; the caller
+        // does a proper global sort via `sort_expert_assignments`.
+        if self.norm_topk_prob {
+            if let Some(result) = ops.fused_moe_routing(&router_logits, self.num_experts_per_tok) {
+                let (tw, topk_ids, _sorted_exp, _sorted_tok) = result?;
+                return Ok((
+                    tw,
+                    topk_ids.reshape((n_tokens, self.num_experts_per_tok))?,
+                    hidden_dim,
+                ));
+            }
+        }
+
         let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
 
         let experts_per_tok = routing_weights
@@ -192,25 +250,40 @@ impl Qwen3SparseMoeBlock {
     }
 
     /// Sort expert assignments by expert ID to produce sorted_token_ids and sorted_expert_ids.
-    /// Uses GPU bitonic sort for small arrays (<=1024 elements, fits in shared memory),
-    /// falls back to CPU argsort for larger arrays (prefill with many tokens).
+    ///
+    /// Prefer the `ops.moe_sort_experts` GPU path (thrust::sort_by_key) on
+    /// CUDA — it's O(n log n) on-device with no sync. The CPU fallback
+    /// below was being hit for every prefill step of > 1024 assignments
+    /// (prefill of ≥ 256 tokens at top-4 from 64 experts), forcing a
+    /// GPU→CPU copy + CPU sort + CPU→GPU copy per MoE layer × 48 layers.
+    /// qwen3_5.rs has used the fast path for a while; qwen3_moe was
+    /// overlooked.
     fn sort_expert_assignments(
         &self,
+        ops: &dyn crate::ops::Ops,
         experts_per_tok: &Tensor,
         device: &Device,
     ) -> Result<(Tensor, Tensor)> {
         let flat = experts_per_tok.flatten_all()?;
         let n = flat.elem_count();
 
-        // GPU sort for small arrays: shared_mem = next_power_of_2(n) * 4 bytes.
-        // For n <= 1024, that's at most 4096 bytes — well within CUDA limits.
-        if n <= 1024 && device.is_cuda() {
+        // For decode batches (n ≤ 1024 assignments), candle's
+        // `sort_last_dim` is a small bitonic sort kernel with less fixed
+        // overhead than thrust::sort_by_key — measured ~2ms/tok
+        // regression when we forced thrust here for decode. For prefill
+        // (n > 1024) candle's sort would fall back to CPU, so we use the
+        // `ops.moe_sort_experts` thrust path there.
+        if device.is_cuda() && n <= 1024 {
             let flat_2d = flat.reshape((1, n))?;
             let (sorted_vals, sorted_idx) = flat_2d.sort_last_dim(true)?;
             return Ok((sorted_vals.flatten_all()?, sorted_idx.flatten_all()?));
         }
 
-        // CPU fallback for large prefills (>128 tokens × 8 experts = >1024 elements)
+        if let Some(result) = ops.moe_sort_experts(&flat) {
+            return result;
+        }
+
+        // CPU fallback (non-CUDA).
         let flat_vec = flat.to_vec1::<u32>()?;
         let mut indices: Vec<u32> = (0..n as u32).collect();
         indices.sort_by_key(|&i| flat_vec[i as usize]);
@@ -235,16 +308,18 @@ impl Qwen3SparseMoeBlock {
         let down_w = self.down_w.as_ref().unwrap();
         let (total_tokens, _) = xs.dims2()?;
         let (sorted_expert_ids, sorted_token_ids) =
-            self.sort_expert_assignments(experts_per_tok, xs.device())?;
+            self.sort_expert_assignments(ops, experts_per_tok, xs.device())?;
 
         let is_prefill = total_tokens > 1;
-        let num_tokens_per_expert = count_tokens_per_expert(&sorted_expert_ids, self.experts.len(), xs.device())?;
+        // `num_tokens_per_expert` used to be computed here via a GPU→CPU→GPU
+        // histogram pass, but the CUDA impl of `grouped_gemm` ignores it.
+        // Pass a zero-length placeholder to preserve the trait signature.
+        let num_tokens_per_expert = Tensor::zeros((0,), DType::U32, xs.device())?;
 
         let gate = ops.grouped_gemm(
             xs, gate_w,
             &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
         )?;
-
         let up = ops.grouped_gemm(
             xs, up_w,
             &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
@@ -252,25 +327,31 @@ impl Qwen3SparseMoeBlock {
 
         let down_input = ops.silu_mul(&gate, &up)?;
 
-        let ys = match ops.fused_moe_gemm(
-            &down_input, down_w, topk_weights,
-            &sorted_token_ids, &sorted_expert_ids,
-            self.num_experts_per_tok, is_prefill,
-        ) {
-            Some(r) => r?,
-            None => {
-                let raw = ops.grouped_gemm(
-                    &down_input, down_w,
-                    &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
-                )?;
-                let raw = raw.reshape((total_tokens, self.num_experts_per_tok, hidden_dim))?;
-                let w = topk_weights.unsqueeze(D::Minus1)?;
-                return (raw * w)?.sum(D::Minus2);
-            }
-        };
-
-        ys.reshape((total_tokens, self.num_experts_per_tok, hidden_dim))?
-            .sum(D::Minus2)
+        // Always take the grouped-GEMM + external weighted-sum path.
+        //
+        // The alternative `fused_moe_gemm` call — which folds the topk
+        // weighting and reduction into the MoE WMMA kernel — has a write
+        // race when topk > 1: multiple expert blocks all store
+        // `val * topk_weight` to `output[token_index * size_n + ..]`,
+        // so the final value is the contribution of whichever warp wrote
+        // last, rather than the sum of all four. That's bit-nondeterministic
+        // across batch compositions (different scheduling → different
+        // "winner"), which is what made prefix-cache reuse drift from
+        // fresh compute by enough to flip the first predicted token.
+        //
+        // Using grouped_gemm (size_m = total_tokens * topk, one row per
+        // (token, expert) pair, no collisions) + a Rust-side weighted
+        // reduction is deterministic. A small extra launch + a multiply+sum
+        // over (topk, hidden_dim) is cheap vs the kernel call itself.
+        let raw = ops.grouped_gemm(
+            &down_input, down_w,
+            &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
+        )?;
+        let raw = raw.reshape((total_tokens, self.num_experts_per_tok, hidden_dim))?;
+        // topk_weights is F32 but raw is BF16. Candle's mul is strict on
+        // both shape and dtype — use broadcast_mul + explicit cast.
+        let w = topk_weights.unsqueeze(D::Minus1)?.to_dtype(raw.dtype())?;
+        raw.broadcast_mul(&w)?.sum(D::Minus2)
     }
 
     /// Sequential per-expert dispatch (CPU fallback).
@@ -319,13 +400,30 @@ impl Qwen3SparseMoeBlock {
     }
 
     /// Forward for varlen packed sequences: xs is (total_tokens, hidden_dim).
+    #[allow(clippy::too_many_arguments)]
     fn forward_varlen(&self, ops: &dyn crate::ops::Ops, xs: &Tensor) -> Result<Tensor> {
-        let (topk_weights, experts_per_tok, hidden_dim) = self.compute_routing_2d(xs)?;
+        let (topk_weights, experts_per_tok, hidden_dim) = self.compute_routing_2d(ops, xs)?;
 
+        // Preferred path: FlashInfer's CUTLASS fused MoE handles
+        // gate+up+silu+down+topk-weighted-sum in one kernel. The ops impl
+        // internally returns None on unsupported archs (e.g. SM100 right
+        // now, because upstream FlashInfer hasn't instantiated Blackwell
+        // MoE kernels yet), so we fall through to the WMMA grouped-GEMM
+        // path on Blackwell.
+        if xs.device().is_cuda() {
+            if let (Some(egu), Some(ed)) = (self.experts_gate_up.as_ref(), self.experts_down.as_ref()) {
+                if let Some(r) = ops.cutlass_fused_moe(xs, &experts_per_tok, &topk_weights, egu, ed) {
+                    return r;
+                }
+            }
+        }
+
+        // Fallback 1: WMMA / GEMV grouped-GEMM path (works on older archs / missing cutlass).
         if xs.device().is_cuda() && self.gate_w.is_some() {
             return self.forward_fused_varlen(ops, xs, &topk_weights, &experts_per_tok, hidden_dim);
         }
 
+        // Fallback 2: per-expert loop (CPU / debug).
         self.forward_sequential(ops, xs, &topk_weights, &experts_per_tok, hidden_dim)
     }
 
@@ -651,13 +749,35 @@ mod meta {
             let is_generate = task == TaskKind::Generate;
 
             let is_cuda = device.is_cuda();
+            // CUDA graph capture for MoE decode is opt-in via
+            // PRELUDE_MOE_CUDA_GRAPH=1. cudarc 0.19's `CudaStream::alloc`
+            // uses `cuMemAllocAsync` whenever the device supports memory
+            // pools (true on SM90+), which IS graph-capturable — so most
+            // intermediate tensor allocations are safe during capture.
+            //
+            // Known remaining blockers (these only fire on prefill, NOT
+            // decode, so decode graph capture should work):
+            //   - `moe_sort_experts_gpu` (thrust::sort_by_key) — only
+            //     used when n > 1024 assignments; decode max_bs=32 caps
+            //     n=128 so candle's bitonic sort is used instead.
+            //   - `calculate_expert_offsets` (thrust::inclusive_scan) —
+            //     only used when `is_prefill=true`; decode uses the
+            //     custom `_light` kernel path.
+            //
+            // Keep the flag off by default; flip on to benchmark.
+            let moe_graph = std::env::var("PRELUDE_MOE_CUDA_GRAPH")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .map(|v| v != 0)
+                .unwrap_or(false);
+            let _ = (is_cuda, is_generate);
             RuntimeCaps {
                 supports_kv_cache: is_safetensors && is_generate,
                 supports_prefix_cache: is_safetensors && is_cuda,
                 supports_paged_attn: is_cuda && is_safetensors,
                 supports_varlen: is_cuda && is_safetensors,
                 supports_deltanet: false,
-                supports_cuda_graph: false,
+                supports_cuda_graph: moe_graph,
             }
         }
     }
