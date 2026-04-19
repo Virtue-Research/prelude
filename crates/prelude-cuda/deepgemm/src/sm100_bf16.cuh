@@ -323,8 +323,15 @@ static SM100Config select_sm100_masked_config(int expected_m, int n, int k, int 
     int block_ms[2] = {64, 128};
     int n_block_ms = 2;
 
-    int block_ns[9] = {16, 32, 64, 96, 128, 160, 192, 224, 256};
-    int n_block_ns = 9;
+    // NOTE: restricted to the block_n values that actually have compiled
+    // kernel instantiations below (see SM100_MASKED_CONFIGS). The full
+    // {96, 160, 192, 224} set is covered for *non-masked* SM100 GEMMs but
+    // not for masked yet — the heuristic previously included them and
+    // then returned a nullptr at dispatch for shapes like
+    // (M=256, N=4096, K=1024, G=4). Expand the instantiation table below
+    // if those tiles turn out to be optimal for real workloads.
+    int block_ns[5] = {16, 32, 64, 128, 256};
+    int n_block_ns = 5;
 
     int best_bm = 0, best_bn = 0, best_waves = 0, best_last = 0;
     auto ceil_div = [](int a, int b) { return (a + b - 1) / b; };
