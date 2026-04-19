@@ -957,15 +957,21 @@ def generate_utility_sources(
             pass  # source file already contains TVM FFI export
         else:
             binding_path = csrc / binding_file
-            if binding_path.exists() and not (out / binding_file).exists():
-                if kind == "norm":
-                    # Remove layernorm binding export
-                    src_text = binding_path.read_text()
-                    lines = [l for l in src_text.split('\n')
-                             if 'layernorm' not in l]
-                    (out / binding_file).write_text('\n'.join(lines))
-                else:
-                    shutil.copy2(binding_path, out / binding_file)
+            if binding_path.exists():
+                # Bug fix: always add the binding to the sources list so it gets
+                # compiled. The previous `and not (out / binding_file).exists()`
+                # short-circuit would skip the append on incremental builds
+                # where the staged binding .cu was already present, leaving the
+                # TVM FFI exports (e.g. __tvm_ffi_sampling_from_probs) undefined.
+                if not (out / binding_file).exists():
+                    if kind == "norm":
+                        # Remove layernorm binding export
+                        src_text = binding_path.read_text()
+                        lines = [l for l in src_text.split('\n')
+                                 if 'layernorm' not in l]
+                        (out / binding_file).write_text('\n'.join(lines))
+                    else:
+                        shutil.copy2(binding_path, out / binding_file)
                 sources.append(out / binding_file)
 
         vinfo = {
@@ -1781,11 +1787,15 @@ def main():
             tgv_out = gen_dir / f"fi_tgv_gemm_{tgv_dtype}"
             tgv_out.mkdir(parents=True, exist_ok=True)
             tgv_sources = []
-            # Copy main dispatch file
-            sp = csrc / "tgv_gemm.cu"
-            if sp.exists():
-                shutil.copy2(sp, tgv_out / "tgv_gemm.cu")
-                tgv_sources.append(tgv_out / "tgv_gemm.cu")
+            # Dispatch TU (tgv_gemm.cu) defines torch_ext::tgv_gemm /
+            # bf16_gemm + TVM_FFI exports — compile it once (under bf16) so
+            # we don't get duplicate symbols when linked into a single static
+            # archive. fp16 variant just provides the extra kernel tile .o's.
+            if tgv_dtype == "bf16":
+                sp = csrc / "tgv_gemm.cu"
+                if sp.exists():
+                    shutil.copy2(sp, tgv_out / "tgv_gemm.cu")
+                    tgv_sources.append(tgv_out / "tgv_gemm.cu")
             for cta_m, cta_n, dma_stage in tgv_cta_configs:
                 src_text = tgv_templ.render(cta_m=cta_m, cta_n=cta_n,
                                             dma_stage=dma_stage, dtype=tgv_dtype)
@@ -1793,11 +1803,12 @@ def main():
                 fpath = tgv_out / fname
                 fpath.write_text(src_text)
                 tgv_sources.append(fpath)
+            # Upstream tgv_gemm.cu only emits TVM_FFI_DLL_EXPORT for tgv_gemm
+            # and tgv_gemm_tactic_num; bf16_gemm / bf16_gemm_tactic_num are
+            # C++ wrappers without TVM FFI exports, so don't advertise them.
             tgv_vinfo = {"vid": f"fi_tgv_gemm_{tgv_dtype}", "kind": "gemm",
                          "symbols": {"tgv_gemm": "__tvm_ffi_tgv_gemm",
-                                     "tgv_gemm_tactic_num": "__tvm_ffi_tgv_gemm_tactic_num",
-                                     "bf16_gemm": "__tvm_ffi_bf16_gemm",
-                                     "bf16_gemm_tactic_num": "__tvm_ffi_bf16_gemm_tactic_num"}}
+                                     "tgv_gemm_tactic_num": "__tvm_ffi_tgv_gemm_tactic_num"}}
             tgv_extra = ["-DCUTLASS_ENABLE_GDC_FOR_SM100=1"]
             for src in tgv_sources:
                 compile_jobs.append((src, sm100_flags, tgv_extra, tgv_vinfo))
@@ -1808,14 +1819,18 @@ def main():
         _add_sm100_module("fi_gemm_sm100",
                           ["gemm_groupwise_sm100.cu"], "gemm_sm100_binding.cu",
                           ["gemm_fp8_nt_groupwise"])
-        # gen_gemm_sm100_module_cutlass_fp4: FP4 GEMM
-        _add_sm100_module("fi_fp4_gemm_sm100",
-                          ["fp4_gemm_cutlass.cu"], None,
-                          ["fp4_gemm", "fp4_gemm_tactic_num"])
-        # gen_gemm_sm100_module_cutlass_mxfp8: MXFP8 GEMM
-        _add_sm100_module("fi_mxfp8_gemm",
-                          ["mxfp8_gemm_cutlass.cu"], None,
-                          ["mxfp8_gemm", "mxfp8_gemm_tactic_num"])
+        # gen_gemm_sm100_module_cutlass_fp4: FP4 GEMM (DISABLED)
+        # The upstream jinja instantiations for genericFp4GemmKernelLauncher
+        # are not expanded here, so the dispatch TU leaves undefined symbols.
+        # Not needed for BF16/FP16 models.
+        # _add_sm100_module("fi_fp4_gemm_sm100",
+        #                   ["fp4_gemm_cutlass.cu"], None,
+        #                   ["fp4_gemm", "fp4_gemm_tactic_num"])
+        # gen_gemm_sm100_module_cutlass_mxfp8: MXFP8 GEMM (DISABLED — same
+        # reason as FP4: template instantiations not generated).
+        # _add_sm100_module("fi_mxfp8_gemm",
+        #                   ["mxfp8_gemm_cutlass.cu"], None,
+        #                   ["mxfp8_gemm", "mxfp8_gemm_tactic_num"])
         # Group GEMM SM100 (FP8 + MXFP4)
         _add_sm100_module("fi_group_gemm_sm100",
                           ["group_gemm_fp8_groupwise_sm100.cu",
@@ -1871,10 +1886,10 @@ def main():
                 compile_jobs.append((src, sm120_flags, [], vinfo))
             sm120_modules.append(vinfo)
 
-        # FP4 GEMM SM120
-        _add_sm120_module("fi_fp4_gemm_sm120",
-                          ["fp4_gemm_cutlass_sm120.cu"], None,
-                          ["fp4_gemm", "fp4_gemm_tactic_num"])
+        # FP4 GEMM SM120 (DISABLED — see SM100 comment)
+        # _add_sm120_module("fi_fp4_gemm_sm120",
+        #                   ["fp4_gemm_cutlass_sm120.cu"], None,
+        #                   ["fp4_gemm", "fp4_gemm_tactic_num"])
         # Groupwise GEMM SM120
         _add_sm120_module("fi_gemm_groupwise_sm120",
                           ["gemm_groupwise_sm120.cu"], "gemm_sm120_binding.cu",
