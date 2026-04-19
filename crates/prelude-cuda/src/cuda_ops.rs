@@ -21,6 +21,27 @@ pub fn cuda_ops() -> &'static dyn Ops {
 
 // ── Helpers ────────────────────────────────────────────────────────
 
+/// Detect the major compute capability of the current CUDA device once,
+/// cached for the process lifetime. Used to gate kernels whose FlashInfer
+/// bindings abort on unsupported archs.
+fn detect_sm_major() -> i32 {
+    use std::sync::OnceLock;
+    static SM: OnceLock<i32> = OnceLock::new();
+    *SM.get_or_init(|| {
+        unsafe extern "C" {
+            fn cudaGetDevice(dev: *mut i32) -> i32;
+            fn cudaDeviceGetAttribute(v: *mut i32, attr: i32, dev: i32) -> i32;
+        }
+        const CUDA_DEV_ATTR_MAJOR: i32 = 75;
+        let mut dev = 0i32;
+        let mut major = 0i32;
+        unsafe {
+            if cudaGetDevice(&mut dev) != 0 { return 0; }
+            if cudaDeviceGetAttribute(&mut major, CUDA_DEV_ATTR_MAJOR, dev) != 0 { return 0; }
+        }
+        major
+    })
+}
 
 fn cu_seqlens_to_lens(cu_seqlens: &Tensor) -> Result<Tensor> {
     let n = cu_seqlens.dim(0)? - 1;
@@ -82,6 +103,16 @@ impl Ops for CudaOps {
         w1: &Tensor,
         w2: &Tensor,
     ) -> Option<Result<Tensor>> {
+        // Upstream FlashInfer's CUTLASS MoE kernel aborts hard on SM100+
+        // (Blackwell) — it `throw`s a `TllmException("Please recompile with
+        // support for blackwell")` from inside a C++ kernel dispatch. That
+        // crosses the FFI boundary and `std::terminate()`s the process.
+        //
+        // Bail to None on unsupported archs so the model falls through to
+        // the WMMA grouped-GEMM path cleanly.
+        if detect_sm_major() >= 10 {
+            return None;
+        }
         Some(crate::ops::moe::cutlass_fused_moe_forward(input, experts_per_tok, topk_weights, w1, w2))
     }
 
