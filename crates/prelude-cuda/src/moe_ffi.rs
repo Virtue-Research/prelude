@@ -31,6 +31,28 @@ unsafe extern "C" {
         stream: i64,
     );
 
+    /// Warp-reduction GEMV kernel for MoE decode (size_m small).
+    ///
+    /// Same signature as `moe_gemm_wmma` minus the expert_counts / expert_offsets
+    /// scratch (this kernel indexes via sorted_token_ids + expert_ids directly
+    /// per block, so it needs no per-expert layout scan). `dtype` mirrors
+    /// the WMMA convention (0=fp16, 1=bf16).
+    pub fn moe_gemv(
+        input: *const c_void,
+        weights: *const c_void,
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        topk_weights: *const f32,
+        output: *mut c_void,
+        num_experts: i32,
+        topk: i32,
+        size_m: i32,
+        size_n: i32,
+        size_k: i32,
+        dtype: i32,
+        stream: i64,
+    );
+
     /// GPU sort of expert assignments using thrust::sort_by_key.
     pub fn moe_sort_expert_assignments(
         expert_ids_in: *const u32,

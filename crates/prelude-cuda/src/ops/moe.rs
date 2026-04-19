@@ -182,8 +182,6 @@ pub fn moe_gemm_wmma(
         };
 
         let output = unsafe { dev.alloc::<T>(size_m * size_n) }?;
-        let expert_counts = unsafe { dev.alloc::<u32>(num_experts) }?;
-        let expert_offsets = unsafe { dev.alloc::<u32>(num_experts + 1) }?;
 
         let cu_stream = stream.cu_stream() as i64;
         use core::ffi::c_void;
@@ -194,25 +192,73 @@ pub fn moe_gemm_wmma(
             _ => candle_core::bail!("moe_gemm_wmma only accepts f16/bf16 inputs"),
         };
 
-        unsafe {
-            ffi::moe_gemm_wmma(
-                input_s.device_ptr(&stream).0 as *const c_void,
-                weights_s.device_ptr(&stream).0 as *const c_void,
-                sti.device_ptr(&stream).0 as *const i32,
-                ei.device_ptr(&stream).0 as *const i32,
-                topk_weights_ptr,
-                output.device_ptr(&stream).0 as *mut c_void,
-                expert_counts.device_ptr(&stream).0 as *mut i32,
-                expert_offsets.device_ptr(&stream).0 as *mut i32,
-                num_experts as i32,
-                topk as i32,
-                size_m as i32,
-                size_n as i32,
-                size_k as i32,
-                data_type as i32,
-                is_prefill,
-                cu_stream,
-            );
+        // GEMV fast path for very-small-M MoE (single-token decode).
+        //
+        // The WMMA kernel's M-tile is 32 and launches `num_experts *
+        // ceil(size_n / 32)` blocks independent of size_m — so its
+        // launch overhead is fixed while Tensor Cores churn. The GEMV
+        // kernel launches `size_m * size_n` blocks, one dot product
+        // each: fine when size_m ≤ ~8, but past that the block-launch
+        // cost of `size_m * size_n` blocks (≈ 128 * 2048 = 256K for
+        // batch=32 × top=4) outweighs the Tensor Core slack.
+        //
+        // Empirically for this model (Qwen3-MoE, moe_inter=768) GEMV
+        // only beats WMMA at batch=1–2 (size_m = 4–8). For larger
+        // batched decode we stay on WMMA with is_prefill=false.
+        // Override via PRELUDE_MOE_GEMV_THRESHOLD to tune.
+        let gemv_threshold: usize = std::env::var("PRELUDE_MOE_GEMV_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8);
+        let use_gemv = size_m <= gemv_threshold;
+        // Always take the no-thrust offsets path: `calculate_expert_offsets_light`
+        // works for num_experts ≤ 1024 and is CUDA-graph-capturable. The thrust
+        // variant is faster only when num_experts is much larger than that,
+        // which no current MoE uses (Qwen3-MoE: 64, DeepSeek v2: 160).
+        let is_prefill_for_offsets = false;
+        let _ = is_prefill;
+
+        if use_gemv {
+            unsafe {
+                ffi::moe_gemv(
+                    input_s.device_ptr(&stream).0 as *const c_void,
+                    weights_s.device_ptr(&stream).0 as *const c_void,
+                    sti.device_ptr(&stream).0 as *const i32,
+                    ei.device_ptr(&stream).0 as *const i32,
+                    topk_weights_ptr,
+                    output.device_ptr(&stream).0 as *mut c_void,
+                    num_experts as i32,
+                    topk as i32,
+                    size_m as i32,
+                    size_n as i32,
+                    size_k as i32,
+                    data_type as i32,
+                    cu_stream,
+                );
+            }
+        } else {
+            let expert_counts = unsafe { dev.alloc::<u32>(num_experts) }?;
+            let expert_offsets = unsafe { dev.alloc::<u32>(num_experts + 1) }?;
+            unsafe {
+                ffi::moe_gemm_wmma(
+                    input_s.device_ptr(&stream).0 as *const c_void,
+                    weights_s.device_ptr(&stream).0 as *const c_void,
+                    sti.device_ptr(&stream).0 as *const i32,
+                    ei.device_ptr(&stream).0 as *const i32,
+                    topk_weights_ptr,
+                    output.device_ptr(&stream).0 as *mut c_void,
+                    expert_counts.device_ptr(&stream).0 as *mut i32,
+                    expert_offsets.device_ptr(&stream).0 as *mut i32,
+                    num_experts as i32,
+                    topk as i32,
+                    size_m as i32,
+                    size_n as i32,
+                    size_k as i32,
+                    data_type as i32,
+                    is_prefill_for_offsets,
+                    cu_stream,
+                );
+            }
         }
 
         drop(input_g);

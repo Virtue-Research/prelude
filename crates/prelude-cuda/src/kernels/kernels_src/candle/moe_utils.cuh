@@ -187,4 +187,12 @@ inline __device__ void from_float(__nv_bfloat16& dst, float src) {
   dst = __float2bfloat16(src);
 }
 
+inline __device__ float to_float(half u) {
+  return __half2float(u);
+}
+
+inline __device__ float to_float(__nv_bfloat16 u) {
+  return __bfloat162float(u);
+}
+
 }
