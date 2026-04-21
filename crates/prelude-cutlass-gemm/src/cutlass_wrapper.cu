@@ -440,6 +440,91 @@ static int sm80_f32_gemm(const void* A, const void* B, void* D,
     return launch<Sm80RunnerF32<cutlass::gemm::MainloopSm80CpAsync<4>>>(A, B, D, m, n, k, s);
 }
 
+// SM80 BF16/FP16 TensorOp with alignment=2 — safe for any M/N/K.
+// Fallback when alignment=8 TensorOp kernels fail due to TMA/cp.async constraints.
+// Uses 4-byte cp.async (2 BF16 elements) — works with any K (even K=7).
+template <class Element, class DispatchPolicy_,
+          class TileShape_ = Shape<_128, _128, _32>, int SwizzleB_ = 2>
+struct Sm80RunnerAlign2 {
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::ColumnMajor;
+    using LayoutD = cutlass::layout::ColumnMajor;
+
+    using ElementAccumulator = float;
+    using ElementCompute = float;
+
+    using TileShape = TileShape_;
+    static constexpr int TileK = size<2>(TileShape{});
+    using DispatchPolicy = DispatchPolicy_;
+
+    // Same TensorOp MMA as alignment=8 config
+    using MmaAtom = cute::conditional_t<
+        cute::is_same_v<Element, BF16>,
+        MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>,
+        MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>>;
+    using TiledMma = TiledMMA<
+        MmaAtom,
+        Layout<Shape<_2, _2, _1>>,
+        Tile<_32, _32, _16>>;
+
+    // Key change: alignment=2 (4-byte cp.async), works with any address alignment
+    static constexpr int kAlignmentA = 2;
+    using SmemLayoutAtomA = decltype(
+        composition(Swizzle<SwizzleB_, 3, 3>{},
+                    Layout<Shape <_8, Int<TileK>>,
+                           Stride<Int<TileK>, _1>>{}));
+    using SmemCopyAtomA = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
+    // 4-byte cp.async (2 BF16 elements per copy): uint32_t instead of uint128_t
+    using GmemTiledCopyA = decltype(
+        make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint32_t>, Element>{},
+                        Layout<Shape <_32, _4>,
+                               Stride< _4, _1>>{},
+                        Layout<Shape<_1, _2>>{}));
+
+    static constexpr int kAlignmentB = 2;
+    using SmemLayoutAtomB = SmemLayoutAtomA;
+    using SmemCopyAtomB = SmemCopyAtomA;
+    using GmemTiledCopyB = GmemTiledCopyA;
+
+    using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+        DispatchPolicy, TileShape,
+        Element, cutlass::gemm::TagToStrideA_t<LayoutA>,
+        Element, cutlass::gemm::TagToStrideB_t<LayoutB>,
+        TiledMma,
+        GmemTiledCopyA, SmemLayoutAtomA, SmemCopyAtomA, cute::identity,
+        GmemTiledCopyB, SmemLayoutAtomB, SmemCopyAtomB, cute::identity>;
+
+    static constexpr int kEpilogueVectorWidth = 1;
+    using CollectiveEpilogue = cutlass::epilogue::collective::DefaultEpilogue<
+        Element,
+        cutlass::gemm::TagToStrideC_t<LayoutC>,
+        cutlass::gemm::TagToStrideC_t<LayoutD>,
+        cutlass::epilogue::thread::LinearCombination<Element, kEpilogueVectorWidth, ElementAccumulator, ElementCompute>,
+        cutlass::gemm::EpilogueDefault>;
+
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        Shape<int, int, int, int>,
+        CollectiveMainloop,
+        CollectiveEpilogue>;
+
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+};
+
+static int sm80_bf16_align2(const void* A, const void* B, void* D,
+                            int m, int n, int k, cudaStream_t s) {
+    return launch<Sm80RunnerAlign2<BF16, cutlass::gemm::MainloopSm80CpAsync<3>>>(A, B, D, m, n, k, s);
+}
+
+static int sm80_fp16_align2(const void* A, const void* B, void* D,
+                            int m, int n, int k, cudaStream_t s) {
+    return launch<Sm80RunnerAlign2<FP16, cutlass::gemm::MainloopSm80CpAsync<3>>>(A, B, D, m, n, k, s);
+}
+
 // ============================================================================
 // C FFI dispatch
 // ============================================================================
@@ -480,8 +565,17 @@ extern "C" int cutlass_gemm_dispatch(
     }
 #endif
 
-    // SM80 fallback — non-batched only (SM80 configs don't carry batch strides).
-    if (batch > 1) return -30;
+    // SM80 fallback — handle batch > 1 by looping over batches.
+    if (batch > 1) {
+        for (int b = 0; b < batch; b++) {
+            const void* Ab = (const char*)A + b * stride_a * sizeof(uint16_t);
+            const void* Bb = (const char*)B + b * stride_b * sizeof(uint16_t);
+            void* Db = (char*)D + b * stride_d * (dtype == 2 ? sizeof(float) : sizeof(uint16_t));
+            int ret = cutlass_gemm_dispatch(Ab, Bb, Db, m, n, k, 1, lda, ldb, ldd, 0, 0, 0, transa, transb, dtype, stream);
+            if (ret != 0) return ret;
+        }
+        return 0;
+    }
 
     // Try unpredicated first (fastest), fall back to predicated for unaligned M.
     // Unpredicated requires M and N aligned to tile dims (128); skip if not aligned.
@@ -490,14 +584,22 @@ extern "C" int cutlass_gemm_dispatch(
             int ret = sm80_bf16_c3(A, B, D, m, n, k, s);  // unpredicated
             if (ret == 0) return 0;
         }
-        return sm80_bf16_c1(A, B, D, m, n, k, s);      // predicated fallback
+        {
+            int ret = sm80_bf16_c1(A, B, D, m, n, k, s);  // predicated (alignment=8)
+            if (ret == 0) return 0;
+        }
+        return sm80_bf16_align2(A, B, D, m, n, k, s);     // alignment=2 fallback
     }
     if (dtype == 1) {
         if (m % 128 == 0 && n % 128 == 0) {
             int ret = sm80_fp16_c3(A, B, D, m, n, k, s);
             if (ret == 0) return 0;
         }
-        return sm80_fp16_c1(A, B, D, m, n, k, s);
+        {
+            int ret = sm80_fp16_c1(A, B, D, m, n, k, s);
+            if (ret == 0) return 0;
+        }
+        return sm80_fp16_align2(A, B, D, m, n, k, s);     // alignment=2 fallback
     }
     if (dtype == 2) {
         return sm80_f32_gemm(A, B, D, m, n, k, s);
