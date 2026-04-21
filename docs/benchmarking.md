@@ -93,17 +93,17 @@ Each requires specific feature flags:
 
 ```bash
 # CPU operator benchmarks (GEMM, attention, RMSNorm, RoPE, SiLU) — no special features needed
-cargo run --release --bin cpu_ops_bench -p prelude-core
+cargo bench -p prelude-core --bench cpu_ops_bench
 
 # GPU operator benchmarks (GEMM dispatch, elementwise, etc.) — requires CUDA
-cargo run --release --bin gpu_ops_bench -p prelude-core --features cuda
+cargo bench -p prelude-core --bench gpu_ops_bench --features cuda
 
 # Tokenizer benchmark (fastokens vs HuggingFace tokenizers comparison)
-cargo run --release --bin tokenizer_bench -p prelude-core --features hf_tokenizer -- \
+cargo bench -p prelude-core --bench tokenizer_bench --features hf_tokenizer -- \
   --model-path /path/to/model
 
 # Qwen3 end-to-end single-model benchmark — requires CUDA
-cargo run --release --bin qwen3_bench -p prelude-core --features cuda
+cargo bench -p prelude-core --bench qwen3_bench --features cuda
 
 # Fused ops correctness test — requires CUDA
 cargo run --release --bin fused_ops_test -p prelude-core --features cuda

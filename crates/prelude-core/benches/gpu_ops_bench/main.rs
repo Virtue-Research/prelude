@@ -4,7 +4,7 @@
 //!
 //! Usage:
 //!   # All benchmarks, all models:
-//!   CUDA_VISIBLE_DEVICES=1 cargo run -p prelude-core --bin gpu_ops_bench --release \
+//!   CUDA_VISIBLE_DEVICES=1 cargo bench -p prelude-core --bench gpu_ops_bench \
 //!       --features flashinfer-v4,cutlass-gemm,deepgemm,bench-cublas,onednn
 //!
 //!   # Filter by model (substring match):

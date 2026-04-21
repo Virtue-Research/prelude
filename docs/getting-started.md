@@ -59,7 +59,7 @@ docker run --gpus all -it -v $(pwd):/workspace prelude-dev bash
 
 # CPU benchmarks (no GPU needed)
 docker run -v $(pwd):/workspace prelude-dev \
-  cargo run -p prelude-core --bin cpu_ops_bench --release -- quant
+  cargo bench -p prelude-core --bench cpu_ops_bench -- quant
 
 # Tests
 docker run -v $(pwd):/workspace prelude-dev \
@@ -219,11 +219,11 @@ cargo test -p prelude-core --lib -- linear
 
 ```bash
 # CPU kernel benchmarks (quantized, GEMM, attention, etc.)
-cargo run -p prelude-core --bin cpu_ops_bench --release
+cargo bench -p prelude-core --bench cpu_ops_bench
 
 # Filter specific benchmark
-cargo run -p prelude-core --bin cpu_ops_bench --release -- quant
-cargo run -p prelude-core --bin cpu_ops_bench --release -- gemm
+cargo bench -p prelude-core --bench cpu_ops_bench -- quant
+cargo bench -p prelude-core --bench cpu_ops_bench -- gemm
 ```
 
 See [benchmarking.md](benchmarking.md) for the end-to-end server benchmark suite.

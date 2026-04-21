@@ -63,7 +63,7 @@ python tests/accuracy/test_ppl.py \
 #### Tokenizer Latency
 
 ```bash
-cargo run -p prelude-core --bin tokenizer_bench --release --features hf_tokenizer -- --model Qwen/Qwen3-0.6B
+cargo bench -p prelude-core --bench tokenizer_bench --features hf_tokenizer -- --model Qwen/Qwen3-0.6B
 ```
 ### microbench
 

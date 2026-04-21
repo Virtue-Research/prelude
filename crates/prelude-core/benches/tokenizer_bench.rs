@@ -1,10 +1,10 @@
 //! Benchmark: HuggingFace `tokenizers` vs `fastokens` — encode/decode speed + correctness.
 //!
 //! Usage:
-//!   cargo run -p prelude-core --bin tokenizer_bench --release --features hf_tokenizer -- --model Qwen/Qwen3-0.6B
+//!   cargo bench -p prelude-core --bench tokenizer_bench --features hf_tokenizer -- --model Qwen/Qwen3-0.6B
 //!
 //! Custom model:
-//!   cargo run -p prelude-core --bin tokenizer_bench --release --features hf_tokenizer -- --model deepseek-ai/DeepSeek-V3
+//!   cargo bench -p prelude-core --bench tokenizer_bench --features hf_tokenizer -- --model deepseek-ai/DeepSeek-V3
 
 #[cfg(not(feature = "hf_tokenizer"))]
 compile_error!("This benchmark requires the `hf_tokenizer` feature for HF comparison. Use: --features hf_tokenizer");
