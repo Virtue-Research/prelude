@@ -120,16 +120,16 @@ MODEL=Qwen/Qwen3-0.6B INPUT_TOKENS=64 OUTPUT_TOKENS=64 \
 
 #### Non-Docker benchmarks
 
-The `benchmark/prelude/` directory also has direct serve scripts for host-based benchmarking:
+The `benchmark/local/` directory also has direct serve scripts for host-based benchmarking:
 
 ```bash
 # Start server manually
-./benchmark/prelude/serve_prelude.sh   # Prelude
-./benchmark/prelude/serve_vllm.sh      # vLLM
-./benchmark/prelude/serve_sglang.sh    # SGLang
+./benchmark/local/serve_prelude.sh   # Prelude
+./benchmark/local/serve_vllm.sh      # vLLM
+./benchmark/local/serve_sglang.sh    # SGLang
 
 # Run benchmark.py against any OpenAI-compatible server
-python benchmark/prelude/benchmark.py complete --url http://localhost:8000 --model Qwen/Qwen3-0.6B
+python benchmark/local/benchmark.py complete --url http://localhost:8000 --model Qwen/Qwen3-0.6B
 ```
 
 ## Notes

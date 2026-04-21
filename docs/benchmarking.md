@@ -1,16 +1,16 @@
 # Benchmarking
 
-The local benchmark suite lives in `benchmark/prelude/` with its own [README](../benchmark/prelude/README.md).
+The local benchmark suite lives in `benchmark/local/` with its own [README](../benchmark/local/README.md).
 For Dockerized cross-engine comparisons, see [`benchmark/genai-bench/README.md`](../benchmark/genai-bench/README.md).
 
 ## Quick Start
 
 ```bash
 # Start server
-MODEL=Qwen/Qwen3-4B GPU=0 ./benchmark/prelude/serve_prelude.sh
+MODEL=Qwen/Qwen3-4B GPU=0 ./benchmark/local/serve_prelude.sh
 
 # Run a preset
-python benchmark/prelude/benchmark.py --config benchmark/prelude/presets/complete_prefill.toml \
+python benchmark/local/benchmark.py --config benchmark/local/presets/complete_prefill.toml \
   --model Qwen/Qwen3-4B --url http://localhost:8000
 ```
 
@@ -34,13 +34,13 @@ All presets require `--model` and `--url` on the command line.
 
 ```bash
 # Start all three servers (different ports)
-MODEL=Qwen/Qwen3-4B GPU=0 PORT=8000 ./benchmark/prelude/serve_prelude.sh
-MODEL=Qwen/Qwen3-4B GPU=0 PORT=8001 ./benchmark/prelude/serve_vllm.sh
-MODEL=Qwen/Qwen3-4B GPU=0 PORT=8002 ./benchmark/prelude/serve_sglang.sh
+MODEL=Qwen/Qwen3-4B GPU=0 PORT=8000 ./benchmark/local/serve_prelude.sh
+MODEL=Qwen/Qwen3-4B GPU=0 PORT=8001 ./benchmark/local/serve_vllm.sh
+MODEL=Qwen/Qwen3-4B GPU=0 PORT=8002 ./benchmark/local/serve_sglang.sh
 
 # Run the same preset against each
 for port in 8000 8001 8002; do
-  python benchmark/prelude/benchmark.py --config benchmark/prelude/presets/complete_prefill.toml \
+  python benchmark/local/benchmark.py --config benchmark/local/presets/complete_prefill.toml \
     --model Qwen/Qwen3-4B --url http://localhost:$port \
     --output results_${port}.json
 done
@@ -71,20 +71,20 @@ For generation benchmarks, look at **Out-tok/s**, **TTFT**, and **TPOT** (printe
 
 ```bash
 # Tight token range for stable results
-python benchmark/prelude/benchmark.py complete \
+python benchmark/local/benchmark.py complete \
   --model Qwen/Qwen3-4B --prompt-tokens 500-530 --max-tokens 1
 
 # Generation with streaming (TTFT + TPOT)
-python benchmark/prelude/benchmark.py complete \
+python benchmark/local/benchmark.py complete \
   --model Qwen/Qwen3-4B --prompt-tokens 256-768 --max-tokens 128 --streaming
 
 # Prefix cache test
-python benchmark/prelude/benchmark.py complete \
+python benchmark/local/benchmark.py complete \
   --model Qwen/Qwen3-4B --max-tokens 1 \
   --prefix --prefix-tokens 3072 --num-unique-prefixes 1
 ```
 
-See `benchmark/prelude/README.md` for the full CLI reference.
+See `benchmark/local/README.md` for the full CLI reference.
 
 ## Micro-Benchmarks (Kernel-Level)
 

@@ -6,14 +6,14 @@ Benchmark suite for inference servers (Prelude, vLLM, SGLang).
 
 ```bash
 # Start server
-MODEL=Qwen/Qwen3-4B GPU=0 ./benchmark/prelude/serve_prelude.sh
+MODEL=Qwen/Qwen3-4B GPU=0 ./benchmark/local/serve_prelude.sh
 
 # Run with a preset
-python benchmark/prelude/benchmark.py --config benchmark/prelude/presets/complete_prefill.toml \
+python benchmark/local/benchmark.py --config benchmark/local/presets/complete_prefill.toml \
   --model Qwen/Qwen3-4B --url http://localhost:8000
 
 # Run inline
-python benchmark/prelude/benchmark.py complete --model Qwen/Qwen3-4B --max-tokens 1 --prompt-tokens 500-530
+python benchmark/local/benchmark.py complete --model Qwen/Qwen3-4B --max-tokens 1 --prompt-tokens 500-530
 ```
 
 Two modes: `--config <preset.toml> --model NAME --url URL`, or `<task> [options]` directly.
@@ -160,9 +160,9 @@ With `--rerun N > 1`, results include `_std` and `_cv` fields for standard devia
 ## Server Scripts
 
 ```bash
-MODEL=Qwen/Qwen3-4B GPU=0 PORT=8000 ./benchmark/prelude/serve_prelude.sh
-MODEL=Qwen/Qwen3-4B GPU=0 PORT=8000 ./benchmark/prelude/serve_vllm.sh
-MODEL=Qwen/Qwen3-4B GPU=0 PORT=8000 ./benchmark/prelude/serve_sglang.sh
+MODEL=Qwen/Qwen3-4B GPU=0 PORT=8000 ./benchmark/local/serve_prelude.sh
+MODEL=Qwen/Qwen3-4B GPU=0 PORT=8000 ./benchmark/local/serve_vllm.sh
+MODEL=Qwen/Qwen3-4B GPU=0 PORT=8000 ./benchmark/local/serve_sglang.sh
 ```
 
 | Env var | Default | Description |
