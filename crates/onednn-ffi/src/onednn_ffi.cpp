@@ -539,8 +539,12 @@ brgemm_packed_b_t brgemm_bf16_pack(const void* weight_ptr, int64_t k, int64_t n)
     int64_t n_blocks = (n + block_n - 1) / block_n;
     int64_t vnni = 2;  // BF16 VNNI factor (pack32)
 
-    // Each block: [K/vnni, block_n, vnni] = K * block_n BF16 elements
-    size_t block_elems = (size_t)(k * block_n);
+    // Tail-aware allocation: the odd-k tail loop writes into
+    // [(k/vnni) * block_n * vnni, (k/vnni) * block_n * vnni + actual_n * vnni),
+    // which exceeds k * block_n elements for odd k. Round k up to a vnni multiple.
+    int64_t k_padded = ((k + vnni - 1) / vnni) * vnni;
+    // Each block: [K/vnni, block_n, vnni] = k_padded * block_n BF16 elements
+    size_t block_elems = (size_t)(k_padded * block_n);
     size_t total_bytes = n_blocks * block_elems * 2;
 
     uint16_t* packed = (uint16_t*)aligned_alloc(64, total_bytes);
@@ -616,7 +620,9 @@ void brgemm_bf16_linear(
     const uint16_t* packed = (const uint16_t*)pw->data;
     int64_t k = pw->k;
     int64_t block_n = pw->block_n;
-    int64_t block_elems = k * block_n;
+    // Stride between packed blocks matches the packer's tail-aware allocation.
+    int64_t k_padded = ((k + 1) / 2) * 2;  // vnni = 2 for BF16
+    int64_t block_elems = k_padded * block_n;
 
     // Thread-local accumulator (grows-only, no per-call heap alloc)
     static thread_local std::vector<float> tls_acc;
@@ -677,7 +683,9 @@ void brgemm_bf16_linear_fused_silu_mul(
     const uint16_t* packed = (const uint16_t*)pw->data;
     int64_t k = pw->k;
     int64_t block_n = pw->block_n;
-    int64_t block_elems = k * block_n;
+    // Stride between packed blocks matches the packer's tail-aware allocation.
+    int64_t k_padded = ((k + 1) / 2) * 2;  // vnni = 2 for BF16
+    int64_t block_elems = k_padded * block_n;
 
     // Two accumulators: one for gate columns, one for up columns
     static thread_local std::vector<float> tls_gate_acc;
@@ -1268,7 +1276,11 @@ brgemm_s8_packed_b_t brgemm_s8_pack(
     int64_t n_blocks = (n + block_n - 1) / block_n;
     int64_t vnni = 4;  // INT8 VNNI factor: 4 bytes = 32 bits
 
-    size_t block_elems = (size_t)(k * block_n);
+    // Allocation must cover the tail group. When k is not a multiple of vnni,
+    // the tail loop writes into [k_groups * block_n * vnni, k_groups * block_n * vnni + actual_n * vnni),
+    // which exceeds k * block_n bytes. Round k up to a vnni multiple.
+    int64_t k_padded = ((k + vnni - 1) / vnni) * vnni;
+    size_t block_elems = (size_t)(k_padded * block_n);
     size_t total_bytes = n_blocks * block_elems;
 
     int8_t* packed = (int8_t*)aligned_alloc(64, total_bytes);
@@ -1376,7 +1388,9 @@ void brgemm_s8_linear(
     const int8_t* packed = (const int8_t*)pw->data;
     int64_t k = pw->k;
     int64_t block_n = pw->block_n;
-    int64_t block_elems = k * block_n;
+    // Stride between packed blocks matches the packer's tail-aware allocation.
+    int64_t k_padded = ((k + 3) / 4) * 4;  // vnni = 4 for INT8
+    int64_t block_elems = k_padded * block_n;
 
     static thread_local std::vector<float> tls_s8_acc;
     size_t acc_needed = (size_t)(m * BRGEMM_BLOCK_N);
@@ -1540,7 +1554,10 @@ brgemm_f8_packed_b_t brgemm_f8e4m3_pack(
     int64_t n_blocks = (n + block_n - 1) / block_n;
     int64_t vnni = 4;  // FP8 VNNI factor: 4 bytes = 32 bits
 
-    size_t block_elems = (size_t)(k * block_n);
+    // Allocation must cover the tail group — see brgemm_s8_pack for the detailed
+    // addressing argument. Round k up to a vnni multiple.
+    int64_t k_padded = ((k + vnni - 1) / vnni) * vnni;
+    size_t block_elems = (size_t)(k_padded * block_n);
     size_t total_bytes = n_blocks * block_elems;
 
     uint8_t* packed = (uint8_t*)aligned_alloc(64, total_bytes);
@@ -1638,7 +1655,9 @@ void brgemm_f8e4m3_linear(
     const uint8_t* packed = (const uint8_t*)pw->data;
     int64_t k = pw->k;
     int64_t block_n = pw->block_n;
-    int64_t block_elems = k * block_n;
+    // Stride between packed blocks matches the packer's tail-aware allocation.
+    int64_t k_padded = ((k + 3) / 4) * 4;  // vnni = 4 for FP8 E4M3
+    int64_t block_elems = k_padded * block_n;
 
     static thread_local std::vector<float> tls_f8_acc;
     size_t acc_needed = (size_t)(m * BRGEMM_BLOCK_N);
@@ -1765,7 +1784,9 @@ void brgemm_bf16_linear_postops(
     const uint16_t* packed = (const uint16_t*)pw->data;
     int64_t k = pw->k;
     int64_t block_n = pw->block_n;
-    int64_t block_elems = k * block_n;
+    // Stride between packed blocks matches the packer's tail-aware allocation.
+    int64_t k_padded = ((k + 1) / 2) * 2;  // vnni = 2 for BF16
+    int64_t block_elems = k_padded * block_n;
 
     // Thread-local F32 accumulator
     static thread_local std::vector<float> tls_postops_acc;
