@@ -1,16 +1,6 @@
-//! Thread-local scratch buffers and profiling for attention kernels.
+//! Thread-local scratch buffers for attention kernels.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-/// Attention sub-section profiling (enabled by PRELUDE_ATTN_PROFILE=1)
-pub(super) static ATTN_PROFILE: AtomicBool = AtomicBool::new(false);
-
-pub fn init_attn_profile() {
-    if std::env::var("PRELUDE_ATTN_PROFILE").is_ok() {
-        ATTN_PROFILE.store(true, Ordering::Relaxed);
-    }
-}
 
 // ── Thread-local reusable buffers for tiled attention ───────────────────
 // Eliminates heap alloc/dealloc per head call in the tiled attention kernel.

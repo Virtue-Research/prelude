@@ -25,30 +25,28 @@ pub(super) fn normalize_output_avx512(
     head_dim: usize,
 ) {
     use std::arch::x86_64::*;
-    unsafe {
-        let scale = _mm512_set1_ps(inv_sum);
-        let bias = _mm512_set1_epi32(0x7FFF_i32);
-        let one = _mm512_set1_epi32(1);
+    let scale = _mm512_set1_ps(inv_sum);
+    let bias = _mm512_set1_epi32(0x7FFF_i32);
+    let one = _mm512_set1_epi32(1);
 
-        let mut d = 0usize;
-        while d + 16 <= head_dim {
-            let v = _mm512_loadu_ps(v_prime.add(d));
-            let scaled = _mm512_mul_ps(v, scale);
-            // Round-to-nearest-even BF16 conversion (same as scalar f32_to_bf16)
-            let bits = _mm512_castps_si512(scaled);
-            let lsb = _mm512_and_si512(_mm512_srli_epi32::<16>(bits), one);
-            let rounded = _mm512_add_epi32(_mm512_add_epi32(bits, bias), lsb);
-            let bf16_32 = _mm512_srli_epi32::<16>(rounded);
-            // Pack 16 × i32 → 16 × i16 (truncation, values already in [0,65535])
-            let bf16_16 = _mm512_cvtepi32_epi16(bf16_32);
-            _mm256_storeu_si256(output.add(d) as *mut __m256i, bf16_16);
-            d += 16;
-        }
-        // Scalar remainder
-        while d < head_dim {
-            *output.add(d) = f32_to_bf16(*v_prime.add(d) * inv_sum);
-            d += 1;
-        }
+    let mut d = 0usize;
+    while d + 16 <= head_dim {
+        let v = unsafe { _mm512_loadu_ps(v_prime.add(d)) };
+        let scaled = _mm512_mul_ps(v, scale);
+        // Round-to-nearest-even BF16 conversion (same as scalar f32_to_bf16)
+        let bits = _mm512_castps_si512(scaled);
+        let lsb = _mm512_and_si512(_mm512_srli_epi32::<16>(bits), one);
+        let rounded = _mm512_add_epi32(_mm512_add_epi32(bits, bias), lsb);
+        let bf16_32 = _mm512_srli_epi32::<16>(rounded);
+        // Pack 16 × i32 → 16 × i16 (truncation, values already in [0,65535])
+        let bf16_16 = _mm512_cvtepi32_epi16(bf16_32);
+        unsafe { _mm256_storeu_si256(output.add(d) as *mut __m256i, bf16_16) };
+        d += 16;
+    }
+    // Scalar remainder
+    while d < head_dim {
+        unsafe { *output.add(d) = f32_to_bf16(*v_prime.add(d) * inv_sum) };
+        d += 1;
     }
 }
 
@@ -77,15 +75,13 @@ pub(super) fn convert_bf16_to_f32(dst: &mut [f32], src: &[u16], use_avx512: bool
 #[target_feature(enable = "avx512f")]
 fn convert_bf16_to_f32_avx512(dst: *mut f32, src: *const u16, len: usize) {
     let chunks = len / 16;
-    unsafe {
-        for i in 0..chunks {
-            let off = i * 16;
-            let v = bf16x16_load_as_f32(src.add(off));
-            core::arch::x86_64::_mm512_storeu_ps(dst.add(off), v);
-        }
-        for i in (chunks * 16)..len {
-            *dst.add(i) = bf16_to_f32(*src.add(i));
-        }
+    for i in 0..chunks {
+        let off = i * 16;
+        let v = bf16x16_load_as_f32(unsafe { src.add(off) });
+        unsafe { core::arch::x86_64::_mm512_storeu_ps(dst.add(off), v) };
+    }
+    for i in (chunks * 16)..len {
+        unsafe { *dst.add(i) = bf16_to_f32(*src.add(i)) };
     }
 }
 
@@ -111,21 +107,19 @@ pub(super) fn dot_f32_f32(a: &[f32], b: &[f32], len: usize, use_avx512: bool) ->
 #[target_feature(enable = "avx512f")]
 fn dot_f32_f32_avx512(a: *const f32, b: *const f32, len: usize) -> f32 {
     use core::arch::x86_64::*;
-    unsafe {
-        let chunks = len / 16;
-        let mut acc = _mm512_setzero_ps();
-        for i in 0..chunks {
-            let off = i * 16;
-            let va = _mm512_loadu_ps(a.add(off));
-            let vb = _mm512_loadu_ps(b.add(off));
-            acc = _mm512_fmadd_ps(va, vb, acc);
-        }
-        let mut sum = _mm512_reduce_add_ps(acc);
-        for j in (chunks * 16)..len {
-            sum += *a.add(j) * *b.add(j);
-        }
-        sum
+    let chunks = len / 16;
+    let mut acc = _mm512_setzero_ps();
+    for i in 0..chunks {
+        let off = i * 16;
+        let va = unsafe { _mm512_loadu_ps(a.add(off)) };
+        let vb = unsafe { _mm512_loadu_ps(b.add(off)) };
+        acc = _mm512_fmadd_ps(va, vb, acc);
     }
+    let mut sum = _mm512_reduce_add_ps(acc);
+    for j in (chunks * 16)..len {
+        sum += unsafe { *a.add(j) * *b.add(j) };
+    }
+    sum
 }
 
 /// acc[d] += w * src[d] for d in 0..acc.len() (both F32)
@@ -150,19 +144,17 @@ pub(super) fn fma_f32_f32(acc: &mut [f32], src: &[f32], w: f32, use_avx512: bool
 #[target_feature(enable = "avx512f")]
 fn fma_f32_f32_avx512(acc: *mut f32, src: *const f32, w: f32, len: usize) {
     use core::arch::x86_64::*;
-    unsafe {
-        let vw = _mm512_set1_ps(w);
-        let chunks = len / 16;
-        for i in 0..chunks {
-            let off = i * 16;
-            let v_src = _mm512_loadu_ps(src.add(off));
-            let v_acc = _mm512_loadu_ps(acc.add(off));
-            let v_res = _mm512_fmadd_ps(vw, v_src, v_acc);
-            _mm512_storeu_ps(acc.add(off), v_res);
-        }
-        for d in (chunks * 16)..len {
-            *acc.add(d) += w * *src.add(d);
-        }
+    let vw = _mm512_set1_ps(w);
+    let chunks = len / 16;
+    for i in 0..chunks {
+        let off = i * 16;
+        let v_src = unsafe { _mm512_loadu_ps(src.add(off)) };
+        let v_acc = unsafe { _mm512_loadu_ps(acc.add(off)) };
+        let v_res = _mm512_fmadd_ps(vw, v_src, v_acc);
+        unsafe { _mm512_storeu_ps(acc.add(off), v_res) };
+    }
+    for d in (chunks * 16)..len {
+        unsafe { *acc.add(d) += w * *src.add(d) };
     }
 }
 
@@ -188,17 +180,15 @@ pub(super) fn scale_f32(acc: &mut [f32], scale: f32, use_avx512: bool) {
 #[target_feature(enable = "avx512f")]
 fn scale_f32_avx512(acc: *mut f32, scale: f32, len: usize) {
     use core::arch::x86_64::*;
-    unsafe {
-        let vs = _mm512_set1_ps(scale);
-        let chunks = len / 16;
-        for i in 0..chunks {
-            let off = i * 16;
-            let v = _mm512_loadu_ps(acc.add(off));
-            _mm512_storeu_ps(acc.add(off), _mm512_mul_ps(v, vs));
-        }
-        for d in (chunks * 16)..len {
-            *acc.add(d) *= scale;
-        }
+    let vs = _mm512_set1_ps(scale);
+    let chunks = len / 16;
+    for i in 0..chunks {
+        let off = i * 16;
+        let v = unsafe { _mm512_loadu_ps(acc.add(off)) };
+        unsafe { _mm512_storeu_ps(acc.add(off), _mm512_mul_ps(v, vs)) };
+    }
+    for d in (chunks * 16)..len {
+        unsafe { *acc.add(d) *= scale };
     }
 }
 
@@ -259,44 +249,42 @@ pub(super) fn online_softmax_avx512(
 ) -> (f32, f32, f32) {   // (new_max, block_sum, rescale_factor)
     use core::arch::x86_64::*;
 
-    unsafe {
-        let chunks16 = n_size / 16;
-        let scale_vec = _mm512_set1_ps(sm_scale);
+    let chunks16 = n_size / 16;
+    let scale_vec = _mm512_set1_ps(sm_scale);
 
-        // Step 1: Find max(score * sm_scale)
-        let mut max_vec = _mm512_set1_ps(f32::NEG_INFINITY);
-        for c in 0..chunks16 {
-            let v = _mm512_mul_ps(_mm512_loadu_ps(scores.add(c * 16)), scale_vec);
-            max_vec = _mm512_max_ps(max_vec, v);
-        }
-        let mut m_i = _mm512_reduce_max_ps(max_vec);
-        for j in (chunks16 * 16)..n_size {
-            let v = *scores.add(j) * sm_scale;
-            if v > m_i { m_i = v; }
-        }
-        m_i = m_i.max(m_prime);
-
-        let rescale = (m_prime - m_i).exp();
-
-        // Step 2: Vectorized exp(score * sm_scale - max) + sum
-        let m_i_vec = _mm512_set1_ps(m_i);
-        let mut sum_vec = _mm512_setzero_ps();
-        for c in 0..chunks16 {
-            let off = c * 16;
-            let v = _mm512_mul_ps(_mm512_loadu_ps(scores.add(off)), scale_vec);
-            let e = exp_ps_avx512(_mm512_sub_ps(v, m_i_vec));
-            _mm512_storeu_ps(scores.add(off), e);
-            sum_vec = _mm512_add_ps(sum_vec, e);
-        }
-        let mut block_sum = _mm512_reduce_add_ps(sum_vec);
-        for j in (chunks16 * 16)..n_size {
-            let w = (*scores.add(j) * sm_scale - m_i).exp();
-            *scores.add(j) = w;
-            block_sum += w;
-        }
-
-        (m_i, block_sum, rescale)
+    // Step 1: Find max(score * sm_scale)
+    let mut max_vec = _mm512_set1_ps(f32::NEG_INFINITY);
+    for c in 0..chunks16 {
+        let v = _mm512_mul_ps(unsafe { _mm512_loadu_ps(scores.add(c * 16)) }, scale_vec);
+        max_vec = _mm512_max_ps(max_vec, v);
     }
+    let mut m_i = _mm512_reduce_max_ps(max_vec);
+    for j in (chunks16 * 16)..n_size {
+        let v = unsafe { *scores.add(j) } * sm_scale;
+        if v > m_i { m_i = v; }
+    }
+    m_i = m_i.max(m_prime);
+
+    let rescale = (m_prime - m_i).exp();
+
+    // Step 2: Vectorized exp(score * sm_scale - max) + sum
+    let m_i_vec = _mm512_set1_ps(m_i);
+    let mut sum_vec = _mm512_setzero_ps();
+    for c in 0..chunks16 {
+        let off = c * 16;
+        let v = _mm512_mul_ps(unsafe { _mm512_loadu_ps(scores.add(off)) }, scale_vec);
+        let e = exp_ps_avx512(_mm512_sub_ps(v, m_i_vec));
+        unsafe { _mm512_storeu_ps(scores.add(off), e) };
+        sum_vec = _mm512_add_ps(sum_vec, e);
+    }
+    let mut block_sum = _mm512_reduce_add_ps(sum_vec);
+    for j in (chunks16 * 16)..n_size {
+        let w = (unsafe { *scores.add(j) } * sm_scale - m_i).exp();
+        unsafe { *scores.add(j) = w };
+        block_sum += w;
+    }
+
+    (m_i, block_sum, rescale)
 }
 
 /// Scalar fallback for online softmax with fused sm_scale.
@@ -320,7 +308,6 @@ pub(super) fn softmax_scalar(scores: &mut [f32], n_size: usize, m_prime: f32, sm
 /// Select adaptive block sizes based on sequence length (matches SGLang).
 /// Both QK^T and V accumulation now use brgemm (AMX), so larger blocks are efficient.
 pub(super) fn select_blocks(slen: usize) -> (usize, usize) {
-    #[cfg(feature = "onednn")]
     if crate::ops::onednn::brgemm_available() {
         return match slen {
             0..=256 => (32, 64),
@@ -369,26 +356,23 @@ pub(super) fn dot_bf16_f32_scalar(a: &[u16], b: &[u16], len: usize) -> f32 {
 #[target_feature(enable = "avx512f,avx512bw")]
 fn dot_bf16_f32_avx512(a: *const u16, b: *const u16, len: usize) -> f32 {
     use core::arch::x86_64::*;
+    let chunks = len / 16;
+    let mut acc = _mm512_setzero_ps();
 
-    unsafe {
-        let chunks = len / 16;
-        let mut acc = _mm512_setzero_ps();
-
-        for i in 0..chunks {
-            let av = bf16x16_load_as_f32(a.add(i * 16));
-            let bv = bf16x16_load_as_f32(b.add(i * 16));
-            acc = _mm512_fmadd_ps(av, bv, acc);
-        }
-
-        let mut sum = _mm512_reduce_add_ps(acc);
-
-        // Handle remainder
-        for j in (chunks * 16)..len {
-            sum += bf16_to_f32(*a.add(j)) * bf16_to_f32(*b.add(j));
-        }
-
-        sum
+    for i in 0..chunks {
+        let av = bf16x16_load_as_f32(unsafe { a.add(i * 16) });
+        let bv = bf16x16_load_as_f32(unsafe { b.add(i * 16) });
+        acc = _mm512_fmadd_ps(av, bv, acc);
     }
+
+    let mut sum = _mm512_reduce_add_ps(acc);
+
+    // Handle remainder
+    for j in (chunks * 16)..len {
+        sum += unsafe { bf16_to_f32(*a.add(j)) * bf16_to_f32(*b.add(j)) };
+    }
+
+    sum
 }
 
 // ── AVX-512 BF16 load helper ────────────────────────────────────────────
@@ -399,10 +383,8 @@ fn dot_bf16_f32_avx512(a: *const u16, b: *const u16, len: usize) -> f32 {
 #[inline]
 pub(super) fn bf16x16_load_as_f32(ptr: *const u16) -> core::arch::x86_64::__m512 {
     use core::arch::x86_64::*;
-    unsafe {
-        let bf16_vals = _mm256_loadu_si256(ptr as *const __m256i);
-        let extended = _mm512_cvtepu16_epi32(bf16_vals);
-        let shifted = _mm512_slli_epi32(extended, 16);
-        _mm512_castsi512_ps(shifted)
-    }
+    let bf16_vals = unsafe { _mm256_loadu_si256(ptr as *const __m256i) };
+    let extended = _mm512_cvtepu16_epi32(bf16_vals);
+    let shifted = _mm512_slli_epi32(extended, 16);
+    _mm512_castsi512_ps(shifted)
 }

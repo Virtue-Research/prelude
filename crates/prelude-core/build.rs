@@ -1,4 +1,3 @@
-#[cfg(feature = "onednn")]
 fn configured_parallel_jobs() -> Option<usize> {
     for key in ["NUM_JOBS", "CARGO_BUILD_JOBS"] {
         if let Ok(value) = std::env::var(key)
@@ -14,7 +13,6 @@ fn configured_parallel_jobs() -> Option<usize> {
         .map(std::num::NonZeroUsize::get)
 }
 
-#[cfg(feature = "onednn")]
 fn run_cmake_build(build_dir: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {
     let mut cmd = std::process::Command::new("cmake");
     cmd.arg("--build").arg(build_dir);
@@ -97,7 +95,6 @@ fn main() {
     }
 
     // ── oneDNN FFI (static linking — no .so needed at runtime) ──
-    #[cfg(feature = "onednn")]
     {
         use std::path::{Path, PathBuf};
         use std::process::Command;
@@ -111,7 +108,7 @@ fn main() {
             workspace_root.join("crates/onednn-ffi")
         };
 
-        let build_dir = ffi_dir.join("build");
+        let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("onednn-build");
         let ffi_lib = build_dir.join("libonednn_ffi.a");
         let dnnl_lib_dir = build_dir.join("_deps/onednn-build/src");
 
@@ -192,6 +189,15 @@ fn main() {
         );
     }
 
+    // ── NVTX profiling (link libnvToolsExt when feature is enabled) ──
+    #[cfg(feature = "nvtx")]
+    {
+        let cuda_root = std::env::var("CUDA_HOME")
+            .or_else(|_| std::env::var("CUDA_PATH"))
+            .unwrap_or_else(|_| "/usr/local/cuda".to_string());
+        println!("cargo:rustc-link-search=native={}/lib64", cuda_root);
+        println!("cargo:rustc-link-lib=dylib=nvToolsExt");
+    }
 }
 
 #[cfg(feature = "cuda")]

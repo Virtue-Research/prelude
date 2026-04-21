@@ -10,6 +10,7 @@ pub mod cpu_float;
 pub mod gemm;
 pub mod gemm_pool;
 pub mod numa;
+pub mod quant;
 pub mod rmsnorm;
 pub mod rope;
 pub mod silu_mul;
@@ -142,6 +143,9 @@ pub(crate) fn tensor_as_f32_slice(tensor: &Tensor) -> Result<&[f32]> {
 }
 
 /// Get a mutable `&mut [u16]` view into a CPU BF16 tensor's storage.
+///
+/// # Safety
+/// Caller must guarantee exclusive access to the storage region `[offset..offset+n]`.
 pub(crate) unsafe fn extract_bf16_mut_u16(
     storage: &mut candle_core::Storage,
     offset: usize,
@@ -157,6 +161,9 @@ pub(crate) unsafe fn extract_bf16_mut_u16(
 }
 
 /// Get a mutable `&mut [f32]` view into a CPU F32 tensor's storage.
+///
+/// # Safety
+/// Caller must guarantee exclusive access to the storage region `[offset..offset+n]`.
 pub(crate) unsafe fn extract_f32_mut(
     storage: &mut candle_core::Storage,
     offset: usize,
@@ -171,10 +178,50 @@ pub(crate) unsafe fn extract_f32_mut(
     }
 }
 
+// ── Safe in-place mutation helpers ──────────────────────────────────────
+
+/// In-place BF16 residual add: `tensor[..] += src[..]`.
+///
+/// This is safe because it acquires exclusive mutable access via candle's
+/// `storage_mut_and_layout()` write lock. The caller must ensure this tensor
+/// is not aliased by other tensors sharing the same storage (e.g., via reshape/narrow).
+pub(crate) fn inplace_add_bf16(tensor: &Tensor, src: &[u16]) -> Result<()> {
+    let n = src.len();
+    // SAFETY: we hold the exclusive write lock for the duration of this function.
+    let (mut storage, layout) = unsafe { tensor.storage_mut_and_layout() };
+    // SAFETY: we hold the exclusive write lock via storage_mut_and_layout().
+    // Caller guarantees no other tensor aliases this storage region.
+    let data = unsafe { extract_bf16_mut_u16(&mut storage, layout.start_offset(), n)? };
+    // SAFETY: both pointers are valid, non-overlapping, and cover `n` elements.
+    unsafe {
+        crate::models::common::raw_cpu::raw_residual_add_bf16(
+            data.as_mut_ptr(),
+            src.as_ptr(),
+            n,
+        );
+    }
+    Ok(())
+}
+
+/// In-place F32 residual add: `tensor[..] += src[..]`.
+pub(crate) fn inplace_add_f32(tensor: &Tensor, src: &[f32]) -> Result<()> {
+    let n = src.len();
+    // SAFETY: we hold the exclusive write lock for the duration of this function.
+    let (mut storage, layout) = unsafe { tensor.storage_mut_and_layout() };
+    let data = unsafe { extract_f32_mut(&mut storage, layout.start_offset(), n)? };
+    unsafe {
+        crate::models::common::raw_cpu::raw_residual_add_f32(
+            data.as_mut_ptr(),
+            src.as_ptr(),
+            n,
+        );
+    }
+    Ok(())
+}
+
 /// Convert a `Vec<u16>` (BF16 bit patterns) back to a Candle BF16 tensor.
 pub(crate) fn u16_vec_to_bf16_tensor(buf: Vec<u16>, shape: &[usize], device: &Device) -> Result<Tensor> {
-    let bf16_vec: Vec<half::bf16> =
-        unsafe { std::mem::transmute::<Vec<u16>, Vec<half::bf16>>(buf) };
+    let bf16_vec: Vec<half::bf16> = bytemuck::cast_vec(buf);
     Tensor::from_vec(bf16_vec, shape, device)
 }
 
@@ -200,8 +247,7 @@ mod attention_tensor {
         let k_slice = super::tensor_as_u16_slice(&k_cont)?;
         let v_slice = super::tensor_as_u16_slice(&v_cont)?;
 
-        let mut out_buf = Vec::with_capacity(total_tokens * num_heads * head_dim);
-        unsafe { out_buf.set_len(total_tokens * num_heads * head_dim) };
+        let mut out_buf = vec![0u16; total_tokens * num_heads * head_dim];
         super::attention::prefill_attention_bf16(
             &mut out_buf, q_slice, k_slice, v_slice,
             seq_lens, num_heads, num_kv_heads, head_dim, sm_scale as f32,

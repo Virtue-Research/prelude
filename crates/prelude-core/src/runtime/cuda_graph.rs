@@ -22,7 +22,7 @@ use candle_core::{DType, Device, Storage, Tensor};
 use crate::cache::block_manager::BlockManager;
 use crate::config::EngineConfig;
 use crate::engine::{Engine, EngineError, OwnedBatchDecodeSeq};
-use crate::models::layers::{BatchAttnContext, PagedKvBatchContext};
+use crate::models::common::{BatchAttnContext, PagedKvBatchContext};
 
 fn candle_err(e: candle_core::Error) -> EngineError {
     EngineError::Internal(format!("candle: {e}"))
@@ -80,7 +80,7 @@ impl DecodeGraphBuffers {
         #[cfg(feature = "flashinfer")]
         let (fi_indptr, fi_indices, fi_last_page_len) = {
             let max_total_pages = batch_size * max_blocks;
-            crate::models::layers::allocate_fi_graph_meta(batch_size, max_total_pages, device)
+            crate::models::common::allocate_fi_graph_meta(batch_size, max_total_pages, device)
                 .map_err(candle_err)?
         };
 
@@ -370,7 +370,7 @@ impl DecodeGraphCache {
             let num_qo_heads = engine.executor.config.num_attention_heads;
             let head_dim = engine.executor.config.head_dim;
 
-            if let Err(e) = crate::models::layers::fi_precompute_paged_plan_graphed(
+            if let Err(e) = crate::models::common::fi_precompute_paged_plan_graphed(
                 (bs, num_qo_heads, head_dim),
                 &key_caches[0],
                 &captured.buffers.cu_seqlens_q,
@@ -446,12 +446,12 @@ impl DecodeGraphCache {
                     deltanet_slots: None,
                 };
                 #[cfg(feature = "flashinfer")]
-                if $manage { crate::models::layers::fi_begin_forward(); }
+                if $manage { crate::models::common::fi_begin_forward(); }
                 let result = $model
                     .forward(&buffers.packed_input, &mut ctx)
                     .map_err(candle_err);
                 #[cfg(feature = "flashinfer")]
-                if $manage { crate::models::layers::fi_end_forward(); }
+                if $manage { crate::models::common::fi_end_forward(); }
                 result
             }};
         }
@@ -472,7 +472,7 @@ impl DecodeGraphCache {
         {
             let num_qo_heads = engine.executor.config.num_attention_heads;
             let head_dim = engine.executor.config.head_dim;
-            crate::models::layers::fi_precompute_paged_plan_graphed(
+            crate::models::common::fi_precompute_paged_plan_graphed(
                 (batch_size, num_qo_heads, head_dim),
                 &key_caches[0],
                 &buffers.cu_seqlens_q,

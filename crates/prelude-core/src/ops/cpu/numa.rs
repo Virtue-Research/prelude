@@ -154,11 +154,13 @@ pub fn init_numa_rayon_pool() -> String {
 /// Pin the calling thread to a specific CPU core via `sched_setaffinity`.
 pub(crate) fn pin_current_thread_to_core(cpu_id: usize) {
     #[cfg(target_os = "linux")]
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut set);
-        libc::CPU_SET(cpu_id, &mut set);
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    {
+        use nix::sched::{sched_setaffinity, CpuSet};
+        use nix::unistd::Pid;
+        let mut cpuset = CpuSet::new();
+        if cpuset.set(cpu_id).is_ok() {
+            let _ = sched_setaffinity(Pid::from_raw(0), &cpuset);
+        }
     }
 }
 
@@ -166,16 +168,19 @@ pub(crate) fn pin_current_thread_to_core(cpu_id: usize) {
 /// This restricts future allocations to NUMA node 0 memory.
 pub(crate) fn set_mempolicy_bind_node0() {
     #[cfg(target_os = "linux")]
-    unsafe {
-        // MPOL_BIND = 2, node 0 → bitmask = 0x1
-        let nodemask: libc::c_ulong = 1;
-        libc::syscall(
-            libc::SYS_set_mempolicy,
-            2 as libc::c_int, // MPOL_BIND
-            &nodemask as *const libc::c_ulong,
-            // maxnode: number of bits in the mask (need at least 2 for node 0)
-            std::mem::size_of::<libc::c_ulong>() * 8 + 1,
-        );
+    {
+        // SAFETY: SYS_set_mempolicy is a well-defined Linux syscall.
+        // nodemask lives on the stack for the duration of the syscall.
+        // nix does not wrap set_mempolicy, so we use the raw syscall.
+        let nodemask: nix::libc::c_ulong = 1; // node 0 → bitmask = 0x1
+        unsafe {
+            nix::libc::syscall(
+                nix::libc::SYS_set_mempolicy,
+                2 as nix::libc::c_int, // MPOL_BIND
+                &nodemask as *const nix::libc::c_ulong,
+                std::mem::size_of::<nix::libc::c_ulong>() * 8 + 1,
+            );
+        }
     }
 }
 

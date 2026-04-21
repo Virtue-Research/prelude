@@ -17,7 +17,7 @@ No model code, no engine code, no scheduler code needs to change. Attention disp
 All attention dispatch lives in one directory:
 
 ```
-crates/prelude-core/src/models/layers/attn/
+crates/prelude-core/src/models/common/attn/
   mod.rs       -- dispatch functions (the ONLY file with #[cfg] gates)
   flash_v4.rs  -- FA4 CuTeDSL wrappers
   flash_v3.rs  -- FA3 Hopper wrappers (varlen + paged)
@@ -152,7 +152,7 @@ Both should produce identical text output and logprob cosine similarity >= 0.99.
 ### Benchmark
 
 ```bash
-python benchmark/benchmark.py --config benchmark/presets/complete_prefill.toml \
+python benchmark/local/benchmark.py --config benchmark/local/presets/complete_prefill.toml \
   --model Qwen/Qwen3-4B --url http://localhost:8000
 ```
 

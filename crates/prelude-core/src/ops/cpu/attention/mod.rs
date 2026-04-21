@@ -22,11 +22,9 @@ use dpbf16::*;
 #[cfg(target_arch = "x86_64")]
 use avx512::*;
 
-pub use buffers::init_attn_profile;
-use buffers::{ensure_len_f32, ensure_len_u16, get_attn_bufs, ATTN_PROFILE};
+use buffers::{ensure_len_f32, ensure_len_u16, get_attn_bufs};
 use common::*;
 
-use std::sync::atomic::Ordering;
 use std::sync::LazyLock;
 
 // ── CPU capabilities ────────────────────────────────────────────────────
@@ -47,7 +45,6 @@ static CAPS: LazyLock<Caps> = LazyLock::new(|| {
             && is_x86_feature_detected!("avx512bw");
         caps.avx512_bf16 = is_x86_feature_detected!("avx512bf16");
     }
-    #[cfg(feature = "onednn")]
     {
         caps.amx = crate::ops::onednn::brgemm_available();
     }
@@ -246,14 +243,6 @@ fn prefill_attention_one_head(
 
     // SAFETY: GemmPool threads are single-threaded; no re-entrancy.
     let bufs = unsafe { get_attn_bufs() };
-    let do_profile = ATTN_PROFILE.load(Ordering::Relaxed);
-    let mut prof_gather_ns = 0u64;
-    let mut prof_qk_ns = 0u64;
-    let mut prof_softmax_ns = 0u64;
-    let mut prof_sv_ns = 0u64;
-    let mut prof_nblocks = 0u32;
-
-    let t_gather = std::time::Instant::now();
 
     let (block_m, block_n) = select_blocks(slen);
 
@@ -287,7 +276,6 @@ fn prefill_attention_one_head(
             convert_bf16_to_f32(&mut bufs.k_f32[..kv_len], &bufs.k_buf[..kv_len], use_avx512);
         }
     }
-    if do_profile { prof_gather_ns += t_gather.elapsed().as_nanos() as u64; }
 
     // Ensure scratch buffers
     ensure_len_f32(&mut bufs.s_i, block_m * block_n);
@@ -325,13 +313,10 @@ fn prefill_attention_one_head(
     let mut n = 0;
     while n < num_keys {
         let n_size = (num_keys - n).min(block_n);
-        if do_profile { prof_nblocks += 1; }
 
         // ── QK GEMM (backend-specific) ──────────────────────────────────
-        let t_qk = std::time::Instant::now();
         if use_amx {
             // AMX: strided Q/K access, oneDNN brgemm GEMM
-            #[cfg(feature = "onednn")]
             {
                 unsafe {
                     crate::ops::onednn::ffi::brgemm_qk_gemm(
@@ -373,10 +358,8 @@ fn prefill_attention_one_head(
                 }
             }
         }
-        if do_profile { prof_qk_ns += t_qk.elapsed().as_nanos() as u64; }
 
         // ── Causal mask (shared) ────────────────────────────────────────
-        let t_sm = std::time::Instant::now();
         if n + n_size > m {
             for i in 0..m_size {
                 let last_valid_col = (m + i).saturating_sub(n);
@@ -415,12 +398,9 @@ fn prefill_attention_one_head(
             bufs.s_prime[i] += block_sum;
             bufs.m_prime[i] = m_i;
         }
-        if do_profile { prof_softmax_ns += t_sm.elapsed().as_nanos() as u64; }
 
         // ── V accumulation ───────────────────────────────────────────────
-        let t_sv = std::time::Instant::now();
         if use_amx {
-            #[cfg(feature = "onednn")]
             unsafe {
                 crate::ops::onednn::ffi::brgemm_score_v_accum(
                     bufs.s_i.as_ptr(),
@@ -456,13 +436,11 @@ fn prefill_attention_one_head(
                 }
             }
         }
-        if do_profile { prof_sv_ns += t_sv.elapsed().as_nanos() as u64; }
 
         n += n_size;
     }
 
     // ── Post-loop cleanup (brgemm only) ─────────────────────────────────
-    #[cfg(feature = "onednn")]
     if use_amx {
         unsafe { crate::ops::onednn::ffi::brgemm_attn_release(); }
     }
@@ -488,17 +466,6 @@ fn prefill_attention_one_head(
         }
     }
 
-    if do_profile && head_idx == 0 {
-        eprintln!(
-            "[attn_profile] slen={} nblocks={} gather={:.1}us qk={:.1}us softmax={:.1}us sv={:.1}us total={:.1}us",
-            slen, prof_nblocks,
-            prof_gather_ns as f64 / 1000.0,
-            prof_qk_ns as f64 / 1000.0,
-            prof_softmax_ns as f64 / 1000.0,
-            prof_sv_ns as f64 / 1000.0,
-            (prof_gather_ns + prof_qk_ns + prof_softmax_ns + prof_sv_ns) as f64 / 1000.0,
-        );
-    }
 }
 
 // ── Decode (single-token) attention ─────────────────────────────────────

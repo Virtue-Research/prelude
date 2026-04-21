@@ -1,8 +1,8 @@
 use crate::engine::*;
 #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
-use crate::models::layers::BatchAttnContext;
+use crate::models::common::BatchAttnContext;
 #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
-use crate::models::layers::PagedKvBatchContext;
+use crate::models::common::PagedKvBatchContext;
 
 impl Engine {
     /// Batched decode step: N sequences, each with Q=1 (one new token),
@@ -114,10 +114,10 @@ impl Engine {
             deltanet_slots: deltanet_slots.as_deref(),
         };
         #[cfg(feature = "flashinfer")]
-        crate::models::layers::fi_begin_forward();
+        crate::models::common::fi_begin_forward();
         let logits = model.forward(&packed_input, &mut ctx).map_err(candle_err)?;
         #[cfg(feature = "flashinfer")]
-        crate::models::layers::fi_end_forward();
+        crate::models::common::fi_end_forward();
         drop(dn_pool_guard);
         drop(model);
 
@@ -257,10 +257,10 @@ impl Engine {
                     deltanet_slots: dn_slots.as_deref(),
                 };
                 #[cfg(feature = "flashinfer")]
-                crate::models::layers::fi_begin_forward();
+                crate::models::common::fi_begin_forward();
                 let logits = model.forward(&input_t, &mut ctx).map_err(candle_err)?;
                 #[cfg(feature = "flashinfer")]
-                crate::models::layers::fi_end_forward();
+                crate::models::common::fi_end_forward();
                 drop(dn_pool_guard);
                 drop(model);
 

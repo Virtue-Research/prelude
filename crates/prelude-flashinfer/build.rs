@@ -12,6 +12,9 @@ use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const FLASHINFER_REPO: &str = "https://github.com/flashinfer-ai/flashinfer.git";
+const FLASHINFER_BRANCH: &str = "main";
+
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=scripts/compile_kernels.py");
     println!("cargo:rerun-if-changed=kernels/");
@@ -65,22 +68,53 @@ fn find_flashinfer_source(manifest_dir: &Path) -> Result<PathBuf> {
         anyhow::bail!("FLASHINFER_SRC={src} does not contain csrc/");
     }
 
-    // Check sibling directory (common development layout)
-    let workspace_root = manifest_dir.parent().and_then(|p| p.parent());
-    if let Some(root) = workspace_root {
-        for candidate in ["flashinfer", "../kernel/flashinfer"] {
-            let p = root.join(candidate);
-            if p.join("csrc").exists() {
-                println!("cargo:warning=Found FlashInfer at {}", p.display());
-                return Ok(p);
-            }
-        }
+    // Auto-clone into OUT_DIR (like fa4 does)
+    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
+    let fi_src = out_dir.join("flashinfer-src");
+
+    if fi_src.join("csrc").exists() {
+        println!("cargo:warning=Using cached FlashInfer source: {}", fi_src.display());
+        return Ok(fi_src);
     }
 
-    anyhow::bail!(
-        "FlashInfer source not found. Set FLASHINFER_SRC env var \
-         or place flashinfer/ next to this workspace."
-    )
+    println!("cargo:warning=Cloning FlashInfer {FLASHINFER_BRANCH} branch...");
+
+    if fi_src.exists() {
+        std::fs::remove_dir_all(&fi_src)?;
+    }
+
+    let status = Command::new("git")
+        .args([
+            "clone",
+            "--depth", "1",
+            "--branch", FLASHINFER_BRANCH,
+            "--single-branch",
+            "--filter=blob:limit=1m",
+            FLASHINFER_REPO,
+        ])
+        .arg(&fi_src)
+        .status()
+        .context("Failed to clone FlashInfer repo")?;
+
+    if !status.success() {
+        anyhow::bail!("git clone failed for {FLASHINFER_REPO}");
+    }
+
+    if !fi_src.join("csrc").exists() {
+        anyhow::bail!("csrc/ not found in cloned FlashInfer repo");
+    }
+
+    // Initialize submodules (e.g. 3rdparty/tvm_ffi for TVM headers)
+    let sub_status = Command::new("git")
+        .args(["submodule", "update", "--init", "--recursive", "--depth", "1"])
+        .current_dir(&fi_src)
+        .status()
+        .context("Failed to init FlashInfer submodules")?;
+    if !sub_status.success() {
+        println!("cargo:warning=FlashInfer submodule init failed (non-fatal)");
+    }
+
+    Ok(fi_src)
 }
 
 fn ensure_kernels(

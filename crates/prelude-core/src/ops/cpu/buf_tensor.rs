@@ -85,16 +85,7 @@ impl<'a> CpuTensor<'a> {
     /// Copy data into a new candle BF16 Tensor.
     pub fn to_candle(&self, device: &Device) -> Result<Tensor> {
         let data = self.as_slice();
-        let bf16_vec: Vec<half::bf16> = unsafe {
-            let mut v = Vec::with_capacity(data.len());
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr() as *const half::bf16,
-                v.as_mut_ptr(),
-                data.len(),
-            );
-            v.set_len(data.len());
-            v
-        };
+        let bf16_vec: Vec<half::bf16> = bytemuck::cast_slice::<u16, half::bf16>(data).to_vec();
         Tensor::from_vec(bf16_vec, self.dims(), device)
     }
 

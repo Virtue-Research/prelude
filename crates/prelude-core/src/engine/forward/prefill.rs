@@ -89,7 +89,7 @@ impl Engine {
         token_groups: &[&[Vec<u32>]],
         need_hidden_states: bool,
     ) -> Result<Option<PrefillForwardResult>, EngineError> {
-        use crate::models::layers::BatchAttnContext;
+        use crate::models::common::BatchAttnContext;
 
         // ── Step 1: Prefix cache lookup ──
         let common_prefix = find_common_prefix_from_groups(token_groups);
@@ -166,7 +166,7 @@ impl Engine {
                 let run = (|| -> Result<(candle_core::Tensor, Option<candle_core::Tensor>), EngineError> {
                     if use_paged_forward {
                         if let Some(pool) = &self.cache.paged_pool {
-                            use crate::models::layers::PagedKvBatchContext;
+                            use crate::models::common::PagedKvBatchContext;
 
                             paged_block_size = pool.block_size;
 
@@ -256,19 +256,21 @@ impl Engine {
                                 deltanet_slots: None,
                             };
                             #[cfg(feature = "flashinfer")]
-                            crate::models::layers::fi_begin_forward();
+                            crate::models::common::fi_begin_forward();
                             let result = if need_hidden_states {
-                                let hidden = model.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
-                                let last = crate::models::layers::last_token_select(&hidden, &seq_lens)
+                                let lm = model.as_logits_model_mut()
+                                    .expect("hidden states requested but model doesn't support LogitsSplitModel");
+                                let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
+                                let last = crate::models::common::last_token_select(&hidden, &seq_lens)
                                     .map_err(candle_err)?;
-                                let logits = model.compute_logits(&last).map_err(candle_err)?
+                                let logits = lm.compute_logits(&last).map_err(candle_err)?
                                     .unsqueeze(1).map_err(candle_err)?;
                                 Ok((logits, Some(hidden)))
                             } else {
                                 Ok((model.forward(&packed_input, &mut ctx).map_err(candle_err)?, None))
                             };
                             #[cfg(feature = "flashinfer")]
-                            crate::models::layers::fi_end_forward();
+                            crate::models::common::fi_end_forward();
                             return result;
                         }
                     }
@@ -284,19 +286,21 @@ impl Engine {
                         deltanet_slots: None,
                     };
                     #[cfg(feature = "flashinfer")]
-                    crate::models::layers::fi_begin_forward();
+                    crate::models::common::fi_begin_forward();
                     let result = if need_hidden_states {
-                        let hidden = model.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
-                        let last = crate::models::layers::last_token_select(&hidden, &seq_lens)
+                        let lm = model.as_logits_model_mut()
+                            .expect("hidden states requested but model doesn't support LogitsSplitModel");
+                        let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(candle_err)?;
+                        let last = crate::models::common::last_token_select(&hidden, &seq_lens)
                             .map_err(candle_err)?;
-                        let logits = model.compute_logits(&last).map_err(candle_err)?
+                        let logits = lm.compute_logits(&last).map_err(candle_err)?
                             .unsqueeze(1).map_err(candle_err)?;
                         Ok((logits, Some(hidden)))
                     } else {
                         Ok((model.forward(&packed_input, &mut ctx).map_err(candle_err)?, None))
                     };
                     #[cfg(feature = "flashinfer")]
-                    crate::models::layers::fi_end_forward();
+                    crate::models::common::fi_end_forward();
                     result
                 })();
 

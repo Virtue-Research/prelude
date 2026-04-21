@@ -17,6 +17,43 @@ use std::process::Command;
 const FA4_REPO: &str = "https://github.com/Dao-AILab/flash-attention.git";
 const FA4_BRANCH: &str = "main";
 
+/// Recursively search for a file by name under a directory.
+fn find_file_recursive(dir: &Path, name: &str) -> Option<PathBuf> {
+    if !dir.is_dir() {
+        return None;
+    }
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.file_name().map_or(false, |n| n == name) {
+            return Some(path);
+        }
+        if path.is_dir() {
+            if let Some(found) = find_file_recursive(&path, name) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Detect local CUDA toolkit version from nvcc and return the matching
+/// PyTorch wheel index URL (e.g. "https://download.pytorch.org/whl/cu128").
+/// Returns None if nvcc is not found or version can't be parsed.
+fn detect_torch_cuda_index() -> Option<String> {
+    let output = Command::new("nvcc").arg("--version").output().ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    // nvcc output contains "release X.Y," — parse major.minor
+    let release = text.split("release ").nth(1)?;
+    let version = release.split(',').next()?.trim();
+    let parts: Vec<&str> = version.split('.').collect();
+    if parts.len() >= 2 {
+        let cu_tag = format!("{}{}", parts[0], parts[1]);
+        Some(format!("https://download.pytorch.org/whl/cu{cu_tag}"))
+    } else {
+        None
+    }
+}
+
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=kernels/");
     println!("cargo:rerun-if-changed=scripts/compile_kernels.py");
@@ -36,7 +73,7 @@ fn main() -> Result<()> {
     let has_kernels = link_kernel_objects(&kernels_dir, &out_dir)?;
 
     // Phase 4: Compile vendored tvm_ffi + link cuda_dialect_runtime
-    compile_tvm_ffi_static(&manifest_dir)?;
+    compile_tvm_ffi_static(&manifest_dir, &out_dir)?;
 
     // Phase 5: Generate Rust dispatch code
     generate_dispatch_code(&kernels_dir, &out_dir, has_kernels)?;
@@ -202,7 +239,7 @@ fn generate_dispatch_code(
 /// Kernel .o files reference TVM FFI symbols (TVMFFIEnvGetStream, etc.)
 /// that need to be resolved at link time.
 /// Also links vendored libcuda_dialect_runtime_static.a.
-fn compile_tvm_ffi_static(manifest_dir: &Path) -> Result<()> {
+fn compile_tvm_ffi_static(manifest_dir: &Path, out_dir: &Path) -> Result<()> {
     let vendor_dir = manifest_dir.join("vendor");
     let tvm_src = vendor_dir.join("tvm_ffi/src");
     let tvm_include = vendor_dir.join("tvm_ffi/include");
@@ -252,18 +289,23 @@ fn compile_tvm_ffi_static(manifest_dir: &Path) -> Result<()> {
         .try_compile("tvm_ffi_static")
         .context("Failed to compile vendored tvm_ffi")?;
 
-    // Link vendored libcuda_dialect_runtime_static.a with +whole-archive.
+    // Link libcuda_dialect_runtime_static.a with +whole-archive.
     // Kernel .o host code calls _cudaLibraryLoadData etc. from this library.
-    let cuda_dialect_dir = vendor_dir.join("cuda_dialect");
-    if cuda_dialect_dir
-        .join("libcuda_dialect_runtime_static.a")
-        .exists()
-    {
-        println!(
-            "cargo:rustc-link-search=native={}",
-            cuda_dialect_dir.display()
-        );
+    // Check vendor dir first, then the cutlass-dsl Python package in the build venv.
+    let cuda_dialect_lib = "libcuda_dialect_runtime_static.a";
+    let vendor_path = vendor_dir.join("cuda_dialect").join(cuda_dialect_lib);
+    let cuda_dialect_dir = if vendor_path.exists() {
+        Some(vendor_dir.join("cuda_dialect"))
+    } else {
+        // Search in the FA4 venv (cutlass-dsl installs it)
+        find_file_recursive(&out_dir.join("fa4-venv"), cuda_dialect_lib)
+            .map(|p| p.parent().unwrap().to_path_buf())
+    };
+    if let Some(dir) = cuda_dialect_dir {
+        println!("cargo:rustc-link-search=native={}", dir.display());
         println!("cargo:rustc-link-lib=static:+whole-archive=cuda_dialect_runtime_static");
+    } else {
+        println!("cargo:warning=cuda_dialect_runtime_static.a not found — FA4 SM90 kernels may fail to link");
     }
 
     // CUDA runtime (cudaLibraryLoadData etc.)
@@ -527,6 +569,12 @@ fn ensure_python_env(out_dir: &Path) -> Result<String> {
     }
 
     // Install dependencies
+    // Detect CUDA version to pick matching PyTorch wheel (avoids driver mismatch)
+    let torch_index = detect_torch_cuda_index();
+    if let Some(ref idx) = torch_index {
+        println!("cargo:warning=Detected CUDA index: {idx}");
+    }
+
     println!("cargo:warning=Installing FA4 Python deps (nvidia-cutlass-dsl, torch)...");
 
     let venv_python_str = venv_python.to_string_lossy().to_string();
@@ -536,18 +584,30 @@ fn ensure_python_env(out_dir: &Path) -> Result<String> {
         .map(|o| o.status.success())
         .unwrap_or(false);
 
+    let base_pkgs = &[
+        "nvidia-cutlass-dsl",
+        "quack-kernels@git+https://github.com/Dao-AILab/quack.git",
+        "torch",
+        "einops",
+    ];
+
     let status = if has_uv {
-        Command::new("uv")
-            .args(["pip", "install", "--python", &venv_python_str])
-            .args(["nvidia-cutlass-dsl", "quack-kernels@git+https://github.com/Dao-AILab/quack.git", "torch", "einops"])
-            .status()
-            .context("uv pip install failed")?
+        let mut cmd = Command::new("uv");
+        cmd.args(["pip", "install", "--python", &venv_python_str]);
+        if let Some(ref idx) = torch_index {
+            cmd.args(["--extra-index-url", idx]);
+        }
+        cmd.args(base_pkgs);
+        cmd.status().context("uv pip install failed")?
     } else {
         let pip_path = venv_dir.join("bin/pip");
-        Command::new(&pip_path)
-            .args(["install", "nvidia-cutlass-dsl", "quack-kernels>=0.3.4", "torch", "einops"])
-            .status()
-            .context("pip install failed")?
+        let mut cmd = Command::new(&pip_path);
+        cmd.arg("install");
+        if let Some(ref idx) = torch_index {
+            cmd.args(["--extra-index-url", idx]);
+        }
+        cmd.args(base_pkgs);
+        cmd.status().context("pip install failed")?
     };
 
     if !status.success() {

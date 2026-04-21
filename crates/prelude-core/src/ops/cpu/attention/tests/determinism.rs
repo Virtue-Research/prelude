@@ -118,12 +118,11 @@ fn test_fused_add_rmsnorm_determinism() {
     }
 }
 
-/// QwenLinear forward (candle Linear → brgemm dispatch): run twice, assert bit-exact.
+/// Linear forward (candle Linear → brgemm dispatch): run twice, assert bit-exact.
 /// Tests the full Linear layer path including Tensor allocation/dispatch.
-#[cfg(feature = "onednn")]
 #[test]
 fn test_qwen_linear_determinism() {
-    use crate::models::layers::linear::wrap_linear;
+    use crate::models::common::linear::Linear;
     use candle_core::{DType, Device, Tensor};
 
     if !crate::ops::onednn::brgemm_available() { return; }
@@ -137,7 +136,7 @@ fn test_qwen_linear_determinism() {
         .map(|i| half::bf16::from_f32(((i as f32 * 0.0003) - 0.15).sin()))
         .collect();
     let w = Tensor::from_vec(w_vals, &[out_dim, in_dim], &Device::Cpu).unwrap();
-    let linear = wrap_linear(candle_nn::Linear::new(w, None)).unwrap();
+    let linear = Linear::from_weight(w, None).unwrap();
 
     let make_input = || -> Tensor {
         let vals: Vec<half::bf16> = (0..batch * in_dim)
@@ -152,13 +151,12 @@ fn test_qwen_linear_determinism() {
     let v1: Vec<f32> = out1.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
     let v2: Vec<f32> = out2.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
     for (i, (&a, &b)) in v1.iter().zip(v2.iter()).enumerate() {
-        assert_eq!(a.to_bits(), b.to_bits(), "QwenLinear determinism mismatch at {i}: {a} vs {b}");
+        assert_eq!(a.to_bits(), b.to_bits(), "Linear determinism mismatch at {i}: {a} vs {b}");
     }
 }
 
 /// Chain: rmsnorm → brgemm GEMM → fused_add_rmsnorm → brgemm GEMM.
 /// Simulates DecoderLayer forward data flow. Run twice, assert bit-exact.
-#[cfg(feature = "onednn")]
 #[test]
 fn test_layer_chain_determinism() {
     use crate::ops::cpu::{cpu_rmsnorm, cpu_fused_add_rmsnorm};
@@ -220,10 +218,10 @@ fn test_layer_chain_determinism() {
 
     // Step 3: fused_add_rmsnorm with narrow (non-contiguous input)
     let pt1 = Tensor::from_vec(
-        unsafe { std::mem::transmute::<Vec<u16>, Vec<half::bf16>>(p1) },
+        bytemuck::cast_vec::<u16, half::bf16>(p1),
         &[seq_len, inter], &Device::Cpu).unwrap();
     let pt2 = Tensor::from_vec(
-        unsafe { std::mem::transmute::<Vec<u16>, Vec<half::bf16>>(p2) },
+        bytemuck::cast_vec::<u16, half::bf16>(p2),
         &[seq_len, inter], &Device::Cpu).unwrap();
     let n1 = pt1.narrow(1, 0, hidden).unwrap();
     let n2 = pt2.narrow(1, 0, hidden).unwrap();
@@ -251,18 +249,17 @@ fn test_layer_chain_determinism() {
     assert_eq!(diffs_23, 0, "step4: f2 vs f3 differ by {diffs_23} elements");
 }
 
-/// Model-like chain: rmsnorm → OnednnLinear → fused_add_rmsnorm → OnednnLinear.
+/// Model-like chain: rmsnorm → Linear → fused_add_rmsnorm → Linear.
 /// Run twice, assert bit-exact. Passes alone but FAILS after test_prefill_amx_precision:
 ///   cargo test -p prelude-core --lib -- "test_extend_amx" "test_linear_chain" --test-threads=1
 /// Root cause: 1 ULP non-determinism in brgemm_bf16_linear (C++ oneDNN FFI) when
 /// the test harness runs verify_prefill_precision (brgemm attention + naive comparison)
 /// in a prior #[test]. Cannot be reproduced within a single test function.
-/// The non-determinism is in OnednnLinear::forward's second call vs first call.
-#[cfg(feature = "onednn")]
+/// The non-determinism is in Linear::forward's second call vs first call.
 #[test]
 fn test_linear_chain_determinism() {
     use crate::ops::cpu::{cpu_rmsnorm, cpu_fused_add_rmsnorm};
-    use crate::models::layers::linear::wrap_linear;
+    use crate::models::common::linear::Linear;
     use candle_core::{DType, Device, Module, Tensor};
 
     if !crate::ops::onednn::brgemm_available() { return; }
@@ -282,10 +279,10 @@ fn test_linear_chain_determinism() {
     };
 
     let norm_w = make_bf16_tensor(1, hidden, 0.001).reshape(&[hidden]).unwrap();
-    let proj = wrap_linear(candle_nn::Linear::new(make_bf16_tensor(inter, hidden, 0.0003), None)).unwrap();
+    let proj = Linear::from_weight(make_bf16_tensor(inter, hidden, 0.0003), None).unwrap();
     // down: [hidden, hidden] — input from fused_add_rmsnorm is [seq_len, hidden]
     // (Previously [hidden, inter] caused K=inter mismatch: brgemm read past buffer)
-    let down = wrap_linear(candle_nn::Linear::new(make_bf16_tensor(hidden, hidden, 0.0004), None)).unwrap();
+    let down = Linear::from_weight(make_bf16_tensor(hidden, hidden, 0.0004), None).unwrap();
 
     // Step-by-step: find first diverging operation
     let x1 = make_bf16_tensor(seq_len, hidden, 0.002);
@@ -325,7 +322,6 @@ fn test_linear_chain_determinism() {
 /// brgemm GEMM with different shapes interleaved: tests if JIT cache / scratchpad
 /// residuals cause non-determinism. Simulates what happens when different layers
 /// (with different M) use the same GemmPool thread.
-#[cfg(feature = "onednn")]
 #[test]
 fn test_brgemm_interleaved_shapes_determinism() {
     use crate::ops::onednn;
@@ -365,7 +361,6 @@ fn test_brgemm_interleaved_shapes_determinism() {
 
 /// brgemm GEMM (GemmPool 2D M×N dispatch): run twice, assert bit-exact.
 /// This is the Linear layer's hot path — the most likely source of non-determinism.
-#[cfg(feature = "onednn")]
 #[test]
 fn test_brgemm_gemm_determinism() {
     use crate::ops::onednn;
@@ -408,7 +403,6 @@ fn test_brgemm_gemm_determinism() {
 /// Each layer: rmsnorm → attn(prefill) → fused_add_rmsnorm → gate_up GEMM → SiLU → down GEMM → residual_add.
 /// Uses Qwen3-0.6B dimensions: hidden=1024, inter=3072, heads=16, kv_heads=8, head_dim=64.
 /// Run full chain twice with same input, assert bit-exact output.
-#[cfg(feature = "onednn")]
 #[test]
 fn test_multi_layer_determinism() {
     use crate::ops::cpu::{cpu_rmsnorm, cpu_fused_add_rmsnorm, cpu_silu_and_mul};
@@ -529,7 +523,7 @@ fn test_multi_layer_determinism() {
 
             // Step 6: fused_add_rmsnorm(residual=h, attn_out=proj_out)
             let proj_tensor = {
-                let vals: Vec<half::bf16> = unsafe { std::mem::transmute::<Vec<u16>, Vec<half::bf16>>(proj_out) };
+                let vals: Vec<half::bf16> = bytemuck::cast_vec::<u16, half::bf16>(proj_out);
                 Tensor::from_vec(vals, &[seq_len, hidden], &Device::Cpu).unwrap()
             };
             let (x_res, h2) = cpu_fused_add_rmsnorm(&h, &proj_tensor, &lw.norm2_w, eps).unwrap();
@@ -544,7 +538,7 @@ fn test_multi_layer_determinism() {
 
             // Step 8: SiLU×Mul → [seq_len, inter]
             let gu_tensor = {
-                let vals: Vec<half::bf16> = unsafe { std::mem::transmute::<Vec<u16>, Vec<half::bf16>>(gate_up) };
+                let vals: Vec<half::bf16> = bytemuck::cast_vec::<u16, half::bf16>(gate_up);
                 Tensor::from_vec(vals, &[seq_len, 2 * inter], &Device::Cpu).unwrap()
             };
             let silu_out = cpu_silu_and_mul(&gu_tensor).unwrap();
@@ -559,7 +553,7 @@ fn test_multi_layer_determinism() {
 
             // Step 10: residual add: h = x_res + mlp_out
             let mlp_tensor = {
-                let vals: Vec<half::bf16> = unsafe { std::mem::transmute::<Vec<u16>, Vec<half::bf16>>(mlp_out) };
+                let vals: Vec<half::bf16> = bytemuck::cast_vec::<u16, half::bf16>(mlp_out);
                 Tensor::from_vec(vals, &[seq_len, hidden], &Device::Cpu).unwrap()
             };
             h = (x_res + mlp_tensor).unwrap();

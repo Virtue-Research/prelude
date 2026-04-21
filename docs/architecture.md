@@ -90,7 +90,7 @@ overhead, critical when per-token decode is only a few milliseconds).
 
 ## 5. Attention Backends
 
-Modular dispatch lives exclusively in `models/layers/attn/mod.rs`. Model code
+Modular dispatch lives exclusively in `models/common/attn/mod.rs`. Model code
 has zero `#[cfg]` gates for attention -- adding a backend means one file in
 `attn/` and one dispatch branch in `mod.rs`.
 

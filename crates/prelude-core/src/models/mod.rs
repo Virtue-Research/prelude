@@ -1,8 +1,17 @@
-pub mod architectures;
-pub(crate) mod layers;
-mod model_forward;
+pub(crate) mod common;
+mod forward;
+pub mod gemma3;
+pub mod qwen3;
+pub mod qwen3_5;
+pub mod qwen3_moe;
+pub mod qwen3_next;
+pub(crate) mod registry;
 
-pub(crate) use model_forward::ModelForward;
+
+
+pub(crate) use forward::{
+    ClassifierModel, EmbeddingModel, KvCacheModel, LogitsSplitModel, ModelForward,
+};
 
 /// Resolve an optional config field, warning if falling back to a default value.
 ///

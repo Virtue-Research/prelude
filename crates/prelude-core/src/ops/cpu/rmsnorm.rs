@@ -29,8 +29,7 @@ pub fn cpu_rmsnorm(input: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> 
             let input_2d = input.reshape((batch_size, hidden_size))?;
             let in_slice = super::tensor_as_u16_slice(&input_2d)?;
             let w_slice = super::tensor_as_u16_slice(weight)?;
-            let mut out_buf = Vec::with_capacity(batch_size * hidden_size);
-            unsafe { out_buf.set_len(batch_size * hidden_size) };
+            let mut out_buf = vec![0u16; batch_size * hidden_size];
             rmsnorm_bf16(&mut out_buf, in_slice, w_slice, batch_size, hidden_size, eps as f32);
             super::u16_vec_to_bf16_tensor(out_buf, dims, input.device())
         }
@@ -121,7 +120,7 @@ pub struct CpuRmsNorm {
 }
 
 impl CpuRmsNorm {
-    pub fn new(_norm: candle_nn::RmsNorm, eps: f64, weight: Tensor) -> Self {
+    pub fn new(eps: f64, weight: Tensor) -> Self {
         Self { weight, eps }
     }
 }

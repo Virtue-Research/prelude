@@ -45,6 +45,30 @@ Feature flags cascade: `flashinfer`, `flash-attn-v4`, and `flash-attn` each impl
 
 Attention dispatch priority: FA4 -> FlashInfer -> FA3 -> FA2 -> CPU.
 
+### Docker (alternative)
+
+One Dockerfile, works with or without a GPU. `--gpus all` is ignored on machines
+without the NVIDIA runtime, so the same image works everywhere.
+
+```bash
+# Build image (once per machine, or after Dockerfile changes)
+docker build -t prelude-dev .
+
+# Interactive development
+docker run --gpus all -it -v $(pwd):/workspace prelude-dev bash
+
+# CPU benchmarks (no GPU needed)
+docker run -v $(pwd):/workspace prelude-dev \
+  cargo bench -p prelude-core --bench cpu_ops_bench -- quant
+
+# Tests
+docker run -v $(pwd):/workspace prelude-dev \
+  cargo test -p prelude-core --lib -- --test-threads=1
+```
+
+The image includes: Rust stable, CUDA 12.8 toolkit, cmake, llama.cpp (for
+benchmark comparison), and Claude Code.
+
 ## Run
 
 ### GPU
@@ -177,6 +201,32 @@ curl -s http://localhost:8000/v1/models
 **CMake version too old for oneDNN.** oneDNN requires CMake >= 3.18. On Ubuntu 20.04, install via `pip install cmake` or use the Kitware PPA.
 
 **CUDA out of memory.** Lower `--gpu-memory-utilization` (default 0.4). This controls the fraction of free GPU memory used for paged KV cache.
+
+## Development
+
+### Test
+
+```bash
+# All library tests (single-threaded to avoid GemmPool conflicts)
+cargo test -p prelude-core --lib -- --test-threads=1
+
+# Specific module
+cargo test -p prelude-core --lib -- quant
+cargo test -p prelude-core --lib -- linear
+```
+
+### Benchmark
+
+```bash
+# CPU kernel benchmarks (quantized, GEMM, attention, etc.)
+cargo bench -p prelude-core --bench cpu_ops_bench
+
+# Filter specific benchmark
+cargo bench -p prelude-core --bench cpu_ops_bench -- quant
+cargo bench -p prelude-core --bench cpu_ops_bench -- gemm
+```
+
+See [benchmarking.md](benchmarking.md) for the end-to-end server benchmark suite.
 
 ## Next steps
 
