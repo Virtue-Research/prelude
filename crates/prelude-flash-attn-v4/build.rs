@@ -15,7 +15,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const FA4_REPO: &str = "https://github.com/Dao-AILab/flash-attention.git";
-const FA4_BRANCH: &str = "main";
+// Pinned. Upstream adds/renames kernel parameters (e.g. `aux_tensors`) without
+// bumping a version, and our Rust binding in lib.rs encodes a fixed param
+// count, so a drifting `main` breaks the TVM FFI call with
+// `Expects N parameters when calling ...`. Bump deliberately when Rust bindings
+// are updated to match.
+const FA4_COMMIT: &str = "b322ae2675065ad96ad3c248fd6ef0f32252808f";
 
 /// Recursively search for a file by name under a directory.
 fn find_file_recursive(dir: &Path, name: &str) -> Option<PathBuf> {
@@ -395,29 +400,36 @@ fn ensure_fa4_source(out_dir: &Path) -> Result<PathBuf> {
         return Ok(fa4_src);
     }
 
-    println!("cargo:warning=Cloning flash-attention main branch...");
+    println!("cargo:warning=Cloning flash-attention @ {}...", &FA4_COMMIT[..8]);
 
     if fa4_src.exists() {
         std::fs::remove_dir_all(&fa4_src)?;
     }
 
+    // Full clone (no shallow/branch) so an arbitrary SHA can be checked out.
+    // `--filter=blob:limit=1m` keeps the download small by lazily fetching
+    // large blobs; only kernel sources we actually read are materialised.
     let status = Command::new("git")
         .args([
             "clone",
-            "--depth",
-            "1",
-            "--branch",
-            FA4_BRANCH,
-            "--single-branch",
             "--filter=blob:limit=1m",
+            "--no-checkout",
             FA4_REPO,
         ])
         .arg(&fa4_src)
         .status()
         .context("Failed to clone flash-attention repo")?;
-
     if !status.success() {
         anyhow::bail!("git clone failed for {FA4_REPO}");
+    }
+
+    let status = Command::new("git")
+        .args(["checkout", FA4_COMMIT])
+        .current_dir(&fa4_src)
+        .status()
+        .context("Failed to check out flash-attention @ {FA4_COMMIT}")?;
+    if !status.success() {
+        anyhow::bail!("git checkout failed for {FA4_COMMIT}");
     }
 
     if !fa4_src.join("flash_attn/cute/__init__.py").exists() {

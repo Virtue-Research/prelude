@@ -360,11 +360,17 @@ static int launch_kernel(const void* kernel_ptr, int num_threads, int smem_size,
         attrs[0].id = cudaLaunchAttributeClusterDimension;
         attrs[0].val.clusterDim = {(unsigned)num_multicast, 1, 1};
         lc.attrs = attrs; lc.numAttrs = 1;
-        if (cudaLaunchKernelExC(&lc, kernel_ptr, args) != cudaSuccess) {
+        cudaError_t e = cudaLaunchKernelExC(&lc, kernel_ptr, args);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "DeepGEMM cluster launch failed: %s (cluster=%d, threads=%d, smem=%d)\n",
+                    cudaGetErrorString(e), num_multicast, num_threads, smem_size);
             cudaGetLastError(); return -2;
         }
     } else {
-        if (cudaLaunchKernel(kernel_ptr, grid, block, args, smem_size, stream) != cudaSuccess) {
+        cudaError_t e = cudaLaunchKernel(kernel_ptr, grid, block, args, smem_size, stream);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "DeepGEMM launch failed: %s (threads=%d, smem=%d)\n",
+                    cudaGetErrorString(e), num_threads, smem_size);
             cudaGetLastError(); return -2;
         }
     }

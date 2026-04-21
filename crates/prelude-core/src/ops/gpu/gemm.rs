@@ -61,7 +61,7 @@ unsafe fn gemm_dispatch_impl(
         match &ret {
             Ok(()) => return 0,
             Err(e) => {
-                tracing::debug!("DeepGEMM → CUTLASS fallback: {e}");
+                tracing::warn!("DeepGEMM → CUTLASS fallback: {e}");
             }
         }
     }
