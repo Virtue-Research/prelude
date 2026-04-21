@@ -170,7 +170,11 @@ fn detect_gpu_arch() -> Option<u32> {
     if parts.len() == 2 {
         let major: u32 = parts[0].parse().ok()?;
         let minor: u32 = parts[1].parse().ok()?;
-        Some(major * 10 + minor)
+        // This branch of DeepGEMM only ships SM90 kernel bodies (wgmma). Emitting
+        // for SM100+ makes ptxas reject those instructions. Clamp to 90 so nvcc
+        // produces SM90 PTX that the driver JIT-lowers at runtime on Blackwell.
+        let arch = major * 10 + minor;
+        Some(if arch >= 100 { 90 } else { arch })
     } else {
         None
     }
