@@ -314,7 +314,11 @@ def build_variant_matrix(arch: int, prototype=False):
     supports_paged = constraints["supports_paged"]
     supports_deepseek_mla = constraints["supports_deepseek_mla"]
 
-    gqa_ratios = [1, 2, 4, 8, 16, 32]
+    # Include odd ratios needed by common HF models:
+    #   gqa=5: Qwen3-14B (40/8)
+    #   gqa=6: Qwen3-32B (48/8)
+    #   gqa=7: Llama-3-70B (56/8)
+    gqa_ratios = [1, 2, 3, 4, 5, 6, 7, 8, 16, 32]
     causal_modes = [True, False]
     window_modes = [False, True]
     dtypes = ["bf16", "fp16"]
