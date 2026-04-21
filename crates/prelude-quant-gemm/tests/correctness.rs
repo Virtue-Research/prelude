@@ -84,7 +84,6 @@ fn random_bytes(n: usize, seed: u64) -> Vec<u8> {
 /// This makes tests deterministic and avoids false failures from degenerate scales.
 fn sanitize_fp16_scales(data: &mut [u8], t: GgmlType) {
     let bb = block_bytes(t);
-    let qk = block_elems(t);
     if data.len() < bb { return; }
     let num_blocks = data.len() / bb;
     // FP16 for 1.0 = 0x3C00

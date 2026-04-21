@@ -12,7 +12,6 @@
 use prelude_flashinfer::types::*;
 use prelude_flashinfer::*;
 use std::ffi::c_void;
-use std::time::Instant;
 
 // ── CUDA FFI ─────────────────────────────────────────────────────────
 
