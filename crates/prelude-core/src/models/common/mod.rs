@@ -80,7 +80,6 @@ pub(crate) use attn::{
     reshape_and_cache, varlen_attention, varlen_attention_bidirectional, varlen_attention_paged,
     varlen_attention_windowed,
 };
-pub(crate) use attn::{AttentionBackend, select_backend};
 #[cfg(feature = "flashinfer")]
 pub(crate) use attn::{
     allocate_fi_graph_meta, fi_begin_forward, fi_end_forward, fi_precompute_paged_plan,

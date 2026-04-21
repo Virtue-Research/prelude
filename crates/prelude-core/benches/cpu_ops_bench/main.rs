@@ -1,10 +1,10 @@
 //! Micro-benchmark for pure Rust CPU kernels vs Candle baseline (and onednn if available).
 //!
 //! Usage:
-//!   cargo run -p prelude-core --bin cpu_ops_bench --release
+//!   cargo bench -p prelude-core --bench cpu_ops_bench
 //!
 //! With oneDNN GEMM:
-//!   cargo run -p prelude-core --bin cpu_ops_bench --release --features onednn
+//!   cargo bench -p prelude-core --bench cpu_ops_bench --features onednn
 
 #[global_allocator]
 static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
@@ -232,6 +232,35 @@ fn main() -> Result<()> {
         for &(m, k, n) in postops_configs {
             gemm::bench_postops_variants(m, k, n, 5, gemm_repeats)?;
             println!();
+        }
+    }
+
+    // -- Quantized kernels --
+    if run("quant") {
+        // Precision (llama.cpp style: dot product error vs F32)
+        quant::verify_dot_precision()?;
+
+        // Dot product throughput
+        println!("\n=== Quantized dot product throughput ===");
+        for &k in &[256, 512, 1024, 2048, 4096] {
+            quant::bench_dot(k, 100, 10000)?;
+        }
+
+        // Matmul throughput
+        println!("\n=== Quantized matmul: Q4_0 / Q4_K vs F32 ===");
+        let quant_repeats = 50;
+        let quant_configs: &[(usize, usize, usize)] = &[
+            (1, 1024, 1024),
+            (1, 2048, 2048),
+            (1, 4096, 4096),
+            (4, 2048, 2048),
+            (4, 4096, 4096),
+            (16, 4096, 4096),
+            (1, 1024, 4096),
+            (1, 4096, 1024),
+        ];
+        for &(m, k, n) in quant_configs {
+            quant::bench_matmul(m, k, n, 5, quant_repeats)?;
         }
     }
 

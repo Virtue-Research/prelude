@@ -60,23 +60,27 @@ nix = { version = "0.31", features = ["sched"] }
 tokenizers = { workspace = true, optional = true }
 bc-mimalloc.workspace = true
 
-[[bin]]
+[[bench]]
 name = "cpu_ops_bench"
-path = "src/bin/cpu_ops_bench/main.rs"
+path = "benches/cpu_ops_bench/main.rs"
+harness = false
 
-[[bin]]
+[[bench]]
 name = "gpu_ops_bench"
-path = "src/bin/gpu_ops_bench/main.rs"
+path = "benches/gpu_ops_bench/main.rs"
+harness = false
 required-features = ["cuda"]
 
-[[bin]]
+[[bench]]
 name = "tokenizer_bench"
-path = "src/bin/tokenizer_bench.rs"
+path = "benches/tokenizer_bench.rs"
+harness = false
 required-features = ["hf_tokenizer"]
 
-[[bin]]
+[[bench]]
 name = "qwen3_bench"
-path = "src/bin/qwen3_bench.rs"
+path = "benches/qwen3_bench.rs"
+harness = false
 required-features = ["cuda"]
 # Add "candle-baseline" to required-features for baseline comparison mode
 

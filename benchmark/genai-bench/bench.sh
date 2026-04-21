@@ -3,12 +3,12 @@
 # E2E inference benchmark — each engine runs in its own Docker container.
 #
 # Usage:
-#   ./benchmark/e2e/bench.sh prelude --local       # GPU, local binary (no Docker)
-#   ./benchmark/e2e/bench.sh prelude --local --cpu # CPU, local binary
-#   ./benchmark/e2e/bench.sh prelude               # GPU, Docker
-#   ./benchmark/e2e/bench.sh vllm                  # vLLM GPU
-#   ./benchmark/e2e/bench.sh all --gpu             # all engines, GPU
-#   ./benchmark/e2e/bench.sh all --cpu             # all engines, CPU
+#   ./benchmark/genai-bench/bench.sh prelude --local       # GPU, local binary (no Docker)
+#   ./benchmark/genai-bench/bench.sh prelude --local --cpu # CPU, local binary
+#   ./benchmark/genai-bench/bench.sh prelude               # GPU, Docker
+#   ./benchmark/genai-bench/bench.sh vllm                  # vLLM GPU
+#   ./benchmark/genai-bench/bench.sh all --gpu             # all engines, GPU
+#   ./benchmark/genai-bench/bench.sh all --cpu             # all engines, CPU
 #
 # Environment variables:
 #   MODEL           HuggingFace model (default: Qwen/Qwen3-0.6B)
@@ -18,7 +18,7 @@
 #   CONCURRENCY     Concurrent requests (default: 1)
 #   GPU             GPU id (default: 0)
 #   PORT            Server port (default: 8000)
-#   RESULTS_DIR     Output directory (default: benchmark/e2e/results)
+#   RESULTS_DIR     Output directory (default: benchmark/genai-bench/results)
 #   HF_TOKEN        HuggingFace token for gated models
 #   LLAMA_CPP_CONVERT  Path to convert_hf_to_gguf.py (auto-detected)
 #

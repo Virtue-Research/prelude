@@ -1,15 +1,16 @@
 # Benchmarking
 
-The benchmark suite lives in `benchmark/` with its own [README](../benchmark/README.md).
+The local benchmark suite lives in `benchmark/local/` with its own [README](../benchmark/local/README.md).
+For Dockerized cross-engine comparisons, see [`benchmark/genai-bench/README.md`](../benchmark/genai-bench/README.md).
 
 ## Quick Start
 
 ```bash
 # Start server
-MODEL=Qwen/Qwen3-4B GPU=0 ./benchmark/serve_prelude.sh
+MODEL=Qwen/Qwen3-4B GPU=0 ./benchmark/local/serve_prelude.sh
 
 # Run a preset
-python benchmark/benchmark.py --config benchmark/presets/complete_prefill.toml \
+python benchmark/local/benchmark.py --config benchmark/local/presets/complete_prefill.toml \
   --model Qwen/Qwen3-4B --url http://localhost:8000
 ```
 
@@ -33,13 +34,13 @@ All presets require `--model` and `--url` on the command line.
 
 ```bash
 # Start all three servers (different ports)
-MODEL=Qwen/Qwen3-4B GPU=0 PORT=8000 ./benchmark/serve_prelude.sh
-MODEL=Qwen/Qwen3-4B GPU=0 PORT=8001 ./benchmark/serve_vllm.sh
-MODEL=Qwen/Qwen3-4B GPU=0 PORT=8002 ./benchmark/serve_sglang.sh
+MODEL=Qwen/Qwen3-4B GPU=0 PORT=8000 ./benchmark/local/serve_prelude.sh
+MODEL=Qwen/Qwen3-4B GPU=0 PORT=8001 ./benchmark/local/serve_vllm.sh
+MODEL=Qwen/Qwen3-4B GPU=0 PORT=8002 ./benchmark/local/serve_sglang.sh
 
 # Run the same preset against each
 for port in 8000 8001 8002; do
-  python benchmark/benchmark.py --config benchmark/presets/complete_prefill.toml \
+  python benchmark/local/benchmark.py --config benchmark/local/presets/complete_prefill.toml \
     --model Qwen/Qwen3-4B --url http://localhost:$port \
     --output results_${port}.json
 done
@@ -70,20 +71,20 @@ For generation benchmarks, look at **Out-tok/s**, **TTFT**, and **TPOT** (printe
 
 ```bash
 # Tight token range for stable results
-python benchmark/benchmark.py complete \
+python benchmark/local/benchmark.py complete \
   --model Qwen/Qwen3-4B --prompt-tokens 500-530 --max-tokens 1
 
 # Generation with streaming (TTFT + TPOT)
-python benchmark/benchmark.py complete \
+python benchmark/local/benchmark.py complete \
   --model Qwen/Qwen3-4B --prompt-tokens 256-768 --max-tokens 128 --streaming
 
 # Prefix cache test
-python benchmark/benchmark.py complete \
+python benchmark/local/benchmark.py complete \
   --model Qwen/Qwen3-4B --max-tokens 1 \
   --prefix --prefix-tokens 3072 --num-unique-prefixes 1
 ```
 
-See `benchmark/README.md` for the full CLI reference.
+See `benchmark/local/README.md` for the full CLI reference.
 
 ## Micro-Benchmarks (Kernel-Level)
 
@@ -92,17 +93,17 @@ Each requires specific feature flags:
 
 ```bash
 # CPU operator benchmarks (GEMM, attention, RMSNorm, RoPE, SiLU) — no special features needed
-cargo run --release --bin cpu_ops_bench -p prelude-core
+cargo bench -p prelude-core --bench cpu_ops_bench
 
 # GPU operator benchmarks (GEMM dispatch, elementwise, etc.) — requires CUDA
-cargo run --release --bin gpu_ops_bench -p prelude-core --features cuda
+cargo bench -p prelude-core --bench gpu_ops_bench --features cuda
 
 # Tokenizer benchmark (fastokens vs HuggingFace tokenizers comparison)
-cargo run --release --bin tokenizer_bench -p prelude-core --features hf_tokenizer -- \
+cargo bench -p prelude-core --bench tokenizer_bench --features hf_tokenizer -- \
   --model-path /path/to/model
 
 # Qwen3 end-to-end single-model benchmark — requires CUDA
-cargo run --release --bin qwen3_bench -p prelude-core --features cuda
+cargo bench -p prelude-core --bench qwen3_bench --features cuda
 
 # Fused ops correctness test — requires CUDA
 cargo run --release --bin fused_ops_test -p prelude-core --features cuda

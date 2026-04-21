@@ -438,7 +438,10 @@ impl Engine {
             // When prompt logprobs requested: get hidden states, apply lm_head separately.
             let (logits_flat, prompt_token_logprobs) = if needs_prompt_logprobs {
                 let logits_model = model.as_logits_model_mut()
-                    .expect("prompt logprobs requested but model doesn't support LogitsSplitModel");
+                    .ok_or_else(|| EngineError::Unavailable(
+                        "prompt_logprobs requires a model that implements LogitsSplitModel \
+                         (GGUF models do not support this)".to_string()
+                    ))?;
                 let hidden = logits_model.forward_hidden_states(&input, &mut ctx)
                     .map_err(|e| EngineError::Internal(e.to_string()))?;
                 let last_hidden = hidden.get(seq_len - 1)
@@ -675,7 +678,10 @@ impl Engine {
         let mut model = self.executor.model.lock().unwrap();
         model.clear_kv_cache();
         let kv = model.as_kv_cache_model()
-            .expect("cpu_prefill_with_cache called on model without KvCacheModel");
+            .ok_or_else(|| EngineError::Unavailable(
+                "cpu_prefill_with_cache requires a model that implements KvCacheModel \
+                 (check supports_kv_cache vs. actual trait impl in loading/mod.rs)".to_string()
+            ))?;
         let logits = kv
             .forward_with_cache(&input, 0)
             .map_err(|e| EngineError::Internal(e.to_string()))?;
@@ -697,7 +703,10 @@ impl Engine {
             .map_err(|e| EngineError::Internal(e.to_string()))?;
         let mut model = self.executor.model.lock().unwrap();
         let kv = model.as_kv_cache_model()
-            .expect("cpu_decode_step called on model without KvCacheModel");
+            .ok_or_else(|| EngineError::Unavailable(
+                "cpu_decode_step requires a model that implements KvCacheModel \
+                 (check supports_kv_cache vs. actual trait impl in loading/mod.rs)".to_string()
+            ))?;
         let logits = kv
             .forward_with_cache(&input, position_offset)
             .map_err(|e| EngineError::Internal(e.to_string()))?;
