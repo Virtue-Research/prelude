@@ -82,31 +82,31 @@ pip install "genai-bench @ git+https://github.com/rucnyz/genai-bench.git"
 #### Prefill only (128 tokens)
 
 ```bash
-INPUT_TOKENS=128 OUTPUT_TOKENS=1 MAX_REQUESTS=500 CONCURRENCY=1 ./benchmark/e2e/bench.sh prelude
-INPUT_TOKENS=128 OUTPUT_TOKENS=1 MAX_REQUESTS=500 CONCURRENCY=4 ./benchmark/e2e/bench.sh prelude
+INPUT_TOKENS=128 OUTPUT_TOKENS=1 MAX_REQUESTS=500 CONCURRENCY=1 ./benchmark/genai-bench/bench.sh prelude
+INPUT_TOKENS=128 OUTPUT_TOKENS=1 MAX_REQUESTS=500 CONCURRENCY=4 ./benchmark/genai-bench/bench.sh prelude
 ```
 
 #### Decode (32 in, 32 out)
 
 ```bash
-INPUT_TOKENS=32 OUTPUT_TOKENS=32 MAX_REQUESTS=100 CONCURRENCY=1 ./benchmark/e2e/bench.sh prelude
+INPUT_TOKENS=32 OUTPUT_TOKENS=32 MAX_REQUESTS=100 CONCURRENCY=1 ./benchmark/genai-bench/bench.sh prelude
 ```
 
 #### Compare all engines
 
 ```bash
 # All engines sequentially
-./benchmark/e2e/bench.sh all
+./benchmark/genai-bench/bench.sh all
 
 # Single engine
-./benchmark/e2e/bench.sh prelude
-./benchmark/e2e/bench.sh vllm
-./benchmark/e2e/bench.sh sglang
-GGUF_MODEL=/path/to/model.gguf ./benchmark/e2e/bench.sh llama.cpp
+./benchmark/genai-bench/bench.sh prelude
+./benchmark/genai-bench/bench.sh vllm
+./benchmark/genai-bench/bench.sh sglang
+GGUF_MODEL=/path/to/model.gguf ./benchmark/genai-bench/bench.sh llama.cpp
 
 # Custom parameters
 MODEL=Qwen/Qwen3-0.6B INPUT_TOKENS=64 OUTPUT_TOKENS=64 \
-  CONCURRENCY=4 MAX_REQUESTS=200 ./benchmark/e2e/bench.sh all
+  CONCURRENCY=4 MAX_REQUESTS=200 ./benchmark/genai-bench/bench.sh all
 ```
 
 #### Docker images used
@@ -120,16 +120,16 @@ MODEL=Qwen/Qwen3-0.6B INPUT_TOKENS=64 OUTPUT_TOKENS=64 \
 
 #### Non-Docker benchmarks
 
-The `benchmark/` directory also has direct serve scripts for host-based benchmarking:
+The `benchmark/prelude/` directory also has direct serve scripts for host-based benchmarking:
 
 ```bash
 # Start server manually
-./benchmark/serve_prelude.sh   # Prelude
-./benchmark/serve_vllm.sh      # vLLM
-./benchmark/serve_sglang.sh    # SGLang
+./benchmark/prelude/serve_prelude.sh   # Prelude
+./benchmark/prelude/serve_vllm.sh      # vLLM
+./benchmark/prelude/serve_sglang.sh    # SGLang
 
 # Run benchmark.py against any OpenAI-compatible server
-python benchmark/benchmark.py complete --url http://localhost:8000 --model Qwen/Qwen3-0.6B
+python benchmark/prelude/benchmark.py complete --url http://localhost:8000 --model Qwen/Qwen3-0.6B
 ```
 
 ## Notes

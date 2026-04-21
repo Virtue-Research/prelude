@@ -1,7 +1,7 @@
 # llama.cpp + vllm.rs — both in one image, GPU and CPU
 #
 # Build:
-#   docker build -f benchmark/e2e/Dockerfile.others -t prelude-others benchmark/e2e
+#   docker build -f benchmark/genai-bench/Dockerfile.others -t prelude-others benchmark/genai-bench
 #
 # Run llama.cpp (GPU):
 #   docker run --gpus all -p 8000:8000 -v /path/to/models:/models prelude-others \

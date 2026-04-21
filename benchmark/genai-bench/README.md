@@ -12,25 +12,25 @@ pip install "genai-bench @ git+https://github.com/rucnyz/genai-bench.git"
 
 ```bash
 # All engines, both GPU and CPU
-./benchmark/e2e/bench.sh all
+./benchmark/genai-bench/bench.sh all
 
 # Single engine (runs both GPU and CPU)
-./benchmark/e2e/bench.sh prelude
-./benchmark/e2e/bench.sh vllm
-./benchmark/e2e/bench.sh sglang
-./benchmark/e2e/bench.sh llama.cpp        # auto-converts HF model to GGUF
-./benchmark/e2e/bench.sh vllm.rs
+./benchmark/genai-bench/bench.sh prelude
+./benchmark/genai-bench/bench.sh vllm
+./benchmark/genai-bench/bench.sh sglang
+./benchmark/genai-bench/bench.sh llama.cpp        # auto-converts HF model to GGUF
+./benchmark/genai-bench/bench.sh vllm.rs
 
 # GPU or CPU only
-./benchmark/e2e/bench.sh prelude --cpu
-./benchmark/e2e/bench.sh prelude --gpu
+./benchmark/genai-bench/bench.sh prelude --cpu
+./benchmark/genai-bench/bench.sh prelude --gpu
 
 # Multiple engines
-./benchmark/e2e/bench.sh prelude vllm sglang
+./benchmark/genai-bench/bench.sh prelude vllm sglang
 
 # Custom parameters
 INPUT_TOKENS=512 OUTPUT_TOKENS=32 MAX_REQUESTS=100 CONCURRENCY=4 \
-  ./benchmark/e2e/bench.sh prelude vllm
+  ./benchmark/genai-bench/bench.sh prelude vllm
 ```
 
 ## Engines and Docker Images
@@ -85,7 +85,7 @@ docker build -f docker/xeon.Dockerfile -t sglang-cpu .
 
 ## Results
 
-Output to `benchmark/e2e/results/`, with a summary table printed after all runs:
+Output to `benchmark/genai-bench/results/`, with a summary table printed after all runs:
 
 ```
 ┌────────────────┬─────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬────────┐

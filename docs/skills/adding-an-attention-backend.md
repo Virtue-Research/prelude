@@ -152,7 +152,7 @@ Both should produce identical text output and logprob cosine similarity >= 0.99.
 ### Benchmark
 
 ```bash
-python benchmark/benchmark.py --config benchmark/presets/complete_prefill.toml \
+python benchmark/prelude/benchmark.py --config benchmark/prelude/presets/complete_prefill.toml \
   --model Qwen/Qwen3-4B --url http://localhost:8000
 ```
 
