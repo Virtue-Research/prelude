@@ -297,16 +297,44 @@ fn compile_tvm_ffi_static(manifest_dir: &Path, out_dir: &Path) -> Result<()> {
 
     // Link libcuda_dialect_runtime_static.a with +whole-archive.
     // Kernel .o host code calls _cudaLibraryLoadData etc. from this library.
-    // Check vendor dir first, then the cutlass-dsl Python package in the build venv.
+    // Locations checked in order:
+    //   1. Vendor dir (pre-shipped copy).
+    //   2. Our build venv (OUT_DIR/fa4-venv) if we created one.
+    //   3. The active Python's nvidia_cutlass_dsl install — covers the case
+    //      where the user already has cutlass-dsl available system-wide and
+    //      ensure_python_env() skipped venv creation.
     let cuda_dialect_lib = "libcuda_dialect_runtime_static.a";
     let vendor_path = vendor_dir.join("cuda_dialect").join(cuda_dialect_lib);
-    let cuda_dialect_dir = if vendor_path.exists() {
+    let mut cuda_dialect_dir = if vendor_path.exists() {
         Some(vendor_dir.join("cuda_dialect"))
     } else {
-        // Search in the FA4 venv (cutlass-dsl installs it)
         find_file_recursive(&out_dir.join("fa4-venv"), cuda_dialect_lib)
             .map(|p| p.parent().unwrap().to_path_buf())
     };
+    if cuda_dialect_dir.is_none() {
+        for py in ["python3", "python"] {
+            // nvidia_cutlass_dsl is a namespace package (no __init__.py at top),
+            // so __file__ is None. Use __path__ instead, which is always populated.
+            let out = Command::new(py)
+                .args([
+                    "-c",
+                    "import os, nvidia_cutlass_dsl as m; \
+                     print(os.path.join(list(m.__path__)[0], 'lib'))",
+                ])
+                .output();
+            if let Ok(out) = out {
+                if out.status.success() {
+                    let candidate = PathBuf::from(
+                        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                    );
+                    if candidate.join(cuda_dialect_lib).exists() {
+                        cuda_dialect_dir = Some(candidate);
+                        break;
+                    }
+                }
+            }
+        }
+    }
     if let Some(dir) = cuda_dialect_dir {
         println!("cargo:rustc-link-search=native={}", dir.display());
         println!("cargo:rustc-link-lib=static:+whole-archive=cuda_dialect_runtime_static");

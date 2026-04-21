@@ -1878,18 +1878,30 @@ def main():
             sm90_modules.append(vinfo)
             return len(sources)
 
-        # gen_gdn_prefill_sm90_module: 32 kernel instantiations via jinja
+        # gen_gdn_prefill_sm90_module: 64 kernel instantiations via jinja.
+        # Template has 5 bool flags (is_gva, needs_beta, needs_alpha, init_state,
+        # enable_checkpointing) — mirror upstream flashinfer/jit/gdn.py which
+        # uses itertools.product([False, True], repeat=5). Missing any flag
+        # leaves an empty slot in the `template void ...<...>` instantiation
+        # and nvcc fails with "expected an expression".
         gdn_instances = []
         for dtype in ["half", "nv_bfloat16"]:
             for is_gva in ["false", "true"]:
                 for needs_beta in ["false", "true"]:
                     for needs_alpha in ["false", "true"]:
                         for init_state in ["false", "true"]:
-                            params = dict(dtype=dtype, is_gva=is_gva, needs_beta=needs_beta,
-                                          needs_alpha=needs_alpha, init_state=init_state)
-                            fname = (f"gdn_prefill_kernel_{dtype}_g{is_gva}"
-                                     f"b{needs_beta}a{needs_alpha}i{init_state}.cu")
-                            gdn_instances.append((params, fname))
+                            for enable_checkpointing in ["false", "true"]:
+                                params = dict(
+                                    dtype=dtype, is_gva=is_gva, needs_beta=needs_beta,
+                                    needs_alpha=needs_alpha, init_state=init_state,
+                                    enable_checkpointing=enable_checkpointing,
+                                )
+                                fname = (
+                                    f"gdn_prefill_kernel_{dtype}_g{is_gva}"
+                                    f"b{needs_beta}a{needs_alpha}i{init_state}"
+                                    f"c{enable_checkpointing}.cu"
+                                )
+                                gdn_instances.append((params, fname))
         n = _add_sm90_jinja(
             "fi_gdn", "gdn", "gdn_prefill_sm90_kernel_inst.jinja",
             gdn_instances,
@@ -1897,7 +1909,7 @@ def main():
             None, ["gdn_prefill"],
             ["-DFLAT_SM90A_ENABLED"],
         )
-        print(f"  SM90 GDN: {n} sources (32 jinja instantiations)")
+        print(f"  SM90 GDN: {n} sources (64 jinja instantiations)")
 
         # gen_gemm_sm90_module: 6 dtype pair instantiations via jinja
         cutlass_dtype_map = {

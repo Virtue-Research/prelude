@@ -10,10 +10,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const CUTLASS_REPO: &str = "https://github.com/NVIDIA/cutlass.git";
-const CUTLASS_BRANCH: &str = "main";
+// Pinned to a known-good commit. Upstream `main` changes template APIs
+// (e.g. adds/removes params on `cute::UMMA::Major`-using kernels), which breaks
+// the hardcoded instantiations in src/sm90_fp8.cuh. Bump this deliberately
+// when the caller code is updated to match.
+const CUTLASS_COMMIT: &str = "08185b9c3e90510ee2b656662ed0d53b06d28157";
 
 const DEEPGEMM_REPO: &str = "https://github.com/deepseek-ai/DeepGEMM.git";
-const DEEPGEMM_BRANCH: &str = "main";
+// Pinned for the same reason — see CUTLASS_COMMIT.
+const DEEPGEMM_COMMIT: &str = "d30fc36c8f229f4f873b90a492f6e19e6e610923";
 
 fn main() {
     println!("cargo:rerun-if-changed=src/deepgemm_wrapper.cu");
@@ -132,21 +137,18 @@ fn ensure_cutlass(out_dir: &Path) -> PathBuf {
         return cutlass_dir;
     }
 
-    println!("cargo:warning=Cloning CUTLASS main branch (headers only)...");
+    println!("cargo:warning=Cloning CUTLASS @ {}...", &CUTLASS_COMMIT[..8]);
 
     if cutlass_dir.exists() {
         std::fs::remove_dir_all(&cutlass_dir).ok();
     }
 
+    // Full clone (no --depth/--branch) so we can check out an arbitrary SHA.
     let status = Command::new("git")
-        .args([
-            "clone", "--depth", "1", "--branch", CUTLASS_BRANCH,
-            "--single-branch", "--no-checkout", CUTLASS_REPO,
-        ])
+        .args(["clone", "--no-checkout", CUTLASS_REPO])
         .arg(&cutlass_dir)
         .status()
         .expect("git clone failed");
-
     if !status.success() {
         panic!("Failed to clone CUTLASS repo");
     }
@@ -159,10 +161,14 @@ fn ensure_cutlass(out_dir: &Path) -> PathBuf {
         .args(["sparse-checkout", "set", "include"])
         .current_dir(&cutlass_dir)
         .status().ok();
-    Command::new("git")
-        .args(["checkout"])
+    let status = Command::new("git")
+        .args(["checkout", CUTLASS_COMMIT])
         .current_dir(&cutlass_dir)
-        .status().ok();
+        .status()
+        .expect("git checkout failed");
+    if !status.success() {
+        panic!("Failed to check out CUTLASS @ {CUTLASS_COMMIT}");
+    }
 
     if !cutlass_dir.join("include/cutlass/cutlass.h").exists() {
         panic!("CUTLASS headers not found after clone");
@@ -179,17 +185,15 @@ fn ensure_deepgemm(out_dir: &Path) -> PathBuf {
         return dg_dir;
     }
 
-    println!("cargo:warning=Cloning DeepGEMM (headers only)...");
+    println!("cargo:warning=Cloning DeepGEMM @ {}...", &DEEPGEMM_COMMIT[..8]);
 
     if dg_dir.exists() {
         std::fs::remove_dir_all(&dg_dir).ok();
     }
 
+    // Full clone so we can check out an arbitrary SHA.
     let status = Command::new("git")
-        .args([
-            "clone", "--depth", "1", "--branch", DEEPGEMM_BRANCH,
-            "--single-branch", "--no-checkout", DEEPGEMM_REPO,
-        ])
+        .args(["clone", "--no-checkout", DEEPGEMM_REPO])
         .arg(&dg_dir)
         .status()
         .expect("git clone failed");
@@ -205,10 +209,14 @@ fn ensure_deepgemm(out_dir: &Path) -> PathBuf {
         .args(["sparse-checkout", "set", "deep_gemm/include"])
         .current_dir(&dg_dir)
         .status().ok();
-    Command::new("git")
-        .args(["checkout"])
+    let status = Command::new("git")
+        .args(["checkout", DEEPGEMM_COMMIT])
         .current_dir(&dg_dir)
-        .status().ok();
+        .status()
+        .expect("git checkout failed");
+    if !status.success() {
+        panic!("Failed to check out DeepGEMM @ {DEEPGEMM_COMMIT}");
+    }
 
     if !dg_dir.join("deep_gemm/include/deep_gemm/impls/sm90_bf16_gemm.cuh").exists() {
         panic!("DeepGEMM headers not found after clone");
