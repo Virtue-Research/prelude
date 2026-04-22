@@ -9,6 +9,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/bfloat16.h"
 #include "cutlass/half.h"
+#include "cutlass/float8.h"
 #include "cute/tensor.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/atom/copy_atom.hpp"
@@ -23,6 +24,7 @@
 
 using BF16 = cutlass::bfloat16_t;
 using FP16 = cutlass::half_t;
+using FP8E4M3 = cutlass::float_e4m3_t;
 using namespace cute;
 
 static int g_sm_count = 0;
@@ -133,6 +135,25 @@ template <class E> using Sm90_Default = Sm90Runner<
     cutlass::gemm::PersistentScheduler,
     Shape<_128, _128, _64>, E>;
 
+// F32 (TF32): CollectiveBuilder auto-maps float→tfloat32_t for MMA.
+// TMA loads FP32 and converts to TF32 implicitly (see CUTLASS example 48).
+// Tile K=32 (not 64) — TF32 elements are 4B so K=32 keeps smem reasonable.
+template <class E> using Sm90_F32 = Sm90Runner<
+    cutlass::gemm::collective::KernelScheduleAuto,
+    cutlass::epilogue::collective::EpilogueScheduleAuto,
+    cutlass::gemm::collective::StageCountAuto,
+    cutlass::gemm::PersistentScheduler,
+    Shape<_128, _128, _32>, E>;
+
+// FP8 (E4M3): 1B per element so K=128 fits easily in smem (see CUTLASS example 54).
+// CollectiveBuilder selects FP8 GMMA automatically.
+template <class E> using Sm90_FP8 = Sm90Runner<
+    cutlass::gemm::collective::KernelScheduleAuto,
+    cutlass::epilogue::collective::EpilogueScheduleAuto,
+    cutlass::gemm::collective::StageCountAuto,
+    cutlass::gemm::PersistentScheduler,
+    Shape<_128, _128, _128>, E>;
+
 #endif // CUTLASS_ARCH_MMA_SM90_SUPPORTED
 
 // ============================================================================
@@ -240,17 +261,29 @@ using Sm80RunnerUnpred = Sm80RunnerBase<Element,
 
 // ── Unified launch for both SM90 and SM80 ────────────────────────────
 // Both paths use GemmUniversalAdapter with the same argument structure.
+// L = batch count (default 1).  batch_stride_* override packed strides for L>1.
 
 template <typename Runner>
 static int launch(const void* A, const void* B, void* D,
-                  int M, int N, int K, cudaStream_t stream)
+                  int M, int N, int K, cudaStream_t stream,
+                  int L = 1,
+                  int64_t batch_stride_a = 0,
+                  int64_t batch_stride_b = 0,
+                  int64_t batch_stride_d = 0)
 {
     using Gemm = typename Runner::Gemm;
 
-    auto stride_A = cutlass::make_cute_packed_stride(typename Runner::StrideA{}, make_shape(M, K, 1));
-    auto stride_B = cutlass::make_cute_packed_stride(typename Runner::StrideB{}, make_shape(N, K, 1));
-    auto stride_C = cutlass::make_cute_packed_stride(typename Runner::StrideC{}, make_shape(M, N, 1));
-    auto stride_D = cutlass::make_cute_packed_stride(typename Runner::StrideD{}, make_shape(M, N, 1));
+    auto stride_A = cutlass::make_cute_packed_stride(typename Runner::StrideA{}, make_shape(M, K, L));
+    auto stride_B = cutlass::make_cute_packed_stride(typename Runner::StrideB{}, make_shape(N, K, L));
+    auto stride_C = cutlass::make_cute_packed_stride(typename Runner::StrideC{}, make_shape(M, N, L));
+    auto stride_D = cutlass::make_cute_packed_stride(typename Runner::StrideD{}, make_shape(M, N, L));
+
+    // Override batch strides for non-contiguous batched tensors
+    if (L > 1) {
+        if (batch_stride_a > 0) get<2>(stride_A) = batch_stride_a;
+        if (batch_stride_b > 0) get<2>(stride_B) = batch_stride_b;
+        if (batch_stride_d > 0) get<2>(stride_D) = batch_stride_d;
+    }
 
     ensure_sm_count();
     cutlass::KernelHardwareInfo hw;
@@ -260,7 +293,7 @@ static int launch(const void* A, const void* B, void* D,
 
     typename Gemm::Arguments args{
         cutlass::gemm::GemmUniversalMode::kGemm,
-        {M, N, K, 1},
+        {M, N, K, L},
         {static_cast<const typename Gemm::ElementA*>(A), stride_A,
          static_cast<const typename Gemm::ElementB*>(B), stride_B},
         {{1.0f, 0.0f},
@@ -407,6 +440,91 @@ static int sm80_f32_gemm(const void* A, const void* B, void* D,
     return launch<Sm80RunnerF32<cutlass::gemm::MainloopSm80CpAsync<4>>>(A, B, D, m, n, k, s);
 }
 
+// SM80 BF16/FP16 TensorOp with alignment=2 — safe for any M/N/K.
+// Fallback when alignment=8 TensorOp kernels fail due to TMA/cp.async constraints.
+// Uses 4-byte cp.async (2 BF16 elements) — works with any K (even K=7).
+template <class Element, class DispatchPolicy_,
+          class TileShape_ = Shape<_128, _128, _32>, int SwizzleB_ = 2>
+struct Sm80RunnerAlign2 {
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::ColumnMajor;
+    using LayoutD = cutlass::layout::ColumnMajor;
+
+    using ElementAccumulator = float;
+    using ElementCompute = float;
+
+    using TileShape = TileShape_;
+    static constexpr int TileK = size<2>(TileShape{});
+    using DispatchPolicy = DispatchPolicy_;
+
+    // Same TensorOp MMA as alignment=8 config
+    using MmaAtom = cute::conditional_t<
+        cute::is_same_v<Element, BF16>,
+        MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>,
+        MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>>;
+    using TiledMma = TiledMMA<
+        MmaAtom,
+        Layout<Shape<_2, _2, _1>>,
+        Tile<_32, _32, _16>>;
+
+    // Key change: alignment=2 (4-byte cp.async), works with any address alignment
+    static constexpr int kAlignmentA = 2;
+    using SmemLayoutAtomA = decltype(
+        composition(Swizzle<SwizzleB_, 3, 3>{},
+                    Layout<Shape <_8, Int<TileK>>,
+                           Stride<Int<TileK>, _1>>{}));
+    using SmemCopyAtomA = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
+    // 4-byte cp.async (2 BF16 elements per copy): uint32_t instead of uint128_t
+    using GmemTiledCopyA = decltype(
+        make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint32_t>, Element>{},
+                        Layout<Shape <_32, _4>,
+                               Stride< _4, _1>>{},
+                        Layout<Shape<_1, _2>>{}));
+
+    static constexpr int kAlignmentB = 2;
+    using SmemLayoutAtomB = SmemLayoutAtomA;
+    using SmemCopyAtomB = SmemCopyAtomA;
+    using GmemTiledCopyB = GmemTiledCopyA;
+
+    using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+        DispatchPolicy, TileShape,
+        Element, cutlass::gemm::TagToStrideA_t<LayoutA>,
+        Element, cutlass::gemm::TagToStrideB_t<LayoutB>,
+        TiledMma,
+        GmemTiledCopyA, SmemLayoutAtomA, SmemCopyAtomA, cute::identity,
+        GmemTiledCopyB, SmemLayoutAtomB, SmemCopyAtomB, cute::identity>;
+
+    static constexpr int kEpilogueVectorWidth = 1;
+    using CollectiveEpilogue = cutlass::epilogue::collective::DefaultEpilogue<
+        Element,
+        cutlass::gemm::TagToStrideC_t<LayoutC>,
+        cutlass::gemm::TagToStrideC_t<LayoutD>,
+        cutlass::epilogue::thread::LinearCombination<Element, kEpilogueVectorWidth, ElementAccumulator, ElementCompute>,
+        cutlass::gemm::EpilogueDefault>;
+
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        Shape<int, int, int, int>,
+        CollectiveMainloop,
+        CollectiveEpilogue>;
+
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+};
+
+static int sm80_bf16_align2(const void* A, const void* B, void* D,
+                            int m, int n, int k, cudaStream_t s) {
+    return launch<Sm80RunnerAlign2<BF16, cutlass::gemm::MainloopSm80CpAsync<3>>>(A, B, D, m, n, k, s);
+}
+
+static int sm80_fp16_align2(const void* A, const void* B, void* D,
+                            int m, int n, int k, cudaStream_t s) {
+    return launch<Sm80RunnerAlign2<FP16, cutlass::gemm::MainloopSm80CpAsync<3>>>(A, B, D, m, n, k, s);
+}
+
 // ============================================================================
 // C FFI dispatch
 // ============================================================================
@@ -421,60 +539,81 @@ extern "C" int cutlass_gemm_dispatch(
     uint32_t dtype,
     const void* stream)
 {
-    if (batch > 1) return -30;
-
     // CUTLASS kernels only support TN (transa=1, transb=0).
-    // For other combos, use the identity: D = op(A)*op(B) in col-major
-    // can be rewritten as TN on swapped operands.
-    //
-    // NN (transa=0, transb=0): D[m,n] = A*B
-    //   = (B^T * A^T)^T   →  call TN with swap(A,B), swap(m,n), swap(lda,ldb)
-    //   Output is naturally transposed, but since D is col-major with ldd=m
-    //   and we produce col-major with ldd=n, we need to swap ldd too.
-    if (transa == 0 && transb == 0) {
-        std::swap(A, B);
-        std::swap(m, n);
-        std::swap(lda, ldb);
-        std::swap(stride_a, stride_b);
-        ldd = m;  // output is now m-rows after swap
-        // Fall through to TN path below
-    } else if (transa != 1 || transb != 0) {
-        return -10;  // NT and TT not yet supported
+    // Caller (candle) must convert NN to TN before calling dispatch.
+    if (transa != 1 || transb != 0) {
+        return -10;
     }
 
     auto s = static_cast<cudaStream_t>(const_cast<void*>(stream));
     cudaGetLastError();
 
 #if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
+    // SM90 kernels use the `wgmma` family — those instructions only exist on SM90
+    // itself. On Blackwell (SM100/SM103) the compiled kernel still links OK
+    // (because we also build for sm_103a), but running it triggers CUTLASS's
+    // `Arch conditional MMA instruction used without targeting appropriate
+    // compute capability` device-side assert and takes the whole process down.
+    // Gate the SM90 path on the runtime compute major == 9.
     {
-        int ret;
-        switch (dtype) {
-            case 0: ret = launch<Sm90_Default<BF16>>(A, B, D, m, n, k, s); break;
-            case 1: ret = launch<Sm90_Default<FP16>>(A, B, D, m, n, k, s); break;
-            default: ret = -20; break;
+        static int s_cc_major = -1;
+        if (s_cc_major < 0) {
+            int dev = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&s_cc_major, cudaDevAttrComputeCapabilityMajor, dev);
         }
-        if (ret == 0) return 0;
-        // SM90 failed — log and fall through to SM80
-        fprintf(stderr, "CUTLASS: SM90 failed (code %d) for m=%d n=%d k=%d dtype=%u, falling back to SM80\n",
-                ret, m, n, k, dtype);
+        if (s_cc_major == 9) {
+            int ret;
+            switch (dtype) {
+                case 0: ret = launch<Sm90_Default<BF16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
+                case 1: ret = launch<Sm90_Default<FP16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
+                case 2: ret = launch<Sm90_F32<float>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
+                case 3: ret = launch<Sm90_FP8<FP8E4M3>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
+                default: ret = -20; break;
+            }
+            if (ret == 0) return 0;
+            // SM90 failed — log and fall through to SM80
+            fprintf(stderr, "CUTLASS: SM90 failed (code %d) for m=%d n=%d k=%d batch=%d dtype=%u, falling back to SM80\n",
+                    ret, m, n, k, batch, dtype);
+        }
     }
 #endif
 
-    // SM80 fallback — try unpredicated first (fastest), fall back to predicated for unaligned M.
+    // SM80 fallback — handle batch > 1 by looping over batches.
+    if (batch > 1) {
+        for (int b = 0; b < batch; b++) {
+            const void* Ab = (const char*)A + b * stride_a * sizeof(uint16_t);
+            const void* Bb = (const char*)B + b * stride_b * sizeof(uint16_t);
+            void* Db = (char*)D + b * stride_d * (dtype == 2 ? sizeof(float) : sizeof(uint16_t));
+            int ret = cutlass_gemm_dispatch(Ab, Bb, Db, m, n, k, 1, lda, ldb, ldd, 0, 0, 0, transa, transb, dtype, stream);
+            if (ret != 0) return ret;
+        }
+        return 0;
+    }
+
+    // Try unpredicated first (fastest), fall back to predicated for unaligned M.
     // Unpredicated requires M and N aligned to tile dims (128); skip if not aligned.
     if (dtype == 0) {
         if (m % 128 == 0 && n % 128 == 0) {
             int ret = sm80_bf16_c3(A, B, D, m, n, k, s);  // unpredicated
             if (ret == 0) return 0;
         }
-        return sm80_bf16_c1(A, B, D, m, n, k, s);      // predicated fallback
+        {
+            int ret = sm80_bf16_c1(A, B, D, m, n, k, s);  // predicated (alignment=8)
+            if (ret == 0) return 0;
+        }
+        return sm80_bf16_align2(A, B, D, m, n, k, s);     // alignment=2 fallback
     }
     if (dtype == 1) {
         if (m % 128 == 0 && n % 128 == 0) {
             int ret = sm80_fp16_c3(A, B, D, m, n, k, s);
             if (ret == 0) return 0;
         }
-        return sm80_fp16_c1(A, B, D, m, n, k, s);
+        {
+            int ret = sm80_fp16_c1(A, B, D, m, n, k, s);
+            if (ret == 0) return 0;
+        }
+        return sm80_fp16_align2(A, B, D, m, n, k, s);     // alignment=2 fallback
     }
     if (dtype == 2) {
         return sm80_f32_gemm(A, B, D, m, n, k, s);

@@ -1,50 +1,70 @@
 //! Build script for prelude-flashinfer.
 //!
-//! 1. Find FlashInfer source (FLASHINFER_SRC env var or auto-clone).
+//! 1. Find FlashInfer source (third_party/flashinfer/ or FLASHINFER_SRC env var).
 //! 2. Run scripts/compile_kernels.py to AOT-compile kernel variants.
 //! 3. Archive all .o files into libflashinfer_kernels.a.
 //! 4. Compile vendored tvm_ffi C++ (shared with FA4).
 //! 5. Generate fi_dispatch.rs from manifest.json.
+//!
+//! All build artifacts go into OUT_DIR. `cargo clean` = full rebuild.
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::env;
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const FLASHINFER_REPO: &str = "https://github.com/flashinfer-ai/flashinfer.git";
-const FLASHINFER_BRANCH: &str = "main";
+// ── Manifest schema ─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct Manifest {
+    variants: Vec<Variant>,
+}
+
+#[derive(Deserialize)]
+struct Variant {
+    kind: String,
+    symbols: HashMap<String, String>,
+    #[serde(default)]
+    dtype: Option<String>,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    hdim_qk: Option<u64>,
+    #[serde(default)]
+    hdim_vo: Option<u64>,
+    #[serde(default)]
+    head_dim_ckv: Option<u64>,
+    #[serde(default)]
+    head_dim_kpe: Option<u64>,
+}
 
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=scripts/compile_kernels.py");
-    println!("cargo:rerun-if-changed=kernels/");
     println!("cargo:rerun-if-env-changed=FLASHINFER_SRC");
     println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_ARCHS");
     println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_HEAD_DIMS");
     println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_DTYPES");
     println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_WORKERS");
+    println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_MLA_DIMS");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
-    let kernels_dir = manifest_dir.join("kernels");
+    let kernels_dir = out_dir.join("kernels");
 
-    // Phase 1+2: Compile kernels if needed (skip if pre-compiled .o exist)
-    let manifest = kernels_dir.join("manifest.json");
-    let precompiled_objs = walkdir_ext(&kernels_dir, "o");
-    if manifest.exists() && !precompiled_objs.is_empty() {
-        let n = precompiled_objs.len();
-        println!("cargo:warning=FlashInfer: using {n} pre-compiled kernel objects");
-    } else {
-        let fi_src = find_flashinfer_source(&manifest_dir)?;
-        ensure_kernels(&kernels_dir, &manifest_dir, &fi_src)?;
-    }
+    // Phase 1: Find FlashInfer source
+    let fi_src = find_flashinfer_source(&manifest_dir)?;
 
-    // Phase 3: Archive .o files
+
+    // Phase 2: Compile kernels (incremental — .o timestamp check inside python)
+    ensure_kernels(&kernels_dir, &manifest_dir, &fi_src)?;
+
+    // Phase 3: Archive .o → .a
     let has_kernels = archive_objects(&kernels_dir, &out_dir)?;
 
-    // Phase 4: Compile TVM FFI (reuse FA4's vendored copy).
-    // Skip when `skip-tvm-ffi` feature is enabled — another crate (FA4) already
-    // compiles the same tvm_ffi library, and linking both causes duplicate symbols.
+    // Phase 4: Compile TVM FFI
     if env::var("CARGO_FEATURE_SKIP_TVM_FFI").is_ok() {
         println!("cargo:warning=FlashInfer: skipping tvm_ffi (provided by flash-attn-v4)");
     } else {
@@ -57,76 +77,57 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+// ── FlashInfer source ────────────────────────────────────────────────
+
 fn find_flashinfer_source(manifest_dir: &Path) -> Result<PathBuf> {
-    // Check env var first
+    // Priority 1: FLASHINFER_SRC env var (for development overrides)
     if let Ok(src) = env::var("FLASHINFER_SRC") {
         let p = PathBuf::from(&src);
         if p.join("csrc").exists() {
-            println!("cargo:warning=Using FlashInfer source: {src}");
+            println!("cargo:warning=FlashInfer: using source at {src}");
             return Ok(p);
         }
         anyhow::bail!("FLASHINFER_SRC={src} does not contain csrc/");
     }
 
-    // Auto-clone into OUT_DIR (like fa4 does)
-    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
-    let fi_src = out_dir.join("flashinfer-src");
-
+    // Priority 2: third_party/flashinfer/ submodule (standard path)
+    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
+    let fi_src = workspace_root.join("third_party/flashinfer");
     if fi_src.join("csrc").exists() {
-        println!("cargo:warning=Using cached FlashInfer source: {}", fi_src.display());
         return Ok(fi_src);
     }
 
-    println!("cargo:warning=Cloning FlashInfer {FLASHINFER_BRANCH} branch...");
-
-    if fi_src.exists() {
-        std::fs::remove_dir_all(&fi_src)?;
-    }
-
-    let status = Command::new("git")
-        .args([
-            "clone",
-            "--depth", "1",
-            "--branch", FLASHINFER_BRANCH,
-            "--single-branch",
-            "--filter=blob:limit=1m",
-            FLASHINFER_REPO,
-        ])
-        .arg(&fi_src)
-        .status()
-        .context("Failed to clone FlashInfer repo")?;
-
-    if !status.success() {
-        anyhow::bail!("git clone failed for {FLASHINFER_REPO}");
-    }
-
-    if !fi_src.join("csrc").exists() {
-        anyhow::bail!("csrc/ not found in cloned FlashInfer repo");
-    }
-
-    // Initialize submodules (e.g. 3rdparty/tvm_ffi for TVM headers)
-    let sub_status = Command::new("git")
-        .args(["submodule", "update", "--init", "--recursive", "--depth", "1"])
-        .current_dir(&fi_src)
-        .status()
-        .context("Failed to init FlashInfer submodules")?;
-    if !sub_status.success() {
-        println!("cargo:warning=FlashInfer submodule init failed (non-fatal)");
-    }
-
-    Ok(fi_src)
+    anyhow::bail!(
+        "FlashInfer source not found. Either:\n\
+         1. Run: git submodule update --init --recursive third_party/flashinfer\n\
+         2. Set FLASHINFER_SRC=/path/to/flashinfer"
+    )
 }
 
-fn ensure_kernels(
-    kernels_dir: &Path, manifest_dir: &Path, fi_src: &Path,
-) -> Result<()> {
-    // Caller already verified kernels are missing; proceed directly to compilation.
-    println!("cargo:warning=FlashInfer: compiling kernels via compile_kernels.py...");
 
+// ── Kernel compilation ───────────────────────────────────────────────
+
+fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fi_src: &Path) -> Result<()> {
     let script = manifest_dir.join("scripts/compile_kernels.py");
+    let manifest = kernels_dir.join("manifest.json");
+
+    // Skip recompilation only if manifest exists AND is newer than the build script.
+    if manifest.exists() {
+        let script_mtime = script.metadata()?.modified()?;
+        let manifest_mtime = manifest.metadata()?.modified()?;
+        if manifest_mtime > script_mtime {
+            let n = walkdir_ext(kernels_dir, "o").len();
+            println!("cargo:warning=FlashInfer: {n} kernel objects up-to-date");
+            return Ok(());
+        }
+        println!("cargo:warning=FlashInfer: compile_kernels.py changed, recompiling...");
+        // Remove stale manifest so the script regenerates everything
+        std::fs::remove_file(&manifest)?;
+    } else {
+        println!("cargo:warning=FlashInfer: compiling kernels...");
+    }
     let python = find_python()?;
 
-    // Determine target archs
     let archs = env::var("PRELUDE_FLASHINFER_ARCHS")
         .unwrap_or_else(|_| "sm_80,sm_90".to_string());
     let head_dims = env::var("PRELUDE_FLASHINFER_HEAD_DIMS")
@@ -134,10 +135,10 @@ fn ensure_kernels(
     let dtypes = env::var("PRELUDE_FLASHINFER_DTYPES")
         .unwrap_or_else(|_| "bf16,fp16".to_string());
     let workers = env::var("PRELUDE_FLASHINFER_WORKERS").unwrap_or_else(|_| {
-        let cpus = std::thread::available_parallelism()
+        std::thread::available_parallelism()
             .map(|n| n.get())
-            .unwrap_or(1);
-        cpus.min(8).to_string()
+            .unwrap_or(8)
+            .to_string()
     });
 
     let status = Command::new(&python)
@@ -160,33 +161,36 @@ fn ensure_kernels(
 
 fn archive_objects(kernels_dir: &Path, out_dir: &Path) -> Result<bool> {
     let obj_files = walkdir_ext(kernels_dir, "o");
-
     if obj_files.is_empty() {
-        println!("cargo:warning=No FlashInfer kernel .o files found");
+        println!("cargo:warning=FlashInfer: no kernel .o files found");
         return Ok(false);
     }
 
-    println!("cargo:warning=Archiving {} FlashInfer kernel .o files", obj_files.len());
-
     let archive = out_dir.join("libflashinfer_kernels.a");
-    let mut cmd = Command::new("ar");
-    cmd.arg("rcs").arg(&archive);
-    for obj in &obj_files {
-        cmd.arg(obj);
-    }
-    let status = cmd.status().context("Failed to run ar")?;
-    if !status.success() {
-        anyhow::bail!("ar failed");
+    if !archive.exists() {
+        println!("cargo:warning=FlashInfer: creating archive ({} objects)", obj_files.len());
+        // Use `q` (quick append) not `r` (replace) — multiple variants have
+        // identically named .o files (e.g. batch_decode.o) and `r` would
+        // keep only the last one, losing symbols from other variants.
+        let mut cmd = Command::new("ar");
+        cmd.arg("qcs").arg(&archive);
+        for obj in &obj_files {
+            cmd.arg(obj);
+        }
+        let status = cmd.status().context("ar failed")?;
+        if !status.success() {
+            anyhow::bail!("ar qcs failed");
+        }
     }
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static:+whole-archive=flashinfer_kernels");
-
     Ok(true)
 }
 
+// ── TVM FFI ──────────────────────────────────────────────────────────
+
 fn compile_tvm_ffi(manifest_dir: &Path) -> Result<()> {
-    // Try to reuse FA4's vendored tvm_ffi
     let fa4_vendor = manifest_dir
         .parent().unwrap()
         .join("prelude-flash-attn-v4/vendor/tvm_ffi");
@@ -198,7 +202,7 @@ fn compile_tvm_ffi(manifest_dir: &Path) -> Result<()> {
             fa4_vendor.join("3rdparty/dlpack/include"),
         )
     } else {
-        println!("cargo:warning=tvm_ffi vendor not found (FA4 crate needed for TVM FFI)");
+        println!("cargo:warning=tvm_ffi vendor not found (FA4 crate needed)");
         return Ok(());
     };
 
@@ -209,8 +213,6 @@ fn compile_tvm_ffi(manifest_dir: &Path) -> Result<()> {
             !name.contains("win") && !name.contains("testing") && name != "backtrace.cc"
         })
         .collect();
-
-    println!("cargo:warning=Compiling tvm_ffi: {} files", cc_files.len());
 
     let mut build = cc::Build::new();
     build
@@ -228,11 +230,14 @@ fn compile_tvm_ffi(manifest_dir: &Path) -> Result<()> {
         build.file(f);
     }
 
+    // Our C++ helper that uses upstream TVM FFI APIs for error extraction
+    let tvm_error_helper = manifest_dir.join("src/tvm_error_helper.cc");
+    build.file(&tvm_error_helper);
+
     build.link_lib_modifier("+whole-archive");
     build.try_compile("tvm_ffi_fi_static")
         .context("Failed to compile tvm_ffi")?;
 
-    // Also link cuda_dialect_runtime if available
     let cuda_dialect = manifest_dir
         .parent().unwrap()
         .join("prelude-flash-attn-v4/vendor/cuda_dialect");
@@ -241,7 +246,6 @@ fn compile_tvm_ffi(manifest_dir: &Path) -> Result<()> {
         println!("cargo:rustc-link-lib=static:+whole-archive=cuda_dialect_runtime_static");
     }
 
-    // CUDA runtime
     for candidate in [
         "/opt/cuda/targets/x86_64-linux/lib",
         "/opt/cuda/lib64",
@@ -252,115 +256,195 @@ fn compile_tvm_ffi(manifest_dir: &Path) -> Result<()> {
             break;
         }
     }
-    println!("cargo:rustc-link-lib=dylib=cudart");
+    println!("cargo:rustc-link-lib=static=cudart_static");
+    println!("cargo:rustc-link-lib=dylib=cuda");  // CUDA Driver API (comes with GPU driver)
+    println!("cargo:rustc-link-lib=dylib=rt");   // required by cudart_static
+    println!("cargo:rustc-link-lib=dylib=dl");   // required by cudart_static
     println!("cargo:rustc-link-lib=dylib=stdc++");
 
     Ok(())
 }
 
-fn generate_dispatch(
-    kernels_dir: &Path, out_dir: &Path, has_kernels: bool,
-) -> Result<()> {
+// ── Dispatch codegen ─────────────────────────────────────────────────
+
+fn generate_dispatch(kernels_dir: &Path, out_dir: &Path, has_kernels: bool) -> Result<()> {
     let path = out_dir.join("fi_dispatch.rs");
 
     if !has_kernels {
         std::fs::write(&path, concat!(
             "pub(crate) fn lookup_prefill(_key: &crate::loader::PrefillKey) -> Option<crate::loader::PrefillVariant> { None }\n",
+            "pub(crate) fn lookup_prefill_fp8(_key: &crate::loader::FP8PrefillKey) -> Option<crate::loader::PrefillVariant> { None }\n",
             "pub(crate) fn lookup_decode(_key: &crate::loader::DecodeKey) -> Option<crate::loader::DecodeVariant> { None }\n",
+            "pub(crate) fn lookup_mla_decode(_key: &crate::loader::MLADecodeKey) -> Option<crate::loader::MLADecodeVariant> { None }\n",
+            "pub(crate) fn lookup_mla_paged(_key: &crate::loader::MLAPagedKey) -> Option<crate::loader::MLAPagedVariant> { None }\n",
+            "pub(crate) fn lookup_pod(_key: &crate::loader::PodKey) -> Option<crate::loader::PodVariant> { None }\n",
+            "pub(crate) fn lookup_utility(_name: &str) -> Option<crate::loader::TVMSafeCallFn> { None }\n",
         ))?;
         return Ok(());
     }
 
     let manifest_str = std::fs::read_to_string(kernels_dir.join("manifest.json"))
         .context("manifest.json not found")?;
-    let manifest: serde_json::Value = serde_json::from_str(&manifest_str)?;
-    let variants = manifest["variants"].as_array().context("missing variants")?;
+    let manifest: Manifest = serde_json::from_str(&manifest_str)
+        .context("failed to parse manifest.json")?;
 
     let mut code = String::new();
     writeln!(code, "// AUTO-GENERATED by build.rs — do not edit")?;
     writeln!(code)?;
 
+    // Helper: map dtype string to u8 (bf16=0, fp16=1)
+    let dtype_val = |dt: &Option<String>| -> u8 {
+        match dt.as_deref() {
+            Some("fp16") => 1,
+            _ => 0,
+        }
+    };
+
     // Extern declarations
     writeln!(code, "unsafe extern \"C\" {{")?;
-    for v in variants {
-        let symbols = v["symbols"].as_object().context("missing symbols")?;
-        for (_name, sym) in symbols {
-            let s = sym.as_str().unwrap();
+    for v in &manifest.variants {
+        for sym in v.symbols.values() {
             writeln!(code,
-                "    fn {s}(handle: *mut c_void, args: *const TVMFFIAny, num_args: i32, ret: *mut TVMFFIAny) -> i32;"
+                "    fn {sym}(handle: *mut c_void, args: *const TVMFFIAny, num_args: i32, ret: *mut TVMFFIAny) -> i32;"
             )?;
         }
     }
     writeln!(code, "}}")?;
     writeln!(code)?;
 
-    // Prefill lookup
+    // Prefill lookup (FA2 merged + FA3 per-swa/softcap)
+    // FA2: swa/softcap dispatched at runtime in CUDA — lookup by (dtype, hdim, backend) only
+    // FA3: still per-swa/softcap (different variant type)
     writeln!(code, "pub(crate) fn lookup_prefill(key: &crate::loader::PrefillKey) -> Option<crate::loader::PrefillVariant> {{")?;
-    writeln!(code, "    use crate::loader::{{KernelDtype, Backend, PrefillVariant}};")?;
+    writeln!(code, "    use crate::loader::PrefillVariant;")?;
     writeln!(code, "    match (key.dtype as u8, key.head_dim_qk, key.head_dim_vo, key.sliding_window, key.logits_soft_cap, key.backend as u8) {{")?;
-
-    for v in variants {
-        let kind = v["kind"].as_str().unwrap();
-        if !kind.starts_with("prefill") { continue; }
-        let symbols = v["symbols"].as_object().unwrap();
-        let plan = symbols["plan"].as_str().unwrap();
-        let ragged_run = symbols["ragged_run"].as_str().unwrap();
-        let paged_run = symbols["paged_run"].as_str().unwrap();
-
-        let dtype_val: u8 = match v["dtype"].as_str().unwrap() {
-            "fp16" => 1, _ => 0,
-        };
-        let backend_val: u8 = match v["backend"].as_str().unwrap() {
-            "fa3" => 1, _ => 0,
-        };
-        let hdim_qk = v["hdim_qk"].as_u64().unwrap();
-        let hdim_vo = v["hdim_vo"].as_u64().unwrap();
-        let swa = v["swa"].as_bool().unwrap();
-        let softcap = v["softcap"].as_bool().unwrap();
-
-        writeln!(code,
-            "        ({dtype_val}, {hdim_qk}, {hdim_vo}, {swa}, {softcap}, {backend_val}) => Some(PrefillVariant {{ plan: {plan}, ragged_run: {ragged_run}, paged_run: {paged_run} }}),"
-        )?;
+    for v in &manifest.variants {
+        if v.kind != "prefill_fa2" && v.kind != "prefill_fa3" { continue; }
+        let plan = &v.symbols["plan"];
+        let ragged_run = &v.symbols["ragged_run"];
+        let paged_run = &v.symbols["paged_run"];
+        let dv = dtype_val(&v.dtype);
+        let backend_val: u8 = if v.backend.as_deref() == Some("fa3") { 1 } else { 0 };
+        let hqk = v.hdim_qk.context("prefill variant missing hdim_qk")?;
+        let hvo = v.hdim_vo.context("prefill variant missing hdim_vo")?;
+        // Both FA2 and FA3 are merged: match any swa/softcap (runtime dispatched in CUDA)
+        for swa in [false, true] {
+            for cap in [false, true] {
+                writeln!(code, "        ({dv}, {hqk}, {hvo}, {swa}, {cap}, {backend_val}) => Some(PrefillVariant {{ plan: {plan}, ragged_run: {ragged_run}, paged_run: {paged_run} }}),")?;
+            }
+        }
     }
     writeln!(code, "        _ => None,")?;
-    writeln!(code, "    }}")?;
-    writeln!(code, "}}")?;
-    writeln!(code)?;
+    writeln!(code, "    }}\n}}\n")?;
 
-    // Decode lookup
+    // FP8 Prefill lookup (merged: swa dispatched at runtime)
+    writeln!(code, "pub(crate) fn lookup_prefill_fp8(key: &crate::loader::FP8PrefillKey) -> Option<crate::loader::PrefillVariant> {{")?;
+    writeln!(code, "    use crate::loader::PrefillVariant;")?;
+    writeln!(code, "    match (key.head_dim, key.sliding_window) {{")?;
+    for v in &manifest.variants {
+        if v.kind != "prefill_fp8" { continue; }
+        let plan = &v.symbols["plan"];
+        let ragged_run = &v.symbols["ragged_run"];
+        let paged_run = &v.symbols["paged_run"];
+        let hdim = v.hdim_qk.context("prefill_fp8 variant missing hdim_qk")?;
+        // Merged: match any swa (runtime dispatched)
+        for swa in [false, true] {
+            writeln!(code, "        ({hdim}, {swa}) => Some(PrefillVariant {{ plan: {plan}, ragged_run: {ragged_run}, paged_run: {paged_run} }}),")?;
+        }
+    }
+    writeln!(code, "        _ => None,")?;
+    writeln!(code, "    }}\n}}\n")?;
+
+    // Decode lookup (merged: swa/softcap dispatched at runtime in CUDA)
     writeln!(code, "pub(crate) fn lookup_decode(key: &crate::loader::DecodeKey) -> Option<crate::loader::DecodeVariant> {{")?;
-    writeln!(code, "    use crate::loader::{{KernelDtype, DecodeVariant}};")?;
+    writeln!(code, "    use crate::loader::DecodeVariant;")?;
     writeln!(code, "    match (key.dtype as u8, key.head_dim_qk, key.head_dim_vo, key.sliding_window, key.logits_soft_cap) {{")?;
-
-    for v in variants {
-        if v["kind"].as_str().unwrap() != "decode" { continue; }
-        let symbols = v["symbols"].as_object().unwrap();
-        let plan = symbols["plan"].as_str().unwrap();
-        let run = symbols["run"].as_str().unwrap();
-
-        let dtype_val: u8 = match v["dtype"].as_str().unwrap() {
-            "fp16" => 1, _ => 0,
-        };
-        let hdim_qk = v["hdim_qk"].as_u64().unwrap();
-        let hdim_vo = v["hdim_vo"].as_u64().unwrap();
-        let swa = v["swa"].as_bool().unwrap();
-        let softcap = v["softcap"].as_bool().unwrap();
-
-        writeln!(code,
-            "        ({dtype_val}, {hdim_qk}, {hdim_vo}, {swa}, {softcap}) => Some(DecodeVariant {{ plan: {plan}, run: {run} }}),"
-        )?;
+    for v in &manifest.variants {
+        if v.kind != "decode" { continue; }
+        let plan = &v.symbols["plan"];
+        let run = &v.symbols["run"];
+        let dv = dtype_val(&v.dtype);
+        let hqk = v.hdim_qk.context("decode variant missing hdim_qk")?;
+        let hvo = v.hdim_vo.context("decode variant missing hdim_vo")?;
+        // Merged: match any swa/softcap
+        for swa in [false, true] {
+            for cap in [false, true] {
+                writeln!(code, "        ({dv}, {hqk}, {hvo}, {swa}, {cap}) => Some(DecodeVariant {{ plan: {plan}, run: {run} }}),")?;
+            }
+        }
     }
     writeln!(code, "        _ => None,")?;
-    writeln!(code, "    }}")?;
-    writeln!(code, "}}")?;
+    writeln!(code, "    }}\n}}\n")?;
+
+    // MLA decode lookup
+    writeln!(code, "pub(crate) fn lookup_mla_decode(key: &crate::loader::MLADecodeKey) -> Option<crate::loader::MLADecodeVariant> {{")?;
+    writeln!(code, "    use crate::loader::MLADecodeVariant;")?;
+    writeln!(code, "    match (key.dtype as u8, key.head_dim_ckv, key.head_dim_kpe) {{")?;
+    for v in &manifest.variants {
+        if v.kind != "mla_decode" { continue; }
+        let plan = &v.symbols["plan"];
+        let run = &v.symbols["run"];
+        let dv = dtype_val(&v.dtype);
+        let ckv = v.head_dim_ckv.context("mla_decode variant missing head_dim_ckv")?;
+        let kpe = v.head_dim_kpe.context("mla_decode variant missing head_dim_kpe")?;
+        writeln!(code, "        ({dv}, {ckv}, {kpe}) => Some(MLADecodeVariant {{ plan: {plan}, run: {run} }}),")?;
+    }
+    writeln!(code, "        _ => None,")?;
+    writeln!(code, "    }}\n}}\n")?;
+
+    // MLA paged lookup
+    writeln!(code, "pub(crate) fn lookup_mla_paged(key: &crate::loader::MLAPagedKey) -> Option<crate::loader::MLAPagedVariant> {{")?;
+    writeln!(code, "    use crate::loader::MLAPagedVariant;")?;
+    writeln!(code, "    match (key.dtype as u8, key.head_dim_ckv, key.head_dim_kpe) {{")?;
+    for v in &manifest.variants {
+        if v.kind != "mla_paged" { continue; }
+        let plan = &v.symbols["plan"];
+        let run = &v.symbols["run"];
+        let dv = dtype_val(&v.dtype);
+        let ckv = v.head_dim_ckv.context("mla_paged variant missing head_dim_ckv")?;
+        let kpe = v.head_dim_kpe.context("mla_paged variant missing head_dim_kpe")?;
+        writeln!(code, "        ({dv}, {ckv}, {kpe}) => Some(MLAPagedVariant {{ plan: {plan}, run: {run} }}),")?;
+    }
+    writeln!(code, "        _ => None,")?;
+    writeln!(code, "    }}\n}}\n")?;
+
+    // POD (Prefill-On-Decode) lookup (merged: swa/softcap dispatched at runtime)
+    writeln!(code, "pub(crate) fn lookup_pod(key: &crate::loader::PodKey) -> Option<crate::loader::PodVariant> {{")?;
+    writeln!(code, "    use crate::loader::PodVariant;")?;
+    writeln!(code, "    match (key.dtype as u8, key.head_dim_qk, key.head_dim_vo) {{")?;
+    for v in &manifest.variants {
+        if v.kind != "pod_merged" { continue; }
+        let run = &v.symbols["run"];
+        let dv = dtype_val(&v.dtype);
+        let hqk = v.hdim_qk.context("pod variant missing hdim_qk")?;
+        let hvo = v.hdim_vo.context("pod variant missing hdim_vo")?;
+        writeln!(code, "        ({dv}, {hqk}, {hvo}) => Some(PodVariant {{ run: {run} }}),")?;
+    }
+    writeln!(code, "        _ => None,")?;
+    writeln!(code, "    }}\n}}\n")?;
+
+    // Utility kernel lookup
+    writeln!(code, "pub(crate) fn lookup_utility(name: &str) -> Option<crate::loader::TVMSafeCallFn> {{")?;
+    writeln!(code, "    match name {{")?;
+    for v in &manifest.variants {
+        if !["page", "sampling", "norm", "rope", "cascade", "activation",
+             "moe_routing", "fp4", "quantization", "fmha_sm100",
+             "topk", "mla", "moe_utils", "moe", "gemm", "comm",
+             "gdn", "mamba"].contains(&v.kind.as_str()) { continue; }
+        for (name, sym) in &v.symbols {
+            writeln!(code, "        \"{name}\" => Some({sym}),")?;
+        }
+    }
+    writeln!(code, "        _ => None,")?;
+    writeln!(code, "    }}\n}}")?;
 
     std::fs::write(&path, &code)?;
-    println!("cargo:warning=Generated fi_dispatch.rs with {} variants", variants.len());
+    println!("cargo:warning=FlashInfer: generated dispatch ({} variants)", manifest.variants.len());
 
     Ok(())
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────
 
 fn walkdir_ext(dir: &Path, ext: &str) -> Vec<PathBuf> {
     let mut result = Vec::new();

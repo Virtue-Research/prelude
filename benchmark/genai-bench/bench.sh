@@ -226,12 +226,14 @@ start_vllm() {
     fi
 
     # Same official image for both GPU and CPU (--device cpu for CPU mode)
+    # vLLM writes `.locks/` under the HF cache for download coordination, so
+    # mount rw (unlike prelude's ro mount).
     # shellcheck disable=SC2086
     docker run -d --name "${CONTAINER_NAME}" \
         ${gpu_flag} \
         -p "${PORT}:8000" \
         --ipc=host \
-        -v "${HF_CACHE}:/root/.cache/huggingface:ro" \
+        -v "${HF_CACHE}:/root/.cache/huggingface" \
         -e HF_TOKEN="${HF_TOKEN}" \
         vllm/vllm-openai:latest \
         --model "${MODEL}" \

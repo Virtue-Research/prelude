@@ -72,6 +72,55 @@ unsafe extern "C" {
         c_f32: *mut f32,
         m: i64, k: i64, n: i64, lda: i64, v_stride: i64,
     );
+
+    // ── INT8 BRGeMM ──────────────────────────────────────────────────
+
+    pub fn brgemm_s8_available() -> i32;
+
+    pub fn brgemm_s8_pack(
+        weight: *const i8, scales: *const f32, k: i64, n: i64,
+    ) -> *mut c_void;
+
+    pub fn brgemm_s8_pack_destroy(pw: *mut c_void);
+
+    pub fn brgemm_quantize_bf16_s8(
+        input_bf16: *const c_void, out_s8: *mut i8, m: i64, k: i64,
+    ) -> f32;
+
+    pub fn brgemm_s8_linear(
+        input_s8: *const i8, a_scale: f32,
+        pw: *mut c_void, output_bf16: *mut c_void,
+        m: i64, n_total: i64, n_start: i64, n_end: i64,
+    );
+
+    // ── FP8 BRGeMM ──────────────────────────────────────────────────
+
+    pub fn brgemm_f8_available() -> i32;
+
+    pub fn brgemm_f8e4m3_pack(
+        weight_f8: *const c_void, scales: *const f32, k: i64, n: i64,
+    ) -> *mut c_void;
+
+    pub fn brgemm_f8_pack_destroy(pw: *mut c_void);
+
+    pub fn brgemm_quantize_bf16_f8e4m3(
+        input_bf16: *const c_void, out_f8: *mut c_void, m: i64, k: i64,
+    ) -> f32;
+
+    pub fn brgemm_f8e4m3_linear(
+        input_f8: *const c_void, a_scale: f32,
+        pw: *mut c_void, output_bf16: *mut c_void,
+        m: i64, n_total: i64, n_start: i64, n_end: i64,
+    );
+
+    // ── BRGeMM post-ops ─────────────────────────────────────────────
+
+    pub fn brgemm_bf16_linear_postops(
+        input: *const c_void, pw: *mut c_void,
+        output: *mut c_void, bias_bf16: *const c_void,
+        postop_flags: i32,
+        m: i64, n_total: i64, n_start: i64, n_end: i64,
+    );
 }
 
 // ── Rayon callback exports ──────────────────────────────────────────────

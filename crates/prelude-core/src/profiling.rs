@@ -5,7 +5,7 @@
 //!
 //! Usage:
 //!   cargo build --features nvtx
-//!   nsys profile ./target/release/<binary>
+//!   nsys profile ./target/release/prelude-microbench forward
 
 #[cfg(feature = "nvtx")]
 pub mod ffi {

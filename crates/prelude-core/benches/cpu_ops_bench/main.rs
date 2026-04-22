@@ -6,6 +6,9 @@
 //! With oneDNN GEMM:
 //!   cargo bench -p prelude-core --bench cpu_ops_bench --features onednn
 
+#[global_allocator]
+static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
+
 mod attention;
 mod gemm;
 mod quant;
@@ -131,10 +134,17 @@ fn main() -> Result<()> {
 
     // -- RMSNorm --
     if run("rmsnorm") {
-        println!("\n=== RMSNorm ===");
+        println!("\n=== RMSNorm (BF16) ===");
         for &hidden in hiddens {
             for &batch in batches {
                 rmsnorm::bench(hidden, batch, warmup, repeats)?;
+            }
+            println!();
+        }
+        println!("=== RMSNorm (F16 / F32) ===");
+        for &hidden in hiddens {
+            for &batch in &[1, 16, 256] {
+                rmsnorm::bench_dtypes(hidden, batch, warmup, repeats)?;
             }
             println!();
         }
@@ -142,10 +152,17 @@ fn main() -> Result<()> {
 
     // -- Fused Add+RMSNorm --
     if run("fused") {
-        println!("=== Fused Add+RMSNorm ===");
+        println!("=== Fused Add+RMSNorm (BF16) ===");
         for &hidden in hiddens {
             for &batch in batches {
                 rmsnorm::bench_fused(hidden, batch, warmup, repeats)?;
+            }
+            println!();
+        }
+        println!("=== Fused Add+RMSNorm (F16 / F32) ===");
+        for &hidden in hiddens {
+            for &batch in &[1, 16, 256] {
+                rmsnorm::bench_fused_dtypes(hidden, batch, warmup, repeats)?;
             }
             println!();
         }
@@ -196,6 +213,55 @@ fn main() -> Result<()> {
         for &(m, k, n) in gemm_configs {
             gemm::bench(m, k, n, 5, gemm_repeats)?;
         }
+
+        println!("\n=== GEMM (INT8 W8A8 linear) ===");
+        for &(m, k, n) in gemm_configs {
+            gemm::bench_s8(m, k, n, 5, gemm_repeats)?;
+        }
+
+        println!("\n=== GEMM (BF16 + fused post-ops: bias + GELU) ===");
+        for &(m, k, n) in gemm_configs {
+            gemm::bench_postops(m, k, n, 5, gemm_repeats)?;
+        }
+
+        println!("\n=== GEMM post-ops variants (plain / bias / gelu / relu / bias+gelu) ===");
+        let postops_configs: &[(usize, usize, usize)] = &[
+            (1, 896, 4864), (16, 896, 4864), (64, 896, 4864),
+            (1, 3584, 18944), (16, 3584, 18944),
+        ];
+        for &(m, k, n) in postops_configs {
+            gemm::bench_postops_variants(m, k, n, 5, gemm_repeats)?;
+            println!();
+        }
+    }
+
+    // -- Quantized kernels --
+    if run("quant") {
+        // Precision (llama.cpp style: dot product error vs F32)
+        quant::verify_dot_precision()?;
+
+        // Dot product throughput
+        println!("\n=== Quantized dot product throughput ===");
+        for &k in &[256, 512, 1024, 2048, 4096] {
+            quant::bench_dot(k, 100, 10000)?;
+        }
+
+        // Matmul throughput
+        println!("\n=== Quantized matmul: Q4_0 / Q4_K vs F32 ===");
+        let quant_repeats = 50;
+        let quant_configs: &[(usize, usize, usize)] = &[
+            (1, 1024, 1024),
+            (1, 2048, 2048),
+            (1, 4096, 4096),
+            (4, 2048, 2048),
+            (4, 4096, 4096),
+            (16, 4096, 4096),
+            (1, 1024, 4096),
+            (1, 4096, 1024),
+        ];
+        for &(m, k, n) in quant_configs {
+            quant::bench_matmul(m, k, n, 5, quant_repeats)?;
+        }
     }
 
     // -- Quantized kernels --
@@ -234,6 +300,13 @@ fn main() -> Result<()> {
             println!("  Pass criteria: |a-b| <= atol + rtol*max(|a|,|b|) (atol=5e-2, rtol=5e-2)");
             for &(m, k, n) in gemm_configs {
                 gemm::verify_accuracy(m, k, n)?;
+            }
+        }
+        {
+            println!("\n=== Numerical accuracy: INT8 W8A8 vs F32 ===");
+            println!("  Pass criteria: |a-b| <= atol + rtol*max(|a|,|b|) (atol=0.1, rtol=0.1)");
+            for &(m, k, n) in gemm_configs {
+                gemm::verify_s8_accuracy(m, k, n)?;
             }
         }
     }

@@ -12,10 +12,9 @@ use super::bf16_utils::{bf16_to_f32, f32_to_bf16};
 use super::bf16_utils::{bf16x16_load_as_f32, f32x16_store_as_bf16};
 
 /// Minimum elements per thread to justify parallelization overhead.
-/// RoPE per-element work is very light (~0.26ns/elem AVX-512). On 64+ core
-/// systems, pool-wide overhead is ~50-100µs, so we need large total
-/// work before parallelizing. 32K elems/thread with pool-wide floor.
-const MIN_ELEMS_PER_THREAD: usize = 32768;
+/// With mimalloc (no mmap page faults), GemmPool dispatch is ~5µs.
+/// RoPE per-element work is ~0.26ns/elem AVX-512, so 2K elems ≈ 0.5µs.
+const MIN_ELEMS_PER_THREAD: usize = 2048;
 
 /// Apply NeoX split-half RoPE in-place to Q and K tensors (4D THD layout).
 ///

@@ -199,6 +199,52 @@ pub fn quantize_row_q8k(x: &[f32]) -> Vec<BlockQ8K> {
     quantize_row_q8k_scalar(x)
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// Q8_1 quantization (32-element blocks, paired with Q4_1/Q5_1 weights)
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Quantize a row of FP32 values into Q8_1 blocks (scalar).
+///
+/// Like Q8_0 but also precomputes `s = d * sum(qs)` for asymmetric dot products.
+pub fn quantize_row_q8_1_scalar(x: &[f32]) -> Vec<BlockQ8_1> {
+    assert!(x.len() % QK8_0 == 0, "input length must be multiple of {QK8_0}");
+    let nb = x.len() / QK8_0;
+    let mut output = Vec::with_capacity(nb);
+
+    for i in 0..nb {
+        let block = &x[i * QK8_0..(i + 1) * QK8_0];
+
+        let mut amax: f32 = 0.0;
+        for &v in block {
+            let av = v.abs();
+            if av > amax { amax = av; }
+        }
+
+        let d = amax / 127.0;
+        let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
+
+        let mut qs = [0i8; QK8_0];
+        let mut sum: f32 = 0.0;
+        for (j, &v) in block.iter().enumerate() {
+            let q = (v * id).round();
+            qs[j] = q as i8;
+            sum += q;
+        }
+
+        output.push(BlockQ8_1 {
+            d: f32_to_fp16(d),
+            s: f32_to_fp16(d * sum),
+            qs,
+        });
+    }
+    output
+}
+
+/// Quantize FP32 activations to Q8_1, selecting the best kernel at runtime.
+pub fn quantize_row_q8_1(x: &[f32]) -> Vec<BlockQ8_1> {
+    quantize_row_q8_1_scalar(x)
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

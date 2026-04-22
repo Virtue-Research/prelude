@@ -12,7 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 
 [dev-dependencies]
-half = "2"
+cudarc = { version = "0.19.4", features = ["std", "cuda-version-from-build-system", "f16", "cublas", "cublaslt"] }
+half = "2.7.1"
+rand = "0.10.0"
 
-[[example]]
-name = "correctness_test"

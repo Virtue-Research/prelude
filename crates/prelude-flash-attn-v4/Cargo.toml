@@ -25,9 +25,6 @@ half = "2"
 candle-flash-attn-v3 = { path = "../candle-flash-attn-v3" }
 candle-paged-attn = { path = "../candle-paged-attn" }
 
-[[example]]
-name = "bench_kernel"
-
 [[bench]]
 name = "fa4_vs_fa3"
 harness = false

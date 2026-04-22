@@ -10,7 +10,7 @@ pub(crate) mod cpu_batch;
 pub(crate) mod cpu_continuous;
 pub(crate) mod gpu_queue;
 pub(crate) mod request_state;
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
 pub(crate) mod cuda_graph;
 
 // Re-export all scheduler types so existing `use crate::runtime::*` still works.

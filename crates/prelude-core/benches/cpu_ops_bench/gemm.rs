@@ -113,6 +113,252 @@ pub fn bench(m: usize, k: usize, n: usize, warmup: usize, repeats: usize) -> Res
     Ok(())
 }
 
+/// Benchmark INT8 W8A8 GEMM: BF16 input → quantize → INT8 GEMM → BF16 output.
+pub fn bench_s8(m: usize, k: usize, n: usize, warmup: usize, repeats: usize) -> Result<()> {
+    use prelude_core::ops::onednn::{brgemm_s8_available, BrgemmS8PackedWeight, brgemm_s8_gemm_forward};
+
+    if !brgemm_s8_available() {
+        println!("  s8_gemm [{m}x{k}x{n}]  INT8 brgemm not available");
+        return Ok(());
+    }
+
+    let device = Device::Cpu;
+
+    // BF16 input [M, K]
+    let input_data: Vec<bf16> = (0..m * k)
+        .map(|i| bf16::from_f32(((i as f32 * 0.007) - 0.5).sin()))
+        .collect();
+    let input = Tensor::from_vec(input_data, (m, k), &device)?;
+
+    // Quantize weights to INT8 with per-channel scales
+    let weight_f32: Vec<f32> = (0..n * k)
+        .map(|i| ((i as f32 * 0.013) + 0.2).cos())
+        .collect();
+    let mut weight_s8 = vec![0i8; n * k];
+    let mut scales = vec![0.0f32; n];
+    for row in 0..n {
+        let row_data = &weight_f32[row * k..(row + 1) * k];
+        let max_abs = row_data.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let scale = max_abs / 127.0;
+        scales[row] = scale;
+        let inv = if max_abs > 0.0 { 127.0 / max_abs } else { 0.0 };
+        for c in 0..k {
+            weight_s8[row * k + c] = (row_data[c] * inv).round().clamp(-128.0, 127.0) as i8;
+        }
+    }
+
+    let packed = BrgemmS8PackedWeight::pack(&weight_s8, &scales, k, n)
+        .expect("INT8 packing should succeed");
+
+    // -- INT8 GEMM --
+    for _ in 0..warmup {
+        let _ = brgemm_s8_gemm_forward(&input, &packed, m, k, n)?;
+    }
+    let start = std::time::Instant::now();
+    for _ in 0..repeats {
+        let _ = brgemm_s8_gemm_forward(&input, &packed, m, k, n)?;
+    }
+    let s8_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
+
+    // -- BF16 brgemm baseline --
+    let bf16_us = {
+        use prelude_core::ops::onednn::{brgemm_available, BrgemmPackedWeight};
+        if brgemm_available() {
+            let w_bf16: Vec<bf16> = weight_f32.iter().map(|&v| bf16::from_f32(v)).collect();
+            let w_tensor = Tensor::from_vec(w_bf16, (n, k), &device)?;
+            match BrgemmPackedWeight::pack(&w_tensor)? {
+                Some(brg) => {
+                    for _ in 0..warmup {
+                        let _ = prelude_core::ops::onednn::brgemm_gemm_forward_pub(&input, &brg, m, k, n)?;
+                    }
+                    let start = std::time::Instant::now();
+                    for _ in 0..repeats {
+                        let _ = prelude_core::ops::onednn::brgemm_gemm_forward_pub(&input, &brg, m, k, n)?;
+                    }
+                    Some(start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0)
+                }
+                None => None,
+            }
+        } else {
+            None
+        }
+    };
+
+    let label = format!("[{m}x{k}x{n}]");
+    let weight_mb = (n * k) as f64 / 1e6; // INT8: 1 byte per weight
+    let bw_gbs = weight_mb / (s8_us / 1e6) / 1e3;
+    print!("  s8_gemm {label:<22} int8={s8_us:>10.1}us ({bw_gbs:.0} GB/s)");
+    if let Some(bf16) = bf16_us {
+        print!("  bf16={bf16:>10.1}us  ({:.2}x)", bf16 / s8_us);
+    }
+    println!();
+    Ok(())
+}
+
+/// Benchmark BF16 GEMM with fused post-ops (bias, GELU).
+pub fn bench_postops(m: usize, k: usize, n: usize, warmup: usize, repeats: usize) -> Result<()> {
+    use prelude_core::ops::onednn::{
+        brgemm_available, brgemm_gemm_forward_postops, BrgemmPackedWeight,
+        BRGEMM_POSTOP_BIAS, BRGEMM_POSTOP_GELU_TANH,
+    };
+
+    if !brgemm_available() {
+        println!("  postops [{m}x{k}x{n}]  BF16 brgemm not available");
+        return Ok(());
+    }
+
+    let device = Device::Cpu;
+
+    let input_data: Vec<bf16> = (0..m * k)
+        .map(|i| bf16::from_f32(((i as f32 * 0.007) - 0.5).sin()))
+        .collect();
+    let input = Tensor::from_vec(input_data, (m, k), &device)?;
+
+    let weight_data: Vec<bf16> = (0..n * k)
+        .map(|i| bf16::from_f32(((i as f32 * 0.013) + 0.2).cos()))
+        .collect();
+    let weight = Tensor::from_vec(weight_data, (n, k), &device)?;
+    let packed = BrgemmPackedWeight::pack(&weight)?.expect("BF16 packing should succeed");
+
+    let bias_data: Vec<bf16> = (0..n)
+        .map(|i| bf16::from_f32((i as f32 * 0.001) - 0.05))
+        .collect();
+    let bias = Tensor::from_vec(bias_data, (n,), &device)?;
+
+    // -- Plain brgemm (no post-ops) --
+    for _ in 0..warmup {
+        let _ = prelude_core::ops::onednn::brgemm_gemm_forward_pub(&input, &packed, m, k, n)?;
+    }
+    let start = std::time::Instant::now();
+    for _ in 0..repeats {
+        let _ = prelude_core::ops::onednn::brgemm_gemm_forward_pub(&input, &packed, m, k, n)?;
+    }
+    let plain_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
+
+    // -- Postops: bias + GELU --
+    let flags = BRGEMM_POSTOP_BIAS | BRGEMM_POSTOP_GELU_TANH;
+    for _ in 0..warmup {
+        let _ = brgemm_gemm_forward_postops(&input, &packed, Some(&bias), flags, m, k, n)?;
+    }
+    let start = std::time::Instant::now();
+    for _ in 0..repeats {
+        let _ = brgemm_gemm_forward_postops(&input, &packed, Some(&bias), flags, m, k, n)?;
+    }
+    let postops_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
+
+    // -- Separate: brgemm + manual bias + manual GELU --
+    for _ in 0..warmup {
+        let out = prelude_core::ops::onednn::brgemm_gemm_forward_pub(&input, &packed, m, k, n)?;
+        let _ = candle_core::Tensor::gelu(&out.broadcast_add(&bias)?)?;
+    }
+    let start = std::time::Instant::now();
+    for _ in 0..repeats {
+        let out = prelude_core::ops::onednn::brgemm_gemm_forward_pub(&input, &packed, m, k, n)?;
+        let _ = candle_core::Tensor::gelu(&out.broadcast_add(&bias)?)?;
+    }
+    let separate_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
+
+    let label = format!("[{m}x{k}x{n}]");
+    println!(
+        "  postops {label:<22} plain={plain_us:>10.1}us  fused_bias_gelu={postops_us:>10.1}us  separate={separate_us:>10.1}us  ({:.2}x vs separate)",
+        separate_us / postops_us,
+    );
+    Ok(())
+}
+
+/// Benchmark individual post-ops configurations.
+pub fn bench_postops_variants(m: usize, k: usize, n: usize, warmup: usize, repeats: usize) -> Result<()> {
+    use prelude_core::ops::onednn::{
+        brgemm_available, brgemm_gemm_forward_postops, BrgemmPackedWeight,
+        BRGEMM_POSTOP_BIAS, BRGEMM_POSTOP_GELU_TANH, BRGEMM_POSTOP_RELU,
+    };
+    if !brgemm_available() { return Ok(()); }
+
+    let device = Device::Cpu;
+    let input_data: Vec<bf16> = (0..m * k).map(|i| bf16::from_f32(((i as f32 * 0.007) - 0.5).sin())).collect();
+    let input = Tensor::from_vec(input_data, (m, k), &device)?;
+    let weight_data: Vec<bf16> = (0..n * k).map(|i| bf16::from_f32(((i as f32 * 0.013) + 0.2).cos())).collect();
+    let weight = Tensor::from_vec(weight_data, (n, k), &device)?;
+    let packed = BrgemmPackedWeight::pack(&weight)?.expect("pack");
+    let bias_data: Vec<bf16> = (0..n).map(|i| bf16::from_f32((i as f32 * 0.001) - 0.05)).collect();
+    let bias = Tensor::from_vec(bias_data, (n,), &device)?;
+
+    let configs: &[(&str, Option<&Tensor>, i32)] = &[
+        ("plain   ", None, 0),
+        ("bias    ", Some(&bias), BRGEMM_POSTOP_BIAS),
+        ("gelu    ", None, BRGEMM_POSTOP_GELU_TANH),
+        ("relu    ", None, BRGEMM_POSTOP_RELU),
+        ("bias+gel", Some(&bias), BRGEMM_POSTOP_BIAS | BRGEMM_POSTOP_GELU_TANH),
+    ];
+
+    let label = format!("[{m}x{k}x{n}]");
+    for &(name, ref b, flags) in configs {
+        let bias_arg = b.as_deref();
+        for _ in 0..warmup {
+            let _ = brgemm_gemm_forward_postops(&input, &packed, bias_arg, flags, m, k, n)?;
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..repeats {
+            let _ = brgemm_gemm_forward_postops(&input, &packed, bias_arg, flags, m, k, n)?;
+        }
+        let us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
+        println!("  postops {label:<22} {name}={us:>10.1}us");
+    }
+    Ok(())
+}
+
+/// INT8 W8A8 accuracy: compare quantized GEMM against F32 reference.
+pub fn verify_s8_accuracy(m: usize, k: usize, n: usize) -> Result<()> {
+    use prelude_core::ops::onednn::{brgemm_s8_available, BrgemmS8PackedWeight, brgemm_s8_gemm_forward};
+    if !brgemm_s8_available() { return Ok(()); }
+
+    let device = Device::Cpu;
+
+    let w_f32: Vec<f32> = (0..n * k).map(|i| ((i as f32 * 0.013) + 0.2).cos()).collect();
+    let mut w_s8 = vec![0i8; n * k];
+    let mut scales = vec![0.0f32; n];
+    for row in 0..n {
+        let slice = &w_f32[row * k..(row + 1) * k];
+        let max_abs = slice.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        scales[row] = max_abs / 127.0;
+        let inv = if max_abs > 0.0 { 127.0 / max_abs } else { 0.0 };
+        for c in 0..k {
+            w_s8[row * k + c] = (slice[c] * inv).round().clamp(-128.0, 127.0) as i8;
+        }
+    }
+    let packed = BrgemmS8PackedWeight::pack(&w_s8, &scales, k, n).expect("INT8 pack");
+
+    let input_data: Vec<bf16> = (0..m * k).map(|i| bf16::from_f32(((i as f32 * 0.007) - 0.5).sin())).collect();
+    let input = Tensor::from_vec(input_data.clone(), (m, k), &device)?;
+
+    let out_s8 = brgemm_s8_gemm_forward(&input, &packed, m, k, n)?;
+    let w_tensor = Tensor::from_vec(w_f32, (n, k), &device)?;
+    let out_ref = input.to_dtype(DType::F32)?.matmul(&w_tensor.t()?)?;
+
+    let a = out_s8.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let b = out_ref.flatten_all()?.to_vec1::<f32>()?;
+
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    let atol = 0.1f32;
+    let rtol = 0.1f32;
+    let mut fail = 0usize;
+    for (&va, &vb) in a.iter().zip(b.iter()) {
+        let abs_err = (va - vb).abs();
+        let denom = va.abs().max(vb.abs());
+        let rel_err = if denom > 1e-6 { abs_err / denom } else { 0.0 };
+        max_abs = max_abs.max(abs_err);
+        max_rel = max_rel.max(rel_err);
+        if abs_err > atol + rtol * denom { fail += 1; }
+    }
+    let status = if fail == 0 { "PASS" } else { "FAIL" };
+    println!(
+        "  s8_acc [{m:>3}x{k:>4}x{n:>5}] {status}: max_abs={max_abs:.6}, max_rel={max_rel:.6}, fail={fail}/{} (atol={atol}, rtol={rtol})",
+        a.len(),
+    );
+    Ok(())
+}
+
 /// Accuracy: compare GEMM backends against candle F32 reference
 pub fn verify_accuracy(m: usize, k: usize, n: usize) -> Result<()> {
     let device = Device::Cpu;

@@ -34,18 +34,36 @@ fn main() {
     let cu_src = manifest_dir.join("src/cutlass_wrapper.cu");
     let obj = out_dir.join("cutlass_wrapper.o");
 
-    println!("cargo:warning=CUTLASS GEMM: compiling 3.x for SM90a + SM80");
+    let sm100 = nvcc_supports_sm100(&nvcc);
+    let sm103 = nvcc_supports_sm103(&nvcc);
+    if sm100 {
+        println!("cargo:warning=CUTLASS GEMM: compiling 3.x for SM80 + SM90a + SM100a (fat binary)");
+    } else {
+        println!("cargo:warning=CUTLASS GEMM: compiling 3.x for SM80 + SM90a");
+    }
 
-    let status = Command::new(&nvcc)
+    let mut nvcc_cmd = Command::new(&nvcc);
+    nvcc_cmd.args([
+        "-std=c++17",
+        "-O3",
+        "--expt-relaxed-constexpr",
+        "-Xcompiler", "-fPIC",
+        // SM80: CUTLASS 3.x manual CollectiveMma (Ampere TensorOp)
+        "-gencode=arch=compute_80,code=sm_80",
+        // SM90a: CUTLASS 3.x CollectiveBuilder (TMA + warp-specialized)
+        "-gencode=arch=compute_90a,code=sm_90a",
+    ]);
+    if sm100 {
+        nvcc_cmd.arg("-gencode=arch=compute_100a,code=sm_100a");
+    }
+    if sm103 {
+        // B300 is SM103, sm_100a cubin doesn't run on it and "a" PTX is not
+        // forward-compatible across the Blackwell family — need a native
+        // sm_103a cubin. See prelude-deepgemm build.rs for the same fix.
+        nvcc_cmd.arg("-gencode=arch=compute_103a,code=sm_103a");
+    }
+    let status = nvcc_cmd
         .args([
-            "-std=c++17",
-            "-O3",
-            "--expt-relaxed-constexpr",
-            "-Xcompiler", "-fPIC",
-            // SM90a: CUTLASS 3.x CollectiveBuilder (TMA + warp-specialized)
-            "-gencode=arch=compute_90a,code=sm_90a",
-            // SM80: CUTLASS 3.x manual CollectiveMma (Ampere TensorOp)
-            "-gencode=arch=compute_80,code=sm_80",
             "-I", cutlass_include.to_str().unwrap(),
             "-I", cutlass_dir.join("tools/util/include").to_str().unwrap(),
             "-I", &format!("{}/include", cuda_path.display()),
@@ -136,6 +154,22 @@ fn ensure_cutlass(out_dir: &Path) -> PathBuf {
 
     println!("cargo:warning=CUTLASS headers ready");
     cutlass_dir
+}
+
+fn nvcc_supports_sm100(nvcc: &Path) -> bool {
+    Command::new(nvcc)
+        .arg("--list-gpu-arch")
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("compute_100"))
+        .unwrap_or(false)
+}
+
+fn nvcc_supports_sm103(nvcc: &Path) -> bool {
+    Command::new(nvcc)
+        .arg("--list-gpu-arch")
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("compute_103"))
+        .unwrap_or(false)
 }
 
 fn find_cuda() -> PathBuf {

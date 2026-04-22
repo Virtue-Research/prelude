@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -115,8 +118,11 @@ struct Cli {
 
     #[arg(
         long,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
         default_value_t = true,
-        help = "CUDA graph capture for decode steps (default: true)"
+        default_missing_value = "true",
+        help = "CUDA graph capture for decode steps. Accepts --cuda-graph, --cuda-graph=true, --cuda-graph=false."
     )]
     cuda_graph: bool,
 

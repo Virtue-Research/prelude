@@ -166,6 +166,91 @@ void brgemm_qk_gemm(
     int64_t m, int64_t n, int64_t head_dim,
     int64_t q_stride, int64_t k_stride, int64_t ldc, float sm_scale);
 
+// ── INT8 BRGeMM API (W8A8 quantization) ────────────────────────────────
+// INT8 weights (per-channel scales) × INT8 activations (per-tensor dynamic
+// quantization). Uses AVX-512 VNNI for INT8 GEMM.
+
+/// Opaque handle for INT8 VNNI-packed weights with per-channel scales.
+typedef struct brgemm_s8_packed_b* brgemm_s8_packed_b_t;
+
+/// Returns 1 if INT8 brgemm is available on this CPU, 0 otherwise.
+int brgemm_s8_available(void);
+
+/// Pack INT8 weight [N,K] row-major into VNNI format for INT8 brgemm.
+/// scales: float[N] per-channel weight quantization scales.
+brgemm_s8_packed_b_t brgemm_s8_pack(
+    const int8_t* weight, const float* scales, int64_t k, int64_t n);
+
+/// Free INT8 packed weight.
+void brgemm_s8_pack_destroy(brgemm_s8_packed_b_t pw);
+
+/// Dynamic per-tensor quantization: BF16 [M,K] → INT8 [M,K].
+/// Returns the activation scale factor. Writes quantized values to out_s8.
+float brgemm_quantize_bf16_s8(
+    const void* input_bf16, int8_t* out_s8,
+    int64_t m, int64_t k);
+
+/// INT8 W8A8 linear with pre-quantized INT8 input.
+/// output[M, n_start:n_end] = dequant(input_s8 × packed_weight) → BF16.
+/// a_scale: per-tensor activation scale from brgemm_quantize_bf16_s8.
+void brgemm_s8_linear(
+    const int8_t* input_s8, float a_scale,
+    brgemm_s8_packed_b_t pw,
+    void* output_bf16,
+    int64_t m, int64_t n_total,
+    int64_t n_start, int64_t n_end);
+
+// ── FP8 BRGeMM API ────────────────────────────────────────────────────
+// FP8 weights (per-channel scales) × FP8 activations (per-tensor).
+// Requires AVX10.2 with AMX-2 (Intel Granite Rapids+). Code compiles on
+// all platforms but returns 0/NULL at runtime if HW is unavailable.
+
+/// Opaque handle for FP8 VNNI-packed weights with per-channel scales.
+typedef struct brgemm_f8_packed_b* brgemm_f8_packed_b_t;
+
+/// Returns 1 if FP8 (f8_e4m3) brgemm is available, 0 otherwise.
+int brgemm_f8_available(void);
+
+/// Pack FP8-E4M3 weight [N,K] into VNNI format with per-channel scales.
+brgemm_f8_packed_b_t brgemm_f8e4m3_pack(
+    const void* weight_f8, const float* scales, int64_t k, int64_t n);
+
+/// Free FP8 packed weight.
+void brgemm_f8_pack_destroy(brgemm_f8_packed_b_t pw);
+
+/// Dynamic quantization: BF16 [M,K] → FP8-E4M3 [M,K].
+/// Returns the activation scale factor.
+float brgemm_quantize_bf16_f8e4m3(
+    const void* input_bf16, void* out_f8,
+    int64_t m, int64_t k);
+
+/// FP8 linear: output[M, n_start:n_end] = dequant(input_f8 × packed) → BF16.
+void brgemm_f8e4m3_linear(
+    const void* input_f8, float a_scale,
+    brgemm_f8_packed_b_t pw,
+    void* output_bf16,
+    int64_t m, int64_t n_total,
+    int64_t n_start, int64_t n_end);
+
+// ── BRGeMM post-ops flags ──────────────────────────────────────────────
+// Fuse bias add, GELU, ReLU etc. into brgemm output path.
+// Eliminates separate memory passes for these operations.
+
+#define BRGEMM_POSTOP_BIAS      1
+#define BRGEMM_POSTOP_GELU_TANH 2
+#define BRGEMM_POSTOP_GELU_ERF  4
+#define BRGEMM_POSTOP_RELU      8
+
+/// BF16 linear with fused post-ops (F32→BF16 + optional bias/GELU/ReLU).
+/// bias_bf16: pointer to BF16 bias[N], or NULL if BRGEMM_POSTOP_BIAS not set.
+void brgemm_bf16_linear_postops(
+    const void* input, brgemm_packed_b_t pw,
+    void* output,
+    const void* bias_bf16,
+    int postop_flags,
+    int64_t m, int64_t n_total,
+    int64_t n_start, int64_t n_end);
+
 #ifdef __cplusplus
 }
 #endif

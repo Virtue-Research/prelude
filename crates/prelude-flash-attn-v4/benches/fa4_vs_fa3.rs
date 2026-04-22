@@ -7,7 +7,7 @@
 //!   CUDA_VISIBLE_DEVICES=1 cargo bench -p prelude-flash-attn-v4 --bench fa4_vs_fa3
 
 use half::bf16;
-use prelude_flash_attn_v4::{KernelKey, KernelRegistry};
+use prelude_flash_attn_v4::{KernelDtype, KernelKey, KernelRegistry};
 use std::ffi::c_void;
 
 // ── CUDA FFI ────────────────────────────────────────────────────────
@@ -250,6 +250,7 @@ fn bench_varlen(
                 cu_gpu.ptr, cu_gpu.ptr,
                 &q_shape, &k_shape, &o_shape, &lse_shape, &cu_shape,
                 0, None, None, None, None,
+                KernelDtype::BF16,
             ).expect("FA4 kernel failed");
         })
     });
@@ -393,6 +394,7 @@ fn bench_paged(
                 &q_shape, &k_shape, &o_shape, &lse_shape,
                 &cu_q_shape, &seqused_k_shape, &pt_shape,
                 0, None, None,
+                KernelDtype::BF16,
             ).expect("FA4 paged kernel failed");
         })
     });

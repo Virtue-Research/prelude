@@ -539,8 +539,12 @@ brgemm_packed_b_t brgemm_bf16_pack(const void* weight_ptr, int64_t k, int64_t n)
     int64_t n_blocks = (n + block_n - 1) / block_n;
     int64_t vnni = 2;  // BF16 VNNI factor (pack32)
 
-    // Each block: [K/vnni, block_n, vnni] = K * block_n BF16 elements
-    size_t block_elems = (size_t)(k * block_n);
+    // Tail-aware allocation: the odd-k tail loop writes into
+    // [(k/vnni) * block_n * vnni, (k/vnni) * block_n * vnni + actual_n * vnni),
+    // which exceeds k * block_n elements for odd k. Round k up to a vnni multiple.
+    int64_t k_padded = ((k + vnni - 1) / vnni) * vnni;
+    // Each block: [K/vnni, block_n, vnni] = k_padded * block_n BF16 elements
+    size_t block_elems = (size_t)(k_padded * block_n);
     size_t total_bytes = n_blocks * block_elems * 2;
 
     uint16_t* packed = (uint16_t*)aligned_alloc(64, total_bytes);
@@ -594,6 +598,13 @@ static inline uint16_t f32_to_bf16(float v) {
     return (uint16_t)(bits >> 16);
 }
 
+static inline float bf16_to_f32(uint16_t v) {
+    uint32_t bits = (uint32_t)v << 16;
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
 void brgemm_bf16_linear(
     const void* input,
     brgemm_packed_b_t pw,
@@ -609,7 +620,9 @@ void brgemm_bf16_linear(
     const uint16_t* packed = (const uint16_t*)pw->data;
     int64_t k = pw->k;
     int64_t block_n = pw->block_n;
-    int64_t block_elems = k * block_n;
+    // Stride between packed blocks matches the packer's tail-aware allocation.
+    int64_t k_padded = ((k + 1) / 2) * 2;  // vnni = 2 for BF16
+    int64_t block_elems = k_padded * block_n;
 
     // Thread-local accumulator (grows-only, no per-call heap alloc)
     static thread_local std::vector<float> tls_acc;
@@ -670,7 +683,9 @@ void brgemm_bf16_linear_fused_silu_mul(
     const uint16_t* packed = (const uint16_t*)pw->data;
     int64_t k = pw->k;
     int64_t block_n = pw->block_n;
-    int64_t block_elems = k * block_n;
+    // Stride between packed blocks matches the packer's tail-aware allocation.
+    int64_t k_padded = ((k + 1) / 2) * 2;  // vnni = 2 for BF16
+    int64_t block_elems = k_padded * block_n;
 
     // Two accumulators: one for gate columns, one for up columns
     static thread_local std::vector<float> tls_gate_acc;
@@ -1145,6 +1160,681 @@ void brgemm_attn_release() {
     tls_current = nullptr;
 }
 
+// ── INT8 BRGeMM (W8A8) ─────────────────────────────────────────────────
+// U8 × S8 → F32 accumulation → compensation → scale → BF16 output.
+//
+// The brgemm ukernel API does NOT handle s8→u8 compensation internally
+// (see upstream: brgemm_desc_.req_s8s8_compensation = false, with comment
+// "Users must add compensation on their own as a binary post-op").
+//
+// AVX-512 VNNI only has VPDPBUSD (u8×s8). For W8A8 we:
+//   1. Quantize BF16 input to u8 (= clamp(round(x/scale)) + 128)
+//   2. Run brgemm u8×s8 → F32 (native VPDPBUSD, no compensation needed inside)
+//   3. Subtract compensation: C -= 128 × Σ_k(weight_s8[j,k]) per column
+//   4. Apply scales: D = C × a_scale × b_scale[j] → BF16
+//
+// Steps 3-4 are fused via post-ops: binary_add(comp) + A/B scales + BF16 output.
+
+struct brgemm_s8_packed_b {
+    void* data;           // packed weight buffer, 64-byte aligned
+    float* scales;        // per-channel F32 scales [N]
+    float* col_comp;      // per-column compensation: -128 * Σ_k(w_s8[j,k]) as F32 [N]
+    int64_t k, n;
+    int64_t block_n;
+    int64_t n_blocks;
+};
+
+// Thread-local INT8 brgemm kernel cache (u8×s8 with compensation post-op)
+struct BrgemmS8Key {
+    int64_t m, n, k, ldd;
+    bool operator==(const BrgemmS8Key& o) const {
+        return m==o.m && n==o.n && k==o.k && ldd==o.ldd;
+    }
+};
+struct BrgemmS8KeyHash {
+    size_t operator()(const BrgemmS8Key& key) const {
+        return (size_t)(key.m * 1000003 + key.n * 1009 + key.k * 31 + key.ldd);
+    }
+};
+struct BrgemmS8Kernel {
+    dnnl_brgemm_t brgemm = nullptr;
+    std::vector<uint8_t> scratchpad;
+};
+static thread_local std::unordered_map<BrgemmS8Key, BrgemmS8Kernel, BrgemmS8KeyHash> tls_brgemm_s8;
+
+static BrgemmS8Kernel& get_brgemm_s8_kernel(int64_t m, int64_t n, int64_t k, int64_t ldd) {
+    BrgemmS8Key key{m, n, k, ldd};
+    auto it = tls_brgemm_s8.find(key);
+    if (it != tls_brgemm_s8.end()) return it->second;
+
+    BrgemmS8Kernel kern{};
+    // u8×s8 → F32, with A/B scales and binary_add post-op for compensation.
+    //
+    // Execution order in execute_postops:
+    //   1. C = GEMM(u8_A, s8_B)           — native VPDPBUSD
+    //   2. C *= a_scale * b_scale[j]       — dequantization
+    //   3. D = C + comp_scaled[j]          — s8→u8 compensation (binary_add)
+    //   4. Convert D → BF16               — set via d_dt
+    //
+    // comp_scaled[j] = -128 * Σ_k(w[j,k]) * a_scale * b_scale[j]
+    // Precomputed at runtime since a_scale is dynamic.
+    CHECK_DNNL(dnnl_brgemm_create(&kern.brgemm, m, n, k,
+        /*batch_size*/1, /*lda*/k, /*ldb*/n, /*ldc*/n,
+        dnnl_u8, dnnl_s8, dnnl_f32));
+    CHECK_DNNL(dnnl_brgemm_set_add_C(kern.brgemm, 0));
+    CHECK_DNNL(dnnl_brgemm_set_A_scales(kern.brgemm, 0));  // per-tensor
+    CHECK_DNNL(dnnl_brgemm_set_B_scales(kern.brgemm, 2));  // per-channel
+
+    // Binary_add post-op for compensation [1, N] F32
+    dnnl_post_ops_t post_ops = nullptr;
+    CHECK_DNNL(dnnl_post_ops_create(&post_ops));
+    dnnl_dims_t comp_dims = {1, n};
+    dnnl_memory_desc_t comp_md = nullptr;
+    CHECK_DNNL(dnnl_memory_desc_create_with_tag(&comp_md, 2, comp_dims, dnnl_f32, dnnl_ab));
+    CHECK_DNNL(dnnl_post_ops_append_binary(post_ops, dnnl_binary_add, comp_md));
+    dnnl_memory_desc_destroy(comp_md);
+
+    CHECK_DNNL(dnnl_brgemm_set_post_ops(kern.brgemm, ldd, dnnl_bf16, post_ops));
+    dnnl_post_ops_destroy(post_ops);
+
+    CHECK_DNNL(dnnl_brgemm_finalize(kern.brgemm));
+    CHECK_DNNL(dnnl_brgemm_generate(kern.brgemm));
+
+    size_t sz = 0;
+    CHECK_DNNL(dnnl_brgemm_get_scratchpad_size(kern.brgemm, &sz));
+    kern.scratchpad.resize(sz);
+
+    auto [inserted, _] = tls_brgemm_s8.emplace(key, std::move(kern));
+    return inserted->second;
+}
+
+int brgemm_s8_available(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+
+    dnnl_brgemm_t brg = nullptr;
+    dnnl_status_t s = dnnl_brgemm_create(&brg, 1, 32, 64,
+        1, 64, 32, 32, dnnl_u8, dnnl_s8, dnnl_f32);
+    if (s == dnnl_success && brg) {
+        s = dnnl_brgemm_finalize(brg);
+        if (s == dnnl_success) s = dnnl_brgemm_generate(brg);
+        dnnl_brgemm_destroy(brg);
+        cached = (s == dnnl_success) ? 1 : 0;
+    } else {
+        if (brg) dnnl_brgemm_destroy(brg);
+        cached = 0;
+    }
+    return cached;
+}
+
+brgemm_s8_packed_b_t brgemm_s8_pack(
+    const int8_t* weight, const float* scales, int64_t k, int64_t n)
+{
+    if (!brgemm_s8_available()) return nullptr;
+
+    int64_t block_n = BRGEMM_BLOCK_N;
+    int64_t n_blocks = (n + block_n - 1) / block_n;
+    int64_t vnni = 4;  // INT8 VNNI factor: 4 bytes = 32 bits
+
+    // Allocation must cover the tail group. When k is not a multiple of vnni,
+    // the tail loop writes into [k_groups * block_n * vnni, k_groups * block_n * vnni + actual_n * vnni),
+    // which exceeds k * block_n bytes. Round k up to a vnni multiple.
+    int64_t k_padded = ((k + vnni - 1) / vnni) * vnni;
+    size_t block_elems = (size_t)(k_padded * block_n);
+    size_t total_bytes = n_blocks * block_elems;
+
+    int8_t* packed = (int8_t*)aligned_alloc(64, total_bytes);
+    if (!packed) return nullptr;
+    memset(packed, 0, total_bytes);
+
+    // Pack: weight[N, K] row-major → packed[NB, K/4, BLOCK_N, 4]
+    for (int64_t nb = 0; nb < n_blocks; nb++) {
+        int8_t* blk = packed + nb * block_elems;
+        int64_t nc = nb * block_n;
+        int64_t actual_n = (nc + block_n <= n) ? block_n : (n - nc);
+
+        int64_t k_groups = k / vnni;
+        for (int64_t kp = 0; kp < k_groups; kp++) {
+            for (int64_t j = 0; j < actual_n; j++) {
+                for (int64_t d = 0; d < vnni; d++) {
+                    blk[kp * block_n * vnni + j * vnni + d] =
+                        weight[(nc + j) * k + kp * vnni + d];
+                }
+            }
+        }
+        int64_t k_tail = k % vnni;
+        if (k_tail > 0) {
+            for (int64_t j = 0; j < actual_n; j++) {
+                for (int64_t d = 0; d < k_tail; d++) {
+                    blk[k_groups * block_n * vnni + j * vnni + d] =
+                        weight[(nc + j) * k + k_groups * vnni + d];
+                }
+            }
+        }
+    }
+
+    float* scales_copy = (float*)malloc(n * sizeof(float));
+    memcpy(scales_copy, scales, n * sizeof(float));
+
+    // Precompute per-column compensation: -128 * Σ_k(weight_s8[j,k])
+    float* col_comp = (float*)malloc(n * sizeof(float));
+    for (int64_t j = 0; j < n; j++) {
+        int64_t sum = 0;
+        for (int64_t c = 0; c < k; c++) {
+            sum += weight[j * k + c];
+        }
+        col_comp[j] = -128.0f * (float)sum;
+    }
+
+    auto* pw = new brgemm_s8_packed_b();
+    pw->data = packed;
+    pw->scales = scales_copy;
+    pw->col_comp = col_comp;
+    pw->k = k;
+    pw->n = n;
+    pw->block_n = block_n;
+    pw->n_blocks = n_blocks;
+    return pw;
+}
+
+void brgemm_s8_pack_destroy(brgemm_s8_packed_b_t pw) {
+    if (!pw) return;
+    free(pw->data);
+    free(pw->scales);
+    free(pw->col_comp);
+    delete pw;
+}
+
+float brgemm_quantize_bf16_s8(
+    const void* input_bf16, int8_t* out_s8, int64_t m, int64_t k)
+{
+    const uint16_t* in = (const uint16_t*)input_bf16;
+    int64_t n = m * k;
+
+    float max_abs = 0.0f;
+    for (int64_t i = 0; i < n; i++) {
+        float abs_v = fabsf(bf16_to_f32(in[i]));
+        if (abs_v > max_abs) max_abs = abs_v;
+    }
+
+    float scale = max_abs / 127.0f;
+    if (max_abs == 0.0f) {
+        // Output u8 zero-point = 128
+        memset(out_s8, (int8_t)(uint8_t)128, n);
+        return scale;
+    }
+
+    float inv_scale = 127.0f / max_abs;
+    for (int64_t i = 0; i < n; i++) {
+        float v = bf16_to_f32(in[i]);
+        int32_t q = (int32_t)roundf(v * inv_scale);
+        q = std::max(-128, std::min(127, q));
+        // Store as u8 = s8 + 128 (reinterpreted as int8_t for FFI convenience)
+        out_s8[i] = (int8_t)(uint8_t)(q + 128);
+    }
+    return scale;
+}
+
+void brgemm_s8_linear(
+    const int8_t* input_s8, float a_scale,
+    brgemm_s8_packed_b_t pw,
+    void* output_bf16,
+    int64_t m, int64_t n_total,
+    int64_t n_start, int64_t n_end)
+{
+    if (m <= 0 || n_start >= n_end || !pw) return;
+
+    uint16_t* out = (uint16_t*)output_bf16;
+    const int8_t* packed = (const int8_t*)pw->data;
+    int64_t k = pw->k;
+    int64_t block_n = pw->block_n;
+    // Stride between packed blocks matches the packer's tail-aware allocation.
+    int64_t k_padded = ((k + 3) / 4) * 4;  // vnni = 4 for INT8
+    int64_t block_elems = k_padded * block_n;
+
+    static thread_local std::vector<float> tls_s8_acc;
+    size_t acc_needed = (size_t)(m * BRGEMM_BLOCK_N);
+    if (tls_s8_acc.size() < acc_needed) tls_s8_acc.resize(acc_needed);
+    float* acc = tls_s8_acc.data();
+    int64_t offsets[2] = {0, 0};
+
+    int64_t nb_start = n_start / block_n;
+    int64_t nb_end = (n_end + block_n - 1) / block_n;
+
+    // Thread-local buffer for runtime-scaled compensation
+    static thread_local std::vector<float> tls_comp_scaled;
+    if (tls_comp_scaled.size() < (size_t)BRGEMM_BLOCK_N)
+        tls_comp_scaled.resize(BRGEMM_BLOCK_N);
+
+    dnnl_ukernel_attr_params_t params = nullptr;
+    CHECK_DNNL(dnnl_ukernel_attr_params_create(&params));
+    CHECK_DNNL(dnnl_ukernel_attr_params_set_A_scales(params, &a_scale));
+
+    const BrgemmS8Kernel* current_kern = nullptr;
+
+    for (int64_t nb = nb_start; nb < nb_end; nb++) {
+        int64_t nc = nb * block_n;
+        int64_t actual_n = (nc + block_n <= pw->n) ? block_n : (pw->n - nc);
+
+        BrgemmS8Kernel& kern = get_brgemm_s8_kernel(m, actual_n, k, n_total);
+        if (&kern != current_kern) {
+            dnnl_brgemm_set_hw_context(kern.brgemm);
+            current_kern = &kern;
+        }
+
+        const void* B = packed + nb * block_elems;
+
+        CHECK_DNNL(dnnl_ukernel_attr_params_set_B_scales(params, pw->scales + nc));
+
+        // Compute runtime-scaled compensation:
+        // comp_scaled[j] = col_comp[nc+j] * a_scale * b_scale[nc+j]
+        // where col_comp = -128 * Σ_k(w[j,k])
+        for (int64_t j = 0; j < actual_n; j++) {
+            tls_comp_scaled[j] = pw->col_comp[nc + j] * a_scale * pw->scales[nc + j];
+        }
+        const void* po_args[1] = { tls_comp_scaled.data() };
+        CHECK_DNNL(dnnl_ukernel_attr_params_set_post_ops_args(params, po_args));
+
+        uint16_t* D = out + nc;
+
+        CHECK_DNNL(dnnl_brgemm_execute_postops(kern.brgemm,
+            input_s8, B, offsets,
+            acc, D, kern.scratchpad.data(), params));
+    }
+
+    dnnl_brgemm_release_hw_context();
+    tls_current = nullptr;
+    dnnl_ukernel_attr_params_destroy(params);
+}
+
+// ── FP8 BRGeMM ─────────────────────────────────────────────────────────
+// FP8 (E4M3) × FP8 (E4M3) → F32 → BF16.
+// Requires AVX10.2 AMX-2 hardware. Gracefully returns 0/NULL if unavailable.
+
+struct brgemm_f8_packed_b {
+    void* data;
+    float* scales;
+    int64_t k, n;
+    int64_t block_n;
+    int64_t n_blocks;
+};
+
+// Thread-local FP8 brgemm kernel cache
+static thread_local std::unordered_map<BrgemmS8Key, BrgemmS8Kernel, BrgemmS8KeyHash> tls_brgemm_f8;
+
+static BrgemmS8Kernel& get_brgemm_f8_kernel(int64_t m, int64_t n, int64_t k, int64_t ldd) {
+    BrgemmS8Key key{m, n, k, ldd};
+    auto it = tls_brgemm_f8.find(key);
+    if (it != tls_brgemm_f8.end()) return it->second;
+
+    BrgemmS8Kernel kern{};
+    CHECK_DNNL(dnnl_brgemm_create(&kern.brgemm, m, n, k,
+        1, k, n, n,
+        dnnl_f8_e4m3, dnnl_f8_e4m3, dnnl_f32));
+    CHECK_DNNL(dnnl_brgemm_set_add_C(kern.brgemm, 0));
+    CHECK_DNNL(dnnl_brgemm_set_A_scales(kern.brgemm, 0));
+    CHECK_DNNL(dnnl_brgemm_set_B_scales(kern.brgemm, 2));
+
+    dnnl_post_ops_t post_ops = nullptr;
+    CHECK_DNNL(dnnl_post_ops_create(&post_ops));
+    CHECK_DNNL(dnnl_brgemm_set_post_ops(kern.brgemm, ldd, dnnl_bf16, post_ops));
+    dnnl_post_ops_destroy(post_ops);
+
+    CHECK_DNNL(dnnl_brgemm_finalize(kern.brgemm));
+    CHECK_DNNL(dnnl_brgemm_generate(kern.brgemm));
+
+    size_t sz = 0;
+    CHECK_DNNL(dnnl_brgemm_get_scratchpad_size(kern.brgemm, &sz));
+    kern.scratchpad.resize(sz);
+
+    auto [inserted, _] = tls_brgemm_f8.emplace(key, std::move(kern));
+    return inserted->second;
+}
+
+int brgemm_f8_available(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+
+    dnnl_brgemm_t brg = nullptr;
+    dnnl_status_t s = dnnl_brgemm_create(&brg, 1, 32, 64,
+        1, 64, 32, 32, dnnl_f8_e4m3, dnnl_f8_e4m3, dnnl_f32);
+    if (s == dnnl_success && brg) {
+        s = dnnl_brgemm_finalize(brg);
+        if (s == dnnl_success) s = dnnl_brgemm_generate(brg);
+        dnnl_brgemm_destroy(brg);
+        cached = (s == dnnl_success) ? 1 : 0;
+    } else {
+        if (brg) dnnl_brgemm_destroy(brg);
+        cached = 0;
+    }
+    return cached;
+}
+
+// F8E4M3 conversion helpers
+// E4M3 format: 1 sign, 4 exponent (bias=7), 3 mantissa. No inf, max=448.
+static inline uint8_t f32_to_f8e4m3(float v) {
+    uint32_t bits;
+    memcpy(&bits, &v, 4);
+    uint32_t sign = (bits >> 31) & 1;
+    int32_t exp32 = ((int32_t)((bits >> 23) & 0xFF)) - 127;
+    uint32_t mant = bits & 0x7FFFFF;
+
+    // Handle special cases
+    if ((bits & 0x7FFFFFFF) == 0) return (uint8_t)(sign << 7); // ±0
+    if (exp32 > 8) return (uint8_t)((sign << 7) | 0x7E);       // overflow → max
+
+    int32_t e4 = exp32 + 7; // E4M3 bias = 7
+    if (e4 <= 0) {
+        // Subnormal: shift mantissa
+        int shift = 1 - e4 + 20; // 20 = 23 - 3 mantissa bits
+        uint32_t full_mant = (0x800000 | mant);
+        uint32_t m3 = (shift < 32) ? (full_mant >> shift) : 0;
+        return (uint8_t)((sign << 7) | (m3 & 0x7));
+    }
+    if (e4 > 15) return (uint8_t)((sign << 7) | 0x7E); // overflow
+
+    // Round mantissa to 3 bits (round to nearest even)
+    uint32_t round_bit = (mant >> 19) & 1;
+    uint32_t sticky = mant & ((1 << 19) - 1);
+    uint32_t m3 = (mant >> 20) & 0x7;
+    if (round_bit && (sticky || (m3 & 1))) {
+        m3++;
+        if (m3 > 7) { m3 = 0; e4++; }
+        if (e4 > 15) return (uint8_t)((sign << 7) | 0x7E);
+    }
+    return (uint8_t)((sign << 7) | ((e4 & 0xF) << 3) | (m3 & 0x7));
+}
+
+brgemm_f8_packed_b_t brgemm_f8e4m3_pack(
+    const void* weight_f8, const float* scales, int64_t k, int64_t n)
+{
+    if (!brgemm_f8_available()) return nullptr;
+
+    int64_t block_n = BRGEMM_BLOCK_N;
+    int64_t n_blocks = (n + block_n - 1) / block_n;
+    int64_t vnni = 4;  // FP8 VNNI factor: 4 bytes = 32 bits
+
+    // Allocation must cover the tail group — see brgemm_s8_pack for the detailed
+    // addressing argument. Round k up to a vnni multiple.
+    int64_t k_padded = ((k + vnni - 1) / vnni) * vnni;
+    size_t block_elems = (size_t)(k_padded * block_n);
+    size_t total_bytes = n_blocks * block_elems;
+
+    uint8_t* packed = (uint8_t*)aligned_alloc(64, total_bytes);
+    if (!packed) return nullptr;
+    memset(packed, 0, total_bytes);
+
+    const uint8_t* w = (const uint8_t*)weight_f8;
+
+    // Pack: weight[N, K] → packed[NB, K/4, BLOCK_N, 4]
+    for (int64_t nb = 0; nb < n_blocks; nb++) {
+        uint8_t* blk = packed + nb * block_elems;
+        int64_t nc = nb * block_n;
+        int64_t actual_n = (nc + block_n <= n) ? block_n : (n - nc);
+
+        int64_t k_groups = k / vnni;
+        for (int64_t kp = 0; kp < k_groups; kp++) {
+            for (int64_t j = 0; j < actual_n; j++) {
+                for (int64_t d = 0; d < vnni; d++) {
+                    blk[kp * block_n * vnni + j * vnni + d] =
+                        w[(nc + j) * k + kp * vnni + d];
+                }
+            }
+        }
+        int64_t k_tail = k % vnni;
+        if (k_tail > 0) {
+            for (int64_t j = 0; j < actual_n; j++) {
+                for (int64_t d = 0; d < k_tail; d++) {
+                    blk[k_groups * block_n * vnni + j * vnni + d] =
+                        w[(nc + j) * k + k_groups * vnni + d];
+                }
+            }
+        }
+    }
+
+    float* scales_copy = (float*)malloc(n * sizeof(float));
+    memcpy(scales_copy, scales, n * sizeof(float));
+
+    auto* pw = new brgemm_f8_packed_b();
+    pw->data = packed;
+    pw->scales = scales_copy;
+    pw->k = k;
+    pw->n = n;
+    pw->block_n = block_n;
+    pw->n_blocks = n_blocks;
+    return pw;
+}
+
+void brgemm_f8_pack_destroy(brgemm_f8_packed_b_t pw) {
+    if (!pw) return;
+    free(pw->data);
+    free(pw->scales);
+    delete pw;
+}
+
+float brgemm_quantize_bf16_f8e4m3(
+    const void* input_bf16, void* out_f8, int64_t m, int64_t k)
+{
+    const uint16_t* in = (const uint16_t*)input_bf16;
+    uint8_t* out = (uint8_t*)out_f8;
+    int64_t n = m * k;
+
+    // E4M3 max representable value = 448.0
+    const float f8_max = 448.0f;
+
+    float max_abs = 0.0f;
+    for (int64_t i = 0; i < n; i++) {
+        float abs_v = fabsf(bf16_to_f32(in[i]));
+        if (abs_v > max_abs) max_abs = abs_v;
+    }
+
+    float scale = max_abs / f8_max;
+    if (max_abs == 0.0f) {
+        memset(out, 0, n);
+        return scale;
+    }
+
+    float inv_scale = f8_max / max_abs;
+    for (int64_t i = 0; i < n; i++) {
+        float v = bf16_to_f32(in[i]) * inv_scale;
+        out[i] = f32_to_f8e4m3(v);
+    }
+    return scale;
+}
+
+void brgemm_f8e4m3_linear(
+    const void* input_f8, float a_scale,
+    brgemm_f8_packed_b_t pw,
+    void* output_bf16,
+    int64_t m, int64_t n_total,
+    int64_t n_start, int64_t n_end)
+{
+    if (m <= 0 || n_start >= n_end || !pw) return;
+
+    uint16_t* out = (uint16_t*)output_bf16;
+    const uint8_t* packed = (const uint8_t*)pw->data;
+    int64_t k = pw->k;
+    int64_t block_n = pw->block_n;
+    // Stride between packed blocks matches the packer's tail-aware allocation.
+    int64_t k_padded = ((k + 3) / 4) * 4;  // vnni = 4 for FP8 E4M3
+    int64_t block_elems = k_padded * block_n;
+
+    static thread_local std::vector<float> tls_f8_acc;
+    size_t acc_needed = (size_t)(m * BRGEMM_BLOCK_N);
+    if (tls_f8_acc.size() < acc_needed) tls_f8_acc.resize(acc_needed);
+    float* acc = tls_f8_acc.data();
+    int64_t offsets[2] = {0, 0};
+
+    int64_t nb_start = n_start / block_n;
+    int64_t nb_end = (n_end + block_n - 1) / block_n;
+
+    dnnl_ukernel_attr_params_t params = nullptr;
+    CHECK_DNNL(dnnl_ukernel_attr_params_create(&params));
+    CHECK_DNNL(dnnl_ukernel_attr_params_set_A_scales(params, &a_scale));
+
+    const BrgemmS8Kernel* current_kern = nullptr;
+
+    for (int64_t nb = nb_start; nb < nb_end; nb++) {
+        int64_t nc = nb * block_n;
+        int64_t actual_n = (nc + block_n <= pw->n) ? block_n : (pw->n - nc);
+
+        BrgemmS8Kernel& kern = get_brgemm_f8_kernel(m, actual_n, k, n_total);
+        if (&kern != current_kern) {
+            dnnl_brgemm_set_hw_context(kern.brgemm);
+            current_kern = &kern;
+        }
+
+        const void* B = packed + nb * block_elems;
+        CHECK_DNNL(dnnl_ukernel_attr_params_set_B_scales(params, pw->scales + nc));
+
+        uint16_t* D = out + nc;
+
+        CHECK_DNNL(dnnl_brgemm_execute_postops(kern.brgemm,
+            input_f8, B, offsets,
+            acc, D, kern.scratchpad.data(), params));
+    }
+
+    dnnl_brgemm_release_hw_context();
+    tls_current = nullptr;
+    dnnl_ukernel_attr_params_destroy(params);
+}
+
+// ── BRGeMM post-ops (BF16 with fused bias/GELU/ReLU) ───────────────────
+
+struct BrgemmPostopsKey {
+    int64_t m, n, k, ldd;
+    int flags;
+    bool operator==(const BrgemmPostopsKey& o) const {
+        return m==o.m && n==o.n && k==o.k && ldd==o.ldd && flags==o.flags;
+    }
+};
+struct BrgemmPostopsKeyHash {
+    size_t operator()(const BrgemmPostopsKey& key) const {
+        return (size_t)(key.m * 1000003 + key.n * 1009 + key.k * 31 + key.ldd + key.flags * 7);
+    }
+};
+struct BrgemmPostopsKernel {
+    dnnl_brgemm_t brgemm = nullptr;
+    std::vector<uint8_t> scratchpad;
+    int num_binary_args;  // number of post-op args needing external data
+};
+static thread_local std::unordered_map<BrgemmPostopsKey, BrgemmPostopsKernel, BrgemmPostopsKeyHash> tls_brgemm_postops;
+
+static BrgemmPostopsKernel& get_brgemm_postops_kernel(
+    int64_t m, int64_t n, int64_t k, int64_t ldd, int flags)
+{
+    BrgemmPostopsKey key{m, n, k, ldd, flags};
+    auto it = tls_brgemm_postops.find(key);
+    if (it != tls_brgemm_postops.end()) return it->second;
+
+    BrgemmPostopsKernel kern{};
+    CHECK_DNNL(dnnl_brgemm_create(&kern.brgemm, m, n, k,
+        1, k, n, n,
+        dnnl_bf16, dnnl_bf16, dnnl_f32));
+    CHECK_DNNL(dnnl_brgemm_set_add_C(kern.brgemm, 0));
+
+    dnnl_post_ops_t post_ops = nullptr;
+    CHECK_DNNL(dnnl_post_ops_create(&post_ops));
+    kern.num_binary_args = 0;
+
+    if (flags & BRGEMM_POSTOP_BIAS) {
+        dnnl_dims_t bias_dims = {1, n};
+        dnnl_memory_desc_t bias_md = nullptr;
+        CHECK_DNNL(dnnl_memory_desc_create_with_tag(&bias_md, 2, bias_dims, dnnl_bf16, dnnl_ab));
+        CHECK_DNNL(dnnl_post_ops_append_binary(post_ops, dnnl_binary_add, bias_md));
+        dnnl_memory_desc_destroy(bias_md);
+        kern.num_binary_args++;
+    }
+    if (flags & BRGEMM_POSTOP_GELU_TANH) {
+        CHECK_DNNL(dnnl_post_ops_append_eltwise(post_ops, dnnl_eltwise_gelu_tanh, 0.0f, 0.0f));
+    }
+    if (flags & BRGEMM_POSTOP_GELU_ERF) {
+        CHECK_DNNL(dnnl_post_ops_append_eltwise(post_ops, dnnl_eltwise_gelu_erf, 0.0f, 0.0f));
+    }
+    if (flags & BRGEMM_POSTOP_RELU) {
+        CHECK_DNNL(dnnl_post_ops_append_eltwise(post_ops, dnnl_eltwise_relu, 0.0f, 0.0f));
+    }
+
+    CHECK_DNNL(dnnl_brgemm_set_post_ops(kern.brgemm, ldd, dnnl_bf16, post_ops));
+    dnnl_post_ops_destroy(post_ops);
+
+    CHECK_DNNL(dnnl_brgemm_finalize(kern.brgemm));
+    CHECK_DNNL(dnnl_brgemm_generate(kern.brgemm));
+
+    size_t sz = 0;
+    CHECK_DNNL(dnnl_brgemm_get_scratchpad_size(kern.brgemm, &sz));
+    kern.scratchpad.resize(sz);
+
+    auto [inserted, _] = tls_brgemm_postops.emplace(key, std::move(kern));
+    return inserted->second;
+}
+
+void brgemm_bf16_linear_postops(
+    const void* input, brgemm_packed_b_t pw,
+    void* output,
+    const void* bias_bf16,
+    int postop_flags,
+    int64_t m, int64_t n_total,
+    int64_t n_start, int64_t n_end)
+{
+    if (m <= 0 || n_start >= n_end || !pw) return;
+
+    const uint16_t* A = (const uint16_t*)input;
+    uint16_t* out = (uint16_t*)output;
+    const uint16_t* packed = (const uint16_t*)pw->data;
+    int64_t k = pw->k;
+    int64_t block_n = pw->block_n;
+    // Stride between packed blocks matches the packer's tail-aware allocation.
+    int64_t k_padded = ((k + 1) / 2) * 2;  // vnni = 2 for BF16
+    int64_t block_elems = k_padded * block_n;
+
+    // Thread-local F32 accumulator
+    static thread_local std::vector<float> tls_postops_acc;
+    size_t acc_needed = (size_t)(m * BRGEMM_BLOCK_N);
+    if (tls_postops_acc.size() < acc_needed) tls_postops_acc.resize(acc_needed);
+    float* acc = tls_postops_acc.data();
+    int64_t offsets[2] = {0, 0};
+
+    int64_t nb_start = n_start / block_n;
+    int64_t nb_end = (n_end + block_n - 1) / block_n;
+
+    dnnl_ukernel_attr_params_t params = nullptr;
+    CHECK_DNNL(dnnl_ukernel_attr_params_create(&params));
+
+    const BrgemmPostopsKernel* current_kern = nullptr;
+
+    for (int64_t nb = nb_start; nb < nb_end; nb++) {
+        int64_t nc = nb * block_n;
+        int64_t actual_n = (nc + block_n <= pw->n) ? block_n : (pw->n - nc);
+
+        BrgemmPostopsKernel& kern = get_brgemm_postops_kernel(
+            m, actual_n, k, n_total, postop_flags);
+        if (&kern != current_kern) {
+            dnnl_brgemm_set_hw_context(kern.brgemm);
+            current_kern = &kern;
+        }
+
+        const void* B = packed + nb * block_elems;
+
+        // Set bias pointer for this block's columns
+        if (kern.num_binary_args > 0 && bias_bf16) {
+            const void* args[1] = { (const uint16_t*)bias_bf16 + nc };
+            CHECK_DNNL(dnnl_ukernel_attr_params_set_post_ops_args(params, args));
+        }
+
+        // D_ptr at column nc with stride n_total
+        uint16_t* D = out + nc;
+
+        CHECK_DNNL(dnnl_brgemm_execute_postops(kern.brgemm,
+            A, B, offsets,
+            acc, D, kern.scratchpad.data(), params));
+    }
+
+    dnnl_brgemm_release_hw_context();
+    tls_current = nullptr;
+    dnnl_ukernel_attr_params_destroy(params);
+}
+
 #else
 // Stubs when brgemm ukernel API is not available
 int brgemm_available(void) { return 0; }
@@ -1173,4 +1863,39 @@ void brgemm_qk_gemm(const uint16_t* q, const uint16_t* k, float* c,
     (void)q;(void)k;(void)c;(void)m;(void)n;(void)d;(void)qs;(void)ks;(void)ldc;(void)sm;
 }
 void brgemm_attn_release() {}
+// INT8 stubs
+int brgemm_s8_available(void) { return 0; }
+brgemm_s8_packed_b_t brgemm_s8_pack(const int8_t* w, const float* s, int64_t k, int64_t n) {
+    (void)w;(void)s;(void)k;(void)n; return NULL;
+}
+void brgemm_s8_pack_destroy(brgemm_s8_packed_b_t pw) { (void)pw; }
+float brgemm_quantize_bf16_s8(const void* in, int8_t* out, int64_t m, int64_t k) {
+    (void)in;(void)out;(void)m;(void)k; return 0.0f;
+}
+void brgemm_s8_linear(const int8_t* in, float as, brgemm_s8_packed_b_t pw,
+    void* out, int64_t m, int64_t nt, int64_t ns, int64_t ne)
+{
+    (void)in;(void)as;(void)pw;(void)out;(void)m;(void)nt;(void)ns;(void)ne;
+}
+// FP8 stubs
+int brgemm_f8_available(void) { return 0; }
+brgemm_f8_packed_b_t brgemm_f8e4m3_pack(const void* w, const float* s, int64_t k, int64_t n) {
+    (void)w;(void)s;(void)k;(void)n; return NULL;
+}
+void brgemm_f8_pack_destroy(brgemm_f8_packed_b_t pw) { (void)pw; }
+float brgemm_quantize_bf16_f8e4m3(const void* in, void* out, int64_t m, int64_t k) {
+    (void)in;(void)out;(void)m;(void)k; return 0.0f;
+}
+void brgemm_f8e4m3_linear(const void* in, float as, brgemm_f8_packed_b_t pw,
+    void* out, int64_t m, int64_t nt, int64_t ns, int64_t ne)
+{
+    (void)in;(void)as;(void)pw;(void)out;(void)m;(void)nt;(void)ns;(void)ne;
+}
+// Post-ops stubs
+void brgemm_bf16_linear_postops(const void* in, brgemm_packed_b_t pw,
+    void* out, const void* bias, int flags,
+    int64_t m, int64_t nt, int64_t ns, int64_t ne)
+{
+    (void)in;(void)pw;(void)out;(void)bias;(void)flags;(void)m;(void)nt;(void)ns;(void)ne;
+}
 #endif

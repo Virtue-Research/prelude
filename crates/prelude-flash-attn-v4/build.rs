@@ -15,7 +15,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const FA4_REPO: &str = "https://github.com/Dao-AILab/flash-attention.git";
-const FA4_BRANCH: &str = "main";
+// Pinned. Upstream adds/renames kernel parameters (e.g. `aux_tensors`) without
+// bumping a version, and our Rust binding in lib.rs encodes a fixed param
+// count, so a drifting `main` breaks the TVM FFI call with
+// `Expects N parameters when calling ...`. Bump deliberately when Rust bindings
+// are updated to match.
+const FA4_COMMIT: &str = "b322ae2675065ad96ad3c248fd6ef0f32252808f";
 
 /// Recursively search for a file by name under a directory.
 fn find_file_recursive(dir: &Path, name: &str) -> Option<PathBuf> {
@@ -283,6 +288,12 @@ fn compile_tvm_ffi_static(manifest_dir: &Path, out_dir: &Path) -> Result<()> {
         build.file(f);
     }
 
+    // TVM error helper for extracting error messages from TVM FFI calls
+    let error_helper = manifest_dir.join("src/tvm_error_helper.cc");
+    if error_helper.exists() {
+        build.file(&error_helper);
+    }
+
     // Use +whole-archive so kernel .o files can resolve TVM symbols at link time.
     build.link_lib_modifier("+whole-archive");
     build
@@ -291,16 +302,44 @@ fn compile_tvm_ffi_static(manifest_dir: &Path, out_dir: &Path) -> Result<()> {
 
     // Link libcuda_dialect_runtime_static.a with +whole-archive.
     // Kernel .o host code calls _cudaLibraryLoadData etc. from this library.
-    // Check vendor dir first, then the cutlass-dsl Python package in the build venv.
+    // Locations checked in order:
+    //   1. Vendor dir (pre-shipped copy).
+    //   2. Our build venv (OUT_DIR/fa4-venv) if we created one.
+    //   3. The active Python's nvidia_cutlass_dsl install — covers the case
+    //      where the user already has cutlass-dsl available system-wide and
+    //      ensure_python_env() skipped venv creation.
     let cuda_dialect_lib = "libcuda_dialect_runtime_static.a";
     let vendor_path = vendor_dir.join("cuda_dialect").join(cuda_dialect_lib);
-    let cuda_dialect_dir = if vendor_path.exists() {
+    let mut cuda_dialect_dir = if vendor_path.exists() {
         Some(vendor_dir.join("cuda_dialect"))
     } else {
-        // Search in the FA4 venv (cutlass-dsl installs it)
         find_file_recursive(&out_dir.join("fa4-venv"), cuda_dialect_lib)
             .map(|p| p.parent().unwrap().to_path_buf())
     };
+    if cuda_dialect_dir.is_none() {
+        for py in ["python3", "python"] {
+            // nvidia_cutlass_dsl is a namespace package (no __init__.py at top),
+            // so __file__ is None. Use __path__ instead, which is always populated.
+            let out = Command::new(py)
+                .args([
+                    "-c",
+                    "import os, nvidia_cutlass_dsl as m; \
+                     print(os.path.join(list(m.__path__)[0], 'lib'))",
+                ])
+                .output();
+            if let Ok(out) = out {
+                if out.status.success() {
+                    let candidate = PathBuf::from(
+                        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                    );
+                    if candidate.join(cuda_dialect_lib).exists() {
+                        cuda_dialect_dir = Some(candidate);
+                        break;
+                    }
+                }
+            }
+        }
+    }
     if let Some(dir) = cuda_dialect_dir {
         println!("cargo:rustc-link-search=native={}", dir.display());
         println!("cargo:rustc-link-lib=static:+whole-archive=cuda_dialect_runtime_static");
@@ -325,7 +364,9 @@ fn compile_tvm_ffi_static(manifest_dir: &Path, out_dir: &Path) -> Result<()> {
     if let Ok(cuda_path) = env::var("CUDA_PATH") {
         println!("cargo:rustc-link-search=native={cuda_path}/lib64");
     }
-    println!("cargo:rustc-link-lib=dylib=cudart");
+    println!("cargo:rustc-link-lib=static=cudart_static");
+    println!("cargo:rustc-link-lib=dylib=rt");   // required by cudart_static
+    println!("cargo:rustc-link-lib=dylib=dl");   // required by cudart_static
 
     // C++ stdlib
     println!("cargo:rustc-link-lib=dylib=stdc++");
@@ -359,47 +400,40 @@ fn ensure_fa4_source(out_dir: &Path) -> Result<PathBuf> {
         return Ok(fa4_src);
     }
 
-    println!("cargo:warning=Cloning flash-attention main branch...");
+    println!("cargo:warning=Cloning flash-attention @ {}...", &FA4_COMMIT[..8]);
 
     if fa4_src.exists() {
         std::fs::remove_dir_all(&fa4_src)?;
     }
 
+    // Full clone (no shallow/branch) so an arbitrary SHA can be checked out.
+    // `--filter=blob:limit=1m` keeps the download small by lazily fetching
+    // large blobs; only kernel sources we actually read are materialised.
     let status = Command::new("git")
         .args([
             "clone",
-            "--depth",
-            "1",
-            "--branch",
-            FA4_BRANCH,
-            "--single-branch",
             "--filter=blob:limit=1m",
+            "--no-checkout",
             FA4_REPO,
         ])
         .arg(&fa4_src)
         .status()
         .context("Failed to clone flash-attention repo")?;
-
     if !status.success() {
         anyhow::bail!("git clone failed for {FA4_REPO}");
     }
 
-    if !fa4_src.join("flash_attn/cute/__init__.py").exists() {
-        anyhow::bail!("flash_attn/cute/ not found in cloned repo");
+    let status = Command::new("git")
+        .args(["checkout", FA4_COMMIT])
+        .current_dir(&fa4_src)
+        .status()
+        .context("Failed to check out flash-attention @ {FA4_COMMIT}")?;
+    if !status.success() {
+        anyhow::bail!("git checkout failed for {FA4_COMMIT}");
     }
 
-    // Upstream bug: create_softcap_scoremod missing seqlen_info param.
-    // Tracked in https://github.com/Dao-AILab/flash-attention/pull/2366
-    let utils_py = fa4_src.join("flash_attn/cute/utils.py");
-    if utils_py.exists() {
-        let content = std::fs::read_to_string(&utils_py)?;
-        let patched = content.replace(
-            "def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, aux_tensors):",
-            "def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):",
-        );
-        if patched != content {
-            std::fs::write(&utils_py, patched)?;
-        }
+    if !fa4_src.join("flash_attn/cute/__init__.py").exists() {
+        anyhow::bail!("flash_attn/cute/ not found in cloned repo");
     }
 
     Ok(fa4_src)
@@ -585,7 +619,7 @@ fn ensure_python_env(out_dir: &Path) -> Result<String> {
         .unwrap_or(false);
 
     let base_pkgs = &[
-        "nvidia-cutlass-dsl",
+        "nvidia-cutlass-dsl>=4.4.2",
         "quack-kernels@git+https://github.com/Dao-AILab/quack.git",
         "torch",
         "einops",
@@ -613,7 +647,7 @@ fn ensure_python_env(out_dir: &Path) -> Result<String> {
     if !status.success() {
         anyhow::bail!(
             "Failed to install FA4 Python deps.\n\
-             Requires: pip install nvidia-cutlass-dsl torch"
+             Requires: pip install 'nvidia-cutlass-dsl>=4.4.2' torch"
         );
     }
 

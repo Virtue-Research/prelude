@@ -24,8 +24,9 @@ cutlass-gemm = ["cuda", "prelude-cutlass-gemm"]
 flashinfer = ["cuda", "prelude-flashinfer"]
 ## FlashInfer + FA4 combined: FlashInfer skips tvm_ffi compilation (FA4 provides it).
 flashinfer-v4 = ["flashinfer", "flash-attn-v4", "prelude-flashinfer/skip-tvm-ffi"]
+quant-gemm = ["cuda", "prelude-quant-gemm"]
 paged-attn = ["dep:candle-paged-attn"]
-full = ["flashinfer-v4", "deepgemm"]
+full = ["flashinfer-v4", "deepgemm", "quant-gemm"]
 hf_tokenizer = ["dep:tokenizers"]
 nvtx = []
 
@@ -52,10 +53,12 @@ prelude-flash-attn-v4 = { workspace = true, optional = true }
 prelude-deepgemm = { workspace = true, optional = true }
 prelude-cutlass-gemm = { workspace = true, optional = true }
 prelude-flashinfer = { workspace = true, optional = true }
+prelude-quant-gemm = { workspace = true, optional = true }
 inventory = "0.3"
 rayon = "1.11.0"
 nix = { version = "0.31", features = ["sched"] }
 tokenizers = { workspace = true, optional = true }
+bc-mimalloc.workspace = true
 
 [[bench]]
 name = "cpu_ops_bench"

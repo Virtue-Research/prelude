@@ -121,7 +121,7 @@ async fn gpu_worker_loop(
     engine: Arc<Engine>,
 ) {
     // CUDA graph cache — owned by this thread, no synchronization needed.
-    #[cfg(feature = "cuda")]
+    #[cfg(all(feature = "cuda", any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
     let mut graph_cache = {
         let block_size = engine
             .cache
@@ -138,15 +138,15 @@ async fn gpu_worker_loop(
     };
 
     // Eager CUDA graph warmup — capture all graphs before accepting requests.
-    #[cfg(feature = "cuda")]
+    #[cfg(all(feature = "cuda", any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
     graph_cache.warmup_all(&engine);
 
     tracing::info!("GPU worker started");
 
     while let Some(packet) = rx.recv().await {
-        #[cfg(feature = "cuda")]
+        #[cfg(all(feature = "cuda", any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
         execute_gpu_packet(&engine, packet, &mut graph_cache);
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(all(feature = "cuda", any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))))]
         execute_gpu_packet(&engine, packet);
     }
 
@@ -163,7 +163,8 @@ async fn gpu_worker_loop(
 fn execute_gpu_packet(
     engine: &Engine,
     packet: GpuPacket,
-    #[cfg(feature = "cuda")] graph_cache: &mut super::cuda_graph::DecodeGraphCache,
+    #[cfg(all(feature = "cuda", any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
+    graph_cache: &mut super::cuda_graph::DecodeGraphCache,
 ) {
     match packet {
         GpuPacket::GenerateBatch {

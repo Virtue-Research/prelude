@@ -12,10 +12,13 @@
 //! Uses NHD layout: `[num_blocks, block_size, num_kv_heads, head_dim]` — same
 //! as "flash layout" used by FA3/FA4.
 
+pub mod cascade;
 pub mod loader;
+pub mod sparse;
 pub mod types;
 
 pub use loader::{
-    Backend, DecodeKey, DecodeVariant, KernelDtype, KernelRegistry, MaskMode,
-    PrefillKey, PrefillVariant, TVMSafeCallFn,
+    Backend, DecodeKey, DecodeVariant, FP8PrefillKey, KernelDtype, KernelRegistry,
+    MLADecodeKey, MLADecodeVariant, MLAPagedKey, MLAPagedVariant,
+    MaskMode, PodKey, PodVariant, PrefillKey, PrefillVariant, TVMSafeCallFn,
 };
