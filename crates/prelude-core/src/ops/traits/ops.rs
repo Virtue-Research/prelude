@@ -271,6 +271,7 @@ pub use candle_nn::rotary_emb::rope_thd;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tensor::Device;
 
     /// Minimal Ops impl — all defaults inherited.
     struct StubOps;

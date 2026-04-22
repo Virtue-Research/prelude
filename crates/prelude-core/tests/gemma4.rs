@@ -2,7 +2,7 @@
 
 mod common;
 
-use prelude_core::tensor::{DType, Device, Module, Result, Tensor};
+use prelude_core::tensor::{DType, Device, Module, Result, Tensor, TensorExt};
 use prelude_core::ops::traits::{VarlenParams, MaskType};
 
 // ── Config parsing ──────────────────────────────────────────────────────

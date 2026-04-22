@@ -6,7 +6,7 @@
 
 mod common;
 
-use prelude_core::tensor::{DType, Device, Result, Tensor, D};
+use prelude_core::tensor::{DType, Device, Result, Tensor, TensorExt, D};
 use prelude_core::ops::{self, traits::{Ops, VarlenParams, MaskType}};
 
 /// Register device ops once, then return the test device.
@@ -18,8 +18,14 @@ fn dev() -> &'static Device {
         #[cfg(feature = "test-cuda")]
         prelude_cuda::register();
     });
-    static DEV: LazyLock<Device> = LazyLock::new(|| *common::test_devices().last().unwrap());
+    static DEV: LazyLock<Device> = LazyLock::new(|| common::test_devices().last().unwrap().clone());
     &DEV
+}
+
+/// Dtype configs to test for matmul-based tests. Candle CPU matmul is F32-only,
+/// so BF16/F16 are skipped unless the test device is CUDA.
+fn matmul_dtypes() -> &'static [&'static common::DTypeConfig] {
+    if dev().is_cuda() { common::ALL_DTYPES } else { &[&common::F32_CONFIG] }
 }
 
 /// Run a test body on ALL test devices (CPU + GPU if enabled).
@@ -240,7 +246,7 @@ fn matmul_vs_pytorch() -> Result<()> {
     let a_data = common::pseudo_random(m * k, 1.0);
     let b_data = common::pseudo_random(k * n, 2.0);
 
-    for cfg in common::ALL_DTYPES {
+    for cfg in matmul_dtypes() {
         let reference = require_pytorch_ref!(
             &[("a", &a_data), ("b", &b_data)],
             &format!(r#"
@@ -276,7 +282,7 @@ fn matmul_tall_skinny_vs_pytorch() -> Result<()> {
     let a_data = common::pseudo_random(m * k, 3.0);
     let b_data = common::pseudo_random(k * n, 4.0);
 
-    for cfg in common::ALL_DTYPES {
+    for cfg in matmul_dtypes() {
         let reference = require_pytorch_ref!(
             &[("a", &a_data), ("b", &b_data)],
             &format!(r#"
@@ -314,7 +320,7 @@ fn matmul_gemma4_double_wide_mlp_vs_pytorch() -> Result<()> {
     let a_data = common::pseudo_random(m * k, 7.0);
     let b_data = common::pseudo_random(k * n, 8.0);
 
-    for cfg in common::ALL_DTYPES {
+    for cfg in matmul_dtypes() {
         let reference = require_pytorch_ref!(
             &[("a", &a_data), ("b", &b_data)],
             &format!(r#"
@@ -344,6 +350,10 @@ write_output(y)
 /// Gemma4 attention: (7, 512) × (512, 7) — Q@K^T score computation
 #[test]
 fn matmul_gemma4_attn_score_vs_pytorch() -> Result<()> {
+    if !dev().is_cuda() {
+        eprintln!("SKIPPED: BF16 matmul requires CUDA");
+        return Ok(());
+    }
     let m = 7;
     let k = 512; // head_dim=512
     let n = 7;   // seq_len
@@ -381,6 +391,10 @@ write_output(y)
 /// to verify error accumulation stays bounded. Uses Gemma4-like dimensions.
 #[test]
 fn matmul_chained_14_layers_vs_pytorch() -> Result<()> {
+    if !dev().is_cuda() {
+        eprintln!("SKIPPED: BF16 matmul requires CUDA");
+        return Ok(());
+    }
     let seq = 7;
     let hidden = 1536;
     let inter = 6144;
@@ -1996,7 +2010,7 @@ fn linear_vs_pytorch() -> Result<()> {
     let x_data = common::pseudo_random(batch * in_dim, 9.0);
     let w_data = common::pseudo_random(out_dim * in_dim, 10.0);
 
-    for cfg in common::ALL_DTYPES {
+    for cfg in matmul_dtypes() {
         let reference = require_pytorch_ref!(
             &[("x", &x_data), ("w", &w_data)],
             &format!(r#"
@@ -2045,7 +2059,7 @@ fn chained_norm_linear_silu_vs_pytorch() -> Result<()> {
     let up_w = common::pseudo_random(inter * hidden, 14.0);
     let eps = 1e-6;
 
-    for cfg in common::ALL_DTYPES {
+    for cfg in matmul_dtypes() {
         let reference = require_pytorch_ref!(
             &[("x", &x_data), ("nw", &norm_w), ("gw", &gate_w), ("uw", &up_w)],
             &format!(r#"
@@ -2229,6 +2243,11 @@ fn run_varlen_attention_vs_pytorch(
     num_heads_q: usize, num_heads_k: usize, head_dim: usize,
     causal: bool, py_dtype: &str, dtype: DType, atol: f32, context: &str,
 ) -> Result<()> {
+    // Candle CPU matmul is F32-only; varlen_attention tests all use BF16.
+    if !dev().is_cuda() && dtype != DType::F32 {
+        eprintln!("SKIPPED ({context}): {dtype:?} matmul is GPU-only on candle");
+        return Ok(());
+    }
     let total_q: usize = seq_lens_q.iter().sum();
     let total_k: usize = seq_lens_k.iter().sum();
     let batch = seq_lens_q.len();

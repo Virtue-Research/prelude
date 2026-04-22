@@ -1120,7 +1120,7 @@ mod tests {
     #[test]
     fn flashinfer_paged_decode_engine_path() {
         crate::register();
-        let dev = Device::Cuda(0);
+        let dev = Device::new_cuda(0).expect("CUDA device required for flashinfer test");
 
         let num_qo: usize = 16;
         let num_kv: usize = 8;
@@ -1297,7 +1297,7 @@ mod tests {
     #[test]
     fn flashinfer_multi_layer_decode() {
         crate::register();
-        let dev = Device::Cuda(0);
+        let dev = Device::new_cuda(0).expect("CUDA device required for flashinfer test");
 
         let num_layers: usize = 28; // Qwen3-0.6B
         let num_qo: usize = 16;

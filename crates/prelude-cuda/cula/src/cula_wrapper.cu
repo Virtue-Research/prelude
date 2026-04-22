@@ -8,6 +8,8 @@
 
 // ── SM90: Fused KDA prefill ──────────────────────────────────────────
 
+#ifdef CULA_SM90A_ENABLED
+
 #include "kda/sm90/prefill_kernel.hpp"
 
 extern "C" int cula_kda_fwd_prefill_sm90(
@@ -55,6 +57,8 @@ extern "C" int cula_kda_fwd_prefill_sm90(
 
     return 0;
 }
+
+#endif // CULA_SM90A_ENABLED
 
 // ── SM100: Chunked intra-attention ───────────────────────────────────
 

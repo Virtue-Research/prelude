@@ -763,6 +763,7 @@ pub(crate) fn build_model_variant(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tensor::{Device, Tensor};
     use crate::tensor::safetensors::save as save_safetensors;
     use serde_json::json;
     use std::collections::HashMap;

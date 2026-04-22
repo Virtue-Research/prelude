@@ -59,11 +59,14 @@ fn priority_probe_and_device_matching() {
     );
 
     // GPU: fake_gpu probe fails, no other GPU backend → bare_ops fallback.
-    let gpu_ops = ops::select_ops(&Device::Cuda(0));
-    assert_eq!(
-        gpu_ops.attn_name(), "default",
-        "should fall back to bare_ops when GPU probe fails"
-    );
+    // Only run the CUDA half when a CUDA device is actually available.
+    if let Ok(cuda_dev) = Device::new_cuda(0) {
+        let gpu_ops = ops::select_ops(&cuda_dev);
+        assert_eq!(
+            gpu_ops.attn_name(), "default",
+            "should fall back to bare_ops when GPU probe fails"
+        );
+    }
 
     // Calling again should return the same cached result.
     let cpu_ops2 = ops::select_ops(&Device::Cpu);

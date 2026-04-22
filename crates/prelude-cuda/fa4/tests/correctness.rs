@@ -279,6 +279,7 @@ fn run_test(
 
     let q_shape: [i64; 3] = [total_tokens as _, num_heads_q as _, head_dim as _];
     let k_shape: [i64; 3] = [total_tokens as _, num_heads_k as _, head_dim as _];
+    let v_shape = k_shape;
     let o_shape = q_shape;
     let lse_shape: [i64; 2] = [num_heads_q as _, total_tokens as _];
     let cu_shape: [i64; 1] = [(batch_size + 1) as _];
@@ -292,7 +293,7 @@ fn run_test(
             softmax_scale,
             stream,
             cu_gpu, cu_gpu,
-            &q_shape, &k_shape, &o_shape, &lse_shape, &cu_shape,
+            &q_shape, &k_shape, &v_shape, &o_shape, &lse_shape, &cu_shape,
             0, window_left, window_right,
             None, None,
             dtype,
@@ -433,6 +434,7 @@ fn run_test_paged(
 
     let q_shape: [i64; 3] = [total_q as _, num_heads_q as _, head_dim as _];
     let k_shape: [i64; 4] = [total_blocks as _, block_size as _, num_heads_k as _, head_dim as _];
+    let v_shape: [i64; 4] = k_shape;
     let o_shape: [i64; 3] = q_shape;
     let lse_shape: [i64; 2] = [num_heads_q as _, total_q as _];
     let cu_q_shape: [i64; 1] = [(batch_size + 1) as _];
@@ -453,7 +455,7 @@ fn run_test_paged(
             cu_q_gpu,
             seqused_k_gpu,
             pt_gpu,
-            &q_shape, &k_shape, &o_shape, &lse_shape,
+            &q_shape, &k_shape, &v_shape, &o_shape, &lse_shape,
             &cu_q_shape, &seqused_k_shape, &pt_shape,
             0, None, None,
             KernelDtype::BF16,
@@ -680,6 +682,7 @@ fn test_fa4_determinism() {
 
     let q_shape: [i64; 3] = [total_tokens as _, num_heads_q as _, head_dim as _];
     let k_shape: [i64; 3] = [total_tokens as _, num_heads_k as _, head_dim as _];
+    let v_shape = k_shape;
     let o_shape = q_shape;
     let lse_shape: [i64; 2] = [num_heads_q as _, total_tokens as _];
     let cu_shape: [i64; 1] = [2];
@@ -697,7 +700,7 @@ fn test_fa4_determinism() {
                 1.0 / (head_dim as f32).sqrt(),
                 std::ptr::null_mut(),
                 cu_gpu, cu_gpu,
-                &q_shape, &k_shape, &o_shape, &lse_shape, &cu_shape,
+                &q_shape, &k_shape, &v_shape, &o_shape, &lse_shape, &cu_shape,
                 0, None, None, None, None,
                 KernelDtype::BF16,
             )

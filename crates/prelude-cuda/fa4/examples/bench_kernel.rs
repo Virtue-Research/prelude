@@ -220,6 +220,7 @@ fn bench_varlen(registry: &KernelRegistry, cublas: &CuBlas, cublas_handle: cubla
 
             let q_shape: [i64; 3] = [seq_len as _, cfg.num_heads_q as _, cfg.head_dim as _];
             let k_shape: [i64; 3] = [seq_len as _, cfg.num_heads_k as _, cfg.head_dim as _];
+            let v_shape = k_shape;
             let o_shape = q_shape;
             let lse_shape: [i64; 2] = [cfg.num_heads_q as _, seq_len as _];
             let cu_shape: [i64; 1] = [2];
@@ -235,7 +236,7 @@ fn bench_varlen(registry: &KernelRegistry, cublas: &CuBlas, cublas_handle: cubla
                         softmax_scale,
                         std::ptr::null_mut(),
                         cu_gpu, cu_gpu,
-                        &q_shape, &k_shape, &o_shape, &lse_shape, &cu_shape,
+                        &q_shape, &k_shape, &v_shape, &o_shape, &lse_shape, &cu_shape,
                         0, None, None, None, None,
                         KernelDtype::BF16,
                     )
@@ -367,6 +368,7 @@ fn bench_paged(registry: &KernelRegistry) {
 
             let q_shape: [i64; 3] = [q_len as _, cfg.num_heads_q as _, cfg.head_dim as _];
             let k_shape: [i64; 4] = [num_blocks as _, block_size as _, cfg.num_heads_k as _, cfg.head_dim as _];
+            let v_shape: [i64; 4] = k_shape;
             let o_shape: [i64; 3] = q_shape;
             let lse_shape: [i64; 2] = [cfg.num_heads_q as _, q_len as _];
             let cu_q_shape: [i64; 1] = [2];
@@ -385,7 +387,7 @@ fn bench_paged(registry: &KernelRegistry) {
                         softmax_scale,
                         std::ptr::null_mut(),
                         cu_q_gpu, sk_gpu, pt_gpu,
-                        &q_shape, &k_shape, &o_shape, &lse_shape,
+                        &q_shape, &k_shape, &v_shape, &o_shape, &lse_shape,
                         &cu_q_shape, &sk_shape, &pt_shape,
                         0, None, None,
                         KernelDtype::BF16,

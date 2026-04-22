@@ -170,7 +170,7 @@ pub async fn ar_loop(
 
         // ── Phase 4: Build ForwardBatch and submit to Executor ──────
         let mut exhausted: Vec<String> = Vec::new();
-        let batch = build_forward_batch(&engine, &mut states, &step, &mut exhausted);
+        let batch = build_forward_batch(&engine.cache, &mut states, &step, &mut exhausted);
         for id in &exhausted {
             // KV pool ran out while allocating for this decode tick. Abort
             // cleanly instead of letting the forward read past block_table.
@@ -268,7 +268,7 @@ fn handle_message(
 // ── Batch construction ─────────────────────────────────────────────
 
 fn build_forward_batch(
-    engine: &Engine,
+    cache: &crate::scheduler::components::cache::manager::CacheManager,
     states: &mut HashMap<String, ArSequenceState>,
     step: &SchedulerStep,
     exhausted: &mut Vec<String>,
@@ -299,8 +299,8 @@ fn build_forward_batch(
         // Each sequence may cross a block boundary during decode; if the pool
         // is exhausted, the sequence can't continue and must be terminated —
         // otherwise paged decode reads past the end of `block_table`.
-        if let Some(pool) = engine.cache.paged_pool.as_ref() {
-            if let Some(bm_mutex) = engine.cache.block_manager.as_ref() {
+        if let Some(pool) = cache.paged_pool.as_ref() {
+            if let Some(bm_mutex) = cache.block_manager.as_ref() {
                 if let Ok(mut bm) = bm_mutex.lock() {
                     for id in &step.decode_request_ids {
                         if let Some(state) = states.get_mut(id) {
@@ -784,8 +784,9 @@ mod tests {
         states.insert("s2".to_string(), make_decode_state("s2", 99, 8));
 
         let step = SchedulerStep::decode(vec!["s1".into(), "s2".into()]);
+        let cache = crate::scheduler::components::cache::manager::CacheManager::empty_for_test();
         let mut exhausted = Vec::new();
-        let batch = build_forward_batch(&engine, &mut states, &step, &mut exhausted);
+        let batch = build_forward_batch(&cache, &mut states, &step, &mut exhausted);
 
         match batch {
             ForwardBatch::Decode { tokens, positions, block_tables, deltanet_slots } => {
@@ -809,8 +810,9 @@ mod tests {
         states.insert("s2".to_string(), s2);
 
         let step = SchedulerStep::decode(vec!["s1".into(), "s2".into()]);
+        let cache = crate::scheduler::components::cache::manager::CacheManager::empty_for_test();
         let mut exhausted = Vec::new();
-        let batch = build_forward_batch(&engine, &mut states, &step, &mut exhausted);
+        let batch = build_forward_batch(&cache, &mut states, &step, &mut exhausted);
 
         match batch {
             ForwardBatch::Decode { deltanet_slots, .. } => {
@@ -835,8 +837,9 @@ mod tests {
         assert!(states.get("r1").unwrap().prepared.is_some());
 
         let step = SchedulerStep::prefill(vec!["r1".into()]);
+        let cache = crate::scheduler::components::cache::manager::CacheManager::empty_for_test();
         let mut exhausted = Vec::new();
-        let batch = build_forward_batch(&engine, &mut states, &step, &mut exhausted);
+        let batch = build_forward_batch(&cache, &mut states, &step, &mut exhausted);
 
         match batch {
             ForwardBatch::Prefill { items } => {
