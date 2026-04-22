@@ -18,4 +18,8 @@ onednn-ffi/buildCargo.lock
 .cargo-ok
 .cargo_vcs_info.json
 *.orig
+<<<<<<< Updated upstream
 genai_bench.log
+=======
+/local_test/
+>>>>>>> Stashed changes

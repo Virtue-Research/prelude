@@ -169,7 +169,25 @@ pub async fn ar_loop(
         };
 
         // ── Phase 4: Build ForwardBatch and submit to Executor ──────
-        let batch = build_forward_batch(&engine, &mut states, &step);
+        let mut exhausted: Vec<String> = Vec::new();
+        let batch = build_forward_batch(&engine, &mut states, &step, &mut exhausted);
+        for id in &exhausted {
+            // KV pool ran out while allocating for this decode tick. Abort
+            // cleanly instead of letting the forward read past block_table.
+            scheduler.finish_request(
+                id,
+                crate::scheduler::SeqFinishReason::Abort("paged KV pool exhausted".into()),
+            );
+            if let Some(state) = states.remove(id) {
+                fail_state(
+                    &engine,
+                    state,
+                    EngineError::Unavailable(
+                        "paged KV pool exhausted mid-decode".into(),
+                    ),
+                );
+            }
+        }
         let handle = match executor.submit(batch) {
             Ok(h) => h,
             Err(error) => {
@@ -253,11 +271,23 @@ fn build_forward_batch(
     engine: &Engine,
     states: &mut HashMap<String, ArSequenceState>,
     step: &SchedulerStep,
+    exhausted: &mut Vec<String>,
 ) -> ForwardBatch {
     if !step.prefill_request_ids.is_empty() {
         // Prefill: take PreparedGenerateRequests for the forward pass.
         // They're put back into states after process_output so decode steps
         // can still read max_new, logprobs, and stop config.
+        if !step.decode_request_ids.is_empty() {
+            // `mixed_chunked` scheduling emits both sets; the executor's
+            // ForwardBatch has no Mixed variant yet, so decode work in this
+            // tick is dropped. mixed_chunked is off by default; if it ever
+            // becomes default, this branch must grow a Mixed variant.
+            tracing::warn!(
+                prefill = step.prefill_request_ids.len(),
+                decode_dropped = step.decode_request_ids.len(),
+                "mixed scheduler step: decode IDs deferred (no ForwardBatch::Mixed yet)"
+            );
+        }
         let items: Vec<_> = step.prefill_request_ids.iter()
             .filter_map(|id| {
                 states.get_mut(id).and_then(|s| s.prepared.take())
@@ -266,15 +296,25 @@ fn build_forward_batch(
         ForwardBatch::Prefill { items }
     } else {
         // Allocate new KV cache blocks where needed before building the batch.
-        // Each sequence may cross a block boundary during decode.
+        // Each sequence may cross a block boundary during decode; if the pool
+        // is exhausted, the sequence can't continue and must be terminated —
+        // otherwise paged decode reads past the end of `block_table`.
         if let Some(pool) = engine.cache.paged_pool.as_ref() {
             if let Some(bm_mutex) = engine.cache.block_manager.as_ref() {
                 if let Ok(mut bm) = bm_mutex.lock() {
                     for id in &step.decode_request_ids {
                         if let Some(state) = states.get_mut(id) {
                             if state.next_decode_position % pool.block_size == 0 {
-                                if let Some(new_block) = bm.allocate() {
-                                    state.block_table.push(new_block);
+                                match bm.allocate() {
+                                    Some(new_block) => state.block_table.push(new_block),
+                                    None => {
+                                        tracing::warn!(
+                                            request_id = id,
+                                            position = state.next_decode_position,
+                                            "paged KV pool exhausted; terminating sequence"
+                                        );
+                                        exhausted.push(id.clone());
+                                    }
                                 }
                             }
                         }
@@ -283,7 +323,8 @@ fn build_forward_batch(
             }
         }
 
-        // Decode: collect (token, position, block_table) per sequence
+        // Decode: collect (token, position, block_table) per sequence.
+        // Skip anything we just marked exhausted — the caller terminates them.
         let cap = step.decode_request_ids.len();
         let mut tokens = Vec::with_capacity(cap);
         let mut positions = Vec::with_capacity(cap);
@@ -291,6 +332,7 @@ fn build_forward_batch(
         let mut dn_slots: Vec<u32> = Vec::new();
         let mut has_dn = false;
         for id in &step.decode_request_ids {
+            if exhausted.iter().any(|e| e == id) { continue; }
             if let Some(state) = states.get(id) {
                 tokens.push(state.pending_token.unwrap_or(0));
                 positions.push(state.next_decode_position);
@@ -742,7 +784,8 @@ mod tests {
         states.insert("s2".to_string(), make_decode_state("s2", 99, 8));
 
         let step = SchedulerStep::decode(vec!["s1".into(), "s2".into()]);
-        let batch = build_forward_batch(&engine, &mut states, &step);
+        let mut exhausted = Vec::new();
+        let batch = build_forward_batch(&engine, &mut states, &step, &mut exhausted);
 
         match batch {
             ForwardBatch::Decode { tokens, positions, block_tables, deltanet_slots } => {
@@ -766,7 +809,8 @@ mod tests {
         states.insert("s2".to_string(), s2);
 
         let step = SchedulerStep::decode(vec!["s1".into(), "s2".into()]);
-        let batch = build_forward_batch(&engine, &mut states, &step);
+        let mut exhausted = Vec::new();
+        let batch = build_forward_batch(&engine, &mut states, &step, &mut exhausted);
 
         match batch {
             ForwardBatch::Decode { deltanet_slots, .. } => {
@@ -791,7 +835,8 @@ mod tests {
         assert!(states.get("r1").unwrap().prepared.is_some());
 
         let step = SchedulerStep::prefill(vec!["r1".into()]);
-        let batch = build_forward_batch(&engine, &mut states, &step);
+        let mut exhausted = Vec::new();
+        let batch = build_forward_batch(&engine, &mut states, &step, &mut exhausted);
 
         match batch {
             ForwardBatch::Prefill { items } => {
