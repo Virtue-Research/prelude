@@ -414,10 +414,22 @@ fn process_prefill_output(
         let Some(result) = results.get(i) else { continue; };
         let Some(state) = states.get_mut(request_id) else { continue; };
 
-        // Populate state from prefill result
+        // Populate state from prefill result.
+        //
+        // `next_decode_position` is the semantic position of `pending_token` —
+        // i.e. the position feed to RoPE / KV-slot lookup on the next decode
+        // step. `first_token` lives at `prompt_len` (prefill covered 0..prompt_len-1,
+        // so first_token is the token sampled for position `prompt_len`).
+        // `process_single_token` unconditionally increments, so start one less
+        // and let it tick up to `prompt_len`. Without this, a prompt whose
+        // length is an exact multiple of the paged block size would panic
+        // with an index-out-of-bounds on the block_table — the allocation
+        // check at the top of `build_forward_batch` reads next_decode_position
+        // and wouldn't trigger a new block when the position was really the
+        // boundary.
         state.block_table = result.block_table.clone();
         state.prompt_len = result.prompt_len;
-        state.next_decode_position = result.prompt_len;
+        state.next_decode_position = result.prompt_len.saturating_sub(1);
         state.prefill_ms = result.prefill_ms;
         state.deltanet_slot = result.deltanet_slot;
         state.prompt_token_logprobs = result.prompt_token_logprobs.clone();
