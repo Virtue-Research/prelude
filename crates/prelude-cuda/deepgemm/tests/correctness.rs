@@ -168,6 +168,46 @@ fn bf16_gemm_prefill_shapes() {
 }
 
 // ============================================================================
+// BF16 GEMM — SM103 (B300) multicast=2 regression
+//
+// `M=1408, N=3072, K=1024` is a minimal repro of a Blackwell-Ultra crash:
+// `select_sm100_config` picks
+//     (BM=256, BN=128, stages=4, swizzle_d=128, multicast=2)
+// for this shape, and the matching kernel variant crashes on B300 with
+// "out-of-range shared or local address" (compute-sanitizer catches it
+// inside `sm100_bf16_gemm_impl<…, 256, 128, …, 2, false>`). The shape is
+// Qwen3-0.6B's gate_proj / up_proj during an 11-paged-block prefill
+// (hidden=1024, intermediate=3072, 11*128=1408 tokens).
+//
+// With the SM103 gate in `src/sm100_bf16.cuh` (downgrade `best_bm = 128`
+// when `g_gpu_arch == 103 && best_bm == 256 && best_bn == 128`) the test
+// reroutes to the smaller, safe tile and passes.
+//
+// To reproduce the upstream crash for debugging, delete that gate and run:
+//
+//   CUDA_VISIBLE_DEVICES=<B300> cargo test --release -p prelude-deepgemm \
+//       --test correctness -- bf16_gemm_sm103_multicast2_repro --nocapture
+//
+// For the kernel-level ISA backtrace:
+//
+//   CUDA_VISIBLE_DEVICES=<B300> \
+//       /usr/local/cuda/bin/compute-sanitizer --tool memcheck \
+//           --log-file /tmp/dg-sm103.log \
+//           target/release/deps/correctness-<hash> \
+//           --test-threads=1 --exact bf16_gemm_sm103_multicast2_repro
+//   grep -A4 "Out-of-range" /tmp/dg-sm103.log
+//
+// Other shapes that hit the same heuristic output on 132-SM Blackwell:
+//   (M∈{1408,1920,2304}, N∈{3072,4096}, K∈{1024,2048,3072,4096}, …).
+// See the full list: uncomment `scan_sm100_configs` below and rerun.
+// ============================================================================
+#[test]
+fn bf16_gemm_sm103_multicast2_repro() {
+    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    run_test(1408, 3072, 1024, &gpu);
+}
+
+// ============================================================================
 // BF16 GEMM — query_config sanity
 // ============================================================================
 

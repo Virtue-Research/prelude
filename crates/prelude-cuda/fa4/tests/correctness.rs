@@ -782,3 +782,19 @@ fn test_fa4_paged_long_kv() {
 
 // NOTE: FA4 paged with Q=1 (decode) produces incorrect results on SM90.
 // Our dispatch routes Q=1 decode to FA3, so this is not a production issue.
+
+// Regression tests for Qwen3-0.6B shapes that previously failed in production.
+// Initially suspected to be FA4 bugs; compute-sanitizer traced the actual crash
+// to DeepGEMM's sm100_bf16_gemm_impl<256,128,4,128,2,false> on SM103 — FA4
+// itself handles all these shapes correctly, as these tests confirm.
+// Keeping them as explicit shape-coverage guards since the dense 0.6B/1.7B/4B
+// models go through exactly these total_q values for the accuracy suite.
+#[test]
+fn test_fa4_hdim128_gqa2_varlen_1408() {
+    run_test(128, 16, 8, &[0, 1408], true, None, None, None, KernelDtype::BF16, 2e-2, 2e-2);
+}
+
+#[test]
+fn test_fa4_hdim128_gqa2_varlen_1920() {
+    run_test(128, 16, 8, &[0, 1920], true, None, None, None, KernelDtype::BF16, 2e-2, 2e-2);
+}
