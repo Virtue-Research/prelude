@@ -152,7 +152,7 @@ impl Engine {
         &self,
         batch: super::executor::ForwardBatch,
     ) -> Result<super::executor::ModelOutput, EngineError> {
-        use super::executor::{ForwardBatch, ModelOutput};
+        use super::executor::ForwardBatch;
 
         match batch {
             ForwardBatch::Prefill { items } => self.forward_prefill(items),
