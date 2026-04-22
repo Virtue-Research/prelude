@@ -63,22 +63,24 @@ struct Cli {
 
     #[arg(
         long,
-        default_value_t = 4096,
-        help = "Max prefill tokens per scheduling step"
+        default_value_t = 0,
+        help = "Max prefill tokens per scheduling step. 0 = read model's max_position_embeddings"
     )]
     max_prefill_tokens: usize,
 
     #[arg(
         long,
-        default_value_t = 32768,
-        help = "Max total tokens across all running requests"
+        default_value_t = 0,
+        help = "Max total tokens across all running requests. \
+                0 = max_position_embeddings * max_running_requests"
     )]
     max_total_tokens: usize,
 
     #[arg(
         long,
-        default_value_t = 4096,
-        help = "Per-request cap for reserving future decode tokens in the scheduler"
+        default_value_t = 0,
+        help = "Per-request cap for reserving future decode tokens in the scheduler. \
+                0 = read model's max_position_embeddings"
     )]
     decode_reservation_cap: usize,
 
@@ -222,13 +224,30 @@ fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
         return Ok(Arc::new(base_engine));
     }
 
+    // 0 = "auto-size from model's max_position_embeddings". Models advertise
+    // their full context window (e.g. Qwen3-0.6B: 40960) — fall back to that
+    // instead of an arbitrary CLI default that silently truncates long prompts.
+    let ctx_len = base_engine.max_context_len();
+    let max_prefill_tokens = match cli.max_prefill_tokens {
+        0 => ctx_len,
+        n => n,
+    };
+    let decode_reservation_cap = match cli.decode_reservation_cap {
+        0 => ctx_len,
+        n => n,
+    };
+    let max_total_tokens = match cli.max_total_tokens {
+        0 => ctx_len.saturating_mul(cli.max_running_requests.max(1)),
+        n => n,
+    };
+
     let scheduler_config = SchedulerConfig {
         max_batch_size: cli.max_batch_size,
         max_batch_wait_ms: cli.max_batch_wait_ms,
         max_running_requests: cli.max_running_requests,
-        max_prefill_tokens: cli.max_prefill_tokens,
-        max_total_tokens: cli.max_total_tokens,
-        decode_reservation_cap: cli.decode_reservation_cap,
+        max_prefill_tokens,
+        max_total_tokens,
+        decode_reservation_cap,
         ..SchedulerConfig::default()
     };
     info!(
