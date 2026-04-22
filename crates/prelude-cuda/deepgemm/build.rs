@@ -68,7 +68,10 @@ fn main() {
     let obj = out_dir.join("deepgemm_wrapper.o");
 
     let sm100 = nvcc_supports_sm100(&nvcc);
-    if sm100 {
+    let sm103 = nvcc_supports_sm103(&nvcc);
+    if sm103 {
+        build_log!("compiling for SM90a + SM100a + SM103a (fat binary)");
+    } else if sm100 {
         build_log!("compiling for SM90a + SM100a (fat binary)");
     } else {
         build_log!("compiling for SM90a only (CUDA toolkit lacks SM100 support)");
@@ -79,6 +82,13 @@ fn main() {
         .arg("-gencode=arch=compute_90a,code=sm_90a");
     if sm100 {
         nvcc_cmd.arg("-gencode=arch=compute_100a,code=sm_100a");
+    }
+    if sm103 {
+        // Blackwell-Ultra (B300) has compute cap 10.3. sm_100a cubin won't run
+        // on it ("no kernel image is available for execution on the device")
+        // and "a"-variant PTX isn't forward-compatible across the family,
+        // so emit a native sm_103a cubin when the toolkit supports it.
+        nvcc_cmd.arg("-gencode=arch=compute_103a,code=sm_103a");
     }
     let status = nvcc_cmd
         .args(&include_args)
@@ -307,6 +317,18 @@ fn nvcc_supports_sm100(nvcc: &Path) -> bool {
     match output {
         Ok(o) if o.status.success() => {
             String::from_utf8_lossy(&o.stdout).contains("compute_100")
+        }
+        _ => false,
+    }
+}
+
+fn nvcc_supports_sm103(nvcc: &Path) -> bool {
+    let output = Command::new(nvcc)
+        .args(["--list-gpu-arch"])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).contains("compute_103")
         }
         _ => false,
     }

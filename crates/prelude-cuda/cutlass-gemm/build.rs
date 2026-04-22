@@ -43,7 +43,10 @@ fn main() {
     let obj = out_dir.join("cutlass_wrapper.o");
 
     let sm100 = nvcc_supports_sm100(&nvcc);
-    if sm100 {
+    let sm103 = nvcc_supports_sm103(&nvcc);
+    if sm103 {
+        build_log!("compiling 3.x for SM80 + SM90a + SM100a + SM103a (fat binary)");
+    } else if sm100 {
         build_log!("compiling 3.x for SM80 + SM90a + SM100a (fat binary)");
     } else {
         build_log!("compiling 3.x for SM80 + SM90a");
@@ -62,6 +65,12 @@ fn main() {
     ]);
     if sm100 {
         nvcc_cmd.arg("-gencode=arch=compute_100a,code=sm_100a");
+    }
+    if sm103 {
+        // B300 is SM103, sm_100a cubin doesn't run on it and "a" PTX is not
+        // forward-compatible across the Blackwell family — need a native
+        // sm_103a cubin. See prelude-deepgemm build.rs for the same fix.
+        nvcc_cmd.arg("-gencode=arch=compute_103a,code=sm_103a");
     }
     let status = nvcc_cmd
         .args([
@@ -93,6 +102,9 @@ fn main() {
     ]);
     if sm100 {
         naive_cmd.arg("-gencode=arch=compute_100a,code=sm_100a");
+    }
+    if sm103 {
+        naive_cmd.arg("-gencode=arch=compute_103a,code=sm_103a");
     }
     let status = naive_cmd
         .args([
@@ -145,6 +157,14 @@ fn nvcc_supports_sm100(nvcc: &Path) -> bool {
         .arg("--list-gpu-arch")
         .output()
         .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("compute_100"))
+        .unwrap_or(false)
+}
+
+fn nvcc_supports_sm103(nvcc: &Path) -> bool {
+    Command::new(nvcc)
+        .arg("--list-gpu-arch")
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("compute_103"))
         .unwrap_or(false)
 }
 

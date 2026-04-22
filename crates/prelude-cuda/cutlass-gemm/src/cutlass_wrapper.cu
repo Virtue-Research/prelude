@@ -570,19 +570,33 @@ extern "C" int cutlass_gemm_dispatch(
     cudaGetLastError();
 
 #if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
+    // SM90 kernels use the `wgmma` family — those instructions only exist on SM90
+    // itself. On Blackwell (SM100/SM103) the compiled kernel still links OK
+    // (because we also build for sm_103a), but running it triggers CUTLASS's
+    // `Arch conditional MMA instruction used without targeting appropriate
+    // compute capability` device-side assert and takes the whole process down.
+    // Gate the SM90 path on the runtime compute major == 9.
     {
-        int ret;
-        switch (dtype) {
-            case 0: ret = launch<Sm90_Default<BF16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
-            case 1: ret = launch<Sm90_Default<FP16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
-            case 2: ret = launch<Sm90_F32<float>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
-            case 3: ret = launch<Sm90_FP8<FP8E4M3>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
-            default: ret = -20; break;
+        static int s_cc_major = -1;
+        if (s_cc_major < 0) {
+            int dev = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&s_cc_major, cudaDevAttrComputeCapabilityMajor, dev);
         }
-        if (ret == 0) return 0;
-        // SM90 failed — fall through to SM80
-        fprintf(stderr, "CUTLASS: SM90 failed (code %d) for m=%d n=%d k=%d dtype=%u, falling back to SM80\n",
-                ret, m, n, k, dtype);
+        if (s_cc_major == 9) {
+            int ret;
+            switch (dtype) {
+                case 0: ret = launch<Sm90_Default<BF16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
+                case 1: ret = launch<Sm90_Default<FP16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
+                case 2: ret = launch<Sm90_F32<float>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
+                case 3: ret = launch<Sm90_FP8<FP8E4M3>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
+                default: ret = -20; break;
+            }
+            if (ret == 0) return 0;
+            // SM90 failed — log and fall through to SM80
+            fprintf(stderr, "CUTLASS: SM90 failed (code %d) for m=%d n=%d k=%d batch=%d dtype=%u, falling back to SM80\n",
+                    ret, m, n, k, batch, dtype);
+        }
     }
 #endif
 

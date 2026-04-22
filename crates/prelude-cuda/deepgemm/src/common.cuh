@@ -350,7 +350,13 @@ static int launch_kernel(const void* kernel_ptr, int num_threads, int smem_size,
                          int num_multicast, void** args, cudaStream_t stream) {
     dim3 grid(g_num_sms, 1, 1);
     dim3 block(num_threads, 1, 1);
-    cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    cudaError_t attr_err = cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    if (attr_err != cudaSuccess) {
+        fprintf(stderr, "DeepGEMM: cudaFuncSetAttribute failed: %s (smem=%d)\n",
+                cudaGetErrorString(attr_err), smem_size);
+        cudaGetLastError();
+        return -3;
+    }
 
     if (num_multicast > 1) {
         cudaLaunchConfig_t lc = {};
@@ -360,11 +366,15 @@ static int launch_kernel(const void* kernel_ptr, int num_threads, int smem_size,
         attrs[0].id = cudaLaunchAttributeClusterDimension;
         attrs[0].val.clusterDim = {(unsigned)num_multicast, 1, 1};
         lc.attrs = attrs; lc.numAttrs = 1;
-        if (cudaLaunchKernelExC(&lc, kernel_ptr, args) != cudaSuccess) {
+        cudaError_t err = cudaLaunchKernelExC(&lc, kernel_ptr, args);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "DeepGEMM: cudaLaunchKernelExC failed: %s\n", cudaGetErrorString(err));
             cudaGetLastError(); return -2;
         }
     } else {
-        if (cudaLaunchKernel(kernel_ptr, grid, block, args, smem_size, stream) != cudaSuccess) {
+        cudaError_t err = cudaLaunchKernel(kernel_ptr, grid, block, args, smem_size, stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "DeepGEMM: cudaLaunchKernel failed: %s\n", cudaGetErrorString(err));
             cudaGetLastError(); return -2;
         }
     }
