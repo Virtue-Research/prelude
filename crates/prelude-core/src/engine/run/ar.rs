@@ -333,11 +333,30 @@ fn build_step_batch(
         let deltanet_slot = seq.deltanet_slot;
         if current_blocks < total_blocks_needed {
             for _ in current_blocks..total_blocks_needed {
-                if let Some(block) = scheduler.allocate_block() {
-                    if let Some(seq_mut) = scheduler.get_sequence_mut(id) {
-                        seq_mut.block_table.push(block);
+                match scheduler.allocate_block() {
+                    Some(block) => {
+                        if let Some(seq_mut) = scheduler.get_sequence_mut(id) {
+                            seq_mut.block_table.push(block);
+                        }
                     }
+                    None => break,
                 }
+            }
+            // If the pool was exhausted, skip this chunk rather than build a
+            // short block_table. batch_mixed_paged indexes block_table by
+            // pos / block_size and would panic on an undersized table.
+            let actual = scheduler
+                .get_sequence(id)
+                .map(|s| s.block_table.len())
+                .unwrap_or(0);
+            if actual < total_blocks_needed {
+                tracing::warn!(
+                    request_id = %id,
+                    needed = total_blocks_needed,
+                    got = actual,
+                    "KV block pool exhausted during prefill chunk allocation — skipping this step"
+                );
+                continue;
             }
         }
 
@@ -426,11 +445,14 @@ fn process_step_output(
             continue;
         };
 
-        let chunk_len = step.prefill_chunk_lens.get(i).copied().unwrap_or(0);
+        let _ = step.prefill_chunk_lens.get(i); // chunk_len unused here; see kv_computed_len below
         let full_prompt_len = seq.input_ids.len();
+        // scheduler::schedule_step already incremented kv_computed_len to reflect
+        // this chunk's tokens. Don't add chunk_len again — doing so double-counts
+        // and flags the second-to-last chunk as final on prompts where the last
+        // chunk is shorter than the chunk budget.
         let computed = seq.kv_computed_len;
-        let end = (computed + chunk_len).min(full_prompt_len);
-        let is_final = end >= full_prompt_len;
+        let is_final = computed >= full_prompt_len;
 
         // Update scheduler sequence block table and state from prefill result.
         // kv_computed_len and status were already updated by the scheduler
@@ -445,14 +467,23 @@ fn process_step_output(
         }
 
         if is_final {
-            // Final chunk: sample first token from logits
+            // Final chunk: sample first token from logits. Mirror the decode
+            // path's sampling: greedy → argmax, otherwise route through the
+            // request's own `LogitsProcessor` so temperature/top-p/penalties
+            // still apply to this first token.
             if let Ok(row) = output.logits.get(logit_row) {
-                let token = row
-                    .argmax(crate::tensor::D::Minus1)
-                    .and_then(|t| t.to_scalar::<u32>())
-                    .unwrap_or(0);
-
-                // TODO: use logits_processor from prepared for non-greedy sampling
+                let token = if state.is_greedy() {
+                    row.argmax(crate::tensor::D::Minus1)
+                        .and_then(|t| t.to_scalar::<u32>())
+                        .unwrap_or(0)
+                } else if let Some(ref mut prepared) = state.prepared {
+                    let row_f32 = row.to_dtype(crate::tensor::DType::F32).unwrap();
+                    prepared.logits_processor.sample(&row_f32).unwrap_or(0)
+                } else {
+                    row.argmax(crate::tensor::D::Minus1)
+                        .and_then(|t| t.to_scalar::<u32>())
+                        .unwrap_or(0)
+                };
                 process_single_token(engine, scheduler, state, request_id, token, None, &mut completed);
             }
         }
