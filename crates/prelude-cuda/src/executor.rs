@@ -31,14 +31,22 @@ impl CudaExecutor {
         let worker = std::thread::Builder::new()
             .name("gpu-executor".into())
             .spawn(move || {
-                // Initialize CUDA graph cache
+                // Initialize CUDA graph cache.
+                //
+                // Models whose decode forward allocates inside the forward
+                // (MoE expert dispatch, hybrid state machines, etc.) set
+                // `runtime_caps.supports_cuda_graph = false`. Capturing them
+                // trips `cudaErrorStreamCaptureUnsupported` and aborts the
+                // executor; treat that like a DeltaNet model and skip
+                // capture.
                 let block_size = worker_engine.cache.paged_pool.as_ref()
                     .map(|p| p.block_size).unwrap_or(128);
-                let has_deltanet = worker_engine.cache.deltanet_pool.is_some();
+                let disable_graph = worker_engine.cache.deltanet_pool.is_some()
+                    || !worker_engine.runtime_caps().supports_cuda_graph;
                 let mut graph_cache = DecodeGraphCache::new(
                     &worker_engine.engine_config,
                     block_size,
-                    has_deltanet,
+                    disable_graph,
                 );
                 graph_cache.warmup_all(&worker_engine);
 
