@@ -16,23 +16,28 @@ prelude-server [OPTIONS]
 | `--max-batch-size <N>` | `32` | Max requests per batch |
 | `--max-batch-wait-ms <MS>` | `5` | Max wait time before batch dispatch |
 | `--max-running-requests <N>` | `8` | Max concurrent running requests |
-| `--max-prefill-tokens <N>` | `4096` | Max prefill tokens per step |
-| `--max-total-tokens <N>` | `32768` | Max total tokens across requests |
+| `--max-prefill-tokens <N>` | `0` (auto) | Max prefill tokens per scheduling step. `0` = use the model's `max_position_embeddings` |
+| `--max-total-tokens <N>` | `0` (auto) | Max total tokens across all running requests. `0` = `max_position_embeddings * max_running_requests` |
+| `--decode-reservation-cap <N>` | `0` (auto) | Per-request cap for reserving future decode tokens. `0` = `max_position_embeddings` |
+| `--cuda-graph[=true\|false]` | `true` | CUDA graph capture for decode. Pass `--cuda-graph=false` to disable for debugging |
+| `--gpu-memory-utilization <F>` | `0.4` | Fraction of free GPU memory for paged KV cache (0.0–1.0) |
+| `--dtype <DT>` | auto | Override model dtype: `f32`, `bf16` |
+| `--device <DEV>` | `auto` | Device: `auto`, `cpu`, `cuda`, `cuda:N` |
 | `--api-key <KEY>` | - | API key for authentication (repeatable). `/v1/*` routes require `Authorization: Bearer <key>` |
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PRELUDE_DEVICE` | `auto` | Device selection: `auto`, `cpu`, `cuda`, `cuda:N` |
-| `PRELUDE_PAGED_BLOCK_SIZE` | `128`* | Block size for paged KV cache (128 with FA3, 16 otherwise) |
+| `PRELUDE_DEVICE` | `auto` | Device selection: `auto`, `cpu`, `cuda`, `cuda:N` (also available as `--device`) |
+| `PRELUDE_DTYPE` | auto | Override model dtype: `f32`, `bf16` (also available as `--dtype`) |
+| `PRELUDE_PAGED_BLOCK_SIZE` | `128` | Block size for paged KV cache. Auto-adjusted per attention backend unless set explicitly |
+| `PRELUDE_PAGED_ATTN_BLOCKS` | `0` (auto) | Total paged KV blocks. `0` auto-sizes from `gpu_memory_utilization × free GPU memory` |
 | `CUDA_VISIBLE_DEVICES` | all | GPU device selection |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | - | OpenTelemetry collector endpoint (e.g. `http://localhost:4317`) |
 | `OTEL_SERVICE_NAME` | `prelude` | Service name reported to OTel collector |
 | `RUST_LOG` | `info` | Log level: `debug`, `info`, `warn`, `error` |
-| `PRELUDE_MOCK` | - | Enable mock engine (no model needed, dev only) |
-| `PRELUDE_MOCK_LATENCY_MS` | `25` | Simulated latency in mock mode (ms) |
-| `PRELUDE_NO_SCHEDULER` | - | Disable scheduler, run engine directly (dev only) |
+| `PRELUDE_NO_SCHEDULER` | - | Disable scheduler, run engine directly (dev only — single request at a time) |
 | `PRELUDE_API_KEY` | - | API key (merged with `--api-key` CLI args) |
 
 ### Example Startup Commands

@@ -35,17 +35,14 @@
 ### Build
 
 ```bash
-# GPU — full stack (recommended): FlashInfer + FA4 + DeepGEMM + oneDNN
-cargo build -p prelude-server --release --features flashinfer-v4,onednn,deepgemm
+# GPU — full stack (FlashInfer + FA4 + DeepGEMM + CUTLASS + quant-gemm + cuLA)
+cargo build -p prelude-server --release --features cuda
 
-# GPU — FlashInfer only (no FA4)
-cargo build -p prelude-server --release --features flashinfer,onednn
+# CPU only (default — oneDNN BF16 GEMM + AVX-512 kernels)
+cargo build -p prelude-server --release
 
-# CPU only with oneDNN BF16 GEMM
-cargo build -p prelude-server --release --features onednn
-
-# GGUF models (auto-detected, no extra flags needed)
-cargo build -p prelude-server --release --features onednn
+# Both backends in one binary
+cargo build -p prelude-server --release --features full
 ```
 
 ### Run
