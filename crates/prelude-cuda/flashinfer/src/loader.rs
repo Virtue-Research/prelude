@@ -178,9 +178,15 @@ impl KernelRegistry {
 
     pub fn arch(&self) -> u32 { self.arch }
 
-    /// Select backend based on GPU arch: FA3 for SM90+, FA2 for SM80+.
+    /// Select backend based on GPU arch: FA3 for SM90 (Hopper), FA2 elsewhere.
+    ///
+    /// FA3 cubins are compiled exclusively for `sm_90`; SM100/103 (Blackwell)
+    /// would trigger "no kernel image is available for execution on the device"
+    /// at runtime because neither the `sm_90` cubin nor the `sm_80` PTX is a
+    /// valid match. FA2 has an `sm_80` PTX fallback that JIT-compiles for any
+    /// higher arch, so Blackwell stays on FA2 until we ship FA3 cubins for it.
     pub fn default_backend(&self) -> Backend {
-        if self.arch >= 90 { Backend::FA3 } else { Backend::FA2 }
+        if self.arch == 90 { Backend::FA3 } else { Backend::FA2 }
     }
 
     /// Look up a batch prefill variant.

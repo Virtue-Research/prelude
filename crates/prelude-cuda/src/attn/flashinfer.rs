@@ -607,8 +607,10 @@ pub fn varlen_paged(
 
     if max_seqlen_q == 1 {
         // Decode: dedicated Q=1 kernel — faster than prefill kernel on all archs.
-        paged_decode(q, key_cache, value_cache,
-                     &meta.indptr_gpu, &meta.indices_gpu, &meta.last_page_len_gpu,
+        // Pass `meta` so paged_decode can use the CPU-side indptr authoritatively
+        // computed by compute_paged_metadata_cpu (monotonic), instead of doing a
+        // D2H readback that races with the H2D inside Tensor::new.
+        paged_decode(q, key_cache, value_cache, &meta,
                      block_size, num_kv_heads, head_dim, softmax_scale)
     } else {
         // Prefill: varlen paged prefill kernel for Q>1.
@@ -810,7 +812,7 @@ fn append_prefill_run_tail(run_args: &mut Vec<TVMFFIAny>, is_fa3: bool, softmax_
 fn paged_decode(
     q: &Tensor,
     key_cache: &Tensor, value_cache: &Tensor,
-    kv_indptr: &Tensor, kv_indices: &Tensor, kv_last_page_len: &Tensor,
+    meta: &PagedMeta,
     block_size: usize, num_kv_heads: usize, head_dim: usize,
     softmax_scale: f32,
 ) -> Result<Tensor> {
@@ -833,8 +835,15 @@ fn paged_decode(
     let ws_guard = get_workspace(did)?;
     let ws = ws_guard.as_ref().unwrap();
 
-    // Plan needs CPU indptr; run needs GPU indptr/indices/last_page_len.
-    let indptr_cpu: Vec<i32> = kv_indptr.to_vec1()?;
+    // Plan needs CPU indptr. Use the authoritative CPU copy from PagedMeta
+    // rather than D2H from indptr_gpu — Tensor::new's H2D isn't ordered wrt
+    // subsequent to_vec1() D2H under all code paths, and stale allocations
+    // have been observed to expose garbage values (triggering div-by-zero in
+    // flashinfer's scheduler when num_pages appears non-monotonic).
+    let indptr_cpu = &meta.indptr_cpu;
+    let kv_indptr = &meta.indptr_gpu;
+    let kv_indices = &meta.indices_gpu;
+    let kv_last_page_len = &meta.last_page_len_gpu;
 
     let q_ptr = cuda_ptr!(q, bf16, &stream);
     let k_ptr = cuda_ptr!(key_cache, bf16, &stream);
