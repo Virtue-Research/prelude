@@ -1,7 +1,29 @@
 <p align="center">
-  <h1> AGInfer: Agent-native inference framework </h1>
+  <img src="assets/Prelude_logo_readme.svg" alt="Prelude" width="600">
 </p>
-sure
+
+<p align="center">
+  Fast LLM inference engine in Rust. Optimized for prefill throughput.
+</p>
+
+---
+
+## Performance
+
+**GPU (H200, Qwen3-4B)**
+
+<img src="assets/perf-throughput.svg" width="100%" alt="Prefill throughput vs concurrency">
+
+<img src="assets/perf-latency.svg" width="100%" alt="Latency P50/P95 at c=1">
+
+
+- **Peak throughput**: 186.7 req/s × 512 tokens = **95,590 tok/s** — **1.39× vs vLLM**, **1.23× vs SGLang** (at c=96)
+- **Latency (c=1)**: P50 **15.4ms** · P95 **21.1ms** — vs vLLM 18.1ms/27.9ms, SGLang 20.8ms/26.2ms
+
+*512-token inputs, max_tokens=1, 200 requests per concurrency level, engines isolated on separate H200 GPUs.*
+
+---
+
 ## Quick Start
 
 ### Prerequisites
@@ -89,9 +111,9 @@ Supports `logprobs`, `top_logprobs`, `prompt_logprobs`, `stop` sequences, and `s
 Request -> Continuous Batching Scheduler -> GPU Queue -> GPU Worker -> Response
 ```
 
-**Attention**: FA4 (prefill + decode) -> FlashInfer (fallback) -> CPU fallback. CUDA graph decode. One file per backend, zero `#[cfg]` in model code.
+**Attention**: FA4 (prefill) -> FlashInfer (decode + CUDA graph) -> CPU fallback. One file per backend, zero `#[cfg]` in model code.
 
-**GEMM**: CUTLASS (SM80+) / DeepGEMM (SM90+ BF16) / oneDNN (CPU BF16). No cuBLAS dependency.
+**GEMM**: DeepGEMM (SM90+, 2x cuBLAS) / cuBLAS / oneDNN (CPU BF16).
 
 **Runtime**: Paged KV cache, prefix caching, fused CUDA kernels (QKNorm+RoPE, SiLU*Mul, Add+RMSNorm), pure Rust AVX-512 CPU kernels.
 

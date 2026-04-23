@@ -20,3 +20,5 @@ onednn-ffi/buildCargo.lock
 .cargo_vcs_info.json
 *.orig
 genai_bench.log
+analysis/
+CLAUDE.md
