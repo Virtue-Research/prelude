@@ -12,30 +12,34 @@ This guide walks through adding a new model architecture to Prelude.
 **Recommended approach:** If your model is architecturally similar to an existing one (e.g., a LLaMA variant), start by copying `qwen3/` and modifying. Most transformer-based LLMs share 90%+ of the same structure.
 
 **Reference implementations:**
-- `qwen3/` -- dense model (generate + classify + embed)
-- `gemma3/` -- model with sliding window + bidirectional attention
-- `qwen3_moe/` -- Mixture-of-Experts with fused GEMM
-- `qwen3_next/` -- hybrid (DeltaNet + attention + MoE)
+- `qwen3.rs` -- dense model (generate + classify + embed)
+- `gemma3.rs` -- sliding window + bidirectional attention
+- `qwen3_moe.rs` -- Mixture-of-Experts with fused GEMM
+- `qwen3_next.rs` -- hybrid (DeltaNet + attention + MoE)
 
 ## Overview
 
-Adding a model requires **4 steps**:
+Adding a model requires **3 steps**:
 
-1. Create `models/<name>/mod.rs` — config struct, model struct, `ModelForward` impl
-2. Create `models/<name>/meta.rs` — `ArchSpec` impl with static instance
-3. Add `pub mod <name>;` in `models/mod.rs`
-4. Add one line in `ALL_ARCH_SPECS` in `models/registry.rs`
+1. Create `models/<name>.rs` — config struct, model struct, `ModelForward` impl,
+   and an `ArchSpec` impl + `inventory::submit!` for auto-registration.
+2. Add `pub mod <name>;` in `models/mod.rs`.
+3. That's it — `registry.rs` never needs editing. The `inventory` crate
+   collects every `ArchSpec` submission at link time.
 
-No enum variants, no match arms, no macro changes — just implement two traits and register.
+No enum variants, no match arms, no central registry list.
 
 ## File Structure
 
 ```
 crates/prelude-core/src/models/
-  mymodel/
-    mod.rs    # Config struct, model struct, forward logic, ModelForward impl
-    meta.rs   # ArchSpec impl, static registration
+  mymodel.rs    # Everything: config, model, ModelForward impl, ArchSpec impl,
+                # and one inventory::submit! line.
 ```
+
+Each model is a **single flat file**. There is no `models/<name>/` subdirectory
+and no `meta.rs` split; one file per architecture keeps the registration and
+the implementation next to each other.
 
 ## Step 1: Config Struct
 
@@ -44,7 +48,7 @@ Your config struct deserializes from the model's `config.json`:
 ```rust
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct MyModelConfig {
-    // --- needed for CommonModelConfig (extracted in meta.rs) ---
+    // --- needed for CommonModelConfig (surface to the engine via ArchSpec::parse_config) ---
     pub vocab_size: usize,
     pub num_hidden_layers: usize,
     pub max_position_embeddings: usize,
@@ -72,7 +76,7 @@ Build the model layers and implement the forward pass:
 
 ```rust
 pub struct MyModelForCausalLM {
-    embed_tokens: candle_nn::Embedding,
+    embed_tokens: prelude_core::modules::embedding::Embedding,
     layers: Vec<MyDecoderLayer>,
     norm: RmsNorm,
     lm_head: Linear,
@@ -81,7 +85,7 @@ pub struct MyModelForCausalLM {
 }
 
 impl MyModelForCausalLM {
-    pub fn new(cfg: &MyModelConfig, vb: VarBuilder<'_>) -> candle_core::Result<Self> {
+    pub fn new(cfg: &MyModelConfig, vb: VarBuilder<'_>) -> prelude_core::tensor::Result<Self> {
         // load weights from vb
     }
 
@@ -89,7 +93,7 @@ impl MyModelForCausalLM {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
+    ) -> prelude_core::tensor::Result<Tensor> {
         // embed -> layers -> norm -> lm_head
     }
 
@@ -113,7 +117,7 @@ impl ModelForward for MyModelForCausalLM {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor> {
+    ) -> prelude_core::tensor::Result<Tensor> {
         self.forward(packed_input, ctx)
     }
 
@@ -125,7 +129,7 @@ impl ModelForward for MyModelForCausalLM {
     fn set_kv_cache_enabled(&mut self, enabled: bool) { /* ... */ }
     fn set_kv_cache_capacity(&mut self, target: usize) { /* ... */ }
     fn force_kv_cache_prealloc(&mut self, target: usize) { /* ... */ }
-    fn inject_kv_cache(&mut self, layer_kvs: &[(Tensor, Tensor)]) -> candle_core::Result<()> { /* ... */ }
+    fn inject_kv_cache(&mut self, layer_kvs: &[(Tensor, Tensor)]) -> prelude_core::tensor::Result<()> { /* ... */ }
     fn extract_kv_cache(&self) -> Vec<Option<(Tensor, Tensor)>> { /* ... */ }
 }
 ```
@@ -134,7 +138,7 @@ impl ModelForward for MyModelForCausalLM {
 
 ```rust
 impl ModelForward for MyModelForClassification {
-    fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> candle_core::Result<Tensor> {
+    fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> prelude_core::tensor::Result<Tensor> {
         MyModelForClassification::forward(self, packed_input, ctx)
         // ^ use fully-qualified syntax to call inherent method, not trait method
     }
@@ -163,7 +167,7 @@ impl ModelForward for MyModelForClassification {
 
 ```rust
 impl ModelForward for MyModelForEmbedding {
-    fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> candle_core::Result<Tensor> {
+    fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> prelude_core::tensor::Result<Tensor> {
         self.forward(packed_input, ctx)
     }
 
@@ -194,14 +198,15 @@ impl ModelForward for MyModelForEmbedding {
 
 ## Step 4: Implement `ArchSpec`
 
-Create `meta.rs` to handle model discovery, config parsing, and construction:
+At the bottom of the same `models/<name>.rs` file, implement `ArchSpec` for
+discovery / config parsing / construction, and submit it to `inventory`:
 
 ```rust
 use super::*;
 use crate::engine::{CommonModelConfig, RuntimeCaps, TaskKind, WeightsBackend};
 use crate::engine::EngineError;
 use crate::models::registry::{
-    parse_json, candle_model_err, ArchSpec, ParsedModelConfig,
+    parse_json, model_err, ArchSpec, ParsedModelConfig,
 };
 
 const ARCHITECTURE_ALIASES: &[&str] = &["MyModelForCausalLM"];
@@ -248,7 +253,7 @@ impl ArchSpec for MyModelArchSpec {
             .downcast_ref::<MyModelConfig>()
             .ok_or_else(|| EngineError::Internal("unexpected config for MyModel".into()))?;
         Ok(Box::new(
-            MyModelForCausalLM::new(cfg, vb).map_err(candle_model_err)?,
+            MyModelForCausalLM::new(cfg, vb).map_err(model_err)?,
         ))
     }
 
@@ -256,7 +261,7 @@ impl ArchSpec for MyModelArchSpec {
         &self,
         task: TaskKind,
         backend: WeightsBackend,
-        device: &candle_core::Device,
+        device: &prelude_core::tensor::Device,
     ) -> RuntimeCaps {
         let cuda_safetensors = device.is_cuda() && backend == WeightsBackend::Safetensors;
         RuntimeCaps {
@@ -313,9 +318,9 @@ fn build_model(&self, arch_config: &dyn std::any::Any, vb: VarBuilder<'_>)
     let cfg = arch_config.downcast_ref::<MyModelArchConfig>()
         .ok_or_else(|| EngineError::Internal("unexpected config".into()))?;
     match cfg {
-        MyModelArchConfig::Dense(c) => Ok(Box::new(MyModelForCausalLM::new(c, vb).map_err(candle_model_err)?)),
-        MyModelArchConfig::Classifier(c) => Ok(Box::new(MyModelForClassification::new(c, vb).map_err(candle_model_err)?)),
-        MyModelArchConfig::Embedding(c) => Ok(Box::new(MyModelForEmbedding::new(c, vb).map_err(candle_model_err)?)),
+        MyModelArchConfig::Dense(c) => Ok(Box::new(MyModelForCausalLM::new(c, vb).map_err(model_err)?)),
+        MyModelArchConfig::Classifier(c) => Ok(Box::new(MyModelForClassification::new(c, vb).map_err(model_err)?)),
+        MyModelArchConfig::Embedding(c) => Ok(Box::new(MyModelForEmbedding::new(c, vb).map_err(model_err)?)),
     }
 }
 ```
@@ -344,40 +349,34 @@ fn parse_config(&self, _task: TaskKind, _raw: &serde_json::Value, content: &str)
 }
 ```
 
-## Step 5: Wire into the Registry
+## Step 5: Wire into the Module Tree
 
-Only **2 lines** needed in existing files:
+Only **1 line** needed in existing code — the `ArchSpec` registration itself
+is done via `inventory::submit!` inside your model file:
 
-### 5a. Export the module
+```rust
+// tail of crates/prelude-core/src/models/mymodel.rs
+pub(crate) struct MyModelArchSpec;
+pub(crate) static MYMODEL_ARCH_SPEC: MyModelArchSpec = MyModelArchSpec;
+inventory::submit!(crate::models::registry::ArchSpecEntry::new(&MYMODEL_ARCH_SPEC));
+```
 
-In `crates/prelude-core/src/models/mod.rs`:
+Then expose the module in `crates/prelude-core/src/models/mod.rs`:
 
 ```rust
 pub mod mymodel;   // <-- add
 ```
 
-### 5b. Register in `all_arch_specs()`
-
-In `crates/prelude-core/src/models/registry.rs`:
-
-```rust
-static ALL_ARCH_SPECS: &[&dyn ArchSpec] = &[
-    &super::qwen3::meta::QWEN3_ARCH_SPEC,
-    // ...existing...
-    &super::mymodel::meta::MYMODEL_ARCH_SPEC,    // <-- add
-];
-```
-
-No array size to bump — it's a static slice.
+`registry.rs` **is never edited**. `inventory::collect!(ArchSpecEntry)` at the
+bottom of `registry.rs` picks up every `submit!` at link time.
 
 ## Checklist
 
 - [ ] Config struct with 5 common fields (`vocab_size`, `num_hidden_layers`, `max_position_embeddings`, `num_key_value_heads`, `head_dim`)
 - [ ] Model struct with `new()` and `forward()`
 - [ ] `impl ModelForward` with required + relevant optional methods
-- [ ] `meta.rs` with `ArchSpec` impl and static instance
+- [ ] `ArchSpec` impl + static instance + `inventory::submit!` in the same file
 - [ ] Module exported in `models/mod.rs`
-- [ ] Registered in `ALL_ARCH_SPECS` in `models/registry.rs`
 - [ ] `cargo build` passes
 - [ ] `cargo test` passes
 - [ ] Server loads model and serves requests

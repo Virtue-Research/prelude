@@ -1,15 +1,24 @@
-pub mod cache;
+pub mod tensor;
+
+// Re-export candle's bail! macro at crate root for `crate::bail!()` usage.
+pub use candle_core::bail;
 pub mod config;
 pub mod constants;
 pub mod engine;
-pub mod loading;
 pub mod models;
-pub mod nn_ops;
 pub mod ops;
 pub mod profiling;
-pub mod runtime;
 pub mod scheduler;
 pub mod types;
+
+/// Backward-compatible re-export: `cache` now lives at `scheduler::components::cache`.
+pub use scheduler::components::cache;
+
+/// Backward-compatible re-export: `loading` now lives under `engine`.
+pub mod loading {
+    pub use crate::engine::weight_loader as var_builder;
+    pub use crate::engine::weights;
+}
 
 pub use cache::deltanet_pool;
 pub use cache::prefix_cache;

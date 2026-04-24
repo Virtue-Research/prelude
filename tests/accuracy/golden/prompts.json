@@ -1,0 +1,88 @@
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "version": 1,
+  "prompts": [
+    {
+      "id": "short_en",
+      "description": "Short English factual question",
+      "messages": [
+        {"role": "user", "content": "What is the capital of France?"}
+      ],
+      "max_tokens": 32,
+      "temperature": 0.0
+    },
+    {
+      "id": "medium_en",
+      "description": "Medium English instruction",
+      "messages": [
+        {"role": "user", "content": "Explain what a hash table is in one paragraph."}
+      ],
+      "max_tokens": 64,
+      "temperature": 0.0
+    },
+    {
+      "id": "code_python",
+      "description": "Code generation (Python)",
+      "messages": [
+        {"role": "user", "content": "Write a Python function to compute the nth Fibonacci number."}
+      ],
+      "max_tokens": 128,
+      "temperature": 0.0
+    },
+    {
+      "id": "multilingual_zh",
+      "description": "Chinese language question",
+      "messages": [
+        {"role": "user", "content": "请用中文简单介绍一下机器学习。"}
+      ],
+      "max_tokens": 64,
+      "temperature": 0.0
+    },
+    {
+      "id": "short_completion",
+      "description": "Raw text completion (no chat template)",
+      "type": "completion",
+      "prompt": "The quick brown fox jumps over the",
+      "max_tokens": 16,
+      "temperature": 0.0
+    },
+    {
+      "id": "long_context",
+      "description": "Longer input context to stress prefill path",
+      "messages": [
+        {"role": "system", "content": "You are a helpful assistant that summarizes text concisely."},
+        {"role": "user", "content": "Summarize the following: Machine learning is a subset of artificial intelligence that focuses on building systems that learn from data. Rather than being explicitly programmed, these systems improve through experience. Common approaches include supervised learning, unsupervised learning, and reinforcement learning. Deep learning, a subfield of machine learning, uses neural networks with multiple layers to model complex patterns in data."}
+      ],
+      "max_tokens": 64,
+      "temperature": 0.0
+    },
+    {
+      "id": "single_token",
+      "description": "Single token generation (prefill-only edge case)",
+      "messages": [
+        {"role": "user", "content": "Say only the word yes."}
+      ],
+      "max_tokens": 1,
+      "temperature": 0.0
+    },
+    {
+      "id": "empty_system",
+      "description": "Empty system message edge case",
+      "messages": [
+        {"role": "system", "content": ""},
+        {"role": "user", "content": "Hello"}
+      ],
+      "max_tokens": 16,
+      "temperature": 0.0
+    },
+    {
+      "id": "multi_step_decode",
+      "description": "Multi-step decode — tests KV cache correctness across 64 decode steps",
+      "messages": [
+        {"role": "user", "content": "Write a detailed step-by-step recipe for making chocolate chip cookies from scratch, including exact measurements and baking times."}
+      ],
+      "max_tokens": 64,
+      "temperature": 0.0
+    }
+  ]
+}

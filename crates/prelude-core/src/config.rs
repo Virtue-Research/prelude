@@ -105,7 +105,7 @@ impl CacheConfig {
         Self {
             paged_block_size: parse_env_usize(
                 "PRELUDE_PAGED_BLOCK_SIZE",
-                if cfg!(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")) { 128 } else { 16 },
+                128, // adjusted at runtime for FA4/FlashInfer by cache manager
             ),
             paged_attn_blocks: parse_env_usize("PRELUDE_PAGED_ATTN_BLOCKS", 0),
             gpu_memory_utilization: 0.4,
@@ -163,14 +163,17 @@ pub struct RuntimeConfig {
 impl RuntimeConfig {
     fn from_env() -> Self {
         Self {
-            device: "auto".to_string(),
+            device: std::env::var("PRELUDE_DEVICE")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "auto".to_string()),
             sync_timing: parse_env_bool("PRELUDE_SYNC_TIMING"),
             force_varlen_prefill: parse_env_bool("PRELUDE_FORCE_VARLEN_PREFILL"),
             fused_kv_cache_write: parse_env_bool_eq1("PRELUDE_FUSED_KV_CACHE_WRITE"),
             cpu_thread_bind: std::env::var("SGLANG_CPU_OMP_THREADS_BIND")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            dtype: None,
+            dtype: std::env::var("PRELUDE_DTYPE").ok().filter(|s| !s.is_empty()),
             cuda_graph: true,
             cuda_graph_max_bs: parse_env_usize("PRELUDE_CUDA_GRAPH_MAX_BS", 32),
         }
@@ -245,3 +248,4 @@ fn parse_env_bool(name: &str) -> bool {
 fn parse_env_bool_eq1(name: &str) -> bool {
     std::env::var(name).map_or(false, |v| v == "1")
 }
+

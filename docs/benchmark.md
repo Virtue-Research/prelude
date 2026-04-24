@@ -1,141 +1,119 @@
 # Benchmark Guide
 
-## Environment Setup (GPU Server)
+## Prerequisites
 
-### 1. Clone and build Prelude
+- Docker (for SGLang, vLLM baselines)
+- CUDA GPU + NVIDIA Container Toolkit (`nvidia-ctk`)
+- Python 3.12 + uv (for genai-bench client)
+
+## Setup
+
+### 1. Build Prelude
 
 ```bash
-git clone https://github.com/Virtue-Research/prelude
-cd prelude
+# GPU (recommended)
+cargo build -p prelude-server --release --features cuda
 
-# GPU (recommended): FlashInfer + FA4 + DeepGEMM + oneDNN
-cargo build -p prelude-server --release --features flashinfer-v4,onednn,deepgemm
+# CPU only
+cargo build -p prelude-server --release
 ```
 
-### 2. Install Python dependencies
-
-Python 3.12 is recommended
+### 2. Install genai-bench (benchmark client)
 
 ```bash
 uv venv .venv --python 3.12 --seed
 source .venv/bin/activate
-
-uv pip install "genai-bench @ git+https://github.com/rucnyz/genai-bench.git" # contain fixing for prefill-only e2e test
-uv pip install transformers torch requests numpy
+uv pip install "genai-bench @ git+https://github.com/rucnyz/genai-bench.git"
 ```
 
-### Accuracy Tests
+### 3. Pull baseline Docker images
 
-- cpu-f32
+```bash
+docker pull lmsysorg/sglang:latest
+docker pull vllm/vllm-openai:latest
+```
 
-```shell
+### 4. Verify
+
+```bash
+source .venv/bin/activate
+genai-bench --version
+./target/release/prelude-server --help
+```
+
+## Run Benchmarks
+
+All engines use the same `bench.sh` script. SGLang and vLLM run in Docker containers automatically.
+
+```bash
+source .venv/bin/activate
+
+# Single engine
+./benchmark/bench.sh prelude --gpu
+./benchmark/bench.sh sglang --gpu
+
+# Multiple engines (run sequentially)
+./benchmark/bench.sh sglang prelude vllm --gpu
+
+# All GPU engines
+./benchmark/bench.sh --gpu
+
+# All CPU engines
+./benchmark/bench.sh --cpu
+```
+
+### Prefill-Only (128 in, 1 out)
+
+```bash
+CUDA_VISIBLE_DEVICES=2 INPUT_TOKENS=128 OUTPUT_TOKENS=1 MAX_REQUESTS=100 CONCURRENCY=1 \
+  ./benchmark/bench.sh --gpu
+```
+
+### Decode (32 in, 32 out)
+
+```bash
+CUDA_VISIBLE_DEVICES=2 INPUT_TOKENS=32 OUTPUT_TOKENS=32 MAX_REQUESTS=400 CONCURRENCY=4 \
+  ./benchmark/bench.sh --gpu
+```
+
+### Decode (128 in, 32 out)
+
+```bash
+CUDA_VISIBLE_DEVICES=2 INPUT_TOKENS=128 OUTPUT_TOKENS=32 MAX_REQUESTS=400 CONCURRENCY=4 \
+  ./benchmark/bench.sh --gpu
+```
+
+### Custom
+
+```bash
+MODEL=Qwen/Qwen3-0.6B INPUT_TOKENS=64 OUTPUT_TOKENS=64 \
+  CONCURRENCY=1 MAX_REQUESTS=50 ./benchmark/bench.sh prelude --gpu
+```
+
+## Accuracy Tests
+
+```bash
+# GPU
+.venv/bin/python tests/accuracy/run_accuracy_test.py --variant gpu \
+    --server prelude --binary target/release/prelude-server \
+    --model Qwen/Qwen3-0.6B
+
+# CPU F32
 .venv/bin/python tests/accuracy/run_accuracy_test.py --variant cpu-f32 \
     --server prelude --binary target/release/prelude-server \
     --model Qwen/Qwen3-0.6B --timeout 600
 
-python tests/accuracy/test_ppl.py \
-    --binary target/release/prelude-server --model Qwen/Qwen3-0.6B --device cpu --dtype f32 --max-chunks 100
-```
-
-- cpu-bf16
-
-```shell
+# CPU BF16
 .venv/bin/python tests/accuracy/run_accuracy_test.py --variant cpu-bf16 \
     --server prelude --binary target/release/prelude-server \
     --model Qwen/Qwen3-0.6B
-
-python tests/accuracy/test_ppl.py \
-    --binary target/release/prelude-server --model Qwen/Qwen3-0.6B --device cpu --dtype bf16 --max-chunks 100
-```
-
-- gpu
-
-```shell
-# logit
-.venv/bin/python tests/accuracy/run_accuracy_test.py --variant gpu \
-    --server prelude --binary target/release/prelude-server \
-    --model Qwen/Qwen3-0.6B
-# PPL
-python tests/accuracy/test_ppl.py \
-    --binary target/release/prelude-server --model Qwen/Qwen3-0.6B
-```
-
-#### Tokenizer Latency
-
-```bash
-cargo bench -p prelude-core --bench tokenizer_bench --features hf_tokenizer -- --model Qwen/Qwen3-0.6B
-```
-### microbench
-
-```shell
-cd crates/prelude-flash-attn-v4
-CUDA_VISIBLE_DEVICES=1 cargo bench --bench fa4_vs_fa3
-```
-### End2End Latency (Docker)
-
-Each engine runs in its own Docker container. Benchmark client (`genai-bench`) runs on the host.
-
-```bash
-pip install "genai-bench @ git+https://github.com/rucnyz/genai-bench.git"
-```
-
-#### Prefill only (128 tokens)
-
-```bash
-INPUT_TOKENS=128 OUTPUT_TOKENS=1 MAX_REQUESTS=500 CONCURRENCY=1 ./benchmark/genai-bench/bench.sh prelude
-INPUT_TOKENS=128 OUTPUT_TOKENS=1 MAX_REQUESTS=500 CONCURRENCY=4 ./benchmark/genai-bench/bench.sh prelude
-```
-
-#### Decode (32 in, 32 out)
-
-```bash
-INPUT_TOKENS=32 OUTPUT_TOKENS=32 MAX_REQUESTS=100 CONCURRENCY=1 ./benchmark/genai-bench/bench.sh prelude
-```
-
-#### Compare all engines
-
-```bash
-# All engines sequentially
-./benchmark/genai-bench/bench.sh all
-
-# Single engine
-./benchmark/genai-bench/bench.sh prelude
-./benchmark/genai-bench/bench.sh vllm
-./benchmark/genai-bench/bench.sh sglang
-GGUF_MODEL=/path/to/model.gguf ./benchmark/genai-bench/bench.sh llama.cpp
-
-# Custom parameters
-MODEL=Qwen/Qwen3-0.6B INPUT_TOKENS=64 OUTPUT_TOKENS=64 \
-  CONCURRENCY=4 MAX_REQUESTS=200 ./benchmark/genai-bench/bench.sh all
-```
-
-#### Docker images used
-
-| Engine | Image | Notes |
-|--------|-------|-------|
-| prelude | `prelude-e2e` (built from `Dockerfile.prelude`) | GPU + CPU |
-| vllm | `vllm/vllm-openai:latest` | Official image |
-| sglang | `lmsysorg/sglang:latest` | Official image |
-| llama.cpp | `llama-cpp-e2e` (built from `Dockerfile.llama-cpp`) | Needs GGUF model |
-
-#### Non-Docker benchmarks
-
-The `benchmark/local/` directory also has direct serve scripts for host-based benchmarking:
-
-```bash
-# Start server manually
-./benchmark/local/serve_prelude.sh   # Prelude
-./benchmark/local/serve_vllm.sh      # vLLM
-./benchmark/local/serve_sglang.sh    # SGLang
-
-# Run benchmark.py against any OpenAI-compatible server
-python benchmark/local/benchmark.py complete --url http://localhost:8000 --model Qwen/Qwen3-0.6B
 ```
 
 ## Notes
 
-- CPU benchmarks are slow. Use small traffic like `D(16,16)` and few requests.
-- vLLM and SGLang official images require GPU.
-- llama.cpp requires a GGUF model file. Download with:
-  `huggingface-cli download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-BF16.gguf --local-dir models`
-- Custom fused CUDA kernels are compiled to PTX at build time and loaded at runtime via cudarc.
+- SGLang and vLLM run inside Docker — no pip install needed
+- `CUDA_VISIBLE_DEVICES` is passed into the Docker container automatically
+- HuggingFace model cache (`~/.cache/huggingface`) is mounted into containers
+- CPU benchmarks are slow — use small traffic like `D(16,16)` and few requests
+- Results are saved to `bench_results/<timestamp>/summary.csv`
+- Always use an idle GPU — check `nvidia-smi` before running

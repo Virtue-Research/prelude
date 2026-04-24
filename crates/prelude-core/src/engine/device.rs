@@ -1,25 +1,12 @@
 use super::*;
 
-pub(crate) fn candle_err(e: candle_core::Error) -> EngineError {
-    EngineError::Internal(format!("candle error: {e}"))
+pub(crate) fn tensor_err(e: impl std::fmt::Display) -> EngineError {
+    EngineError::Internal(format!("tensor error: {e}"))
 }
 
-pub(crate) fn init_runtime(device: &Device, runtime: &crate::config::RuntimeConfig) {
-    if device.is_cpu() {
-        let _ = runtime;
-        // oneDNN uses THREADPOOL runtime (rayon-backed). No OpenMP, no contention.
-        crate::ops::onednn::init();
-        tracing::info!("oneDNN initialized (THREADPOOL runtime, rayon-backed)");
-
-        // NUMA-aware rayon pool for cpu_ops kernels
-        let numa_report = crate::ops::cpu::numa::init_numa_rayon_pool();
-        tracing::info!(numa_report, "cpu_ops NUMA rayon pool initialized");
-    }
-
-    #[cfg(feature = "cuda")]
-    if device.is_cuda() {
-        crate::ops::gpu::gemm::register_gpu_gemm();
-    }
+pub(crate) fn init_runtime(_device: &Device, _runtime: &crate::config::RuntimeConfig) {
+    // Device-specific initialization (oneDNN, NUMA pool, GPU GEMM registration)
+    // is handled by device crates (prelude-cpu, prelude-cuda) in their ops factories.
 }
 
 pub(crate) fn select_device(
@@ -29,7 +16,7 @@ pub(crate) fn select_device(
 
     let device = match requested.as_str() {
         "cpu" => Device::Cpu,
-        "auto" => Device::cuda_if_available(0).map_err(candle_err)?,
+        "auto" => Device::new_cuda(0).map_err(|e| EngineError::Internal(format!("CUDA init: {e}")))?,
         s if s.starts_with("cuda:") => {
             let ordinal = s
                 .trim_start_matches("cuda:")
@@ -37,9 +24,9 @@ pub(crate) fn select_device(
                 .map_err(|e| {
                     EngineError::InvalidRequest(format!("invalid PRELUDE_DEVICE: {e}"))
                 })?;
-            Device::new_cuda(ordinal).map_err(candle_err)?
+            Device::new_cuda(ordinal).map_err(|e| EngineError::Internal(format!("CUDA init: {e}")))?
         }
-        "cuda" => Device::new_cuda(0).map_err(candle_err)?,
+        "cuda" => Device::new_cuda(0).map_err(|e| EngineError::Internal(format!("CUDA init: {e}")))?,
         other => {
             return Err(EngineError::InvalidRequest(format!(
                 "invalid PRELUDE_DEVICE '{other}', expected auto|cpu|cuda|cuda:N"
@@ -50,9 +37,7 @@ pub(crate) fn select_device(
     let dtype = match runtime.dtype.as_deref() {
         Some("f32" | "F32" | "float32") => DType::F32,
         Some("bf16" | "BF16" | "bfloat16") => DType::BF16,
-        _ if device.is_cuda() => {
-            if device.supports_bf16() { DType::BF16 } else { DType::F32 }
-        }
+        _ if device.is_cuda() => DType::BF16,
         // CPU: BF16 with oneDNN BRGeMM backend
         _ => DType::BF16,
     };

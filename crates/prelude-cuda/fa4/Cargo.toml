@@ -1,0 +1,24 @@
+[package]
+name = "prelude-flash-attn-v4"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+description = "Flash Attention v4 (CuTeDSL AOT) for Prelude inference engine."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "prelude_flash_attn_v4"
+path = "src/lib.rs"
+
+[dependencies]
+tracing = "0.1"
+prelude-tvm-ffi = { path = "../tvm-ffi" }
+
+[build-dependencies]
+anyhow = "1"
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+half = "2"

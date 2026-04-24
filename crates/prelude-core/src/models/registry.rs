@@ -1,4 +1,4 @@
-use candle_core::Device;
+use crate::tensor::Device;
 use crate::loading::var_builder::VarBuilder;
 use serde::de::DeserializeOwned;
 
@@ -45,6 +45,35 @@ pub(crate) trait ArchSpec: Sync {
     fn supports_task(&self, task: TaskKind) -> bool {
         self.supported_tasks().contains(&task)
     }
+
+    /// GGUF architecture aliases (e.g. `["qwen3"]`, `["qwen35", "qwen35moe"]`).
+    /// Default: empty (model does not support GGUF loading).
+    fn gguf_aliases(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Build a model from GGUF content. Returns the model, common config,
+    /// and EOS token IDs extracted from GGUF metadata.
+    ///
+    /// Default: returns an error (model does not support GGUF).
+    fn load_gguf(
+        &self,
+        _ct: crate::tensor::quantized::gguf_file::Content,
+        _reader: &mut std::fs::File,
+        _device: &Device,
+    ) -> Result<GgufLoadResult, EngineError> {
+        Err(EngineError::Unavailable(format!(
+            "GGUF loading not supported for architecture '{}'", self.name()
+        )))
+    }
+}
+
+/// Result of loading a model from GGUF format via `ArchSpec::load_gguf()`.
+pub(crate) struct GgufLoadResult {
+    pub model: Box<dyn crate::models::ModelForward>,
+    pub common: CommonModelConfig,
+    pub deltanet: Option<DeltaNetPoolConfig>,
+    pub eos_token_ids: Vec<u32>,
 }
 
 pub(crate) fn resolve_architecture_name(name: &str) -> Option<(&'static dyn ArchSpec, TaskKind)> {
@@ -60,6 +89,13 @@ pub(crate) fn find_arch_spec_by_architecture_prefix(prefix: &str) -> Option<&'st
         .iter()
         .copied()
         .find(|spec| matches_any_alias(prefix, spec.architecture_aliases()))
+}
+
+pub(crate) fn find_arch_spec_by_gguf_arch(arch: &str) -> Option<&'static dyn ArchSpec> {
+    all_arch_specs()
+        .iter()
+        .copied()
+        .find(|spec| matches_any_alias(arch, spec.gguf_aliases()))
 }
 
 pub(crate) fn find_arch_spec_by_model_type(model_type: &str) -> Option<&'static dyn ArchSpec> {
@@ -105,7 +141,7 @@ pub(crate) fn unsupported_task_error(arch_name: &str, task: TaskKind) -> EngineE
     ))
 }
 
-pub(crate) fn candle_model_err(e: candle_core::Error) -> EngineError {
+pub(crate) fn candle_model_err(e: crate::tensor::Error) -> EngineError {
     EngineError::Internal(format!("candle error: {e}"))
 }
 
@@ -156,4 +192,95 @@ fn normalize_identifier(input: &str) -> String {
         .filter(|ch| ch.is_ascii_alphanumeric())
         .flat_map(|ch| ch.to_lowercase())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Registry lookup tests ──────────────────────────────────────
+
+    #[test]
+    fn find_gguf_arch_qwen3() {
+        // qwen3 GGUF support was removed — the wrapper depended on
+        // candle-transformers + a "candle-baseline" feature that doesn't
+        // exist in this workspace. Confirm the alias stays unregistered.
+        let spec = find_arch_spec_by_gguf_arch("qwen3");
+        assert!(spec.is_none(), "qwen3 GGUF alias should not be registered");
+    }
+
+    #[test]
+    fn find_gguf_arch_qwen35() {
+        let spec = find_arch_spec_by_gguf_arch("qwen35");
+        assert!(spec.is_some(), "qwen35 should be registered as a GGUF arch");
+        assert_eq!(spec.unwrap().name(), "qwen3_5");
+    }
+
+    #[test]
+    fn find_gguf_arch_qwen35moe() {
+        let spec = find_arch_spec_by_gguf_arch("qwen35moe");
+        assert!(spec.is_some(), "qwen35moe should be registered as a GGUF arch");
+        assert_eq!(spec.unwrap().name(), "qwen3_5");
+    }
+
+    #[test]
+    fn find_gguf_arch_unknown() {
+        let spec = find_arch_spec_by_gguf_arch("unknown_arch_xyz");
+        assert!(spec.is_none(), "unknown arch should not match");
+    }
+
+    // ── Architecture alias tests ───────────────────────────────────
+
+    #[test]
+    fn find_arch_by_prefix_qwen3() {
+        let spec = find_arch_spec_by_architecture_prefix("Qwen3");
+        assert!(spec.is_some());
+        assert_eq!(spec.unwrap().name(), "qwen3");
+    }
+
+    #[test]
+    fn find_arch_by_model_type_qwen3() {
+        let spec = find_arch_spec_by_model_type("qwen3");
+        assert!(spec.is_some());
+        assert_eq!(spec.unwrap().name(), "qwen3");
+    }
+
+    #[test]
+    fn find_arch_by_model_type_unknown() {
+        let spec = find_arch_spec_by_model_type("nonexistent_model_type");
+        assert!(spec.is_none());
+    }
+
+    // ── Resolution tests ───────────────────────────────────────────
+
+    #[test]
+    fn resolve_qwen3_for_causal_lm() {
+        let result = resolve_architecture_name("Qwen3ForCausalLM");
+        assert!(result.is_some());
+        let (spec, task) = result.unwrap();
+        assert_eq!(spec.name(), "qwen3");
+        assert_eq!(task, TaskKind::Generate);
+    }
+
+    #[test]
+    fn resolve_qwen3_for_classification() {
+        let result = resolve_architecture_name("Qwen3ForSequenceClassification");
+        assert!(result.is_some());
+        let (spec, task) = result.unwrap();
+        assert_eq!(spec.name(), "qwen3");
+        assert_eq!(task, TaskKind::Classify);
+    }
+
+    // ── Normalize identifier tests ─────────────────────────────────
+
+    #[test]
+    fn normalize_strips_underscores() {
+        assert_eq!(normalize_identifier("Qwen3_5"), "qwen35");
+    }
+
+    #[test]
+    fn normalize_case_insensitive() {
+        assert_eq!(normalize_identifier("QWEN3"), "qwen3");
+        assert_eq!(normalize_identifier("qwen3"), "qwen3");
+    }
 }

@@ -1,0 +1,30 @@
+[package]
+name = "prelude-cpu"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+description = "CPU device implementation for Prelude inference engine."
+license = "Apache-2.0"
+
+[lib]
+name = "prelude_cpu"
+path = "src/lib.rs"
+
+[features]
+default = ["onednn"]
+onednn = []
+
+[dependencies]
+prelude-core = { path = "../prelude-core" }
+half = { version = "2.7.1", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["extern_crate_alloc", "derive"] }
+rayon = "1.11.0"
+nix = { version = "0.31", features = ["sched"] }
+tokio = { workspace = true, features = ["sync", "rt"] }
+tracing.workspace = true
+bc-mimalloc.workspace = true
+inventory = "0.3"
+
+[[bin]]
+name = "cpu_ops_bench"
+path = "src/bin_cpu_ops_bench/main.rs"

@@ -84,7 +84,7 @@ python benchmark/local/benchmark.py complete \
   --prefix --prefix-tokens 3072 --num-unique-prefixes 1
 ```
 
-See `benchmark/local/README.md` for the full CLI reference.
+See `benchmark/README.md` for the full CLI reference.
 
 ## Micro-Benchmarks (Kernel-Level)
 
@@ -93,17 +93,17 @@ Each requires specific feature flags:
 
 ```bash
 # CPU operator benchmarks (GEMM, attention, RMSNorm, RoPE, SiLU) — no special features needed
-cargo bench -p prelude-core --bench cpu_ops_bench
+cargo run --release --bin cpu_ops_bench -p prelude-core
 
 # GPU operator benchmarks (GEMM dispatch, elementwise, etc.) — requires CUDA
-cargo bench -p prelude-core --bench gpu_ops_bench --features cuda
+cargo run --release --bin gpu_ops_bench -p prelude-core --features cuda
 
 # Tokenizer benchmark (fastokens vs HuggingFace tokenizers comparison)
-cargo bench -p prelude-core --bench tokenizer_bench --features hf_tokenizer -- \
+cargo run --release --bin tokenizer_bench -p prelude-core --features hf_tokenizer -- \
   --model-path /path/to/model
 
 # Qwen3 end-to-end single-model benchmark — requires CUDA
-cargo bench -p prelude-core --bench qwen3_bench --features cuda
+cargo run --release --bin qwen3_bench -p prelude-core --features cuda
 
 # Fused ops correctness test — requires CUDA
 cargo run --release --bin fused_ops_test -p prelude-core --features cuda

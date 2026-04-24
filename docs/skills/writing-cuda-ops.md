@@ -14,21 +14,34 @@ The pattern for every fused kernel in Prelude is:
 ## File Structure
 
 ```
-crates/prelude-core/src/ops/gpu/
-  mod.rs              -- module exports, PTX loading
-  elementwise.rs      -- vectorized_add, fast_silu_mul
-  rmsnorm.rs          -- fast_rmsnorm, fused_add_rmsnorm
-  rope.rs             -- fused_qknorm_rope_varlen
-  kv_cache.rs         -- fused_knorm_rope_kv_cache_write_varlen
-  moe.rs              -- MoE routing ops
-  kernels/            -- .cu source files
-    add.cu
-    silu_mul.cu
-    rmsnorm.cu
-    add_rmsnorm.cu
-    qknorm_rope.cu
-    knorm_rope_kv_write.cu
-    moe_routing.cu
+crates/prelude-cuda/src/
+  ops/                       -- kernel wrapper modules
+    mod.rs                   -- module exports, PTX loading
+    elementwise.rs           -- vectorized_add, fast_silu_mul
+    rmsnorm.rs               -- fast_rmsnorm, fused_add_rmsnorm
+    rope.rs                  -- fused_qknorm_rope_varlen
+    kv_cache.rs              -- fused_knorm_rope_kv_cache_write_varlen
+    moe.rs                   -- MoE routing ops
+    gemm.rs                  -- GEMM wrappers
+    quant.rs                 -- quantization ops
+    tiled_mmq.rs             -- tiled MMQ kernels
+  kernels/kernels_src/       -- .cu source files (organized by subdirectory)
+    elementwise/
+      add.cu
+      silu_mul.cu
+    normalization/
+      rmsnorm.cu
+      add_rmsnorm.cu
+    rope/
+      qknorm_rope.cu
+    kvcache/
+      knorm_rope_kv_write.cu
+      scatter_kv_cache.cu
+      append.cu
+    moe/
+      routing.cu
+      gateup.cu
+      down.cu
 ```
 
 ## Existing Kernels
@@ -70,18 +83,18 @@ extern "C" __global__ void my_kernel_bf16(
 
 ### 2. Compile to PTX
 
-Add to `build.rs` in `prelude-core`:
+Add to `build.rs` in `prelude-cuda`:
 
 ```rust
 // In the cuda build section
-compile_ptx("src/ops/gpu/kernels/my_kernel.cu", "my_kernel.ptx");
+compile_ptx("src/kernels/kernels_src/my_kernel.cu", "my_kernel.ptx");
 ```
 
 The PTX file is written to `OUT_DIR` and included at compile time.
 
 ### 3. Load the PTX module
 
-In `ops/gpu/mod.rs`, add the PTX loading:
+In `ops/mod.rs` (inside `prelude-cuda`), add the PTX loading:
 
 ```rust
 const PTX_MY_KERNEL: &str = include_str!(concat!(env!("OUT_DIR"), "/my_kernel.ptx"));
@@ -90,31 +103,28 @@ const MOD_MY_KERNEL: &str = "my_kernel_module";
 
 ### 4. Write the Rust wrapper
 
-Create `ops/gpu/my_kernel.rs`:
+Create `ops/my_kernel.rs` (inside `prelude-cuda/src/`):
 
 ```rust
-use candle_core::{CudaDevice, CudaStorage, Result, Tensor};
+use prelude_core::tensor::{bail, Result, Tensor, Device};
+use crate::device::{CudaStorage, as_cuda_slice_bf16, load_ptx, get_func, cuda_stream};
 use super::{PTX_MY_KERNEL, MOD_MY_KERNEL};
 
 pub fn my_operation(input: &Tensor) -> Result<Tensor> {
     let device = input.device();
-    let cuda_dev = match device {
-        candle_core::Device::Cuda(dev) => dev,
-        _ => candle_core::bail!("my_operation requires CUDA"),
+    let ordinal = match device {
+        Device::Cuda(ord) => *ord,
+        _ => bail!("my_operation requires CUDA"),
     };
 
-    let (storage, layout) = input.storage_and_layout();
-    let input_slice = match &*storage {
-        candle_core::Storage::Cuda(s) => s.as_cuda_slice::<half::bf16>()?,
-        _ => candle_core::bail!("expected CUDA storage"),
-    };
+    let input_slice = as_cuda_slice_bf16(input)?;
+    let n = input.elem_count();
+    let stream = cuda_stream(ordinal)?;
+    let output = unsafe { stream.ctx().alloc::<half::bf16>(n) }?;
 
-    let n = layout.shape().elem_count();
-    let output = unsafe { cuda_dev.alloc::<half::bf16>(n) }?;
-
-    // Load module (cached by cudarc)
-    cuda_dev.load_ptx(PTX_MY_KERNEL.into(), MOD_MY_KERNEL, &["my_kernel_bf16"])?;
-    let func = cuda_dev.get_func(MOD_MY_KERNEL, "my_kernel_bf16").unwrap();
+    // Load module (cached by device.rs registry)
+    load_ptx(ordinal, PTX_MY_KERNEL, MOD_MY_KERNEL, &["my_kernel_bf16"])?;
+    let func = get_func(ordinal, MOD_MY_KERNEL, "my_kernel_bf16")?;
 
     let block_size = 256u32;
     let grid_size = (n as u32 + block_size - 1) / block_size;
@@ -131,28 +141,35 @@ pub fn my_operation(input: &Tensor) -> Result<Tensor> {
     }
 
     // Wrap output into a Tensor
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(output, cuda_dev.clone());
-    Ok(Tensor::from_storage(storage.into(), layout.shape(), device))
+    let storage = CudaStorage::wrap_cuda_slice(output, ordinal);
+    Ok(Tensor::from_storage(storage.into(), input.shape(), device))
 }
 ```
 
 ### 5. Export and use
 
-In `ops/gpu/mod.rs`:
+In `ops/mod.rs` (inside `prelude-cuda`):
 
 ```rust
 mod my_kernel;
 pub use my_kernel::my_operation;
 ```
 
-Call from model code:
+Model code does **not** call kernel functions directly. Instead, expose the operation through an Ops trait (e.g., `FusedOps`) so that models remain device-agnostic:
 
 ```rust
-#[cfg(feature = "cuda")]
-let result = crate::ops::gpu::my_operation(&input)?;
+// In prelude-cuda: implement the trait method to call your kernel
+impl FusedOps for CudaFusedOps {
+    fn my_operation(&self, input: &Tensor) -> Option<Result<Tensor>> {
+        Some(my_kernel::my_operation(input))
+    }
+}
 
-#[cfg(not(feature = "cuda"))]
-let result = fallback_cpu_implementation(&input)?;
+// In model code (prelude-core): call via Ops trait, no #[cfg] needed
+let result = match ops.fused.my_operation(&input) {
+    Some(r) => r?,
+    None => fallback_cpu_implementation(&input)?,
+};
 ```
 
 ## Runtime Disable for Debugging

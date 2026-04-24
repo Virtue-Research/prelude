@@ -1,6 +1,6 @@
-use candle_core::Tensor;
+use crate::tensor::Tensor;
 
-use crate::models::common::BatchAttnContext;
+use crate::models::commons::BatchAttnContext;
 
 // ── Sub-traits ──────────────────────────────────────────────────────────
 
@@ -13,11 +13,11 @@ pub trait LogitsSplitModel: Send {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor>;
+    ) -> crate::tensor::Result<Tensor>;
 
     /// Apply lm_head (and any post-processing like softcapping) to hidden states.
     /// Can be called on chunks: `compute_logits(chunk)` → `(chunk_size, vocab_size)`.
-    fn compute_logits(&self, hidden: &Tensor) -> candle_core::Result<Tensor>;
+    fn compute_logits(&self, hidden: &Tensor) -> crate::tensor::Result<Tensor>;
 }
 
 /// Models with internal KV cache for CPU sequential decode.
@@ -30,7 +30,7 @@ pub trait KvCacheModel: Send {
         &mut self,
         input_ids: &Tensor,
         position_offset: usize,
-    ) -> candle_core::Result<Tensor>;
+    ) -> crate::tensor::Result<Tensor>;
 }
 
 /// Classifier model metadata.
@@ -66,7 +66,7 @@ pub trait ModelForward: Send {
         &mut self,
         packed_input: &Tensor,
         ctx: &mut BatchAttnContext,
-    ) -> candle_core::Result<Tensor>;
+    ) -> crate::tensor::Result<Tensor>;
 
     /// Clear all KV caches.
     fn clear_kv_cache(&mut self);
@@ -87,13 +87,19 @@ pub trait ModelForward: Send {
     /// Access embedding-specific metadata.
     fn as_embedding(&self) -> Option<&dyn EmbeddingModel> { None }
 
+    /// KV cache sharing: per-layer mapping from shared layers to source layers.
+    /// `result[i] = Some(j)` means layer `i` shares KV cache with layer `j`.
+    /// `result[i] = None` means layer `i` has its own independent KV cache.
+    /// Default: empty (no sharing, all layers independent).
+    fn kv_cache_sharing(&self) -> Vec<Option<usize>> { vec![] }
+
     /// Direct generation: prefill + decode loop handled internally (e.g. by llama.cpp FFI).
     /// Returns (generated_token_ids, last_logits_f32). Default: not supported.
     fn generate_direct(
         &mut self,
         _prompt_tokens: &[u32],
         _max_new: usize,
-    ) -> candle_core::Result<Option<(Vec<u32>, Vec<f32>)>> {
+    ) -> crate::tensor::Result<Option<(Vec<u32>, Vec<f32>)>> {
         Ok(None)
     }
 }

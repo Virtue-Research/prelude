@@ -5,7 +5,7 @@ Fast LLM inference engine in Rust. OpenAI-compatible API for generation, classif
 ## 30-Second Start
 
 ```bash
-cargo build -p prelude-server --release --features flashinfer-v4,onednn,deepgemm
+cargo build -p prelude-server --release --features cuda      # GPU (or omit --features for CPU)
 ./target/release/prelude-server --model Qwen/Qwen3-0.6B
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -41,15 +41,21 @@ curl http://localhost:8000/v1/chat/completions \
 
 ```
 crates/
-  prelude-server/        HTTP server (axum), OpenAI-compatible routes
-  prelude-core/          Engine, scheduler, models, attention backends, KV cache
-  prelude-flashinfer/    FlashInfer AOT kernels (128 variants, SM80+/SM90+)
-  prelude-flash-attn-v4/ Flash Attention v4 AOT kernels (SM80+)
-  prelude-ggml-quants/   llama.cpp FFI for GGUF inference
-  prelude-deepgemm/      DeepGEMM BF16 GEMM (SM90+)
-  onednn-ffi/            oneDNN FFI for CPU BF16 GEMM
-  candle-core/           Patched candle tensor library
-benchmark/               Benchmark suite (bench.sh + bench_utils.py)
-tests/                   Accuracy and integration tests
-docs/                    This documentation
+  prelude-server/           HTTP server (axum), OpenAI-compatible routes
+  prelude-core/             Engine, scheduler, models, KV cache, tokenizer
+  prelude-cpu/              CPU backend (oneDNN + AVX-512 BF16 GEMM, cpu attention)
+  prelude-cuda/             CUDA backend + nested kernel crates:
+    fa4/                      Flash Attention v4 AOT kernels (SM90+)
+    flashinfer/               FlashInfer AOT kernels (BF16/FP16, SM80+)
+    deepgemm/                 DeepGEMM BF16/FP8 GEMM (SM90+/SM100+/SM103)
+    cutlass-gemm/             CUTLASS 3.x BF16/FP16/F32 GEMM (SM80+)
+    quant-gemm/               llama.cpp-style quantized MMQ (GGUF)
+    cula/                     cuLA linear attention (KDA, SM90/SM100)
+    tvm-ffi/                  TVM-FFI shim for AOT kernels
+    prelude-kernelbuild/      Shared nvcc/cutedsl build helpers
+benchmark/                  Benchmark suite (bench.sh + bench_utils.py)
+tests/                      Accuracy and integration tests
+docs/                       This documentation
+third_party/                Submodules: cutlass, DeepGEMM, flashinfer,
+                              flash-attention, llama.cpp, oneDNN, cuLA, tvm-ffi
 ```

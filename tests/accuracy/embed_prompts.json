@@ -1,0 +1,14 @@
+[
+  {
+    "id": "single_text",
+    "input": "Rust provides zero-cost abstractions."
+  },
+  {
+    "id": "batch_text",
+    "input": [
+      "Embeddings turn text into vectors.",
+      "Continuous batching improves throughput.",
+      "KV cache reuse reduces repeated work."
+    ]
+  }
+]

@@ -1,6 +1,16 @@
 [workspace]
-members = ["crates/prelude-core", "crates/prelude-server", "crates/prelude-cutlass-gemm", "crates/prelude-deepgemm", "crates/prelude-flashinfer", "crates/prelude-flash-attn-v4", "crates/prelude-quant-gemm"]
-exclude = ["crates/candle-core", "crates/candle-paged-attn", "crates/candle-flash-attn-v3"]
+members = [
+    "crates/prelude-core",
+    "crates/prelude-cpu",
+    "crates/prelude-server",
+    "crates/prelude-cuda",
+    "crates/prelude-cuda/cutlass-gemm",
+    "crates/prelude-cuda/deepgemm",
+    "crates/prelude-cuda/flashinfer",
+    "crates/prelude-cuda/fa4",
+    "crates/prelude-cuda/quant-gemm",
+    "crates/prelude-cuda/cula",
+]
 resolver = "2"
 
 [workspace.package]
@@ -36,16 +46,15 @@ tracing-opentelemetry = { version = "0.32.1" }
 uuid = { version = "1.22.0", features = ["v4", "serde"] }
 
 # ML / Tensor computation
-candle-core = { version = "0.9.2" }
-candle-transformers = { version = "0.9.2" }
-candle-flash-attn = { version = "0.9.2" }
-candle-flash-attn-v3 = { path = "crates/candle-flash-attn-v3" }
-candle-paged-attn = { path = "crates/candle-paged-attn" }
-prelude-flash-attn-v4 = { path = "crates/prelude-flash-attn-v4" }
-prelude-deepgemm = { path = "crates/prelude-deepgemm" }
-prelude-cutlass-gemm = { path = "crates/prelude-cutlass-gemm" }
-prelude-flashinfer = { path = "crates/prelude-flashinfer" }
-prelude-quant-gemm = { path = "crates/prelude-quant-gemm" }
+candle-core = { git = "https://github.com/rucnyz/candle", branch = "prelude" }
+candle-nn = { git = "https://github.com/rucnyz/candle", branch = "prelude" }
+prelude-cuda = { path = "crates/prelude-cuda" }
+prelude-flash-attn-v4 = { path = "crates/prelude-cuda/fa4" }
+prelude-deepgemm = { path = "crates/prelude-cuda/deepgemm" }
+prelude-cutlass-gemm = { path = "crates/prelude-cuda/cutlass-gemm" }
+prelude-flashinfer = { path = "crates/prelude-cuda/flashinfer" }
+prelude-quant-gemm = { path = "crates/prelude-cuda/quant-gemm" }
+prelude-cula = { path = "crates/prelude-cuda/cula" }
 
 # Tokenization & model loading
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
@@ -65,5 +74,3 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 
-[patch.crates-io]
-candle-core = { path = "crates/candle-core" }

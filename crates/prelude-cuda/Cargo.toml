@@ -1,0 +1,42 @@
+[package]
+name = "prelude-cuda"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+description = "CUDA device implementation for Prelude inference engine."
+license = "Apache-2.0"
+
+[lib]
+name = "prelude_cuda"
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+prelude-core = { path = "../prelude-core", features = ["cuda"] }
+candle-core = { workspace = true, features = ["cuda"] }
+cudarc = { version = "0.19.4", features = ["std", "driver", "f16", "nvrtc", "fallback-dynamic-loading", "cuda-version-from-build-system"], default-features = false }
+half = { version = "2.7.1", features = ["bytemuck"] }
+tokio = { workspace = true, features = ["sync", "rt"] }
+tracing.workspace = true
+bc-mimalloc.workspace = true
+inventory = "0.3"
+
+# Always compiled — runtime dispatch selects the best kernel
+prelude-flash-attn-v4 = { path = "fa4" }
+prelude-flashinfer = { path = "flashinfer" }
+
+prelude-deepgemm = { path = "deepgemm" }
+prelude-cutlass-gemm = { path = "cutlass-gemm" }
+prelude-quant-gemm = { path = "quant-gemm" }
+prelude-cula = { path = "cula" }
+
+# gpu_ops_bench temporarily disabled — needs migration from candle_core
+# [[bin]]
+# name = "gpu_ops_bench"
+# path = "src/bin/gpu_ops_bench/main.rs"
+
+[[bin]]
+name = "fused_ops_test"
+path = "src/bin/fused_ops_test.rs"

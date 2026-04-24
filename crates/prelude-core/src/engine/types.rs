@@ -1,7 +1,6 @@
 use crate::types::{ClassifyRequest, EmbedRequest, GenerateRequest, TokenLogprobInfo};
-#[cfg(feature = "cuda")]
-use candle_core::Tensor;
-use crate::nn_ops::generation::LogitsProcessor;
+use crate::tensor::Tensor;
+use crate::engine::sampling::LogitsProcessor;
 
 // ── Model dispatch ──────────────────────────────────────────────────────
 
@@ -153,13 +152,18 @@ pub(crate) enum ExecutionKind {
 ///
 /// The scheduler constructs these once so the engine hot path can avoid
 /// repeated tokenization and request normalization.
-pub(crate) struct PreparedGenerateRequest {
-    pub(crate) request_idx: usize,
-    pub(crate) request: GenerateRequest,
-    pub(crate) prompt_tokens: Vec<u32>,
-    pub(crate) max_new: usize,
-    pub(crate) is_greedy: bool,
-    pub(crate) logits_processor: LogitsProcessor,
+///
+/// `Clone` is required so the AR loop can hand one copy to the executor's
+/// prefill batch and keep the original on the sequence state for decode
+/// sampling + stop-check inspection.
+#[derive(Clone)]
+pub struct PreparedGenerateRequest {
+    pub request_idx: usize,
+    pub request: GenerateRequest,
+    pub prompt_tokens: Vec<u32>,
+    pub max_new: usize,
+    pub is_greedy: bool,
+    pub logits_processor: LogitsProcessor,
 }
 
 /// Logical prefix reuse candidate discovered during queue-side planning.
@@ -218,15 +222,15 @@ pub(crate) struct DecodePlan {
 
 /// A prepared generation batch plan produced before execution.
 #[derive(Clone, Debug)]
-pub(crate) enum GenerateBatchPlan {
+pub enum GenerateBatchPlan {
     Prefill(PrefillPlan),
     Decode(DecodePlan),
 }
 
 /// A prepared generation batch plus its queue-side logical plan.
-pub(crate) struct PreparedGenerateBatch {
-    pub(crate) plan: GenerateBatchPlan,
-    pub(crate) items: Vec<PreparedGenerateRequest>,
+pub struct PreparedGenerateBatch {
+    pub plan: GenerateBatchPlan,
+    pub items: Vec<PreparedGenerateRequest>,
 }
 
 // ── Batch item types ────────────────────────────────────────────────────
@@ -245,6 +249,7 @@ pub type PreTokenizedEmbedItem = PreTokenizedBatchItem<EmbedRequest>;
 
 /// Result of batch prefill for a single request.
 /// Block table is retained (NOT freed) for subsequent streaming decode.
+#[derive(Debug)]
 pub struct BatchPrefillResult {
     pub first_token: u32,
     pub block_table: Vec<u32>,
@@ -269,7 +274,6 @@ pub struct BatchDecodeSeq<'a> {
 }
 
 /// Owned version of [`BatchDecodeSeq`] for sending through the GPU queue.
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
 pub struct OwnedBatchDecodeSeq {
     pub token: u32,
     pub position: usize,
@@ -278,7 +282,6 @@ pub struct OwnedBatchDecodeSeq {
     pub deltanet_slot: Option<u32>,
 }
 
-#[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
 impl OwnedBatchDecodeSeq {
     pub fn as_borrowed(&self) -> BatchDecodeSeq<'_> {
         BatchDecodeSeq {
@@ -293,35 +296,22 @@ impl OwnedBatchDecodeSeq {
 
 // ── Paged KV pool ───────────────────────────────────────────────────────
 
-#[cfg(feature = "cuda")]
-#[allow(dead_code)]
-pub(crate) struct PagedKvPool {
+pub struct PagedKvPool {
     pub(crate) key_caches: Vec<Tensor>,
     pub(crate) value_caches: Vec<Tensor>,
-    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
     pub(crate) key_caches_flash: Vec<Tensor>,
-    #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
     pub(crate) value_caches_flash: Vec<Tensor>,
-    pub(crate) block_size: usize,
+    pub block_size: usize,
 }
 
-#[cfg(feature = "cuda")]
 impl PagedKvPool {
     /// Returns the active key caches for the compiled attention backend.
-    /// FA3: flash layout `[blocks, block_sz, heads, dim]`.
-    /// FA2/others: v1 layout `[blocks, heads, dim/x, block_sz, x]`.
-    pub(crate) fn active_key_caches(&self) -> &[Tensor] {
-        #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
-        return &self.key_caches_flash;
-        #[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
-        return &self.key_caches;
+    pub fn active_key_caches(&self) -> &[Tensor] {
+        &self.key_caches_flash
     }
 
     /// Returns the active value caches for the compiled attention backend.
-    pub(crate) fn active_value_caches(&self) -> &[Tensor] {
-        #[cfg(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer"))]
-        return &self.value_caches_flash;
-        #[cfg(not(any(feature = "flash-attn-v3", feature = "flash-attn-v4", feature = "flashinfer")))]
-        return &self.value_caches;
+    pub fn active_value_caches(&self) -> &[Tensor] {
+        &self.value_caches_flash
     }
 }
