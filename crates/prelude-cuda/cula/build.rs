@@ -292,6 +292,13 @@ fn compile_dsl_kernels(
 
     // Monkey-patch assert_blackwell/assert_hopper so AOT cross-compilation works
     // regardless of the host GPU. The target arch comes from CUTE_DSL_ARCH env var.
+    //
+    // Invocation: `python -c BOOTSTRAP <script_path> --output-dir ... -j N`
+    //   sys.argv[0] == '-c' (Python convention for `python -c`)
+    //   sys.argv[1] == <script_path>
+    //   sys.argv[2:] == script args
+    // We read the script from sys.argv[1] (the absolute path passed from Rust)
+    // and then rewrite sys.argv so the script sees itself at argv[0].
     let bootstrap = r#"
 import sys, os
 arch = int(''.join(c for c in os.environ.get('CUTE_DSL_ARCH','sm_90a').split('_')[1] if c.isdigit()))
@@ -300,8 +307,10 @@ import cula.utils
 cula.utils.get_device_sm_version = lambda device=None: (major, minor)
 cula.utils.assert_blackwell = lambda device=None: None
 cula.utils.assert_hopper = lambda device=None: None
-sys.argv = ['compile_kernels.py'] + sys.argv[1:]
-exec(open(sys.argv[0]).read())
+script_path = sys.argv[1]
+sys.argv = [script_path] + sys.argv[2:]
+with open(script_path) as _f: _src = _f.read()
+exec(compile(_src, script_path, 'exec'))
 "#;
 
     // Compile for each target arch
