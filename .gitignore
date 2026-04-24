@@ -33,3 +33,6 @@ onednn-ffi/buildCargo.lock
 .cargo-ok
 .cargo_vcs_info.json
 *.orig
+
+# AI assistant working notes — not part of the project
+CLAUDE.md
