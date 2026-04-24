@@ -152,6 +152,11 @@ pub(crate) enum ExecutionKind {
 ///
 /// The scheduler constructs these once so the engine hot path can avoid
 /// repeated tokenization and request normalization.
+///
+/// `Clone` is required so the AR loop can hand one copy to the executor's
+/// prefill batch and keep the original on the sequence state for decode
+/// sampling + stop-check inspection.
+#[derive(Clone)]
 pub struct PreparedGenerateRequest {
     pub request_idx: usize,
     pub request: GenerateRequest,

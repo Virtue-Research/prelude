@@ -147,7 +147,7 @@ pub async fn ar_loop(
         // ── Phase 1: Wait for at least one request if idle ─────────
         if !scheduler.has_work() {
             match rx.recv().await {
-                Some(msg) => handle_message(msg, &mut scheduler, &mut states),
+                Some(msg) => handle_message(msg, Some(&engine), &mut scheduler, &mut states),
                 None => { rx_open = false; }
             }
         }
@@ -155,7 +155,7 @@ pub async fn ar_loop(
         // ── Phase 2: Drain all pending messages (non-blocking) ─────
         loop {
             match rx.try_recv() {
-                Ok(msg) => handle_message(msg, &mut scheduler, &mut states),
+                Ok(msg) => handle_message(msg, Some(&engine), &mut scheduler, &mut states),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => { rx_open = false; break; }
             }
@@ -222,6 +222,7 @@ pub async fn ar_loop(
 
 fn handle_message(
     msg: ArMessage,
+    engine: Option<&Engine>,
     scheduler: &mut Scheduler,
     states: &mut HashMap<String, ArSequenceState>,
 ) {
@@ -260,7 +261,15 @@ fn handle_message(
         }
         ArMessage::Abort(request_id) => {
             let _ = scheduler.abort_request(&request_id);
-            states.remove(&request_id);
+            // Free paged-KV blocks + deltanet pool slot before dropping the
+            // state. Without this, a client cancel leaks the cache entries
+            // the in-flight request still owns, and repeated aborts can
+            // permanently drain the pools.
+            if let Some(mut state) = states.remove(&request_id) {
+                if let Some(engine) = engine {
+                    release_resources(engine, &mut state);
+                }
+            }
         }
     }
 }
@@ -274,9 +283,15 @@ fn build_forward_batch(
     exhausted: &mut Vec<String>,
 ) -> ForwardBatch {
     if !step.prefill_request_ids.is_empty() {
-        // Prefill: take PreparedGenerateRequests for the forward pass.
-        // They're put back into states after process_output so decode steps
-        // can still read max_new, logprobs, and stop config.
+        // Prefill: clone the PreparedGenerateRequests into the batch. We
+        // intentionally do NOT take ownership — decode needs the original
+        // on `state.prepared` for sampling (logits_processor), stop-token /
+        // stop-string checks, and model name. The clone's RNG state
+        // advances once inside `batch_prefill_paged` (for the first-token
+        // sample) and is then dropped; the state's copy is still at
+        // pre-prefill RNG position, so decode starts fresh. Acceptable
+        // divergence for reproducibility — the alternative was silent loss
+        // of all non-greedy / stop-token behavior after prefill.
         if !step.decode_request_ids.is_empty() {
             // `mixed_chunked` scheduling emits both sets; the executor's
             // ForwardBatch has no Mixed variant yet, so decode work in this
@@ -290,7 +305,7 @@ fn build_forward_batch(
         }
         let items: Vec<_> = step.prefill_request_ids.iter()
             .filter_map(|id| {
-                states.get_mut(id).and_then(|s| s.prepared.take())
+                states.get(id).and_then(|s| s.prepared.clone())
             })
             .collect();
         ForwardBatch::Prefill { items }
@@ -370,11 +385,24 @@ fn process_output(
         return;
     }
 
-    // Decode path: sample from logits
+    // Decode path: sample from logits.
+    //
+    // build_forward_batch skipped any request that hit paged-KV exhaustion
+    // for this step (the caller then removed those state entries). So
+    // `output.logits` has one row per *live* id, in the same order as the
+    // filtered iteration here. Indexing `sampled` by `step.decode_request_ids`
+    // enumeration would go out of bounds whenever an exhausted id preceded
+    // a live one — filter to `states.contains_key(id)` first so row_idx
+    // stays aligned with the logits tensor.
     let logits = &output.logits;
-    let all_ids: Vec<String> = step.decode_request_ids.iter().cloned().collect();
+    let live_ids: Vec<String> = step
+        .decode_request_ids
+        .iter()
+        .filter(|id| states.contains_key(id.as_str()))
+        .cloned()
+        .collect();
 
-    let sampled = match sample_batch(states, &all_ids, logits) {
+    let sampled = match sample_batch(states, &live_ids, logits) {
         Ok(tokens) => tokens,
         Err(error) => {
             fail_step(engine, scheduler, states, step, error);
@@ -384,7 +412,7 @@ fn process_output(
 
     let mut completed: Vec<(String, FinishReason)> = Vec::new();
 
-    for (row_idx, request_id) in all_ids.iter().enumerate() {
+    for (row_idx, request_id) in live_ids.iter().enumerate() {
         let Some(state) = states.get_mut(request_id) else { continue; };
         let next_token = sampled[row_idx];
 
@@ -667,6 +695,7 @@ mod tests {
                 prepared,
                 response: ResponseChannel::Complete(tx),
             },
+            None,
             &mut scheduler,
             &mut states,
         );
@@ -687,6 +716,7 @@ mod tests {
                 prepared,
                 response: ResponseChannel::Complete(tx),
             },
+            None,
             &mut scheduler,
             &mut states,
         );
@@ -694,6 +724,7 @@ mod tests {
 
         handle_message(
             ArMessage::Abort("r1".into()),
+            None,
             &mut scheduler,
             &mut states,
         );
@@ -835,17 +866,17 @@ mod tests {
     }
 
     #[test]
-    fn build_prefill_batch_extracts_prepared() {
+    fn build_prefill_batch_clones_prepared() {
         let mut states = HashMap::new();
         let prepared = make_prepared("r1", 5);
         let (tx, _rx) = tokio::sync::oneshot::channel();
         handle_message(
             ArMessage::NewRequest { prepared, response: ResponseChannel::Complete(tx) },
+            None,
             &mut Scheduler::new(SchedulerConfig::default()),
             &mut states,
         );
 
-        // State should have prepared
         assert!(states.get("r1").unwrap().prepared.is_some());
 
         let step = SchedulerStep::prefill(vec!["r1".into()]);
@@ -861,7 +892,9 @@ mod tests {
             _ => panic!("expected Prefill"),
         }
 
-        // Prepared should be taken (None now)
-        assert!(states.get("r1").unwrap().prepared.is_none());
+        // Post-fix: prepared is cloned into the batch, not taken, so the
+        // sequence state keeps it around for decode-side sampling and
+        // stop-token inspection.
+        assert!(states.get("r1").unwrap().prepared.is_some());
     }
 }

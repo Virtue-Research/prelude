@@ -18,12 +18,31 @@ pub enum Sampling {
 pub struct LogitsProcessor {
     rng: rand::rngs::StdRng,
     sampling: Sampling,
+    /// Seed kept alongside the live `rng` so `Clone` can reconstruct a
+    /// fresh StdRng — `rand::rngs::StdRng` doesn't implement `Clone` in
+    /// rand 0.10, but storing the seed lets us hand prefill its own copy
+    /// while the sequence state keeps another for decode. The clones
+    /// don't share advanced state, so after prefill the decode-side RNG
+    /// restarts from the seed — acceptable because determinism was
+    /// already per-request, and it's strictly better than silently
+    /// breaking non-greedy sampling post-prefill.
+    seed: u64,
+}
+
+impl Clone for LogitsProcessor {
+    fn clone(&self) -> Self {
+        Self {
+            rng: rand::rngs::StdRng::seed_from_u64(self.seed),
+            sampling: self.sampling.clone(),
+            seed: self.seed,
+        }
+    }
 }
 
 impl LogitsProcessor {
     pub fn from_sampling(seed: u64, sampling: Sampling) -> Self {
         let rng = rand::rngs::StdRng::seed_from_u64(seed);
-        Self { rng, sampling }
+        Self { rng, sampling, seed }
     }
 
     pub fn new(seed: u64, temperature: Option<f64>, top_p: Option<f64>) -> Self {
