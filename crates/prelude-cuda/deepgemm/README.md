@@ -44,7 +44,7 @@ CUDA_VISIBLE_DEVICES=1 cargo run --manifest-path crates/prelude-deepgemm/Cargo.t
     --example correctness_test --release
 
 # GPU GEMM benchmark (vs candle/cuBLAS)
-CUDA_VISIBLE_DEVICES=1 cargo run -p prelude-core --bin gpu_ops_bench --release --features deepgemm
+CUDA_VISIBLE_DEVICES=1 cargo bench -p prelude-core --bench gpu_ops_bench --features deepgemm
 ```
 
 Requires: CUDA Toolkit 12.3+ with nvcc, SM90 (Hopper) GPU.

@@ -28,30 +28,30 @@ Config file:
   --config config.toml    load all parameters from TOML (no other args allowed)
 
 Usage examples:
-  python benchmark/benchmark.py classify \\
+  python benchmark/local/benchmark.py classify \\
     --url http://localhost:8000 --model mymodel \\
     --concurrency 1,4,16,64 --batch-size 20
 
-  python benchmark/benchmark.py classify \\
+  python benchmark/local/benchmark.py classify \\
     --data realworld --dataset openai/gsm8k \\
     --url http://localhost:8000 --model mymodel
 
-  python benchmark/benchmark.py embed \\
+  python benchmark/local/benchmark.py embed \\
     --prompt-tokens 10-512 --url http://localhost:8000 --model mymodel
 
-  python benchmark/benchmark.py complete \\
+  python benchmark/local/benchmark.py complete \\
     --max-tokens 1 --prefix --prefix-tokens 512 --num-unique-prefixes 3 \\
     --url http://localhost:8000 --model mymodel --concurrency 1,4,16,64
 
-  python benchmark/benchmark.py complete \\
+  python benchmark/local/benchmark.py complete \\
     --max-tokens 32 --streaming \\
     --url http://localhost:8000 --model mymodel --concurrency 1,4,16
 
-  python benchmark/benchmark.py mix \\
+  python benchmark/local/benchmark.py mix \\
     --prefill-weight 0.7 --gen-weight 0.3 --max-tokens 32 --rerun 3 \\
     --url http://localhost:8000 --model mymodel --concurrency 1,4,16
 
-  python benchmark/benchmark.py --config bench.toml
+  python benchmark/local/benchmark.py --config bench.toml
 """
 
 import argparse

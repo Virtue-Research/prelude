@@ -615,7 +615,14 @@ extern "C" int cutlass_gemm_dispatch(
             int ret = sm80_fp16_c3(A, B, D, m, n, k, s);
             if (ret == 0) return 0;
         }
-        return sm80_fp16_c1(A, B, D, m, n, k, s);
+        {
+            int ret = sm80_fp16_c1(A, B, D, m, n, k, s);
+            if (ret == 0) return 0;
+        }
+        return sm80_fp16_align2(A, B, D, m, n, k, s);     // alignment=2 fallback
+    }
+    if (dtype == 2) {
+        return sm80_f32_gemm(A, B, D, m, n, k, s);
     }
     return -20;
 }
