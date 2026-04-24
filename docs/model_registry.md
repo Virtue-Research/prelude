@@ -1,287 +1,164 @@
 # Model Registry & Loading
 
+Reference for how models are wired into Prelude. For a step-by-step walkthrough of
+adding a new model, see [`skills/adding-a-model.md`](skills/adding-a-model.md).
+
 ## File Layout
 
+Models are **flat, one file per architecture** under `crates/prelude-core/src/models/`:
+
 ```
-prelude-core/src/
-├── engine/
-│   ├── weight_loader.rs                       # WeightLoader: safetensors/GGUF → model struct
-│   └── ...
-├── models/
-│   ├── mod.rs                                 # trait Model, re-exports
-│   ├── registry.rs                            # ModelRegistry: arch name → model constructor
-│   ├── config.rs                              # ModelConfig: parsed from HF config.json
-│   ├── qwen3.rs                               # impl Model for Qwen3
-│   ├── llama.rs                               # impl Model for Llama (also serves Phi3, InternLM3)
-│   └── ...
+crates/prelude-core/src/models/
+├── mod.rs                     # `pub mod qwen3; pub mod gemma3; ...`
+├── registry.rs                # ArchSpec trait + inventory collection
+├── forward.rs                 # ModelForward trait + helper traits
+├── config.rs                  # Shared config types (rope, MoE configs, ...)
+├── commons/                   # Shared layers: Linear, RmsNorm, Embedding, RotaryEmbedding
+├── qwen3.rs                   # Qwen3 (dense GQA + QK-norm)
+├── qwen3_5.rs                 # Qwen3.5 hybrid (DeltaNet + attention)
+├── qwen3_moe.rs               # Qwen3-MoE
+├── qwen3_next.rs              # Qwen3-Next hybrid MoE
+├── gemma3.rs                  # Gemma3
+└── gemma4.rs                  # Gemma4
 ```
 
-## Model Registration
+Each model is its own `.rs` file. No subdirectories, no `meta.rs`, no `architectures/`
+wrapper. The file contains config structs, model structs, `ModelForward` impls, and
+one `ArchSpec` registration block.
 
-Auto-registration via `inventory` crate. Adding a new model = one file + one `inventory::submit!`.
-No manual modification of registry.rs or mod.rs.
+## Auto-Registration via `inventory`
+
+`registry.rs` defines an `ArchSpec` trait plus an `ArchSpecEntry` wrapper collected
+by the `inventory` crate. Each model file submits one entry; no central list to edit.
 
 ```rust
-// prelude-core/src/models/registry.rs
+// crates/prelude-core/src/models/registry.rs (shortened)
+pub(crate) trait ArchSpec: Sync {
+    fn name(&self) -> &'static str;
+    fn architecture_aliases(&self) -> &'static [&'static str];   // HF "architectures"
+    fn model_type_aliases(&self) -> &'static [&'static str];     // HF "model_type"
+    fn gguf_aliases(&self) -> &'static [&'static str] { &[] }    // GGUF architecture
+    fn supported_tasks(&self) -> &'static [TaskKind];            // Generate / Classify / Embed
 
-/// Registration entry. Submitted once per model file via inventory::submit!
-struct ModelRegistration {
-    /// HF architecture names this model handles.
-    /// Matched against config.json "architectures" field.
-    architectures: &'static [&'static str],
-    /// Constructor function.
-    create: fn(&ModelConfig, &Ops) -> Result<Box<dyn Model>>,
+    fn parse_config(
+        &self, task: TaskKind, raw: &serde_json::Value, content: &str,
+    ) -> Result<ParsedModelConfig, EngineError>;
+
+    fn build_model(
+        &self, arch_config: &dyn Any, vb: VarBuilder<'_>,
+    ) -> Result<Box<dyn ModelForward>, EngineError>;
+
+    fn runtime_caps(&self, task: TaskKind, backend: WeightsBackend, device: &Device)
+        -> RuntimeCaps;
+
+    // Optional — only for models that ship GGUF checkpoints.
+    fn load_gguf(
+        &self, ct: gguf_file::Content, reader: &mut File, device: &Device,
+    ) -> Result<GgufLoadResult, EngineError> { /* default: error */ }
 }
 
-inventory::collect!(ModelRegistration);
-
-/// Lookup: HF arch name → constructor.
-fn resolve_model(arch: &str) -> Option<&'static ModelRegistration> {
-    inventory::iter::<ModelRegistration>()
-        .find(|r| r.architectures.contains(&arch))
-}
+pub(crate) struct ArchSpecEntry { pub spec: &'static dyn ArchSpec }
+inventory::collect!(ArchSpecEntry);
 ```
+
+Registration happens inside the model file itself:
 
 ```rust
-// prelude-core/src/models/llama.rs
+// crates/prelude-core/src/models/qwen3.rs (tail)
+pub(crate) struct Qwen3ArchSpec;
+pub(crate) static QWEN3_ARCH_SPEC: Qwen3ArchSpec = Qwen3ArchSpec;
+inventory::submit!(crate::models::registry::ArchSpecEntry::new(&QWEN3_ARCH_SPEC));
 
-struct LlamaModel { /* layers, embed, lm_head */ }
-
-impl Model for LlamaModel {
-    fn forward(&mut self, x: &Tensor, ctx: &ForwardCtx, ops: &Ops, kv: &PagedKvCtx) -> Result<Tensor> {
-        // ...
-    }
-}
-
-// One line: register this model for multiple HF architectures
-inventory::submit! {
-    ModelRegistration {
-        architectures: &[
-            "LlamaForCausalLM",
-            "Phi3ForCausalLM",       // Phi3 = Llama architecture
-            "InternLM3ForCausalLM",  // InternLM3 = Llama architecture
-        ],
-        create: |config, ops| {
-            let model = LlamaModel::from_config(config, ops)?;
-            Ok(Box::new(model))
-        },
-    }
+impl ArchSpec for Qwen3ArchSpec {
+    fn name(&self) -> &'static str { "qwen3" }
+    fn architecture_aliases(&self) -> &'static [&'static str] { ARCHITECTURE_ALIASES }
+    fn model_type_aliases(&self) -> &'static [&'static str] { MODEL_TYPE_ALIASES }
+    fn supported_tasks(&self) -> &'static [TaskKind] { SUPPORTED_TASKS }
+    // ... parse_config, build_model, runtime_caps ...
 }
 ```
 
-**Design choice (learn from SGLang, avoid vLLM):**
-- SGLang: `EntryClass` convention + `pkgutil.iter_modules()` auto-discovery. 133 lines of registry.
-  Clean — adding a model doesn't touch the registry file.
-- vLLM: 19K-line registry dict mapping 500+ architecture names. Manual, error-prone.
-- **We use `inventory` crate** — Rust equivalent of SGLang's EntryClass.
-  Each model file `submit!`s its own registration. Registry just iterates.
-  Adding a model = add one file. Zero changes to existing code.
+Adding a new architecture = new `.rs` file with its own `ArchSpec` impl + one
+`inventory::submit!` line. `registry.rs` never needs edits.
 
-### Architecture Aliasing
+## Resolving an Architecture
 
-Multiple HF architectures can map to the same model implementation:
+`ParsedModelConfig` comes back from `ArchSpec::parse_config()`; it bundles the
+engine-facing `CommonModelConfig`, any DeltaNet pool config, and an opaque
+`arch_config: Box<dyn Any>` that the same `ArchSpec::build_model()` later
+down-casts to its own concrete config struct.
 
-```rust
-// prelude-core/src/models/llama.rs — one file serves Llama, Phi3, InternLM3, Yi, etc.
-// All are architecturally identical (RoPE + GQA + SiLU MLP).
-// Config differences (num_layers, num_heads, vocab_size) handled by ModelConfig.
+The resolver walks HF config fields in order:
 
-inventory::submit! {
-    ModelRegistration {
-        architectures: &[
-            "LlamaForCausalLM",
-            "Phi3ForCausalLM",
-            "InternLM3ForCausalLM",
-            "YiForCausalLM",
-            "MistralForCausalLM",
-        ],
-        create: |config, ops| Ok(Box::new(LlamaModel::from_config(config, ops)?)),
-    }
-}
-```
+1. **`architectures: ["Qwen3ForCausalLM", ...]`** — prefix match via
+   `resolve_architecture_name` / `find_arch_spec_by_architecture_prefix`. The
+   suffix (`ForCausalLM`, `ForSequenceClassification`, `ForEmbedding`, ...) is
+   mapped to `TaskKind` by `task_from_architecture_suffix`.
+2. **`model_type: "qwen3"`** — matched via `find_arch_spec_by_model_type` when
+   the `architectures` list is missing or unhandled.
+3. **GGUF `general.architecture` metadata** — `find_arch_spec_by_gguf_arch` for
+   GGUF loads; uses `ArchSpec::gguf_aliases()`.
 
-This is SGLang's pattern (Phi3 = LlamaForCausalLM via inheritance) adapted for Rust.
-No inheritance needed — same struct, different config values.
-
-## Model Config
-
-```rust
-// prelude-core/src/models/config.rs
-
-/// Parsed from HF config.json. Architecture-agnostic fields.
-struct ModelConfig {
-    pub architectures: Vec<String>,
-    pub model_type: String,
-    pub hidden_size: usize,
-    pub num_hidden_layers: usize,
-    pub num_attention_heads: usize,
-    pub num_key_value_heads: usize,
-    pub head_dim: usize,
-    pub intermediate_size: usize,
-    pub vocab_size: usize,
-    pub max_position_embeddings: usize,
-    pub rope_theta: f64,
-    pub rms_norm_eps: f64,
-    pub tie_word_embeddings: bool,
-
-    // Quantization (if specified in config)
-    pub quantization_config: Option<QuantizationConfig>,
-
-    // MoE (optional)
-    pub num_experts: Option<usize>,
-    pub num_experts_per_tok: Option<usize>,
-
-    // Model-specific extra fields (parsed as raw JSON)
-    pub extra: serde_json::Value,
-}
-
-impl ModelConfig {
-    /// Parse from HF config.json. Handles different HF naming conventions.
-    fn from_hf_config(path: &Path) -> Result<Self> {
-        let json: serde_json::Value = serde_json::from_reader(File::open(path)?)?;
-        // Normalize: some models nest under "text_config" (Gemma3, multimodal)
-        let config = if let Some(tc) = json.get("text_config") { tc } else { &json };
-        // Extract fields with fallbacks for different naming conventions
-        Ok(ModelConfig {
-            hidden_size: config["hidden_size"].as_u64()? as usize,
-            num_attention_heads: config["num_attention_heads"].as_u64()? as usize,
-            num_key_value_heads: config.get("num_key_value_heads")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(config["num_attention_heads"].as_u64()?) as usize,
-            // ... etc ...
-            extra: json.clone(),  // keep raw JSON for model-specific fields
-        })
-    }
-}
-```
-
-**Design choice:**
-- vLLM: `ModelArchitectureConfig` with per-model converter functions (`MODEL_ARCH_CONFIG_CONVERTORS`). Modular but verbose.
-- SGLang: loads HF config directly, per-model `__init__` extracts fields. Simpler.
-- **We use**: common `ModelConfig` struct with `extra: serde_json::Value` for model-specific fields.
-  Common fields (hidden_size, num_layers, etc.) are normalized once. Models access
-  `config.extra["sliding_window"]` for anything non-standard.
+Multiple HF architectures map to the same `ArchSpec` by returning them all in
+`architecture_aliases()` — e.g. Qwen3 covers both `Qwen3ForCausalLM` and
+`Qwen3ForSequenceClassification` with one spec.
 
 ## Weight Loading
 
+Models take a `VarBuilder` in `ArchSpec::build_model`:
+
 ```rust
-// prelude-core/src/engine/weight_loader.rs
+use crate::loading::var_builder::VarBuilder;
 
-/// Load model weights from safetensors/GGUF files.
-/// Maps HF tensor names to model struct fields.
-trait WeightLoadable {
-    /// Stacked parameter mappings: combine separate Q/K/V into fused QKV.
-    fn stacked_params() -> &'static [StackedParam] {
-        &[]  // default: no stacking
-    }
-
-    /// Load weights into self. Called once at model init.
-    fn load_weights(&mut self, weights: &mut WeightIterator, ops: &Ops) -> Result<()>;
-}
-
-/// Stacked parameter mapping: combine multiple HF weights into one fused tensor.
-struct StackedParam {
-    /// Name in our model struct (e.g., "qkv_proj")
-    target: &'static str,
-    /// Names in HF safetensors (e.g., ["q_proj", "k_proj", "v_proj"])
-    sources: &'static [&'static str],
-    /// Shard IDs for each source (e.g., ["q", "k", "v"] or [0, 1])
-    shard_ids: &'static [&'static str],
-}
-
-/// Iterator over (name, tensor) pairs from safetensors/GGUF files.
-struct WeightIterator {
-    // Handles format detection, shard discovery, lazy loading
-}
-
-impl WeightIterator {
-    /// Open weight files at path. Auto-detects format.
-    fn open(path: &Path) -> Result<Self> {
-        if path.join("model.safetensors.index.json").exists() {
-            // Sharded safetensors: read index → load relevant shards
-            Self::open_safetensors_sharded(path)
-        } else if path.extension() == Some("gguf") {
-            Self::open_gguf(path)
-        } else {
-            // Single safetensors or .bin
-            Self::open_single(path)
-        }
-    }
+fn build_model(
+    &self, arch_config: &dyn Any, vb: VarBuilder<'_>,
+) -> Result<Box<dyn ModelForward>, EngineError> {
+    let cfg = arch_config.downcast_ref::<Qwen3Config>().unwrap();
+    let model = Qwen3Model::load(vb, cfg)?;
+    Ok(Box::new(model))
 }
 ```
 
-### Example: Llama Weight Loading
+Inside `Qwen3Model::load`, the model walks the tensor tree with `vb.pp("model")`
+and builds each layer from shared building blocks in `models::commons`:
 
-```rust
-// prelude-core/src/models/llama.rs
+- `Linear::load(vb, in_dim, out_dim, bias)` — picks oneDNN BRGeMM on CPU,
+  the 3-tier GEMM dispatch on CUDA.
+- `RmsNorm::load(vb, dim, eps)` — AVX-512 on CPU, a CUDA kernel on GPU.
+- `Embedding::load`, `RotaryEmbedding`, etc.
 
-impl WeightLoadable for LlamaModel {
-    fn stacked_params() -> &'static [StackedParam] {
-        &[
-            StackedParam {
-                target: "qkv_proj",
-                sources: &["q_proj", "k_proj", "v_proj"],
-                shard_ids: &["q", "k", "v"],
-            },
-            StackedParam {
-                target: "gate_up_proj",
-                sources: &["gate_proj", "up_proj"],
-                shard_ids: &["0", "1"],
-            },
-        ]
-    }
+There is no separate `WeightLoadable` trait or central parameter-stacking table
+— fused QKV is handled per-model (see `Qwen3Attention::load`).
 
-    fn load_weights(&mut self, weights: &mut WeightIterator, ops: &Ops) -> Result<()> {
-        let stacked = Self::stacked_params();
-        for (name, tensor) in weights {
-            // 1. Try stacked params mapping
-            if let Some(sp) = stacked.iter().find(|sp| sp.sources.iter().any(|s| name.contains(s))) {
-                let target_name = name.replace(matched_source, sp.target);
-                let param = self.get_param_mut(&target_name)?;
-                param.load_shard(&tensor, shard_id)?;
-                continue;
-            }
-            // 2. Direct load (name matches)
-            if let Some(param) = self.get_param_mut(&name) {
-                param.load(&tensor)?;
-            }
-        }
-        Ok(())
-    }
-}
-```
+## GGUF Loading
 
-**Design choice (learn from SGLang):**
-- SGLang: per-model `stacked_params_mapping` list. Explicit, clear, but duplicated across 10+ models.
-- vLLM: recursive `AutoWeightsLoader` that traverses module tree. Generic but complex.
-- **We use**: `stacked_params()` as a trait method with default empty impl.
-  Models that need QKV fusion override it with a static list. Simple, no duplication
-  if models share the same stacking pattern (they can call a shared constant).
+GGUF follows a parallel path: `ArchSpec::load_gguf()` consumes a
+`gguf_file::Content`, returns the built model plus `CommonModelConfig` and
+`eos_token_ids`. Default impl returns `Unavailable`; only architectures that
+ship GGUF checkpoints (currently Qwen3 / Qwen3.5 / Qwen3-MoE) override it.
 
-## Weight Format Support
-
-| Format | Detection | Loading |
-|--------|-----------|---------|
-| **Safetensors** (sharded) | `model.safetensors.index.json` exists | Read index → load relevant shards |
-| **Safetensors** (single) | `model.safetensors` exists | Direct load |
-| **GGUF** | `.gguf` extension | GGUF parser → tensor iterator |
-| **.bin** | `.bin` extension (legacy PyTorch) | Not supported initially |
-
-GGUF needs a name mapping table (GGUF uses different naming than HF safetensors).
-This is per-model-family — kept in the model file alongside `stacked_params`.
+`gguf_aliases()` reports the GGUF `general.architecture` strings this `ArchSpec`
+handles (e.g. `qwen3` serves `qwen3` and `qwen35`).
 
 ## Engine Integration
 
 ```rust
-// prelude-core/src/engine/mod.rs
-fn load_model(config: &ModelConfig, device: &Device) -> Result<Box<dyn Model>> {
-    let registration = resolve_model(&config.architectures[0])?;
-    let mut model = (registration.create)(config)?;
-    let mut weights = WeightIterator::open(&config.model_path)?;
-    model.load_weights(&mut weights)?;
-    Ok(model)
-}
+// crates/prelude-core/src/engine/loading.rs
+let (spec, task) = resolve_architecture_name(&config["architectures"][0])
+    .or_else(|| find_arch_spec_by_model_type(&config["model_type"]))
+    .ok_or(EngineError::UnknownArchitecture)?;
+
+let parsed = spec.parse_config(task, &raw_json, &raw_content)?;
+let vb     = VarBuilder::from_safetensors(shards, dtype, device)?;
+let model  = spec.build_model(&*parsed.arch_config, vb)?;
+let caps   = spec.runtime_caps(task, WeightsBackend::Safetensors, device);
 ```
 
-The engine calls `resolve_model()` once. No runtime registry modification.
-`inventory` collects all registrations at link time — the registry is immutable.
+The engine stores the returned `Box<dyn ModelForward>` plus `RuntimeCaps`
+(which drive paged-attn, CUDA-graph, DeltaNet-pool, and prefix-cache
+decisions) and does not look at the concrete architecture again.
+
+## Adding a New Architecture
+
+See [`skills/adding-a-model.md`](skills/adding-a-model.md) for the end-to-end
+walkthrough.
