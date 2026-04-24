@@ -300,8 +300,9 @@ import cula.utils
 cula.utils.get_device_sm_version = lambda device=None: (major, minor)
 cula.utils.assert_blackwell = lambda device=None: None
 cula.utils.assert_hopper = lambda device=None: None
-sys.argv = ['compile_kernels.py'] + sys.argv[1:]
-exec(open(sys.argv[0]).read())
+script_path = sys.argv[1]
+sys.argv = [script_path] + sys.argv[2:]
+exec(open(script_path).read())
 "#;
 
     // Compile for each target arch

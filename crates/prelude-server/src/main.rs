@@ -243,10 +243,6 @@ fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
     // their full context window (e.g. Qwen3-0.6B: 40960) — fall back to that
     // instead of an arbitrary CLI default that silently truncates long prompts.
     let ctx_len = base_engine.max_context_len();
-    let max_prefill_tokens = match cli.max_prefill_tokens {
-        0 => ctx_len,
-        n => n,
-    };
     let decode_reservation_cap = match cli.decode_reservation_cap {
         0 => ctx_len,
         n => n,
@@ -262,8 +258,8 @@ fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
         max_running_requests: cli.max_running_requests,
         max_num_batched_tokens: cli.max_num_batched_tokens,
         long_prefill_token_threshold: cli.long_prefill_token_threshold,
-        max_total_tokens: cli.max_total_tokens,
-        decode_reservation_cap: cli.decode_reservation_cap,
+        max_total_tokens,
+        decode_reservation_cap,
         chunked_prefill: cli.chunked_prefill,
         ..SchedulerConfig::default()
     };

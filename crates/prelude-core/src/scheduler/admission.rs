@@ -1,4 +1,4 @@
-use super::{Scheduler, SchedulerStep, SequenceStatus};
+use super::{Scheduler, SchedulerStep, SeqFinishReason, SequenceStatus};
 
 impl Scheduler {
     /// Schedule one step using a unified per-step token budget.
@@ -256,7 +256,7 @@ impl Scheduler {
         mut total_token_budget: usize,
     ) -> AdmissionBatch {
         let mut admission = AdmissionBatch::default();
-        let global_prefill_cap = self.config.max_prefill_tokens;
+        let global_prefill_cap = self.config.max_num_batched_tokens;
 
         while !self.waiting_queue.is_empty() && admission.to_prefill.len() < available_slots {
             let prompt_len = self
@@ -281,8 +281,8 @@ impl Scheduler {
                 sequence.status = SequenceStatus::Finished;
                 sequence.finish_reason = Some(SeqFinishReason::Abort(
                     format!(
-                        "prompt length {prompt_len} exceeds max_prefill_tokens={global_prefill_cap}; \
-                         raise --max-prefill-tokens or shorten the prompt"
+                        "prompt length {prompt_len} exceeds max_num_batched_tokens={global_prefill_cap}; \
+                         raise --max-num-batched-tokens or shorten the prompt"
                     ),
                 ));
                 self.finished.push(sequence);

@@ -9,9 +9,6 @@
 #[global_allocator]
 static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
 
-#[global_allocator]
-static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
-
 mod attention;
 mod gemm;
 mod quant;
