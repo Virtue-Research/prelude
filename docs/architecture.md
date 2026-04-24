@@ -6,7 +6,7 @@ Target audience: contributors and power users who want to understand the interna
 
 All inference goes through the `InferenceEngine` trait (`engine/mod.rs`).
 Three implementations exist: `PseudoEngine` for testing (no model), `Engine` for
-direct single-request inference via Candle tensors, and `ScheduledEngine` which
+direct single-request inference, and `ScheduledEngine` which
 wraps `Engine` with dynamic batching, pipelined tokenization, and streaming support.
 `ScheduledEngine` is the production path.
 
@@ -14,7 +14,7 @@ wraps `Engine` with dynamic batching, pipelined tokenization, and streaming supp
 InferenceEngine (trait)
   |
   +-- PseudoEngine          mock, no model
-  +-- Engine                 real forward pass (Candle tensors)
+  +-- Engine                 real forward pass (own tensors)
   +-- ScheduledEngine        Engine + dynamic batching + GPU queue
 ```
 
@@ -90,38 +90,41 @@ overhead, critical when per-token decode is only a few milliseconds).
 
 ## 5. Attention Backends
 
-Modular dispatch lives exclusively in `models/layers/attn/mod.rs`. Model code
-has zero `#[cfg]` gates for attention -- adding a backend means one file in
-`attn/` and one dispatch branch in `mod.rs`.
+Dispatch lives in `prelude-cuda::cuda_ops::paged_attention` /
+`varlen_attention`. Adding a backend is one file in `crates/prelude-cuda/src/attn/`
+and one arm in the dispatch.
 
-| Backend | Feature flag | GPU requirement | Key capabilities |
-|---|---|---|---|
-| FA4 | `flash-attn-v4` | SM80+ | Prefill + paged decode, AOT CuTeDSL |
-| FlashInfer | `flashinfer` | SM80+ (FA2) / SM90+ (FA3) | All attention paths, CUDA graph (32 graphs), plan caching |
-| FA3 | `flash-attn-v3` | SM90 (Hopper) | Legacy, replaced by FlashInfer |
-| FA2 | `flash-attn` | SM80+ | Legacy, replaced by FlashInfer |
-| CPU | (always available) | None | Tiled BF16 (AVX-512) + F32 matmul SDPA |
+| Backend | GPU requirement | Key capabilities |
+|---|---|---|
+| FA4 | SM90+ (Hopper/Blackwell) | Prefill + paged decode, AOT CuTeDSL |
+| FlashInfer | SM80+ (FA2) / SM90+ (FA3) | All attention paths, CUDA graph (32 graphs), plan caching |
+| Composed SDPA | Any | F32 matmul fallback in `ops/traits/attention.rs` |
 
-**Dispatch priority:** FA4 -> FlashInfer -> FA3 -> FA2 -> CPU.
-Recommended GPU build: `flashinfer-v4,onednn,deepgemm` (~98MB binary).
+**Dispatch priority (GPU):** FA4 → FlashInfer → composed SDPA.
+Recommended GPU build: `--features cuda` (FA4 + FlashInfer + DeepGEMM + CUTLASS
+are all enabled by default in that feature set).
 
 ## 6. GEMM Backends
 
-| Backend   | Feature flag | Target   | Notes                                         |
-|-----------|-------------|----------|-----------------------------------------------|
-| cuBLAS    | `cuda`      | GPU      | Default GPU GEMM                              |
-| DeepGEMM  | `deepgemm`  | SM90+    | BF16, replaces cuBLAS. Decode 17%-2x faster   |
-| oneDNN    | `onednn`    | CPU      | BF16 + F32 GEMM, packed weights, static link  |
-| Candle    | (default)   | CPU      | Fallback F32 GEMM when oneDNN is absent       |
+GPU GEMM goes through a 3-tier dispatch in `prelude-cuda::ops::gemm`:
+
+| Tier | Target | Notes |
+|------|--------|-------|
+| DeepGEMM | SM90+/SM100/SM103 BF16 | Fastest path, non-batched BF16. Skipped per-shape after first failure (thread-local cache) |
+| CUTLASS 3.x | SM80+ BF16/FP16/F32 | Batched + all transposes. Runtime-gated to SM90 only when `compute_major == 9` |
+| cuBLAS | All | Universal fallback. Preallocates 64 MB workspace so CUDA graph capture doesn't hit `cudaMalloc` |
+
+CPU GEMM: oneDNN (BF16/F32, packed weights, feature `onednn`) with a pure-Rust
+F32 fallback when oneDNN is absent.
 
 ## 7. KV Cache
 
-**Paged KV cache** with `BlockManager` (vLLM-style). Block size is auto-tuned
-for the active attention backend (128 with FlashInfer/FA3, 16 otherwise) and
-overridable via `PRELUDE_PAGED_BLOCK_SIZE`.
+**Paged KV cache** with `BlockManager` (vLLM-style). Block size defaults to
+128 on CUDA (matches FlashInfer / FA4 TMA tile) and is overridable via
+`PRELUDE_PAGED_BLOCK_SIZE`.
 
 **KV cache write**: custom vectorized PTX kernel (`scatter_kv_cache_flash` in
-`ops/gpu/kv_cache.rs`), 128-bit float4 loads/stores. Independent of candle-paged-attn.
+`crates/prelude-cuda/src/ops/kv_cache.rs`), 128-bit float4 loads/stores.
 
 **Prefix cache** (`prefix_cache.rs`): hash-trie structure that matches incoming
 prompts against cached token blocks using hash chains. LRU eviction of leaf

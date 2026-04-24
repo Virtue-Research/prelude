@@ -1,10 +1,13 @@
 //! Micro-benchmark for pure Rust CPU kernels vs naive baseline (and onednn if available).
 //!
 //! Usage:
-//!   cargo run -p prelude-core --bin cpu_ops_bench --release
+//!   cargo bench -p prelude-core --bench cpu_ops_bench
 //!
 //! With oneDNN GEMM:
-//!   cargo run -p prelude-core --bin cpu_ops_bench --release --features onednn
+//!   cargo bench -p prelude-core --bench cpu_ops_bench --features onednn
+
+#[global_allocator]
+static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
 
 #[global_allocator]
 static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;

@@ -5,13 +5,13 @@ Run these checks before every release. All must pass.
 ## 1. Build (full features)
 
 ```bash
-cargo build -p prelude-server --release --features flashinfer-v4,onednn,deepgemm
+cargo build -p prelude-server --release --features full
 ```
 
 ## 2. Unit tests
 
 ```bash
-cargo test -p prelude-core
+cargo test --workspace --release
 ```
 
 ## 3. Accuracy tests (on a GPU host)

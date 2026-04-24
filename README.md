@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  Fast LLM inference engine in Rust. Optimized for prefill throughput.
+  Fast LLM inference engine in Rust.
 </p>
 
 ---
@@ -35,17 +35,14 @@
 ### Build
 
 ```bash
-# GPU — full stack (recommended): FlashInfer + FA4 + DeepGEMM + oneDNN
-cargo build -p prelude-server --release --features flashinfer-v4,onednn,deepgemm
+# GPU — full stack (FlashInfer + FA4 + DeepGEMM + CUTLASS + quant-gemm + cuLA)
+cargo build -p prelude-server --release --features cuda
 
-# GPU — FlashInfer only (no FA4)
-cargo build -p prelude-server --release --features flashinfer,onednn
+# CPU only (default — oneDNN BF16 GEMM + AVX-512 kernels)
+cargo build -p prelude-server --release
 
-# CPU only with oneDNN BF16 GEMM
-cargo build -p prelude-server --release --features onednn
-
-# GGUF models (auto-detected, no extra flags needed)
-cargo build -p prelude-server --release --features onednn
+# Both backends in one binary
+cargo build -p prelude-server --release --features full
 ```
 
 ### Run
@@ -111,9 +108,9 @@ Supports `logprobs`, `top_logprobs`, `prompt_logprobs`, `stop` sequences, and `s
 Request -> Continuous Batching Scheduler -> GPU Queue -> GPU Worker -> Response
 ```
 
-**Attention**: FA4 (prefill) -> FlashInfer (decode + CUDA graph) -> CPU fallback. One file per backend, zero `#[cfg]` in model code.
+**Attention**: FA4 (prefill + decode) -> FlashInfer (fallback) -> CPU fallback. CUDA graph decode. One file per backend, zero `#[cfg]` in model code.
 
-**GEMM**: DeepGEMM (SM90+, 2x cuBLAS) / cuBLAS / oneDNN (CPU BF16).
+**GEMM**: CUTLASS (SM80+) / DeepGEMM (SM90+ BF16) / oneDNN (CPU BF16). No cuBLAS dependency.
 
 **Runtime**: Paged KV cache, prefix caching, fused CUDA kernels (QKNorm+RoPE, SiLU*Mul, Add+RMSNorm), pure Rust AVX-512 CPU kernels.
 

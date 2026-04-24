@@ -2,16 +2,26 @@
 
 ## Model Support Matrix
 
-| Architecture | Models | GPU Backend | CPU | Continuous Batching | Quantization |
-|---|---|---|---|---|---|
-| Qwen3 (Dense) | 0.6B, 1.7B, 4B, 8B, 14B, 32B | FlashInfer / FA4 | Yes | Yes | GGUF |
-| Qwen3-MoE | 30B-A3B | FlashInfer / FA4 | No | Yes | -- |
-| Qwen3.5 (Hybrid) | 0.8B-27B dense, 35B-A3B MoE | FlashInfer / FA4 | No | Yes (DeltaNet pool) | GGUF |
-| Qwen3-Next (Hybrid) | 80B-A3B | FlashInfer / FA4 | No | Yes (DeltaNet pool) | -- |
-| Gemma3 | All sizes | FlashInfer / FA4 | Yes | Yes | -- |
-| GGUF | Qwen3, Qwen3.5, LLaMA, Gemma, Phi3, Qwen2 | CUDA / CPU | Yes | No | All GGUF formats |
+| Architecture | Models | GPU Backend | CPU | Continuous Batching |
+|---|---|---|---|---|
+| Qwen3 (dense) | 0.6B, 1.7B, 4B, 8B, 14B, 32B | FA4 / FlashInfer | Yes | Yes |
+| Qwen3 MoE | 30B-A3B | FA4 / FlashInfer | No | Yes |
+| Qwen3.5 (hybrid) | Dense + 35B-A3B MoE | FA4 / FlashInfer | No | Yes (DeltaNet pool) |
+| Qwen3-Next (hybrid) | 80B-A3B | FA4 / FlashInfer | No | Yes (DeltaNet pool) |
+| Gemma3 | All sizes | FA4 / FlashInfer | Yes | Yes |
+| Gemma4 | All sizes | FA4 / FlashInfer | Yes | Yes |
 
-**Backend key:** FlashInfer = AOT attention (FA2 SM80+ / FA3 SM90+), FA4 = CuTeDSL AOT (SM80+). GGUF uses llama.cpp FFI backend.
+**Backend key:** FA4 = CuTeDSL AOT (SM90+), FlashInfer = AOT attention (FA2 SM80+ / FA3 SM90+). GPU dispatch: FA4 → FlashInfer → composed F32 SDPA.
+
+**GGUF loading** currently resolves `qwen35` and `qwen35moe` architectures via
+the native Qwen3.5 implementation. Other GGUF architectures (llama, gemma,
+phi3, …) are not wired on this branch.
+
+**MoE caveat on Blackwell (SM103)**: the MoE dispatch in this branch hits a
+silent CUDA error on the first request. Verified-working models on B300 as of
+this PR are the dense Qwen3 family and Gemma3/Gemma4; MoE Blackwell support
+needs the kernel-level fixes from the GPU-kernels stack (fused MoE GEMM +
+GPU sort + routing write-race fix) that aren't in this PR.
 
 ## Task Support
 
@@ -77,7 +87,7 @@ The directory must contain `config.json`, safetensor weight files, and `tokenize
 PRELUDE_DEVICE=cpu ./target/release/prelude-server --model /path/to/model.gguf --port 8000
 ```
 
-GGUF files are auto-detected by the `.gguf` extension or from HuggingFace Hub repos (e.g., `--model unsloth/Qwen3.5-0.8B-GGUF`). The architecture is read from GGUF metadata (`general.architecture`). When `ggml-quants` feature is enabled, all architectures use the llama.cpp FFI backend. Supported architectures: qwen3, qwen35, qwen3moe, llama, gemma3, gemma2, gemma, phi3, qwen2.
+GGUF files are auto-detected by the `.gguf` extension or from HuggingFace Hub repos (e.g., `--model unsloth/Qwen3.5-0.8B-GGUF`). The architecture is read from GGUF metadata (`general.architecture`). On this branch the native Qwen3.5 model serves `qwen35` and `qwen35moe`; other architectures (llama, gemma, phi3, …) fall through with `GGUF loading not supported`.
 
 ## Hybrid Models
 

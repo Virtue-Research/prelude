@@ -614,7 +614,25 @@ extern "C" int cutlass_gemm_dispatch(
             int ret = sm80_fp16_c3(A, B, D, m, n, k, s);
             if (ret == 0) return 0;
         }
-        return sm80_fp16_c1(A, B, D, m, n, k, s);
+        {
+            int ret = sm80_fp16_c1(A, B, D, m, n, k, s);
+            if (ret == 0) return 0;
+        }
+        return sm80_fp16_align2(A, B, D, m, n, k, s);     // alignment=2 fallback
+    }
+    if (dtype == 2) {
+        // The SM80 SIMT F32 kernel produces wrong results on Blackwell
+        // (compute major 10+) despite being TensorOp-free. Return the
+        // "no kernel available" code here so callers can fall back to
+        // cuBLAS rather than silently getting bad F32 output.
+        static int s_cc_major_f32 = -1;
+        if (s_cc_major_f32 < 0) {
+            int dev = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&s_cc_major_f32, cudaDevAttrComputeCapabilityMajor, dev);
+        }
+        if (s_cc_major_f32 >= 10) return -20;
+        return sm80_f32_gemm(A, B, D, m, n, k, s);
     }
     return -20;
 }
