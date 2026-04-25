@@ -6,7 +6,7 @@
 
 mod common;
 
-use prelude_core::tensor::{DType, Device, Result, Tensor, D};
+use prelude_core::tensor::{DType, Device, Result, Tensor, TensorExt, D};
 use prelude_core::ops::{self, traits::{Ops, VarlenParams, MaskType}};
 
 /// Register device ops once, then return the test device.
@@ -20,6 +20,12 @@ fn dev() -> &'static Device {
     });
     static DEV: LazyLock<Device> = LazyLock::new(|| common::test_devices().last().unwrap().clone());
     &DEV
+}
+
+/// Dtype configs to test for matmul-based tests. Candle CPU matmul is F32-only,
+/// so BF16/F16 are skipped unless the test device is CUDA.
+fn matmul_dtypes() -> &'static [&'static common::DTypeConfig] {
+    if dev().is_cuda() { common::ALL_DTYPES } else { &[&common::F32_CONFIG] }
 }
 
 /// Run a test body on ALL test devices (CPU + GPU if enabled).
@@ -240,7 +246,7 @@ fn matmul_vs_pytorch() -> Result<()> {
     let a_data = common::pseudo_random(m * k, 1.0);
     let b_data = common::pseudo_random(k * n, 2.0);
 
-    for cfg in common::ALL_DTYPES {
+    for cfg in matmul_dtypes() {
         let reference = require_pytorch_ref!(
             &[("a", &a_data), ("b", &b_data)],
             &format!(r#"
@@ -276,7 +282,7 @@ fn matmul_tall_skinny_vs_pytorch() -> Result<()> {
     let a_data = common::pseudo_random(m * k, 3.0);
     let b_data = common::pseudo_random(k * n, 4.0);
 
-    for cfg in common::ALL_DTYPES {
+    for cfg in matmul_dtypes() {
         let reference = require_pytorch_ref!(
             &[("a", &a_data), ("b", &b_data)],
             &format!(r#"
@@ -314,7 +320,7 @@ fn matmul_gemma4_double_wide_mlp_vs_pytorch() -> Result<()> {
     let a_data = common::pseudo_random(m * k, 7.0);
     let b_data = common::pseudo_random(k * n, 8.0);
 
-    for cfg in common::ALL_DTYPES {
+    for cfg in matmul_dtypes() {
         let reference = require_pytorch_ref!(
             &[("a", &a_data), ("b", &b_data)],
             &format!(r#"
@@ -344,6 +350,10 @@ write_output(y)
 /// Gemma4 attention: (7, 512) × (512, 7) — Q@K^T score computation
 #[test]
 fn matmul_gemma4_attn_score_vs_pytorch() -> Result<()> {
+    if !dev().is_cuda() {
+        eprintln!("SKIPPED: BF16 matmul requires CUDA");
+        return Ok(());
+    }
     let m = 7;
     let k = 512; // head_dim=512
     let n = 7;   // seq_len
@@ -381,6 +391,10 @@ write_output(y)
 /// to verify error accumulation stays bounded. Uses Gemma4-like dimensions.
 #[test]
 fn matmul_chained_14_layers_vs_pytorch() -> Result<()> {
+    if !dev().is_cuda() {
+        eprintln!("SKIPPED: BF16 matmul requires CUDA");
+        return Ok(());
+    }
     let seq = 7;
     let hidden = 1536;
     let inter = 6144;
@@ -565,27 +579,27 @@ fn comparisons() -> Result<()> {
     let t1 = Tensor::from_vec(vec![0u32, 1, 2, 3, 4, 5], (3, 2), dev())?;
     let t2 = Tensor::from_vec(vec![1u32, 0, 3, 3, 4, 7], (3, 2), dev())?;
     assert_eq!(
-        t1.eq(&t2)?.to_vec2::<u8>()?,
+        t1.eq_t(&t2)?.to_vec2::<u8>()?,
         vec![vec![0, 0], vec![0, 1], vec![1, 0]]
     );
     assert_eq!(
-        t1.ne(&t2)?.to_vec2::<u8>()?,
+        t1.ne_t(&t2)?.to_vec2::<u8>()?,
         vec![vec![1, 1], vec![1, 0], vec![0, 1]]
     );
     assert_eq!(
-        t1.lt(&t2)?.to_vec2::<u8>()?,
+        t1.lt_t(&t2)?.to_vec2::<u8>()?,
         vec![vec![1, 0], vec![1, 0], vec![0, 1]]
     );
     assert_eq!(
-        t1.gt(&t2)?.to_vec2::<u8>()?,
+        t1.gt_t(&t2)?.to_vec2::<u8>()?,
         vec![vec![0, 1], vec![0, 0], vec![0, 0]]
     );
     assert_eq!(
-        t1.le(&t2)?.to_vec2::<u8>()?,
+        t1.le_t(&t2)?.to_vec2::<u8>()?,
         vec![vec![1, 0], vec![1, 1], vec![1, 1]]
     );
     assert_eq!(
-        t1.ge(&t2)?.to_vec2::<u8>()?,
+        t1.ge_t(&t2)?.to_vec2::<u8>()?,
         vec![vec![0, 1], vec![0, 1], vec![1, 0]]
     );
     Ok(())
@@ -742,7 +756,7 @@ fn affine() -> Result<()> {
 #[test]
 fn softmax() -> Result<()> {
     let t = Tensor::from_vec(vec![1f32, 2., 3.], 3, dev())?;
-    let s = candle_nn::ops::softmax(&t, 0)?;
+    let s = t.softmax(0)?;
     let v = common::to_vec1_round(&s, 4)?;
     assert_eq!(v, vec![0.0900, 0.2447, 0.6652]);
     let sum: f32 = s.to_vec1::<f32>()?.iter().sum();
@@ -768,7 +782,7 @@ write_output(y)
         );
 
         let x = Tensor::from_vec(data.clone(), (1, len), dev())?.to_dtype(cfg.dtype)?;
-        let y = candle_nn::ops::softmax(&x, D::Minus1)?.to_dtype(DType::F32)?;
+        let y = x.softmax(D::Minus1)?.to_dtype(DType::F32)?;
         let ours: Vec<f32> = y.flatten_all()?.to_vec1()?;
         common::assert_close(
             &ours,
@@ -805,7 +819,7 @@ write_output(y)
     );
 
     let x = Tensor::from_vec(data, (1, 512), dev())?;
-    let y = candle_nn::ops::softmax(&x, D::Minus1)?;
+    let y = x.softmax(D::Minus1)?;
     let ours: Vec<f32> = y.flatten_all()?.to_vec1()?;
     common::assert_close(&ours, &reference, 1e-6, "softmax_extreme");
     Ok(())
@@ -1005,19 +1019,19 @@ fn comparison_ops() -> Result<()> {
     let a = Tensor::from_vec(vec![0f32, 1., 2., 3., 4., 5.], (2, 3), dev())?;
     let b = Tensor::from_vec(vec![1f32, 0., 3., 3., 4., 7.], (2, 3), dev())?;
 
-    let eq = a.eq(&b)?;
+    let eq = a.eq_t(&b)?;
     assert_eq!(eq.to_vec2::<u8>()?, vec![vec![0, 0, 0], vec![1, 1, 0]]);
 
-    let lt = a.lt(&b)?;
+    let lt = a.lt_t(&b)?;
     assert_eq!(lt.to_vec2::<u8>()?, vec![vec![1, 0, 1], vec![0, 0, 1]]);
 
-    let gt = a.gt(&b)?;
+    let gt = a.gt_t(&b)?;
     assert_eq!(gt.to_vec2::<u8>()?, vec![vec![0, 1, 0], vec![0, 0, 0]]);
 
-    let le = a.le(&b)?;
+    let le = a.le_t(&b)?;
     assert_eq!(le.to_vec2::<u8>()?, vec![vec![1, 0, 1], vec![1, 1, 1]]);
 
-    let ge = a.ge(&b)?;
+    let ge = a.ge_t(&b)?;
     assert_eq!(ge.to_vec2::<u8>()?, vec![vec![0, 1, 0], vec![1, 1, 0]]);
     Ok(())
 }
@@ -1046,7 +1060,7 @@ fn gather_2d_indices() -> Result<()> {
 #[test]
 fn softmax_large_values() -> Result<()> {
     let t = Tensor::from_vec(vec![1000f32, 1001., 1002.], 3, dev())?;
-    let s = candle_nn::ops::softmax(&t, D::Minus1)?;
+    let s = t.softmax(D::Minus1)?;
     let v = common::to_vec1_round(&s, 4)?;
     assert_eq!(v, vec![0.0900, 0.2447, 0.6652]);
     let sum: f32 = s.to_vec1::<f32>()?.iter().sum();
@@ -1314,10 +1328,10 @@ write_output(x.mean().reshape(1))
     Ok(())
 }
 
-// == ne (tensor) vs PyTorch ==
+// == ne_t vs PyTorch ==
 
 #[test]
-fn ne_tensor_vs_pytorch() -> Result<()> {
+fn ne_t_vs_pytorch() -> Result<()> {
     let a_data = vec![0f32, 1., 2., 3., 4., 5.];
     let b_data = vec![1f32, 1., 3., 3., 4., 7.];
     let ref_flat = require_pytorch_ref!(
@@ -1331,9 +1345,9 @@ write_output((a != b).float())
     let reference: Vec<u8> = ref_flat.iter().map(|&v| v as u8).collect();
     let a = Tensor::from_vec(a_data, 6, dev())?;
     let b = Tensor::from_vec(b_data, 6, dev())?;
-    let y = a.ne(&b)?;
+    let y = a.ne_t(&b)?;
     let ours = y.to_vec1::<u8>()?;
-    assert_eq!(ours, reference, "ne mismatch");
+    assert_eq!(ours, reference, "ne_t mismatch");
     Ok(())
 }
 
@@ -1419,8 +1433,8 @@ write_output((x == 3.0).float())
     );
     let reference: Vec<u8> = ref_flat.iter().map(|&v| v as u8).collect();
     let x = Tensor::from_vec(data, 5, dev())?;
-    let y = x.eq(3.0f32)?;
-    assert_eq!(y.to_vec1::<u8>()?, reference, "eq(3.0)");
+    let y = x.eq_scalar(3.0f32)?;
+    assert_eq!(y.to_vec1::<u8>()?, reference, "eq_scalar(3.0)");
     Ok(())
 }
 
@@ -1436,8 +1450,8 @@ write_output((x != 3.0).float())
     );
     let reference: Vec<u8> = ref_flat.iter().map(|&v| v as u8).collect();
     let x = Tensor::from_vec(data, 5, dev())?;
-    let y = x.ne(3.0f32)?;
-    assert_eq!(y.to_vec1::<u8>()?, reference, "ne(3.0)");
+    let y = x.ne_scalar(3.0f32)?;
+    assert_eq!(y.to_vec1::<u8>()?, reference, "ne_scalar(3.0)");
     Ok(())
 }
 
@@ -1697,7 +1711,7 @@ write_output(y)
     let x = Tensor::from_vec(x_data, (b, l, h, d), dev())?;
     let cos = Tensor::from_vec(cos_data, (l, d / 2), dev())?;
     let sin = Tensor::from_vec(sin_data, (l, d / 2), dev())?;
-    let y = candle_nn::rotary_emb::rope_thd(&x, &cos, &sin)?;
+    let y = x.rope_thd(&cos, &sin)?;
     let ours: Vec<f32> = y.flatten_all()?.to_vec1()?;
     common::assert_close(&ours, &reference, 1e-5, "rope_thd");
     Ok(())
@@ -1996,7 +2010,7 @@ fn linear_vs_pytorch() -> Result<()> {
     let x_data = common::pseudo_random(batch * in_dim, 9.0);
     let w_data = common::pseudo_random(out_dim * in_dim, 10.0);
 
-    for cfg in common::ALL_DTYPES {
+    for cfg in matmul_dtypes() {
         let reference = require_pytorch_ref!(
             &[("x", &x_data), ("w", &w_data)],
             &format!(r#"
@@ -2045,7 +2059,7 @@ fn chained_norm_linear_silu_vs_pytorch() -> Result<()> {
     let up_w = common::pseudo_random(inter * hidden, 14.0);
     let eps = 1e-6;
 
-    for cfg in common::ALL_DTYPES {
+    for cfg in matmul_dtypes() {
         let reference = require_pytorch_ref!(
             &[("x", &x_data), ("nw", &norm_w), ("gw", &gate_w), ("uw", &up_w)],
             &format!(r#"
@@ -2067,7 +2081,7 @@ write_output(y)
             .to_dtype(cfg.dtype)?;
         let nw =
             Tensor::from_vec(norm_w.clone(), (hidden,), dev())?.to_dtype(cfg.dtype)?;
-        let _norm = prelude_core::models::commons::linear::RmsNorm::from_weight(nw.clone(), eps);
+        let norm = prelude_core::models::commons::linear::RmsNorm::from_weight(nw.clone(), eps);
         let ops = prelude_core::ops::select_ops(dev());
 
         let h = ops.rms_norm(&x, &nw, eps as f32)?;
@@ -2117,7 +2131,7 @@ write_outputs(residual=residual, normed=normed)
     let x = Tensor::from_vec(x_data, (batch, hidden), dev())?;
     let h = Tensor::from_vec(h_data, (batch, hidden), dev())?;
     let w = Tensor::from_vec(w_data.clone(), (hidden,), dev())?;
-    let _norm = prelude_core::models::commons::linear::RmsNorm::from_weight(w.clone(), eps);
+    let norm = prelude_core::models::commons::linear::RmsNorm::from_weight(w.clone(), eps);
     let ops = prelude_core::ops::select_ops(dev());
 
     let (residual, normed) =
@@ -2229,6 +2243,11 @@ fn run_varlen_attention_vs_pytorch(
     num_heads_q: usize, num_heads_k: usize, head_dim: usize,
     causal: bool, py_dtype: &str, dtype: DType, atol: f32, context: &str,
 ) -> Result<()> {
+    // Candle CPU matmul is F32-only; varlen_attention tests all use BF16.
+    if !dev().is_cuda() && dtype != DType::F32 {
+        eprintln!("SKIPPED ({context}): {dtype:?} matmul is GPU-only on candle");
+        return Ok(());
+    }
     let total_q: usize = seq_lens_q.iter().sum();
     let total_k: usize = seq_lens_k.iter().sum();
     let batch = seq_lens_q.len();
