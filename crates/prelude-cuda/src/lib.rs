@@ -64,6 +64,12 @@ fn cuda_probe() -> bool {
 
 /// Register GPU ops and executor. Call once at startup.
 pub fn register() {
+    // Eagerly install our GEMM dispatch so candle's `Tensor::matmul` on CUDA
+    // routes through CUTLASS/DeepGEMM/cuBLAS. Loading paths can hit matmul
+    // (tied embeddings, weight reshape, etc.) before the engine ever takes
+    // an `ops_for(&Device::Cuda(_))`, which is when the lazy `cuda_ops()`
+    // factory would otherwise register dispatch — too late for those calls.
+    crate::ops::gemm::register_gpu_gemm();
     prelude_core::ops::register_backend(prelude_core::ops::OpsBackend {
         name: "cuda",
         priority: 100,
