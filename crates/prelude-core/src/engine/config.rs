@@ -120,11 +120,17 @@ fn extract_eos_token_ids(raw: &serde_json::Value, task: TaskKind) -> Result<Vec<
         return Ok(Vec::new());
     }
 
-    let value = raw.get("eos_token_id").ok_or_else(|| {
-        EngineError::InvalidRequest(
-            "generation model config is missing required field `eos_token_id`".into(),
-        )
-    })?;
+    // Multi-modal / nested-text-config models (e.g. Qwen3.5-MoE,
+    // Gemma3 multi-modal) put generation knobs under `text_config`. Look
+    // there too, with the root taking precedence when both are present.
+    let value = raw
+        .get("eos_token_id")
+        .or_else(|| raw.get("text_config").and_then(|tc| tc.get("eos_token_id")))
+        .ok_or_else(|| {
+            EngineError::InvalidRequest(
+                "generation model config is missing required field `eos_token_id`".into(),
+            )
+        })?;
 
     let ids = match value {
         serde_json::Value::Number(n) => n.as_u64().map(|id| vec![id as u32]).ok_or_else(|| {
