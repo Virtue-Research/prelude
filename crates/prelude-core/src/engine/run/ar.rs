@@ -472,19 +472,9 @@ fn process_step_output(
             // request's own `LogitsProcessor` so temperature/top-p/penalties
             // still apply to this first token.
             if let Ok(row) = output.logits.get(logit_row) {
-                let token = if state.is_greedy() {
-                    row.argmax(crate::tensor::D::Minus1)
-                        .and_then(|t| t.to_scalar::<u32>())
-                        .unwrap_or(0)
-                } else if let Some(ref mut prepared) = state.prepared {
-                    let row_f32 = row.to_dtype(crate::tensor::DType::F32).unwrap();
-                    prepared.logits_processor.sample(&row_f32).unwrap_or(0)
-                } else {
-                    row.argmax(crate::tensor::D::Minus1)
-                        .and_then(|t| t.to_scalar::<u32>())
-                        .unwrap_or(0)
-                };
-                process_single_token(engine, scheduler, state, request_id, token, None, &mut completed);
+                let token = sample_token(&row, state);
+                let lp = extract_token_logprobs(engine, &row, token, state);
+                process_single_token(engine, scheduler, state, request_id, token, lp, &mut completed);
             }
         }
         // Partial chunk: nothing to do (progress already recorded)
@@ -499,19 +489,9 @@ fn process_step_output(
         };
 
         if let Ok(row) = output.logits.get(logit_row) {
-            let token = if state.is_greedy() {
-                row.argmax(crate::tensor::D::Minus1)
-                    .and_then(|t| t.to_scalar::<u32>())
-                    .unwrap_or(0)
-            } else if let Some(ref mut prepared) = state.prepared {
-                let row_f32 = row.to_dtype(crate::tensor::DType::F32).unwrap();
-                prepared.logits_processor.sample(&row_f32).unwrap_or(0)
-            } else {
-                row.argmax(crate::tensor::D::Minus1)
-                    .and_then(|t| t.to_scalar::<u32>())
-                    .unwrap_or(0)
-            };
-            process_single_token(engine, scheduler, state, request_id, token, None, &mut completed);
+            let token = sample_token(&row, state);
+            let lp = extract_token_logprobs(engine, &row, token, state);
+            process_single_token(engine, scheduler, state, request_id, token, lp, &mut completed);
         }
         logit_row += 1;
     }
@@ -527,6 +507,40 @@ fn process_step_output(
             finish_state(engine, state, finish_reason, prompt_len);
         }
     }
+}
+
+/// Sample a token from a logits row using the sequence's sampling config.
+///
+/// Greedy → argmax. Otherwise route through the request's `LogitsProcessor`
+/// (temperature/top-p/etc.). On any failure, fall back to argmax to avoid
+/// emitting a degenerate `0` token.
+fn sample_token(row: &crate::tensor::Tensor, state: &mut ArSequenceState) -> u32 {
+    let argmax_fallback = || {
+        row.argmax(crate::tensor::D::Minus1)
+            .and_then(|t| t.to_scalar::<u32>())
+            .unwrap_or(0)
+    };
+    if state.is_greedy() {
+        return argmax_fallback();
+    }
+    let Some(prepared) = state.prepared.as_mut() else {
+        return argmax_fallback();
+    };
+    let Ok(row_f32) = row.to_dtype(crate::tensor::DType::F32) else {
+        return argmax_fallback();
+    };
+    prepared.logits_processor.sample(&row_f32).unwrap_or_else(|_| argmax_fallback())
+}
+
+/// Compute top-k logprobs for a sampled token if the request asked for them.
+fn extract_token_logprobs(
+    engine: &Engine,
+    row: &crate::tensor::Tensor,
+    token: u32,
+    state: &ArSequenceState,
+) -> Option<TokenLogprobInfo> {
+    let k = state.prepared.as_ref()?.request.logprobs?;
+    Engine::extract_top_logprobs(row, token, k, &engine.tokenizer).ok()
 }
 
 /// Process a single sampled token: check stop conditions, stream, check length.
