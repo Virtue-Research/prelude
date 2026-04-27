@@ -224,7 +224,15 @@ fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
     engine_config.runtime.cuda_graph = cli.cuda_graph;
     info!(?engine_config, "engine config loaded");
 
-    let base_engine = if let Some(ref path) = cli.model_path {
+    // Auto-detect: explicit --model-path wins. Otherwise, if --model points
+    // at a real file or directory on disk, treat it as a local path so users
+    // can pass `--model /path/to/checkpoint.gguf` directly without having to
+    // know about a separate flag. Falls back to HF Hub.
+    let local_path: Option<&str> = cli
+        .model_path
+        .as_deref()
+        .or_else(|| std::path::Path::new(&cli.model).exists().then(|| cli.model.as_str()));
+    let base_engine = if let Some(path) = local_path {
         info!(path = %path, "loading model from local path");
         Engine::from_local_path_with_task(path, &cli.model, task_override, engine_config)?
     } else {
