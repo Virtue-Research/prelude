@@ -84,10 +84,9 @@ fn main() {
         nvcc_cmd.arg("-gencode=arch=compute_100a,code=sm_100a");
     }
     if sm103 {
-        // Blackwell-Ultra (B300) has compute cap 10.3. sm_100a cubin won't run
-        // on it ("no kernel image is available for execution on the device")
-        // and "a"-variant PTX isn't forward-compatible across the family,
-        // so emit a native sm_103a cubin when the toolkit supports it.
+        // B300 is sm_103; `sm_100a` cubin won't run on it and the "a"-variant
+        // PTX doesn't JIT-forward across the Blackwell family. Emit native
+        // `sm_103a` when the toolkit supports it.
         nvcc_cmd.arg("-gencode=arch=compute_103a,code=sm_103a");
     }
     let status = nvcc_cmd

@@ -1,27 +1,38 @@
 // Shared Linear & RmsNorm — model code uses these, never touches backend types directly.
 //
-// Linear: auto-dispatches to GpuLinear (CUDA), OnednnLinear (CPU), or registered
-//         quantization backends (Q4_0, future Q4_K_M / FP8 / INT4).
-// RmsNorm: AVX-512 on CPU, candle on GPU.
+// Linear: front-end wrapper over `Box<dyn LinearBackend>`. Backends cover the
+//         weight-format axis (DenseLinear, Q4_0Linear, Q4KLinear, GpuQuantLinear,
+//         OnednnLinear). The backend is picked at construction time — model code
+//         only sees `Linear` and doesn't know which format is loaded.
+//
+// Attention and MLP deliberately don't have an analogous `AttentionBackend` /
+// `MlpBackend` trait: weight format is the only dimension that genuinely varies
+// at runtime for a given model, and it only touches the matmul step. Attention
+// kernel selection (FA4 vs FlashInfer vs SDPA) lives inside `Ops.varlen_attention`
+// as a fallback chain instead.
+//
+// RmsNorm: AVX-512 on CPU, fused CUDA kernel on GPU via `Ops`.
 
 use crate::loading::var_builder::VarBuilder;
 use crate::tensor::{DType, Module, Result, Tensor, D};
 use std::any::Any;
 use std::sync::Arc;
 
-// ── NaiveLinear (inlined from nn_ops::NaiveLinear) ─────────────────────
+// ── DenseLinear (fp16/bf16/f32 dense backend) ──────────────────────────
 
-/// A linear layer: `y = x @ weight.T + bias`.
+/// Dense floating-point linear layer: `y = x @ weight.T + bias`.
 ///
-/// Used as the fallback backend when no optimized backend is available.
-/// On CUDA, `Tensor::matmul()` routes through the registered CUTLASS/DeepGEMM dispatch.
+/// The default `LinearBackend` for non-quantized weights. On CUDA, the inner
+/// `matmul()` is intercepted by the registered GEMM dispatch (DeepGEMM → CUTLASS).
+/// On CPU, it falls through to candle's native matmul (or is replaced by
+/// `OnednnLinear` via the `CpuLinearFactory` registry).
 #[derive(Clone, Debug)]
-pub struct NaiveLinear {
+pub struct DenseLinear {
     weight: Tensor,
     bias: Option<Tensor>,
 }
 
-impl NaiveLinear {
+impl DenseLinear {
     pub fn new(weight: Tensor, bias: Option<Tensor>) -> Self {
         Self { weight, bias }
     }
@@ -30,7 +41,7 @@ impl NaiveLinear {
     pub fn bias(&self) -> Option<&Tensor> { self.bias.as_ref() }
 }
 
-impl Module for NaiveLinear {
+impl Module for DenseLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = match *x.dims() {
             [b1, b2, m, k] => {
@@ -63,17 +74,30 @@ impl Module for NaiveLinear {
     }
 }
 
+impl LinearBackend for DenseLinear {
+    fn name(&self) -> &str { "dense" }
+    fn weight(&self) -> Option<&Tensor> { Some(&self.weight) }
+    fn clone_box(&self) -> Box<dyn LinearBackend> { Box::new(self.clone()) }
+    fn as_any(&self) -> &dyn Any { self }
+}
+
 // ── LinearBackend trait ───────────────────────────────────────────────────
 
-/// Trait for all Linear layer backends.
+/// Backend trait for `Linear`. Exists only because Linear has multiple real
+/// runtime implementations (dense fp, Q4_0, Q4_K, GPU quant, oneDNN), one per
+/// weight format. Attention and MLP don't have an analogous trait because
+/// their implementation is fixed per model.
 ///
-/// Models call `Linear::forward(x)` which delegates to the active backend.
-/// Each backend handles its own weight storage and GEMM dispatch.
+/// All impls must also be `Module` (that's where the actual `forward` lives).
+/// The extra methods here are for identity queries and boxed cloning.
 ///
-/// Implemented by: `GpuLinear`, `OnednnLinear`, `QuantizedWeight`, and
-/// future backends (FP8, INT4 GEMM, ...).
+/// Current impls:
+/// - `DenseLinear` (prelude-core, fp16/bf16/f32)
+/// - `OnednnLinear` (prelude-cpu, BF16/F32 with oneDNN)
+/// - `Q4_0Linear`, `Q4KLinear` (prelude-cpu, GGUF quantization)
+/// - `GpuQuantLinear` (prelude-cuda, GGUF quantization via quant-gemm)
 pub trait LinearBackend: Module + Send + Sync + std::fmt::Debug {
-    /// Backend name for logging (e.g., "gpu/cutlass", "cpu/onednn", "quant/q4_0").
+    /// Backend name for logging (e.g., "dense", "cpu/onednn", "cpu/q4_0").
     fn name(&self) -> &str;
 
     /// Access the underlying weight tensor.
@@ -140,7 +164,7 @@ fn find_quant_format(
 
 /// Factory for creating optimized CPU linear backends.
 pub trait CpuLinearFactory: Send + Sync {
-    fn create(&self, linear: NaiveLinear) -> Result<Box<dyn LinearBackend>>;
+    fn create(&self, linear: DenseLinear) -> Result<Box<dyn LinearBackend>>;
 }
 
 pub struct CpuLinearFactoryEntry {
@@ -176,21 +200,21 @@ impl Linear {
         } else {
             None
         };
-        Self::from_candle(NaiveLinear::new(weight, bias))
+        Self::from_dense(DenseLinear::new(weight, bias))
     }
 
     /// Construct from a raw weight tensor (e.g., for tied embeddings / lm_head).
     pub fn from_weight(weight: Tensor, bias: Option<Tensor>) -> Result<Self> {
-        Self::from_candle(NaiveLinear::new(weight, bias))
+        Self::from_dense(DenseLinear::new(weight, bias))
     }
 
-    /// Wrap an existing `NaiveLinear`, selecting the best backend by device.
+    /// Wrap an existing `DenseLinear`, selecting the best backend by device.
     ///
-    /// CUDA: uses `NaiveLinear` — `Tensor::matmul()` routes through the registered
-    /// CUTLASS/DeepGEMM dispatch (set up by `CudaOps::create()`).
+    /// CUDA: uses `DenseLinear` directly — its `forward` calls `Tensor::matmul()`
+    /// which routes through the registered CUTLASS/DeepGEMM dispatch.
     /// CPU: uses registered CPU linear factory (OnednnLinear from prelude-cpu) if available,
-    ///      otherwise falls back to NaiveLinear.
-    pub fn from_candle(linear: NaiveLinear) -> Result<Self> {
+    ///      otherwise falls back to `DenseLinear` + candle native matmul.
+    pub fn from_dense(linear: DenseLinear) -> Result<Self> {
         if linear.weight().device().is_cpu() {
             // Use registered CPU linear factory if available (e.g., OnednnLinear)
             if let Some(entry) = inventory::iter::<CpuLinearFactoryEntry>().next() {
@@ -200,7 +224,7 @@ impl Linear {
             }
         }
         Ok(Self {
-            inner: Box::new(NaiveLinearBackend(linear)),
+            inner: Box::new(linear),
         })
     }
 
@@ -249,29 +273,9 @@ impl Linear {
     }
 }
 
-// ── NaiveLinear backend (CUDA via registered dispatch) ─────────────────
-
-/// Simple wrapper around `NaiveLinear` for CUDA devices.
-/// `Tensor::matmul()` is intercepted by the registered GEMM dispatch
-/// (CUTLASS/DeepGEMM), so no direct FFI needed here.
-#[derive(Debug, Clone)]
-struct NaiveLinearBackend(NaiveLinear);
-
-impl Module for NaiveLinearBackend {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.0.forward(x)
-    }
-}
-
-impl LinearBackend for NaiveLinearBackend {
-    fn name(&self) -> &str { "gpu/candle" }
-    fn weight(&self) -> Option<&Tensor> { Some(self.0.weight()) }
-    fn clone_box(&self) -> Box<dyn LinearBackend> { Box::new(self.clone()) }
-    fn as_any(&self) -> &dyn Any { self }
-}
-
-// Q4_0, Q4_K, OnednnLinear backends moved to prelude-cpu crate.
-// They register via inventory when prelude-cpu is linked.
+// Q4_0Linear, Q4KLinear, OnednnLinear backends live in prelude-cpu.
+// GpuQuantLinear lives in prelude-cuda. They register themselves via inventory
+// when their crate is linked.
 
 // ── RmsNorm ─────────────────────────────────────────────────────────────
 

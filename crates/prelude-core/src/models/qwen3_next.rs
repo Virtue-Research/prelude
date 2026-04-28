@@ -14,7 +14,7 @@
 
 use crate::tensor::{DType, Device, Module, Result, Tensor, D};
 use crate::models::commons::embedding::Embedding;
-use crate::models::commons::linear::NaiveLinear;
+use crate::models::commons::linear::DenseLinear;
 use crate::loading::var_builder::VarBuilder;
 
 use crate::models::commons::{
@@ -736,10 +736,10 @@ impl ExpertMlp {
 // ── Sparse MoE Block with Shared Expert ─────────────────────────────────
 
 struct Qwen3NextSparseMoeBlock {
-    gate: NaiveLinear,
+    gate: DenseLinear,
     experts: Vec<ExpertMlp>,
     shared_expert: ExpertMlp,
-    shared_expert_gate: NaiveLinear,
+    shared_expert_gate: DenseLinear,
     // Stacked weights for fused MoE GEMM (GPU only)
     gate_w: Option<Tensor>,
     up_w: Option<Tensor>,
@@ -754,7 +754,7 @@ impl Qwen3NextSparseMoeBlock {
         let gate = {
             let gvb = vb.pp("gate");
             let w = gvb.get((cfg.num_experts, cfg.hidden_size), "weight")?;
-            NaiveLinear::new(w, None)
+            DenseLinear::new(w, None)
         };
 
         let mut experts = Vec::with_capacity(cfg.num_experts);
@@ -775,7 +775,7 @@ impl Qwen3NextSparseMoeBlock {
         let shared_expert_gate = {
             let gvb = vb.pp("shared_expert_gate");
             let w = gvb.get((1, cfg.hidden_size), "weight")?;
-            NaiveLinear::new(w, None)
+            DenseLinear::new(w, None)
         };
 
         // Stack expert weights for fused GEMM (GPU only)

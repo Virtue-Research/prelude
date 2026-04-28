@@ -7,6 +7,7 @@
 #   ./benchmark/bench.sh sglang --gpu      # SGLang GPU only
 #   ./benchmark/bench.sh --gpu             # all GPU engines
 #   ./benchmark/bench.sh --cpu             # all CPU engines
+#   ./benchmark/bench.sh --gpu --cu12      # use CUDA 12 Docker images (default: CUDA 13)
 #
 # Environment:
 #   MODEL  INPUT_TOKENS  OUTPUT_TOKENS  CONCURRENCY  MAX_REQUESTS  CUDA_VISIBLE_DEVICES
@@ -63,9 +64,9 @@ ENGINES=(
 # Docker image per engine (only for docker-type engines)
 declare -A DOCKER_IMAGES
 DOCKER_IMAGES=(
-    [vllm]="vllm/vllm-openai:latest"
+    [vllm]="vllm/vllm-openai:latest-cu130"
     [vllm-cpu]="vllm/vllm-openai:latest"
-    [sglang]="lmsysorg/sglang:latest"
+    [sglang]="lmsysorg/sglang:latest-cu130"
     [sglang-cpu]="lmsysorg/sglang:latest"
 )
 
@@ -118,8 +119,7 @@ check_engine() {
             [ -f "$LLAMA_CPP_BIN" ] || { echo "llama-server not found ($LLAMA_CPP_BIN)"; return 1; }
             [ -f "$GGUF_MODEL" ] || { echo "GGUF not found ($GGUF_MODEL)"; return 1; } ;;
         vllm|vllm-cpu|sglang|sglang-cpu)
-            local img="${DOCKER_IMAGES[$engine]}"
-            docker image inspect "$img" >/dev/null 2>&1 || { echo "Docker image not found: $img (docker pull $img)"; return 1; } ;;
+            ;; # Docker images are pulled in run_engine before start
     esac
     return 0
 }
@@ -140,20 +140,20 @@ start_engine() {
         vllm)
             docker run --rm --name vllm-bench --network=host --gpus all --ipc=host \
                 -v "$hf_cache:/root/.cache/huggingface" -e "CUDA_VISIBLE_DEVICES=$cvd" \
-                vllm/vllm-openai:latest --model "$MODEL" --port "$port" --host 0.0.0.0 & ;;
+                "$img" --model "$MODEL" --port "$port" --host 0.0.0.0 & ;;
         vllm-cpu)
             docker run --rm --name vllm-cpu-bench --network=host \
                 -v "$hf_cache:/root/.cache/huggingface" \
-                vllm/vllm-openai:latest --model "$MODEL" --port "$port" --host 0.0.0.0 --device cpu & ;;
+                "$img" --model "$MODEL" --port "$port" --host 0.0.0.0 --device cpu & ;;
         sglang)
             docker run --rm --name sglang-bench --network=host --gpus all --ipc=host --shm-size 32g \
                 -v "$hf_cache:/root/.cache/huggingface" -e "CUDA_VISIBLE_DEVICES=$cvd" \
-                lmsysorg/sglang:latest python3 -m sglang.launch_server \
+                "$img" python3 -m sglang.launch_server \
                     --model-path "$MODEL" --port "$port" --host 0.0.0.0 & ;;
         sglang-cpu)
             docker run --rm --name sglang-cpu-bench --network=host \
                 -v "$hf_cache:/root/.cache/huggingface" \
-                lmsysorg/sglang:latest python3 -m sglang.launch_server \
+                "$img" python3 -m sglang.launch_server \
                     --model-path "$MODEL" --port "$port" --host 0.0.0.0 \
                     --device cpu --disable-overlap-schedule & ;;
         llama.cpp)
@@ -179,6 +179,13 @@ run_engine() {
 
     [ "$gpu_only" = "yes" ] && [ "$DEVICE" = "cpu" ] && return
     local reason; reason=$(check_engine "$engine") || { warn "Skipping $display: $reason"; return; }
+
+    # Pull Docker image if needed (outside subshell so output goes to terminal)
+    local img="${DOCKER_IMAGES[$engine]:-}"
+    if [ -n "$img" ]; then
+        log "Pulling $img ..."
+        docker pull "$img" || { warn "Skipping $display: docker pull failed"; return; }
+    fi
 
     log "Starting $display (device=$DEVICE) on port $port ..."
     start_engine "$engine" "$port"
@@ -230,6 +237,10 @@ FILTER=""; TARGETS=()
 for arg in "$@"; do
     case "$arg" in
         --cpu) FILTER="cpu" ;; --gpu) FILTER="gpu" ;;
+        --cu12)
+            DOCKER_IMAGES[vllm]="vllm/vllm-openai:latest"
+            DOCKER_IMAGES[sglang]="lmsysorg/sglang:latest"
+            ;;
         -*) err "Unknown flag: $arg"; exit 1 ;;
         *) TARGETS+=("$arg") ;;
     esac

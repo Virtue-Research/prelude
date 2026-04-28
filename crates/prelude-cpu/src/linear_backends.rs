@@ -1,14 +1,14 @@
 //! CPU linear backends — registered via inventory when prelude-cpu is linked.
 //!
 //! - OnednnLinearFactory: creates OnednnLinear for CPU BF16/F32
-//! - Q4_0Format, Q4KFormat: quantized GGUF backends
+//! - Q4_0Linear, Q4KLinear: GGUF quantized linear backends
 
 use std::sync::Arc;
 use prelude_core::tensor::{Module, Result, Tensor};
 use prelude_core::models::commons::linear::{
     CpuLinearFactory, CpuLinearFactoryEntry, LinearBackend,
 };
-use prelude_core::models::commons::linear::NaiveLinear;
+use prelude_core::models::commons::linear::DenseLinear;
 use std::any::Any;
 
 // ── OneDNN CPU linear factory ───────────────────────────────────────
@@ -18,7 +18,7 @@ struct OnednnLinearFactory;
 
 #[cfg(feature = "onednn")]
 impl CpuLinearFactory for OnednnLinearFactory {
-    fn create(&self, linear: NaiveLinear) -> Result<Box<dyn LinearBackend>> {
+    fn create(&self, linear: DenseLinear) -> Result<Box<dyn LinearBackend>> {
         Ok(Box::new(crate::onednn::OnednnLinear::new(linear)?))
     }
 }
@@ -26,16 +26,16 @@ impl CpuLinearFactory for OnednnLinearFactory {
 #[cfg(feature = "onednn")]
 inventory::submit!(CpuLinearFactoryEntry::new(&OnednnLinearFactory));
 
-// ── Q4_0 quantized backend ──────────────────────────────────────────
+// ── Q4_0 quantized linear backend ───────────────────────────────────
 
 #[derive(Debug, Clone)]
-struct QuantizedWeight {
+struct Q4_0Linear {
     blocks: Vec<crate::ops::quant::BlockQ4_0>,
     n: usize,
     k: usize,
 }
 
-impl Module for QuantizedWeight {
+impl Module for Q4_0Linear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         use prelude_core::tensor::{DType, Device};
 
@@ -45,7 +45,7 @@ impl Module for QuantizedWeight {
         let x_k = *x_dims.last().unwrap();
         if x_k != self.k {
             prelude_core::tensor::bail!(
-                "quantized matmul: x inner dim {x_k} != weight dim {}",
+                "Q4_0 matmul: x inner dim {x_k} != weight dim {}",
                 self.k
             );
         }
@@ -62,23 +62,23 @@ impl Module for QuantizedWeight {
     }
 }
 
-impl LinearBackend for QuantizedWeight {
-    fn name(&self) -> &str { "quant/q4_0" }
+impl LinearBackend for Q4_0Linear {
+    fn name(&self) -> &str { "cpu/q4_0" }
     fn is_quantized(&self) -> bool { true }
     fn clone_box(&self) -> Box<dyn LinearBackend> { Box::new(self.clone()) }
     fn as_any(&self) -> &dyn Any { self }
 }
 
-// ── Q4_K quantized backend ──────────────────────────────────────────
+// ── Q4_K quantized linear backend ───────────────────────────────────
 
 #[derive(Debug, Clone)]
-struct QuantizedWeightQ4K {
+struct Q4KLinear {
     blocks: Vec<crate::ops::quant::BlockQ4K>,
     n: usize,
     k: usize,
 }
 
-impl Module for QuantizedWeightQ4K {
+impl Module for Q4KLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         use prelude_core::tensor::{DType, Device};
 
@@ -105,8 +105,8 @@ impl Module for QuantizedWeightQ4K {
     }
 }
 
-impl LinearBackend for QuantizedWeightQ4K {
-    fn name(&self) -> &str { "quant/q4_k" }
+impl LinearBackend for Q4KLinear {
+    fn name(&self) -> &str { "cpu/q4_k" }
     fn is_quantized(&self) -> bool { true }
     fn clone_box(&self) -> Box<dyn LinearBackend> { Box::new(self.clone()) }
     fn as_any(&self) -> &dyn Any { self }
@@ -131,7 +131,7 @@ impl QuantFormat for CpuQ4_0Format {
         let dims = shape.dims();
         let (n, k) = (dims[0], dims[1]);
         let blocks: Vec<crate::ops::quant::BlockQ4_0> = bytemuck::cast_slice(qtensor.data()).to_vec();
-        Ok(Box::new(QuantizedWeight { blocks, n, k }))
+        Ok(Box::new(Q4_0Linear { blocks, n, k }))
     }
 }
 
@@ -151,7 +151,7 @@ impl QuantFormat for CpuQ4KFormat {
         let dims = shape.dims();
         let (n, k) = (dims[0], dims[1]);
         let blocks: Vec<crate::ops::quant::BlockQ4K> = bytemuck::cast_slice(qtensor.data()).to_vec();
-        Ok(Box::new(QuantizedWeightQ4K { blocks, n, k }))
+        Ok(Box::new(Q4KLinear { blocks, n, k }))
     }
 }
 

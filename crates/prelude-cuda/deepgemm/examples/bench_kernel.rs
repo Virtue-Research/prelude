@@ -84,7 +84,8 @@ fn models() -> Vec<(&'static str, usize, usize, usize)> {
     // (name, hidden, intermediate, vocab)
     vec![
         ("Qwen3-0.6B", 1024, 3072, 151936),
-        ("Qwen3-8B", 4096, 11008, 151936),
+        ("Qwen3-8B", 4096, 12288, 151936),
+        ("Qwen3-32B", 5120, 25600, 151936),
     ]
 }
 
@@ -105,11 +106,13 @@ fn deepgemm_bf16(
     let (wp, _g2) = weight.device_ptr(&gpu.stream);
     let (op, _g3) = output.device_ptr_mut(&gpu.stream);
     unsafe {
-        prelude_deepgemm::bf16_gemm(
+        if let Err(e) = prelude_deepgemm::bf16_gemm(
             ip as *mut c_void, wp as *mut c_void, op as *mut c_void,
             m as i32, n as i32, k as i32,
             gpu.stream_ptr(),
-        ).ok();
+        ) {
+            eprintln!("DeepGEMM ERROR for M={m} N={n} K={k}: {e}");
+        }
     }
 }
 
@@ -166,7 +169,7 @@ fn bench_bf16(gpu: &Gpu) {
     for (name, h, i, v) in &models() {
         println!("--- {name} (H={h}, I={i}) ---");
         let layers: Vec<(&str, usize, usize)> = vec![
-            ("qkvo", *h, *h), ("gate/up", *i, *h), ("down", *h, *i), ("lm_head", *v, *h),
+            ("qkvo", *h, *h), ("gate/up", *i, *h), ("gate_up_F", 2 * *i, *h), ("down", *h, *i), ("lm_head", *v, *h),
         ];
 
         for (m, tok_label) in &token_counts() {

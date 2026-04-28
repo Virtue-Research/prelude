@@ -12,19 +12,7 @@ __pycache__/
 
 # Local-only runs of external benchmarking harnesses
 benchmark/results/
-benchmark/genai-bench/results/
-genai_bench.log
-/local_test/
-
-# Pre-built CUDA kernel artifacts that `cargo build` regenerates from the
-# AOT compile scripts under each crate's `scripts/`. Intermediate ninja/.o
-# output lands here the first time nvcc or cutedsl runs.
-crates/prelude-flash-attn-v4/kernels/
-crates/prelude-flashinfer/kernels/
-
-# Third-party sources vendored ad-hoc outside of .gitmodules
-third_party/causal-conv1d/
-
+benchmark/e2e/results/
 crates/onednn-ffi/build
 onednn-ffi/buildCargo.lock
 *.o
@@ -33,6 +21,6 @@ onednn-ffi/buildCargo.lock
 .cargo-ok
 .cargo_vcs_info.json
 *.orig
-
-# AI assistant working notes — not part of the project
+genai_bench.log
+analysis/
 CLAUDE.md

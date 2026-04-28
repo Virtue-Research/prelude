@@ -3548,3 +3548,110 @@ fn pod_execution() {
         cudaFree(sched_ptr);
     }
 }
+// ── fused_add_rmsnorm correctness ───────────────────────────────────
+
+/// CPU reference: fused add + rmsnorm.
+/// sum = x + residual; normed = sum / sqrt(mean(sum^2) + eps) * weight
+fn cpu_fused_add_rmsnorm(x: &[f32], residual: &[f32], weight: &[f32], eps: f64, tokens: usize, hidden: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut sum_out = vec![0.0f32; tokens * hidden];
+    let mut norm_out = vec![0.0f32; tokens * hidden];
+    for t in 0..tokens {
+        let off = t * hidden;
+        let mut ss = 0.0f64;
+        for i in 0..hidden {
+            let s = x[off + i] as f64 + residual[off + i] as f64;
+            sum_out[off + i] = s as f32;
+            ss += s * s;
+        }
+        let scale = 1.0 / (ss / hidden as f64 + eps).sqrt();
+        for i in 0..hidden {
+            norm_out[off + i] = (sum_out[off + i] as f64 * scale * weight[i] as f64) as f32;
+        }
+    }
+    (sum_out, norm_out)
+}
+
+#[test]
+fn fused_add_rmsnorm_correctness() {
+    let reg = KernelRegistry::new();
+    let fused = reg.get_utility("fused_add_rmsnorm")
+        .expect("fused_add_rmsnorm not found");
+
+    // Test shapes: (tokens, hidden)
+    let shapes = [(1, 1536), (4, 4096), (128, 4096)];
+
+    for (tokens, hidden) in shapes {
+        let n = tokens * hidden;
+        let eps = 1e-6f64;
+
+        // Generate random input data
+        let x_f32: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.01).sin() * 0.5)).collect();
+        let r_f32: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.007 + 1.0).cos() * 0.3)).collect();
+        let w_f32: Vec<f32> = (0..hidden).map(|i| 0.8 + (i as f32 * 0.003).sin() * 0.2).collect();
+
+        // CPU reference (in f32)
+        let (ref_sum, ref_norm) = cpu_fused_add_rmsnorm(&x_f32, &r_f32, &w_f32, eps, tokens, hidden);
+
+        // Convert to BF16 and upload
+        let x_bf16: Vec<u16> = x_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+        let r_bf16: Vec<u16> = r_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+        let w_bf16: Vec<u16> = w_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+
+        let x_gpu = gpu_upload(&x_bf16);
+        let r_gpu = gpu_upload(&r_bf16);
+        let w_gpu = gpu_upload(&w_bf16);
+
+        let in_s = [tokens as i64, hidden as i64];
+        let in_st = contiguous_strides(&in_s);
+        let w_s = [hidden as i64];
+        let w_st = vec![1i64];
+
+        let dl_x = gpu_dl(x_gpu, BF16_DT, &in_s, &in_st);
+        let dl_r = gpu_dl(r_gpu, BF16_DT, &in_s, &in_st);
+        let dl_w = gpu_dl(w_gpu, BF16_DT, &w_s, &w_st);
+
+        unsafe { reg.set_stream(0, std::ptr::null_mut()); }
+
+        // FlashInfer fused_add_rmsnorm is in-place:
+        // after call, x_gpu = rmsnorm(x+residual), r_gpu = x+residual
+        let args = [
+            TVMFFIAny::dltensor(&dl_x),
+            TVMFFIAny::dltensor(&dl_r),
+            TVMFFIAny::dltensor(&dl_w),
+            TVMFFIAny::float64(eps),
+            TVMFFIAny::bool_val(false),
+        ];
+        unsafe {
+            reg.call(fused, &args).unwrap();
+            cudaDeviceSynchronize();
+        }
+
+        // Download results
+        let out_norm_bf16: Vec<u16> = gpu_download(x_gpu, n);  // x now holds normed output
+        let out_sum_bf16: Vec<u16> = gpu_download(r_gpu, n);   // residual now holds sum
+
+        let out_norm: Vec<f32> = out_norm_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
+        let out_sum: Vec<f32> = out_sum_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
+
+        // Compare sum (x + residual)
+        let max_diff_sum: f32 = out_sum.iter().zip(ref_sum.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        // Compare normed output
+        let max_diff_norm: f32 = out_norm.iter().zip(ref_norm.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        // BF16 tolerance: ~0.8% relative error typical
+        let tol = 0.05;
+        assert!(max_diff_sum < tol,
+            "fused_add_rmsnorm sum mismatch ({tokens}×{hidden}): max_diff={max_diff_sum}");
+        assert!(max_diff_norm < tol,
+            "fused_add_rmsnorm norm mismatch ({tokens}×{hidden}): max_diff={max_diff_norm}");
+
+        println!("fused_add_rmsnorm ({tokens}×{hidden}): PASS (sum_diff={max_diff_sum:.6}, norm_diff={max_diff_norm:.6})");
+
+        unsafe { cudaFree(x_gpu); cudaFree(r_gpu); cudaFree(w_gpu); }
+    }
+}

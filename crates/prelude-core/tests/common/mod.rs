@@ -8,11 +8,7 @@ use prelude_core::tensor::{Device, DType, Result, Tensor};
 pub fn test_devices() -> Vec<Device> {
     let mut devs = vec![Device::Cpu];
     #[cfg(feature = "test-cuda")]
-    {
-        if let Ok(cuda) = Device::new_cuda(0) {
-            devs.push(cuda);
-        }
-    }
+    devs.push(Device::Cuda(0));
     // planned:
     // #[cfg(feature = "test-amd")]   devs.push(Device::Amd(0));
     // #[cfg(feature = "test-metal")] devs.push(Device::Metal(0));

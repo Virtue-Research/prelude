@@ -90,7 +90,8 @@ fn models() -> Vec<(&'static str, usize, usize, usize)> {
     // (name, hidden, intermediate, vocab)
     vec![
         ("Qwen3-0.6B", 1024, 3072, 151936),
-        ("Qwen3-8B", 4096, 11008, 151936),
+        ("Qwen3-8B", 4096, 12288, 151936),
+        ("Qwen3-32B", 5120, 25600, 151936),
     ]
 }
 
@@ -248,7 +249,7 @@ fn bench_bf16_gemm(gpu: &Gpu) {
     for (name, h, i, v) in &models() {
         println!("--- {name} (H={h}, I={i}) ---");
         let layers: Vec<(&str, usize, usize)> = vec![
-            ("qkvo", *h, *h), ("gate/up", *i, *h), ("down", *h, *i), ("lm_head", *v, *h),
+            ("qkvo", *h, *h), ("gate/up", *i, *h), ("gate_up_F", 2 * *i, *h), ("down", *h, *i), ("lm_head", *v, *h),
         ];
 
         for (m, tok_label) in &token_counts() {

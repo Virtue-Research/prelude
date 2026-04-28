@@ -70,9 +70,11 @@ impl Ops for CudaOps {
     fn attn_name(&self) -> &str { "cuda" }
 
     fn varlen_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, params: &VarlenParams) -> Result<Tensor> {
+        // All three backends are stride-aware on Q/K/V (requires only stride(-1) == 1):
+        // FA4 reads strides from DLTensor, FlashInfer reads q.stride(0)/stride(1) in
+        // its C++ wrapper, and the composed SDPA fallback materializes via to_dtype.
         if let Some(r) = try_fa4_varlen(q, k, v, params) { return r; }
         if let Some(r) = try_flashinfer_varlen(q, k, v, params) { return r; }
-        // Ultimate fallback: composed matmul SDPA
         prelude_core::ops::traits::attention::varlen_attention(q, k, v, params)
     }
 
@@ -97,12 +99,20 @@ impl Ops for CudaOps {
 
     fn fused_add_rmsnorm(&self, residual: &Tensor, x: &Tensor, weight: &Tensor, eps: f32) -> Option<Result<(Tensor, Tensor)>> {
         if x.dtype() != DType::BF16 { return None; }
-        Some(crate::ops::rmsnorm::fused_add_rmsnorm(x, residual, weight, eps as f64))
+        // FlashInfer in-place: after call, x = rmsnorm(x + residual), residual = x + residual.
+        // Safe because residual flows linearly through layers (never branched).
+        Some(crate::attn::flashinfer::fi_fused_add_rmsnorm(x, residual, weight, eps as f64)
+            .map(|()| (residual.clone(), x.clone())))
     }
 
     fn fused_silu_mul(&self, gate: &Tensor, up: &Tensor) -> Option<Result<Tensor>> {
         if gate.dtype() != DType::BF16 { return None; }
         Some(crate::ops::elementwise::fused_silu_mul(gate, up))
+    }
+
+    fn silu_mul_concat(&self, gate_up: &Tensor) -> Option<Result<Tensor>> {
+        if gate_up.dtype() != DType::BF16 { return None; }
+        Some(crate::attn::flashinfer::silu_and_mul(gate_up))
     }
 
     fn fused_add(&self, a: &Tensor, b: &Tensor) -> Option<Result<Tensor>> {

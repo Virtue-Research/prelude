@@ -17,9 +17,15 @@ impl Scheduler {
         let freed = victim.total_len();
         self.tokens_in_use = self.tokens_in_use.saturating_sub(freed);
 
+        // Free KV blocks directly (scheduler owns block_manager).
+        if !victim.block_table.is_empty() {
+            self.free_blocks(&victim.block_table);
+        }
+
         victim.status = SequenceStatus::Waiting;
         victim.kv_computed_len = 0;
         victim.block_table.clear();
+        victim.deltanet_slot = None;
         victim.preempt_count += 1;
 
         self.effective_new_token_ratio = self.config.new_token_ratio;
@@ -28,6 +34,13 @@ impl Scheduler {
     }
 
     pub(crate) fn ensure_decode_capacity(&mut self) {
+        self.ensure_decode_capacity_tracked();
+    }
+
+    /// Like `ensure_decode_capacity` but returns whether any preemption occurred.
+    /// Used by `get_mixed_batch` to skip waiting admission after preemption
+    /// (like vLLM V1's `if not preempted_reqs` guard).
+    pub(crate) fn ensure_decode_capacity_tracked(&mut self) -> bool {
         let needed = self.running.len();
         let available = self
             .config
@@ -35,18 +48,21 @@ impl Scheduler {
             .saturating_sub(self.tokens_in_use);
 
         if needed <= available {
-            return;
+            return false;
         }
 
         let mut deficit = needed - available;
+        let mut had_preemption = false;
         while deficit > 0 {
             if let Some((freed, victim)) = self.preempt_one_from_running() {
                 deficit = deficit.saturating_sub(freed);
                 self.waiting_queue.push_front(victim);
+                had_preemption = true;
             } else {
                 break;
             }
         }
+        had_preemption
     }
 
     pub(crate) fn drain_finished(&mut self) {

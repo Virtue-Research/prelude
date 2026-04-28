@@ -21,11 +21,10 @@ This guide walks through adding a new model architecture to Prelude.
 
 Adding a model requires **3 steps**:
 
-1. Create `models/<name>.rs` — config struct, model struct, `ModelForward` impl,
-   and an `ArchSpec` impl + `inventory::submit!` for auto-registration.
-2. Add `pub mod <name>;` in `models/mod.rs`.
-3. That's it — `registry.rs` never needs editing. The `inventory` crate
-   collects every `ArchSpec` submission at link time.
+1. Create `models/<name>/mod.rs` — config struct, model struct, `ModelForward` impl
+2. Create `models/<name>/meta.rs` — `ArchSpec` impl with static instance
+3. Add `pub mod <name>;` in `models/mod.rs`
+4. Add one line in `ALL_ARCH_SPECS` in `models/registry.rs`
 
 No enum variants, no match arms, no central registry list.
 
@@ -33,8 +32,9 @@ No enum variants, no match arms, no central registry list.
 
 ```
 crates/prelude-core/src/models/
-  mymodel.rs    # Everything: config, model, ModelForward impl, ArchSpec impl,
-                # and one inventory::submit! line.
+  mymodel/
+    mod.rs    # Config struct, model struct, forward logic, ModelForward impl
+    meta.rs   # ArchSpec impl, static registration
 ```
 
 Each model is a **single flat file**. There is no `models/<name>/` subdirectory
@@ -76,7 +76,7 @@ Build the model layers and implement the forward pass:
 
 ```rust
 pub struct MyModelForCausalLM {
-    embed_tokens: prelude_core::modules::embedding::Embedding,
+    embed_tokens: prelude_core::models::commons::embedding::Embedding,
     layers: Vec<MyDecoderLayer>,
     norm: RmsNorm,
     lm_head: Linear,
@@ -267,8 +267,8 @@ impl ArchSpec for MyModelArchSpec {
         RuntimeCaps {
             supports_kv_cache: task == TaskKind::Generate,
             supports_prefix_cache: false,
-            supports_paged_attn: cfg!(feature = "paged-attn") && cuda_safetensors,
-            supports_varlen: cfg!(feature = "flash-attn-v3") && cuda_safetensors,
+            supports_paged_attn: cfg!(feature = "cuda") && cuda_safetensors,
+            supports_varlen: cfg!(feature = "cuda") && cuda_safetensors,
             supports_deltanet: false,
             supports_cuda_graph: false,
             supports_varlen_cpu: false,
@@ -361,22 +361,34 @@ pub(crate) static MYMODEL_ARCH_SPEC: MyModelArchSpec = MyModelArchSpec;
 inventory::submit!(crate::models::registry::ArchSpecEntry::new(&MYMODEL_ARCH_SPEC));
 ```
 
-Then expose the module in `crates/prelude-core/src/models/mod.rs`:
+In `crates/prelude-core/src/models/mod.rs`:
 
 ```rust
 pub mod mymodel;   // <-- add
 ```
 
-`registry.rs` **is never edited**. `inventory::collect!(ArchSpecEntry)` at the
-bottom of `registry.rs` picks up every `submit!` at link time.
+### 5b. Register in `all_arch_specs()`
+
+In `crates/prelude-core/src/models/registry.rs`:
+
+```rust
+static ALL_ARCH_SPECS: &[&dyn ArchSpec] = &[
+    &super::qwen3::meta::QWEN3_ARCH_SPEC,
+    // ...existing...
+    &super::mymodel::meta::MYMODEL_ARCH_SPEC,    // <-- add
+];
+```
+
+No array size to bump — it's a static slice.
 
 ## Checklist
 
 - [ ] Config struct with 5 common fields (`vocab_size`, `num_hidden_layers`, `max_position_embeddings`, `num_key_value_heads`, `head_dim`)
 - [ ] Model struct with `new()` and `forward()`
 - [ ] `impl ModelForward` with required + relevant optional methods
-- [ ] `ArchSpec` impl + static instance + `inventory::submit!` in the same file
+- [ ] `meta.rs` with `ArchSpec` impl and static instance
 - [ ] Module exported in `models/mod.rs`
+- [ ] Registered in `ALL_ARCH_SPECS` in `models/registry.rs`
 - [ ] `cargo build` passes
 - [ ] `cargo test` passes
 - [ ] Server loads model and serves requests
@@ -386,7 +398,7 @@ bottom of `registry.rs` picks up every `submit!` at link time.
 ### 1. Build and smoke test
 
 ```bash
-cargo build -p prelude-server --release --features flash-attn-v3
+cargo build -p prelude-server --release --features full
 ./target/release/prelude-server --model <your-model> --port 8001
 curl http://localhost:8001/health
 curl http://localhost:8001/v1/completions \

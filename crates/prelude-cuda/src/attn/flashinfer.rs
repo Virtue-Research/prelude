@@ -138,7 +138,7 @@ pub fn precompute_paged_plan(
 /// always reference the same GPU addresses between capture and replay.
 ///
 /// SGLang reference: `flashinfer_backend.py` lines 568-571 (paged_kv_*_buffer).
-pub fn precompute_paged_plan_graphed(
+pub fn precompute_paged_plan_capture(
     q_shape: (usize, usize, usize),
     key_cache: &Tensor,
     cu_seqlens_q: &Tensor,
@@ -153,6 +153,156 @@ pub fn precompute_paged_plan_graphed(
         q_shape, key_cache, cu_seqlens_q, block_tables, cu_seqlens_k, softmax_scale,
         Some((fi_indptr, fi_indices, fi_last_page_len)),
     )
+}
+
+/// Graph-replay fast path: compute FlashInfer plan from CPU-side data directly.
+/// Avoids all GPU→CPU synchronization (no to_vec1/to_vec2 D2H copies).
+pub fn precompute_paged_plan_replay(
+    q_shape: (usize, usize, usize),
+    key_cache: &Tensor,
+    cu_seqlens_k_cpu: &[u32],
+    block_tables_cpu: &[Vec<u32>],
+    block_size: usize,
+    fi_indptr: &Tensor,
+    fi_indices: &Tensor,
+    fi_last_page_len: &Tensor,
+) -> Result<()> {
+    let (batch_size, num_qo_heads, head_dim) = q_shape;
+    let (_, _, num_kv_heads, _) = key_cache.shape().dims4()?;
+
+    let stream = cb::tensor_stream(key_cache)?;
+    let did = device_id(key_cache.device());
+    let raw_stream = stream.cu_stream() as *mut c_void;
+
+    // Compute FlashInfer metadata from CPU data (no D2H needed)
+    let bs = block_size as i32;
+    let mut indptr = vec![0i32; batch_size + 1];
+    let mut indices = Vec::new();
+    let mut last_page = Vec::with_capacity(batch_size);
+    let mut kv_lens = Vec::with_capacity(batch_size);
+
+    for i in 0..batch_size {
+        let kv_len = (cu_seqlens_k_cpu[i + 1] as i32) - (cu_seqlens_k_cpu[i] as i32);
+        kv_lens.push(kv_len);
+        let np = (kv_len + bs - 1) / bs;
+        indptr[i + 1] = indptr[i] + np;
+        for &idx in block_tables_cpu[i].iter().take(np as usize) {
+            indices.push(idx as i32);
+        }
+        let rem = kv_len % bs;
+        last_page.push(if rem == 0 { bs } else { rem });
+    }
+
+    // Upload metadata to pre-allocated GPU tensors via cudaMemcpyAsync
+    {
+        use candle_core::backend::BackendStorage;
+        fn gpu_ptr(t: &Tensor, stream: &std::sync::Arc<CudaStream>) -> Result<*mut c_void> {
+            let (storage, layout) = t.storage_and_layout();
+            let cuda = match &*storage {
+                candle_core::Storage::Cuda(s) => s,
+                _ => bail!("requires CUDA"),
+            };
+            let slice = cuda.as_cuda_slice::<i32>()?.slice(layout.start_offset()..);
+            let (ptr, _) = slice.device_ptr(stream);
+            Ok(ptr as u64 as *mut c_void)
+        }
+
+        let ip_ptr = gpu_ptr(fi_indptr, &stream)?;
+        let rc = unsafe { cudaMemcpyAsync(
+            ip_ptr, indptr.as_ptr() as *const c_void,
+            indptr.len() * 4, CUDA_MEMCPY_HOST_TO_DEVICE, raw_stream,
+        ) };
+        if rc != 0 { bail!("cudaMemcpyAsync indptr failed: {rc}"); }
+
+        if !indices.is_empty() {
+            let ix_ptr = gpu_ptr(fi_indices, &stream)?;
+            let rc = unsafe { cudaMemcpyAsync(
+                ix_ptr, indices.as_ptr() as *const c_void,
+                indices.len() * 4, CUDA_MEMCPY_HOST_TO_DEVICE, raw_stream,
+            ) };
+            if rc != 0 { bail!("cudaMemcpyAsync indices failed: {rc}"); }
+        }
+
+        let lp_ptr = gpu_ptr(fi_last_page_len, &stream)?;
+        let rc = unsafe { cudaMemcpyAsync(
+            lp_ptr, last_page.as_ptr() as *const c_void,
+            last_page.len() * 4, CUDA_MEMCPY_HOST_TO_DEVICE, raw_stream,
+        ) };
+        if rc != 0 { bail!("cudaMemcpyAsync last_page_len failed: {rc}"); }
+    }
+
+    // cu_seqlens_q for decode: [0, 1, 2, ..., bs] (Q=1 per seq)
+    let cuq_cpu: Vec<i32> = (0..=batch_size as i32).collect();
+    let total_q = batch_size;
+
+    let reg = registry();
+    let backend = reg.default_backend();
+    let variant = reg
+        .get_prefill(&PrefillKey {
+            dtype: dtype_to_kernel(key_cache.dtype()),
+            head_dim_qk: head_dim as u32, head_dim_vo: head_dim as u32,
+            sliding_window: false, logits_soft_cap: false,
+            backend,
+        })
+        .ok_or_else(|| prelude_core::tensor::Error::Msg(format!("FlashInfer: no {backend:?} prefill variant")))?;
+
+    let ws_guard = get_workspace(did)?;
+    let ws = ws_guard.as_ref().unwrap();
+
+    let is_fa3 = matches!(backend, prelude_flashinfer::Backend::FA3);
+
+    let fws: [i64; 1] = [FLOAT_WS_BYTES as i64];
+    let iws: [i64; 1] = [INT_WS_BYTES as i64];
+    let pws: [i64; 1] = [PINNED_WS_BYTES as i64];
+    let cuq_s: [i64; 1] = [(batch_size + 1) as i64];
+    let ip_s: [i64; 1] = [(batch_size + 1) as i64];
+    let kvl_s: [i64; 1] = [batch_size as i64];
+
+    let fws_st = contiguous_strides(&fws);
+    let iws_st = contiguous_strides(&iws);
+    let pws_st = contiguous_strides(&pws);
+    let cuq_st = contiguous_strides(&cuq_s);
+    let ip_st = contiguous_strides(&ip_s);
+    let kvl_st = contiguous_strides(&kvl_s);
+
+    let dl_fws = make_gpu_dl(ws.float_ws, did, U8_DT, &fws, &fws_st);
+    let dl_iws = make_gpu_dl(ws.int_ws, did, U8_DT, &iws, &iws_st);
+    let dl_pws = make_cpu_dl(ws.pinned_ws, U8_DT, &pws, &pws_st);
+    let dl_cuq_cpu = make_cpu_dl(cuq_cpu.as_ptr() as *mut c_void, I32_DT, &cuq_s, &cuq_st);
+    let dl_ip_cpu = make_cpu_dl(indptr.as_ptr() as *mut c_void, I32_DT, &ip_s, &ip_st);
+    let dl_kvl_cpu = make_cpu_dl(kv_lens.as_ptr() as *mut c_void, I32_DT, &kvl_s, &kvl_st);
+
+    reg.set_stream(did, raw_stream);
+
+    let mut plan_args = vec![
+        TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws), TVMFFIAny::dltensor(&dl_pws),
+        TVMFFIAny::dltensor(&dl_cuq_cpu), TVMFFIAny::dltensor(&dl_ip_cpu), TVMFFIAny::dltensor(&dl_kvl_cpu),
+        TVMFFIAny::int64(total_q as i64), TVMFFIAny::int64(batch_size as i64),
+        TVMFFIAny::int64(num_qo_heads as i64), TVMFFIAny::int64(num_kv_heads as i64),
+        TVMFFIAny::int64(block_size as i64),
+        TVMFFIAny::bool_val(false),
+        TVMFFIAny::int64(head_dim as i64), TVMFFIAny::int64(head_dim as i64),
+        TVMFFIAny::bool_val(true), // causal
+        TVMFFIAny::int64(-1),      // window_left
+    ];
+    append_fa2_plan_tail(&mut plan_args, is_fa3);
+
+    let pi = unsafe {
+        reg.call(variant.plan, &plan_args)
+            .map_err(|e| prelude_core::tensor::Error::Msg(format!("FlashInfer precompute plan: {e}")))?
+    };
+
+    drop(ws_guard);
+
+    PLAN_CACHE.with(|c| {
+        *c.borrow_mut() = Some(PlanCache {
+            ragged_plan: None,
+            decode_plan: None,
+            paged_prefill_plan: Some(pi),
+            paged_metadata: None,
+        });
+    });
+    Ok(())
 }
 
 /// Allocate pre-allocated FlashInfer metadata buffers for CUDA graph.
@@ -170,7 +320,7 @@ pub fn allocate_fi_graph_meta(
     ))
 }
 
-/// Shared implementation for precompute_paged_plan / precompute_paged_plan_graphed.
+/// Shared implementation for precompute_paged_plan / precompute_paged_plan_capture.
 ///
 /// When `graph_buffers` is Some, metadata is written into pre-allocated GPU tensors
 /// via cudaMemcpyAsync (for CUDA graph address stability).
@@ -457,8 +607,10 @@ pub fn varlen_paged(
 
     if max_seqlen_q == 1 {
         // Decode: dedicated Q=1 kernel — faster than prefill kernel on all archs.
-        paged_decode(q, key_cache, value_cache,
-                     &meta.indptr_gpu, &meta.indices_gpu, &meta.last_page_len_gpu,
+        // Pass `meta` so paged_decode can use the CPU-side indptr authoritatively
+        // computed by compute_paged_metadata_cpu (monotonic), instead of doing a
+        // D2H readback that races with the H2D inside Tensor::new.
+        paged_decode(q, key_cache, value_cache, &meta,
                      block_size, num_kv_heads, head_dim, softmax_scale)
     } else {
         // Prefill: varlen paged prefill kernel for Q>1.
@@ -524,8 +676,16 @@ fn ragged_prefill(
     let fws_st = contiguous_strides(&fws);
     let iws_st = contiguous_strides(&iws);
     let cus_st = contiguous_strides(&cus);
-    let qs_st = contiguous_strides(&qs);
-    let ks_st = contiguous_strides(&ks);
+    // Q/K/V strides come from candle layouts so strided views (e.g. from fused
+    // QKV narrow) are supported. FlashInfer kernels read strides from DLTensor.
+    let qs_st: Vec<i64> = q.layout().stride().iter().map(|&s| s as i64).collect();
+    let ks_st: Vec<i64> = k.layout().stride().iter().map(|&s| s as i64).collect();
+    let vs_st: Vec<i64> = v.layout().stride().iter().map(|&s| s as i64).collect();
+    debug_assert_eq!(qs_st.last().copied(), Some(1), "FlashInfer requires Q stride(-1) == 1");
+    debug_assert_eq!(ks_st.last().copied(), Some(1), "FlashInfer requires K stride(-1) == 1");
+    debug_assert_eq!(vs_st.last().copied(), Some(1), "FlashInfer requires V stride(-1) == 1");
+    // Output is freshly allocated, always contiguous.
+    let os_st = contiguous_strides(&qs);
 
     let dl_fws = make_gpu_dl(ws.float_ws, did, U8_DT, &fws, &fws_st);
     let dl_iws = make_gpu_dl(ws.int_ws, did, U8_DT, &iws, &iws_st);
@@ -534,8 +694,8 @@ fn ragged_prefill(
     let dl_cuk_gpu = make_gpu_dl(cu_k_gpu, did, I32_DT, &cus, &cus_st);
     let dl_q = make_gpu_dl(q_ptr, did, BF16_DT, &qs, &qs_st);
     let dl_k = make_gpu_dl(k_ptr, did, BF16_DT, &ks, &ks_st);
-    let dl_v = make_gpu_dl(v_ptr, did, BF16_DT, &ks, &ks_st);
-    let dl_o = make_gpu_dl(o_ptr, did, BF16_DT, &qs, &qs_st);
+    let dl_v = make_gpu_dl(v_ptr, did, BF16_DT, &ks, &vs_st);
+    let dl_o = make_gpu_dl(o_ptr, did, BF16_DT, &qs, &os_st);
 
     reg.set_stream(did, raw_stream);
 
@@ -652,7 +812,7 @@ fn append_prefill_run_tail(run_args: &mut Vec<TVMFFIAny>, is_fa3: bool, softmax_
 fn paged_decode(
     q: &Tensor,
     key_cache: &Tensor, value_cache: &Tensor,
-    kv_indptr: &Tensor, kv_indices: &Tensor, kv_last_page_len: &Tensor,
+    meta: &PagedMeta,
     block_size: usize, num_kv_heads: usize, head_dim: usize,
     softmax_scale: f32,
 ) -> Result<Tensor> {
@@ -675,8 +835,15 @@ fn paged_decode(
     let ws_guard = get_workspace(did)?;
     let ws = ws_guard.as_ref().unwrap();
 
-    // Plan needs CPU indptr; run needs GPU indptr/indices/last_page_len.
-    let indptr_cpu: Vec<i32> = kv_indptr.to_vec1()?;
+    // Plan needs CPU indptr. Use the authoritative CPU copy from PagedMeta
+    // rather than D2H from indptr_gpu — Tensor::new's H2D isn't ordered wrt
+    // subsequent to_vec1() D2H under all code paths, and stale allocations
+    // have been observed to expose garbage values (triggering div-by-zero in
+    // flashinfer's scheduler when num_pages appears non-monotonic).
+    let indptr_cpu = &meta.indptr_cpu;
+    let kv_indptr = &meta.indptr_gpu;
+    let kv_indices = &meta.indices_gpu;
+    let kv_last_page_len = &meta.last_page_len_gpu;
 
     let q_ptr = cuda_ptr!(q, bf16, &stream);
     let k_ptr = cuda_ptr!(key_cache, bf16, &stream);
@@ -702,7 +869,10 @@ fn paged_decode(
     let ip_st = contiguous_strides(&ip_s);
     let ix_st = contiguous_strides(&ix_s);
     let lp_st = contiguous_strides(&lp_s);
-    let qs_st = contiguous_strides(&qs);
+    // Q may be a strided view (fused QKV narrow); K/V caches are contiguous allocs.
+    let qs_st: Vec<i64> = q.layout().stride().iter().map(|&s| s as i64).collect();
+    debug_assert_eq!(qs_st.last().copied(), Some(1), "FlashInfer requires Q stride(-1) == 1");
+    let os_st = contiguous_strides(&qs);
     let kvs_st = contiguous_strides(&kvs);
     let es_st: [i64; 1] = [1];
 
@@ -716,7 +886,7 @@ fn paged_decode(
     let dl_q = make_gpu_dl(q_ptr, did, BF16_DT, &qs, &qs_st);
     let dl_k = make_gpu_dl(k_ptr, did, BF16_DT, &kvs, &kvs_st);
     let dl_v = make_gpu_dl(v_ptr, did, BF16_DT, &kvs, &kvs_st);
-    let dl_o = make_gpu_dl(o_ptr, did, BF16_DT, &qs, &qs_st);
+    let dl_o = make_gpu_dl(o_ptr, did, BF16_DT, &qs, &os_st);
     let dl_eq = make_gpu_dl(std::ptr::null_mut(), did, BF16_DT, &es, &es_st);
     let dl_ek = make_gpu_dl(std::ptr::null_mut(), did, BF16_DT, &es, &es_st);
 
@@ -833,7 +1003,10 @@ fn paged_prefill_impl(
     let ip_st = contiguous_strides(&ip_s);
     let ix_st = contiguous_strides(&ix_s);
     let lp_st = contiguous_strides(&lp_s);
-    let qs_st = contiguous_strides(&qs);
+    // Q may be a strided view (fused QKV narrow); K/V caches are contiguous allocs.
+    let qs_st: Vec<i64> = q.layout().stride().iter().map(|&s| s as i64).collect();
+    debug_assert_eq!(qs_st.last().copied(), Some(1), "FlashInfer requires Q stride(-1) == 1");
+    let os_st = contiguous_strides(&qs);
     let kvs_st = contiguous_strides(&kvs);
 
     let dl_fws = make_gpu_dl(ws.float_ws, did, U8_DT, &fws, &fws_st);
@@ -845,7 +1018,7 @@ fn paged_prefill_impl(
     let dl_q = make_gpu_dl(q_ptr, did, BF16_DT, &qs, &qs_st);
     let dl_k = make_gpu_dl(k_ptr, did, BF16_DT, &kvs, &kvs_st);
     let dl_v = make_gpu_dl(v_ptr, did, BF16_DT, &kvs, &kvs_st);
-    let dl_o = make_gpu_dl(o_ptr, did, BF16_DT, &qs, &qs_st);
+    let dl_o = make_gpu_dl(o_ptr, did, BF16_DT, &qs, &os_st);
 
     reg.set_stream(did, raw_stream);
 
@@ -929,23 +1102,6 @@ fn paged_prefill_impl(
 
     drop(ws_guard);
     Ok(out)
-}
-
-/// Paged prefill with raw GPU tensor metadata (used when PagedMeta is not available).
-#[allow(clippy::too_many_arguments)]
-fn paged_prefill(
-    q: &Tensor,
-    key_cache: &Tensor, value_cache: &Tensor,
-    cu_seqlens_q: &Tensor,
-    kv_indptr: &Tensor, kv_indices: &Tensor, kv_last_page_len: &Tensor,
-    block_size: usize, num_kv_heads: usize, head_dim: usize,
-    softmax_scale: f32,
-) -> Result<Tensor> {
-    paged_prefill_impl(
-        q, key_cache, value_cache, cu_seqlens_q,
-        None, Some(kv_indptr), Some(kv_indices), Some(kv_last_page_len),
-        block_size, num_kv_heads, head_dim, softmax_scale,
-    )
 }
 
 /// Paged prefill fast path: uses pre-computed PagedMeta with CPU data.
@@ -1071,6 +1227,154 @@ fn convert_paged_metadata_into(
     })
 }
 
+// ── Utility kernels (activation fusions) ─────────────────────────────
+
+/// `silu(gate) * up` on a concatenated `[tokens, 2*dim]` BF16 tensor.
+/// Returns `[tokens, dim]`. Uses FlashInfer's `silu_and_mul` kernel which
+/// splits the last dimension internally, avoiding narrow+contiguous copy.
+pub fn silu_and_mul(gate_up: &Tensor) -> Result<Tensor> {
+    use candle_core::backend::BackendStorage;
+    use candle_core::cuda_backend::WrapErr;
+
+    let (gu_storage, gu_layout) = gate_up.storage_and_layout();
+    let gu_cuda = match &*gu_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => bail!("silu_and_mul: requires CUDA"),
+    };
+    if gu_cuda.dtype() != DType::BF16 {
+        bail!("silu_and_mul: requires BF16");
+    }
+
+    let dims = gu_layout.dims();
+    if dims.is_empty() || dims[dims.len() - 1] % 2 != 0 {
+        bail!("silu_and_mul: last dim must be even, got {:?}", dims);
+    }
+    let half_dim = dims[dims.len() - 1] / 2;
+    let tokens: usize = dims[..dims.len() - 1].iter().product();
+    let out_elems = tokens * half_dim;
+
+    let dev = gu_cuda.device().clone();
+    let stream = dev.cuda_stream();
+    let did = device_id(gate_up.device());
+
+    let reg = registry();
+    let silu_fn = reg.get_utility("silu_and_mul")
+        .ok_or_else(|| candle_core::Error::Msg("FlashInfer: silu_and_mul not found".into()))?;
+
+    // Input DLTensor: [tokens, 2*dim]
+    let gu_slice = gu_cuda.as_cuda_slice::<bf16>()?.slice(gu_layout.start_offset()..);
+    let gu_ptr = gu_slice.device_ptr(&stream).0 as *mut c_void;
+    let in_shape = [tokens as i64, (half_dim * 2) as i64];
+    let in_strides = contiguous_strides(&in_shape);
+    let dl_in = make_gpu_dl(gu_ptr, did, BF16_DT, &in_shape, &in_strides);
+
+    // Output: [tokens, dim]
+    let out = unsafe { dev.alloc::<bf16>(out_elems) }?;
+    let out_ptr = out.device_ptr(&stream).0 as *mut c_void;
+    let out_shape = [tokens as i64, half_dim as i64];
+    let out_strides = contiguous_strides(&out_shape);
+    let dl_out = make_gpu_dl(out_ptr, did, BF16_DT, &out_shape, &out_strides);
+
+    let raw_stream = unsafe { stream.cu_stream() } as *mut c_void;
+    reg.set_stream(did, raw_stream);
+
+    let args = [
+        TVMFFIAny::dltensor(&dl_out),
+        TVMFFIAny::dltensor(&dl_in),
+        TVMFFIAny::bool_val(false), // enable_pdl
+    ];
+    unsafe {
+        reg.call(silu_fn, &args)
+            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer silu_and_mul: {e}")))?;
+    }
+
+    drop(gu_storage);
+
+    let out_storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(out_storage),
+        (tokens, half_dim),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+/// FlashInfer fused add + RMSNorm (in-place).
+/// Computes: input += residual; input = rmsnorm(input, weight, eps)
+/// Both input and residual are modified in-place.
+pub fn fi_fused_add_rmsnorm(input: &Tensor, residual: &Tensor, weight: &Tensor, eps: f64) -> Result<()> {
+    use candle_core::backend::BackendStorage;
+
+    let (in_storage, in_layout) = input.storage_and_layout();
+    let (res_storage, res_layout) = residual.storage_and_layout();
+    let (w_storage, w_layout) = weight.storage_and_layout();
+
+    let in_cuda = match &*in_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => bail!("fi_fused_add_rmsnorm: requires CUDA"),
+    };
+    let res_cuda = match &*res_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => bail!("fi_fused_add_rmsnorm: requires CUDA"),
+    };
+    let w_cuda = match &*w_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => bail!("fi_fused_add_rmsnorm: requires CUDA"),
+    };
+
+    if in_cuda.dtype() != DType::BF16 {
+        bail!("fi_fused_add_rmsnorm: requires BF16");
+    }
+
+    let dims = in_layout.dims();
+    let hidden = *dims.last().unwrap();
+    let tokens: usize = dims[..dims.len() - 1].iter().product();
+
+    let dev = in_cuda.device().clone();
+    let stream = dev.cuda_stream();
+    let did = device_id(input.device());
+
+    let reg = registry();
+    let fused_fn = reg.get_utility("fused_add_rmsnorm")
+        .ok_or_else(|| candle_core::Error::Msg("FlashInfer: fused_add_rmsnorm not found".into()))?;
+
+    let in_slice = in_cuda.as_cuda_slice::<bf16>()?.slice(in_layout.start_offset()..);
+    let in_ptr = in_slice.device_ptr(&stream).0 as *mut c_void;
+    let res_slice = res_cuda.as_cuda_slice::<bf16>()?.slice(res_layout.start_offset()..);
+    let res_ptr = res_slice.device_ptr(&stream).0 as *mut c_void;
+    let w_slice = w_cuda.as_cuda_slice::<bf16>()?.slice(w_layout.start_offset()..);
+    let w_ptr = w_slice.device_ptr(&stream).0 as *mut c_void;
+
+    let in_shape = [tokens as i64, hidden as i64];
+    let in_strides = contiguous_strides(&in_shape);
+    let w_shape = [hidden as i64];
+    let w_strides = [1i64];
+
+    let dl_in = make_gpu_dl(in_ptr, did, BF16_DT, &in_shape, &in_strides);
+    let dl_res = make_gpu_dl(res_ptr, did, BF16_DT, &in_shape, &in_strides);
+    let dl_w = make_gpu_dl(w_ptr, did, BF16_DT, &w_shape, &w_strides);
+
+    let raw_stream = unsafe { stream.cu_stream() } as *mut c_void;
+    reg.set_stream(did, raw_stream);
+
+    let args = [
+        TVMFFIAny::dltensor(&dl_in),
+        TVMFFIAny::dltensor(&dl_res),
+        TVMFFIAny::dltensor(&dl_w),
+        TVMFFIAny::float64(eps),
+        TVMFFIAny::bool_val(false), // enable_pdl
+    ];
+    unsafe {
+        reg.call(fused_fn, &args)
+            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer fused_add_rmsnorm: {e}")))?;
+    }
+
+    drop(in_storage);
+    drop(res_storage);
+    drop(w_storage);
+    Ok(())
+}
+
 // ── Integration test: tensors + real CUDA kernels ────────────
 #[cfg(test)]
 mod tests {
@@ -1120,7 +1424,7 @@ mod tests {
     #[test]
     fn flashinfer_paged_decode_engine_path() {
         crate::register();
-        let dev = Device::new_cuda(0).expect("CUDA device required for flashinfer test");
+        let dev = Device::new_cuda(0).unwrap();
 
         let num_qo: usize = 16;
         let num_kv: usize = 8;
@@ -1297,7 +1601,7 @@ mod tests {
     #[test]
     fn flashinfer_multi_layer_decode() {
         crate::register();
-        let dev = Device::new_cuda(0).expect("CUDA device required for flashinfer test");
+        let dev = Device::new_cuda(0).unwrap();
 
         let num_layers: usize = 28; // Qwen3-0.6B
         let num_qo: usize = 16;

@@ -54,7 +54,10 @@ pub fn fused_qknorm_rope_varlen(
     let num_heads = dims[1];
     let head_dim = dims[2];
     let n_rows = total_tokens * num_heads;
-    let n = shape.elem_count();
+    let n = total_tokens * num_heads * head_dim;
+
+    // Token stride in elements: contiguous = num_heads*head_dim, fused QKV narrow = N_fused.
+    let token_stride = x_layout.stride()[0];
 
     let dev = x_cuda.device().clone();
 
@@ -98,10 +101,12 @@ pub fn fused_qknorm_rope_varlen(
     let num_heads_val = num_heads as u32;
     let d_val = head_dim as u32;
     let eps_val = eps as f32;
+    let token_stride_val = token_stride as u32;
     builder.arg(&n_rows_val);
     builder.arg(&num_heads_val);
     builder.arg(&d_val);
     builder.arg(&eps_val);
+    builder.arg(&token_stride_val);
     unsafe { builder.launch(cfg) }.w()?;
 
     drop(x_storage);

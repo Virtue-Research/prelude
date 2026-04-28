@@ -59,8 +59,13 @@ fn priority_probe_and_device_matching() {
     );
 
     // GPU: fake_gpu probe fails, no other GPU backend → bare_ops fallback.
-    // Only run the CUDA half when a CUDA device is actually available.
-    if let Ok(cuda_dev) = Device::new_cuda(0) {
+    // Constructing Device::Cuda requires a real CudaDevice, so we test the
+    // fallback path by selecting ops for a device that has no matching backend.
+    // On CPU-only builds there's no CUDA device to construct; on CUDA builds
+    // we can create a real one.
+    #[cfg(feature = "cuda")]
+    {
+        let cuda_dev = prelude_core::tensor::Device::new_cuda(0).expect("need GPU for this test");
         let gpu_ops = ops::select_ops(&cuda_dev);
         assert_eq!(
             gpu_ops.attn_name(), "default",

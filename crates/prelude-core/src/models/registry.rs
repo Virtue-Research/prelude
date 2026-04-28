@@ -202,11 +202,9 @@ mod tests {
 
     #[test]
     fn find_gguf_arch_qwen3() {
-        // qwen3 GGUF support was removed — the wrapper depended on
-        // candle-transformers + a "candle-baseline" feature that doesn't
-        // exist in this workspace. Confirm the alias stays unregistered.
         let spec = find_arch_spec_by_gguf_arch("qwen3");
-        assert!(spec.is_none(), "qwen3 GGUF alias should not be registered");
+        assert!(spec.is_some(), "qwen3 should be registered as a GGUF arch");
+        assert_eq!(spec.unwrap().name(), "qwen3");
     }
 
     #[test]

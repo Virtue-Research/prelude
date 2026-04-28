@@ -63,10 +63,17 @@ struct Cli {
 
     #[arg(
         long,
-        default_value_t = 0,
-        help = "Max prefill tokens per scheduling step. 0 = read model's max_position_embeddings"
+        default_value_t = 8192,
+        help = "Per-step total token budget (prefill + decode combined)"
     )]
-    max_prefill_tokens: usize,
+    max_num_batched_tokens: usize,
+
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Per-request prefill token cap (0 = no cap, only limited by per-step budget)"
+    )]
+    long_prefill_token_threshold: usize,
 
     #[arg(
         long,
@@ -83,6 +90,13 @@ struct Cli {
                 0 = read model's max_position_embeddings"
     )]
     decode_reservation_cap: usize,
+
+    #[arg(
+        long,
+        default_value_t = true,
+        help = "Enable chunked prefill: interleave prefill with decode steps for lower TPOT"
+    )]
+    chunked_prefill: bool,
 
     #[arg(
         long,
@@ -112,20 +126,13 @@ struct Cli {
 
     #[arg(
         long,
-        default_value_t = 0.4,
-        help = "Fraction of free GPU memory for KV cache (0.0-1.0, default 0.4). \
+        default_value_t = prelude_core::config::DEFAULT_GPU_MEMORY_UTILIZATION,
+        help = "Fraction of free GPU memory for KV cache (0.0-1.0). \
                 Ignored when PRELUDE_PAGED_ATTN_BLOCKS is set explicitly."
     )]
     gpu_memory_utilization: f32,
 
-    #[arg(
-        long,
-        default_value_t = true,
-        num_args = 0..=1,
-        default_missing_value = "true",
-        action = clap::ArgAction::Set,
-        help = "CUDA graph capture for decode steps. Pass `--cuda-graph=false` to disable."
-    )]
+    #[arg(long, default_value_t = true, help = "CUDA graph capture for decode steps (use --no-cuda-graph to disable)")]
     cuda_graph: bool,
 
     #[arg(long, default_value = "auto", help = "Device: auto, cpu, cuda, cuda:N")]
@@ -159,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
     prelude_cuda::register();
 
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 "prelude_server=info,prelude_core=info,tower_http=info".into()
@@ -216,7 +224,15 @@ fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
     engine_config.runtime.cuda_graph = cli.cuda_graph;
     info!(?engine_config, "engine config loaded");
 
-    let base_engine = if let Some(ref path) = cli.model_path {
+    // Auto-detect: explicit --model-path wins. Otherwise, if --model points
+    // at a real file or directory on disk, treat it as a local path so users
+    // can pass `--model /path/to/checkpoint.gguf` directly without having to
+    // know about a separate flag. Falls back to HF Hub.
+    let local_path: Option<&str> = cli
+        .model_path
+        .as_deref()
+        .or_else(|| std::path::Path::new(&cli.model).exists().then(|| cli.model.as_str()));
+    let base_engine = if let Some(path) = local_path {
         info!(path = %path, "loading model from local path");
         Engine::from_local_path_with_task(path, &cli.model, task_override, engine_config)?
     } else {
@@ -235,10 +251,6 @@ fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
     // their full context window (e.g. Qwen3-0.6B: 40960) — fall back to that
     // instead of an arbitrary CLI default that silently truncates long prompts.
     let ctx_len = base_engine.max_context_len();
-    let max_prefill_tokens = match cli.max_prefill_tokens {
-        0 => ctx_len,
-        n => n,
-    };
     let decode_reservation_cap = match cli.decode_reservation_cap {
         0 => ctx_len,
         n => n,
@@ -252,16 +264,18 @@ fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
         max_batch_size: cli.max_batch_size,
         max_batch_wait_ms: cli.max_batch_wait_ms,
         max_running_requests: cli.max_running_requests,
-        max_prefill_tokens,
+        max_num_batched_tokens: cli.max_num_batched_tokens,
+        long_prefill_token_threshold: cli.long_prefill_token_threshold,
         max_total_tokens,
         decode_reservation_cap,
+        chunked_prefill: cli.chunked_prefill,
         ..SchedulerConfig::default()
     };
     info!(
         max_batch_size = scheduler_config.max_batch_size,
         max_batch_wait_ms = scheduler_config.max_batch_wait_ms,
         max_running = scheduler_config.max_running_requests,
-        max_prefill_tokens = scheduler_config.max_prefill_tokens,
+        max_num_batched_tokens = scheduler_config.max_num_batched_tokens,
         max_total_tokens = scheduler_config.max_total_tokens,
         decode_reservation_cap = scheduler_config.decode_reservation_cap,
         "scheduler enabled"

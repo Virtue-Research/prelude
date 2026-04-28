@@ -39,12 +39,12 @@ VARIANTS = {
         "env": {"PRELUDE_DEVICE": "cpu"},
         "torch_dtype": torch.float32,
         "features": [],
-        "extra_args": ["--device", "cpu", "--dtype", "f32"],
+        "extra_args": ["--dtype", "f32"],
     },
     "cpu-bf16": {
         "env": {"PRELUDE_DEVICE": "cpu"},
         "torch_dtype": torch.bfloat16,
-        "extra_args": ["--device", "cpu", "--dtype", "bf16"],
+        "extra_args": ["--dtype", "bf16"],
     },
     "gpu": {
         "env": {
@@ -57,10 +57,9 @@ VARIANTS = {
 }
 
 # Auto-start port assignments (avoid conflicts)
-import os as _os
-PORT_PRELUDE = int(_os.environ.get("PRELUDE_TEST_PORT", "8099"))
-PORT_SGLANG = int(_os.environ.get("SGLANG_TEST_PORT", "8098"))
-PORT_VLLM = int(_os.environ.get("VLLM_TEST_PORT", "8097"))
+PORT_PRELUDE = 8099
+PORT_SGLANG = 8098
+PORT_VLLM = 8097
 
 TOP_K_LOGPROBS = 5
 
@@ -480,10 +479,7 @@ def main():
         print("Step 1: Generating reference with transformers")
         print("=" * 60)
 
-        # Reference runs on GPU when available — CPU inference on >1B models
-        # takes tens of minutes per prompt and dominates total test time.
-        device = _os.environ.get("PRELUDE_REF_DEVICE") \
-            or ("cuda" if torch.cuda.is_available() else "cpu")
+        device = "cpu"
         print(f"Loading {args.model} in {torch_dtype} on {device}...")
         tokenizer = AutoTokenizer.from_pretrained(args.model)
         ref_model = AutoModelForCausalLM.from_pretrained(

@@ -67,9 +67,8 @@ fn main() {
         nvcc_cmd.arg("-gencode=arch=compute_100a,code=sm_100a");
     }
     if sm103 {
-        // B300 is SM103, sm_100a cubin doesn't run on it and "a" PTX is not
-        // forward-compatible across the Blackwell family — need a native
-        // sm_103a cubin. See prelude-deepgemm build.rs for the same fix.
+        // B300 Blackwell: native `sm_103a` cubin so the loader doesn't fall
+        // back to "no kernel image is available for execution on the device".
         nvcc_cmd.arg("-gencode=arch=compute_103a,code=sm_103a");
     }
     let status = nvcc_cmd

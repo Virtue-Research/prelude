@@ -62,11 +62,7 @@ static SM100Config select_sm100_config(int m, int n, int k, int num_sms) {
     // swizzle_d=128, multicast=2)` kernel variant OOBs on shared/local memory
     // (caught by compute-sanitizer; repro at e.g. M=1408 N=3072 K=1024).
     // Shrink the tile to the safe `(BM=128, BN=128)` and keep multicast
-    // enabled when still legal under the smaller block. Same correctness,
-    // ~10-15 % slower for these shapes, but finite >> crash.
-    //
-    // `g_gpu_arch` is populated by `ensure_gpu_arch()` in common.cuh; it's
-    // a file-static in the enclosing deepgemm_wrapper.cu translation unit.
+    // enabled when still legal under the smaller block.
     if (g_gpu_arch == 103 && best_bm == 256 && best_bn == 128) {
         best_bm = 128;
         if (multicast == 2 && ceil_div(m, best_bm) % 2 != 0) {

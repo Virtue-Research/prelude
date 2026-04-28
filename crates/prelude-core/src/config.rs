@@ -28,6 +28,17 @@ pub fn global_cache_config() -> Option<&'static CacheConfig> {
     GLOBAL_CACHE.get()
 }
 
+// ── Defaults (single source of truth — CLI and from_env() both reference these) ──
+
+pub const DEFAULT_GPU_MEMORY_UTILIZATION: f32 = 0.9;
+pub const DEFAULT_CUDA_GRAPH_MAX_BS: usize = 32;
+pub const DEFAULT_PAGED_BLOCK_SIZE: usize = 128;
+pub const DEFAULT_PREFIX_BLOCK_SIZE: usize = 64;
+pub const DEFAULT_DELTANET_POOL_SLOTS: u32 = 8;
+pub const DEFAULT_TEMPERATURE: f32 = 1.0;
+pub const DEFAULT_TOP_P: f32 = 1.0;
+pub const DEFAULT_MAX_NEW_TOKENS: u32 = 4096;
+
 // ── Top-level config ─────────────────────────────────────────────────────
 
 /// Root configuration for the inference engine.
@@ -90,7 +101,7 @@ pub struct CacheConfig {
     /// Explicit number of paged attention blocks (0 = auto from gpu_memory_utilization).
     pub paged_attn_blocks: usize,
     /// Fraction of free GPU memory to use for KV cache (vLLM-style).
-    /// Only used when paged_attn_blocks == 0. Default 0.4 (vLLM uses 0.9).
+    /// Only used when paged_attn_blocks == 0.
     pub gpu_memory_utilization: f32,
     /// Max cached prefix blocks (0 = disabled).
     pub prefix_cache_blocks: usize,
@@ -103,15 +114,12 @@ pub struct CacheConfig {
 impl CacheConfig {
     fn from_env() -> Self {
         Self {
-            paged_block_size: parse_env_usize(
-                "PRELUDE_PAGED_BLOCK_SIZE",
-                128, // adjusted at runtime for FA4/FlashInfer by cache manager
-            ),
+            paged_block_size: parse_env_usize("PRELUDE_PAGED_BLOCK_SIZE", DEFAULT_PAGED_BLOCK_SIZE),
             paged_attn_blocks: parse_env_usize("PRELUDE_PAGED_ATTN_BLOCKS", 0),
-            gpu_memory_utilization: 0.4,
+            gpu_memory_utilization: DEFAULT_GPU_MEMORY_UTILIZATION,
             prefix_cache_blocks: parse_env_usize("PRELUDE_PREFIX_CACHE_BLOCKS", 0),
-            prefix_block_size: parse_env_usize("PRELUDE_PREFIX_BLOCK_SIZE", 64),
-            deltanet_pool_slots: parse_env_u32("PRELUDE_DELTANET_POOL_SLOTS", 8),
+            prefix_block_size: parse_env_usize("PRELUDE_PREFIX_BLOCK_SIZE", DEFAULT_PREFIX_BLOCK_SIZE),
+            deltanet_pool_slots: parse_env_u32("PRELUDE_DELTANET_POOL_SLOTS", DEFAULT_DELTANET_POOL_SLOTS),
         }
     }
 }
@@ -129,9 +137,9 @@ pub struct SamplingDefaults {
 impl SamplingDefaults {
     fn from_env() -> Self {
         Self {
-            temperature: parse_env_f32("PRELUDE_DEFAULT_TEMPERATURE", 0.7),
-            top_p: parse_env_f32("PRELUDE_DEFAULT_TOP_P", 1.0),
-            max_new_tokens: parse_env_u32("PRELUDE_DEFAULT_MAX_TOKENS", 4096),
+            temperature: parse_env_f32("PRELUDE_DEFAULT_TEMPERATURE", DEFAULT_TEMPERATURE),
+            top_p: parse_env_f32("PRELUDE_DEFAULT_TOP_P", DEFAULT_TOP_P),
+            max_new_tokens: parse_env_u32("PRELUDE_DEFAULT_MAX_TOKENS", DEFAULT_MAX_NEW_TOKENS),
         }
     }
 }
@@ -163,19 +171,16 @@ pub struct RuntimeConfig {
 impl RuntimeConfig {
     fn from_env() -> Self {
         Self {
-            device: std::env::var("PRELUDE_DEVICE")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "auto".to_string()),
+            device: "auto".to_string(),
             sync_timing: parse_env_bool("PRELUDE_SYNC_TIMING"),
             force_varlen_prefill: parse_env_bool("PRELUDE_FORCE_VARLEN_PREFILL"),
             fused_kv_cache_write: parse_env_bool_eq1("PRELUDE_FUSED_KV_CACHE_WRITE"),
             cpu_thread_bind: std::env::var("SGLANG_CPU_OMP_THREADS_BIND")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            dtype: std::env::var("PRELUDE_DTYPE").ok().filter(|s| !s.is_empty()),
+            dtype: None,
             cuda_graph: true,
-            cuda_graph_max_bs: parse_env_usize("PRELUDE_CUDA_GRAPH_MAX_BS", 32),
+            cuda_graph_max_bs: parse_env_usize("PRELUDE_CUDA_GRAPH_MAX_BS", DEFAULT_CUDA_GRAPH_MAX_BS),
         }
     }
 }

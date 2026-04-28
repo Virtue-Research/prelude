@@ -139,7 +139,7 @@ Run the accuracy test suite against an existing backend (e.g., FA2) and your new
 
 ```bash
 # Reference: FA2
-cargo build -p prelude-server --release --features flash-attn
+cargo build -p prelude-server --release --features full
 python tests/accuracy/run_accuracy_test.py --variant gpu-fa2 \
   --server prelude --binary target/release/prelude-server \
   --model Qwen/Qwen3-0.6B

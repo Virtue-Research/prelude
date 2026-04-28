@@ -45,6 +45,12 @@ impl ScheduledEngine {
                 })
         );
 
+        // Set block_size from paged pool so the scheduler can do block-level admission.
+        let mut config = config;
+        if let Some(pool) = engine.cache.paged_pool.as_ref() {
+            config.block_size = pool.block_size;
+        }
+
         // Spawn the unified AR scheduling loop.
         let (ar_tx, ar_rx) = mpsc::unbounded_channel();
         let loop_engine = Arc::clone(&engine);

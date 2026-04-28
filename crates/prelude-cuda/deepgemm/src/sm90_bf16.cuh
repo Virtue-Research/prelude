@@ -173,6 +173,7 @@ __attribute__((used)) static auto* _k02 = &KERNEL_TYPE(16, 48, 28, 128, 32, 1, f
 __attribute__((used)) static auto* _k03 = &KERNEL_TYPE(16, 64, 22, 128, 128, 1, false);
 __attribute__((used)) static auto* _k04 = &KERNEL_TYPE(16, 96, 15, 128, 64, 1, false);
 __attribute__((used)) static auto* _k05 = &KERNEL_TYPE(16, 112, 13, 128, 32, 1, false);
+__attribute__((used)) static auto* _k05a = &KERNEL_TYPE(16, 192, 8, 128, 128, 1, false);
 __attribute__((used)) static auto* _k06 = &KERNEL_TYPE(16, 224, 7, 128, 64, 1, false);
 __attribute__((used)) static auto* _k07 = &KERNEL_TYPE(16, 240, 6, 128, 32, 1, false);
 __attribute__((used)) static auto* _k08 = &KERNEL_TYPE(32, 16, 32, 128, 32, 1, false);
@@ -181,6 +182,7 @@ __attribute__((used)) static auto* _k10 = &KERNEL_TYPE(32, 48, 22, 128, 32, 1, f
 __attribute__((used)) static auto* _k11 = &KERNEL_TYPE(32, 64, 18, 128, 128, 1, false);
 __attribute__((used)) static auto* _k12 = &KERNEL_TYPE(32, 96, 13, 128, 64, 1, false);
 __attribute__((used)) static auto* _k13 = &KERNEL_TYPE(32, 112, 12, 128, 32, 1, false);
+__attribute__((used)) static auto* _k13a = &KERNEL_TYPE(32, 192, 7, 128, 128, 1, false);
 __attribute__((used)) static auto* _k14 = &KERNEL_TYPE(32, 224, 6, 128, 64, 1, false);
 __attribute__((used)) static auto* _k15 = &KERNEL_TYPE(32, 240, 6, 128, 32, 1, false);
 __attribute__((used)) static auto* _k16 = &KERNEL_TYPE(64, 16, 22, 128, 32, 1, false);
@@ -344,6 +346,7 @@ static const void* get_kernel(const KernelConfig& cfg) {
     MATCH(16, 64, 22, 128, 128, 1, false)
     MATCH(16, 96, 15, 128, 64, 1, false)
     MATCH(16, 112, 13, 128, 32, 1, false)
+    MATCH(16, 192, 8, 128, 128, 1, false)
     MATCH(16, 224, 7, 128, 64, 1, false)
     MATCH(16, 240, 6, 128, 32, 1, false)
     MATCH(32, 16, 32, 128, 32, 1, false)
@@ -352,6 +355,7 @@ static const void* get_kernel(const KernelConfig& cfg) {
     MATCH(32, 64, 18, 128, 128, 1, false)
     MATCH(32, 96, 13, 128, 64, 1, false)
     MATCH(32, 112, 12, 128, 32, 1, false)
+    MATCH(32, 192, 7, 128, 128, 1, false)
     MATCH(32, 224, 6, 128, 64, 1, false)
     MATCH(32, 240, 6, 128, 32, 1, false)
     MATCH(64, 16, 22, 128, 32, 1, false)

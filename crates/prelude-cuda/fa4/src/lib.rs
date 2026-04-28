@@ -78,6 +78,10 @@ fn contiguous_strides(shape: &[i64]) -> Vec<i64> {
 // ── Non-paged varlen forward ───────────────────────────────────────────
 
 /// Call FA4 varlen forward attention via TVM FFI (non-paged).
+///
+/// Q/K/V strides are caller-provided (element strides, not byte strides) so
+/// strided views from fused QKV projection work without a prior `.contiguous()`.
+/// The FA4 kernel only requires `stride(-1) == 1` on Q/K/V; other dims are free.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn fa4_varlen_fwd(
     registry: &KernelRegistry,
@@ -92,8 +96,11 @@ pub unsafe fn fa4_varlen_fwd(
     cu_seqlens_q_ptr: *mut c_void,
     cu_seqlens_k_ptr: *mut c_void,
     q_shape: &[i64],
+    q_strides: &[i64],
     k_shape: &[i64],
+    k_strides: &[i64],
     v_shape: &[i64],
+    v_strides: &[i64],
     o_shape: &[i64],
     lse_shape: &[i64],
     cu_seqlens_shape: &[i64],
@@ -108,14 +115,13 @@ pub unsafe fn fa4_varlen_fwd(
     let half_dt = half_dl_dtype(dtype);
     let (f32_dtype, i32_dtype) = make_aux_dtypes();
 
-    let q_strides = contiguous_strides(q_shape);
-    let dl_q = make_dltensor(q_ptr, device, half_dt, q_shape, &q_strides);
+    debug_assert_eq!(q_strides.last().copied(), Some(1), "FA4 requires Q stride(-1) == 1");
+    debug_assert_eq!(k_strides.last().copied(), Some(1), "FA4 requires K stride(-1) == 1");
+    debug_assert_eq!(v_strides.last().copied(), Some(1), "FA4 requires V stride(-1) == 1");
 
-    let k_strides = contiguous_strides(k_shape);
-    let dl_k = make_dltensor(k_ptr, device, half_dt, k_shape, &k_strides);
-
-    let v_strides = contiguous_strides(v_shape);
-    let dl_v = make_dltensor(v_ptr, device, half_dt, v_shape, &v_strides);
+    let dl_q = make_dltensor(q_ptr, device, half_dt, q_shape, q_strides);
+    let dl_k = make_dltensor(k_ptr, device, half_dt, k_shape, k_strides);
+    let dl_v = make_dltensor(v_ptr, device, half_dt, v_shape, v_strides);
 
     let o_strides = contiguous_strides(o_shape);
     let dl_o = make_dltensor(o_ptr, device, half_dt, o_shape, &o_strides);
@@ -182,6 +188,9 @@ pub unsafe fn fa4_varlen_fwd(
 ///
 /// Paged: cu_seqlens_k=None, seqused_k=per-seq lengths, page_table=block table.
 /// K/V are 4D: `[num_pages, page_size, num_heads_k, head_dim]`.
+///
+/// `q_strides` is caller-provided so Q can be a strided view (e.g. from fused
+/// QKV narrow). K/V are the paged cache tensors, always allocated contiguous.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn fa4_varlen_paged_fwd(
     registry: &KernelRegistry,
@@ -197,6 +206,7 @@ pub unsafe fn fa4_varlen_paged_fwd(
     seqused_k_ptr: *mut c_void,
     page_table_ptr: *mut c_void,
     q_shape: &[i64],
+    q_strides: &[i64],
     k_shape: &[i64],
     v_shape: &[i64],
     o_shape: &[i64],
@@ -213,8 +223,9 @@ pub unsafe fn fa4_varlen_paged_fwd(
     let half_dt = half_dl_dtype(dtype);
     let (f32_dtype, i32_dtype) = make_aux_dtypes();
 
-    let q_strides = contiguous_strides(q_shape);
-    let dl_q = make_dltensor(q_ptr, device, half_dt, q_shape, &q_strides);
+    debug_assert_eq!(q_strides.last().copied(), Some(1), "FA4 requires Q stride(-1) == 1");
+
+    let dl_q = make_dltensor(q_ptr, device, half_dt, q_shape, q_strides);
 
     let k_strides = contiguous_strides(k_shape);
     let dl_k = make_dltensor(k_ptr, device, half_dt, k_shape, &k_strides);

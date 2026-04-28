@@ -152,11 +152,6 @@ pub(crate) enum ExecutionKind {
 ///
 /// The scheduler constructs these once so the engine hot path can avoid
 /// repeated tokenization and request normalization.
-///
-/// `Clone` is required so the AR loop can hand one copy to the executor's
-/// prefill batch and keep the original on the sequence state for decode
-/// sampling + stop-check inspection.
-#[derive(Clone)]
 pub struct PreparedGenerateRequest {
     pub request_idx: usize,
     pub request: GenerateRequest,
@@ -184,6 +179,12 @@ pub(crate) struct PrefillPlan {
     pub(crate) all_greedy: bool,
     pub(crate) force_varlen: bool,
     pub(crate) prefix_reuse: Option<PrefixReuseCandidate>,
+    /// Per-request: tokens already in KV cache from previous chunks.
+    /// Empty = standard full prefill (no chunking).
+    pub(crate) computed_lens: Vec<usize>,
+    /// Per-request: block tables from previous chunks.
+    /// Empty = standard full prefill (no prior blocks).
+    pub(crate) existing_block_tables: Vec<Vec<u32>>,
 }
 
 /// Read-only prefix reuse resolved against the current paged prefix cache state.
