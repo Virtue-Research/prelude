@@ -79,22 +79,47 @@ pub(crate) unsafe fn gemm_dispatch_impl(
     let key: ShapeKey = (m, n, k, batch, transa, transb, dtype);
 
     if dtype == 0 && batch == 1 && transa && !transb {
-        // Swap: DeepGEMM A=input(b), B=weight(a), M=tokens(n), N=features(m)
-        let ret = deepgemm::bf16_gemm(
-            b as *mut c_void, a as *mut c_void, d,
-            n, m, k, stream as *mut c_void,
-        );
-        match &ret {
-            Ok(()) => return 0,
-            Err(e) => {
-                tracing::debug!("DeepGEMM → CUTLASS fallback: {e}");
+        let known_fail = DEEPGEMM_FAILED.with(|s| s.borrow().contains(&key));
+        if !known_fail {
+            // Swap: DeepGEMM A=input(b), B=weight(a), M=tokens(n), N=features(m)
+            let ret = unsafe { deepgemm::bf16_gemm(
+                b as *mut c_void, a as *mut c_void, d,
+                n, m, k, stream as *mut c_void,
+            ) };
+            match &ret {
+                Ok(()) => return 0,
+                Err(e) => {
+                    tracing::warn!("DeepGEMM → CUTLASS fallback: {e}");
+                    DEEPGEMM_FAILED.with(|s| { s.borrow_mut().insert(key); });
+                }
             }
         }
     }
 
     // CUTLASS fallback (SM80+, handles BF16/FP16/F32).
     {
-        let ret = cutlass_gemm::gemm_dispatch(
+        let known_fail = CUTLASS_FAILED.with(|s| s.borrow().contains(&key));
+        if !known_fail {
+            let ret = cutlass_gemm::gemm_dispatch(
+                a, b, d, m, n, k, batch, lda, ldb, ldd,
+                stride_a, stride_b, stride_d,
+                transa, transb, dtype, stream,
+            );
+            match ret {
+                Ok(()) => return 0,
+                Err(e) => {
+                    tracing::warn!("CUTLASS → cuBLAS fallback: {e}");
+                    CUTLASS_FAILED.with(|s| { s.borrow_mut().insert(key); });
+                }
+            }
+        }
+    }
+
+    // Final fallback: cuBLAS. Universal shape/arch support. Needed on
+    // Blackwell (SM103) where compiled CUTLASS SM80/SM90 cubins don't run
+    // and DeepGEMM's SM100 kernel table has gaps (e.g. small-M decodes).
+    match unsafe {
+        cublas_gemm_ex(
             a, b, d, m, n, k, batch, lda, ldb, ldd,
             stride_a, stride_b, stride_d,
             transa, transb, dtype, stream,
