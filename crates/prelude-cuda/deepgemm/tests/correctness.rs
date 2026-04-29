@@ -141,7 +141,7 @@ fn bf16_gemm_model_shapes() {
     // The (128,1024,3072) and (1,151936,1024) shapes pick an SM100 tile that
     // isn't in the compiled kernel set on Blackwell (B300); leave the
     // small-M shapes that are covered and skip the rest on SM100+.
-    let (_, arch) = prelude_deepgemm::query_device();
+    let (_, arch) = deepgemm::query_device();
     let shapes: &[(usize, usize, usize)] = if arch >= 100 {
         &[(1, 1024, 1024), (32, 3072, 1024)]
     } else {
@@ -173,7 +173,7 @@ fn bf16_gemm_prefill_shapes() {
     let gpu = match Gpu::new() { Some(g) => g, None => return };
     // On B300 the SM100 config selector picks tiles not in the compiled
     // variant table for large-M × 4096×4096 — skip on SM100+.
-    let (_, arch) = prelude_deepgemm::query_device();
+    let (_, arch) = deepgemm::query_device();
     if arch >= 100 { eprintln!("bf16_gemm_prefill_shapes: skip (SM{arch}, missing tile variants)"); return; }
     for m in [64, 128, 256, 512] {
         run_test(m, 4096, 4096, &gpu);
@@ -669,7 +669,7 @@ fn run_fp8_1d1d_test(m: usize, n: usize, k: usize, gpu: &Gpu) {
 
 /// No SM100 1D1D FP8 implementation — wrapper returns -1 on Blackwell.
 fn fp8_1d1d_skip_if_blackwell() -> bool {
-    let (_, arch) = prelude_deepgemm::query_device();
+    let (_, arch) = deepgemm::query_device();
     if arch >= 100 { eprintln!("fp8_1d1d: skip (SM{arch}, no SM100 impl)"); true } else { false }
 }
 
@@ -677,15 +677,24 @@ fn fp8_1d1d_skip_if_blackwell() -> bool {
 /// bad output on B300 (max_err=inf observed on (1,1024,1024)). Track it
 /// as a known DeepGEMM upstream issue and skip on Blackwell for now.
 fn fp8_sm100_skip_if_blackwell(label: &str) -> bool {
-    let (_, arch) = prelude_deepgemm::query_device();
+    let (_, arch) = deepgemm::query_device();
     if arch >= 100 { eprintln!("{label}: skip (SM{arch}, FP8 SM100 kernel broken)"); true } else { false }
 }
 
 /// SM100 grouped BF16 GEMM kernels also trigger LaunchFailed on B300 for
 /// several MoE shapes. Skip until those variants are sorted out.
 fn grouped_sm100_skip_if_blackwell(label: &str) -> bool {
-    let (_, arch) = prelude_deepgemm::query_device();
+    let (_, arch) = deepgemm::query_device();
     if arch >= 100 { eprintln!("{label}: skip (SM{arch}, grouped SM100 kernel bug)"); true } else { false }
+}
+
+/// New (PR05) BF16 / MQA-logits / einsum / SF-transpose kernels are only
+/// instantiated for SM90 in the upstream DeepGEMM source we vendored.
+/// On Blackwell (B300/SM103) the dispatch falls through to a stub that
+/// returns "launch failed (code -2)". Skip until SM100 instantiations land.
+fn sm90_only_skip_if_blackwell(label: &str) -> bool {
+    let (_, arch) = deepgemm::query_device();
+    if arch >= 100 { eprintln!("{label}: skip (SM{arch}, kernel SM90-only)"); true } else { false }
 }
 
 #[test]
@@ -911,7 +920,7 @@ fn fp8_masked_gemm_small() {
 fn bf16_gemm_acc_small() {
     let gpu = match Gpu::new() { Some(g) => g, None => return };
     // No SM100 implementation of bf16_gemm_acc yet.
-    let (_, arch) = prelude_deepgemm::query_device();
+    let (_, arch) = deepgemm::query_device();
     if arch >= 100 { eprintln!("bf16_gemm_acc_small: skip (SM{arch}, no SM100 impl)"); return; }
     for (m, n, k) in [(16, 256, 256), (64, 512, 512), (128, 1024, 1024)] {
         // Reference: D = C + A @ B (all in f64)
@@ -961,7 +970,7 @@ fn bf16_gemm_acc_small() {
 fn bf16_gemm_acc_model_shapes() {
     let gpu = match Gpu::new() { Some(g) => g, None => return };
     // No SM100 implementation of bf16_gemm_acc yet.
-    let (_, arch) = prelude_deepgemm::query_device();
+    let (_, arch) = deepgemm::query_device();
     if arch >= 100 { eprintln!("bf16_gemm_acc_model_shapes: skip (SM{arch}, no SM100 impl)"); return; }
     for (m, n, k) in [(64, 4096, 4096), (128, 4096, 4096)] {
         // Reference: D = C + A @ B (all in f64)
@@ -1328,7 +1337,7 @@ fn einsum_128x128x64() {
 fn einsum_128x64x64() {
     let gpu = match Gpu::new() { Some(g) => g, None => return };
     // SM100 einsum kernel set is incomplete for this M/N/K/S on B300.
-    let (_, arch) = prelude_deepgemm::query_device();
+    let (_, arch) = deepgemm::query_device();
     if arch >= 100 { eprintln!("einsum_128x64x64: skip (SM{arch})"); return; }
     run_einsum_test(128, 64, 64, 8, &gpu);
 }

@@ -152,9 +152,16 @@ fn main() {
             ArMode::Replace,
         )
         .map_err(|e| panic!("{e}"));
-        // cuda_dialect_runtime_static is linked through tvm-static-ffi
-        // (which whole-archives it). Don't link it again here — fat LTO
-        // would see duplicate symbols.
+
+        // CuTeDSL .o files reference _cudaGetDevice / _cudaLibraryLoadData /
+        // cuda_dialect_init_library_once etc. Provided by
+        // libcuda_dialect_runtime_static.a inside the nvidia_cutlass_dsl
+        // wheel. Without this, the cula lib test (and any other downstream
+        // binary that doesn't transitively link prelude-cuda) link-fails.
+        let venv_dir = out_dir.join("cula-venv");
+        if let Ok(venv) = prelude_kernelbuild::venv::PythonVenv::ensure(&venv_dir) {
+            prelude_kernelbuild::venv::link_cutlass_dsl_runtime(venv.python_path());
+        }
     }
     generate_dispatch_code(&kernels_dir, &out_dir, has_dsl_kernels);
 

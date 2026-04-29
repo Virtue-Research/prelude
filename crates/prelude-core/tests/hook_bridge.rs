@@ -18,6 +18,12 @@ static UNARY_COUNT: AtomicUsize = AtomicUsize::new(0);
 static BINARY_COUNT: AtomicUsize = AtomicUsize::new(0);
 static MATMUL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Tests share `UNARY_COUNT` etc. as process-wide atomics. cargo test
+/// runs them in parallel by default — without serialization, one test's
+/// `reset_counts()` clobbers another's mid-flight `assert_eq!(.., 1)`.
+/// Hold this mutex for the full duration of every hook-test body.
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct CountingOps;
 
 impl Ops for CountingOps {
@@ -72,6 +78,7 @@ fn reset_counts() {
 
 /// Set up hook bridge and ops for a test closure.
 fn with_hook<F: FnOnce() -> Result<()>>(f: F) -> Result<()> {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     reset_counts();
     candle_core::hook::set(Some(ops::hook_bridge_ref()));
     let result = ops::with_ops(&COUNTING_OPS, f);
@@ -162,6 +169,7 @@ fn hook_matmul_passthrough() -> Result<()> {
 #[test]
 fn no_hook_uses_candle_default() -> Result<()> {
     // Without any hook set, tensor ops should work normally
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     candle_core::hook::set(None);
     let t = Tensor::new(&[1.0f32, 2.0, 3.0], &Device::Cpu)?;
     let out = t.exp()?;

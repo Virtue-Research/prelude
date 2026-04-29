@@ -3303,6 +3303,15 @@ fn cutlass_fused_moe_execution() {
         println!("CUTLASS fused MoE kernel not compiled — skipping test");
         return;
     }
+    // TRT-LLM's MoE config-search currently has no valid tile config for
+    // SM10x — calling `run_moe` fails with "Could not find valid config
+    // when calculating workspace size". The CUTLASS MoE templates we
+    // vendor are sm_90a-only. Skip on Blackwell until upstream lands
+    // SM100/SM103 specialisations.
+    if reg.arch() >= 100 {
+        println!("cutlass_fused_moe: skip (SM{}, kernel SM90-only)", reg.arch());
+        return;
+    }
 
     let runner = flashinfer::moe::FusedMoeRunner::new()
         .expect("Failed to create CUTLASS FusedMoeRunner");

@@ -66,9 +66,19 @@ fn main() -> Result<()> {
     )
     .map_err(anyhow::Error::msg)?;
 
-    // cuda_dialect_runtime_static is linked through tvm-static-ffi
-    // (which whole-archives it). Don't link it again here — fat LTO
-    // would see duplicate symbols.
+    // CuTeDSL kernel objects (libfa4_kernels.a) reference _cudaGetDevice,
+    // _cudaLibraryLoadData, etc. — these are provided by
+    // libcuda_dialect_runtime_static.a inside the nvidia_cutlass_dsl
+    // Python wheel. Link it from the FA4 venv. Without this, downstream
+    // examples and tests (e.g. `bench_kernel`) link-fail on undefined
+    // symbols.
+    if has_kernels {
+        let python = PythonVenv::ensure(&venv_dir)
+            .map_err(anyhow::Error::msg)?
+            .python_path()
+            .to_path_buf();
+        prelude_kernelbuild::venv::link_cutlass_dsl_runtime(&python);
+    }
 
     generate_dispatch_code(&kernels_dir, &out_dir, has_kernels)?;
 
