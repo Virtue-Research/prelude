@@ -1,7 +1,29 @@
 <p align="center">
   <h1> Prelude: Agent-native inference framework </h1>
 </p>
-sure
+
+<p align="center">
+  Fast LLM inference engine in Rust.
+</p>
+
+---
+
+## Performance
+
+**GPU (H200, Qwen3-4B)**
+
+<img src="assets/perf-throughput.svg" width="100%" alt="Prefill throughput vs concurrency">
+
+<img src="assets/perf-latency.svg" width="100%" alt="Latency P50/P95 at c=1">
+
+
+- **Peak throughput**: 186.7 req/s × 512 tokens = **95,590 tok/s** — **1.39× vs vLLM**, **1.23× vs SGLang** (at c=96)
+- **Latency (c=1)**: P50 **15.4ms** · P95 **21.1ms** — vs vLLM 18.1ms/27.9ms, SGLang 20.8ms/26.2ms
+
+*512-token inputs, max_tokens=1, 200 requests per concurrency level, engines isolated on separate H200 GPUs.*
+
+---
+
 ## Quick Start
 
 ### Prerequisites
@@ -13,17 +35,14 @@ sure
 ### Build
 
 ```bash
-# GPU — full stack (recommended): FlashInfer + FA4 + DeepGEMM + oneDNN
-cargo build -p prelude-server --release --features flashinfer-v4,onednn,deepgemm
+# GPU — full stack (FlashInfer + FA4 + DeepGEMM + CUTLASS + quant-gemm + cuLA)
+cargo build -p prelude-server --release --features cuda
 
-# GPU — FlashInfer only (no FA4)
-cargo build -p prelude-server --release --features flashinfer,onednn
+# CPU only (default — oneDNN BF16 GEMM + AVX-512 kernels)
+cargo build -p prelude-server --release
 
-# CPU only with oneDNN BF16 GEMM
-cargo build -p prelude-server --release --features onednn
-
-# GGUF models (auto-detected, no extra flags needed)
-cargo build -p prelude-server --release --features onednn
+# Both backends in one binary
+cargo build -p prelude-server --release --features full
 ```
 
 ### Run

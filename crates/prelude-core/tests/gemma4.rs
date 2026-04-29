@@ -2,7 +2,7 @@
 
 mod common;
 
-use prelude_core::tensor::{DType, Device, Module, Result, Tensor};
+use prelude_core::tensor::{DType, Device, Module, Result, Tensor, TensorExt};
 use prelude_core::ops::traits::{VarlenParams, MaskType};
 
 // ── Config parsing ──────────────────────────────────────────────────────
@@ -181,7 +181,7 @@ write_output(out.float())
     let x4 = x.reshape((1, seq_len, num_heads, head_dim))?;
     let cos_sel = cos.index_select(&positions, 0)?;
     let sin_sel = sin.index_select(&positions, 0)?;
-    let out = candle_nn::rotary_emb::rope_thd(&x4, &cos_sel, &sin_sel)?;
+    let out = x4.rope_thd(&cos_sel, &sin_sel)?;
     let out = out.reshape((seq_len * num_heads * head_dim,))?;
 
     let ours: Vec<f32> = out.to_vec1()?;
@@ -593,8 +593,8 @@ write_output(out.float())
     // Apply RoPE
     let q4 = q.reshape((1, seq, num_heads, head_dim))?;
     let k4 = k.reshape((1, seq, num_kv_heads, head_dim))?;
-    let q = candle_nn::rotary_emb::rope_thd(&q4, &cos_sel, &sin_sel)?.reshape((seq, num_heads, head_dim))?;
-    let k = candle_nn::rotary_emb::rope_thd(&k4, &cos_sel, &sin_sel)?.reshape((seq, num_kv_heads, head_dim))?;
+    let q = q4.rope_thd(&cos_sel, &sin_sel)?.reshape((seq, num_heads, head_dim))?;
+    let k = k4.rope_thd(&cos_sel, &sin_sel)?.reshape((seq, num_kv_heads, head_dim))?;
 
     // varlen attention with scaling=1.0
     let cu_seqlens = Tensor::from_vec(vec![0u32, seq as u32], (2,), &dev)?;

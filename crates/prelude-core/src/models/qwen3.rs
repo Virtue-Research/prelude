@@ -88,16 +88,27 @@ impl Qwen3Attention {
             cfg.attention_bias,
         )?;
 
-        // Fused QKV: merge q_proj+k_proj+v_proj weights into single GEMM (saves 2 GEMM calls/layer)
+        // Fused QKV: merge q_proj+k_proj+v_proj weights into single GEMM (saves 2 GEMM calls/layer).
+        // Only enabled where downstream stride-aware ops actually handle the merged layout:
+        //   • CUDA (any dtype) — stride-aware fused_qknorm_rope + scatter_kv.
+        //   • CPU + BF16      — onednn/sgl-cpu fused paths.
+        // F32 CPU and quantized weights fall back to three separate GEMMs to avoid the
+        // "shape mismatch in mul ([N, 64] × [64])" the unit tests were hitting.
         let qkv_proj = if !q_proj.is_quantized() {
-            let merged_w =
-                Tensor::cat(&[q_proj.weight(), k_proj.weight(), v_proj.weight()], 0)?;
-            match Linear::from_weight(merged_w, None) {
-                Ok(l) => Some(l),
-                Err(e) => {
-                    tracing::warn!("Failed to create fused qkv_proj: {e}");
-                    None
+            let qw = q_proj.weight();
+            let eligible = qw.device().is_cuda() || qw.dtype() == DType::BF16;
+            if eligible {
+                let merged_w =
+                    Tensor::cat(&[qw, k_proj.weight(), v_proj.weight()], 0)?;
+                match Linear::from_weight(merged_w, None) {
+                    Ok(l) => Some(l),
+                    Err(e) => {
+                        tracing::warn!("Failed to create fused qkv_proj: {e}");
+                        None
+                    }
                 }
+            } else {
+                None
             }
         } else {
             None

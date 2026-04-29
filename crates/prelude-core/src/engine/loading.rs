@@ -391,13 +391,38 @@ fn load_gguf(
     let arch = detect_gguf_arch(&ct);
     tracing::info!(arch = %arch, "detected GGUF architecture");
 
-    // Resolve tokenizer: look next to GGUF file, else download from HF Hub
+    // Resolve tokenizer:
+    //   1. tokenizer.json sitting next to the GGUF file → use it directly.
+    //   2. `general.base_model.0.repo_url` in GGUF metadata → derive HF repo.
+    //   3. Strip `-GGUF` suffix from `model_id` (covers `Qwen/X-GGUF` →
+    //      `Qwen/X` for users who passed an HF repo).
+    //   4. Fall back to `model_id` as-is.
+    //
+    // Step 2 is what makes `--model /path/to/foo.gguf` work without
+    // requiring a separate `--tokenizer` flag — well-formed GGUFs from
+    // HF embed their base model URL in the metadata.
     let tokenizer = if let Some(parent) = gguf_path.parent()
         && parent.join("tokenizer.json").exists()
     {
         load_tokenizer(parent)?
     } else {
-        download_tokenizer(&model_id)?
+        let tokenizer_repo = ct
+            .metadata
+            .get("general.base_model.0.repo_url")
+            .and_then(|v| v.to_string().ok())
+            .and_then(|url| {
+                url.strip_prefix("https://huggingface.co/")
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| {
+                model_id
+                    .strip_suffix("-GGUF")
+                    .or_else(|| model_id.strip_suffix("-gguf"))
+                    .unwrap_or(&model_id)
+                    .to_string()
+            });
+        tracing::info!(repo = %tokenizer_repo, "resolving GGUF tokenizer");
+        download_tokenizer(&tokenizer_repo)?
     };
 
     // Look up architecture in the registry (inventory-based, no hardcoded model imports)

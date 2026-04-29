@@ -833,8 +833,15 @@ pub(crate) mod meta {
 
     #[derive(Debug, Clone, Copy)]
     enum Gemma3WeightLayout {
+        /// Causal-LM checkpoint: `model.embed_tokens.weight`, `model.layers.*`, …
         FlatText,
+        /// Multi-modal checkpoint with `language_model` wrapper:
+        /// `model.language_model.model.embed_tokens.weight`, …
         NestedLanguageModel,
+        /// Bare text-model checkpoint (e.g. `Gemma3TextModel` /
+        /// `embeddinggemma-300m`): backbone weights live at the root —
+        /// `embed_tokens.weight`, `layers.*` — with no `model.` prefix.
+        BareText,
     }
 
     /// Opaque config stored in `ParsedModelConfig.arch_config` for Gemma3.
@@ -866,7 +873,22 @@ pub(crate) mod meta {
 
     fn infer_weight_layout(raw: &serde_json::Value) -> Gemma3WeightLayout {
         if raw.get("text_config").is_some() {
-            Gemma3WeightLayout::NestedLanguageModel
+            return Gemma3WeightLayout::NestedLanguageModel;
+        }
+        // Bare text-model checkpoints (e.g. `Gemma3TextModel`, EmbeddingGemma)
+        // ship the backbone at the root — no `model.` prefix.
+        let model_type = raw.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
+        let is_bare_text = model_type == "gemma3_text"
+            || raw
+                .get("architectures")
+                .and_then(|v| v.as_array())
+                .is_some_and(|arr| {
+                    arr.iter()
+                        .filter_map(|a| a.as_str())
+                        .any(|s| s == "Gemma3TextModel")
+                });
+        if is_bare_text {
+            Gemma3WeightLayout::BareText
         } else {
             Gemma3WeightLayout::FlatText
         }
@@ -918,6 +940,7 @@ pub(crate) mod meta {
                 .pp("model")
                 .pp("language_model")
                 .pp("model"),
+            Gemma3WeightLayout::BareText => ctx.main_vb.clone(),
         };
 
         match cfg {
