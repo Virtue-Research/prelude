@@ -365,6 +365,47 @@ fn detect_gguf_arch(ct: &crate::tensor::quantized::gguf_file::Content) -> String
         .unwrap_or_else(|| "qwen3".to_string())
 }
 
+/// Guess the HF repo that ships the tokenizer for this GGUF when the
+/// metadata doesn't carry `general.base_model.0.repo_url`. Pieces it
+/// together from `general.basename` + `general.size_label` and a small
+/// per-arch org map (Qwen, Meta-Llama, Google).
+///
+/// Covers the common case of `Qwen/Qwen3-*-GGUF` — those uploads drop
+/// the base_model URL but encode enough metadata to reconstruct the
+/// canonical "Qwen/Qwen3-0.6B" repo. Returns `None` for unmapped arches
+/// (Mistral, DeepSeek, etc.); callers fall back to `model_id` and
+/// surface a clear tokenizer-download error.
+fn guess_tokenizer_repo_from_gguf_metadata(
+    ct: &crate::tensor::quantized::gguf_file::Content,
+    arch: &str,
+) -> Option<String> {
+    let basename = ct
+        .metadata
+        .get("general.basename")
+        .and_then(|v| v.to_string().ok().map(|s| s.to_string()))?;
+    let size_label = ct
+        .metadata
+        .get("general.size_label")
+        .and_then(|v| v.to_string().ok().map(|s| s.to_string()));
+
+    let org = match arch {
+        "qwen3" | "qwen2" | "qwen" => "Qwen",
+        "llama" => "meta-llama",
+        "gemma2" | "gemma3" => "google",
+        _ => return None,
+    };
+
+    let repo = match size_label {
+        Some(size) if !size.is_empty() => format!("{org}/{basename}-{size}"),
+        _ => format!("{org}/{basename}"),
+    };
+    tracing::info!(
+        repo = %repo, arch, basename,
+        "guessing GGUF tokenizer repo from metadata"
+    );
+    Some(repo)
+}
+
 /// Load a quantized model from a GGUF file.
 fn load_gguf(
     gguf_path: &Path,
@@ -396,11 +437,14 @@ fn load_gguf(
     //   2. `general.base_model.0.repo_url` in GGUF metadata → derive HF repo.
     //   3. Strip `-GGUF` suffix from `model_id` (covers `Qwen/X-GGUF` →
     //      `Qwen/X` for users who passed an HF repo).
-    //   4. Fall back to `model_id` as-is.
+    //   4. Per-arch heuristic from `general.basename` + `general.size_label`
+    //      (covers community GGUF uploads that drop the base_model URL —
+    //      most notably `Qwen/Qwen3-*-GGUF`).
+    //   5. Fall back to `model_id` as-is (which 404s — we surface a
+    //      tokenizer download error rather than crashing with a path).
     //
-    // Step 2 is what makes `--model /path/to/foo.gguf` work without
-    // requiring a separate `--tokenizer` flag — well-formed GGUFs from
-    // HF embed their base model URL in the metadata.
+    // Steps 2 and 4 are what make `--model /path/to/foo.gguf` work without
+    // requiring a separate `--tokenizer` flag.
     let tokenizer = if let Some(parent) = gguf_path.parent()
         && parent.join("tokenizer.json").exists()
     {
@@ -414,13 +458,18 @@ fn load_gguf(
                 url.strip_prefix("https://huggingface.co/")
                     .map(str::to_string)
             })
-            .unwrap_or_else(|| {
-                model_id
+            .or_else(|| {
+                let stripped = model_id
                     .strip_suffix("-GGUF")
-                    .or_else(|| model_id.strip_suffix("-gguf"))
-                    .unwrap_or(&model_id)
-                    .to_string()
-            });
+                    .or_else(|| model_id.strip_suffix("-gguf"));
+                // Only useful when model_id is an HF-style "org/repo",
+                // not a filesystem path.
+                stripped
+                    .filter(|s| s.contains('/') && !s.starts_with('/'))
+                    .map(str::to_string)
+            })
+            .or_else(|| guess_tokenizer_repo_from_gguf_metadata(&ct, &arch))
+            .unwrap_or_else(|| model_id.clone());
         tracing::info!(repo = %tokenizer_repo, "resolving GGUF tokenizer");
         download_tokenizer(&tokenizer_repo)?
     };
