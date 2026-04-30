@@ -8,9 +8,9 @@ use crate::loading::var_builder::VarBuilder;
 use serde::Deserialize;
 
 use crate::models::commons::{
-    BatchState, Linear, RmsNorm,
+    BatchAttnContext, BatchState, LayerAttnContext, Linear, RmsNorm,
 };
-use crate::ops::{MaskType, VarlenParams};
+use crate::ops::{MaskType, PagedParams, VarlenParams};
 
 use crate::engine::{EmbeddingActivation, EmbeddingSemantics};
 
@@ -259,16 +259,10 @@ impl Gemma3Attention {
         })
     }
 
-    fn forward(
-        &mut self,
-        ops: &dyn crate::ops::Ops,
-        packed_input: &Tensor,
-        cu_seqlens: &Tensor,
-        max_seqlen: usize,
-        position_ids: &Tensor,
-    ) -> Result<Tensor> {
+    fn forward(&mut self, packed_input: &Tensor, ctx: &LayerAttnContext) -> Result<Tensor> {
         let (total_tokens, _) = packed_input.dims2()?;
         let bs = BatchState::no_lora();
+        let ops = ctx.ops;
 
         let q = self.q_proj.forward(packed_input, &bs, ops)?;
         let k = self.k_proj.forward(packed_input, &bs, ops)?;
@@ -280,7 +274,7 @@ impl Gemma3Attention {
         let q = self.q_norm.forward(&q)?;
         let k = self.k_norm.forward(&k)?;
 
-        let (q, k) = self.rotary_emb.apply_varlen(&q, &k, position_ids)?;
+        let (q, k) = self.rotary_emb.apply_varlen(&q, &k, ctx.position_ids)?;
 
         let mask = match self.attention_mode {
             Gemma3AttentionMode::FullCausal => MaskType::Causal,
@@ -292,11 +286,31 @@ impl Gemma3Attention {
                 left: window_size.saturating_sub(1), right: window_size.saturating_sub(1),
             },
         };
-        let attn_out = ops.varlen_attention(&q, &k, &v, &VarlenParams {
-            cu_seqlens_q: cu_seqlens, cu_seqlens_k: cu_seqlens,
-            max_seqlen_q: max_seqlen, max_seqlen_k: max_seqlen,
-            scale: self.softmax_scale, mask, softcap: None,
-        })?;
+
+        // Paged decode/prefill path: write fresh K/V into the layer's
+        // paged cache via reshape_and_cache, then dispatch through
+        // paged_attention so we read from the full block table for
+        // accumulated context. Falls back to plain varlen_attention when
+        // no cache is plumbed (one-shot embed / classify).
+        let attn_out = if let Some(kv) = ctx.paged_kv {
+            ops.reshape_and_cache(&k, &v, kv.key_cache, kv.value_cache, kv.slot_mapping)?;
+            ops.paged_attention(&q, kv.key_cache, kv.value_cache, &PagedParams {
+                block_tables: kv.block_tables,
+                cu_seqlens_q: ctx.cu_seqlens_q,
+                cu_seqlens_k: kv.cu_seqlens_k,
+                max_seqlen_q: ctx.max_seqlen_q,
+                max_seqlen_k: kv.max_seqlen_k,
+                scale: self.softmax_scale,
+                mask,
+                softcap: None,
+            })?
+        } else {
+            ops.varlen_attention(&q, &k, &v, &VarlenParams {
+                cu_seqlens_q: ctx.cu_seqlens_q, cu_seqlens_k: ctx.cu_seqlens_q,
+                max_seqlen_q: ctx.max_seqlen_q, max_seqlen_k: ctx.max_seqlen_q,
+                scale: self.softmax_scale, mask, softcap: None,
+            })?
+        };
 
         let attn_dim = self.num_heads * self.head_dim;
         self.o_proj.forward(&attn_out.reshape((total_tokens, attn_dim))?, &bs, ops)
@@ -354,18 +368,10 @@ impl Gemma3DecoderLayer {
         })
     }
 
-    fn forward(
-        &mut self,
-        ops: &dyn crate::ops::Ops,
-        xs: &Tensor,
-        cu_seqlens: &Tensor,
-        max_seqlen: usize,
-        position_ids: &Tensor,
-    ) -> Result<Tensor> {
+    fn forward(&mut self, xs: &Tensor, ctx: &LayerAttnContext) -> Result<Tensor> {
+        let ops = ctx.ops;
         let normed = self.input_layernorm.forward(xs)?;
-        let attn_output =
-            self.self_attn
-                .forward(ops, &normed, cu_seqlens, max_seqlen, position_ids)?;
+        let attn_output = self.self_attn.forward(&normed, ctx)?;
 
         let post_attn_normed = self.post_attention_layernorm.forward(&attn_output)?;
         let xs = ops.add_or_fused(&post_attn_normed, xs)?;
@@ -446,19 +452,20 @@ impl Gemma3Model {
         })
     }
 
-    fn forward(
-        &mut self,
-        ops: &dyn crate::ops::Ops,
-        packed_input: &Tensor,
-        cu_seqlens: &Tensor,
-        max_seqlen: usize,
-        position_ids: &Tensor,
-    ) -> Result<Tensor> {
+    fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> Result<Tensor> {
         let embed_scale = (self.hidden_size as f64).sqrt();
         let mut xs = (self.embed_tokens.forward(packed_input)? * embed_scale)?;
 
-        for layer in &mut self.layers {
-            xs = layer.forward(ops, &xs, cu_seqlens, max_seqlen, position_ids)?;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let layer_kv = ctx.paged_kv.map(|kv| kv.layer(i));
+            let layer_ctx = LayerAttnContext {
+                ops: ctx.ops,
+                cu_seqlens_q: ctx.cu_seqlens_q,
+                max_seqlen_q: ctx.max_seqlen_q,
+                position_ids: ctx.position_ids,
+                paged_kv: layer_kv.as_ref(),
+            };
+            xs = layer.forward(&xs, &layer_ctx)?;
         }
 
         self.norm.forward(&xs)
@@ -527,13 +534,7 @@ impl Gemma3ForCausalLM {
         packed_input: &Tensor,
         ctx: &mut crate::models::commons::BatchAttnContext,
     ) -> Result<Tensor> {
-        let hidden = self.base.forward(
-            ctx.ops,
-            packed_input,
-            ctx.cu_seqlens_q,
-            ctx.max_seqlen_q,
-            ctx.position_ids,
-        )?;
+        let hidden = self.base.forward(packed_input, ctx)?;
         let last_hidden =
             crate::models::commons::last_token_select(&hidden, ctx.seq_lens)?.contiguous()?;
 
@@ -559,13 +560,7 @@ impl crate::models::LogitsSplitModel for Gemma3ForCausalLM {
         packed_input: &Tensor,
         ctx: &mut crate::models::commons::BatchAttnContext,
     ) -> crate::tensor::Result<Tensor> {
-        self.base.forward(
-            ctx.ops,
-            packed_input,
-            ctx.cu_seqlens_q,
-            ctx.max_seqlen_q,
-            ctx.position_ids,
-        )
+        self.base.forward(packed_input, ctx)
     }
 
     fn compute_logits(&self, hidden: &Tensor) -> crate::tensor::Result<Tensor> {
@@ -647,13 +642,7 @@ impl Gemma3ForSequenceClassification {
         packed_input: &Tensor,
         ctx: &mut crate::models::commons::BatchAttnContext,
     ) -> Result<Tensor> {
-        let hidden_states = self.base.forward(
-            ctx.ops,
-            packed_input,
-            ctx.cu_seqlens_q,
-            ctx.max_seqlen_q,
-            ctx.position_ids,
-        )?;
+        let hidden_states = self.base.forward(packed_input, ctx)?;
         let last_hidden = crate::models::commons::last_token_select(&hidden_states, ctx.seq_lens)?;
         self.score.forward(&last_hidden, &BatchState::no_lora(), ctx.ops)
     }
@@ -724,13 +713,7 @@ impl Gemma3ForEmbedding {
         packed_input: &Tensor,
         ctx: &mut crate::models::commons::BatchAttnContext,
     ) -> Result<Tensor> {
-        let hidden_states = self.base.forward(
-            ctx.ops,
-            packed_input,
-            ctx.cu_seqlens_q,
-            ctx.max_seqlen_q,
-            ctx.position_ids,
-        )?;
+        let hidden_states = self.base.forward(packed_input, ctx)?;
         let hidden_states = hidden_states.to_dtype(DType::F32)?;
         let mut pooled = match self.pooling {
             crate::engine::EmbeddingPooling::LastToken => {
@@ -1082,7 +1065,7 @@ pub(crate) mod meta {
             RuntimeCaps {
                 supports_kv_cache: is_safetensors && is_generate,
                 supports_prefix_cache: false,
-                supports_paged_attn: false,
+                supports_paged_attn: device.is_cuda() && is_safetensors,
                 supports_varlen: device.is_cuda() && is_safetensors,
                 supports_deltanet: false,
                 supports_cuda_graph: false,

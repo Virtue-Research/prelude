@@ -1218,7 +1218,7 @@ pub(crate) mod meta {
             RuntimeCaps {
                 supports_kv_cache: is_safetensors && is_generate,
                 supports_prefix_cache: false,
-                supports_paged_attn: false,
+                supports_paged_attn: device.is_cuda() && is_safetensors,
                 supports_varlen: device.is_cuda() && is_safetensors,
                 supports_deltanet: false,
                 supports_cuda_graph: false,
