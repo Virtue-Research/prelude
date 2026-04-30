@@ -82,6 +82,15 @@ impl Ops for CudaOps {
         w1: &Tensor,
         w2: &Tensor,
     ) -> Option<Result<Tensor>> {
+        // The vendored TRT-LLM CUTLASS MoE templates are sm_90a only —
+        // calling them on Blackwell triggers
+        // `tensorrt_llm::common::TllmException("Please recompile with
+        // support for blackwell by passing 100-real ...")` and aborts
+        // the process. Return None so the caller falls back to the
+        // unfused per-expert path.
+        if !crate::ops::moe::is_sm90() {
+            return None;
+        }
         Some(crate::ops::moe::cutlass_fused_moe_forward(input, experts_per_tok, topk_weights, w1, w2))
     }
 

@@ -875,18 +875,19 @@ pub(crate) mod meta {
         if raw.get("text_config").is_some() {
             return Gemma3WeightLayout::NestedLanguageModel;
         }
-        // Bare text-model checkpoints (e.g. `Gemma3TextModel`, EmbeddingGemma)
-        // ship the backbone at the root — no `model.` prefix.
-        let model_type = raw.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
-        let is_bare_text = model_type == "gemma3_text"
-            || raw
-                .get("architectures")
-                .and_then(|v| v.as_array())
-                .is_some_and(|arr| {
-                    arr.iter()
-                        .filter_map(|a| a.as_str())
-                        .any(|s| s == "Gemma3TextModel")
-                });
+        // Bare text-model checkpoints (Gemma3TextModel, EmbeddingGemma) ship
+        // the backbone at the root — keys are `embed_tokens.weight`,
+        // `layers.*` etc. with no `model.` prefix. Detect them by the
+        // architectures string only — `model_type == "gemma3_text"` is shared
+        // with `Gemma3ForCausalLM`, which DOES use the `model.` prefix.
+        let is_bare_text = raw
+            .get("architectures")
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| {
+                arr.iter()
+                    .filter_map(|a| a.as_str())
+                    .any(|s| s == "Gemma3TextModel")
+            });
         if is_bare_text {
             Gemma3WeightLayout::BareText
         } else {

@@ -76,10 +76,14 @@ fn main() -> Result<()> {
 
     // Compile the three .cu files with shared nvcc flags.
     let arch_list = env::var("CAUSAL_CONV1D_ARCH_LIST").unwrap_or_else(|_| {
-        // SM80 Ampere, SM89 Ada, SM90 Hopper. Leave out SM100/SM120 —
-        // causal-conv1d has no specialisation for them, compiling for
-        // those archs without a matching cubin just bloats the build.
-        "80;89;90".to_string()
+        // SM80 Ampere, SM89 Ada, SM90 Hopper, SM100/103 Blackwell. The
+        // upstream causal_conv1d kernels are depthwise-conv vectorised
+        // copies — they don't touch wgmma/MMA, so the same source
+        // compiles cleanly for every SM target. Without an explicit
+        // sm_103 cubin a B300 launch fails with "no kernel image is
+        // available" because sm_90a PTX is arch-conditional and won't
+        // JIT-forward to sm_103.
+        "80;89;90;100;103".to_string()
     });
     let mut arch_flags: Vec<String> = Vec::new();
     for raw in arch_list.split(';') {

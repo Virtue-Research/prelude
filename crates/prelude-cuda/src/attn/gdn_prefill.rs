@@ -97,7 +97,11 @@ pub(crate) fn try_prefill(
     scale: f32,
 ) -> Result<Option<(Tensor, Tensor)>> {
     let reg = registry();
-    if reg.arch() < 90 {
+    // Vendored flashinfer gdn_prefill is sm_90a-only — `gdn_prefill_launcher.cu`
+    // raises `flashinfer::Error("delta rule kernel does not support this
+    // device major version: 10")` and `std::terminate`s the process if the
+    // arch isn't 90. Caller will fall through to the cuLA / pure-Rust path.
+    if reg.arch() != 90 {
         return Ok(None);
     }
     let Some(gdn_fn) = reg.get_utility("gdn_prefill") else {
@@ -293,10 +297,13 @@ pub(crate) fn try_prefill(
     let raw_stream = unsafe { stream.cu_stream() } as *mut c_void;
     reg.set_stream(dev_id, raw_stream);
 
+    // The vendored flashinfer gdn_prefill is AOT-compiled with
+    // `enable_checkpointing=false`, which drops the trailing 3
+    // checkpoint args from the kernel signature. The compiled kernel
+    // expects 11 args; passing 14 trips a tvm::ffi arity check.
+    //
     // gdn_prefill(output, output_state, q, k, v, cu_seqlens,
-    //             input_state?, alpha?, beta?, scale, workspace,
-    //             state_checkpoints?, checkpoint_cu_starts?,
-    //             checkpoint_every_n_tokens)
+    //             input_state?, alpha?, beta?, scale, workspace)
     let args = [
         TVMFFIAny::dltensor(&dl_o),
         TVMFFIAny::dltensor(&dl_state),
@@ -312,9 +319,6 @@ pub(crate) fn try_prefill(
         TVMFFIAny::dltensor(&dl_beta),
         TVMFFIAny::float64(scale as f64),
         TVMFFIAny::dltensor(&dl_ws),
-        TVMFFIAny::none(), // state_checkpoints (unused — see enable_checkpointing=false at AOT)
-        TVMFFIAny::none(), // checkpoint_cu_starts
-        TVMFFIAny::int64(0), // checkpoint_every_n_tokens
     ];
 
     unsafe {

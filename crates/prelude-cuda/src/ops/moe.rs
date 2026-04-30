@@ -298,6 +298,28 @@ pub fn swap_gate_up_inplace(w1: &Tensor, inter: usize) -> Result<()> {
 
 // ── CUTLASS Fused MoE forward ─────────────────────────────────────
 
+/// True iff the live CUDA device is Hopper (compute major == 9).
+/// Cached on first call. Used to gate sm_90a-only TRT-LLM kernels off
+/// the Blackwell hot path before a launch can `std::terminate` us.
+pub fn is_sm90() -> bool {
+    static MAJOR: OnceLock<i32> = OnceLock::new();
+    let major = *MAJOR.get_or_init(|| {
+        use cudarc::driver::{sys, CudaContext};
+        let Ok(ctx) = CudaContext::new(0) else { return 0; };
+        let dev = ctx.cu_device();
+        let mut major: i32 = 0;
+        unsafe {
+            sys::cuDeviceGetAttribute(
+                &mut major,
+                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                dev,
+            );
+        }
+        major
+    });
+    major == 9
+}
+
 /// Get or create the CUTLASS fused MoE runner singleton.
 fn get_cutlass_moe_runner() -> Option<&'static flashinfer::moe::FusedMoeRunner> {
     static RUNNER: OnceLock<Option<flashinfer::moe::FusedMoeRunner>> = OnceLock::new();

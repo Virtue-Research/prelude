@@ -543,11 +543,14 @@ fn process_step_output(
                 continue;
             };
 
+            // Always grab the per-row logits — needed for top-k logprob
+            // extraction even when the token itself was sampled in a
+            // batched GPU pass above.
+            let row = output.logits.get(logit_row).ok();
+
             let token = if let Some(ref tokens) = batched_tokens {
-                // Use pre-computed batched result
                 tokens[i]
-            } else if let Ok(row) = output.logits.get(logit_row) {
-                // Per-sequence fallback (non-greedy or batch size 1)
+            } else if let Some(ref row) = row {
                 if state.is_greedy() {
                     row.argmax(crate::tensor::D::Minus1)
                         .and_then(|t| t.to_scalar::<u32>())
@@ -563,7 +566,15 @@ fn process_step_output(
             } else {
                 0
             };
-            process_single_token(engine, scheduler, state, request_id, token, None, &mut completed);
+
+            // Per-token top-k logprobs when requested. Without this the
+            // /v1/completions response leaves `logprobs.tokens = [first_only]`
+            // and downstream tools count tokens via `len(logprobs.tokens)`.
+            let lp = row
+                .as_ref()
+                .and_then(|r| extract_token_logprobs(engine, r, token, state));
+
+            process_single_token(engine, scheduler, state, request_id, token, lp, &mut completed);
             logit_row += 1;
         }
     }
