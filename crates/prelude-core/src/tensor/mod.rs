@@ -143,6 +143,24 @@ pub trait TensorExt {
     /// Get raw storage ref — wraps candle's `storage_and_layout()`.
     /// Note: this holds a read lock on storage.
     fn storage_ref(&self) -> std::sync::RwLockReadGuard<'_, Storage>;
+
+    /// Element-wise `self == other` (tensor–tensor). Thin wrapper around `Tensor::eq`.
+    fn eq_t(&self, other: &Tensor) -> Result<Tensor>;
+    fn ne_t(&self, other: &Tensor) -> Result<Tensor>;
+    fn lt_t(&self, other: &Tensor) -> Result<Tensor>;
+    fn gt_t(&self, other: &Tensor) -> Result<Tensor>;
+    fn le_t(&self, other: &Tensor) -> Result<Tensor>;
+    fn ge_t(&self, other: &Tensor) -> Result<Tensor>;
+
+    /// Element-wise comparison against a scalar (coerced to this tensor's dtype).
+    fn eq_scalar<T: candle_core::scalar::TensorOrScalar>(&self, rhs: T) -> Result<Tensor>;
+    fn ne_scalar<T: candle_core::scalar::TensorOrScalar>(&self, rhs: T) -> Result<Tensor>;
+
+    /// Apply softmax along the given dimension.
+    fn softmax<D: candle_core::shape::Dim>(&self, dim: D) -> Result<Tensor>;
+
+    /// Apply RoPE with `[T, H, D]` layout.
+    fn rope_thd(&self, cos: &Tensor, sin: &Tensor) -> Result<Tensor>;
 }
 
 impl TensorExt for Tensor {
@@ -153,6 +171,28 @@ impl TensorExt for Tensor {
     fn storage_ref(&self) -> std::sync::RwLockReadGuard<'_, Storage> {
         // storage_and_layout() returns (guard, &layout), we just want the guard
         self.storage_and_layout().0
+    }
+
+    fn eq_t(&self, other: &Tensor) -> Result<Tensor> { self.eq(other) }
+    fn ne_t(&self, other: &Tensor) -> Result<Tensor> { self.ne(other) }
+    fn lt_t(&self, other: &Tensor) -> Result<Tensor> { self.lt(other) }
+    fn gt_t(&self, other: &Tensor) -> Result<Tensor> { self.gt(other) }
+    fn le_t(&self, other: &Tensor) -> Result<Tensor> { self.le(other) }
+    fn ge_t(&self, other: &Tensor) -> Result<Tensor> { self.ge(other) }
+
+    fn eq_scalar<T: candle_core::scalar::TensorOrScalar>(&self, rhs: T) -> Result<Tensor> {
+        self.eq(rhs)
+    }
+    fn ne_scalar<T: candle_core::scalar::TensorOrScalar>(&self, rhs: T) -> Result<Tensor> {
+        self.ne(rhs)
+    }
+
+    fn softmax<D: candle_core::shape::Dim>(&self, dim: D) -> Result<Tensor> {
+        candle_nn::ops::softmax(self, dim)
+    }
+
+    fn rope_thd(&self, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        candle_nn::rotary_emb::rope_thd(self, cos, sin)
     }
 }
 

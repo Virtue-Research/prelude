@@ -19,7 +19,7 @@ use std::process::Command;
 use prelude_kernelbuild::build_log;
 use prelude_kernelbuild::nvcc::{
     compile_cu_to_obj, find_cuda, link_cuda_runtime_static, locate_source, nvcc_path,
-    nvcc_supports_sm100, track_submodule, ObjCompile,
+    nvcc_supports_sm100, nvcc_supports_sm103, track_submodule, ObjCompile,
 };
 
 fn main() {
@@ -43,11 +43,12 @@ fn main() {
     let cuda_path = find_cuda();
     let nvcc = nvcc_path(&cuda_path);
     let sm100 = nvcc_supports_sm100(&nvcc);
+    let sm103 = nvcc_supports_sm103(&nvcc);
 
-    if sm100 {
-        build_log!("compiling 3.x for SM80 + SM90a + SM100a (fat binary)");
-    } else {
-        build_log!("compiling 3.x for SM80 + SM90a");
+    match (sm100, sm103) {
+        (true, true) => build_log!("compiling 3.x for SM80 + SM90a + SM100a + SM103a (fat binary)"),
+        (true, false) => build_log!("compiling 3.x for SM80 + SM90a + SM100a (fat binary)"),
+        _ => build_log!("compiling 3.x for SM80 + SM90a"),
     }
 
     let common_gencodes: Vec<String> = {
@@ -57,6 +58,9 @@ fn main() {
         ];
         if sm100 {
             v.push("-gencode=arch=compute_100a,code=sm_100a".into());
+        }
+        if sm103 {
+            v.push("-gencode=arch=compute_103a,code=sm_103a".into());
         }
         v
     };

@@ -167,8 +167,11 @@ impl Gpu {
     fn new() -> Option<Self> {
         let ctx = CudaContext::new(0).ok()?;
         let (major, _) = detect_sm();
-        if major < 9 {
-            eprintln!("cuLA tests require SM90+, skipping (SM{major}x)");
+        // Every test in this file invokes `kda_fwd_prefill_sm90`, which
+        // requires the sm_90a cubin. Blackwell (major 10) can't run that
+        // kernel — skip instead of trapping inside FFI.
+        if major != 9 {
+            eprintln!("cuLA SM90 tests skipped (GPU is SM{major}x, not SM9x)");
             return None;
         }
         let stream = ctx.new_stream().ok()?;

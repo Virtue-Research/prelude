@@ -167,7 +167,13 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fi_src: &Path) -> Res
             .to_string()
     });
 
+    // The vendored flashinfer/__init__.py runs an `flashinfer-cubin` package
+    // version check at import time. We don't pip-install the umbrella
+    // `flashinfer` package (we build kernels directly from the submodule), so
+    // its computed version is `0.0.0+unknown` and the check fails. The cubin
+    // dir resolution is irrelevant for our compile path; bypass.
     let status = Command::new(&python)
+        .env("FLASHINFER_DISABLE_VERSION_CHECK", "1")
         .arg(&script)
         .arg("--flashinfer-src")
         .arg(fi_src)

@@ -1688,7 +1688,17 @@ fn deltanet_varlen_pooled(
         | (64, 64, 128, 128) // MHA H=64
         | (16, 32, 128, 128) // GQA H=16/HV=32 (Qwen3.5-35B-A3B)
     );
-    let fused_eligible = all_decode && packed.device().is_cuda() && fused_supported;
+    // The fast path's first step (`causal_conv1d_update` with pool indexing)
+    // mutates `pool.conv_states` in place. If we let it run and then `kda_decode_batched`
+    // returns None — for example on Blackwell/SM103 where there's no AOT cuLA cubin —
+    // the sequential fallback below will run conv1d *again* against the
+    // already-advanced state, producing degenerate decode output ("Paris Paris…").
+    // Probe `kda_decode_available()` BEFORE entering the fast path so we never
+    // touch pool state if the second stage can't run.
+    let fused_eligible = all_decode
+        && packed.device().is_cuda()
+        && fused_supported
+        && ops.kda_decode_available();
     if fused_eligible {
         if let Some(out) = deltanet_decode_batched_fused(
             gdn, packed, pool, slot_ids, slot_ids_gpu, dn_layer_idx, ops,

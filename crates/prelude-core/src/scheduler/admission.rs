@@ -1,4 +1,4 @@
-use super::{Scheduler, SchedulerStep, SequenceStatus};
+use super::{Scheduler, SchedulerStep, SeqFinishReason, SequenceStatus};
 
 impl Scheduler {
     /// Schedule one step using a unified per-step token budget.
@@ -256,6 +256,7 @@ impl Scheduler {
         mut total_token_budget: usize,
     ) -> AdmissionBatch {
         let mut admission = AdmissionBatch::default();
+        let global_prefill_cap = self.config.max_num_batched_tokens;
 
         while !self.waiting_queue.is_empty() && admission.to_prefill.len() < available_slots {
             let prompt_len = self
@@ -268,6 +269,28 @@ impl Scheduler {
                 sequence.total_len() + sequence.remaining_tokens() as usize
             };
 
+            // Prompt exceeds the global per-step prefill cap — it can never fit,
+            // so fail it immediately rather than silently blocking the queue.
+            // This used to be a `break` that left oversized sequences stuck
+            // forever in `waiting`, surfacing to clients as a request timeout.
+            if prompt_len > global_prefill_cap {
+                let mut sequence = self
+                    .waiting_queue
+                    .pop_front()
+                    .expect("queue was checked non-empty");
+                sequence.status = SequenceStatus::Finished;
+                sequence.finish_reason = Some(SeqFinishReason::Abort(
+                    format!(
+                        "prompt length {prompt_len} exceeds max_num_batched_tokens={global_prefill_cap}; \
+                         raise --max-num-batched-tokens or shorten the prompt"
+                    ),
+                ));
+                self.finished.push(sequence);
+                continue;
+            }
+
+            // Prompt fits the global cap but not this step's remaining budget.
+            // Defer to the next scheduling step.
             if prompt_len > prefill_token_budget {
                 break;
             }

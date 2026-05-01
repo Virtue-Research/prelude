@@ -337,6 +337,7 @@ fn update_bf16_width4() {
             ptr(&w_gpu, &gpu.stream),
             None,
             ptr_mut(&mut o_gpu, &gpu.stream),
+            None,
             b as i32, d as i32, k as i32,
             (k - 1) as i32,
             false,

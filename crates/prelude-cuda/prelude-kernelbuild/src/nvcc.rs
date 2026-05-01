@@ -167,6 +167,19 @@ pub fn nvcc_supports_sm100(nvcc: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Check whether the given nvcc supports Blackwell-Ultra (`compute_103`).
+/// Required for B300 — SM100a PTX does NOT JIT-forward to SM103, so without
+/// a native sm_103a cubin every B300 launch hits "no kernel image
+/// available" or returns -2 from the dispatch.
+pub fn nvcc_supports_sm103(nvcc: &Path) -> bool {
+    Command::new(nvcc)
+        .arg("--list-gpu-arch")
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("compute_103"))
+        .unwrap_or(false)
+}
+
+
 // ─────────────────────────────────────────────────────────────────────
 // Workspace / submodule helpers
 // ─────────────────────────────────────────────────────────────────────

@@ -58,6 +58,26 @@ static SM100Config select_sm100_config(int m, int n, int k, int num_sms) {
         if (legal) multicast = 2;
     }
 
+    // Blackwell-Ultra (SM103, B300): the `(BM=256, BN=128, stages=4,
+    // swizzle_d=128, multicast=2)` kernel variant OOBs on shared/local memory
+    // (caught by compute-sanitizer; repro at e.g. M=1408 N=3072 K=1024).
+    // Shrink the tile to the safe `(BM=128, BN=128)` and keep multicast
+    // enabled when still legal under the smaller block.
+    if (g_gpu_arch == 103 && best_bm == 256 && best_bn == 128) {
+        best_bm = 128;
+        if (multicast == 2 && ceil_div(m, best_bm) % 2 != 0) {
+            multicast = 1;
+        }
+    }
+    // Blackwell-Ultra: tiny-N kernels with multicast=2 also OOB on shared
+    // memory — caught by compute-sanitizer at M=512 N=4096 K=2048 (Qwen3.5
+    // in_proj_q at 512-token prefill), which selects (BM=128, BN=16,
+    // stages=12, multicast=2). Multicast on B with BN<32 doesn't pay back
+    // its sync overhead anyway; just disable it for these tile widths.
+    if (g_gpu_arch == 103 && best_bn < 32 && multicast == 2) {
+        multicast = 1;
+    }
+
     SmemConfig scfg;
     int best_stages = select_num_stages<SM100Arch>(
         KernelKind::NoSF, MmaKindLocal::BF16,

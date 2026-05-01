@@ -76,10 +76,18 @@ fn main() -> Result<()> {
 
     // Compile the three .cu files with shared nvcc flags.
     let arch_list = env::var("CAUSAL_CONV1D_ARCH_LIST").unwrap_or_else(|_| {
-        // SM80 Ampere, SM89 Ada, SM90 Hopper. Leave out SM100/SM120 —
-        // causal-conv1d has no specialisation for them, compiling for
-        // those archs without a matching cubin just bloats the build.
-        "80;89;90".to_string()
+        // SM80 Ampere, SM89 Ada, SM90 Hopper, SM100 Blackwell.
+        //
+        // We deliberately skip an explicit sm_103 cubin even though
+        // nvcc 13.x supports it: when both sm_100 and sm_103 cubins
+        // are present in the fatbin, the CUDA loader prefers sm_103
+        // on B300 (exact match), and CUDA 13.2 nvcc's sm_103 codegen
+        // for these kernels is numerically wrong (max_abs_err ~0.4-0.6
+        // in our unit tests; verified against the pip wheel of
+        // causal_conv1d 1.6.1 which has only sm_100 cubin and produces
+        // bit-exact output on B300). The sm_100 cubin is
+        // forward-compatible to sm_103 within the Blackwell family.
+        "80;89;90;100".to_string()
     });
     let mut arch_flags: Vec<String> = Vec::new();
     for raw in arch_list.split(';') {

@@ -296,6 +296,19 @@ impl CacheManager {
 
         Ok(Some(Mutex::new(pool)))
     }
+
+    /// Empty CacheManager — all caches None. For tests that exercise
+    /// build_forward_batch or similar helpers that only need the cache
+    /// references to exist but never allocate against a real pool.
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            prefix_cache: None,
+            paged_pool: None,
+            block_manager: None,
+            deltanet_pool: None,
+        }
+    }
 }
 
 /// Query free GPU memory via the registered ops session.
