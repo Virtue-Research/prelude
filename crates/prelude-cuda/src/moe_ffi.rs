@@ -62,4 +62,16 @@ unsafe extern "C" {
         sorted_tokens: *mut u32,
         stream: i64,
     );
+
+    /// Per-expert prefix-sum offsets from sorted expert ids. Reused by
+    /// the SM100 grouped GEMM dispatch so it can call the CUTLASS
+    /// grouped path without re-implementing the histogram.
+    pub fn moe_compute_expert_offsets_light(
+        sorted_expert_ids: *const i32,
+        size_m: i32,
+        num_experts: i32,
+        expert_counts_tmp: *mut i32,
+        expert_offsets: *mut i32,
+        stream: i64,
+    );
 }

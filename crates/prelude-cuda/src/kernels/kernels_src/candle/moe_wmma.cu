@@ -313,6 +313,32 @@ extern "C" void moe_swap_gate_up_inplace(
     cudaFree(temp);
 }
 
+/// Compute per-expert prefix-sum offsets from sorted expert ids.
+///
+/// Wraps the `calculate_expert_offsets_light` helper so other kernels
+/// (e.g. the SM100 grouped GEMM in cutlass-gemm) can reuse it without
+/// pulling in the moe_utils.cuh include path. CUDA-graph capturable
+/// (no thrust calls in the light variant).
+///
+/// @param sorted_expert_ids [size_m] Device — globally sorted expert ids
+/// @param size_m            Total assignments (num_tokens * topk)
+/// @param num_experts       Total expert count
+/// @param expert_counts_tmp [num_experts] Device scratch — overwritten
+/// @param expert_offsets    [num_experts + 1] Device output — prefix sum
+/// @param stream            CUDA stream
+extern "C" void moe_compute_expert_offsets_light(
+    const int32_t* sorted_expert_ids,
+    int size_m,
+    int num_experts,
+    int32_t* expert_counts_tmp,
+    int32_t* expert_offsets,
+    cudaStream_t stream
+) {
+    calculate_expert_offsets_light(sorted_expert_ids, size_m,
+                                   expert_counts_tmp, expert_offsets,
+                                   num_experts, stream);
+}
+
 /// Sort expert assignments by expert ID on GPU using thrust.
 /// Produces globally sorted (expert_ids, token_ids) arrays suitable for
 /// the grouped GEMM kernel.

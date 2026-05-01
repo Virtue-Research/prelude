@@ -31,7 +31,7 @@ pub fn cuda_ops() -> &'static dyn Ops {
 /// process-wide cache, an init call on a Hopper GPU could mask a later
 /// call from a Blackwell-current thread, letting the unsafe sm_90a
 /// CUTLASS kernel launch and `std::terminate`.
-fn detect_sm_major() -> i32 {
+pub(crate) fn detect_sm_major() -> i32 {
     use std::collections::HashMap;
     use std::sync::Mutex;
     unsafe extern "C" {
@@ -95,6 +95,12 @@ impl Ops for CudaOps {
         let num_assignments = sorted_token_ids.elem_count();
         let num_tokens = input.dims()[0];
         let topk = if num_tokens > 0 { num_assignments / num_tokens } else { 1 };
+        // Prefer the CUTLASS Blackwell SM100 grouped GEMM (BF16 only) over the
+        // SM75-era WMMA kernel. The helper returns Ok(None) on unsupported
+        // arch / dtype, so fall through to the WMMA path in that case.
+        if let Some(out) = crate::ops::moe::try_grouped_gemm_sm100(input, weights, sorted_token_ids, sorted_expert_ids, topk)? {
+            return Ok(out);
+        }
         crate::ops::moe::moe_gemm_wmma(input, weights, &None, sorted_token_ids, sorted_expert_ids, topk, num_tokens > 1)
     }
 

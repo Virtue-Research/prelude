@@ -282,6 +282,137 @@ pub fn moe_gemm_wmma(
     }
 }
 
+/// CUTLASS Blackwell SM100 grouped MoE GEMM, BF16 only.
+///
+/// Returns `Ok(Some(out))` on success, `Ok(None)` when the path isn't
+/// available (non-Blackwell, FP16 input, batch=0, etc.) so the caller
+/// can fall back to `moe_gemm_wmma`. Returns `Err` only on unexpected
+/// kernel/launch failures.
+///
+/// Same in/out contract as `moe_gemm_wmma` with `topk_weights=None`:
+/// - `input`: `[num_tokens, K]` BF16
+/// - `weights`: `[num_experts, N, K]` BF16
+/// - `sorted_token_ids`: `[m_total]` U32, sorted by expert id (flat
+///    index into `[num_tokens × topk]`)
+/// - `sorted_expert_ids`: `[m_total]` U32, parallel to `sorted_token_ids`
+/// - Output: `[m_total, N]` BF16, in sorted-token-id layout
+pub fn try_grouped_gemm_sm100(
+    input: &Tensor,
+    weights: &Tensor,
+    sorted_token_ids: &Tensor,
+    sorted_expert_ids: &Tensor,
+    topk: usize,
+) -> Result<Option<Tensor>> {
+    use std::ffi::c_void;
+
+    // Arch + dtype gate. Only B300+ gets here; everything else falls
+    // back to the existing WMMA path.
+    if crate::cuda_ops::detect_sm_major() < 10 {
+        return Ok(None);
+    }
+    if input.dtype() != DType::BF16 || weights.dtype() != DType::BF16 {
+        return Ok(None);
+    }
+    if !input.device().is_cuda() {
+        return Ok(None);
+    }
+
+    let (num_tokens, k1) = input.dims2()?;
+    let (num_experts, size_n, size_k) = weights.dims3()?;
+    if size_k != k1 {
+        bail!("grouped_gemm_sm100: input K={k1} vs weights K={size_k} mismatch");
+    }
+    let m_total = sorted_token_ids.elem_count();
+    if m_total != num_tokens * topk {
+        bail!(
+            "grouped_gemm_sm100: sorted_token_ids length {m_total} != num_tokens*topk = {}",
+            num_tokens * topk
+        );
+    }
+
+    let (input_g, _) = input.storage_and_layout();
+    let input_cuda = as_candle_cuda(&input_g, "grouped_gemm_sm100/input")?;
+    let input_s = input_cuda.as_cuda_slice::<half::bf16>()?;
+
+    let (weights_g, _) = weights.storage_and_layout();
+    let weights_cuda = as_candle_cuda(&weights_g, "grouped_gemm_sm100/weights")?;
+    let weights_s = weights_cuda.as_cuda_slice::<half::bf16>()?;
+
+    // Cast i32 / u32 transparently for the offsets shim — sorted_*
+    // tensors are U32 from the sort kernel.
+    let (sti_g, _) = sorted_token_ids.storage_and_layout();
+    let sti_cuda = as_candle_cuda(&sti_g, "grouped_gemm_sm100/sorted_token_ids")?;
+    let sti_s = sti_cuda.as_cuda_slice::<u32>()?;
+
+    let (sei_g, _) = sorted_expert_ids.storage_and_layout();
+    let sei_cuda = as_candle_cuda(&sei_g, "grouped_gemm_sm100/sorted_expert_ids")?;
+    let sei_s = sei_cuda.as_cuda_slice::<u32>()?;
+
+    let dev = input_cuda.device().clone();
+    let stream = dev.cuda_stream();
+    let cu_stream = stream.cu_stream() as i64;
+
+    // Compute per-expert prefix-sum offsets via the existing helper.
+    // Uses two int32 scratch tensors (counts, offsets); both freed at
+    // end of call.
+    let expert_counts = unsafe { dev.alloc::<i32>(num_experts) }?;
+    let expert_offsets = unsafe { dev.alloc::<i32>(num_experts + 1) }?;
+    unsafe {
+        ffi::moe_compute_expert_offsets_light(
+            sei_s.device_ptr(&stream).0 as *const i32,
+            m_total as i32,
+            num_experts as i32,
+            expert_counts.device_ptr(&stream).0 as *mut i32,
+            expert_offsets.device_ptr(&stream).0 as *mut i32,
+            cu_stream,
+        );
+    }
+
+    let output = unsafe { dev.alloc::<half::bf16>(m_total * size_n) }?;
+
+    let ret = unsafe {
+        cutlass_gemm::grouped_moe_sm100(
+            input_s.device_ptr(&stream).0 as *const c_void,
+            weights_s.device_ptr(&stream).0 as *const c_void,
+            sti_s.device_ptr(&stream).0 as *const u32,
+            expert_offsets.device_ptr(&stream).0 as *const i32,
+            output.device_ptr(&stream).0 as *mut c_void,
+            m_total as i32,
+            size_n as i32,
+            size_k as i32,
+            num_experts as i32,
+            topk as i32,
+            /*data_type=*/ 1,  // bf16
+            cu_stream as *const c_void,
+        )
+    };
+    drop(expert_counts);
+    drop(expert_offsets);
+    drop(input_g);
+    drop(weights_g);
+    drop(sti_g);
+    drop(sei_g);
+
+    match ret {
+        Ok(()) => {
+            let storage = candle_core::CudaStorage::wrap_cuda_slice(output, dev);
+            let out = Tensor::from_storage(
+                candle_core::Storage::Cuda(storage),
+                (m_total, size_n),
+                candle_core::op::BackpropOp::none(),
+                false,
+            );
+            Ok(Some(out))
+        }
+        Err(e) => {
+            // Fall through to the WMMA path on any kernel-level error
+            // (e.g. CUTLASS can_implement says no for an unusual shape).
+            tracing::debug!("grouped_gemm_sm100 → WMMA fallback: {e}");
+            Ok(None)
+        }
+    }
+}
+
 /// GPU-accelerated sort of expert assignments using thrust::sort_by_key.
 /// Input:  expert_ids [n] U32 (flat, unsorted)
 /// Output: (sorted_expert_ids [n] U32, sorted_token_ids [n] U32)
