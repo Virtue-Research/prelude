@@ -22,6 +22,7 @@
 #include <vector>
 #include <cassert>
 #include <cstring>
+#include <cub/device/device_radix_sort.cuh>
 #include "moe_utils.cuh"
 using namespace nvcuda::wmma;
 
@@ -339,9 +340,24 @@ extern "C" void moe_compute_expert_offsets_light(
                                    num_experts, stream);
 }
 
-/// Sort expert assignments by expert ID on GPU using thrust.
+/// Tiny init kernel: out[i] = i. Replaces `thrust::sequence`, which had
+/// ~590µs host launch overhead per call vs ~5µs for this direct kernel.
+static __global__ void init_iota_u32(uint32_t* __restrict__ out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = (uint32_t)i;
+}
+
+/// Sort expert assignments by expert ID on GPU using `cub::DeviceRadixSort`.
 /// Produces globally sorted (expert_ids, token_ids) arrays suitable for
 /// the grouped GEMM kernel.
+///
+/// Replaces `thrust::sort_by_key`, which had ~496µs host overhead per call
+/// vs ~7µs for the underlying CUB radix sort. nsys NVTX measured ~80ms
+/// per forward (48 layers × ~1.6ms thrust dispatch) wasted on host-side
+/// thrust validation/launch glue. Going direct cuts that to ~1ms/forward.
+///
+/// `end_bit=16` covers up to 65536 experts; cub does fewer radix passes
+/// than the default 32-bit sort.
 ///
 /// @param expert_ids_in   [n] Device — flat expert IDs (not necessarily sorted)
 /// @param n               Total element count (num_tokens * topk)
@@ -355,17 +371,37 @@ extern "C" void moe_sort_expert_assignments(
     uint32_t* sorted_tokens,
     cudaStream_t stream
 ) {
-    // Copy expert_ids to sorted_experts (thrust sorts in-place)
-    cudaMemcpyAsync(sorted_experts, expert_ids_in, n * sizeof(uint32_t),
-                    cudaMemcpyDeviceToDevice, stream);
+    if (n <= 0) return;
 
-    // Initialize sorted_tokens to [0, 1, 2, ..., n-1]
-    thrust::device_ptr<uint32_t> token_ptr(sorted_tokens);
-    thrust::sequence(thrust::cuda::par.on(stream), token_ptr, token_ptr + n, 0u);
+    // Query CUB temp-storage size for SortPairs<u32, u32>.
+    size_t cub_temp_bytes = 0;
+    cub::DeviceRadixSort::SortPairs(
+        /*d_temp_storage=*/nullptr, cub_temp_bytes,
+        /*keys_in=*/expert_ids_in, /*keys_out=*/sorted_experts,
+        /*values_in=*/(const uint32_t*)nullptr, /*values_out=*/sorted_tokens,
+        n, 0, 16, stream);
 
-    // Sort by expert ID (key), carrying token indices (value)
-    thrust::device_ptr<uint32_t> expert_ptr(sorted_experts);
-    thrust::sort_by_key(thrust::cuda::par.on(stream),
-                        expert_ptr, expert_ptr + n,
-                        token_ptr);
+    // Layout: [values_in_buf | cub_temp]. CUB requires distinct
+    // values_in / values_out buffers (no aliasing); we produce values_in
+    // via init_iota_u32 then SortPairs writes the permutation into
+    // sorted_tokens.
+    size_t values_bytes = (size_t)n * sizeof(uint32_t);
+    size_t total_bytes = values_bytes + cub_temp_bytes;
+    void* scratch = nullptr;
+    cudaMallocAsync(&scratch, total_bytes, stream);
+
+    uint32_t* values_in = reinterpret_cast<uint32_t*>(scratch);
+    void* cub_temp = static_cast<uint8_t*>(scratch) + values_bytes;
+
+    constexpr int THREADS = 256;
+    int blocks = (n + THREADS - 1) / THREADS;
+    init_iota_u32<<<blocks, THREADS, 0, stream>>>(values_in, n);
+
+    cub::DeviceRadixSort::SortPairs(
+        cub_temp, cub_temp_bytes,
+        expert_ids_in, sorted_experts,
+        values_in, sorted_tokens,
+        n, 0, 16, stream);
+
+    cudaFreeAsync(scratch, stream);
 }
