@@ -272,6 +272,17 @@ pub trait Ops: Send + Sync {
         _slot_ids: &Tensor,
     ) -> Option<Result<Tensor>> { None }
 
+    /// True iff `kda_decode_batched` would run successfully on the current
+    /// device and shape. Callers use this to gate the fused decode fast
+    /// path BEFORE they start mutating shared state (e.g. the DeltaNet
+    /// pool's `conv_states`) — running conv1d_update into the pool and
+    /// then falling through to the sequential path on the kda step would
+    /// advance conv_state twice and produce degenerate decode output.
+    ///
+    /// Default: `false` (no kda kernel — caller should pick the
+    /// composed path directly).
+    fn kda_decode_available(&self) -> bool { false }
+
     /// Fused short causal 1D convolution (Dao-AILab causal-conv1d).
     ///
     /// Runs the same kernel Mamba / Mamba-2 / Qwen3-next / Qwen3.5

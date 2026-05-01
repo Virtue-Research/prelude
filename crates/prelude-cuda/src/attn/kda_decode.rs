@@ -70,6 +70,18 @@ fn kernel_name(variant: &str, h: usize, hv: usize, v: usize, arch: u32) -> Strin
     )
 }
 
+/// True iff the current CUDA device has an AOT-compiled `kda_decode`
+/// kernel variant. Mirrors the arch gate in `try_decode` but is cheap
+/// enough for hot-path callers to query before they start mutating
+/// the DeltaNet pool's conv_state — running conv1d into the pool and
+/// then discovering kda is unavailable would advance conv_state twice
+/// (once in the fused fast path, once in the sequential fallback) and
+/// produce repeated tokens at decode.
+pub(crate) fn supported_on_current_arch() -> bool {
+    let arch = registry().arch();
+    arch == 90 || arch == 100
+}
+
 /// Try to run the fused cuLA `kda_decode` kernel over a decode batch.
 ///
 /// Returns `Ok(Some(o))` if the kernel executed — `o` has shape `[N, HV, V]`

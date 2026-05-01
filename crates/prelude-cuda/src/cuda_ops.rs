@@ -231,6 +231,10 @@ impl Ops for CudaOps {
         }
     }
 
+    fn kda_decode_available(&self) -> bool {
+        crate::attn::kda_decode::supported_on_current_arch()
+    }
+
     fn causal_conv1d_fn(
         &self,
         x: &Tensor,
