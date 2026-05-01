@@ -120,32 +120,6 @@ struct Gpu {
     stream: Arc<CudaStream>,
 }
 
-/// Skip helper: causal-conv1d's vendored kernels are compiled for
-/// SM80/89/90 only (see build.rs CAUSAL_CONV1D_ARCH_LIST default). On
-/// Blackwell (SM10x) the cubin falls back to PTX JIT and produces
-/// numerically wrong output (max_abs_err ~0.4-0.6 on BF16, well above
-/// the 0.05 tolerance these tests use). Skip until upstream gets a
-/// SM100/SM103 specialisation.
-fn skip_if_blackwell(label: &str) -> bool {
-    use cudarc::driver::sys;
-    let ctx = match CudaContext::new(0).ok() { Some(c) => c, None => return true };
-    let dev = ctx.cu_device();
-    let mut major: i32 = 0;
-    unsafe {
-        sys::cuDeviceGetAttribute(
-            &mut major,
-            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-            dev,
-        );
-    }
-    if major >= 10 {
-        eprintln!("{label}: skip (SM{major}x, causal-conv1d cubins are SM90-only)");
-        true
-    } else {
-        false
-    }
-}
-
 impl Gpu {
     fn new() -> Option<Self> {
         let ctx = CudaContext::new(0).ok()?;
@@ -205,7 +179,6 @@ fn rand_vec(n: usize, seed: u64) -> Vec<f64> {
 /// initial_states. Tests basic conv + L2 tail, no SiLU.
 #[test]
 fn fwd_bf16_width4_no_init() {
-    if skip_if_blackwell("fwd_bf16_width4_no_init") { return; }
     let gpu = match Gpu::new() { Some(g) => g, None => { eprintln!("no GPU, skipping"); return; } };
     let (b, d, l, k) = (1usize, 64usize, 32usize, 4usize);
 
@@ -253,7 +226,6 @@ fn fwd_bf16_width4_no_init() {
 /// channel-last layout before the call or add a separate kernel path.
 #[test]
 fn fwd_bf16_silu_no_init() {
-    if skip_if_blackwell("fwd_bf16_silu_no_init") { return; }
     let gpu = match Gpu::new() { Some(g) => g, None => return };
     let (b, d, l, k) = (1usize, 128usize, 64usize, 4usize);
 
@@ -297,7 +269,6 @@ fn fwd_bf16_silu_no_init() {
 /// output through this code path.
 #[test]
 fn fwd_bf16_initial_states_silently_ignored_in_channel_first() {
-    if skip_if_blackwell("fwd_bf16_initial_states_silently_ignored_in_channel_first") { return; }
     let gpu = match Gpu::new() { Some(g) => g, None => return };
     let (b, d, l, k) = (1usize, 64usize, 32usize, 4usize);
 
@@ -345,7 +316,6 @@ fn fwd_bf16_initial_states_silently_ignored_in_channel_first() {
 /// the in-place conv_state mutation.
 #[test]
 fn update_bf16_width4() {
-    if skip_if_blackwell("update_bf16_width4") { return; }
     let gpu = match Gpu::new() { Some(g) => g, None => return };
     let (b, d, k) = (2usize, 128usize, 4usize);
 
