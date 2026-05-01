@@ -1,8 +1,4 @@
 <p align="center">
-  <h1> Prelude: Agent-native inference framework </h1>
-</p>
-
-<p align="center">
   Fast LLM inference engine in Rust.
 </p>
 
