@@ -761,14 +761,13 @@ mod meta {
             let is_generate = task == TaskKind::Generate;
 
             let is_cuda = device.is_cuda();
-            // CUDA graph capture for MoE decode is opt-in via
-            // PRELUDE_MOE_CUDA_GRAPH=1. cudarc 0.19's `CudaStream::alloc`
-            // uses `cuMemAllocAsync` whenever the device supports memory
-            // pools (true on SM90+), which IS graph-capturable — so most
-            // intermediate tensor allocations are safe during capture.
+            // CUDA graph capture for MoE decode. cudarc 0.19's
+            // `CudaStream::alloc` uses `cuMemAllocAsync` whenever the
+            // device supports memory pools (true on SM90+), which IS
+            // graph-capturable — so most intermediate tensor allocations
+            // are safe during capture.
             //
-            // Known remaining blockers (these only fire on prefill, NOT
-            // decode, so decode graph capture should work):
+            // Known remaining blockers fire on PREFILL, not decode:
             //   - `moe_sort_experts_gpu` (thrust::sort_by_key) — only
             //     used when n > 1024 assignments; decode max_bs=32 caps
             //     n=128 so candle's bitonic sort is used instead.
@@ -776,12 +775,15 @@ mod meta {
             //     only used when `is_prefill=true`; decode uses the
             //     custom `_light` kernel path.
             //
-            // Keep the flag off by default; flip on to benchmark.
+            // Default ON — bench measured 16ms → 10ms TPOT (and 3.55
+            // → 5.33 RPS @ conc=32) on Qwen3-30B-A3B with no failures
+            // across 200 requests. PRELUDE_MOE_CUDA_GRAPH=0 keeps the
+            // historical opt-out for triage.
             let moe_graph = std::env::var("PRELUDE_MOE_CUDA_GRAPH")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .map(|v| v != 0)
-                .unwrap_or(false);
+                .unwrap_or(true);
             RuntimeCaps {
                 supports_kv_cache: is_safetensors && is_generate,
                 supports_prefix_cache: is_safetensors && is_cuda,
