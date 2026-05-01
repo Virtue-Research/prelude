@@ -15,7 +15,15 @@ use std::sync::{Mutex, OnceLock};
 
 // ── Constants ────────────────────────────────────────────────────────
 
-const FLOAT_WS_BYTES: usize = 128 * 1024 * 1024; // 128 MB GPU float workspace
+// FlashInfer's batch_prefill internal allocator is sequential within one
+// plan() call: tile schedulers reserve scratch buffers that scale with
+// `total_q × num_qo_heads × num_partitions × head_dim`. Empirically on
+// B300 the 35B-A3B GQA shape (H=16, head_dim=256) exhausts a 128 MB
+// float workspace at ~256 prompt tokens (`Buffer overflow when
+// allocating batch_prefill_tmp_s, 0 bytes available`). 512 MB matches
+// vLLM's flashinfer default and leaves headroom for longer prompts;
+// even on the smallest B300 SKU (275 GB) this is < 0.2% of memory.
+const FLOAT_WS_BYTES: usize = 512 * 1024 * 1024; // 512 MB GPU float workspace
 const INT_WS_BYTES: usize = 8 * 1024 * 1024; // 8 MB GPU int workspace
 const PINNED_WS_BYTES: usize = 8 * 1024 * 1024; // 8 MB CPU pinned workspace
 const KV_LAYOUT_NHD: i64 = 0;
