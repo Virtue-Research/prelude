@@ -21,26 +21,44 @@ pub fn cuda_ops() -> &'static dyn Ops {
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-/// Detect the major compute capability of the current CUDA device once,
-/// cached for the process lifetime. Used to gate kernels whose FlashInfer
-/// bindings abort on unsupported archs.
+/// Detect the major compute capability of the **current** CUDA device,
+/// cached per-device for the process lifetime. Used to gate kernels
+/// whose FlashInfer bindings abort on unsupported archs (e.g. CUTLASS
+/// fused MoE: SM90 only).
+///
+/// Per-device cache (not process-wide) because the calling thread's
+/// current device is what determines kernel availability. With a
+/// process-wide cache, an init call on a Hopper GPU could mask a later
+/// call from a Blackwell-current thread, letting the unsafe sm_90a
+/// CUTLASS kernel launch and `std::terminate`.
 fn detect_sm_major() -> i32 {
-    use std::sync::OnceLock;
-    static SM: OnceLock<i32> = OnceLock::new();
-    *SM.get_or_init(|| {
-        unsafe extern "C" {
-            fn cudaGetDevice(dev: *mut i32) -> i32;
-            fn cudaDeviceGetAttribute(v: *mut i32, attr: i32, dev: i32) -> i32;
-        }
-        const CUDA_DEV_ATTR_MAJOR: i32 = 75;
-        let mut dev = 0i32;
-        let mut major = 0i32;
-        unsafe {
-            if cudaGetDevice(&mut dev) != 0 { return 0; }
-            if cudaDeviceGetAttribute(&mut major, CUDA_DEV_ATTR_MAJOR, dev) != 0 { return 0; }
-        }
-        major
-    })
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    unsafe extern "C" {
+        fn cudaGetDevice(dev: *mut i32) -> i32;
+        fn cudaDeviceGetAttribute(v: *mut i32, attr: i32, dev: i32) -> i32;
+    }
+    const CUDA_DEV_ATTR_MAJOR: i32 = 75;
+
+    let mut dev = 0i32;
+    if unsafe { cudaGetDevice(&mut dev) } != 0 { return 0; }
+
+    static CACHE: Mutex<Option<HashMap<i32, i32>>> = Mutex::new(None);
+    let mut guard = match CACHE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let map = guard.get_or_insert_with(HashMap::new);
+    if let Some(&major) = map.get(&dev) {
+        return major;
+    }
+
+    let mut major = 0i32;
+    if unsafe { cudaDeviceGetAttribute(&mut major, CUDA_DEV_ATTR_MAJOR, dev) } != 0 {
+        return 0;
+    }
+    map.insert(dev, major);
+    major
 }
 
 fn cu_seqlens_to_lens(cu_seqlens: &Tensor) -> Result<Tensor> {
@@ -219,9 +237,9 @@ impl Ops for CudaOps {
         ))
     }
 
-    fn fused_moe_routing(&self, gate_logits: &Tensor, top_k: usize) -> Option<Result<(Tensor, Tensor, Tensor, Tensor)>> {
+    fn fused_moe_routing(&self, gate_logits: &Tensor, top_k: usize, norm_topk_prob: bool) -> Option<Result<(Tensor, Tensor, Tensor, Tensor)>> {
         if gate_logits.dtype() != DType::BF16 { return None; }
-        Some(crate::ops::moe::fused_moe_routing(gate_logits, top_k, true))
+        Some(crate::ops::moe::fused_moe_routing(gate_logits, top_k, norm_topk_prob))
     }
 
     fn fused_moe_gemm(&self, input: &Tensor, weights: &Tensor, topk_weights: &Tensor, sorted_token_ids: &Tensor, sorted_expert_ids: &Tensor, topk: usize, is_prefill: bool) -> Option<Result<Tensor>> {

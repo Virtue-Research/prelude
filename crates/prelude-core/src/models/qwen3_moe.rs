@@ -175,8 +175,11 @@ impl Qwen3SparseMoeBlock {
 
                 // Build the CUTLASS [up; gate] stack. `Tensor::cat` along
                 // dim 1 gives [num_experts, 2*inter, hidden] which is what
-                // `cutlass_fused_moe` expects.
-                let experts_gate_up = Tensor::cat(&[&up_w, &gate_w], 1)?.contiguous().ok();
+                // `cutlass_fused_moe` expects. `.contiguous()` can OOM on
+                // a doubled weight stack — propagate that with `?` instead
+                // of swallowing into `None`, which would silently downgrade
+                // to the WMMA fallback at every forward without any log.
+                let experts_gate_up = Some(Tensor::cat(&[&up_w, &gate_w], 1)?.contiguous()?);
                 let experts_down = Some(down_w.clone());
 
                 (
@@ -221,15 +224,15 @@ impl Qwen3SparseMoeBlock {
         // *global* sort-by-expert that the WMMA/GEMV grouped GEMM
         // downstream requires. Ignore those two outputs here; the caller
         // does a proper global sort via `sort_expert_assignments`.
-        if self.norm_topk_prob {
-            if let Some(result) = ops.fused_moe_routing(&router_logits, self.num_experts_per_tok) {
-                let (tw, topk_ids, _sorted_exp, _sorted_tok) = result?;
-                return Ok((
-                    tw,
-                    topk_ids.reshape((n_tokens, self.num_experts_per_tok))?,
-                    hidden_dim,
-                ));
-            }
+        if let Some(result) = ops.fused_moe_routing(
+            &router_logits, self.num_experts_per_tok, self.norm_topk_prob,
+        ) {
+            let (tw, topk_ids, _sorted_exp, _sorted_tok) = result?;
+            return Ok((
+                tw,
+                topk_ids.reshape((n_tokens, self.num_experts_per_tok))?,
+                hidden_dim,
+            ));
         }
 
         let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
@@ -310,7 +313,6 @@ impl Qwen3SparseMoeBlock {
         let (sorted_expert_ids, sorted_token_ids) =
             self.sort_expert_assignments(ops, experts_per_tok, xs.device())?;
 
-        let is_prefill = total_tokens > 1;
         // `num_tokens_per_expert` used to be computed here via a GPU→CPU→GPU
         // histogram pass, but the CUDA impl of `grouped_gemm` ignores it.
         // Pass a zero-length placeholder to preserve the trait signature.
@@ -406,14 +408,24 @@ impl Qwen3SparseMoeBlock {
 
         // Preferred path: FlashInfer's CUTLASS fused MoE handles
         // gate+up+silu+down+topk-weighted-sum in one kernel. The ops impl
-        // internally returns None on unsupported archs (e.g. SM100 right
-        // now, because upstream FlashInfer hasn't instantiated Blackwell
-        // MoE kernels yet), so we fall through to the WMMA grouped-GEMM
-        // path on Blackwell.
+        // returns `None` on archs where it's not compiled (e.g. SM100
+        // until upstream FlashInfer instantiates Blackwell MoE kernels);
+        // those land in the WMMA grouped-GEMM fallback below.
+        //
+        // For `Some(Err(_))` — runtime kernel/launch failure on a
+        // supported arch — we ALSO fall through to WMMA rather than
+        // hard-failing the whole forward. Otherwise a transient
+        // FlashInfer registration glitch turns into a model that never
+        // generates, when the grouped-GEMM path was working fine before
+        // the CUTLASS fast path was added.
         if xs.device().is_cuda() {
             if let (Some(egu), Some(ed)) = (self.experts_gate_up.as_ref(), self.experts_down.as_ref()) {
-                if let Some(r) = ops.cutlass_fused_moe(xs, &experts_per_tok, &topk_weights, egu, ed) {
-                    return r;
+                match ops.cutlass_fused_moe(xs, &experts_per_tok, &topk_weights, egu, ed) {
+                    Some(Ok(out)) => return Ok(out),
+                    Some(Err(e)) => {
+                        tracing::warn!(error = %e, "CUTLASS fused MoE failed at runtime, falling back to WMMA grouped-GEMM");
+                    }
+                    None => {}
                 }
             }
         }
@@ -770,14 +782,17 @@ mod meta {
                 .and_then(|v| v.parse::<u32>().ok())
                 .map(|v| v != 0)
                 .unwrap_or(false);
-            let _ = (is_cuda, is_generate);
             RuntimeCaps {
                 supports_kv_cache: is_safetensors && is_generate,
                 supports_prefix_cache: is_safetensors && is_cuda,
                 supports_paged_attn: is_cuda && is_safetensors,
                 supports_varlen: is_cuda && is_safetensors,
                 supports_deltanet: false,
-                supports_cuda_graph: moe_graph,
+                // Must AND with `is_cuda`: the env-var check above doesn't
+                // know what device we're on, and a CPU run with the flag
+                // set would otherwise tell DecodeGraphCache the model
+                // supports graphs on a non-CUDA device.
+                supports_cuda_graph: is_cuda && moe_graph,
             }
         }
     }

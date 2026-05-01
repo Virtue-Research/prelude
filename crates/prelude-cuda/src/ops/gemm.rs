@@ -11,7 +11,7 @@
 //!      small-M shapes DeepGEMM has no kernel variant for, and for any
 //!      arch where the CUTLASS SM80/SM90 cubins don't run.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::os::raw::c_int;
@@ -149,11 +149,15 @@ const CUBLAS_GEMM_DEFAULT: c_int = -1;
 
 unsafe extern "C" {
     fn cublasCreate_v2(handle: *mut *mut c_void) -> c_int;
+    fn cublasDestroy_v2(handle: *mut c_void) -> c_int;
     fn cublasSetStream_v2(handle: *mut c_void, stream: *mut c_void) -> c_int;
     fn cublasSetWorkspace_v2(
         handle: *mut c_void, workspace: *mut c_void, workspace_size: usize,
     ) -> c_int;
     fn cudaMalloc(ptr: *mut *mut c_void, size: usize) -> c_int;
+    fn cudaFree(ptr: *mut c_void) -> c_int;
+    fn cudaGetDevice(device: *mut c_int) -> c_int;
+    fn cudaSetDevice(device: c_int) -> c_int;
     fn cublasGemmEx(
         handle: *mut c_void,
         transa: c_int, transb: c_int,
@@ -179,53 +183,86 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-// cuBLAS handles are not thread-safe to share, but are cheap to create.
-// Keep one per worker thread — the GPU queue uses a single dedicated OS
-// thread anyway, so in practice this is a single handle.
-thread_local! {
-    static CUBLAS_HANDLE: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
-}
-
 /// Pre-allocated cuBLAS workspace size. 64 MB is the NVIDIA-recommended value
 /// for Hopper/Blackwell. Pre-allocating eliminates `cudaErrorStreamCaptureUnsupported`
 /// errors that cuBLAS would otherwise throw (via bad_alloc) when its internal
 /// workspace allocator tries `cudaMalloc` during an active CUDA graph capture.
 const CUBLAS_WORKSPACE_BYTES: usize = 64 * 1024 * 1024;
 
-unsafe fn get_or_init_handle() -> Result<*mut c_void, String> {
-    CUBLAS_HANDLE.with(|slot| {
-        let existing = slot.get();
-        if !existing.is_null() {
-            return Ok(existing);
+/// Owns one cuBLAS handle and its preallocated workspace, scoped to a
+/// single CUDA device. RAII drop releases both — without this, every
+/// thread that ever calls a cuBLAS GEMM leaks a handle + 64 MiB.
+struct CublasState {
+    handle: *mut c_void,
+    workspace: *mut c_void,
+    device: c_int,
+}
+
+impl Drop for CublasState {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.handle.is_null() {
+                cublasDestroy_v2(self.handle);
+            }
+            if !self.workspace.is_null() {
+                cudaFree(self.workspace);
+            }
         }
+    }
+}
+
+// cuBLAS handles are not thread-safe to share, but are cheap to create.
+// Keep one per worker thread — the GPU queue uses a single dedicated OS
+// thread anyway, so in practice this is a single handle. We key the
+// thread-local on the device id so that a thread that drives multiple
+// devices (rare, but possible in tests / multi-GPU configs) gets a
+// fresh handle bound to the right context instead of routing GEMMs to
+// the wrong GPU.
+thread_local! {
+    static CUBLAS_HANDLES: RefCell<Vec<CublasState>> = const { RefCell::new(Vec::new()) };
+}
+
+unsafe fn get_or_init_handle() -> Result<*mut c_void, String> {
+    let mut device: c_int = 0;
+    let dev_status = unsafe { cudaGetDevice(&mut device) };
+    if dev_status != 0 {
+        return Err(format!("cudaGetDevice failed (status {dev_status})"));
+    }
+
+    CUBLAS_HANDLES.with(|slot| {
+        if let Some(state) = slot.borrow().iter().find(|s| s.device == device) {
+            return Ok(state.handle);
+        }
+
         let mut handle: *mut c_void = std::ptr::null_mut();
         let status = unsafe { cublasCreate_v2(&mut handle) };
         if status != 0 || handle.is_null() {
-            return Err(format!("cublasCreate_v2 failed (status {status})"));
+            return Err(format!("cublasCreate_v2 failed (status {status}) on device {device}"));
         }
 
-        // Pre-allocate workspace so subsequent cublasGemmEx calls never
-        // request device memory during a CUDA graph capture.
         let mut workspace: *mut c_void = std::ptr::null_mut();
         let cuda_status = unsafe { cudaMalloc(&mut workspace, CUBLAS_WORKSPACE_BYTES) };
         if cuda_status != 0 || workspace.is_null() {
             tracing::warn!(
+                device,
                 "cuBLAS workspace preallocation failed (cudaMalloc status {cuda_status}); \
                  GPU matmul inside a captured CUDA graph may fail"
             );
+            workspace = std::ptr::null_mut();
         } else {
             let ws_status = unsafe {
                 cublasSetWorkspace_v2(handle, workspace, CUBLAS_WORKSPACE_BYTES)
             };
             if ws_status != 0 {
                 tracing::warn!(
+                    device,
                     "cublasSetWorkspace_v2 failed (status {ws_status}); \
                      CUDA graph capture may bad_alloc"
                 );
             }
         }
 
-        slot.set(handle);
+        slot.borrow_mut().push(CublasState { handle, workspace, device });
         Ok(handle)
     })
 }

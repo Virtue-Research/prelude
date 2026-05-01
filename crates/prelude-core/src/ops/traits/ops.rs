@@ -185,7 +185,14 @@ pub trait Ops: Send + Sync {
     fn fused_qknorm_rope(&self, _q: &Tensor, _k: &Tensor, _qw: &Tensor, _kw: &Tensor, _cos: &Tensor, _sin: &Tensor, _pos: &Tensor, _eps: f32) -> Option<Result<(Tensor, Tensor)>> { None }
     fn fused_knorm_rope_cache_write(&self, _k: &Tensor, _v: &Tensor, _kw: &Tensor, _cos: &Tensor, _sin: &Tensor, _pos: &Tensor, _kc: &Tensor, _vc: &Tensor, _sm: &Tensor, _eps: f32) -> Option<Result<()>> { None }
     fn fused_add(&self, _a: &Tensor, _b: &Tensor) -> Option<Result<Tensor>> { None }
-    fn fused_moe_routing(&self, _logits: &Tensor, _top_k: usize) -> Option<Result<(Tensor, Tensor, Tensor, Tensor)>> { None }
+    /// Fused softmax + top-k expert routing.
+    ///
+    /// `norm_topk_prob`: when true, the kernel divides each row of
+    /// top-k probabilities by their sum so they sum to 1. Match what
+    /// the model config says — passing `true` for a model trained with
+    /// `norm_topk_prob=false` silently re-normalizes weights and
+    /// changes the math.
+    fn fused_moe_routing(&self, _logits: &Tensor, _top_k: usize, _norm_topk_prob: bool) -> Option<Result<(Tensor, Tensor, Tensor, Tensor)>> { None }
     fn fused_moe_gemm(&self, _input: &Tensor, _weights: &Tensor, _tw: &Tensor, _st: &Tensor, _se: &Tensor, _topk: usize, _prefill: bool) -> Option<Result<Tensor>> { None }
 
     /// GPU-accelerated sort of expert assignments by expert ID.
@@ -590,7 +597,7 @@ mod tests {
         assert!(ops.fused_silu_mul(&t, &t).is_none());
         assert!(ops.fused_gelu_mul(&t, &t).is_none());
         assert!(ops.fused_add(&t, &t).is_none());
-        assert!(ops.fused_moe_routing(&t, 2).is_none());
+        assert!(ops.fused_moe_routing(&t, 2, true).is_none());
 
         // New fused ops from design
         assert!(ops.fused_adaln_zero(&t, &t, None, &t, &t, &t, 1e-5).is_none());

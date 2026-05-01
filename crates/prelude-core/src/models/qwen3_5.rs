@@ -1450,14 +1450,17 @@ impl Qwen3_5SparseMoeBlock {
         router_logits: &Tensor,
         n_tokens: usize,
     ) -> Result<(Tensor, Tensor)> {
-        // Try fused routing (single CUDA kernel, F32 softmax internally)
-        if self.norm_topk_prob {
-            if let Some(result) = ops.fused_moe_routing(router_logits, self.num_experts_per_tok) {
-                let (tw, topk_ids, _, _) = result?;
-                return Ok((tw, topk_ids.reshape((n_tokens, self.num_experts_per_tok))?));
-            }
+        // Try fused routing (single CUDA kernel, F32 softmax internally).
+        // norm_topk_prob is now part of the kernel call instead of an
+        // outer gate; passing the wrong value would silently change the
+        // routing math.
+        if let Some(result) = ops.fused_moe_routing(
+            router_logits, self.num_experts_per_tok, self.norm_topk_prob,
+        ) {
+            let (tw, topk_ids, _, _) = result?;
+            return Ok((tw, topk_ids.reshape((n_tokens, self.num_experts_per_tok))?));
         }
-        // Decomposed fallback (CPU, non-BF16, or norm_topk_prob=false)
+        // Decomposed fallback (CPU or non-BF16)
         let routing_weights = ops.softmax(&router_logits.to_dtype(DType::F32)?, router_logits.rank() - 1)?;
         let experts_per_tok = routing_weights
             .arg_sort_last_dim(false)?

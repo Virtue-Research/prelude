@@ -456,7 +456,16 @@ fn process_step_output(
         // Update scheduler sequence block table and state from prefill result.
         // kv_computed_len and status were already updated by the scheduler
         // during schedule_step (eagerly, before forward).
-        if let Some(result) = output.prefill_results.get(prefill_result_idx) {
+        //
+        // Hold onto `result` past the increment so the prefix-cache write
+        // below can read the SAME entry. Earlier this code recovered it
+        // via `prefill_results.get(prefill_result_idx.saturating_sub(1))`,
+        // which silently read the previous request's block_table whenever
+        // this request's `prefill_results.get(...)` was None — so the
+        // prefix cache could be populated against tokens that belonged to
+        // a different sequence.
+        let prefill_result = output.prefill_results.get(prefill_result_idx);
+        if let Some(result) = prefill_result {
             if let Some(seq_mut) = scheduler.get_sequence_mut(request_id) {
                 seq_mut.block_table = result.block_table.clone();
             }
@@ -480,19 +489,18 @@ fn process_step_output(
         // The prefix cache takes its own ref count on the blocks, so they
         // survive the post-decode free.
         if is_final && engine.cache.prefix_cache.is_some() {
-            if let Some(seq) = scheduler.get_sequence(request_id) {
-                if let (Some(pool), Some(result)) = (
-                    engine.cache.paged_pool.as_ref(),
-                    output.prefill_results.get(prefill_result_idx.saturating_sub(1)),
-                ) {
-                    if !result.block_table.is_empty() && !seq.input_ids.is_empty() {
-                        if let Err(e) = engine.cache.try_prefix_cache_insert_paged_only(
-                            &seq.input_ids,
-                            &result.block_table,
-                            pool.block_size,
-                        ) {
-                            tracing::warn!("prefix cache insert (ar_loop) failed: {e}");
-                        }
+            if let (Some(seq), Some(pool), Some(result)) = (
+                scheduler.get_sequence(request_id),
+                engine.cache.paged_pool.as_ref(),
+                prefill_result,
+            ) {
+                if !result.block_table.is_empty() && !seq.input_ids.is_empty() {
+                    if let Err(e) = engine.cache.try_prefix_cache_insert_paged_only(
+                        &seq.input_ids,
+                        &result.block_table,
+                        pool.block_size,
+                    ) {
+                        tracing::warn!("prefix cache insert (ar_loop) failed: {e}");
                     }
                 }
             }
