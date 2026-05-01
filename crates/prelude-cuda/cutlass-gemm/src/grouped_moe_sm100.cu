@@ -221,21 +221,76 @@ __global__ void prepare_grouped_args_kernel(
     stride_D[g] = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M_g, N, 1));
 }
 
-// ── Workspace allocator ─────────────────────────────────────────────
+// ── Workspace layout ────────────────────────────────────────────────
 //
-// Per-call we need:
+// Per call we need:
 //   - gathered:      M_total * K * sizeof(Element)
-//   - gemm_out:      M_total * N * sizeof(Element)   (intermediate)
-//   - problem_sizes: num_experts * sizeof(...)        (small)
+//   - gemm_out:      M_total * N * sizeof(Element)
+//   - problem_sizes: num_experts * sizeof(PS)
 //   - ptr_*:         num_experts * sizeof(void*) × 4
 //   - stride_*:      num_experts * sizeof(stride) × 4
 //   - cutlass workspace returned by Gemm::get_workspace_size()
 //
-// We carve all of these from a single `cudaMallocAsync`'d buffer and
-// free at the end of the call. The Rust wrapper passes a pre-allocated
-// scratch (TODO) — for now we malloc ad-hoc which adds some overhead
-// but keeps the C interface stateless.
+// All of those land in a single cudaMallocAsync'd workspace allocated
+// at the C entry point. The previous implementation did 11 separate
+// cudaMallocAsync calls per layer; on Qwen3-30B-A3B that's 11 × 48 =
+// 528 allocs per forward. Even with the stream-ordered memory pool it
+// adds host dispatch latency that compounds across the 200ms+ prefill.
 
+constexpr size_t WS_ALIGN = 256;
+inline size_t ws_round_up(size_t bytes) {
+    return (bytes + WS_ALIGN - 1) & ~(WS_ALIGN - 1);
+}
+
+template <class Runner>
+struct WorkspacePlan {
+    using PS = typename Runner::ProblemShape::UnderlyingProblemShape;
+    using ElementA = typename Runner::ElementA;
+    using ElementB = typename Runner::ElementB;
+    using ElementC = typename Runner::ElementC;
+    using ElementD = typename Runner::ElementD;
+    using StrideA = typename Runner::StrideA;
+    using StrideB = typename Runner::StrideB;
+    using StrideC = typename Runner::StrideC;
+    using StrideD = typename Runner::StrideD;
+
+    size_t off_problem_sizes;
+    size_t off_ptr_A, off_ptr_B, off_ptr_C, off_ptr_D;
+    size_t off_stride_A, off_stride_B, off_stride_C, off_stride_D;
+    size_t off_cutlass_ws;
+    size_t metadata_bytes;     // problem_sizes + ptrs + strides (sub-total)
+    size_t cutlass_ws_bytes;
+    size_t total_bytes;
+};
+
+template <class Runner>
+WorkspacePlan<Runner> plan_workspace(int num_experts, size_t cutlass_ws_bytes) {
+    using P = WorkspacePlan<Runner>;
+    P plan{};
+    size_t off = 0;
+    auto carve = [&](size_t bytes) {
+        size_t r = off;
+        off += ws_round_up(bytes);
+        return r;
+    };
+    plan.off_problem_sizes = carve(num_experts * sizeof(typename P::PS));
+    plan.off_ptr_A = carve(num_experts * sizeof(void*));
+    plan.off_ptr_B = carve(num_experts * sizeof(void*));
+    plan.off_ptr_C = carve(num_experts * sizeof(void*));
+    plan.off_ptr_D = carve(num_experts * sizeof(void*));
+    plan.off_stride_A = carve(num_experts * sizeof(typename P::StrideA));
+    plan.off_stride_B = carve(num_experts * sizeof(typename P::StrideB));
+    plan.off_stride_C = carve(num_experts * sizeof(typename P::StrideC));
+    plan.off_stride_D = carve(num_experts * sizeof(typename P::StrideD));
+    plan.metadata_bytes = off;
+    plan.off_cutlass_ws = carve(cutlass_ws_bytes);
+    plan.cutlass_ws_bytes = cutlass_ws_bytes;
+    plan.total_bytes = off;
+    return plan;
+}
+
+// Run the grouped GEMM into a caller-provided workspace. No
+// cudaMallocAsync inside — caller batches all buffers in one call.
 template <class Runner>
 int launch_grouped_moe(
     const typename Runner::ElementA* gathered,
@@ -243,48 +298,34 @@ int launch_grouped_moe(
     const int32_t* expert_offsets,
     typename Runner::ElementD* gemm_out,
     int M_total, int N, int K, int num_experts,
+    void* metadata_ws,                  // size = plan.metadata_bytes
+    void* cutlass_ws,                   // size = plan.cutlass_ws_bytes (or nullptr)
+    const WorkspacePlan<Runner>& plan,
     cudaStream_t stream)
 {
     using Gemm = typename Runner::Gemm;
-    using Kernel = typename Runner::GemmKernel;
     using PS = typename Runner::ProblemShape::UnderlyingProblemShape;
     using StrideA = typename Runner::StrideA;
     using StrideB = typename Runner::StrideB;
     using StrideC = typename Runner::StrideC;
     using StrideD = typename Runner::StrideD;
-
     using ElementA = typename Runner::ElementA;
     using ElementB = typename Runner::ElementB;
     using ElementC = typename Runner::ElementC;
     using ElementD = typename Runner::ElementD;
 
-    // ── 1. Allocate per-group metadata buffers ─────────────────────
-    PS* d_problem_sizes = nullptr;
-    const ElementA** d_ptr_A = nullptr;
-    const ElementB** d_ptr_B = nullptr;
-    const ElementC** d_ptr_C = nullptr;
-    ElementD** d_ptr_D = nullptr;
-    StrideA* d_stride_A = nullptr;
-    StrideB* d_stride_B = nullptr;
-    StrideC* d_stride_C = nullptr;
-    StrideD* d_stride_D = nullptr;
+    uint8_t* base = static_cast<uint8_t*>(metadata_ws);
+    PS* d_problem_sizes = reinterpret_cast<PS*>(base + plan.off_problem_sizes);
+    const ElementA** d_ptr_A = reinterpret_cast<const ElementA**>(base + plan.off_ptr_A);
+    const ElementB** d_ptr_B = reinterpret_cast<const ElementB**>(base + plan.off_ptr_B);
+    const ElementC** d_ptr_C = reinterpret_cast<const ElementC**>(base + plan.off_ptr_C);
+    ElementD** d_ptr_D = reinterpret_cast<ElementD**>(base + plan.off_ptr_D);
+    StrideA* d_stride_A = reinterpret_cast<StrideA*>(base + plan.off_stride_A);
+    StrideB* d_stride_B = reinterpret_cast<StrideB*>(base + plan.off_stride_B);
+    StrideC* d_stride_C = reinterpret_cast<StrideC*>(base + plan.off_stride_C);
+    StrideD* d_stride_D = reinterpret_cast<StrideD*>(base + plan.off_stride_D);
 
-    cudaMallocAsync(&d_problem_sizes, num_experts * sizeof(PS), stream);
-    cudaMallocAsync(&d_ptr_A, num_experts * sizeof(void*), stream);
-    cudaMallocAsync(&d_ptr_B, num_experts * sizeof(void*), stream);
-    cudaMallocAsync(&d_ptr_C, num_experts * sizeof(void*), stream);
-    cudaMallocAsync(&d_ptr_D, num_experts * sizeof(void*), stream);
-    cudaMallocAsync(&d_stride_A, num_experts * sizeof(StrideA), stream);
-    cudaMallocAsync(&d_stride_B, num_experts * sizeof(StrideB), stream);
-    cudaMallocAsync(&d_stride_C, num_experts * sizeof(StrideC), stream);
-    cudaMallocAsync(&d_stride_D, num_experts * sizeof(StrideD), stream);
-
-    if (!d_problem_sizes || !d_ptr_A || !d_ptr_B || !d_ptr_D ||
-        !d_stride_A || !d_stride_B || !d_stride_D) {
-        return -10;  // alloc failed
-    }
-
-    // ── 2. Populate metadata on device ─────────────────────────────
+    // Populate metadata on device.
     prepare_grouped_args_kernel<ElementA, StrideA, StrideB, StrideC, StrideD>
         <<<num_experts, 1, 0, stream>>>(
             expert_offsets, gathered, weights, gemm_out, N, K,
@@ -293,7 +334,6 @@ int launch_grouped_moe(
             d_stride_A, d_stride_B, d_stride_C, d_stride_D,
             num_experts);
 
-    // ── 3. Build & launch CUTLASS grouped GEMM ─────────────────────
     cutlass::KernelHardwareInfo hw_info;
     cudaGetDevice(&hw_info.device_id);
     hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
@@ -311,7 +351,7 @@ int launch_grouped_moe(
 
     args = typename Gemm::Arguments {
         cutlass::gemm::GemmUniversalMode::kGrouped,
-        {num_experts, d_problem_sizes, nullptr},  // host_problem_shapes = nullptr
+        {num_experts, d_problem_sizes, nullptr},
         { (const ElementA**)d_ptr_A, d_stride_A,
           (const ElementB**)d_ptr_B, d_stride_B },
         { fusion_args,
@@ -323,43 +363,50 @@ int launch_grouped_moe(
     Gemm gemm;
     auto status = gemm.can_implement(args);
     if (status != cutlass::Status::kSuccess) {
-        cudaFreeAsync(d_problem_sizes, stream);
-        cudaFreeAsync(d_ptr_A, stream); cudaFreeAsync(d_ptr_B, stream);
-        cudaFreeAsync(d_ptr_C, stream); cudaFreeAsync(d_ptr_D, stream);
-        cudaFreeAsync(d_stride_A, stream); cudaFreeAsync(d_stride_B, stream);
-        cudaFreeAsync(d_stride_C, stream); cudaFreeAsync(d_stride_D, stream);
-        return -11;  // unsupported config
+        return -11;
     }
 
-    size_t ws_bytes = Gemm::get_workspace_size(args);
-    void* ws = nullptr;
-    if (ws_bytes > 0) {
-        cudaMallocAsync(&ws, ws_bytes, stream);
+    // Confirm the actual workspace size for THIS call fits the planned
+    // upper bound. If not, the caller's plan was undersized — bail.
+    size_t actual_ws = Gemm::get_workspace_size(args);
+    if (actual_ws > plan.cutlass_ws_bytes) {
+        return -14;
     }
 
-    status = gemm.initialize(args, ws, stream);
+    status = gemm.initialize(args, actual_ws > 0 ? cutlass_ws : nullptr, stream);
     if (status != cutlass::Status::kSuccess) {
-        if (ws) cudaFreeAsync(ws, stream);
-        cudaFreeAsync(d_problem_sizes, stream);
-        cudaFreeAsync(d_ptr_A, stream); cudaFreeAsync(d_ptr_B, stream);
-        cudaFreeAsync(d_ptr_C, stream); cudaFreeAsync(d_ptr_D, stream);
-        cudaFreeAsync(d_stride_A, stream); cudaFreeAsync(d_stride_B, stream);
-        cudaFreeAsync(d_stride_C, stream); cudaFreeAsync(d_stride_D, stream);
         return -12;
     }
 
     status = gemm.run(stream);
-
-    // Async free; CUDA holds the buffers alive until the stream
-    // operations complete.
-    if (ws) cudaFreeAsync(ws, stream);
-    cudaFreeAsync(d_problem_sizes, stream);
-    cudaFreeAsync(d_ptr_A, stream); cudaFreeAsync(d_ptr_B, stream);
-    cudaFreeAsync(d_ptr_C, stream); cudaFreeAsync(d_ptr_D, stream);
-    cudaFreeAsync(d_stride_A, stream); cudaFreeAsync(d_stride_B, stream);
-    cudaFreeAsync(d_stride_C, stream); cudaFreeAsync(d_stride_D, stream);
-
     return (status == cutlass::Status::kSuccess) ? 0 : -13;
+}
+
+// Conservative upper bound for CUTLASS grouped GEMM workspace at given
+// (num_experts, M_total, N, K). Built by querying with dummy args; the
+// result depends only on the problem shape, not the actual pointers.
+template <class Runner>
+size_t query_cutlass_workspace_upper(int num_experts) {
+    using Gemm = typename Runner::Gemm;
+    cutlass::KernelHardwareInfo hw_info;
+    cudaGetDevice(&hw_info.device_id);
+    hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+
+    typename Gemm::Arguments dummy_args;
+    decltype(dummy_args.epilogue.thread) fusion_args{};
+    fusion_args.alpha = 1.0f;
+    fusion_args.beta = 0.0f;
+    fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
+    fusion_args.dBeta  = {cute::_0{}, cute::_0{}, 0};
+
+    dummy_args = typename Gemm::Arguments {
+        cutlass::gemm::GemmUniversalMode::kGrouped,
+        {num_experts, nullptr, nullptr},
+        { nullptr, nullptr, nullptr, nullptr },
+        { fusion_args, nullptr, nullptr, nullptr, nullptr },
+        hw_info
+    };
+    return Gemm::get_workspace_size(dummy_args);
 }
 
 }  // namespace prelude_grouped_moe_sm100
@@ -384,18 +431,38 @@ extern "C" int moe_grouped_gemm_sm100(
     if (data_type != 1) return -20;  // BF16 only for now
     if (M_total <= 0 || N <= 0 || K <= 0 || num_experts <= 0) return -21;
 
-    // Allocate intermediate buffers (gathered A, intermediate D).
-    void* gathered = nullptr;
-    void* gemm_out = nullptr;
-    cudaMallocAsync(&gathered, (size_t)M_total * K * sizeof(__nv_bfloat16), stream);
-    cudaMallocAsync(&gemm_out, (size_t)M_total * N * sizeof(__nv_bfloat16), stream);
-    if (!gathered || !gemm_out) {
-        if (gathered) cudaFreeAsync(gathered, stream);
-        if (gemm_out) cudaFreeAsync(gemm_out, stream);
+    using R2 = GroupedMoeRunner<BF16, /*Use2SmMma=*/true>;
+    using R1 = GroupedMoeRunner<BF16, /*Use2SmMma=*/false>;
+
+    // ── Plan a single workspace covering everything for this call ──
+    //
+    //   [gathered][gemm_out][metadata][cutlass_ws]
+    //
+    // metadata + cutlass_ws sizes are identical between R1 and R2 (same
+    // ProblemShape, same Stride types). Take max(cutlass_ws) so the
+    // 2Sm-fail → 1Sm retry can reuse the same scratch.
+    size_t cw_2sm = query_cutlass_workspace_upper<R2>(num_experts);
+    size_t cw_1sm = query_cutlass_workspace_upper<R1>(num_experts);
+    size_t cutlass_ws_bound = cw_2sm > cw_1sm ? cw_2sm : cw_1sm;
+    auto plan = plan_workspace<R2>(num_experts, cutlass_ws_bound);
+
+    size_t gathered_bytes = ws_round_up((size_t)M_total * K * sizeof(__nv_bfloat16));
+    size_t gemm_out_bytes = ws_round_up((size_t)M_total * N * sizeof(__nv_bfloat16));
+    size_t total_bytes = gathered_bytes + gemm_out_bytes + plan.total_bytes;
+
+    void* ws_root = nullptr;
+    cudaError_t alloc_err = cudaMallocAsync(&ws_root, total_bytes, stream);
+    if (alloc_err != cudaSuccess || ws_root == nullptr) {
         return -22;
     }
 
-    // Step 1: gather A from input by sorted_token_ids/topk.
+    uint8_t* p = static_cast<uint8_t*>(ws_root);
+    void* gathered = p;                      p += gathered_bytes;
+    void* gemm_out = p;                      p += gemm_out_bytes;
+    void* metadata_ws = p;                   p += plan.metadata_bytes;
+    void* cutlass_ws = (cutlass_ws_bound > 0) ? p : nullptr;
+
+    // Step 1: gather A.
     {
         int block = 256;
         prelude_grouped_moe_sm100::gather_a_kernel<__nv_bfloat16><<<M_total, block, 0, stream>>>(
@@ -405,36 +472,36 @@ extern "C" int moe_grouped_gemm_sm100(
             M_total, K, topk);
     }
 
-    // Step 2: pick 1Sm vs 2Sm based on average M-per-expert.
-    // 2Sm needs M-tile alignment (M_e divisible by 256 typically); for
-    // small M_total we just take the 1Sm path which is more flexible.
-    int avg_M = M_total / num_experts;  // crude; many groups may be 0
+    // Step 2: dispatch 2Sm or 1Sm based on average M.
+    int avg_M = M_total / num_experts;
     int ret = -1;
     if (avg_M >= 32) {
-        using R = GroupedMoeRunner<BF16, /*Use2SmMma=*/true>;
-        ret = launch_grouped_moe<R>(
+        ret = launch_grouped_moe<R2>(
             (const BF16*)gathered, (const BF16*)weights,
             expert_offsets, (BF16*)gemm_out,
-            M_total, N, K, num_experts, stream);
+            M_total, N, K, num_experts,
+            metadata_ws, cutlass_ws, plan, stream);
         if (ret != 0) {
-            // 2Sm failed (e.g., problem-shape misalignment). Retry 1Sm.
-            using R1 = GroupedMoeRunner<BF16, /*Use2SmMma=*/false>;
+            // 2Sm misaligned for this shape — fall back to 1Sm. Plan
+            // is shared (identical metadata + cutlass_ws upper bound).
+            auto plan1 = plan_workspace<R1>(num_experts, cutlass_ws_bound);
             ret = launch_grouped_moe<R1>(
                 (const BF16*)gathered, (const BF16*)weights,
                 expert_offsets, (BF16*)gemm_out,
-                M_total, N, K, num_experts, stream);
+                M_total, N, K, num_experts,
+                metadata_ws, cutlass_ws, plan1, stream);
         }
     } else {
-        using R = GroupedMoeRunner<BF16, /*Use2SmMma=*/false>;
-        ret = launch_grouped_moe<R>(
+        auto plan1 = plan_workspace<R1>(num_experts, cutlass_ws_bound);
+        ret = launch_grouped_moe<R1>(
             (const BF16*)gathered, (const BF16*)weights,
             expert_offsets, (BF16*)gemm_out,
-            M_total, N, K, num_experts, stream);
+            M_total, N, K, num_experts,
+            metadata_ws, cutlass_ws, plan1, stream);
     }
 
     if (ret != 0) {
-        cudaFreeAsync(gathered, stream);
-        cudaFreeAsync(gemm_out, stream);
+        cudaFreeAsync(ws_root, stream);
         return ret;
     }
 
@@ -448,8 +515,7 @@ extern "C" int moe_grouped_gemm_sm100(
             M_total, N);
     }
 
-    cudaFreeAsync(gathered, stream);
-    cudaFreeAsync(gemm_out, stream);
+    cudaFreeAsync(ws_root, stream);
     return 0;
 }
 
