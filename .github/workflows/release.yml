@@ -1,0 +1,182 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Target GPU arches baked into the fat binary — no GPU needed at build time.
+  CUDA_ARCH_LIST: "80,90,100"
+  # sccache wraps both rustc and nvcc — a single cache layer for the
+  # two slowest parts of the build. GitHub Actions cache backend gives
+  # us ~10 GB of free persistent storage per repo.
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+  # Tell our build.rs scripts to use sccache-wrapped nvcc. Every
+  # compile_cu_to_ptx / compile_cu_to_obj call in
+  # prelude_kernelbuild::nvcc goes through the nvcc binary on PATH;
+  # sccache intercepts it transparently.
+  NVCC_WRAPPER_SHOW_COMPILER: "1"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    container:
+      image: nvidia/cuda:12.8.0-devel-ubuntu22.04
+    steps:
+      - name: Install system deps
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq git curl build-essential pkg-config python3 python3-pip python3-venv pipx
+          pip3 install jinja2
+          # uv for fast venv provisioning (cuLA/FA4 DSL kernels)
+          pipx install uv
+
+      - name: Install Rust + sccache
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          # sccache — caches both rustc and nvcc compilations.
+          # The mozilla/sccache-action below wires up GHA cache backend;
+          # cargo install gives us the binary itself.
+          cargo install sccache --locked
+
+      - name: Configure sccache (GitHub Actions cache backend)
+        uses: mozilla/sccache-action@v0.0.7
+
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-
+
+      - name: Cache Python venvs (cuLA + FA4 DSL kernels)
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/fa4-venv
+            target/debug/build/cula-*/out/cula-venv
+          key: python-venvs-${{ hashFiles('crates/prelude-cuda/cula/scripts/compile_kernels.py', 'crates/prelude-cuda/fa4/scripts/compile_kernels.py') }}
+          restore-keys: python-venvs-
+
+      - name: Wrap nvcc with sccache
+        run: |
+          # sccache can wrap nvcc the same way it wraps gcc/clang.
+          # Move real nvcc aside, drop a shim that calls sccache.
+          NVCC_REAL=$(which nvcc)
+          NVCC_DIR=$(dirname "$NVCC_REAL")
+          mv "$NVCC_REAL" "$NVCC_DIR/nvcc.real"
+          cat > "$NVCC_REAL" << 'SHIM'
+          #!/bin/bash
+          exec sccache "$(dirname "$0")/nvcc.real" "$@"
+          SHIM
+          chmod +x "$NVCC_REAL"
+          echo "nvcc wrapped: $(which nvcc) → sccache → nvcc.real"
+
+      - name: Build (dist profile)
+        run: |
+          source "$HOME/.cargo/env"
+          cargo build --profile dist -p prelude-server --features full
+          echo "=== sccache stats ==="
+          sccache --show-stats
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          cp target/dist/prelude-server release/prelude-server
+          cd release
+          sha256sum prelude-server > SHA256SUMS
+          gzip -k prelude-server
+          echo "Binary: $(du -h prelude-server | cut -f1)"
+          echo "Compressed: $(du -h prelude-server.gz | cut -f1)"
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-binary
+          path: release/
+
+  build-windows:
+    runs-on: windows-2022
+    steps:
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.30
+        with:
+          cuda: '13.2.0'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install sccache
+        uses: mozilla/sccache-action@v0.0.7
+
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Python + jinja2
+        run: |
+          pip install jinja2
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: windows-cargo-
+
+      - name: Build (dist profile)
+        run: |
+          cargo build --profile dist -p prelude-server --features full
+          echo "=== sccache stats ==="
+          sccache --show-stats
+
+      - name: Prepare release assets
+        run: |
+          New-Item -ItemType Directory -Force -Path release
+          Copy-Item target/dist/prelude-server.exe release/
+          cd release
+          Get-FileHash prelude-server.exe -Algorithm SHA256 | Format-Table -AutoSize > SHA256SUMS-windows.txt
+          Compress-Archive prelude-server.exe prelude-server-windows.zip
+          Write-Host "Binary: $((Get-Item prelude-server.exe).Length / 1MB) MB"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-binary
+          path: release/
+
+  publish:
+    needs: [build, build-windows]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/linux-binary/prelude-server.gz
+            artifacts/linux-binary/SHA256SUMS
+            artifacts/windows-binary/prelude-server-windows.zip
+            artifacts/windows-binary/SHA256SUMS-windows.txt
+          generate_release_notes: true

@@ -25,12 +25,20 @@ set(DNNL_EXPERIMENTAL_UKERNEL ON CACHE BOOL "" FORCE)
 set(DNNL_CPU_RUNTIME THREADPOOL CACHE STRING "" FORCE)
 message(STATUS "oneDNN FFI: using THREADPOOL runtime (rayon-backed)")
 
-# Use local submodule (third_party/oneDNN) instead of FetchContent download.
-set(ONEDNN_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/oneDNN")
+# oneDNN source tree. The Rust build.rs passes ONEDNN_SOURCE_DIR as a
+# `-D` cache entry; fall back to the prelude workspace submodule when CMake
+# is invoked directly (e.g. from csrc/build.sh for debugging).
+if(NOT DEFINED ONEDNN_SOURCE_DIR OR ONEDNN_SOURCE_DIR STREQUAL "")
+    set(ONEDNN_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/oneDNN"
+        CACHE PATH "Path to the oneDNN source checkout")
+endif()
 if(NOT EXISTS "${ONEDNN_SOURCE_DIR}/CMakeLists.txt")
     message(FATAL_ERROR
-        "third_party/oneDNN not found. Run: git submodule update --init third_party/oneDNN")
+        "oneDNN source not found at ${ONEDNN_SOURCE_DIR}. Pass \
+         -DONEDNN_SOURCE_DIR=/path/to/oneDNN or run \
+         `git submodule update --init third_party/oneDNN` inside the prelude workspace.")
 endif()
+message(STATUS "oneDNN FFI: using source at ${ONEDNN_SOURCE_DIR}")
 add_subdirectory(${ONEDNN_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/onednn)
 
 # ── Our FFI wrapper (static) ─────────────────────────────────────────

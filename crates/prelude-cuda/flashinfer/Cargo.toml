@@ -1,23 +1,22 @@
 [package]
-name = "prelude-flashinfer"
+name = "flashinfer"
 version = "0.1.0"
 edition = "2024"
 build = "build.rs"
-description = "FlashInfer AOT kernels for Prelude inference engine."
+description = "Rust bindings to flashinfer-ai's FlashInfer AOT attention/sampling CUDA kernels. Statically linked, no libtorch dependency."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/flashinfer-ai/flashinfer"
 
 [lib]
-name = "prelude_flashinfer"
+name = "flashinfer"
 path = "src/lib.rs"
 
 [dependencies]
 tracing = "0.1"
-prelude-tvm-ffi = { path = "../tvm-ffi" }
+tvm-static-ffi = { workspace = true }
 
 [build-dependencies]
+prelude-kernelbuild = { workspace = true }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-cc = "1"
-sha2 = "0.10"
-hex = "0.4"

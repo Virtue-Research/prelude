@@ -1,180 +1,108 @@
 //! Build script: compile CUTLASS 3.x BF16+F32 GEMM wrapper with nvcc.
 //!
-//! Requires:
-//! - CUDA Toolkit with nvcc (SM80+ support)
-//! - CUTLASS headers (third_party/cutlass submodule)
+//! Two translation units land in the final `libcutlass_gemm.a`:
+//!
+//!   1. `cutlass_wrapper.cu` — CUTLASS 3.x template kernels. Fat-binary
+//!      across SM80 (Ampere CollectiveMma) + SM90a (Hopper TMA
+//!      CollectiveBuilder) + optionally SM100a (Blackwell) when nvcc
+//!      supports it.
+//!   2. `naive_gemm.cu` — simple reference kernels in a separate TU to
+//!      keep CUTLASS template machinery from corrupting them.
+//!
+//! Requires the `third_party/cutlass` submodule and a CUDA toolkit with
+//! nvcc. All the toolkit discovery / arch probing / submodule tracking /
+//! CUDA runtime linking is centralized in `prelude_kernelbuild::nvcc`.
 
-use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
-include!("../../../build_log.rs");
+use prelude_kernelbuild::build_log;
+use prelude_kernelbuild::nvcc::{
+    compile_cu_to_obj, find_cuda, link_cuda_runtime_static, locate_source, nvcc_path,
+    nvcc_supports_sm100, nvcc_supports_sm103, track_submodule, ObjCompile,
+};
 
 fn main() {
     println!("cargo:rerun-if-changed=src/cutlass_wrapper.cu");
     println!("cargo:rerun-if-changed=src/naive_gemm.cu");
+    println!("cargo:rerun-if-changed=build.rs");
     track_submodule("cutlass");
 
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let workspace_root = manifest_dir.join("../../..");
 
-    // 1. Ensure CUTLASS headers (third_party/cutlass submodule)
-    let workspace_root = PathBuf::from(&manifest_dir).join("../../..");
-    let cutlass_dir = workspace_root.join("third_party/cutlass");
-    if !cutlass_dir.join("include/cutlass/cutlass.h").exists() {
-        panic!(
-            "third_party/cutlass submodule not found or incomplete.\n\
-             Run: git submodule update --init third_party/cutlass"
-        );
-    }
-    let cutlass_include = cutlass_dir.join("include");
+    // CUTLASS headers (third_party/cutlass submodule, with env override)
+    let cutlass_dir = locate_source(
+        "CUTLASS_ROOT",
+        "cutlass",
+        "include/cutlass/cutlass.h",
+        &workspace_root.join("third_party/cutlass"),
+    );
 
-    // 2. Find CUDA toolkit
     let cuda_path = find_cuda();
-    let nvcc = cuda_path.join("bin/nvcc");
-    if !nvcc.exists() {
-        panic!("nvcc not found at {}", nvcc.display());
-    }
-
-    // 3. Compile cutlass_wrapper.cu (CUTLASS template kernels)
-    // SM90 native for 3.x CollectiveBuilder (TMA + warp-specialized)
-    // SM80 for 3.x manual CollectiveMma (cp.async + TensorOp)
-    let cu_src = manifest_dir.join("src/cutlass_wrapper.cu");
-    let obj = out_dir.join("cutlass_wrapper.o");
-
+    let nvcc = nvcc_path(&cuda_path);
     let sm100 = nvcc_supports_sm100(&nvcc);
     let sm103 = nvcc_supports_sm103(&nvcc);
-    if sm103 {
-        build_log!("compiling 3.x for SM80 + SM90a + SM100a + SM103a (fat binary)");
-    } else if sm100 {
-        build_log!("compiling 3.x for SM80 + SM90a + SM100a (fat binary)");
-    } else {
-        build_log!("compiling 3.x for SM80 + SM90a");
+
+    match (sm100, sm103) {
+        (true, true) => build_log!("compiling 3.x for SM80 + SM90a + SM100a + SM103a (fat binary)"),
+        (true, false) => build_log!("compiling 3.x for SM80 + SM90a + SM100a (fat binary)"),
+        _ => build_log!("compiling 3.x for SM80 + SM90a"),
     }
 
-    let mut nvcc_cmd = Command::new(&nvcc);
-    nvcc_cmd.args([
-        "-std=c++17",
-        "-O3",
-        "--expt-relaxed-constexpr",
-        "-Xcompiler", "-fPIC",
-        // SM80: CUTLASS 3.x manual CollectiveMma (Ampere TensorOp)
-        "-gencode=arch=compute_80,code=sm_80",
-        // SM90a: CUTLASS 3.x CollectiveBuilder (TMA + warp-specialized)
-        "-gencode=arch=compute_90a,code=sm_90a",
-    ]);
-    if sm100 {
-        nvcc_cmd.arg("-gencode=arch=compute_100a,code=sm_100a");
-    }
-    if sm103 {
-        // B300 Blackwell: native `sm_103a` cubin so the loader doesn't fall
-        // back to "no kernel image is available for execution on the device".
-        nvcc_cmd.arg("-gencode=arch=compute_103a,code=sm_103a");
-    }
-    let status = nvcc_cmd
-        .args([
-            "-I", cutlass_include.to_str().unwrap(),
-            "-I", cutlass_dir.join("tools/util/include").to_str().unwrap(),
-            "-I", &format!("{}/include", cuda_path.display()),
-            "-c", cu_src.to_str().unwrap(),
-            "-o", obj.to_str().unwrap(),
-        ])
-        .status()
-        .expect("Failed to run nvcc");
+    let common_gencodes: Vec<String> = {
+        let mut v = vec![
+            "-gencode=arch=compute_80,code=sm_80".into(),
+            "-gencode=arch=compute_90a,code=sm_90a".into(),
+        ];
+        if sm100 {
+            v.push("-gencode=arch=compute_100a,code=sm_100a".into());
+        }
+        if sm103 {
+            v.push("-gencode=arch=compute_103a,code=sm_103a".into());
+        }
+        v
+    };
 
-    if !status.success() {
-        panic!("nvcc compilation failed for cutlass_wrapper.cu");
+    // ── TU 1: CUTLASS template wrapper ──────────────────────────────
+    let wrapper_src = manifest_dir.join("src/cutlass_wrapper.cu");
+    let wrapper_obj = out_dir.join("cutlass_wrapper.o");
+    let mut wrapper_opts = ObjCompile::new(&wrapper_src, &wrapper_obj)
+        .include(cutlass_dir.join("include"))
+        .include(cutlass_dir.join("tools/util/include"))
+        .include(cuda_path.join("include"))
+        .cpp_std("-std=c++17");
+    for g in &common_gencodes {
+        wrapper_opts = wrapper_opts.gencode(g.clone());
     }
+    compile_cu_to_obj(&nvcc, &wrapper_opts);
 
-    // 3b. Compile naive_gemm.cu — separate TU, no CUTLASS headers.
-    // Isolated to avoid CUTLASS template machinery corrupting simple kernels.
+    // ── TU 2: Naive reference kernels ───────────────────────────────
     let naive_src = manifest_dir.join("src/naive_gemm.cu");
     let naive_obj = out_dir.join("naive_gemm.o");
-
-    let mut naive_cmd = Command::new(&nvcc);
-    naive_cmd.args([
-        "-std=c++17",
-        "-O3",
-        "-Xcompiler", "-fPIC",
-        "-gencode=arch=compute_80,code=sm_80",
-        "-gencode=arch=compute_90a,code=sm_90a",
-    ]);
-    if sm100 {
-        naive_cmd.arg("-gencode=arch=compute_100a,code=sm_100a");
+    let mut naive_opts = ObjCompile::new(&naive_src, &naive_obj)
+        .include(cuda_path.join("include"))
+        .cpp_std("-std=c++17");
+    for g in &common_gencodes {
+        naive_opts = naive_opts.gencode(g.clone());
     }
-    if sm103 {
-        naive_cmd.arg("-gencode=arch=compute_103a,code=sm_103a");
-    }
-    let status = naive_cmd
-        .args([
-            "-I", &format!("{}/include", cuda_path.display()),
-            "-c", naive_src.to_str().unwrap(),
-            "-o", naive_obj.to_str().unwrap(),
-        ])
-        .status()
-        .expect("Failed to run nvcc for naive_gemm.cu");
+    compile_cu_to_obj(&nvcc, &naive_opts);
 
-    if !status.success() {
-        panic!("nvcc compilation failed for naive_gemm.cu");
-    }
-
-    // 4. Create static archive from both object files
+    // ── Archive both objects into libcutlass_gemm.a ─────────────────
     let lib = out_dir.join("libcutlass_gemm.a");
     let status = Command::new(&nvcc)
         .arg("--lib")
         .args(["-o", lib.to_str().unwrap()])
-        .arg(&obj)
+        .arg(&wrapper_obj)
         .arg(&naive_obj)
         .status()
         .expect("Failed to run nvcc --lib");
     if !status.success() {
-        panic!("nvcc --lib failed");
+        panic!("nvcc --lib failed for libcutlass_gemm.a");
     }
 
-    // 5. Link
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=cutlass_gemm");
-
-    // CUDA runtime (static) + driver (dynamic)
-    let cuda_lib = cuda_path.join("lib64");
-    if cuda_lib.exists() {
-        println!("cargo:rustc-link-search=native={}", cuda_lib.display());
-    }
-    let cuda_targets_lib = cuda_path.join("targets/x86_64-linux/lib");
-    if cuda_targets_lib.exists() {
-        println!("cargo:rustc-link-search=native={}", cuda_targets_lib.display());
-    }
-    // Static cudart — no libcudart.so dependency at runtime
-    println!("cargo:rustc-link-lib=static=cudart_static");
-    println!("cargo:rustc-link-lib=dylib=rt");  // required by cudart_static
-    println!("cargo:rustc-link-lib=dylib=dl");  // required by cudart_static
-    println!("cargo:rustc-link-lib=dylib=stdc++");
-}
-
-fn nvcc_supports_sm100(nvcc: &Path) -> bool {
-    Command::new(nvcc)
-        .arg("--list-gpu-arch")
-        .output()
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("compute_100"))
-        .unwrap_or(false)
-}
-
-fn nvcc_supports_sm103(nvcc: &Path) -> bool {
-    Command::new(nvcc)
-        .arg("--list-gpu-arch")
-        .output()
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("compute_103"))
-        .unwrap_or(false)
-}
-
-fn find_cuda() -> PathBuf {
-    if let Ok(p) = env::var("CUDA_PATH") {
-        return PathBuf::from(p);
-    }
-    for p in ["/usr/local/cuda", "/opt/cuda"] {
-        if Path::new(p).join("bin/nvcc").exists() {
-            return PathBuf::from(p);
-        }
-    }
-    panic!("CUDA toolkit not found. Set CUDA_PATH env var.");
+    link_cuda_runtime_static(&cuda_path);
 }

@@ -69,6 +69,14 @@ static SM100Config select_sm100_config(int m, int n, int k, int num_sms) {
             multicast = 1;
         }
     }
+    // Blackwell-Ultra: tiny-N kernels with multicast=2 also OOB on shared
+    // memory — caught by compute-sanitizer at M=512 N=4096 K=2048 (Qwen3.5
+    // in_proj_q at 512-token prefill), which selects (BM=128, BN=16,
+    // stages=12, multicast=2). Multicast on B with BN<32 doesn't pay back
+    // its sync overhead anyway; just disable it for these tile widths.
+    if (g_gpu_arch == 103 && best_bn < 32 && multicast == 2) {
+        multicast = 1;
+    }
 
     SmemConfig scfg;
     int best_stages = select_num_stages<SM100Arch>(

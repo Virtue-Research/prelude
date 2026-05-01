@@ -9,7 +9,7 @@ use crate::device::{self as cb};
 use cudarc::driver::DevicePtr;
 use prelude_core::tensor::{DType, DeviceExt, Result, Tensor};
 use half::bf16;
-use prelude_flash_attn_v4::{KernelDtype, KernelKey, KernelRegistry};
+use flash_attn_v4::{KernelDtype, KernelKey, KernelRegistry};
 use std::ffi::c_void;
 
 fn to_kernel_dtype(dt: DType) -> KernelDtype {
@@ -125,7 +125,7 @@ pub fn try_varlen_paged(
 /// Inner paged FA4 call — always returns Result (no more Option branching).
 #[allow(clippy::too_many_arguments)]
 fn varlen_paged_inner(
-    registry: &KernelRegistry, func: prelude_flash_attn_v4::TVMSafeCallFn,
+    registry: &KernelRegistry, func: flash_attn_v4::TVMSafeCallFn,
     q: &Tensor,
     key_cache: &Tensor, value_cache: &Tensor,
     block_tables: &Tensor,
@@ -181,7 +181,7 @@ fn varlen_paged_inner(
         let device_id = q.device().ordinal() as i32;
 
         unsafe {
-            prelude_flash_attn_v4::fa4_varlen_paged_fwd(
+            flash_attn_v4::fa4_varlen_paged_fwd(
                 registry, func,
                 q_ptr as *mut c_void,
                 k_ptr as *mut c_void,
@@ -254,7 +254,7 @@ fn try_call_fa4(
 /// P@V uses half head_dim as output dimension (within MMA N≤256 limit).
 #[allow(clippy::too_many_arguments)]
 fn call_fa4_vsplit(
-    registry: &KernelRegistry, func: prelude_flash_attn_v4::TVMSafeCallFn,
+    registry: &KernelRegistry, func: flash_attn_v4::TVMSafeCallFn,
     q: &Tensor, k: &Tensor, v: &Tensor,
     cu_seqlens_q: &Tensor, cu_seqlens_k: &Tensor,
     softmax_scale: f32,
@@ -280,7 +280,7 @@ fn call_fa4_vsplit(
 /// Inner FA4 call for V-split: Q/K have head_dim, V/O have half_dim.
 #[allow(clippy::too_many_arguments)]
 fn call_fa4_inner_vsplit(
-    registry: &KernelRegistry, func: prelude_flash_attn_v4::TVMSafeCallFn,
+    registry: &KernelRegistry, func: flash_attn_v4::TVMSafeCallFn,
     q: &Tensor, k: &Tensor, v: &Tensor,
     cu_seqlens_q: &Tensor, cu_seqlens_k: &Tensor,
     softmax_scale: f32,
@@ -332,7 +332,7 @@ fn call_fa4_inner_vsplit(
         let device_id = q.device().ordinal() as i32;
 
         unsafe {
-            prelude_flash_attn_v4::fa4_varlen_fwd(
+            flash_attn_v4::fa4_varlen_fwd(
                 registry, func,
                 q_ptr as *mut c_void,
                 k_ptr as *mut c_void,
@@ -361,7 +361,7 @@ fn call_fa4_inner_vsplit(
 /// Inner FA4 call — always returns Result (no more Option branching).
 #[allow(clippy::too_many_arguments)]
 fn call_fa4_inner(
-    registry: &KernelRegistry, func: prelude_flash_attn_v4::TVMSafeCallFn,
+    registry: &KernelRegistry, func: flash_attn_v4::TVMSafeCallFn,
     q: &Tensor, k: &Tensor, v: &Tensor,
     cu_seqlens_q: &Tensor, cu_seqlens_k: &Tensor,
     softmax_scale: f32,
@@ -413,7 +413,7 @@ fn call_fa4_inner(
         let device_id = q.device().ordinal() as i32;
 
         unsafe {
-            prelude_flash_attn_v4::fa4_varlen_fwd(
+            flash_attn_v4::fa4_varlen_fwd(
                 registry, func,
                 q_ptr as *mut c_void,
                 k_ptr as *mut c_void,

@@ -31,7 +31,11 @@ pub struct DeltaNetPoolConfig {
 /// Unlike the paged KV cache (which grows with sequence length), DeltaNet state
 /// is fixed-size per layer per request. A simple free-list slot allocator suffices.
 pub struct DeltaNetPool {
-    /// Per DeltaNet layer: `[max_slots, num_v_heads, head_k_dim, head_v_dim]` in F32.
+    /// Per DeltaNet layer: `[max_slots, num_v_heads, head_v_dim, head_k_dim]`
+    /// in F32. Note the (V, K) order — this matches cuLA's `kda_decode` state
+    /// contract (`h0_source.shape == (pool_size, HV, V, K)`) so the fused
+    /// batched decode kernel can read/write pool slots directly via slot
+    /// indices without a transpose copy.
     pub recurrent_states: Vec<Tensor>,
     /// Per DeltaNet layer: `[max_slots, conv_dim, conv_kernel - 1]` in model dtype.
     pub conv_states: Vec<Tensor>,
@@ -64,8 +68,8 @@ impl DeltaNetPool {
                 (
                     max_slots as usize,
                     cfg.num_v_heads,
-                    cfg.head_k_dim,
                     cfg.head_v_dim,
+                    cfg.head_k_dim,
                 ),
                 DType::F32,
                 device,
@@ -89,13 +93,43 @@ impl DeltaNetPool {
     }
 
     /// Allocate a slot for a new request. Returns `None` if the pool is exhausted.
+    ///
+    /// The slot's per-layer recurrent and conv state is zeroed before the slot
+    /// is handed out so the caller sees a clean state (matches vLLM / SGLang
+    /// semantics — requests that reuse a previously freed slot must not see
+    /// stale state from the previous occupant).
     pub fn allocate(&mut self) -> Option<u32> {
-        self.free_slots.pop_front()
+        let slot = self.free_slots.pop_front()?;
+        if let Err(e) = self.reset_slot(slot) {
+            // Put the slot back and surface the failure as "no slot". This
+            // keeps the signature Option<u32>; the zero-fill is a tiny
+            // slice_set per layer and should never realistically fail.
+            tracing::error!(?e, slot, "DeltaNetPool::allocate reset_slot failed");
+            self.free_slots.push_front(slot);
+            return None;
+        }
+        Some(slot)
     }
 
     /// Free a slot when a request finishes or is preempted.
     pub fn free(&mut self, slot: u32) {
         self.free_slots.push_back(slot);
+    }
+
+    /// Zero the recurrent and conv state at `slot` across every DeltaNet layer.
+    /// Uses `slice_set`, which goes through candle's interior-mutable storage
+    /// and so only needs `&self`.
+    pub fn reset_slot(&self, slot: u32) -> Result<()> {
+        let slot = slot as usize;
+        for rs in &self.recurrent_states {
+            let zero = Tensor::zeros(&rs.dims()[1..], rs.dtype(), rs.device())?;
+            rs.slice_set(&zero.unsqueeze(0)?, 0, slot)?;
+        }
+        for cs in &self.conv_states {
+            let zero = Tensor::zeros(&cs.dims()[1..], cs.dtype(), cs.device())?;
+            cs.slice_set(&zero.unsqueeze(0)?, 0, slot)?;
+        }
+        Ok(())
     }
 
     /// Number of available (unallocated) slots.

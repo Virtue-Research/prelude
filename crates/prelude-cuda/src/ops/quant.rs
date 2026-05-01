@@ -1,7 +1,7 @@
-//! GPU dequantization — thin wrapper over prelude-quant-gemm FFI.
+//! GPU dequantization — thin wrapper over the `quant-gemm` crate's FFI.
 //!
 //! Converts quantized weight blocks to BF16 on the GPU.
-//! All kernel implementations live in prelude-quant-gemm.
+//! All kernel implementations live in the `quant-gemm` crate.
 
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::WrapErr;
@@ -18,7 +18,7 @@ use std::ffi::c_void;
 pub fn dequantize_to_bf16(
     quantized_data: &Tensor,
     num_elements: usize,
-    weight_type: prelude_quant_gemm::GgmlType,
+    weight_type: quant_gemm::GgmlType,
 ) -> Result<Tensor> {
     let (storage, layout) = quantized_data.storage_and_layout();
     let cuda = match &*storage {
@@ -41,7 +41,7 @@ pub fn dequantize_to_bf16(
     let out_ptr = output.device_ptr(&stream).0 as *mut c_void;
 
     unsafe {
-        prelude_quant_gemm::gpu_dequantize(
+        quant_gemm::gpu_dequantize(
             in_ptr, out_ptr,
             num_elements as i64,
             weight_type,

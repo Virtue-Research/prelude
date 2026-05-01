@@ -1,12 +1,12 @@
 //! Correctness tests for GPU quant kernels vs llama.cpp CPU reference.
 //!
-//! Run: cargo test -p prelude-quant-gemm --release
+//! Run: cargo test -p quant-gemm --release
 
 use std::ffi::c_void;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, ValidAsZeroBits};
-use prelude_quant_gemm::GgmlType;
+use quant_gemm::GgmlType;
 
 // ── GPU helpers ─────────────────────────────────────────────────────────
 
@@ -171,7 +171,7 @@ fn sanitize_fp16_scales(data: &mut [u8], t: GgmlType) {
 fn cpu_dequantize(raw: &[u8], num_elements: usize, t: GgmlType) -> Vec<f32> {
     let mut out = vec![0.0f32; num_elements];
     unsafe {
-        prelude_quant_gemm::dequantize_ref(
+        quant_gemm::dequantize_ref(
             raw.as_ptr() as *const c_void,
             out.as_mut_ptr(),
             num_elements as i64,
@@ -234,7 +234,7 @@ fn test_mmvq(t: GgmlType, label: &str, n: usize, k: usize, gpu: &Gpu) {
         let (wp, _g1) = d_w.device_ptr(&gpu.stream);
         let (qp, _g2) = d_q8.device_ptr(&gpu.stream);
         let (yp, _g3) = d_y.device_ptr_mut(&gpu.stream);
-        prelude_quant_gemm::mul_mat_vec_q(
+        quant_gemm::mul_mat_vec_q(
             wp as *const c_void,
             qp as *const c_void,
             yp as *mut f32,
@@ -351,7 +351,7 @@ fn test_gpu_dequantize(t: GgmlType, label: &str, num_elements: usize, gpu: &Gpu)
     unsafe {
         let (ip, _g1) = d_input.device_ptr(&gpu.stream);
         let (op, _g2) = d_output.device_ptr_mut(&gpu.stream);
-        prelude_quant_gemm::gpu_dequantize(
+        quant_gemm::gpu_dequantize(
             ip as *const c_void,
             op as *mut c_void,
             num_elements as i64,
@@ -462,11 +462,11 @@ fn test_tiled_mmq(t: GgmlType, label: &str, m: usize, n: usize, k: usize, gpu: &
         let (qp, _g2) = d_q8.device_ptr_mut(&gpu.stream);
         let (wp, _g3) = d_w.device_ptr(&gpu.stream);
         let (yp, _g4) = d_y.device_ptr_mut(&gpu.stream);
-        prelude_quant_gemm::quantize_q8_1(
+        quant_gemm::quantize_q8_1(
             xp as *const c_void, qp as *mut c_void,
             m as i64, k as i64, t, gpu.stream_ptr(),
         );
-        prelude_quant_gemm::mul_mat_q(
+        quant_gemm::mul_mat_q(
             wp as *const c_void, qp as *const c_void, yp as *mut f32,
             m as i64, n as i64, k as i64,
             t, 0, gpu.stream_ptr(),

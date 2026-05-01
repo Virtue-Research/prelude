@@ -1,8 +1,14 @@
-//! Build script for prelude-tvm-ffi.
+//! Build script for `tvm-static-ffi`.
 //!
-//! Compiles the vendored TVM FFI C++ runtime from third_party/tvm-ffi.
-//! This is shared by FA4, FlashInfer, and cuLA kernel crates — compiled once,
-//! linked into the final binary once.
+//! Compiles the vendored TVM FFI C++ runtime from third_party/tvm-ffi so
+//! that the Rust crate can extract error messages after a SafeCall failure.
+//! Shared by FA4, FlashInfer, and cuLA kernel crates — compiled once, linked
+//! into the final binary once.
+//!
+//! Source discovery:
+//!   - `$TVM_FFI_ROOT` overrides the tvm-ffi source path (defaults to
+//!     `$CARGO_WORKSPACE/third_party/tvm-ffi`, for zero-config workspace
+//!     builds).
 //!
 //! Also compiles:
 //! - libbacktrace (required by tvm-ffi's backtrace.cc)
@@ -14,20 +20,32 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 fn main() -> Result<()> {
+    println!("cargo:rerun-if-env-changed=TVM_FFI_ROOT");
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
-    // tvm-ffi lives in workspace third_party/
-    let workspace_root = manifest_dir
-        .parent().unwrap()  // crates/prelude-cuda/
-        .parent().unwrap()  // crates/
-        .parent().unwrap(); // workspace root
-    let tvm_ffi_dir = workspace_root.join("third_party/tvm-ffi");
+
+    // `TVM_FFI_ROOT` overrides the source directory so this crate can be
+    // built outside the prelude workspace. The fallback walks up three levels
+    // to the workspace root and picks `third_party/tvm-ffi`.
+    let tvm_ffi_dir = match env::var("TVM_FFI_ROOT") {
+        Ok(p) if !p.is_empty() => PathBuf::from(p),
+        _ => {
+            let workspace_root = manifest_dir
+                .parent().unwrap()  // crates/prelude-cuda/
+                .parent().unwrap()  // crates/
+                .parent().unwrap(); // workspace root
+            workspace_root.join("third_party/tvm-ffi")
+        }
+    };
     let tvm_src = tvm_ffi_dir.join("src");
     let tvm_include = tvm_ffi_dir.join("include");
     let dlpack_include = tvm_ffi_dir.join("3rdparty/dlpack/include");
 
     if !tvm_src.exists() {
         anyhow::bail!(
-            "third_party/tvm-ffi not found. Run: git submodule update --init third_party/tvm-ffi"
+            "tvm-ffi source not found at {}. Either run `git submodule update \
+             --init third_party/tvm-ffi` inside the prelude workspace, or set \
+             TVM_FFI_ROOT=/path/to/tvm-ffi to build this crate standalone.",
+            tvm_ffi_dir.display(),
         );
     }
 
@@ -40,7 +58,7 @@ fn main() -> Result<()> {
         })
         .collect();
 
-    eprintln!("prelude-tvm-ffi: compiling {} C++ source files", cc_files.len());
+    eprintln!("tvm-static-ffi: compiling {} C++ source files", cc_files.len());
 
     let mut build = cc::Build::new();
     build
@@ -64,6 +82,19 @@ fn main() -> Result<()> {
         build.file(&error_helper);
     }
 
+    // tvm_module_helper.cc — Rust-callable C bridge for TVM Module method calls
+    // Needs CUDA headers for the DLPack allocator.
+    let module_helper = manifest_dir.join("src/tvm_module_helper.cc");
+    if module_helper.exists() {
+        for cuda_inc in ["/usr/local/cuda/include", "/opt/cuda/include"] {
+            if std::path::Path::new(cuda_inc).exists() {
+                build.include(cuda_inc);
+                break;
+            }
+        }
+        build.file(&module_helper);
+    }
+
     // ── Phase 2: Compile libbacktrace ──────────────────────────────
     compile_libbacktrace(&tvm_ffi_dir)?;
 
@@ -73,14 +104,14 @@ fn main() -> Result<()> {
         .try_compile("tvm_ffi_static")
         .context("Failed to compile vendored tvm_ffi")?;
 
-    // ── Phase 3: Link cuda_dialect_runtime_static.a ────────────────
-    let venv_dir = workspace_root.join("target/fa4-venv");
-    if let Some(p) = find_file_recursive(&venv_dir, "libcuda_dialect_runtime_static.a") {
-        println!("cargo:rustc-link-search=native={}", p.parent().unwrap().display());
-        println!("cargo:rustc-link-lib=static:+whole-archive=cuda_dialect_runtime_static");
-    }
+    // NOTE: cuda_dialect_runtime_static.a (the MLIR-generated shim for
+    // _cudaGetDevice etc.) is linked from prelude-cuda's build.rs, NOT
+    // here. tvm-static-ffi builds BEFORE the cuLA/FA4 crates that create
+    // the Python venvs where the .a lives, so searching for it here is a
+    // build-order race: works on warm builds (venv from previous build
+    // still on disk), fails on fresh clones.
 
-    // ── Phase 4: Link CUDA runtime ─────────────────────────────────
+    // ── Phase 3: Link CUDA runtime ─────────────────────────────────
     for candidate in [
         "/opt/cuda/targets/x86_64-linux/lib",
         "/opt/cuda/lib64",

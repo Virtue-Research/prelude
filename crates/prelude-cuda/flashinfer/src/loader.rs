@@ -85,15 +85,6 @@ pub struct MLAPagedKey {
     pub head_dim_kpe: u32,
 }
 
-/// Key for looking up a POD (Prefill-On-Decode) kernel variant.
-/// Merged: swa/softcap dispatched at runtime inside the CUDA kernel.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct PodKey {
-    pub dtype: KernelDtype,
-    pub head_dim_qk: u32,
-    pub head_dim_vo: u32,
-}
-
 /// Function pointers for a batch prefill variant.
 /// Each variant exports: plan, ragged_run, paged_run.
 pub struct PrefillVariant {
@@ -121,12 +112,6 @@ pub struct MLAPagedVariant {
     pub run: TVMSafeCallFn,
 }
 
-/// Function pointers for POD (Prefill-On-Decode) mixed batching.
-/// Single kernel handles both prefill (Q>1) and decode (Q=1) in one launch.
-pub struct PodVariant {
-    pub run: TVMSafeCallFn,
-}
-
 // Include the build.rs-generated dispatch table
 include!(concat!(env!("OUT_DIR"), "/fi_dispatch.rs"));
 
@@ -142,7 +127,7 @@ unsafe extern "C" {
         device_type: i32, device_id: i32,
         stream: *mut c_void, out_original: *mut *mut c_void,
     ) -> i32;
-    fn prelude_tvm_get_last_error(out_len: *mut usize) -> *const u8;
+    fn tvm_static_ffi_get_last_error(out_len: *mut usize) -> *const u8;
 }
 
 const CUDA_DEV_ATTR_MAJOR: i32 = 75;
@@ -215,11 +200,6 @@ impl KernelRegistry {
         lookup_mla_paged(key)
     }
 
-    /// Look up a POD (Prefill-On-Decode) variant for mixed batching.
-    pub fn get_pod(&self, key: &PodKey) -> Option<PodVariant> {
-        lookup_pod(key)
-    }
-
     /// Look up a utility kernel by name (e.g., "softmax", "rmsnorm", "apply_rope").
     pub fn get_utility(&self, name: &str) -> Option<TVMSafeCallFn> {
         lookup_utility(name)
@@ -247,7 +227,7 @@ impl KernelRegistry {
             let detail = unsafe {
                 // Try to get TVM FFI error message first
                 let mut msg_len: usize = 0;
-                let msg_ptr = prelude_tvm_get_last_error(&mut msg_len);
+                let msg_ptr = tvm_static_ffi_get_last_error(&mut msg_len);
                 let tvm_msg = if !msg_ptr.is_null() && msg_len > 0 {
                     String::from_utf8_lossy(std::slice::from_raw_parts(msg_ptr, msg_len)).into_owned()
                 } else {

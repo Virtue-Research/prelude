@@ -1,3 +1,3 @@
-//! TVM FFI and DLPack type definitions — re-exported from prelude-tvm-ffi.
+//! TVM FFI and DLPack type definitions — re-exported from `tvm-static-ffi`.
 
-pub use prelude_tvm_ffi::*;
+pub use tvm_static_ffi::*;

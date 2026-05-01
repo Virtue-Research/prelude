@@ -3,7 +3,7 @@
 //! Each test allocates GPU memory via cudarc, runs CUTLASS GEMM, and compares
 //! against a CPU F64 reference.  Requires a CUDA GPU to run.
 //!
-//! Run:  cargo test -p prelude-cutlass-gemm --release
+//! Run:  cargo test -p cutlass-gemm --release
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -124,7 +124,7 @@ fn call_gemm(
     stream: *const c_void,
 ) -> Result<(), String> {
     unsafe {
-        prelude_cutlass_gemm::gemm_dispatch(
+        cutlass_gemm::gemm_dispatch(
             weight_ptr, input_ptr, output_ptr,
             n as i32, m as i32, k as i32,
             batch as i32,

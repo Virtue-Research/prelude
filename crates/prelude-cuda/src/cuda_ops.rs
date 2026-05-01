@@ -39,10 +39,12 @@ impl Ops for CudaOps {
     // ── Normalization (CUDA kernels) ──────────────────────────────
 
     fn rms_norm(&self, x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
-        if x.dtype() == DType::BF16 {
+        // Fast kernel only supports matching BF16 weight — F32 weight falls through
+        // to the composed path, which casts weight to F32 and does the mul in F32
+        // (matches HF reference for models that carry small `+1` residual weights).
+        if x.dtype() == DType::BF16 && weight.dtype() == DType::BF16 {
             return crate::ops::rmsnorm::fast_rmsnorm(x, weight, eps as f64);
         }
-        // Non-BF16: use composed fallback
         prelude_core::ops::traits::norm::rms_norm(x, weight, eps)
     }
 
@@ -55,6 +57,41 @@ impl Ops for CudaOps {
         let num_tokens = input.dims()[0];
         let topk = if num_tokens > 0 { num_assignments / num_tokens } else { 1 };
         crate::ops::moe::moe_gemm_wmma(input, weights, &None, sorted_token_ids, sorted_expert_ids, topk, num_tokens > 1)
+    }
+
+    fn moe_sort_experts(&self, expert_ids: &Tensor) -> Option<Result<(Tensor, Tensor)>> {
+        Some(crate::ops::moe::moe_sort_experts_gpu(expert_ids))
+    }
+
+    fn rmsnorm_gated(&self, x: &Tensor, gate: &Tensor, weight: &Tensor, eps: f32) -> Option<Result<Tensor>> {
+        if x.dtype() == DType::BF16 && weight.dtype() == DType::F32 {
+            return Some(crate::ops::rmsnorm::fast_rmsnorm_gated(x, gate, weight, eps as f64));
+        }
+        None
+    }
+
+    fn swap_moe_gate_up(&self, w1: &Tensor, inter: usize) -> Option<Result<()>> {
+        Some(crate::ops::moe::swap_gate_up_inplace(w1, inter))
+    }
+
+    fn cutlass_fused_moe(
+        &self,
+        input: &Tensor,
+        experts_per_tok: &Tensor,
+        topk_weights: &Tensor,
+        w1: &Tensor,
+        w2: &Tensor,
+    ) -> Option<Result<Tensor>> {
+        // The vendored TRT-LLM CUTLASS MoE templates are sm_90a only —
+        // calling them on Blackwell triggers
+        // `tensorrt_llm::common::TllmException("Please recompile with
+        // support for blackwell by passing 100-real ...")` and aborts
+        // the process. Return None so the caller falls back to the
+        // unfused per-expert path.
+        if !crate::ops::moe::is_sm90() {
+            return None;
+        }
+        Some(crate::ops::moe::cutlass_fused_moe_forward(input, experts_per_tok, topk_weights, w1, w2))
     }
 
     // ── KV cache ──────────────────────────────────────────────────
@@ -91,14 +128,25 @@ impl Ops for CudaOps {
     }
 
     fn paged_block_size_hint(&self, head_dim: usize) -> usize {
-        // FlashInfer is the paged fallback, use its alignment requirements
-        if head_dim == 256 { 64 } else { 128 }
+        // Prefer block_size == FA4 tile_n so `paged_non_tma=false` and the
+        // compiled TMA paged kernels are eligible. Fall through to the
+        // FlashInfer-compatible value for head_dim combinations FA4 doesn't
+        // cover.
+        match head_dim {
+            128 => 128,
+            256 => crate::attn::fa4_tile_n(head_dim, head_dim), // 80 for head_dim=256
+            _ => 128,
+        }
     }
 
     // ── Fused ops (CUDA kernels) ─────────────────────────────────
 
     fn fused_add_rmsnorm(&self, residual: &Tensor, x: &Tensor, weight: &Tensor, eps: f32) -> Option<Result<(Tensor, Tensor)>> {
         if x.dtype() != DType::BF16 { return None; }
+        // FlashInfer's fused kernel applies weight in BF16; fall through to the
+        // composed path when weight is F32 so the multiply happens in F32 (HF
+        // parity for models with small `+1` residual norm weights).
+        if weight.dtype() != DType::BF16 { return None; }
         // FlashInfer in-place: after call, x = rmsnorm(x + residual), residual = x + residual.
         // Safe because residual flows linearly through layers (never branched).
         Some(crate::attn::flashinfer::fi_fused_add_rmsnorm(x, residual, weight, eps as f64)
@@ -159,6 +207,136 @@ impl Ops for CudaOps {
         Some(crate::ops::moe::moe_gemm_wmma(input, weights, &Some(topk_weights.clone()), sorted_token_ids, sorted_expert_ids, topk, is_prefill))
     }
 
+    fn kda_decode_batched(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        a_raw: &Tensor,
+        b_raw: &Tensor,
+        a_log: &Tensor,
+        dt_bias: &Tensor,
+        pool_state: &Tensor,
+        slot_ids: &Tensor,
+    ) -> Option<Result<Tensor>> {
+        // The wrapper returns Ok(None) when no compiled variant matches the
+        // GPU arch or model dims — lift that into `None` at the Ops layer so
+        // the caller can fall back cleanly.
+        match crate::attn::kda_decode::try_decode(
+            q, k, v, a_raw, b_raw, a_log, dt_bias, pool_state, slot_ids,
+        ) {
+            Ok(Some(out)) => Some(Ok(out)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    fn kda_decode_available(&self) -> bool {
+        crate::attn::kda_decode::supported_on_current_arch()
+    }
+
+    fn causal_conv1d_fn(
+        &self,
+        x: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        initial_states: Option<&Tensor>,
+        silu_activation: bool,
+    ) -> Option<Result<Tensor>> {
+        match crate::attn::causal_conv1d::try_fwd(
+            x, weight, bias, initial_states, silu_activation,
+        ) {
+            Ok(Some(t)) => Some(Ok(t)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    fn causal_conv1d_update(
+        &self,
+        x: &Tensor,
+        conv_state: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        silu_activation: bool,
+        conv_state_indices: Option<&Tensor>,
+    ) -> Option<Result<Tensor>> {
+        match crate::attn::causal_conv1d::try_update(
+            x, conv_state, weight, bias, silu_activation, conv_state_indices,
+        ) {
+            Ok(Some(t)) => Some(Ok(t)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    fn gdn_post_conv(
+        &self,
+        mixed_qkv: &Tensor,
+        a_raw: &Tensor,
+        b_raw: &Tensor,
+        a_log: &Tensor,
+        dt_bias: &Tensor,
+        num_k_heads: usize,
+        num_v_heads: usize,
+        head_dim: usize,
+    ) -> Option<Result<(Tensor, Tensor, Tensor, Tensor, Tensor)>> {
+        Some(crate::ops::gdn_post_conv::gdn_post_conv(
+            mixed_qkv, a_raw, b_raw, a_log, dt_bias,
+            num_k_heads, num_v_heads, head_dim,
+        ))
+    }
+
+    fn gather_log_softmax(
+        &self,
+        logits: &Tensor,
+        target_ids: &Tensor,
+    ) -> Option<Result<Tensor>> {
+        Some(crate::ops::gather_log_softmax::gather_log_softmax(
+            logits, target_ids,
+        ))
+    }
+
+    fn gdn_prefill_varlen(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        alpha: &Tensor,
+        beta: &Tensor,
+        cu_seqlens: &Tensor,
+        initial_state: Option<&Tensor>,
+        scale: f32,
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        match crate::attn::gdn_prefill::try_prefill(
+            q, k, v, alpha, beta, cu_seqlens, initial_state, scale,
+        ) {
+            Ok(Some(pair)) => Some(Ok(pair)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    // ── Sampling ──────────────────────────────────────────────────
+
+    fn sample_from_logits(
+        &self,
+        logits: &Tensor,
+        deterministic: bool,
+    ) -> Option<Result<Tensor>> {
+        Some(crate::ops::sampling::sample_from_logits(logits, deterministic))
+    }
+
+    fn top_k_top_p_sample(
+        &self,
+        logits: &Tensor,
+        top_k: i64,
+        top_p: f64,
+        deterministic: bool,
+    ) -> Option<Result<Tensor>> {
+        Some(crate::ops::sampling::top_k_top_p_sample(logits, top_k, top_p, deterministic))
+    }
+
     // ── Session ───────────────────────────────────────────────────
 
     fn begin_forward(&self) {
@@ -175,6 +353,11 @@ impl Ops for CudaOps {
         unsafe extern "C" { fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32; }
         let (mut free, mut total) = (0usize, 0usize);
         if unsafe { cudaMemGetInfo(&mut free, &mut total) } == 0 { Some(free) } else { None }
+    }
+    fn gpu_total_memory(&self) -> Option<usize> {
+        unsafe extern "C" { fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32; }
+        let (mut free, mut total) = (0usize, 0usize);
+        if unsafe { cudaMemGetInfo(&mut free, &mut total) } == 0 { Some(total) } else { None }
     }
 }
 

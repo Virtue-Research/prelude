@@ -82,7 +82,7 @@ pub(crate) unsafe fn gemm_dispatch_impl(
         let known_fail = DEEPGEMM_FAILED.with(|s| s.borrow().contains(&key));
         if !known_fail {
             // Swap: DeepGEMM A=input(b), B=weight(a), M=tokens(n), N=features(m)
-            let ret = unsafe { prelude_deepgemm::bf16_gemm(
+            let ret = unsafe { deepgemm::bf16_gemm(
                 b as *mut c_void, a as *mut c_void, d,
                 n, m, k, stream as *mut c_void,
             ) };
@@ -100,7 +100,7 @@ pub(crate) unsafe fn gemm_dispatch_impl(
     {
         let known_fail = CUTLASS_FAILED.with(|s| s.borrow().contains(&key));
         if !known_fail {
-            let ret = prelude_cutlass_gemm::gemm_dispatch(
+            let ret = cutlass_gemm::gemm_dispatch(
                 a, b, d, m, n, k, batch, lda, ldb, ldd,
                 stride_a, stride_b, stride_d,
                 transa, transb, dtype, stream,

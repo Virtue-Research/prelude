@@ -1,18 +1,22 @@
 [package]
-name = "prelude-deepgemm"
+name = "deepgemm"
 version = "0.1.0"
 edition = "2024"
 build = "build.rs"
-description = "DeepGEMM BF16 GEMM for Prelude inference engine. Based on deepseek-ai/DeepGEMM."
+description = "Rust bindings to DeepSeek's DeepGEMM BF16/FP8 GEMM CUDA kernels. Statically linked, no libtorch dependency."
+license = "MIT"
+repository = "https://github.com/deepseek-ai/DeepGEMM"
 
 [lib]
-name = "prelude_deepgemm"
+name = "deepgemm"
 path = "src/lib.rs"
 
 [dependencies]
+
+[build-dependencies]
+prelude-kernelbuild = { workspace = true }
 
 [dev-dependencies]
 cudarc = { version = "0.19.4", features = ["std", "cuda-version-from-build-system", "f16", "cublas", "cublaslt"] }
 half = "2.7.1"
 rand = "0.10.0"
-

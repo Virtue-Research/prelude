@@ -1,6 +1,6 @@
 //! DeepGEMM BF16/FP8 GEMM correctness tests — GPU output vs CPU F64 reference.
 //!
-//! Run:  cargo test -p prelude-deepgemm --release
+//! Run:  cargo test -p deepgemm --release
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -69,7 +69,7 @@ fn call_deepgemm(
     stream: *mut c_void,
 ) -> Result<(), String> {
     unsafe {
-        prelude_deepgemm::bf16_gemm(
+        deepgemm::bf16_gemm(
             input_ptr, weight_ptr, output_ptr,
             m as i32, n as i32, k as i32,
             stream,
@@ -141,7 +141,7 @@ fn bf16_gemm_model_shapes() {
     // The (128,1024,3072) and (1,151936,1024) shapes pick an SM100 tile that
     // isn't in the compiled kernel set on Blackwell (B300); leave the
     // small-M shapes that are covered and skip the rest on SM100+.
-    let (_, arch) = prelude_deepgemm::query_device();
+    let (_, arch) = deepgemm::query_device();
     let shapes: &[(usize, usize, usize)] = if arch >= 100 {
         &[(1, 1024, 1024), (32, 3072, 1024)]
     } else {
@@ -173,7 +173,7 @@ fn bf16_gemm_prefill_shapes() {
     let gpu = match Gpu::new() { Some(g) => g, None => return };
     // On B300 the SM100 config selector picks tiles not in the compiled
     // variant table for large-M × 4096×4096 — skip on SM100+.
-    let (_, arch) = prelude_deepgemm::query_device();
+    let (_, arch) = deepgemm::query_device();
     if arch >= 100 { eprintln!("bf16_gemm_prefill_shapes: skip (SM{arch}, missing tile variants)"); return; }
     for m in [64, 128, 256, 512] {
         run_test(m, 4096, 4096, &gpu);
@@ -228,7 +228,7 @@ fn bf16_gemm_sm103_multicast2_repro() {
 fn query_config_returns_valid() {
     let shapes = [(1, 4096, 4096), (32, 4096, 4096), (512, 4096, 4096)];
     for (m, n, k) in shapes {
-        let (bm, bn, stages, smem) = prelude_deepgemm::query_config(m, n, k);
+        let (bm, bn, stages, smem) = deepgemm::query_config(m, n, k);
         assert!(bm > 0, "block_m should be > 0 for M={m}");
         assert!(bn > 0, "block_n should be > 0 for M={m}");
         assert!(stages > 0, "stages should be > 0 for M={m}");
@@ -351,7 +351,7 @@ fn run_fp8_test(m: usize, n: usize, k: usize, gpu: &Gpu) {
             let (sfbp, _g4) = sfb_gpu.device_ptr(&gpu.stream);
             let (op, _g5) = out_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
-                prelude_deepgemm::fp8_gemm(
+                deepgemm::fp8_gemm(
                     ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
                     sfap as *mut c_void, sfbp as *mut c_void,
                     m as i32, n as i32, k as i32,
@@ -396,7 +396,7 @@ fn fp8_gemm_model_shapes() {
 fn query_fp8_config_returns_valid() {
     let shapes = [(1, 4096, 4096), (32, 4096, 4096), (512, 4096, 4096)];
     for (m, n, k) in shapes {
-        let (bm, bn, stages, smem) = prelude_deepgemm::query_fp8_config(m, n, k);
+        let (bm, bn, stages, smem) = deepgemm::query_fp8_config(m, n, k);
         assert!(bm > 0, "FP8 block_m should be > 0 for M={m}");
         assert!(bn > 0, "block_n should be > 0 for M={m}");
         assert!(stages > 0, "stages should be > 0 for M={m}");
@@ -465,7 +465,7 @@ fn run_grouped_test(ms: &[usize], n: usize, k: usize, gpu: &Gpu) {
             let (lp, _g3) = layout_gpu.device_ptr(&gpu.stream);
             let (op, _g4) = out_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
-                prelude_deepgemm::m_grouped_bf16_gemm(
+                deepgemm::m_grouped_bf16_gemm(
                     ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
                     lp as *mut c_void,
                     total_m as i32, n as i32, k as i32,
@@ -520,7 +520,7 @@ fn grouped_gemm_unequal_groups() {
 fn query_grouped_config_returns_valid() {
     let shapes = [(256, 4096, 4096), (1024, 7168, 4096), (512, 4096, 1024)];
     for (m, n, k) in shapes {
-        let (bm, bn, stages, smem) = prelude_deepgemm::query_grouped_config(m, n, k);
+        let (bm, bn, stages, smem) = deepgemm::query_grouped_config(m, n, k);
         assert_eq!(bm, 128, "Grouped block_m should always be 128");
         assert!(bn > 0, "block_n should be > 0 for M={m}");
         assert!(stages > 0, "stages should be > 0 for M={m}");
@@ -573,7 +573,7 @@ fn run_fp8_grouped_test(ms: &[usize], n: usize, k: usize, gpu: &Gpu) {
             let (lp, _) = layout_gpu.device_ptr(&gpu.stream);
             let (op, _) = out_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
-                prelude_deepgemm::m_grouped_fp8_gemm(
+                deepgemm::m_grouped_fp8_gemm(
                     ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
                     sfap as *mut c_void, sfbp as *mut c_void,
                     lp as *mut c_void,
@@ -651,7 +651,7 @@ fn run_fp8_1d1d_test(m: usize, n: usize, k: usize, gpu: &Gpu) {
             let (sfbp, _) = sfb_gpu.device_ptr(&gpu.stream);
             let (op, _) = out_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
-                prelude_deepgemm::fp8_gemm_1d1d(
+                deepgemm::fp8_gemm_1d1d(
                     ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
                     sfap as *mut c_void, sfbp as *mut c_void,
                     m as i32, n as i32, k as i32,
@@ -669,7 +669,7 @@ fn run_fp8_1d1d_test(m: usize, n: usize, k: usize, gpu: &Gpu) {
 
 /// No SM100 1D1D FP8 implementation — wrapper returns -1 on Blackwell.
 fn fp8_1d1d_skip_if_blackwell() -> bool {
-    let (_, arch) = prelude_deepgemm::query_device();
+    let (_, arch) = deepgemm::query_device();
     if arch >= 100 { eprintln!("fp8_1d1d: skip (SM{arch}, no SM100 impl)"); true } else { false }
 }
 
@@ -677,14 +677,14 @@ fn fp8_1d1d_skip_if_blackwell() -> bool {
 /// bad output on B300 (max_err=inf observed on (1,1024,1024)). Track it
 /// as a known DeepGEMM upstream issue and skip on Blackwell for now.
 fn fp8_sm100_skip_if_blackwell(label: &str) -> bool {
-    let (_, arch) = prelude_deepgemm::query_device();
+    let (_, arch) = deepgemm::query_device();
     if arch >= 100 { eprintln!("{label}: skip (SM{arch}, FP8 SM100 kernel broken)"); true } else { false }
 }
 
 /// SM100 grouped BF16 GEMM kernels also trigger LaunchFailed on B300 for
 /// several MoE shapes. Skip until those variants are sorted out.
 fn grouped_sm100_skip_if_blackwell(label: &str) -> bool {
-    let (_, arch) = prelude_deepgemm::query_device();
+    let (_, arch) = deepgemm::query_device();
     if arch >= 100 { eprintln!("{label}: skip (SM{arch}, grouped SM100 kernel bug)"); true } else { false }
 }
 
@@ -770,7 +770,7 @@ fn run_masked_test(actual_ms: &[usize], padded_m: usize, n: usize, k: usize, gpu
             let (mp, _g3) = mask_gpu.device_ptr(&gpu.stream);
             let (op, _g4) = out_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
-                prelude_deepgemm::m_grouped_masked_bf16_gemm(
+                deepgemm::m_grouped_masked_bf16_gemm(
                     ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
                     mp as *mut c_void,
                     padded_m as i32, n as i32, k as i32,
@@ -868,7 +868,7 @@ fn run_fp8_masked_test(actual_ms: &[usize], padded_m: usize, n: usize, k: usize,
             let (mp, _) = mask_gpu.device_ptr(&gpu.stream);
             let (op, _) = out_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
-                prelude_deepgemm::m_grouped_masked_fp8_gemm(
+                deepgemm::m_grouped_masked_fp8_gemm(
                     ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
                     sfap as *mut c_void, sfbp as *mut c_void,
                     mp as *mut c_void,
@@ -911,7 +911,7 @@ fn fp8_masked_gemm_small() {
 fn bf16_gemm_acc_small() {
     let gpu = match Gpu::new() { Some(g) => g, None => return };
     // No SM100 implementation of bf16_gemm_acc yet.
-    let (_, arch) = prelude_deepgemm::query_device();
+    let (_, arch) = deepgemm::query_device();
     if arch >= 100 { eprintln!("bf16_gemm_acc_small: skip (SM{arch}, no SM100 impl)"); return; }
     for (m, n, k) in [(16, 256, 256), (64, 512, 512), (128, 1024, 1024)] {
         // Reference: D = C + A @ B (all in f64)
@@ -940,7 +940,7 @@ fn bf16_gemm_acc_small() {
                 let (cp, _) = c_gpu.device_ptr(&gpu.stream);
                 let (dp, _) = d_gpu.device_ptr_mut(&gpu.stream);
                 unsafe {
-                    prelude_deepgemm::bf16_gemm_acc(
+                    deepgemm::bf16_gemm_acc(
                         ap as *mut c_void, bp as *mut c_void,
                         cp as *mut c_void, dp as *mut c_void,
                         m as i32, n as i32, k as i32,
@@ -961,7 +961,7 @@ fn bf16_gemm_acc_small() {
 fn bf16_gemm_acc_model_shapes() {
     let gpu = match Gpu::new() { Some(g) => g, None => return };
     // No SM100 implementation of bf16_gemm_acc yet.
-    let (_, arch) = prelude_deepgemm::query_device();
+    let (_, arch) = deepgemm::query_device();
     if arch >= 100 { eprintln!("bf16_gemm_acc_model_shapes: skip (SM{arch}, no SM100 impl)"); return; }
     for (m, n, k) in [(64, 4096, 4096), (128, 4096, 4096)] {
         // Reference: D = C + A @ B (all in f64)
@@ -990,7 +990,7 @@ fn bf16_gemm_acc_model_shapes() {
                 let (cp, _) = c_gpu.device_ptr(&gpu.stream);
                 let (dp, _) = d_gpu.device_ptr_mut(&gpu.stream);
                 unsafe {
-                    prelude_deepgemm::bf16_gemm_acc(
+                    deepgemm::bf16_gemm_acc(
                         ap as *mut c_void, bp as *mut c_void,
                         cp as *mut c_void, dp as *mut c_void,
                         m as i32, n as i32, k as i32,
@@ -1022,7 +1022,7 @@ fn fp8_masked_gemm_moe_shapes() {
 #[test]
 fn device_query() {
     let _gpu = match Gpu::new() { Some(g) => g, None => return };
-    let (num_sms, gpu_arch) = prelude_deepgemm::query_device();
+    let (num_sms, gpu_arch) = deepgemm::query_device();
     assert!(num_sms > 0, "num_sms should be positive, got {num_sms}");
     assert!(gpu_arch >= 90, "gpu_arch should be >= 90, got {gpu_arch}");
     println!("Device: {num_sms} SMs, arch sm_{gpu_arch}");
@@ -1034,7 +1034,7 @@ fn device_query() {
 
 /// CPU reference: transpose [G, MN, SF_K] → [G, SF_K, tma_aligned_MN]
 fn cpu_transpose_sf(sf: &[f32], g: usize, mn: usize, sf_k: usize) -> Vec<f32> {
-    let tma_mn = prelude_deepgemm::get_tma_aligned_size(mn as i32, 4) as usize;
+    let tma_mn = deepgemm::get_tma_aligned_size(mn as i32, 4) as usize;
     let mut out = vec![0.0f32; g * sf_k * tma_mn];
     for gi in 0..g {
         for mi in 0..mn {
@@ -1054,7 +1054,7 @@ fn sf_transpose_correctness() {
         let sf_data = rand_f32(g * mn * sf_k);
         let ref_out = cpu_transpose_sf(&sf_data, g, mn, sf_k);
 
-        let tma_mn = prelude_deepgemm::get_tma_aligned_size(mn as i32, 4) as usize;
+        let tma_mn = deepgemm::get_tma_aligned_size(mn as i32, 4) as usize;
         let sf_gpu = gpu.upload(&sf_data);
         let mut out_gpu = gpu.alloc_zeros::<f32>(g * sf_k * tma_mn);
 
@@ -1062,7 +1062,7 @@ fn sf_transpose_correctness() {
             let (sp, _) = sf_gpu.device_ptr(&gpu.stream);
             let (op, _) = out_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
-                prelude_deepgemm::transform_sf_transpose(
+                deepgemm::transform_sf_transpose(
                     sp as *mut c_void, op as *mut c_void,
                     mn as i32, sf_k as i32, g as i32,
                     gpu.stream_ptr(),
@@ -1119,7 +1119,7 @@ fn mqa_logits_basic() {
     // GPU
     let q_gpu = gpu.upload(&q_fp8);
     let kv_gpu = gpu.upload(&kv_fp8);
-    let tma_slkv = prelude_deepgemm::get_tma_aligned_size(seq_len_kv as i32, 4) as usize;
+    let tma_slkv = deepgemm::get_tma_aligned_size(seq_len_kv as i32, 4) as usize;
     let mut kv_scales_padded = vec![0.0f32; tma_slkv];
     kv_scales_padded[..seq_len_kv].copy_from_slice(&kv_scales);
     let kv_scales_gpu = gpu.upload(&kv_scales_padded);
@@ -1137,7 +1137,7 @@ fn mqa_logits_basic() {
         let (kep, _) = k_end_gpu.device_ptr(&gpu.stream);
         let (lp, _) = logits_gpu.device_ptr_mut(&gpu.stream);
         unsafe {
-            prelude_deepgemm::fp8_mqa_logits(
+            deepgemm::fp8_mqa_logits(
                 qp as *mut c_void, kvp as *mut c_void,
                 kvsp as *mut c_void, wp as *mut c_void,
                 ksp as *mut c_void, kep as *mut c_void,
@@ -1187,7 +1187,7 @@ fn clean_logits_basic() {
         let (kep, _g2) = ke_gpu.device_ptr(&gpu.stream);
         let (lp, _g3) = logits_gpu.device_ptr_mut(&gpu.stream);
         unsafe {
-            prelude_deepgemm::clean_logits(
+            deepgemm::clean_logits(
                 ksp as *mut c_void, kep as *mut c_void,
                 lp as *mut c_void,
                 seq_len as i32, seq_len_kv as i32, stride as i32,
@@ -1222,7 +1222,7 @@ fn clean_logits_basic() {
 #[test]
 fn paged_mqa_metadata_basic() {
     let gpu = match Gpu::new() { Some(g) => g, None => return };
-    let (num_sms, _) = prelude_deepgemm::query_device();
+    let (num_sms, _) = deepgemm::query_device();
 
     let batch_size = 4;
     let split_kv = 256;
@@ -1234,7 +1234,7 @@ fn paged_mqa_metadata_basic() {
         let (cp, _) = ctx_gpu.device_ptr(&gpu.stream);
         let (mp, _) = meta_gpu.device_ptr_mut(&gpu.stream);
         unsafe {
-            prelude_deepgemm::paged_mqa_metadata(
+            deepgemm::paged_mqa_metadata(
                 cp as *mut c_void, mp as *mut c_void,
                 batch_size as i32, 1, false,
                 split_kv as i32, num_sms,
@@ -1300,7 +1300,7 @@ fn run_einsum_test(m: usize, n: usize, k: usize, s: usize, gpu: &Gpu) {
             let (bp, _) = b_gpu.device_ptr(&gpu.stream);
             let (dp, _) = d_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
-                prelude_deepgemm::einsum(
+                deepgemm::einsum(
                     ap as *mut c_void, bp as *mut c_void, dp as *mut c_void,
                     m as i32, n as i32, k as i32, s as i32,
                     gpu.stream_ptr(),
@@ -1328,7 +1328,7 @@ fn einsum_128x128x64() {
 fn einsum_128x64x64() {
     let gpu = match Gpu::new() { Some(g) => g, None => return };
     // SM100 einsum kernel set is incomplete for this M/N/K/S on B300.
-    let (_, arch) = prelude_deepgemm::query_device();
+    let (_, arch) = deepgemm::query_device();
     if arch >= 100 { eprintln!("einsum_128x64x64: skip (SM{arch})"); return; }
     run_einsum_test(128, 64, 64, 8, &gpu);
 }
@@ -1351,8 +1351,8 @@ fn einsum_128x128x128() {
 
 #[test]
 fn alignment_helpers() {
-    assert_eq!(prelude_deepgemm::get_tma_aligned_size(100, 4), 100); // 100*4=400, already 16-aligned
-    assert_eq!(prelude_deepgemm::get_tma_aligned_size(3, 4), 4);     // 3*4=12 → 16 → 4 elems
-    assert_eq!(prelude_deepgemm::get_tma_aligned_size(7, 2), 8);     // 7*2=14 → 16 → 8 elems
-    assert_eq!(prelude_deepgemm::get_mk_alignment(), 128);
+    assert_eq!(deepgemm::get_tma_aligned_size(100, 4), 100); // 100*4=400, already 16-aligned
+    assert_eq!(deepgemm::get_tma_aligned_size(3, 4), 4);     // 3*4=12 → 16 → 4 elems
+    assert_eq!(deepgemm::get_tma_aligned_size(7, 2), 8);     // 7*2=14 → 16 → 8 elems
+    assert_eq!(deepgemm::get_mk_alignment(), 128);
 }

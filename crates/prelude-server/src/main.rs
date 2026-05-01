@@ -164,6 +164,11 @@ async fn main() -> anyhow::Result<()> {
     prelude_cpu::register();
     #[cfg(feature = "cuda")]
     prelude_cuda::register();
+    // The `amd` feature + `prelude-amd` dep are commented out in
+    // Cargo.toml until t0-gpu's `tests/t0_original` submodule pin is
+    // fixed upstream. Re-add `#[cfg(feature = "amd")] prelude_amd::register();`
+    // when both are uncommented; leaving the gated call here triggers
+    // `unexpected_cfgs` warnings on every build.
 
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -176,8 +181,8 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let engine = build_engine(&cli)?;
-    let chat_template = build_chat_template(&cli)?.map(Arc::new);
+    let engine = build_engine(&cli).await?;
+    let chat_template = build_chat_template(&cli).await?.map(Arc::new);
 
     let mut api_keys = cli.api_key.clone();
     if let Ok(env_key) = std::env::var("PRELUDE_API_KEY")
@@ -204,7 +209,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
+async fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
     let task_override: TaskOverride = cli.task.into();
     if cli.pseudo {
         info!(model = %cli.model, "using pseudo engine (mock)");
@@ -222,6 +227,12 @@ fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
     }
     engine_config.cache.gpu_memory_utilization = cli.gpu_memory_utilization;
     engine_config.runtime.cuda_graph = cli.cuda_graph;
+    // Activation profiler probes at this token count so the resulting
+    // peak_activation_bytes matches the largest forward the scheduler
+    // will dispatch. Keeping these in lockstep avoids KV cache being
+    // under-allocated (when CLI < default) or activation under-estimated
+    // (when CLI > default).
+    engine_config.runtime.profile_tokens = cli.max_num_batched_tokens;
     info!(?engine_config, "engine config loaded");
 
     // Auto-detect: explicit --model-path wins. Otherwise, if --model points
@@ -237,7 +248,7 @@ fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
         Engine::from_local_path_with_task(path, &cli.model, task_override, engine_config)?
     } else {
         info!(repo = %cli.model, "loading model from HuggingFace Hub");
-        Engine::from_hf_hub_with_task(&cli.model, task_override, engine_config)?
+        Engine::from_hf_hub_with_task_async(&cli.model, task_override, engine_config).await?
     };
 
     // PRELUDE_NO_SCHEDULER=1 bypasses the scheduler and uses the base Engine directly.
@@ -286,10 +297,10 @@ fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
 
 /// Try loading chat template from HF Hub, with fallback for GGUF repos.
 /// If the repo has no tokenizer_config.json, try stripping -GGUF suffix to find the base model.
-fn load_chat_template_with_gguf_fallback(
+async fn load_chat_template_with_gguf_fallback(
     model: &str,
 ) -> anyhow::Result<Option<ModelChatTemplate>> {
-    match ModelChatTemplate::from_hf_hub(model) {
+    match ModelChatTemplate::from_hf_hub(model).await {
         Ok(Some(t)) => return Ok(Some(t)),
         Ok(None) | Err(_) => {}
     }
@@ -299,14 +310,14 @@ fn load_chat_template_with_gguf_fallback(
         .or_else(|| model.strip_suffix("-gguf"))
     {
         info!(base_model = %base, "trying base model for chat template");
-        if let Ok(Some(t)) = ModelChatTemplate::from_hf_hub(base) {
+        if let Ok(Some(t)) = ModelChatTemplate::from_hf_hub(base).await {
             return Ok(Some(t));
         }
     }
     Ok(None)
 }
 
-fn build_chat_template(cli: &Cli) -> anyhow::Result<Option<ModelChatTemplate>> {
+async fn build_chat_template(cli: &Cli) -> anyhow::Result<Option<ModelChatTemplate>> {
     if cli.pseudo {
         return Ok(None);
     }
@@ -318,10 +329,10 @@ fn build_chat_template(cli: &Cli) -> anyhow::Result<Option<ModelChatTemplate>> {
         if local.is_some() {
             local
         } else {
-            load_chat_template_with_gguf_fallback(&cli.model)?
+            load_chat_template_with_gguf_fallback(&cli.model).await?
         }
     } else {
-        load_chat_template_with_gguf_fallback(&cli.model)?
+        load_chat_template_with_gguf_fallback(&cli.model).await?
     };
 
     if template.is_some() {

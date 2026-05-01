@@ -120,9 +120,8 @@ fn extract_eos_token_ids(raw: &serde_json::Value, task: TaskKind) -> Result<Vec<
         return Ok(Vec::new());
     }
 
-    // Multi-modal / nested-text-config models (e.g. Qwen3.5-MoE,
-    // Gemma3 multi-modal) put generation knobs under `text_config`. Look
-    // there too, with the root taking precedence when both are present.
+    // VL models (e.g. Qwen3.5-35B-A3B) nest eos_token_id inside text_config.
+    // Look at the top level first, then fall through to text_config.
     let value = raw
         .get("eos_token_id")
         .or_else(|| raw.get("text_config").and_then(|tc| tc.get("eos_token_id")))

@@ -14,11 +14,12 @@
 
 pub mod cascade;
 pub mod loader;
+pub mod moe;
 pub mod sparse;
 pub mod types;
 
 pub use loader::{
-    Backend, DecodeKey, DecodeVariant, FP8PrefillKey, KernelDtype, KernelRegistry,
-    MLADecodeKey, MLADecodeVariant, MLAPagedKey, MLAPagedVariant,
-    MaskMode, PodKey, PodVariant, PrefillKey, PrefillVariant, TVMSafeCallFn,
+    Backend, DecodeKey, DecodeVariant, FP8PrefillKey, KernelDtype, KernelRegistry, MLADecodeKey,
+    MLADecodeVariant, MLAPagedKey, MLAPagedVariant, MaskMode, PrefillKey, PrefillVariant,
+    TVMSafeCallFn,
 };

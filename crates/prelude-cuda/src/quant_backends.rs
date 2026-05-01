@@ -14,8 +14,8 @@ use crate::device::{self, CuResultExt};
 
 // ── GgmlDType → quant-gemm GgmlType ─────────────────────────────────
 
-fn to_ggml_type(dtype: GgmlDType) -> Option<prelude_quant_gemm::GgmlType> {
-    use prelude_quant_gemm::GgmlType;
+fn to_ggml_type(dtype: GgmlDType) -> Option<quant_gemm::GgmlType> {
+    use quant_gemm::GgmlType;
     Some(match dtype {
         GgmlDType::Q4_0 => GgmlType::Q4_0,
         GgmlDType::Q4_1 => GgmlType::Q4_1,
@@ -40,7 +40,7 @@ fn to_ggml_type(dtype: GgmlDType) -> Option<prelude_quant_gemm::GgmlType> {
 struct GpuQuantLinear {
     /// Raw quantized weight bytes on GPU, as a U8 Tensor.
     gpu_weights: Tensor,
-    ggml_type: prelude_quant_gemm::GgmlType,
+    ggml_type: quant_gemm::GgmlType,
     n: usize,
     k: usize,
 }

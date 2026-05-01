@@ -6,7 +6,34 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-include!("../../../build_log.rs");
+// ── Inlined workspace helper (keep this crate self-contained) ──────
+
+macro_rules! build_log {
+    ($($arg:tt)*) => {{
+        let _msg = format!($($arg)*);
+        eprintln!("  [{}] {_msg}", env!("CARGO_PKG_NAME"));
+        println!("cargo:warning={}", _msg);
+    }};
+}
+
+#[allow(dead_code)]
+fn track_submodule(name: &str) {
+    let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let mut dir = manifest.as_path();
+    loop {
+        if dir.join(".git").is_dir() {
+            let head = dir.join(format!(".git/modules/third_party/{name}/HEAD"));
+            if head.exists() {
+                println!("cargo:rerun-if-changed={}", head.display());
+            }
+            return;
+        }
+        match dir.parent() {
+            Some(p) => dir = p,
+            None => return,
+        }
+    }
+}
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -114,7 +141,7 @@ fn main() {
     });
 
     // 7. Create static archive (CUDA + CPU objects)
-    let lib = out_dir.join("libprelude_quant_gemm.a");
+    let lib = out_dir.join("libquant_gemm.a");
     let status = Command::new(&nvcc)
         .args(["--lib", "-o", lib.to_str().unwrap()])
         .arg(&obj)
@@ -129,7 +156,7 @@ fn main() {
 
     // 8. Link
     println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=prelude_quant_gemm");
+    println!("cargo:rustc-link-lib=static=quant_gemm");
 
     // CUDA runtime (static) — no libcudart.so needed at runtime
     let cuda_lib = cuda_path.join("lib64");

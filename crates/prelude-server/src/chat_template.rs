@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::Local;
-use hf_hub::api::sync::{Api, ApiRepo};
+use hf_hub::api::tokio::{Api, ApiRepo};
 use minijinja::{context, Environment, Error, ErrorKind};
 use minijinja_contrib::pycompat::unknown_method_callback;
 use prelude_core::ChatMessage;
@@ -41,12 +41,12 @@ impl ModelChatTemplate {
         Self::from_sources(template_file, tokenizer_config)
     }
 
-    pub fn from_hf_hub(repo_id: &str) -> Result<Option<Self>> {
+    pub async fn from_hf_hub(repo_id: &str) -> Result<Option<Self>> {
         let api = Api::new().context("failed to initialize hf-hub api")?;
         let repo = api.model(repo_id.to_string());
-        let template_file = read_optional_repo_file(&repo, "chat_template.jinja")?;
+        let template_file = read_optional_repo_file(&repo, "chat_template.jinja").await?;
         let tokenizer_config =
-            load_tokenizer_config(read_optional_repo_file(&repo, "tokenizer_config.json")?)?;
+            load_tokenizer_config(read_optional_repo_file(&repo, "tokenizer_config.json").await?)?;
         Self::from_sources(template_file, tokenizer_config)
     }
 
@@ -247,8 +247,8 @@ fn read_optional_file(path: &Path) -> Result<Option<String>> {
     })?))
 }
 
-fn read_optional_repo_file(repo: &ApiRepo, filename: &str) -> Result<Option<String>> {
-    let Ok(path) = repo.get(filename) else {
+async fn read_optional_repo_file(repo: &ApiRepo, filename: &str) -> Result<Option<String>> {
+    let Ok(path) = repo.get(filename).await else {
         return Ok(None);
     };
     Ok(Some(fs::read_to_string(&path).with_context(|| {
@@ -314,10 +314,11 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore = "debug helper for real HF tokenizer templates"]
-    fn renders_real_qwen3_template_smoke() {
+    async fn renders_real_qwen3_template_smoke() {
         let template = ModelChatTemplate::from_hf_hub("Qwen/Qwen3-0.6B")
+            .await
             .unwrap()
             .expect("Qwen3 template should exist");
         let rendered = template.render(&[

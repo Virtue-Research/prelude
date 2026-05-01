@@ -37,7 +37,6 @@ use crate::scheduler::{
     Sequence, SamplingParams,
 };
 use crate::types::{GenerateResult, StreamEvent};
-use crate::tensor::{DType, Tensor};
 
 // ── Response channel ───────────────────────────────────────────────
 
@@ -146,10 +145,11 @@ pub async fn ar_loop(
     let mut rx_open = true;
 
     loop {
+        let deltanet_pool_ref = engine.cache.deltanet_pool.as_ref();
         // ── Phase 1: Wait for at least one request if idle ─────────
         if !scheduler.has_work() {
             match rx.recv().await {
-                Some(msg) => handle_message(msg, &mut scheduler, &mut states),
+                Some(msg) => handle_message(msg, &mut scheduler, &mut states, deltanet_pool_ref),
                 None => { rx_open = false; }
             }
         }
@@ -157,7 +157,7 @@ pub async fn ar_loop(
         // ── Phase 2: Drain all pending messages (non-blocking) ─────
         loop {
             match rx.try_recv() {
-                Ok(msg) => handle_message(msg, &mut scheduler, &mut states),
+                Ok(msg) => handle_message(msg, &mut scheduler, &mut states, deltanet_pool_ref),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => { rx_open = false; break; }
             }
@@ -165,7 +165,7 @@ pub async fn ar_loop(
 
         // ── Phase 3: Schedule next step ────────────────────────────
         // schedule_step() syncs block availability internally.
-        let Some(step) = scheduler.schedule_step() else {
+        let Some(mut step) = scheduler.schedule_step() else {
             if !rx_open && !scheduler.has_work() { break; }
             tokio::task::yield_now().await;
             continue;
@@ -174,7 +174,11 @@ pub async fn ar_loop(
         // ── Phase 4: Build batch + forward + process output ──────────
         // Pure decode → ForwardBatch::Decode (CUDA graph eligible).
         // Anything with prefill → ForwardBatch::Mixed (single forward pass).
-        let batch = build_step_batch(&engine, &mut scheduler, &mut states, &step);
+        // `build_step_batch` may shrink `step` in place when the KV
+        // block pool is exhausted (see the `retain`/rollback paths
+        // inside) so process_step_output, fail_step, etc. all see a
+        // step that exactly matches what the executor actually ran.
+        let batch = build_step_batch(&engine, &mut scheduler, &mut states, &mut step);
         let handle = match executor.submit(batch) {
             Ok(h) => h,
             Err(error) => {
@@ -195,9 +199,10 @@ pub async fn ar_loop(
     }
 
     // Shutdown: fail remaining requests
+    let deltanet_pool_ref = engine.cache.deltanet_pool.as_ref();
     for (id, state) in states.drain() {
-        release_resources(&engine, &mut scheduler, &id);
-        fail_state(&engine, state, EngineError::Unavailable("AR loop stopped".into()));
+        release_resources(deltanet_pool_ref, &mut scheduler, &id);
+        fail_state(state, EngineError::Unavailable("AR loop stopped".into()));
     }
     tracing::info!("AR loop exited");
 }
@@ -208,11 +213,12 @@ fn handle_message(
     msg: ArMessage,
     scheduler: &mut Scheduler,
     states: &mut HashMap<String, ArSequenceState>,
+    deltanet_pool: Option<&std::sync::Mutex<crate::cache::deltanet_pool::DeltaNetPool>>,
 ) {
     match msg {
         ArMessage::NewRequest { prepared, response } => {
             let request_id = prepared.request.request_id.clone();
-            let seq = Sequence::new(
+            let mut seq = Sequence::new(
                 request_id.clone(),
                 prepared.prompt_tokens.clone(),
                 SamplingParams::default(),
@@ -221,6 +227,53 @@ fn handle_message(
                 prepared.request.stop.token_ids.clone(),
                 None,
             );
+            // Allocate a DeltaNet pool slot for hybrid models before queueing.
+            // `allocate` zeros the slot so a fresh request always starts from
+            // clean recurrent + conv state; `release_resources` frees it when
+            // the sequence finishes.
+            //
+            // Fail the request if the pool is exhausted: `build_step_batch`
+            // only forwards `deltanet_slots` when *every* sequence in the
+            // batch has one, so a single slotless admission flips the whole
+            // batch onto the non-pooled linear-attention path that clears
+            // recurrent state every step — silently corrupting all
+            // co-batched DeltaNet requests, not just the slotless one.
+            if let Some(pool_mutex) = deltanet_pool {
+                let allocated = pool_mutex
+                    .lock()
+                    .ok()
+                    .and_then(|mut pool| pool.allocate());
+                match allocated {
+                    Some(slot) => {
+                        seq.deltanet_slot = Some(slot);
+                    }
+                    None => {
+                        let mut state = ArSequenceState {
+                            request_id: prepared.request.request_id.clone(),
+                            prepared: Some(prepared),
+                            response,
+                            gen_start: Instant::now(),
+                            prefill_ms: 0.0,
+                            started_sent: false,
+                            sent_text_len: 0,
+                            pending_token: None,
+                            output_tokens: Vec::new(),
+                            token_logprobs: Vec::new(),
+                            prompt_token_logprobs: None,
+                            max_new_tokens: 0,
+                        };
+                        state.ensure_started();
+                        fail_state(
+                            state,
+                            EngineError::Unavailable(
+                                "DeltaNet pool exhausted — increase `deltanet_pool_slots` or retry"
+                                    .into(),
+                            ),
+                        );
+                        return;
+                    }
+                }
+            }
             scheduler.add_request(seq);
             let max_new_tokens = prepared.max_new;
             states.insert(request_id, ArSequenceState {
@@ -239,6 +292,11 @@ fn handle_message(
             });
         }
         ArMessage::Abort(request_id) => {
+            // Free the DeltaNet pool slot + any allocated KV blocks before
+            // dropping the sequence: skipping this leaks a slot per cancelled
+            // request, which exhausts the (small) DeltaNet pool under heavy
+            // cancel-and-retry load and starves new admissions.
+            release_resources(deltanet_pool, scheduler, &request_id);
             let _ = scheduler.abort_request(&request_id);
             states.remove(&request_id);
         }
@@ -260,7 +318,7 @@ fn build_step_batch(
     engine: &Engine,
     scheduler: &mut Scheduler,
     states: &mut HashMap<String, ArSequenceState>,
-    step: &SchedulerStep,
+    step: &mut SchedulerStep,
 ) -> ForwardBatch {
     use crate::engine::executor::StepRequest;
 
@@ -285,6 +343,35 @@ fn build_step_batch(
                 }
             }
         }
+        // Filter out requests whose block_table doesn't cover the current
+        // decode position (allocate_block above returned None — KV pool
+        // exhausted). We MUST drop these IDs from `step` itself: the
+        // outer loop in `process_step_output` indexes the forward output
+        // by position in `step.decode_request_ids`, so a length mismatch
+        // between the batch we forward and the IDs we iterate would
+        // misalign every logits row after the first skip and silently
+        // mis-sample tokens for unrelated requests. The skipped requests
+        // stay in the scheduler so the next step retries once blocks free.
+        let mut deferred: Vec<String> = Vec::new();
+        step.decode_request_ids.retain(|id| {
+            let Some(seq) = scheduler.get_sequence(id) else {
+                deferred.push(id.clone());
+                return false;
+            };
+            let position = seq.total_len() - 1;
+            if seq.block_table.len() * block_size <= position {
+                tracing::warn!(
+                    request_id = %id,
+                    position,
+                    blocks = seq.block_table.len(),
+                    "KV block pool exhausted for decode — deferring this request"
+                );
+                deferred.push(id.clone());
+                return false;
+            }
+            true
+        });
+
         let cap = step.decode_request_ids.len();
         let mut tokens = Vec::with_capacity(cap);
         let mut positions = Vec::with_capacity(cap);
@@ -293,10 +380,11 @@ fn build_step_batch(
         let mut has_dn = false;
         for id in &step.decode_request_ids {
             if let (Some(state), Some(seq)) = (states.get(id), scheduler.get_sequence(id)) {
+                let position = seq.total_len() - 1;
                 tokens.push(state.pending_token.unwrap_or(0));
                 // position = total_len() - 1: the decode token's 0-indexed position
                 // (output_ids already contains this token from on_token_generated)
-                positions.push(seq.total_len() - 1);
+                positions.push(position);
                 block_tables.push(seq.block_table.clone());
                 if let Some(slot) = seq.deltanet_slot {
                     dn_slots.push(slot);
@@ -314,20 +402,28 @@ fn build_step_batch(
 
     // Mixed or prefill-only → build unified StepRequests
     let mut requests: Vec<StepRequest> = Vec::new();
+    let block_size = engine.cache.paged_pool.as_ref().map(|p| p.block_size).unwrap_or(16);
 
-    // Prefill requests: allocate blocks for the chunk, build StepRequest.
-    // The scheduler already updated kv_computed_len += chunk_len during schedule_step.
-    // Recover the pre-update offset: computed = kv_computed_len - chunk_len.
+    // ── Prefill: try to allocate blocks; if pool is exhausted, drop the
+    // request from `step` AND roll back the kv_computed_len bump that
+    // `Scheduler::schedule_step` performed when planning this step. The
+    // request stays in the scheduler so the same chunk can be retried
+    // next step; failing to roll back would make the scheduler think
+    // those tokens were already cached, and the next forward would
+    // start from a pointer past the (still-uncomputed) tokens — wrong
+    // attention output forever.
+    let mut prefill_keep: Vec<bool> = Vec::with_capacity(step.prefill_request_ids.len());
     for (idx, id) in step.prefill_request_ids.iter().enumerate() {
-        let Some(seq) = scheduler.get_sequence(id) else { continue; };
         let chunk_len = step.prefill_chunk_lens.get(idx).copied().unwrap_or(0);
+        let Some(seq) = scheduler.get_sequence(id) else {
+            prefill_keep.push(false);
+            continue;
+        };
         let computed = seq.kv_computed_len.saturating_sub(chunk_len);
         let full_prompt_len = seq.input_ids.len();
         let is_final = computed + chunk_len >= full_prompt_len;
         let end = if is_final { full_prompt_len } else { computed + chunk_len };
 
-        // Allocate blocks for this chunk
-        let block_size = engine.cache.paged_pool.as_ref().map(|p| p.block_size).unwrap_or(16);
         let total_blocks_needed = end.div_ceil(block_size);
         let current_blocks = seq.block_table.len();
         let deltanet_slot = seq.deltanet_slot;
@@ -342,9 +438,6 @@ fn build_step_batch(
                     None => break,
                 }
             }
-            // If the pool was exhausted, skip this chunk rather than build a
-            // short block_table. batch_mixed_paged indexes block_table by
-            // pos / block_size and would panic on an undersized table.
             let actual = scheduler
                 .get_sequence(id)
                 .map(|s| s.block_table.len())
@@ -354,14 +447,23 @@ fn build_step_batch(
                     request_id = %id,
                     needed = total_blocks_needed,
                     got = actual,
-                    "KV block pool exhausted during prefill chunk allocation — skipping this step"
+                    "KV block pool exhausted during prefill chunk allocation — deferring"
                 );
+                if let Some(seq_mut) = scheduler.get_sequence_mut(id) {
+                    seq_mut.kv_computed_len = seq_mut.kv_computed_len.saturating_sub(chunk_len);
+                    if seq_mut.status == crate::scheduler::SequenceStatus::Decoding {
+                        seq_mut.status = crate::scheduler::SequenceStatus::Prefilling;
+                    }
+                }
+                prefill_keep.push(false);
                 continue;
             }
         }
 
-        // Re-borrow after potential mutation
-        let Some(seq) = scheduler.get_sequence(id) else { continue; };
+        let Some(seq) = scheduler.get_sequence(id) else {
+            prefill_keep.push(false);
+            continue;
+        };
         let chunk_tokens = seq.input_ids[computed..end].to_vec();
         let prompt_logprobs = states.get(id)
             .and_then(|s| s.prepared.as_ref())
@@ -376,20 +478,26 @@ fn build_step_batch(
             deltanet_slot,
             prompt_logprobs,
         });
-
-        // Take prepared on final chunk (consumed by sampling in process_step_output)
-        if is_final {
-            // prepared is taken later in process_step_output for sampling
-        }
+        prefill_keep.push(true);
+    }
+    // Compact step.prefill_request_ids / step.prefill_chunk_lens by
+    // dropping the indices we marked false. process_step_output walks
+    // both vectors index-parallel with the forward output, so they MUST
+    // shrink together.
+    {
+        let mut keep_iter = prefill_keep.iter().copied();
+        step.prefill_request_ids.retain(|_| keep_iter.next().unwrap_or(false));
+        let mut keep_iter = prefill_keep.iter().copied();
+        step.prefill_chunk_lens.retain(|_| keep_iter.next().unwrap_or(false));
     }
 
-    // Decode requests: total_len() already includes the decode token
-    // (pushed by on_token_generated). position = total_len()-1, context_len = total_len().
-    let block_size = engine.cache.paged_pool.as_ref().map(|p| p.block_size).unwrap_or(16);
+    // ── Decode: same pattern as the pure-decode branch above. Try to
+    // grow block_table; drop deferred requests from step.decode_request_ids
+    // so the index-parallel logits walk in process_step_output stays
+    // aligned with what we actually forward.
     for id in &step.decode_request_ids {
         if let Some(seq) = scheduler.get_sequence(id) {
-            let seq_len = seq.total_len();
-            let position = seq_len - 1;
+            let position = seq.total_len() - 1;
             if position % block_size == 0 {
                 if let Some(new_block) = scheduler.allocate_block() {
                     if let Some(seq_mut) = scheduler.get_sequence_mut(id) {
@@ -399,13 +507,29 @@ fn build_step_batch(
             }
         }
     }
+    step.decode_request_ids.retain(|id| {
+        let Some(seq) = scheduler.get_sequence(id) else { return false; };
+        let position = seq.total_len() - 1;
+        if seq.block_table.len() * block_size <= position {
+            tracing::warn!(
+                request_id = %id,
+                position,
+                blocks = seq.block_table.len(),
+                "KV block pool exhausted for decode in mixed batch — deferring"
+            );
+            return false;
+        }
+        true
+    });
+
     for id in &step.decode_request_ids {
         if let (Some(state), Some(seq)) = (states.get(id), scheduler.get_sequence(id)) {
             let seq_len = seq.total_len();
+            let position = seq_len - 1;
             requests.push(StepRequest {
                 tokens: vec![state.pending_token.unwrap_or(0)],
                 context_len: seq_len,
-                position_start: seq_len - 1,
+                position_start: position,
                 block_table: seq.block_table.clone(),
                 is_prefill_final: false,
                 is_prefill_partial: false,
@@ -481,19 +605,70 @@ fn process_step_output(
         logit_row += 1;
     }
 
-    // ── Decode results ────────────────────────────────────────────
-    for request_id in &step.decode_request_ids {
-        let Some(state) = states.get_mut(request_id) else {
-            logit_row += 1;
-            continue;
+    // ── Decode results (batched GPU sampling) ──────────────────────
+    let num_decode = step.decode_request_ids.len();
+    if num_decode > 0 {
+        let decode_start_row = logit_row;
+
+        // Check if all decode sequences are greedy
+        let all_greedy = step.decode_request_ids.iter().all(|id| {
+            states.get(id).map(|s| s.is_greedy()).unwrap_or(true)
+        });
+
+        // Try batched GPU sampling for all-greedy decode batches
+        let batched_tokens: Option<Vec<u32>> = if all_greedy && num_decode > 1 {
+            // Slice the decode portion of logits: [num_decode, vocab_size]
+            output.logits
+                .narrow(0, decode_start_row, num_decode)
+                .ok()
+                .and_then(|decode_logits| {
+                    // Try GPU batched sampling first (deterministic = greedy)
+                    if let Some(result) = engine.executor.ops.sample_from_logits(&decode_logits, true) {
+                        match result {
+                            Ok(token_ids) => token_ids.to_vec1::<u32>().ok(),
+                            Err(_) => None,
+                        }
+                    } else {
+                        // Fallback: batched argmax on GPU, single D2H copy
+                        decode_logits
+                            .argmax(crate::tensor::D::Minus1)
+                            .and_then(|t| t.to_vec1::<u32>())
+                            .ok()
+                    }
+                })
+        } else {
+            None
         };
 
-        if let Ok(row) = output.logits.get(logit_row) {
-            let token = sample_token(&row, state);
-            let lp = extract_token_logprobs(engine, &row, token, state);
+        for (i, request_id) in step.decode_request_ids.iter().enumerate() {
+            let Some(state) = states.get_mut(request_id) else {
+                logit_row += 1;
+                continue;
+            };
+
+            // Always grab the per-row logits — needed for top-k logprob
+            // extraction even when the token itself was sampled in a
+            // batched GPU pass above.
+            let row = output.logits.get(logit_row).ok();
+
+            let token = if let Some(ref tokens) = batched_tokens {
+                tokens[i]
+            } else if let Some(ref row) = row {
+                sample_token(row, state)
+            } else {
+                0
+            };
+
+            // Per-token top-k logprobs when requested. Without this the
+            // /v1/completions response leaves `logprobs.tokens = [first_only]`
+            // and downstream tools count tokens via `len(logprobs.tokens)`.
+            let lp = row
+                .as_ref()
+                .and_then(|r| extract_token_logprobs(engine, r, token, state));
+
             process_single_token(engine, scheduler, state, request_id, token, lp, &mut completed);
+            logit_row += 1;
         }
-        logit_row += 1;
     }
 
     for (request_id, finish_reason) in completed {
@@ -501,7 +676,7 @@ fn process_step_output(
         let prompt_len = scheduler.get_sequence(&request_id)
             .map(|seq| seq.input_ids.len())
             .unwrap_or(0);
-        release_resources(engine, scheduler, &request_id);
+        release_resources(engine.cache.deltanet_pool.as_ref(), scheduler, &request_id);
         scheduler.finish_request(&request_id, seq_finish_reason(&finish_reason));
         if let Some(state) = states.remove(&request_id) {
             finish_state(engine, state, finish_reason, prompt_len);
@@ -629,10 +804,17 @@ fn finish_state(engine: &Engine, mut state: ArSequenceState, finish_reason: Fini
     }
 }
 
-fn fail_state(_engine: &Engine, state: ArSequenceState, error: EngineError) {
+fn fail_state(mut state: ArSequenceState, error: EngineError) {
+    state.ensure_started();
     match state.response {
-        ResponseChannel::Complete(tx) => { let _ = tx.send(Err(error)); }
-        ResponseChannel::Stream(_) => {} // Dropping sender closes the stream
+        ResponseChannel::Complete(tx) => {
+            let _ = tx.send(Err(error));
+        }
+        ResponseChannel::Stream(tx) => {
+            let _ = tx.send(StreamEvent::Error {
+                message: error.to_string(),
+            });
+        }
     }
 }
 
@@ -644,22 +826,26 @@ fn fail_step(
     error: EngineError,
 ) {
     for id in step.prefill_request_ids.iter().chain(step.decode_request_ids.iter()) {
-        release_resources(engine, scheduler, id);
+        release_resources(engine.cache.deltanet_pool.as_ref(), scheduler, id);
         let _ = scheduler.abort_request(id);
         if let Some(state) = states.remove(id) {
-            fail_state(engine, state, error.clone());
+            fail_state(state, error.clone());
         }
     }
 }
 
-fn release_resources(engine: &Engine, scheduler: &mut Scheduler, request_id: &str) {
+fn release_resources(
+    deltanet_pool: Option<&std::sync::Mutex<crate::cache::deltanet_pool::DeltaNetPool>>,
+    scheduler: &mut Scheduler,
+    request_id: &str,
+) {
     if let Some(seq) = scheduler.get_sequence(request_id) {
         if !seq.block_table.is_empty() {
             let blocks = seq.block_table.clone();
             scheduler.free_blocks(&blocks);
         }
         if let Some(slot) = seq.deltanet_slot {
-            if let Some(pool_mutex) = engine.cache.deltanet_pool.as_ref() {
+            if let Some(pool_mutex) = deltanet_pool {
                 if let Ok(mut pool) = pool_mutex.lock() {
                     pool.free(slot);
                 }
@@ -727,6 +913,7 @@ mod tests {
             },
             &mut scheduler,
             &mut states,
+            None,
         );
 
         assert_eq!(scheduler.num_waiting(), 1);
@@ -747,6 +934,7 @@ mod tests {
             },
             &mut scheduler,
             &mut states,
+            None,
         );
         assert_eq!(scheduler.num_waiting(), 1);
 
@@ -754,6 +942,7 @@ mod tests {
             ArMessage::Abort("r1".into()),
             &mut scheduler,
             &mut states,
+            None,
         );
         assert!(states.is_empty());
     }
@@ -840,6 +1029,7 @@ mod tests {
             ArMessage::NewRequest { prepared, response: ResponseChannel::Complete(tx) },
             &mut Scheduler::new(SchedulerConfig::default()),
             &mut states,
+            None,
         );
 
         assert!(states.get("r1").unwrap().prepared.is_some());

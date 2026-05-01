@@ -285,3 +285,61 @@ extern "C" void moe_gemm_wmma(
     }
 #endif
 }
+
+/// In-place swap of gate/up halves in experts_gate_up weight tensor.
+/// Swaps [E, 0:inter, H] ↔ [E, inter:2*inter, H] using a 2MB temp buffer.
+/// Called once at model load time. No extra memory retained.
+extern "C" void moe_swap_gate_up_inplace(
+    void* data,          // [num_experts, 2*inter, hidden] BF16
+    int num_experts,
+    int inter,           // moe_intermediate_size (half of dim1)
+    int hidden,
+    cudaStream_t stream
+) {
+    size_t half_bytes = (size_t)inter * hidden * sizeof(__nv_bfloat16);
+    void* temp = nullptr;
+    cudaMalloc(&temp, half_bytes);
+
+    for (int e = 0; e < num_experts; e++) {
+        char* base = (char*)data + (size_t)e * 2 * inter * hidden * sizeof(__nv_bfloat16);
+        char* first_half = base;                          // gate
+        char* second_half = base + half_bytes;             // up
+        // swap: first ↔ second via temp
+        cudaMemcpyAsync(temp, first_half, half_bytes, cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(first_half, second_half, half_bytes, cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(second_half, temp, half_bytes, cudaMemcpyDeviceToDevice, stream);
+    }
+    cudaStreamSynchronize(stream);
+    cudaFree(temp);
+}
+
+/// Sort expert assignments by expert ID on GPU using thrust.
+/// Produces globally sorted (expert_ids, token_ids) arrays suitable for
+/// the grouped GEMM kernel.
+///
+/// @param expert_ids_in   [n] Device — flat expert IDs (not necessarily sorted)
+/// @param n               Total element count (num_tokens * topk)
+/// @param sorted_experts  [n] Device output — expert IDs sorted ascending
+/// @param sorted_tokens   [n] Device output — corresponding token indices
+/// @param stream          CUDA stream
+extern "C" void moe_sort_expert_assignments(
+    const uint32_t* expert_ids_in,
+    int n,
+    uint32_t* sorted_experts,
+    uint32_t* sorted_tokens,
+    cudaStream_t stream
+) {
+    // Copy expert_ids to sorted_experts (thrust sorts in-place)
+    cudaMemcpyAsync(sorted_experts, expert_ids_in, n * sizeof(uint32_t),
+                    cudaMemcpyDeviceToDevice, stream);
+
+    // Initialize sorted_tokens to [0, 1, 2, ..., n-1]
+    thrust::device_ptr<uint32_t> token_ptr(sorted_tokens);
+    thrust::sequence(thrust::cuda::par.on(stream), token_ptr, token_ptr + n, 0u);
+
+    // Sort by expert ID (key), carrying token indices (value)
+    thrust::device_ptr<uint32_t> expert_ptr(sorted_experts);
+    thrust::sort_by_key(thrust::cuda::par.on(stream),
+                        expert_ptr, expert_ptr + n,
+                        token_ptr);
+}

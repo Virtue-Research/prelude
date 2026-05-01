@@ -26,7 +26,14 @@ MAX_TIME_MIN="${MAX_TIME_MIN:-20}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PRELUDE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-PRELUDE_BIN="$PRELUDE_DIR/target/release/prelude-server"
+# Prefer dist (fat LTO), fall back to release. Override via PRELUDE_BIN env.
+if [ -n "${PRELUDE_BIN:-}" ]; then
+    : # caller overrode
+elif [ -f "$PRELUDE_DIR/target/dist/prelude-server" ]; then
+    PRELUDE_BIN="$PRELUDE_DIR/target/dist/prelude-server"
+else
+    PRELUDE_BIN="$PRELUDE_DIR/target/release/prelude-server"
+fi
 VLLM_RS_BIN="${VLLM_RS_DIR:-$PRELUDE_DIR/../vllm.rs}/target/release/vllm-rs"
 LLAMA_CPP_DIR="${LLAMA_CPP_DIR:-$PRELUDE_DIR/../llama.cpp}"
 LLAMA_CPP_BIN="${LLAMA_CPP_BIN:-$LLAMA_CPP_DIR/build/bin/llama-server}"

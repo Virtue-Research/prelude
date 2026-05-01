@@ -1,0 +1,22 @@
+[package]
+name = "causal-conv1d"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+license = "Apache-2.0"
+description = "Rust bindings to Dao-AILab causal-conv1d CUDA kernels (fused short 1D causal convolution for Mamba/Qwen3-next/Qwen3.5 DeltaNet layers). Statically linked, no libtorch dependency."
+repository = "https://github.com/Dao-AILab/causal-conv1d"
+
+[lib]
+name = "causal_conv1d"
+path = "src/lib.rs"
+
+[dependencies]
+tracing = "0.1"
+
+[build-dependencies]
+anyhow = "1"
+
+[dev-dependencies]
+cudarc = { version = "0.19.4", features = ["std", "cuda-version-from-build-system", "f16"] }
+half = "2.7.1"

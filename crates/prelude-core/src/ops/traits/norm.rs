@@ -6,11 +6,7 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
     let x32 = x.to_dtype(DType::F32)?;
     let var = x32.sqr()?.mean_keepdim(x.rank() - 1)?;
     let normed = x32.broadcast_div(&(var + eps as f64)?.sqrt()?)?;
-    // weight is [D], normed is [..., D] — use broadcast_mul, not `*`
-    // (`*` is strict shape-match and panics on rank mismatch).
-    normed
-        .broadcast_mul(&weight.to_dtype(DType::F32)?)?
-        .to_dtype(x.dtype())
+    normed.broadcast_mul(&weight.to_dtype(DType::F32)?)?.to_dtype(x.dtype())
 }
 
 pub fn layer_norm(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>, eps: f32) -> Result<Tensor> {

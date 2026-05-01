@@ -148,7 +148,9 @@ def compute_server_ppl(server_url, model_name, tokenizer, chunks):
 def main():
     parser = argparse.ArgumentParser(description="WikiText PPL test (vLLM-compatible)")
     parser.add_argument("--server", default=None, help="Server URL (e.g. http://localhost:8001)")
-    parser.add_argument("--binary", default=None, help="Path to prelude-server binary (auto-start)")
+    parser.add_argument("--binary", default=None,
+                        help="Path to prelude-server binary (auto-start). "
+                             "If omitted, auto-discovers target/dist/ or target/release/.")
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu"],
                         help="Server device (auto=GPU if available, cpu=CPU only)")
@@ -212,9 +214,19 @@ def main():
     proc = None
     server_url = args.server
     if not server_url:
-        if not args.binary:
-            print("ERROR: provide --server URL or --binary path")
-            sys.exit(1)
+        binary = args.binary
+        if not binary:
+            # Auto-discover: prefer dist (optimised), fall back to release.
+            for candidate in ["target/dist/prelude-server", "target/release/prelude-server"]:
+                if os.path.isfile(candidate):
+                    binary = candidate
+                    break
+            if not binary:
+                print("ERROR: no binary found. Build with:\n"
+                      "  cargo build --profile dist -p prelude-server --features full\n"
+                      "or pass --binary <path> / --server <url>")
+                sys.exit(1)
+            print(f"  Auto-discovered binary: {binary}")
         port = 18878
         server_url = f"http://localhost:{port}"
         # Kill any existing server on this port
@@ -226,7 +238,7 @@ def main():
             # GPU needs paged attention
             env["PRELUDE_PAGED_ATTN_BLOCKS"] = "1024"
             env["PRELUDE_PAGED_BLOCK_SIZE"] = "128"
-        cmd = [args.binary, "--host", "0.0.0.0", "--port", str(port),
+        cmd = [binary, "--host", "0.0.0.0", "--port", str(port),
                "--model", args.model, "--dtype", args.dtype]
         print(f"  Starting: {' '.join(cmd)}")
         print(f"  Env: PRELUDE_DEVICE={args.device}")

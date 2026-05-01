@@ -128,6 +128,10 @@ impl<'de> serde::Deserialize<'de> for Qwen3_5Config {
     {
         let raw: serde_json::Value = serde::Deserialize::deserialize(deserializer)?;
 
+        // `tie_word_embeddings` can live at the top level (Qwen3.5-35B-A3B) or
+        // inside `text_config` (dense Qwen3.5 variants). Read top-level first.
+        let top_tie = raw.get("tie_word_embeddings").and_then(|v| v.as_bool());
+
         // If this is a VL model with text_config, extract the sub-object
         let text_val = if let Some(tc) = raw.get("text_config") {
             tc.clone()
@@ -155,6 +159,18 @@ impl<'de> serde::Deserialize<'de> for Qwen3_5Config {
                 })
         });
 
+        // Extract partial_rotary_factor: try direct field, then nested in rope_parameters
+        // (Qwen3.5-35B-A3B stores it there; dense variants store it flat).
+        let partial_rotary_factor = r.partial_rotary_factor.or_else(|| {
+            r.rope_parameters
+                .as_ref()
+                .and_then(|v| v.get("partial_rotary_factor"))
+                .and_then(|b| b.as_f64())
+        });
+
+        // tie_word_embeddings fallback: top-level JSON → text_config field → default false.
+        let tie_word_embeddings = top_tie.unwrap_or(r.tie_word_embeddings);
+
         Ok(Qwen3_5Config {
             vocab_size: resolve_or_warn!(r.vocab_size, 248320, "vocab_size", MODEL),
             hidden_size: resolve_or_warn!(r.hidden_size, 2048, "hidden_size", MODEL),
@@ -166,7 +182,7 @@ impl<'de> serde::Deserialize<'de> for Qwen3_5Config {
             max_position_embeddings: resolve_or_warn!(r.max_position_embeddings, 262144, "max_position_embeddings", MODEL),
             rms_norm_eps: resolve_or_warn!(r.rms_norm_eps, 1e-6, "rms_norm_eps", MODEL),
             rope_theta: resolve_or_warn!(rope_theta, 10_000_000.0, "rope_theta", MODEL),
-            partial_rotary_factor: resolve_or_warn!(r.partial_rotary_factor, 0.25, "partial_rotary_factor", MODEL),
+            partial_rotary_factor: resolve_or_warn!(partial_rotary_factor, 0.25, "partial_rotary_factor", MODEL),
             full_attention_interval: resolve_or_warn!(r.full_attention_interval, 4, "full_attention_interval", MODEL),
             attn_output_gate: resolve_or_warn!(r.attn_output_gate, true, "attn_output_gate", MODEL),
             linear_num_key_heads: resolve_or_warn!(r.linear_num_key_heads, 16, "linear_num_key_heads", MODEL),
@@ -174,7 +190,7 @@ impl<'de> serde::Deserialize<'de> for Qwen3_5Config {
             linear_key_head_dim: resolve_or_warn!(r.linear_key_head_dim, 128, "linear_key_head_dim", MODEL),
             linear_value_head_dim: resolve_or_warn!(r.linear_value_head_dim, 128, "linear_value_head_dim", MODEL),
             linear_conv_kernel_dim: resolve_or_warn!(r.linear_conv_kernel_dim, 4, "linear_conv_kernel_dim", MODEL),
-            tie_word_embeddings: r.tie_word_embeddings,
+            tie_word_embeddings,
             num_experts: r.num_experts,
             num_experts_per_tok: r.num_experts_per_tok,
             moe_intermediate_size: r.moe_intermediate_size,
@@ -232,14 +248,19 @@ pub(super) struct PartialRotaryEmbedding {
 impl PartialRotaryEmbedding {
     pub(super) fn new(cfg: &Qwen3_5Config, dtype: DType, device: &Device) -> Result<Self> {
         let rotary_dim = cfg.rotary_dim();
+        let half = rotary_dim / 2;
         let inv_freq: Vec<f32> = (0..rotary_dim)
             .step_by(2)
             .map(|i| 1.0 / cfg.rope_theta.powf(i as f64 / rotary_dim as f64) as f32)
             .collect();
-        let inv_freq = Tensor::new(inv_freq, device)?;
+        // Build the [L, D/2] frequency table via broadcast_mul instead of a K=1
+        // matmul (CUTLASS/DeepGEMM only support TN layout; a literal outer-product
+        // matmul falls through to an unsupported NN kernel).
+        let inv_freq = Tensor::from_vec(inv_freq, (1, half), device)?.to_dtype(DType::F32)?;
         let positions = Tensor::arange(0u32, cfg.max_position_embeddings as u32, device)?
-            .to_dtype(DType::F32)?;
-        let freqs = positions.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?;
+            .to_dtype(DType::F32)?
+            .reshape((cfg.max_position_embeddings, 1))?;
+        let freqs = positions.broadcast_mul(&inv_freq)?;
         let cos = freqs.cos()?.to_dtype(dtype)?;
         let sin = freqs.sin()?.to_dtype(dtype)?;
         Ok(Self {
@@ -303,7 +324,14 @@ pub(super) struct RmsNormGated {
 
 impl RmsNormGated {
     pub(super) fn new(head_dim: usize, num_heads: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        let weight = vb.get(head_dim, "weight")?;
+        // Qwen3.5-35B-A3B stores this weight as F32 in the checkpoint; compute
+        // it in F32 to avoid precision loss in the DeltaNet output scaling.
+        let weight = vb.get_with_hints_dtype(
+            head_dim,
+            "weight",
+            Default::default(),
+            DType::F32,
+        )?;
         Ok(Self {
             weight,
             eps,
@@ -325,15 +353,24 @@ impl RmsNormGated {
         let x = x.reshape(new_shape.as_slice())?;
         let z = z.reshape(new_shape.as_slice())?;
 
-        // RMS norm on last dimension (head_dim)
-        let x_f32 = x.to_dtype(DType::F32)?;
-        let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
-        let normed = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let normed = normed.to_dtype(x.dtype())?.broadcast_mul(&self.weight)?;
-        let gate = ops.silu(&z)?;
-        let result = normed.broadcast_mul(&gate)?;
+        // Flatten to 2D [...*num_heads, head_dim] for the fused kernel
+        let flat_rows = x.elem_count() / self.head_dim;
+        let x_2d = x.reshape((flat_rows, self.head_dim))?;
+        let z_2d = z.reshape((flat_rows, self.head_dim))?;
 
-        // Reshape back to [..., num_heads * head_dim]
+        // Fused: RMSNorm(x) * weight * SiLU(gate) in one kernel
+        let result = if let Some(r) = ops.rmsnorm_gated(&x_2d, &z_2d, &self.weight, self.eps as f32) {
+            r?
+        } else {
+            // Decomposed fallback (CPU or non-BF16)
+            let x_f32 = x_2d.to_dtype(DType::F32)?;
+            let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
+            let normed = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+            let normed = normed.broadcast_mul(&self.weight)?;
+            let silu_gate = ops.silu(&z_2d.to_dtype(DType::F32)?)?;
+            normed.broadcast_mul(&silu_gate)?.to_dtype(x.dtype())?
+        };
+
         result.reshape(orig_shape)
     }
 }
@@ -353,7 +390,7 @@ pub(super) struct Qwen3_5GatedDeltaNet {
     pub(super) out_proj: Linear,
     // State
     pub(super) conv_state: Option<Tensor>,      // [conv_dim, kernel-1]
-    pub(super) recurrent_state: Option<Tensor>, // [num_v_heads, k_dim, v_dim] in f32
+    pub(super) recurrent_state: Option<Tensor>, // [num_v_heads, v_dim, k_dim] in f32
     // Config
     pub(super) num_k_heads: usize,
     pub(super) num_v_heads: usize,
@@ -371,7 +408,14 @@ impl Qwen3_5GatedDeltaNet {
         let value_dim = cfg.value_dim();
         let conv_dim = cfg.conv_dim();
 
-        // Split projections: QKV separate from Z, B, A
+        // Split projections: QKV separate from Z, B, A. We intentionally
+        // do NOT fuse these four into a single matmul — the fused output
+        // dim would be `2*key_dim + value_dim + value_dim + 2*num_v_heads`
+        // (e.g. 12352 for Qwen3.5-35B-A3B) which has an awkward prime
+        // factor for GEMM tile alignment, and empirically runs ~20%
+        // slower on Hopper than the 4 separate projections whose
+        // individual output dims (8192, 4096, 32, 32) each hit clean
+        // tile boundaries for DeepGEMM / CUTLASS.
         let in_proj_qkv = Linear::load(
             vb.pp("in_proj_qkv"),
             cfg.hidden_size,
@@ -402,7 +446,14 @@ impl Qwen3_5GatedDeltaNet {
         let conv_weight = conv_weight_raw.squeeze(1)?;
 
         let dt_bias = vb.get(cfg.linear_num_value_heads, "dt_bias")?;
-        let a_log = vb.get(cfg.linear_num_value_heads, "A_log")?;
+        // `A_log` is stored as F32 in Qwen3.5-35B-A3B checkpoints and is always
+        // consumed in F32; load it in native precision to avoid the BF16 truncation.
+        let a_log = vb.get_with_hints_dtype(
+            cfg.linear_num_value_heads,
+            "A_log",
+            Default::default(),
+            DType::F32,
+        )?;
 
         let norm = RmsNormGated::new(
             cfg.linear_value_head_dim,
@@ -451,61 +502,43 @@ impl Qwen3_5GatedDeltaNet {
         assert_eq!(b, 1, "Qwen3.5 DeltaNet only supports batch_size=1");
         let bst = BatchState::no_lora();
 
-        // Project with split projections
+        // Split projections. See the comment in `new()` for why the
+        // four are kept separate rather than fused into one matmul.
         let qkv = self.in_proj_qkv.forward(x, &bst, ops)?; // [1, L, key_dim*2 + value_dim]
         let z = self.in_proj_z.forward(x, &bst, ops)?; // [1, L, value_dim]
         let b_param = self.in_proj_b.forward(x, &bst, ops)?; // [1, L, num_v_heads]
         let a_param = self.in_proj_a.forward(x, &bst, ops)?; // [1, L, num_v_heads]
 
-        // Split QKV: simple concat layout [Q(key_dim) | K(key_dim) | V(value_dim)]
-        let q_cat = qkv.narrow(D::Minus1, 0, self.key_dim)?;
-        let k_cat = qkv.narrow(D::Minus1, self.key_dim, self.key_dim)?;
-        let v_cat = qkv.narrow(D::Minus1, self.key_dim * 2, self.value_dim)?;
+        // `qkv` already has the `[Q | K | V]` layout conv1d wants.
+        let qkv_for_conv = qkv; // [B, L, conv_dim]
 
-        // QKV goes through conv1d, Z does not
-        let qkv_for_conv = Tensor::cat(&[&q_cat, &k_cat, &v_cat], D::Minus1)?; // [B, L, conv_dim]
-
-        // Apply causal conv1d
+        // Apply causal conv1d. Both `conv1d_decode` and `conv1d_prefill`
+        // fuse the SiLU activation into the kernel (fast path) or the
+        // fallback loop, so we don't apply a separate SiLU here.
         let qkv_conv = if seq_len == 1 {
-            self.conv1d_decode(&qkv_for_conv.squeeze(0)?.squeeze(0)?)?
+            self.conv1d_decode(&qkv_for_conv.squeeze(0)?.squeeze(0)?, ops)?
                 .unsqueeze(0)?
                 .unsqueeze(0)?
         } else {
-            self.conv1d_prefill(&qkv_for_conv)?
+            self.conv1d_prefill(&qkv_for_conv, ops)?
         };
 
-        // Apply SiLU activation after conv
-        let qkv_conv = ops.silu(&qkv_conv)?;
-
-        // Split into q, k, v
-        let q = qkv_conv.narrow(D::Minus1, 0, self.key_dim)?;
-        let k = qkv_conv.narrow(D::Minus1, self.key_dim, self.key_dim)?;
-        let v = qkv_conv.narrow(D::Minus1, self.key_dim * 2, self.value_dim)?;
-
-        // Process each timestep
-        let device = x.device();
-        let mut outputs = Vec::with_capacity(seq_len);
-
-        // Squeeze batch dim: [1, L, dim] -> [L, dim]
-        let q = q.get(0)?;
-        let k = k.get(0)?;
-        let v = v.get(0)?;
+        // Squeeze batch dim and pass the packed mixed_qkv straight
+        // through to `delta_rule_prefill`. The fast path wants the
+        // un-split tensor so it can hand it to `gdn_post_conv` as one
+        // contiguous channel blob; the fallback still splits it inside.
+        let mixed_qkv = qkv_conv.get(0)?; // [L, conv_dim]
         let b_param = b_param.get(0)?;
         let a_param = a_param.get(0)?;
 
-        for t in 0..seq_len {
-            let q_t = q.get(t)?.contiguous()?; // [key_dim]
-            let k_t = k.get(t)?.contiguous()?; // [key_dim]
-            let v_t = v.get(t)?.contiguous()?; // [value_dim]
-            let b_t = b_param.get(t)?.contiguous()?; // [num_v_heads]
-            let a_t = a_param.get(t)?.contiguous()?; // [num_v_heads]
-
-            let out_t = self.delta_rule_step(&q_t, &k_t, &v_t, &b_t, &a_t, device, ops)?;
-            outputs.push(out_t);
-        }
-
-        // Stack outputs: [1, L, value_dim]
-        let output = Tensor::stack(&outputs, 0)?.unsqueeze(0)?;
+        // Batched delta-rule prefill. For seq_len==1 we still go through this
+        // path; the single-step "loop" is cheap and keeps the hot code in one
+        // place.
+        let device = x.device();
+        let output = self.delta_rule_prefill(
+            &mixed_qkv, &b_param, &a_param, device, ops,
+        )?
+        .unsqueeze(0)?;
 
         // Reshape z for gated norm: [1, L, value_dim]
         let z = z.contiguous()?;
@@ -515,134 +548,322 @@ impl Qwen3_5GatedDeltaNet {
         self.out_proj.forward(&normed, &bst, ops)
     }
 
-    /// Single-step delta rule update (batched across all v_heads).
-    fn delta_rule_step(
+    /// Batched delta-rule prefill for a full sequence.
+    ///
+    /// Inputs are all 2D (seq_len as dim 0), output is [T, value_dim].
+    /// Does the L2 norm / GQA expand / gating / beta in a single batched pass
+    /// over all tokens, then runs the recurrence loop with three batched
+    /// matmuls per step:
+    ///
+    ///   state_decayed @ k_col        → delta correction
+    ///   v_prime @ k_row^T            → outer update
+    ///   state @ q_col                → output
+    ///
+    /// Replaces an older per-step `broadcast_mul + sum(2)` implementation
+    /// that launched ~15 kernels per token and allocated a fresh 2 MB
+    /// intermediate each time — catastrophic at 1 K-token prefill × 30
+    /// DeltaNet layers.
+    fn delta_rule_prefill(
         &mut self,
-        q: &Tensor, // [key_dim]
-        k: &Tensor, // [key_dim]
-        v: &Tensor, // [value_dim]
-        b: &Tensor, // [num_v_heads]
-        a: &Tensor, // [num_v_heads]
+        mixed_qkv: &Tensor, // [T, 2*key_dim + value_dim] — post-conv1d
+        b_in: &Tensor,      // [T, num_v_heads]
+        a_in: &Tensor,      // [T, num_v_heads]
         device: &Device,
         ops: &dyn crate::ops::Ops,
     ) -> Result<Tensor> {
-        let kv_ratio = self.num_v_heads / self.num_k_heads;
+        let t = mixed_qkv.dim(0)?;
+        let hv = self.num_v_heads;
+        let hk = self.num_k_heads;
+        let kdim = self.head_k_dim;
+        let vdim = self.head_v_dim;
+        let out_dtype = mixed_qkv.dtype();
 
-        // L2-normalize q and k per head, scale q by 1/sqrt(head_k_dim)
-        let q = q.reshape((self.num_k_heads, self.head_k_dim))?;
+        // Fast path: FlashInfer SM90 `gdn_prefill` kernel — the one
+        // Qwen3.5 / Qwen3-next / FLA's `chunk_gated_delta_rule` were
+        // designed for. Scalar-per-head linear-space decay, no chunk
+        // cumsum / no safe_gate clamp — bit-exact (within BF16) to the
+        // HF reference.
+        if device.is_cuda() && kdim == vdim && kdim == 128 {
+            if let Some(out) = self.delta_rule_prefill_gdn(
+                mixed_qkv, b_in, a_in, device, ops,
+            )? {
+                return Ok(out.to_dtype(out_dtype)?);
+            }
+        }
+
+        // ── Fallback: batched-matmul recurrence on whatever device we have ──
+        //
+        // Split `mixed_qkv` back into per-head Q / K / V slices.
+        // `mixed_qkv` layout is `[Q (HK*K) | K (HK*K) | V (HV*V)]`.
+        let q_in = mixed_qkv.narrow(D::Minus1, 0, self.key_dim)?;
+        let k_in = mixed_qkv.narrow(D::Minus1, self.key_dim, self.key_dim)?;
+        let v_in = mixed_qkv.narrow(D::Minus1, self.key_dim * 2, self.value_dim)?;
+
+        let kv_ratio = hv / hk;
+
+        // q, k: [T, key_dim] → [T, HK, K] → L2 norm → F32 → (GQA expand) → [T, HV, K]
+        let q = q_in.reshape((t, hk, kdim))?;
         let q = l2_normalize_last_dim(&q)?;
-        let k = k.reshape((self.num_k_heads, self.head_k_dim))?;
+        let k = k_in.reshape((t, hk, kdim))?;
         let k = l2_normalize_last_dim(&k)?;
 
-        // v: [num_v_heads, head_v_dim]
-        let v = v.reshape((self.num_v_heads, self.head_v_dim))?;
+        let expand_heads = |x: &Tensor| -> Result<Tensor> {
+            if kv_ratio > 1 {
+                x.to_dtype(DType::F32)?
+                    .unsqueeze(2)?
+                    .expand((t, hk, kv_ratio, kdim))?
+                    .reshape((t, hv, kdim))?
+                    .contiguous()
+            } else {
+                x.to_dtype(DType::F32)?.contiguous()
+            }
+        };
+        let k_all = expand_heads(&k)?; // [T, HV, K] f32
+        let scale = (kdim as f64).powf(-0.5);
+        let q_all = (expand_heads(&q)? * scale)?; // [T, HV, K] f32
 
-        // Gating computation (all in f32 for numerical stability)
-        let dt_bias = self.dt_bias.to_dtype(DType::F32)?;
-        let a_log = self.a_log.to_dtype(DType::F32)?;
-        let a_f32 = a.to_dtype(DType::F32)?;
-        let b_f32 = b.to_dtype(DType::F32)?;
+        // v: [T, value_dim] → [T, HV, V] f32
+        let v_all = v_in
+            .reshape((t, hv, vdim))?
+            .to_dtype(DType::F32)?
+            .contiguous()?;
 
-        // g = -exp(A_log) * softplus(a + dt_bias) per head
-        let neg_a_exp = a_log.exp()?.neg()?;
-        let a_plus_dt = (a_f32 + dt_bias)?;
+        // Gating: decay[t, hv] = exp(-exp(a_log[hv]) * softplus(a[t, hv] + dt_bias[hv]))
+        // All shapes are [HV] scalar-per-head except `a_in` which is [T, HV].
+        let dt_bias_f32 = self.dt_bias.to_dtype(DType::F32)?;
+        let a_log_f32 = self.a_log.to_dtype(DType::F32)?;
+        let neg_a_exp = a_log_f32.exp()?.neg()?; // [HV]
+        let a_f32 = a_in.to_dtype(DType::F32)?; // [T, HV]
+        let a_plus_dt = a_f32.broadcast_add(&dt_bias_f32)?; // [T, HV]
         let softplus_val = softplus(&a_plus_dt)?;
-        let g = (neg_a_exp * softplus_val)?; // [num_v_heads]
+        let g = softplus_val.broadcast_mul(&neg_a_exp)?; // [T, HV]
+        let decay_all = g.exp()?; // [T, HV]
 
-        // beta = sigmoid(b) per head
-        let beta = ops.sigmoid(&b_f32)?; // [num_v_heads]
+        // beta = sigmoid(b) — [T, HV] f32
+        let beta_all = ops.sigmoid(&b_in.to_dtype(DType::F32)?)?;
 
-        // decay = exp(g)
-        let decay = g.exp()?; // [num_v_heads]
-
-        // Initialize recurrent state if needed: [num_v_heads, head_k_dim, head_v_dim] in f32
+        // ── State init ─────────────────────────────────────────────────────
         if self.recurrent_state.is_none() {
-            self.recurrent_state = Some(Tensor::zeros(
-                (self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                DType::F32,
-                device,
-            )?);
+            self.recurrent_state = Some(Tensor::zeros((hv, vdim, kdim), DType::F32, device)?);
         }
-        let state = self.recurrent_state.as_ref().unwrap();
+        let mut state = self.recurrent_state.take().unwrap();
 
-        // Delta rule: state = state * decay + outer(k, beta * (v - state^T @ k))
-        // decay: [num_v_heads] → [num_v_heads, 1, 1]
-        let decay_3d = decay.reshape((self.num_v_heads, 1, 1))?;
-        let state_decayed = state.broadcast_mul(&decay_3d)?;
+        // ── Sequential recurrence loop ────────────────────────────────────
+        //
+        // The per-step math is the classic gated delta rule:
+        //   state   *= decay
+        //   state_k  = state @ k              (a K=1 batched matmul per head)
+        //   v'       = beta * (v - state_k)
+        //   state   += outer(v', k)
+        //   out      = state @ q              (also K=1 batched matmul)
+        //
+        // We intentionally use `broadcast_mul + sum` instead of `Tensor::matmul`
+        // for the two K=1 GEMMs: candle's batched matmul on CUDA routes through
+        // the cutlass-gemm wrapper, which only implements the TN transpose
+        // combo. A batched matmul with shapes [HV, V, K] @ [HV, K, 1] lands in
+        // the NN layout and the wrapper returns `unsupported transpose combo`.
+        // The broadcast-and-reduce form stays elementwise and works on both
+        // CPU and CUDA.
+        let mut outputs = Vec::with_capacity(t);
+        for i in 0..t {
+            let k_row = k_all.get(i)?.contiguous()?; // [HV, K]
+            let v_row = v_all.get(i)?; // [HV, V]
+            let q_row = q_all.get(i)?.contiguous()?; // [HV, K]
+            let decay = decay_all.get(i)?; // [HV]
+            let beta = beta_all.get(i)?; // [HV]
 
-        // k: [num_k_heads, head_k_dim] → expand to [num_v_heads, head_k_dim]
-        let k_f32 = k.to_dtype(DType::F32)?;
-        let k_expanded = if kv_ratio > 1 {
-            k_f32
-                .unsqueeze(1)?
-                .expand((self.num_k_heads, kv_ratio, self.head_k_dim))?
-                .reshape((self.num_v_heads, self.head_k_dim))?
-        } else {
-            k_f32
-        };
-        let k_col = k_expanded.unsqueeze(D::Minus1)?; // [num_v_heads, head_k_dim, 1]
+            // state *= decay.unsqueeze(-1).unsqueeze(-1)
+            let decay_3d = decay.reshape((hv, 1, 1))?;
+            let state_decayed = state.broadcast_mul(&decay_3d)?;
 
-        // Delta correction: v' = beta * (v - state_decayed^T @ k)
-        // state_decayed^T @ k: [num_v_heads, head_v_dim, head_k_dim] @ [num_v_heads, head_k_dim, 1]
-        let state_k = state_decayed
-            .transpose(1, 2)?
-            .matmul(&k_col)?
-            .squeeze(D::Minus1)?; // [num_v_heads, head_v_dim]
-        let v_f32 = v.to_dtype(DType::F32)?;
-        let v_error = (v_f32 - state_k)?; // [num_v_heads, head_v_dim]
+            // state_k[b, v] = Σ_k state_decayed[b, v, k] * k_row[b, k]
+            let k_row_1xk = k_row.reshape((hv, 1, kdim))?; // broadcast over V
+            let state_k = state_decayed
+                .broadcast_mul(&k_row_1xk)?
+                .sum(D::Minus1)?; // [HV, V]
 
-        // beta: [num_v_heads] → [num_v_heads, 1]
-        let beta_2d = beta.reshape((self.num_v_heads, 1))?;
-        let v_prime = v_error.broadcast_mul(&beta_2d)?; // [num_v_heads, head_v_dim]
+            // v_error = v_row - state_k; v_prime = beta * v_error
+            let v_err = (v_row - state_k)?;
+            let beta_col = beta.unsqueeze(D::Minus1)?; // [HV, 1]
+            let v_prime = v_err.broadcast_mul(&beta_col)?; // [HV, V]
 
-        // state += outer(k, v_prime)
-        let v_row = v_prime.unsqueeze(1)?; // [num_v_heads, 1, head_v_dim]
-        let outer = k_col.matmul(&v_row)?;
-        let state = (state_decayed + outer)?;
+            // outer[b, v, k] = v_prime[b, v] * k_row[b, k]  — pure broadcast
+            let v_col = v_prime.reshape((hv, vdim, 1))?;
+            let outer = v_col.broadcast_mul(&k_row_1xk)?; // [HV, V, K]
 
-        // output = state^T @ (q * scale): scale = 1/sqrt(head_k_dim)
-        let scale = (self.head_k_dim as f64).powf(-0.5);
-        let q_f32 = (q.to_dtype(DType::F32)? * scale)?;
-        let q_expanded = if kv_ratio > 1 {
-            q_f32
-                .unsqueeze(1)?
-                .expand((self.num_k_heads, kv_ratio, self.head_k_dim))?
-                .reshape((self.num_v_heads, self.head_k_dim))?
-        } else {
-            q_f32
-        };
-        let q_col = q_expanded.unsqueeze(D::Minus1)?; // [num_v_heads, head_k_dim, 1]
-        let out = state.transpose(1, 2)?.matmul(&q_col)?; // [num_v_heads, head_v_dim, 1]
-        let out = out.squeeze(D::Minus1)?; // [num_v_heads, head_v_dim]
-        let out = out.to_dtype(v.dtype())?;
-        let out = out.reshape((self.value_dim,))?;
+            state = (state_decayed + outer)?;
+
+            // out[b, v] = Σ_k state[b, v, k] * q_row[b, k]
+            let q_row_1xk = q_row.reshape((hv, 1, kdim))?;
+            let out = state
+                .broadcast_mul(&q_row_1xk)?
+                .sum(D::Minus1)?; // [HV, V]
+            outputs.push(out);
+        }
 
         self.recurrent_state = Some(state);
-        Ok(out)
+
+        // Stack outputs: [T, HV, V] → [T, value_dim] → caller dtype
+        let out_stacked = Tensor::stack(&outputs, 0)?; // [T, HV, V]
+        out_stacked.reshape((t, self.value_dim))?.to_dtype(out_dtype)
+    }
+
+    /// FlashInfer-backed GDN prefill fast path for Qwen3.5 DeltaNet.
+    ///
+    /// Two-stage fast path:
+    ///  1. `ops.gdn_post_conv` — one fused CUDA kernel produces Q, K
+    ///     (L2-normalised), V (raw), `alpha = exp(g_scalar)` and
+    ///     `beta = sigmoid(b_raw)` directly from the mixed_qkv channel
+    ///     blob + the raw gate inputs. Replaces ~20 candle ops per layer.
+    ///  2. `ops.gdn_prefill_varlen` — FlashInfer's fused SM90 gdn_prefill
+    ///     TMA kernel consuming the prepped tensors.
+    ///
+    /// This matches HF transformers' `chunk_gated_delta_rule` semantics
+    /// bit-for-bit modulo BF16 rounding: scalar-per-head **linear-space**
+    /// decay, no `RCP_LN2` rescaling, no `safe_gate` clamp, no per-element
+    /// broadcast. The kernel math is the same one Qwen3.5 was trained
+    /// against.
+    ///
+    /// Returns `Ok(None)` when any backend can't serve the call (non-SM90,
+    /// shape mismatch, kernel not compiled); caller falls back.
+    fn delta_rule_prefill_gdn(
+        &mut self,
+        mixed_qkv: &Tensor, // [T, 2*HK*D + HV*D] BF16
+        b_in: &Tensor,      // [T, HV] BF16
+        a_in: &Tensor,      // [T, HV] BF16
+        device: &Device,
+        ops: &dyn crate::ops::Ops,
+    ) -> Result<Option<Tensor>> {
+        let t = mixed_qkv.dim(0)?;
+        let hk = self.num_k_heads;
+        let hv = self.num_v_heads;
+        let kdim = self.head_k_dim;
+        // FlashInfer uses `num_sab_heads = max(num_q, num_v)` for the
+        // state / gate / output head axis. Qwen3.5 is GVA (num_v > num_k),
+        // so alpha/beta/output live on the V-head axis.
+        debug_assert!(hv >= hk, "Qwen3.5 DeltaNet is GVA: num_v >= num_k");
+
+        // ── Stage 1: fused post-conv1d prep ────────────────────────────
+        // `gdn_post_conv` wants dt_bias and A_log as F32. A_log is
+        // loaded in F32 natively; dt_bias comes from the checkpoint in
+        // BF16 (or F16), so we pre-cast once and cache the F32 copy on
+        // the layer. Stash it lazily.
+        let dt_bias_f32 = self.dt_bias.to_dtype(DType::F32)?;
+        let a_log_f32 = if self.a_log.dtype() == DType::F32 {
+            self.a_log.clone()
+        } else {
+            self.a_log.to_dtype(DType::F32)?
+        };
+        let Some(prep) = ops.gdn_post_conv(
+            mixed_qkv, a_in, b_in, &a_log_f32, &dt_bias_f32, hk, hv, kdim,
+        ) else {
+            // No CUDA fast path for gdn_post_conv — fall back to the
+            // composed recurrence.
+            return Ok(None);
+        };
+        let (q_bf16, k_bf16, v_bf16, alpha, beta) = prep?;
+
+        // ── cu_seqlens = [0, T] for a single packed sequence (I64) ───────
+        // Note: flashinfer expects I64, unlike cuLA's I32.
+        let cu_seqlens = Tensor::from_vec(vec![0i64, t as i64], (2,), device)?;
+
+        // ── Initial state: [1, HV, D, D] f32 or None ─────────────────────
+        // Our own recurrent state is stored [HV, V, K]; the kernel wants a
+        // leading num_seqs=1 dim. Pull it out of `self` so the fallback
+        // can restore it on the backend-declined branch.
+        let initial_state = self.recurrent_state.take();
+        let initial_state_4d = match initial_state.as_ref() {
+            Some(s) => Some(s.unsqueeze(0)?.contiguous()?),
+            None => None,
+        };
+
+        let scale = (kdim as f32).powf(-0.5);
+
+        // ── Launch ───────────────────────────────────────────────────────
+        let Some(result) = ops.gdn_prefill_varlen(
+            &q_bf16, &k_bf16, &v_bf16,
+            &alpha, &beta, &cu_seqlens,
+            initial_state_4d.as_ref(), scale,
+        ) else {
+            // Backend declined — restore recurrent_state so the composed
+            // fallback picks up where we left off.
+            self.recurrent_state = initial_state;
+            return Ok(None);
+        };
+        let (out, final_state) = result?;
+
+        // Save the updated recurrent state: [1, HV, D, D] → [HV, D, D].
+        // Note: kernel returns `[num_seqs, num_sab_heads, head_dim, head_dim]`
+        // which for Qwen3.5 is `[1, HV, D, D]` with `D == head_k_dim == head_v_dim`.
+        self.recurrent_state = Some(final_state.squeeze(0)?.contiguous()?);
+
+        // out is [T, HV, D] BF16 (num_sab_heads == hv for GVA). Fold HV*D
+        // back into value_dim.
+        Ok(Some(out.reshape((t, self.value_dim))?))
     }
 
     /// Causal conv1d for a single token (decode step).
-    fn conv1d_decode(&mut self, x: &Tensor) -> Result<Tensor> {
+    ///
+    /// Prefers the fused `Ops::causal_conv1d_update` kernel (Dao-AILab
+    /// mamba kernel), falls back to a broadcast+sum in-place update
+    /// loop on non-CUDA / unsupported-width devices. Always fuses the
+    /// SiLU tail so callers must NOT apply SiLU on top.
+    fn conv1d_decode(&mut self, x: &Tensor, ops: &dyn crate::ops::Ops) -> Result<Tensor> {
         // x: [conv_dim]
         let device = x.device();
         let dtype = x.dtype();
+        let pad_len = self.conv_kernel - 1;
 
+        // Lazy-init conv_state. The fast path expects `[B, D, W-1]`;
+        // the fallback keeps the 2-D `[D, W-1]` layout the old code used.
         if self.conv_state.is_none() {
             self.conv_state = Some(Tensor::zeros(
-                (self.conv_dim, self.conv_kernel - 1),
+                (self.conv_dim, pad_len),
                 dtype,
                 device,
             )?);
         }
-        let state = self.conv_state.as_ref().unwrap();
 
-        // state: [conv_dim, kernel-1] (the kernel-1 most recent inputs).
-        // For the dot product we want [conv_dim, kernel]: [old state | current_input].
+        // Fast path: Ops::causal_conv1d_update
+        //   wants `x: [B=1, D]`, `conv_state: [B=1, D, W-1]`,
+        //   `weight: [D, W]`, returns `[B=1, D]`.
+        //
+        // Important: Dao's update kernel mutates `conv_state` in
+        // place. If the state tensor we hand it aliases some OTHER
+        // tensor's storage (e.g. `deltanet_varlen_pooled` loads the
+        // state as a view into `pool.conv_states[layer]`), that other
+        // tensor would be silently mutated too, and a later
+        // `slice_set` write-back from our owned copy would refuse with
+        // "cannot use slice_set when self and src share their
+        // storage". Force a fresh allocation with `x + 0` so the
+        // kernel's in-place update lands on our own buffer.
+        let x_bd = x.unsqueeze(0)?; // [1, conv_dim]
+        let state_flat = self.conv_state.as_ref().unwrap();
+        let state_fresh = (state_flat + 0.0f64)?.contiguous()?; // [conv_dim, W-1] fresh
+        let state_bd = state_fresh.unsqueeze(0)?.contiguous()?;  // [1, conv_dim, W-1]
+        if let Some(res) = ops.causal_conv1d_update(
+            &x_bd,
+            &state_bd,
+            &self.conv_weight,
+            None,
+            /*silu_activation=*/ true,
+            None, // conv_state_indices — single-seq decode, not pool-indexed
+        ) {
+            let out_bd = res?; // [1, conv_dim]
+            // `state_bd` was mutated in place. Save it back to
+            // `self.conv_state` — squeezed to our 2-D on-disk layout.
+            self.conv_state = Some(state_bd.squeeze(0)?.contiguous()?);
+            return out_bd.squeeze(0);
+        }
+
+        // ── Fallback: manual shift + broadcast * sum ────────────────
+        let state = self.conv_state.as_ref().unwrap();
         let x_col = x.unsqueeze(D::Minus1)?; // [conv_dim, 1]
         let full_window = Tensor::cat(&[state, &x_col], 1)?; // [conv_dim, kernel]
-        let out = (full_window * &self.conv_weight)?.sum(D::Minus1)?; // [conv_dim]
+        let out_raw = (full_window * &self.conv_weight)?.sum(D::Minus1)?; // [conv_dim]
+        // Manual SiLU fusion parity with the fast path.
+        let out = ops.silu(&out_raw)?;
 
-        // Shift state left and append new input
         let new_state = if self.conv_kernel > 2 {
             let kept = state.narrow(1, 1, self.conv_kernel - 2)?;
             Tensor::cat(&[kept, x_col], 1)?
@@ -654,44 +875,131 @@ impl Qwen3_5GatedDeltaNet {
     }
 
     /// Causal conv1d for a full sequence (prefill).
-    fn conv1d_prefill(&mut self, x: &Tensor) -> Result<Tensor> {
+    ///
+    /// Prefers Dao-AILab's `causal_conv1d_fn` (fused kernel, SiLU fused
+    /// in) and falls back to a per-kernel-position shift+sum loop on
+    /// non-CUDA / unsupported-width paths.
+    ///
+    /// **Cross-chunk left context**: upstream's channel-first kernel
+    /// silently ignores the `initial_states` pointer (only the
+    /// channel-last variant honors it). To keep cross-chunk state
+    /// correct we pre-pad `x` on the time axis with the saved
+    /// `conv_state` ourselves (adding `W-1` tokens), then call the
+    /// kernel with `L + W - 1` timesteps and slice the trailing `L`
+    /// outputs. This is mathematically identical to what the upstream
+    /// channel-last kernel would do via `initial_states_ptr`.
+    fn conv1d_prefill(&mut self, x: &Tensor, ops: &dyn crate::ops::Ops) -> Result<Tensor> {
         // x: [1, L, conv_dim]
         let (b, seq_len, _) = x.dims3()?;
         let device = x.device();
         let dtype = x.dtype();
-
-        // Transpose to [1, conv_dim, L] for conv
-        let x_t = x.transpose(1, 2)?; // [1, conv_dim, L]
-
-        // Left-pad with zeros (or existing conv_state)
         let pad_len = self.conv_kernel - 1;
+
+        // Transpose to `[B, D, L]` for the Dao-AILab kernel convention.
+        let x_t = x.transpose(1, 2)?.contiguous()?; // [1, conv_dim, L]
+
+        // Pre-pad left context with saved conv_state (or zeros on the
+        // first chunk). The kernel processes `[B, D, pad_len + L]` and
+        // emits `[B, D, pad_len + L]` whose last `L` timesteps are the
+        // correct causal conv outputs; we drop the leading pad.
         let prefix = if let Some(ref state) = self.conv_state {
-            state.unsqueeze(0)?
+            state.unsqueeze(0)?.contiguous()? // [1, D, W-1]
         } else {
             Tensor::zeros((b, self.conv_dim, pad_len), dtype, device)?
         };
-        let padded = Tensor::cat(&[prefix, x_t.clone()], 2)?; // [1, conv_dim, pad+L]
+        let x_padded = Tensor::cat(&[&prefix, &x_t], 2)?.contiguous()?; // [1, D, pad_len+L]
+        let padded_len = seq_len + pad_len;
 
-        // Manual conv1d: slide window of size kernel over padded
-        let mut outputs = Vec::with_capacity(seq_len);
-        for t in 0..seq_len {
-            let window = padded.narrow(2, t, self.conv_kernel)?; // [1, conv_dim, kernel]
-            let out = (window.squeeze(0)? * &self.conv_weight)?.sum(D::Minus1)?; // [conv_dim]
-            outputs.push(out);
+        // ── Fast path: Ops::causal_conv1d_fn ─────────────────────────
+        //
+        // We pass `None` for `initial_states` — the prefix we prepended
+        // above is the semantic equivalent and is guaranteed to be
+        // honored by the kernel (unlike `initial_states` which upstream
+        // silently drops in channel-first layout).
+        //
+        // SiLU is fused so the caller must NOT apply SiLU on top.
+        if let Some(res) = ops.causal_conv1d_fn(
+            &x_padded,
+            &self.conv_weight,
+            None,
+            None,
+            /*silu_activation=*/ true,
+        ) {
+            let result_padded = res?; // [1, D, pad_len+L]
+            // Drop the leading `pad_len` outputs: they correspond to
+            // timesteps in the pre-pad zone which don't belong to the
+            // output sequence.
+            let result_t = result_padded.narrow(2, pad_len, seq_len)?; // [1, D, L]
+            let result = result_t.transpose(1, 2)?.contiguous()?; // [1, L, conv_dim]
+            debug_assert_eq!(padded_len - pad_len, seq_len);
+
+            // Save the last `W-1` raw inputs as the new conv_state.
+            let x_t_2d = x_t.squeeze(0)?; // [conv_dim, L]
+            if seq_len >= pad_len {
+                self.conv_state = Some(
+                    x_t_2d
+                        .narrow(1, seq_len - pad_len, pad_len)?
+                        .contiguous()?,
+                );
+            } else {
+                let old = if let Some(ref state) = self.conv_state {
+                    state.narrow(1, seq_len, pad_len - seq_len)?
+                } else {
+                    Tensor::zeros((self.conv_dim, pad_len - seq_len), dtype, device)?
+                };
+                self.conv_state = Some(Tensor::cat(&[old, x_t_2d], 1)?.contiguous()?);
+            }
+            return Ok(result);
         }
-        let result = Tensor::stack(&outputs, 0)?.unsqueeze(0)?; // [1, L, conv_dim]
 
-        // Save last kernel-1 inputs as conv_state
-        let x_t_2d = x_t.squeeze(0)?; // [conv_dim, L]
+        // ── Fallback: per-kernel-position shift + sum loop ───────────
+        //
+        // For each `k_i ∈ 0..width`, the output contribution at time
+        // `t` is `weight[:, k_i] * padded[:, t + k_i]`. We accumulate
+        // across the 4 kernel offsets with simple tensor ops (no
+        // matmul → CUDA-safe even when the CUTLASS wrapper can't serve
+        // the NN-mode GEMM candle's conv1d path would emit).
+        let prefix = if let Some(ref state) = self.conv_state {
+            state.unsqueeze(0)?.contiguous()?
+        } else {
+            Tensor::zeros((b, self.conv_dim, pad_len), dtype, device)?
+        };
+        let padded = Tensor::cat(&[&prefix, &x_t], 2)?.contiguous()?; // [1, D, L+W-1]
+
+        let mut acc: Option<Tensor> = None;
+        for k_i in 0..self.conv_kernel {
+            let shifted = padded.narrow(2, k_i, seq_len)?; // [1, D, L]
+            // weight[:, k_i] → [D], reshape to [1, D, 1] for broadcast.
+            let w_slice = self
+                .conv_weight
+                .narrow(1, k_i, 1)?
+                .reshape((1, self.conv_dim, 1))?;
+            let term = shifted.broadcast_mul(&w_slice)?;
+            acc = Some(match acc {
+                None => term,
+                Some(a) => (a + term)?,
+            });
+        }
+        let out_t = acc.unwrap(); // [1, D, L]
+        // Fuse SiLU here so the caller can drop its separate silu call.
+        let out_t = ops.silu(&out_t)?;
+        let result = out_t.transpose(1, 2)?.contiguous()?; // [1, L, conv_dim]
+
+        // Save state, same as fast path.
+        let x_t_2d = x_t.squeeze(0)?;
         if seq_len >= pad_len {
-            self.conv_state = Some(x_t_2d.narrow(1, seq_len - pad_len, pad_len)?);
+            self.conv_state = Some(
+                x_t_2d
+                    .narrow(1, seq_len - pad_len, pad_len)?
+                    .contiguous()?,
+            );
         } else {
             let old = if let Some(ref state) = self.conv_state {
                 state.narrow(1, seq_len, pad_len - seq_len)?
             } else {
                 Tensor::zeros((self.conv_dim, pad_len - seq_len), dtype, device)?
             };
-            self.conv_state = Some(Tensor::cat(&[old, x_t_2d], 1)?);
+            self.conv_state = Some(Tensor::cat(&[old, x_t_2d], 1)?.contiguous()?);
         }
 
         Ok(result)
@@ -754,11 +1062,23 @@ impl Qwen3_5Attention {
             false,
         )?;
 
-        // Qwen3.5 uses residual RMSNorm: output = norm(x) * (1 + weight)
-        let q_norm_weight = (vb.pp("q_norm").get(cfg.head_dim, "weight")? + 1.0)?;
+        // Qwen3.5 uses residual RMSNorm: output = norm(x) * (1 + weight). HF
+        // casts weight to F32 before the `1 +` and the final multiply, so small
+        // weight values aren't crushed by BF16 rounding near 1.0. Match that by
+        // materialising `(1 + weight)` in F32 and letting `ops.rms_norm` fall
+        // through to the composed F32 path when it sees an F32 weight.
+        let q_norm_weight = (vb
+            .pp("q_norm")
+            .get(cfg.head_dim, "weight")?
+            .to_dtype(DType::F32)?
+            + 1.0)?;
         let q_norm = RmsNorm::from_weight(q_norm_weight.clone(), cfg.rms_norm_eps);
 
-        let k_norm_weight = (vb.pp("k_norm").get(cfg.head_dim, "weight")? + 1.0)?;
+        let k_norm_weight = (vb
+            .pp("k_norm")
+            .get(cfg.head_dim, "weight")?
+            .to_dtype(DType::F32)?
+            + 1.0)?;
         let k_norm = RmsNorm::from_weight(k_norm_weight.clone(), cfg.rms_norm_eps);
 
 
@@ -801,12 +1121,18 @@ impl Qwen3_5Attention {
         let k = self.k_proj.forward(x, &bs, ctx.ops)?;
         let v = self.v_proj.forward(x, &bs, ctx.ops)?;
 
-        // Split Q and gate
+        // Split Q and gate. `narrow` yields a strided view over the packed
+        // `[Q | gate]` tensor; downstream fused kernels (rms_norm, RoPE) assume
+        // contiguous input and can hit misaligned-address errors on strided data,
+        // so materialize here.
         let (q, gate) = if self.attn_output_gate {
             let q_and_gate = q_raw.reshape((total_tokens, self.num_heads, self.head_dim * 2))?;
-            let q = q_and_gate.narrow(D::Minus1, 0, self.head_dim)?;
+            let q = q_and_gate
+                .narrow(D::Minus1, 0, self.head_dim)?
+                .contiguous()?;
             let gate = q_and_gate
                 .narrow(D::Minus1, self.head_dim, self.head_dim)?
+                .contiguous()?
                 .reshape((total_tokens, self.num_heads * self.head_dim))?;
             (q, Some(gate))
         } else {
@@ -833,6 +1159,11 @@ impl Qwen3_5Attention {
 
         // Partial RoPE
         let (q, k) = self.rope.apply_varlen(&q, &k, ctx.position_ids)?;
+        // FA4 / FlashInfer require stride(-1) == 1. `apply_varlen` goes through
+        // `Tensor::cat` which can leave a non-row-stride layout; force contig.
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
 
         // Attention dispatch: paged KV cache or plain varlen
         let softmax_scale = self.softmax_scale as f32;
@@ -1006,7 +1337,10 @@ struct Qwen3_5SparseMoeBlock {
     experts_down: Tensor,
     moe_intermediate_size: usize,
     shared_expert: Option<Qwen3_5Mlp>,
-    shared_expert_gate: Option<DenseLinear>, // [1, hidden_size]
+    /// Shared-expert gating weight `[hidden_size]` (raw, not wrapped as Linear).
+    /// We apply it as `(x * w).sum(-1, keepdim)` because a degenerate `out_dim=1`
+    /// matmul lands on an NN GEMM layout that CUTLASS/DeepGEMM don't support.
+    shared_expert_gate_weight: Option<Tensor>,
     num_experts_per_tok: usize,
     norm_topk_prob: bool,
 }
@@ -1029,6 +1363,14 @@ impl Qwen3_5SparseMoeBlock {
             (num_experts, 2 * moe_intermediate_size, cfg.hidden_size),
             "gate_up_proj",
         )?;
+        // CUTLASS Swiglu expects [up|gate] order. Swap in-place at load time
+        // via the Ops trait (2MB GPU temp, done once).
+        if experts_gate_up.device().is_cuda() {
+            let ops = crate::ops::select_ops(experts_gate_up.device());
+            if let Some(result) = ops.swap_moe_gate_up(&experts_gate_up, moe_intermediate_size) {
+                result?;
+            }
+        }
         let experts_down = vb_experts.get(
             (num_experts, cfg.hidden_size, moe_intermediate_size),
             "down_proj",
@@ -1048,12 +1390,10 @@ impl Qwen3_5SparseMoeBlock {
             None
         };
 
-        let shared_expert_gate = if shared_expert.is_some() {
-            Some({
-                let gvb = vb.pp("shared_expert_gate");
-                let w = gvb.get((1, cfg.hidden_size), "weight")?;
-                DenseLinear::new(w, None)
-            })
+        let shared_expert_gate_weight = if shared_expert.is_some() {
+            // Stored as `[1, hidden]` in the checkpoint; flatten to `[hidden]`.
+            let gvb = vb.pp("shared_expert_gate");
+            Some(gvb.get((1, cfg.hidden_size), "weight")?.squeeze(0)?)
         } else {
             None
         };
@@ -1064,103 +1404,36 @@ impl Qwen3_5SparseMoeBlock {
             experts_down,
             moe_intermediate_size,
             shared_expert,
-            shared_expert_gate,
+            shared_expert_gate_weight,
             num_experts_per_tok,
             norm_topk_prob: cfg.norm_topk_prob,
         })
     }
 
     fn forward(&self, ops: &dyn crate::ops::Ops, xs: &Tensor) -> Result<Tensor> {
-        let ndim = xs.dims().len();
-        if ndim == 2 {
-            return self.forward_2d(ops, xs);
-        }
-        let (b, seq_len, hidden_dim) = xs.dims3()?;
-        let xs_flat = xs.reshape(((), hidden_dim))?;
-        let result = self.forward_2d(ops, &xs_flat)?;
-        result.reshape((b, seq_len, hidden_dim))
-    }
+        let (n_tokens, hidden_dim) = xs.dims2()?;
 
-    fn expert_forward(&self, expert_idx: usize, x: &Tensor, ops: &dyn crate::ops::Ops) -> Result<Tensor> {
-        let gate_up_w = self.experts_gate_up.get(expert_idx)?; // [2*inter, hidden]
-        let down_w = self.experts_down.get(expert_idx)?; // [hidden, inter]
-        let inter = self.moe_intermediate_size;
-
-        if x.device().is_cpu() {
-            return self.expert_forward_matmul(x, &gate_up_w, &down_w, inter, ops);
-        }
-
-        let gate_up = x.matmul(&gate_up_w.t()?)?;
-        let gate = gate_up.narrow(D::Minus1, 0, inter)?;
-        let up = gate_up.narrow(D::Minus1, inter, inter)?;
-        let act = ops.silu(&gate)?;
-        let hidden = (act * up)?;
-        hidden.matmul(&down_w.t()?)
-    }
-
-    fn expert_forward_matmul(
-        &self, x: &Tensor, gate_up_w: &Tensor, down_w: &Tensor, inter: usize,
-        ops: &dyn crate::ops::Ops,
-    ) -> Result<Tensor> {
-        // gate_up GEMM: x @ gate_up_w^T
-        let gate_up = x.matmul(&gate_up_w.t()?)?;
-        let gate = gate_up.narrow(gate_up.dims().len() - 1, 0, inter)?;
-        let up = gate_up.narrow(gate_up.dims().len() - 1, inter, inter)?;
-        // SiLU(gate) * up
-        let silu_gate = ops.silu(&gate)?;
-        let hidden = (&silu_gate * &up)?;
-        // down GEMM: hidden @ down_w^T
-        hidden.matmul(&down_w.t()?)
-    }
-
-    fn forward_2d(&self, ops: &dyn crate::ops::Ops, xs: &Tensor) -> Result<Tensor> {
-        let (_n_tokens, hidden_dim) = xs.dims2()?;
-
-        // Router: softmax → topk → gather weights
+        // Routing: fused kernel when available, decomposed fallback
         let router_logits = xs.apply(&self.gate)?;
-        let last_dim = router_logits.rank() - 1;
-        let routing_weights = ops.softmax(&router_logits, last_dim)?;
+        let (topk_weights, experts_per_tok) = self.compute_routing(ops, &router_logits, n_tokens)?;
 
-        let experts_per_tok = routing_weights
-            .arg_sort_last_dim(false)?
-            .narrow(D::Minus1, 0, self.num_experts_per_tok)?
-            .contiguous()?;
-        let mut topk_weights = routing_weights
-            .gather(&experts_per_tok, D::Minus1)?
-            .to_dtype(DType::F32)?;
+        // Expert dispatch: fused CUTLASS pipeline when available,
+        // composed grouped_gemm + silu_mul fallback
+        let mut routed_out = if let Some(r) = ops.cutlass_fused_moe(
+            xs, &experts_per_tok, &topk_weights,
+            &self.experts_gate_up, &self.experts_down,
+        ) {
+            r?
+        } else {
+            self.forward_composed(ops, xs, &topk_weights, &experts_per_tok, n_tokens, hidden_dim)?
+        };
 
-        if self.norm_topk_prob {
-            topk_weights = topk_weights.broadcast_div(&topk_weights.sum_keepdim(D::Minus1)?)?;
-        }
-
-        // Sequential expert dispatch (CPU path)
-        let topk_weights_vec: Vec<Vec<f32>> = topk_weights.to_vec2()?;
-        let experts_per_tok_vec: Vec<Vec<u32>> = experts_per_tok.to_vec2()?;
-
-        let n_tokens = topk_weights_vec.len();
-        let mut routed_out = Tensor::zeros((n_tokens, hidden_dim), xs.dtype(), xs.device())?;
-
-        for t in 0..n_tokens {
-            let x_t = xs.get(t)?.unsqueeze(0)?; // [1, hidden]
-            let mut acc = Tensor::zeros((1, hidden_dim), DType::F32, xs.device())?;
-            for k in 0..self.num_experts_per_tok {
-                let expert_idx = experts_per_tok_vec[t][k] as usize;
-                let weight = topk_weights_vec[t][k];
-                let expert_out = self
-                    .expert_forward(expert_idx, &x_t, ops)?
-                    .to_dtype(DType::F32)?;
-                acc = (acc + (expert_out * weight as f64)?)?;
-            }
-            let acc = acc.to_dtype(xs.dtype())?;
-            routed_out = routed_out.slice_assign(&[t..t + 1, 0..hidden_dim], &acc)?;
-        }
-
-        // Shared expert
+        // 3. Shared expert
         if let Some(ref shared) = self.shared_expert {
             let shared_out = shared.forward(ops, xs)?;
-            let shared_out = if let Some(ref gate) = self.shared_expert_gate {
-                let gate_val = ops.sigmoid(&xs.apply(gate)?)?; // [n, 1]
-                shared_out.broadcast_mul(&gate_val)?
+            let shared_out = if let Some(ref gate_w) = self.shared_expert_gate_weight {
+                let logits = xs.broadcast_mul(&gate_w.unsqueeze(0)?)?.sum_keepdim(D::Minus1)?;
+                shared_out.broadcast_mul(&ops.sigmoid(&logits)?)?
             } else {
                 shared_out
             };
@@ -1169,6 +1442,145 @@ impl Qwen3_5SparseMoeBlock {
 
         Ok(routed_out)
     }
+
+    /// Routing: fused kernel on CUDA, decomposed on CPU.
+    fn compute_routing(
+        &self,
+        ops: &dyn crate::ops::Ops,
+        router_logits: &Tensor,
+        n_tokens: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        // Try fused routing (single CUDA kernel, F32 softmax internally)
+        if self.norm_topk_prob {
+            if let Some(result) = ops.fused_moe_routing(router_logits, self.num_experts_per_tok) {
+                let (tw, topk_ids, _, _) = result?;
+                return Ok((tw, topk_ids.reshape((n_tokens, self.num_experts_per_tok))?));
+            }
+        }
+        // Decomposed fallback (CPU, non-BF16, or norm_topk_prob=false)
+        let routing_weights = ops.softmax(&router_logits.to_dtype(DType::F32)?, router_logits.rank() - 1)?;
+        let experts_per_tok = routing_weights
+            .arg_sort_last_dim(false)?
+            .narrow(D::Minus1, 0, self.num_experts_per_tok)?
+            .contiguous()?;
+        let mut topk_weights = routing_weights
+            .gather(&experts_per_tok, D::Minus1)?
+            .to_dtype(DType::F32)?;
+        if self.norm_topk_prob {
+            topk_weights = topk_weights.broadcast_div(&topk_weights.sum_keepdim(D::Minus1)?)?;
+        }
+        Ok((topk_weights, experts_per_tok))
+    }
+
+    /// Fused MoE dispatch (CUDA fast path).
+    ///
+    /// One `grouped_gemm` over the stacked `[E, 2*inter, hidden]` gate_up
+    /// weight handles all experts in a single kernel, then `silu_mul_concat`
+    /// fuses the activation, then `fused_moe_gemm` applies the down projection
+    /// with topk-weighted accumulation. This replaces a sequential
+    /// `for t { for k in 0..topk { two tiny matmuls } }` loop that did two
+    /// D2H syncs per layer via `to_vec2()` and launched ~`n_tokens * topk * 2`
+    /// tiny GEMMs — catastrophic for a 40-layer 256-expert top-8 model.
+    fn forward_composed(
+        &self,
+        ops: &dyn crate::ops::Ops,
+        xs: &Tensor,
+        topk_weights: &Tensor,
+        experts_per_tok: &Tensor,
+        n_tokens: usize,
+        hidden_dim: usize,
+    ) -> Result<Tensor> {
+        let flat = experts_per_tok.flatten_all()?;
+        let (sorted_expert_ids, sorted_token_ids) =
+            if let Some(result) = ops.moe_sort_experts(&flat) {
+                result?
+            } else {
+                sort_expert_assignments(experts_per_tok, xs.device())?
+            };
+
+        let is_prefill = n_tokens > 1;
+        // `num_tokens_per_expert` is unused by the current CUDA grouped_gemm
+        // kernel (it derives offsets internally), but keep the arg for trait
+        // compatibility. Reuse `sorted_expert_ids` as the sentinel to avoid an
+        // extra D2H sync via count_tokens_per_expert.
+        let counts_sentinel = &sorted_expert_ids;
+
+        // Single grouped GEMM against fused [E, 2*inter, hidden] → [N*topk, 2*inter]
+        let gate_up = ops.grouped_gemm(
+            xs,
+            &self.experts_gate_up,
+            &sorted_token_ids,
+            &sorted_expert_ids,
+            counts_sentinel,
+        )?;
+
+        // Weights are in [up|gate] order (swapped for CUTLASS Swiglu at load time).
+        // silu(gate) * up: gate is second half, up is first half.
+        let inter = self.moe_intermediate_size;
+        let down_input = {
+            let up = gate_up.narrow(D::Minus1, 0, inter)?.contiguous()?;
+            let gate = gate_up.narrow(D::Minus1, inter, inter)?.contiguous()?;
+            ops.silu_mul(&gate, &up)?
+        };
+
+        // Down projection with fused topk weighted accumulation.
+        let ys = match ops.fused_moe_gemm(
+            &down_input,
+            &self.experts_down,
+            topk_weights,
+            &sorted_token_ids,
+            &sorted_expert_ids,
+            self.num_experts_per_tok,
+            is_prefill,
+        ) {
+            Some(r) => r?,
+            None => {
+                // Fallback: unweighted grouped_gemm + manual weighted sum.
+                let raw = ops.grouped_gemm(
+                    &down_input,
+                    &self.experts_down,
+                    &sorted_token_ids,
+                    &sorted_expert_ids,
+                    counts_sentinel,
+                )?;
+                let raw = raw.reshape((n_tokens, self.num_experts_per_tok, hidden_dim))?;
+                let w = topk_weights.unsqueeze(D::Minus1)?;
+                return (raw * w)?.sum(D::Minus2);
+            }
+        };
+
+        ys.reshape((n_tokens, self.num_experts_per_tok, hidden_dim))?
+            .sum(D::Minus2)
+    }
+
+}
+
+/// Sort topk expert assignments so that all tokens routed to the same expert
+/// are contiguous in the output. Returns `(sorted_expert_ids, sorted_token_ids)`
+/// both as flat `[num_tokens * topk]` u32 tensors. The `sorted_token_ids[i]`
+/// gives the original flat assignment index (token * topk + k) for the i-th
+/// entry in the sorted expert stream, which is what `grouped_gemm` expects.
+fn sort_expert_assignments(
+    experts_per_tok: &Tensor,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let flat = experts_per_tok.flatten_all()?;
+    let n = flat.elem_count();
+
+    if n <= 1024 && device.is_cuda() {
+        let flat_2d = flat.reshape((1, n))?;
+        let (sorted_vals, sorted_idx) = flat_2d.sort_last_dim(true)?;
+        return Ok((sorted_vals.flatten_all()?, sorted_idx.flatten_all()?));
+    }
+
+    let flat_vec = flat.to_vec1::<u32>()?;
+    let mut indices: Vec<u32> = (0..n as u32).collect();
+    indices.sort_by_key(|&i| flat_vec[i as usize]);
+    let sorted_expert_ids: Vec<u32> = indices.iter().map(|&i| flat_vec[i as usize]).collect();
+    Ok((
+        Tensor::from_vec(sorted_expert_ids, (n,), device)?,
+        Tensor::from_vec(indices, (n,), device)?,
+    ))
 }
 
 pub(super) enum MlpVariant {
@@ -1200,7 +1612,13 @@ pub(super) struct Qwen3_5DecoderLayer {
     rms_norm_eps: f32,
 }
 
-/// Free function to run DeltaNet on packed varlen input (avoids borrow conflicts).
+/// Free function to run DeltaNet on packed varlen input WITHOUT the pool
+/// (single-batch prefill-only path, e.g. `prefill_pipeline` on servers that
+/// have no DeltaNet pool wired up). State is cleared per sequence so each
+/// batch starts fresh and requests can't leak state into each other through
+/// `gdn`'s transient fields. Decode never lands here — the GPU decode runners
+/// always build `BatchAttnContext` with `deltanet_slots` populated, which
+/// takes `deltanet_varlen_pooled` instead.
 fn deltanet_varlen(
     gdn: &mut Qwen3_5GatedDeltaNet,
     packed: &Tensor,
@@ -1210,52 +1628,250 @@ fn deltanet_varlen(
     let mut outputs = Vec::new();
     let mut offset = 0usize;
     for &len in seq_lens {
+        gdn.clear_state();
         let seq = packed.narrow(0, offset, len)?.unsqueeze(0)?; // [1, L, D]
         let out = gdn.forward(&seq, 0, ops)?; // [1, L, D]
         outputs.push(out.squeeze(0)?); // [L, D]
         offset += len;
     }
+    gdn.clear_state();
     Tensor::cat(&outputs, 0) // [total_tokens, D]
 }
 
-/// Pooled varlen DeltaNet: process each sequence independently, scatter final state to pool.
-/// Used during prefill to initialize per-request state in the pool.
+/// Pooled varlen DeltaNet: for each sequence in the batch,
+///   1. load this request's recurrent + conv state from the pool slot,
+///   2. run the per-token delta rule / conv1d forward,
+///   3. write the updated state back to the same slot.
+///
+/// Works for both prefill (len > 1, starting from zero because
+/// `DeltaNetPool::allocate` zeros the slot) and decode (len == 1, reading the
+/// state left over from the previous decode step). `gdn`'s transient
+/// `recurrent_state` / `conv_state` fields are used as per-call scratch — we
+/// load into them before `gdn.forward` and clear them after we scatter back,
+/// so concurrent requests sharing the same layer struct don't leak state.
 fn deltanet_varlen_pooled(
     gdn: &mut Qwen3_5GatedDeltaNet,
     packed: &Tensor,
     seq_lens: &[usize],
     pool: &mut crate::deltanet_pool::DeltaNetPool,
     slot_ids: &[u32],
+    slot_ids_gpu: Option<&Tensor>,
     dn_layer_idx: usize,
     ops: &dyn crate::ops::Ops,
 ) -> Result<Tensor> {
+    // Fast path: when every request in the batch is a single decode token
+    // AND the fused cuLA `kda_decode` kernel is available for this model's
+    // shape, let one CUDA call handle the delta rule step for the whole
+    // batch. The kernel reads each request's recurrent state from the pool
+    // via slot indices and updates it in place.
+    //
+    // We must decide eligibility BEFORE running conv1d, because the fused
+    // path and the sequential fallback BOTH mutate the pool's conv_state.
+    // If we ran conv1d in the fused path and then fell through, the
+    // conv_state would be advanced twice (producing "Paris Paris Paris …"
+    // on repeat as the state drifts).
+    let all_decode = !seq_lens.is_empty() && seq_lens.iter().all(|&l| l == 1);
+    // The cuLA kda_decode launcher is specialized on (H, HV, K, V), so we
+    // enumerate the AOT-compiled variants here. Keep this in sync with
+    // `crates/prelude-cuda/cula/scripts/compile_kernels.py`.
+    let fused_supported = matches!(
+        (
+            gdn.num_k_heads,
+            gdn.num_v_heads,
+            gdn.head_k_dim,
+            gdn.head_v_dim,
+        ),
+        (32, 32, 128, 128)   // MHA H=32
+        | (64, 64, 128, 128) // MHA H=64
+        | (16, 32, 128, 128) // GQA H=16/HV=32 (Qwen3.5-35B-A3B)
+    );
+    // The fast path's first step (`causal_conv1d_update` with pool indexing)
+    // mutates `pool.conv_states` in place. If we let it run and then `kda_decode_batched`
+    // returns None — for example on Blackwell/SM103 where there's no AOT cuLA cubin —
+    // the sequential fallback below will run conv1d *again* against the
+    // already-advanced state, producing degenerate decode output ("Paris Paris…").
+    // Probe `kda_decode_available()` BEFORE entering the fast path so we never
+    // touch pool state if the second stage can't run.
+    let fused_eligible = all_decode
+        && packed.device().is_cuda()
+        && fused_supported
+        && ops.kda_decode_available();
+    if fused_eligible {
+        if let Some(out) = deltanet_decode_batched_fused(
+            gdn, packed, pool, slot_ids, slot_ids_gpu, dn_layer_idx, ops,
+        )? {
+            return Ok(out);
+        }
+    }
+
     let mut outputs = Vec::new();
     let mut offset = 0usize;
     for (i, &len) in seq_lens.iter().enumerate() {
-        gdn.clear_state();
+        let slot = slot_ids[i] as usize;
+
+        // Load this request's state from the pool into the layer scratch.
+        // Force contiguous so downstream ops (matmul, slice_set on write-back)
+        // see a dense layout. `get(slot)` strips the leading max_slots dim.
+        gdn.recurrent_state = Some(
+            pool.recurrent_states[dn_layer_idx]
+                .get(slot)?
+                .contiguous()?,
+        );
+        gdn.conv_state = Some(
+            pool.conv_states[dn_layer_idx]
+                .get(slot)?
+                .contiguous()?,
+        );
+
         let seq = packed.narrow(0, offset, len)?.unsqueeze(0)?; // [1, L, D]
         let out = gdn.forward(&seq, 0, ops)?; // [1, L, D]
         outputs.push(out.squeeze(0)?); // [L, D]
 
-        // Scatter final state to pool at this request's slot
+        // Scatter updated state back to the same slot. `slice_set` needs the
+        // src contiguous, and intermediate broadcasts in delta_rule_step can
+        // leave a non-contiguous layout, so materialize before write-back.
         if let Some(ref state) = gdn.recurrent_state {
-            pool.recurrent_states[dn_layer_idx].slice_set(
-                &state.unsqueeze(0)?,
-                0,
-                slot_ids[i] as usize,
-            )?;
+            let row = state.contiguous()?.unsqueeze(0)?.contiguous()?;
+            pool.recurrent_states[dn_layer_idx].slice_set(&row, 0, slot)?;
         }
         if let Some(ref state) = gdn.conv_state {
-            pool.conv_states[dn_layer_idx].slice_set(
-                &state.unsqueeze(0)?,
-                0,
-                slot_ids[i] as usize,
-            )?;
+            let row = state.contiguous()?.unsqueeze(0)?.contiguous()?;
+            pool.conv_states[dn_layer_idx].slice_set(&row, 0, slot)?;
         }
         offset += len;
     }
-    gdn.clear_state(); // State is now in the pool
+    gdn.clear_state(); // scratch is only valid within this call
     Tensor::cat(&outputs, 0) // [total_tokens, D]
+}
+
+/// Batched decode-only fast path: one fused cuLA kernel call per layer for
+/// the whole decode batch. Returns `Ok(None)` if the kernel can't be used
+/// (wrong GPU arch, shape mismatch, etc.) so the caller falls back to the
+/// sequential loop. Conv1d is still done sequentially per request — cuLA
+/// doesn't ship a batched conv1d_decode, and it's cheap enough not to be
+/// the bottleneck.
+fn deltanet_decode_batched_fused(
+    gdn: &mut Qwen3_5GatedDeltaNet,
+    packed: &Tensor,
+    pool: &mut crate::deltanet_pool::DeltaNetPool,
+    slot_ids: &[u32],
+    slot_ids_gpu: Option<&Tensor>,
+    dn_layer_idx: usize,
+    ops: &dyn crate::ops::Ops,
+) -> Result<Option<Tensor>> {
+    // Only hybrid GPU paths pass through here, but guard anyway.
+    if !packed.device().is_cuda() {
+        return Ok(None);
+    }
+
+    let n = slot_ids.len();
+    if n == 0 {
+        return Ok(None);
+    }
+    // `packed` is `[total_tokens, hidden]` and all seq_lens == 1, so
+    // `total_tokens == n`. Fold the batch dim into the time dim for the
+    // projections: `gdn.in_proj_*` expect the existing `[B, L, hidden]`
+    // layout, so wrap `packed` as `[1, N, hidden]`.
+    let bst = BatchState::no_lora();
+    let x = packed.unsqueeze(0)?; // [1, N, hidden]
+
+    let qkv = gdn.in_proj_qkv.forward(&x, &bst, ops)?;   // [1, N, key*2+val]
+    let z   = gdn.in_proj_z  .forward(&x, &bst, ops)?;   // [1, N, value_dim]
+    let b_raw_full = gdn.in_proj_b.forward(&x, &bst, ops)?; // [1, N, HV]
+    let a_raw_full = gdn.in_proj_a.forward(&x, &bst, ops)?; // [1, N, HV]
+
+    let qkv_for_conv = qkv; // [1, N, conv_dim]
+    let qkv_for_conv_2d = qkv_for_conv.squeeze(0)?; // [N, conv_dim]
+
+    // ── Batched conv1d_decode via pool-indexed kernel ────────────────
+    // Uses `conv_state_indices` to let the kernel index directly into
+    // pool.conv_states[layer] (shape `[pool_size, conv_dim, state_len]`),
+    // eliminating the per-request CPU loop. One kernel launch for all N
+    // sequences, CUDA-graph compatible.
+    let device = packed.device();
+    // Use pre-allocated GPU tensor when available (CUDA graph compatible).
+    // Otherwise create on-the-fly (eager path, allocates memory).
+    let slot_ids_owned: Option<Tensor>;
+    let slot_ids_gpu: &Tensor = match slot_ids_gpu {
+        Some(t) => t,
+        None => {
+            slot_ids_owned = Some(Tensor::from_vec(slot_ids.to_vec(), (n,), device)?);
+            slot_ids_owned.as_ref().unwrap()
+        }
+    };
+    let qkv_conv = {
+        let x_bd = qkv_for_conv_2d.contiguous()?; // [N, conv_dim]
+        let pool_conv = &pool.conv_states[dn_layer_idx]; // [pool_size, conv_dim, state_len]
+        let sl = pool_conv.dim(2)?;
+        // causal_conv1d_update wants x: [N, dim, 1], conv_state: [pool, dim, sl]
+        // We need to check if the fused kernel path is available
+        if let Some(res) = ops.causal_conv1d_update(
+            &x_bd,                    // [N, conv_dim]
+            pool_conv,                // [pool_size, conv_dim, state_len]
+            &gdn.conv_weight,         // [conv_dim, width]
+            None,                     // bias
+            /*silu_activation=*/ true,
+            Some(slot_ids_gpu),       // conv_state_indices [N] U32 (reinterpreted as I32)
+        ) {
+            res? // [N, conv_dim]
+        } else {
+            // Fallback: per-request sequential (CPU loop, non-graph-compatible)
+            let mut conv_outs: Vec<Tensor> = Vec::with_capacity(n);
+            for (i, &slot) in slot_ids.iter().enumerate() {
+                let slot_us = slot as usize;
+                gdn.conv_state = Some(
+                    pool_conv.get(slot_us)?.contiguous()?,
+                );
+                let x_row = qkv_for_conv_2d.get(i)?.contiguous()?;
+                let out = gdn.conv1d_decode(&x_row, ops)?;
+                conv_outs.push(out);
+                if let Some(ref state) = gdn.conv_state {
+                    let row = state.contiguous()?.unsqueeze(0)?.contiguous()?;
+                    pool_conv.slice_set(&row, 0, slot_us)?;
+                }
+            }
+            gdn.conv_state = None;
+            Tensor::stack(&conv_outs, 0)?
+        }
+    };
+
+    // Split into q, k, v with head layout.
+    let q_flat = qkv_conv.narrow(D::Minus1, 0, gdn.key_dim)?;
+    let k_flat = qkv_conv.narrow(D::Minus1, gdn.key_dim, gdn.key_dim)?;
+    let v_flat = qkv_conv.narrow(D::Minus1, gdn.key_dim * 2, gdn.value_dim)?;
+    let q_nhk = q_flat.reshape((n, gdn.num_k_heads, gdn.head_k_dim))?.contiguous()?;
+    let k_nhk = k_flat.reshape((n, gdn.num_k_heads, gdn.head_k_dim))?.contiguous()?;
+    let v_nhv = v_flat.reshape((n, gdn.num_v_heads, gdn.head_v_dim))?.contiguous()?;
+
+    // Scalar-per-head a/b drop the batch-of-1 dim.
+    let a_2d = a_raw_full.squeeze(0)?.contiguous()?; // [N, HV]
+    let b_2d = b_raw_full.squeeze(0)?.contiguous()?; // [N, HV]
+
+    let decode_out = match ops.kda_decode_batched(
+        &q_nhk,
+        &k_nhk,
+        &v_nhv,
+        &a_2d,
+        &b_2d,
+        &gdn.a_log,
+        &gdn.dt_bias,
+        &pool.recurrent_states[dn_layer_idx],
+        slot_ids_gpu,
+    ) {
+        Some(Ok(o)) => o,    // [N, HV, V]
+        Some(Err(e)) => return Err(e),
+        None => return Ok(None),
+    };
+
+    // Reshape into [1, N, value_dim] for the gated norm + out projection,
+    // matching what the sequential path hands to `gdn.norm.forward`.
+    let out_nhv = decode_out.reshape((n, gdn.value_dim))?;
+    let out_1nd = out_nhv.unsqueeze(0)?;
+
+    let z_cont = z.contiguous()?; // [1, N, value_dim]
+    let normed = gdn.norm.forward(&out_1nd, &z_cont, ops)?;
+    let projected = gdn.out_proj.forward(&normed, &bst, ops)?; // [1, N, hidden]
+    Ok(Some(projected.squeeze(0)?)) // [N, hidden]
 }
 
 impl Qwen3_5DecoderLayer {
@@ -1265,9 +1881,18 @@ impl Qwen3_5DecoderLayer {
         rope: PartialRotaryEmbedding,
         vb: VarBuilder,
     ) -> Result<Self> {
-        // Qwen3.5 uses residual RMSNorm: output = norm(x) * (1 + weight)
-        let ln1_weight = (vb.pp("input_layernorm").get(cfg.hidden_size, "weight")? + 1.0)?;
-        let ln2_weight = (vb.pp("post_attention_layernorm").get(cfg.hidden_size, "weight")? + 1.0)?;
+        // Qwen3.5 uses residual RMSNorm: output = norm(x) * (1 + weight). See
+        // `Qwen3_5Attention::new` for why this is computed in F32.
+        let ln1_weight = (vb
+            .pp("input_layernorm")
+            .get(cfg.hidden_size, "weight")?
+            .to_dtype(DType::F32)?
+            + 1.0)?;
+        let ln2_weight = (vb
+            .pp("post_attention_layernorm")
+            .get(cfg.hidden_size, "weight")?
+            .to_dtype(DType::F32)?
+            + 1.0)?;
 
         let token_mixer = match cfg.layer_type(layer_idx) {
             LayerType::LinearAttention => {
@@ -1322,12 +1947,13 @@ impl Qwen3_5DecoderLayer {
         seq_lens: &[usize],
         pool: &mut crate::deltanet_pool::DeltaNetPool,
         slot_ids: &[u32],
+        slot_ids_gpu: Option<&Tensor>,
         dn_layer_idx: usize,
     ) -> Result<Tensor> {
         let h = ops.rms_norm(x, &self.ln1_weight, self.rms_norm_eps)?;
         let h = match &mut self.token_mixer {
             TokenMixer::LinearAttention(gdn) => {
-                deltanet_varlen_pooled(gdn, &h, seq_lens, pool, slot_ids, dn_layer_idx, ops)?
+                deltanet_varlen_pooled(gdn, &h, seq_lens, pool, slot_ids, slot_ids_gpu, dn_layer_idx, ops)?
             }
             TokenMixer::FullAttention(_) => {
                 crate::tensor::bail!("forward_with_paged_prefix_pooled called on FullAttention layer")
@@ -1391,8 +2017,13 @@ impl Qwen3_5Model {
             layers.push(Qwen3_5DecoderLayer::new(cfg, idx, rope, vb_l.pp(idx))?);
         }
 
-        // Qwen3.5 uses residual RMSNorm: output = norm(x) * (1 + weight)
-        let norm_weight = (vb_m.pp("norm").get(cfg.hidden_size, "weight")? + 1.0)?;
+        // Qwen3.5 uses residual RMSNorm: output = norm(x) * (1 + weight). See
+        // `Qwen3_5Attention::new` for why this is computed in F32.
+        let norm_weight = (vb_m
+            .pp("norm")
+            .get(cfg.hidden_size, "weight")?
+            .to_dtype(DType::F32)?
+            + 1.0)?;
         let norm = RmsNorm::from_weight(norm_weight.clone(), cfg.rms_norm_eps);
 
         Ok(Self {
@@ -1439,6 +2070,7 @@ impl Qwen3_5Model {
                                 seq_lens,
                                 pool,
                                 slots,
+                                ctx.deltanet_slots_gpu,
                                 dn_layer_idx,
                             )?;
                         } else {
@@ -1690,7 +2322,7 @@ pub(crate) mod meta {
                 supports_paged_attn: device.is_cuda() && is_safetensors,
                 supports_varlen: device.is_cuda() && is_safetensors,
                 supports_deltanet: true,
-                supports_cuda_graph: false,
+                supports_cuda_graph: device.is_cuda() && is_safetensors,
             }
         }
 
@@ -1841,15 +2473,18 @@ pub mod gguf {
             // Build PartialRotaryEmbedding from GGUF config
             let build_rope = |dtype: DType| -> Result<super::PartialRotaryEmbedding> {
                 let rotary_dim = config.rotary_dim();
+                let half = rotary_dim / 2;
                 let inv_freq: Vec<f32> = (0..rotary_dim)
                     .step_by(2)
                     .map(|i| 1.0 / config.rope_theta.powf(i as f64 / rotary_dim as f64) as f32)
                     .collect();
-                let inv_freq = Tensor::new(inv_freq, device)?;
+                let inv_freq =
+                    Tensor::from_vec(inv_freq, (1, half), device)?.to_dtype(DType::F32)?;
                 let positions =
                     Tensor::arange(0u32, config.max_position_embeddings as u32, device)?
-                        .to_dtype(DType::F32)?;
-                let freqs = positions.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?;
+                        .to_dtype(DType::F32)?
+                        .reshape((config.max_position_embeddings, 1))?;
+                let freqs = positions.broadcast_mul(&inv_freq)?;
                 let cos = freqs.cos()?.to_dtype(dtype)?;
                 let sin = freqs.sin()?.to_dtype(dtype)?;
                 Ok(super::PartialRotaryEmbedding {
@@ -1879,7 +2514,11 @@ pub mod gguf {
     
                 // Token mixer
                 let token_mixer = if config.is_recurrent(i) {
-                    // DeltaNet layer
+                    // DeltaNet layer. We keep the four input
+                    // projections split rather than fusing into one
+                    // matmul — see the comment in
+                    // `Qwen3_5GatedDeltaNet::new` (safetensors loader)
+                    // for the GEMM tile-alignment rationale.
                     let in_proj_qkv = Self::load_linear(
                         &ct,
                         reader,

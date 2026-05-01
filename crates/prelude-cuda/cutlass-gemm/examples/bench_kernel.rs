@@ -1,6 +1,6 @@
 //! CUTLASS GEMM performance benchmark — SM90 vs SM80 vs cuBLAS/cuBLASLt.
 //!
-//! Run:  cargo run -p prelude-cutlass-gemm --example bench_kernel --release
+//! Run:  cargo run -p cutlass-gemm --example bench_kernel --release
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -112,7 +112,7 @@ fn cutlass_gemm_bf16(
     let (ip, _g2) = input.device_ptr(&gpu.stream);
     let (op, _g3) = output.device_ptr_mut(&gpu.stream);
     unsafe {
-        prelude_cutlass_gemm::gemm_dispatch(
+        cutlass_gemm::gemm_dispatch(
             wp as *const c_void, ip as *const c_void, op as *mut c_void,
             n as i32, m as i32, k as i32, 1,
             k as i32, k as i32, n as i32, 0, 0, 0,
@@ -132,7 +132,7 @@ fn cutlass_sm80_bf16(
     let (ip, _g2) = input.device_ptr(&gpu.stream);
     let (op, _g3) = output.device_ptr_mut(&gpu.stream);
     unsafe {
-        prelude_cutlass_gemm::gemm_sm80(
+        cutlass_gemm::gemm_sm80(
             wp as *const c_void, ip as *const c_void, op as *mut c_void,
             n as i32, m as i32, k as i32, 0, config, gpu.stream_ptr(),
         ).ok();
@@ -147,7 +147,7 @@ fn cutlass_dispatch(
     dtype: u32, gpu: &Gpu,
 ) {
     unsafe {
-        prelude_cutlass_gemm::gemm_dispatch(
+        cutlass_gemm::gemm_dispatch(
             weight, input, output,
             n as i32, m as i32, k as i32, batch as i32,
             k as i32, k as i32, n as i32,
@@ -215,7 +215,7 @@ fn print_header(title: &str) {
 
 // ============================================================================
 // All benchmarks in a single test to avoid GPU memory contention from parallel execution.
-// Run with: cargo test -p prelude-cutlass-gemm --release --test performance -- --nocapture
+// Run with: cargo test -p cutlass-gemm --release --test performance -- --nocapture
 // ============================================================================
 
 fn main() {
@@ -479,7 +479,7 @@ fn bench_fp8_gemm(gpu: &Gpu) {
                     let (ip, _g2) = input.device_ptr(&gpu.stream);
                     let (op, _g3) = out.device_ptr_mut(&gpu.stream);
                     unsafe {
-                        prelude_cutlass_gemm::gemm_dispatch(
+                        cutlass_gemm::gemm_dispatch(
                             wp as _, ip as _, op as _,
                             *n as i32, m as i32, *k as i32, 1,
                             *k as i32, *k as i32, *n as i32, 0, 0, 0,

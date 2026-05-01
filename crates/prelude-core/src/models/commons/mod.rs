@@ -89,6 +89,10 @@ pub struct BatchAttnContext<'a> {
     pub paged_kv: Option<&'a PagedKvBatchContext<'a>>,
     pub deltanet_pool: Option<&'a mut crate::cache::deltanet_pool::DeltaNetPool>,
     pub deltanet_slots: Option<&'a [u32]>,
+    /// Pre-allocated GPU tensor of DeltaNet slot IDs `[bs]` U32.
+    /// Used by batched conv1d_update (conv_state_indices) and kda_decode.
+    /// Created outside model.forward() to be CUDA-graph compatible.
+    pub deltanet_slots_gpu: Option<&'a Tensor>,
 }
 
 // Re-exports for convenient use.

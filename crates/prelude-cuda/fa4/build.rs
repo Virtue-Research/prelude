@@ -1,10 +1,23 @@
-//! Build script for prelude-flash-attn-v4.
+//! Build script for the `flash-attn-v4` crate.
 //!
-//! 1. Find flash-attention source (third_party/flash-attention submodule).
-//! 2. If pre-compiled kernel .o files exist in `kernels/`, use them.
-//!    Otherwise, run `scripts/compile_kernels.py` to AOT-compile.
-//! 3. Create a static archive (libfa4_kernels.a) from all kernel .o files.
-//! 4. Generate Rust FFI dispatch table from manifest.json.
+//! Runs the FA4 Python CuTeDSL compile script to AOT-generate kernel
+//! `.o` files, archives them into `libfa4_kernels.a`, and generates a
+//! Rust dispatch table mapping `KernelKey` + arch → TVM-FFI function
+//! pointer.
+//!
+//! Shared build-support lives in `prelude_kernelbuild`:
+//!
+//!   * `venv` — Python venv provisioning, `uv`/pip wrapping, torch
+//!     wheel index detection, importability checks
+//!   * `dispatch` — manifest parsing, TVM-FFI extern-block emission,
+//!     stub fallback
+//!   * `archive` — `.o` collection, `ar rcs` + whole-archive linking
+//!
+//! The one FA4-specific bit that stays inline is the dispatch table
+//! layout: FA4 keys by a 12-element tuple of shape params (head_dim,
+//! head_dim_v, gqa_ratio, causal, window, ...), not by a simple string
+//! name, so the `match` arms get assembled from the manifest fields
+//! here rather than in the shared helper.
 
 use anyhow::{Context, Result};
 use std::env;
@@ -12,25 +25,11 @@ use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-include!("../../../build_log.rs");
-
-/// Detect local CUDA toolkit version from nvcc and return the matching
-/// PyTorch wheel index URL (e.g. "https://download.pytorch.org/whl/cu128").
-/// Returns None if nvcc is not found or version can't be parsed.
-fn detect_torch_cuda_index() -> Option<String> {
-    let output = Command::new("nvcc").arg("--version").output().ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    // nvcc output contains "release X.Y," — parse major.minor
-    let release = text.split("release ").nth(1)?;
-    let version = release.split(',').next()?.trim();
-    let parts: Vec<&str> = version.split('.').collect();
-    if parts.len() >= 2 {
-        let cu_tag = format!("{}{}", parts[0], parts[1]);
-        Some(format!("https://download.pytorch.org/whl/cu{cu_tag}"))
-    } else {
-        None
-    }
-}
+use prelude_kernelbuild::archive::{self, ArMode};
+use prelude_kernelbuild::build_log;
+use prelude_kernelbuild::dispatch;
+use prelude_kernelbuild::nvcc::{file_hash, track_submodule};
+use prelude_kernelbuild::venv::{detect_torch_cuda_index, InstallOpts, PythonVenv};
 
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
@@ -40,129 +39,111 @@ fn main() -> Result<()> {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
-    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap().parent().unwrap();
+    let workspace_root = manifest_dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
     let kernels_dir = out_dir.join("fa4_kernels");
-    // Stable venv location — survives `cargo clean -p`
+    // Stable venv location — survives `cargo clean -p`.
     let venv_dir = workspace_root.join("target/fa4-venv");
 
     // Phase 1: Ensure FA4 Python source is available
-    let fa4_src = ensure_fa4_source(&out_dir)?;
+    let fa4_src = ensure_fa4_source(workspace_root)?;
 
     // Phase 2: Ensure kernel .o files exist (auto-creates Python venv if needed)
-    ensure_kernels(&kernels_dir, &manifest_dir, &fa4_src, &out_dir, &venv_dir)?;
+    ensure_kernels(&kernels_dir, &manifest_dir, &fa4_src, &venv_dir)?;
 
-    // Phase 3: Create static archive from kernel .o files + generate dispatch table
-    let has_kernels = link_kernel_objects(&kernels_dir, &out_dir)?;
+    // Phase 3: Archive the .o files and generate the dispatch table.
+    let objects = archive::collect_obj_files(&kernels_dir);
+    let has_kernels = archive::archive_and_whole_link(
+        &objects,
+        &out_dir,
+        "fa4_kernels",
+        ArMode::Replace,
+    )
+    .map_err(anyhow::Error::msg)?;
 
-    // Phase 4: Generate Rust dispatch code
+    // CuTeDSL kernel objects (libfa4_kernels.a) reference _cudaGetDevice,
+    // _cudaLibraryLoadData, etc. — these are provided by
+    // libcuda_dialect_runtime_static.a inside the nvidia_cutlass_dsl
+    // Python wheel. Link it from the FA4 venv. Without this, downstream
+    // examples and tests (e.g. `bench_kernel`) link-fail on undefined
+    // symbols.
+    if has_kernels {
+        let python = PythonVenv::ensure(&venv_dir)
+            .map_err(anyhow::Error::msg)?
+            .python_path()
+            .to_path_buf();
+        prelude_kernelbuild::venv::link_cutlass_dsl_runtime(&python);
+    }
+
     generate_dispatch_code(&kernels_dir, &out_dir, has_kernels)?;
 
     Ok(())
 }
 
-/// Create a static archive from all kernel .o files in the kernels directory.
-/// Returns true if any .o files were found and archived.
-fn link_kernel_objects(kernels_dir: &Path, out_dir: &Path) -> Result<bool> {
-    let obj_files: Vec<PathBuf> = std::fs::read_dir(kernels_dir)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "o"))
-        .collect();
-
-    if obj_files.is_empty() {
-        build_log!("No kernel .o files found, FA4 dispatch will be empty");
-        return Ok(false);
-    }
-
-    build_log!(
-        "Archiving {} kernel .o files into libfa4_kernels.a",
-        obj_files.len()
-    );
-
-    // Create static archive: ar rcs libfa4_kernels.a *.o
-    let archive_path = out_dir.join("libfa4_kernels.a");
-    let mut cmd = Command::new("ar");
-    cmd.arg("rcs").arg(&archive_path);
-    for obj in &obj_files {
-        cmd.arg(obj);
-    }
-    let status = cmd.status().context("Failed to run ar")?;
-    if !status.success() {
-        anyhow::bail!("ar failed to create libfa4_kernels.a");
-    }
-
-    // Link the static archive with +whole-archive because Rust code references
-    // kernel symbols via function pointers in the generated dispatch table.
-    // Without whole-archive, the linker would drop "unreferenced" kernel symbols.
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static:+whole-archive=fa4_kernels");
-
-    Ok(true)
-}
-
-/// Generate `fa4_dispatch.rs` with extern "C" declarations and a lookup function.
-/// Reads manifest.json to know which variants were compiled.
-fn generate_dispatch_code(
-    kernels_dir: &Path,
-    out_dir: &Path,
-    has_kernels: bool,
-) -> Result<()> {
+/// FA4's dispatch key is a 12-tuple of shape params, so we can't drop
+/// in the generic name-based lookup from `prelude_kernelbuild::dispatch`
+/// — we read the manifests via the shared helper, then assemble the
+/// match arms by hand.
+fn generate_dispatch_code(kernels_dir: &Path, out_dir: &Path, has_kernels: bool) -> Result<()> {
     let dispatch_path = out_dir.join("fa4_dispatch.rs");
 
+    let stub_signature =
+        "pub(crate) fn lookup(_key: &crate::loader::KernelKey, _arch: u32) \
+         -> Option<crate::loader::TVMSafeCallFn>";
+
     if !has_kernels {
-        // No kernels — generate empty dispatch
-        std::fs::write(
-            &dispatch_path,
-            "pub(crate) fn lookup(_key: &crate::loader::KernelKey, _arch: u32) -> Option<crate::loader::TVMSafeCallFn> { None }\n",
-        )?;
+        std::fs::write(&dispatch_path, dispatch::stub_lookup(stub_signature))?;
         return Ok(());
     }
 
-    let manifest_path = kernels_dir.join("manifest.json");
-    let manifest_str = std::fs::read_to_string(&manifest_path)
-        .context("Failed to read manifest.json")?;
-    let manifest: serde_json::Value =
-        serde_json::from_str(&manifest_str).context("Failed to parse manifest.json")?;
-
-    let variants = manifest["variants"]
-        .as_array()
-        .context("manifest.json missing 'variants' array")?;
-
-    let mut code = String::new();
-    writeln!(code, "// AUTO-GENERATED by build.rs — do not edit")?;
-    writeln!(code, "// Included into loader.rs which already imports c_void and TVMFFIAny.")?;
-    writeln!(code)?;
-
-    // Extern declarations for each kernel variant
-    writeln!(code, "unsafe extern \"C\" {{")?;
-    for variant in variants {
-        let symbol = variant["symbol"]
-            .as_str()
-            .context("variant missing 'symbol' field")?;
-        writeln!(
-            code,
-            "    fn {symbol}(handle: *mut c_void, args: *const TVMFFIAny, num_args: i32, ret: *mut TVMFFIAny) -> i32;"
-        )?;
+    let variants = dispatch::collect_manifests(kernels_dir);
+    if variants.is_empty() {
+        std::fs::write(&dispatch_path, dispatch::stub_lookup(stub_signature))?;
+        return Ok(());
     }
-    writeln!(code, "}}")?;
-    writeln!(code)?;
 
-    // Lookup function: KernelKey + arch → function pointer
+    // Extern declarations for every compiled symbol. Loader already has
+    // `c_void` and `TVMFFIAny` in scope (the generated file is
+    // `include!`-ed into `loader.rs`), so the path we pass is just
+    // `TVMFFIAny`.
+    let symbols: Vec<&str> = variants
+        .iter()
+        .filter_map(|v| v["symbol"].as_str())
+        .collect();
+
+    let mut code = dispatch::header_comment();
     writeln!(
         code,
-        "pub(crate) fn lookup(key: &crate::loader::KernelKey, arch: u32) -> Option<crate::loader::TVMSafeCallFn> {{"
+        "// Included into loader.rs which already imports c_void and TVMFFIAny."
+    )?;
+    writeln!(code)?;
+    code.push_str(&dispatch::tvm_ffi_extern_block(
+        symbols.iter().copied(),
+        "TVMFFIAny",
+    ));
+
+    // FA4-specific lookup signature: matches on the struct fields.
+    writeln!(
+        code,
+        "pub(crate) fn lookup(key: &crate::loader::KernelKey, arch: u32) \
+         -> Option<crate::loader::TVMSafeCallFn> {{"
     )?;
     writeln!(
         code,
-        "    match (key.head_dim, key.head_dim_v, key.gqa_ratio, key.causal, key.window, key.pack_gqa, key.softcap_bits, key.paged, key.paged_non_tma, key.dtype as u8, key.has_seqused_q, arch) {{"
+        "    match (key.head_dim, key.head_dim_v, key.gqa_ratio, key.causal, key.window, \
+         key.pack_gqa, key.softcap_bits, key.paged, key.paged_non_tma, key.dtype as u8, \
+         key.has_seqused_q, arch) {{"
     )?;
-    for variant in variants {
+    for variant in &variants {
         let symbol = variant["symbol"].as_str().unwrap();
         let head_dim = variant["head_dim"].as_u64().unwrap();
-        let head_dim_v = variant.get("head_dim_v")
+        let head_dim_v = variant
+            .get("head_dim_v")
             .and_then(|v| v.as_u64())
             .unwrap_or(head_dim);
         let gqa_ratio = variant["gqa_ratio"].as_u64().unwrap();
@@ -186,7 +167,7 @@ fn generate_dispatch_code(
             .unwrap_or(false);
         let dtype_val: u8 = match variant.get("dtype").and_then(|v| v.as_str()) {
             Some("fp16") => 1,
-            _ => 0,  // bf16
+            _ => 0, // bf16
         };
         let paged_non_tma = variant
             .get("paged_non_tma")
@@ -198,7 +179,9 @@ fn generate_dispatch_code(
             .unwrap_or(false);
         writeln!(
             code,
-            "        ({head_dim}, {head_dim_v}, {gqa_ratio}, {causal}, {window}, {pack_gqa}, {softcap_bits}_u32, {paged}, {paged_non_tma}, {dtype_val}_u8, {has_seqused_q}, {arch}) => Some({symbol}),"
+            "        ({head_dim}, {head_dim_v}, {gqa_ratio}, {causal}, {window}, \
+             {pack_gqa}, {softcap_bits}_u32, {paged}, {paged_non_tma}, {dtype_val}_u8, \
+             {has_seqused_q}, {arch}) => Some({symbol}),"
         )?;
     }
     writeln!(code, "        _ => None,")?;
@@ -206,53 +189,68 @@ fn generate_dispatch_code(
     writeln!(code, "}}")?;
 
     std::fs::write(&dispatch_path, &code)?;
-    build_log!(
-        "Generated fa4_dispatch.rs with {} kernel variants",
-        variants.len()
-    );
+    dispatch::log_generated("FA4", variants.len());
 
     Ok(())
 }
 
-fn ensure_fa4_source(_out_dir: &Path) -> Result<PathBuf> {
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
-    let workspace_root = manifest_dir.join("../../..");
+fn ensure_fa4_source(workspace_root: &Path) -> Result<PathBuf> {
     let fa4_src = workspace_root.join("third_party/flash-attention");
-
     if !fa4_src.join("flash_attn/cute/__init__.py").exists() {
         anyhow::bail!(
             "third_party/flash-attention submodule not found or incomplete.\n\
              Run: git submodule update --init third_party/flash-attention"
         );
     }
-
     Ok(fa4_src)
 }
 
-/// Compute SHA-256 hash (first 16 hex chars) of a file. Matches compile_kernels.py.
-fn file_hash(path: &Path) -> Option<String> {
-    use sha2::Digest;
-    let content = std::fs::read(path).ok()?;
-    let hash = sha2::Sha256::digest(&content);
-    Some(hex::encode(hash)[..16].to_string())
-}
-
-fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_dir: &Path, venv_dir: &Path) -> Result<()> {
+/// Provision the FA4 venv and run the compile script per target
+/// arch. FA4's layout differs from cuLA's in two ways that keep it
+/// from using the shared `prelude_kernelbuild::dsl` driver:
+///
+///   * All archs write `.o` files into a flat `kernels_dir` (not
+///     per-arch subdirectories). The same directory is populated
+///     incrementally across invocations.
+///   * Each arch needs a *set* of env vars (`FLASH_ATTENTION_ARCH`,
+///     `FLASH_ATTENTION_FAKE_TENSOR`, `FA_CLC`, `FA_DISABLE_2CTA`,
+///     `CUTE_DSL_ARCH`, `PYTHONPATH`) rather than a single
+///     `CUTE_DSL_ARCH=smXXa`, so the driver's per-arch-env-var hook
+///     isn't a clean fit.
+///
+/// Forcing those into the driver would add a `flat_output` +
+/// callback-shaped env strategy for marginal reuse. cuLA is the only
+/// current consumer of the shared driver; if a future crate lands
+/// with FA4's flat-output pattern we revisit then. The cache check
+/// and sticky-failure logic still stay inline here but are small
+/// enough not to matter.
+fn ensure_kernels(
+    kernels_dir: &Path,
+    manifest_dir: &Path,
+    fa4_src: &Path,
+    venv_dir: &Path,
+) -> Result<()> {
     let script = manifest_dir.join("scripts/compile_kernels.py");
     let current_hash = file_hash(&script).unwrap_or_default();
 
-    // Check if we already have compiled kernels that match the current script
+    // Cache hit: script hash hasn't changed since the last successful
+    // build.
     if kernels_dir.join("manifest.json").exists() {
         let has_objs = std::fs::read_dir(kernels_dir)
             .ok()
             .into_iter()
             .flatten()
-            .any(|e| e.ok().map(|e| e.path().extension().is_some_and(|x| x == "o")).unwrap_or(false));
+            .any(|e| {
+                e.ok()
+                    .map(|e| e.path().extension().is_some_and(|x| x == "o"))
+                    .unwrap_or(false)
+            });
         if has_objs {
-            // Check if compile_kernels.py has changed since last compilation
-            let manifest_str = std::fs::read_to_string(kernels_dir.join("manifest.json")).unwrap_or_default();
+            let manifest_str =
+                std::fs::read_to_string(kernels_dir.join("manifest.json")).unwrap_or_default();
             if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&manifest_str) {
-                let stored_hash = manifest.get("script_hash")
+                let stored_hash = manifest
+                    .get("script_hash")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if stored_hash == current_hash {
@@ -262,7 +260,6 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_d
                     "compile_kernels.py changed (hash {stored_hash:.8} → {current_hash:.8}), \
                      clearing old kernels and recompiling..."
                 );
-                // Clear all old .o files
                 for entry in std::fs::read_dir(kernels_dir).into_iter().flatten().flatten() {
                     let p = entry.path();
                     if p.extension().is_some_and(|x| x == "o") {
@@ -274,14 +271,11 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_d
                 return Ok(());
             }
         } else {
-            // manifest exists but no .o files — need to recompile
             let _ = std::fs::remove_file(kernels_dir.join("manifest.json"));
         }
     }
 
     build_log!("No pre-compiled FA4 kernels, attempting AOT compilation...");
-
-    let script = manifest_dir.join("scripts/compile_kernels.py");
     if !script.exists() {
         anyhow::bail!(
             "No pre-compiled FA4 kernels and no compile script.\n\
@@ -289,9 +283,10 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_d
         );
     }
 
-    let python = ensure_python_env(venv_dir)?;
+    let python = ensure_fa4_python_env(venv_dir)?;
 
     // Collect target archs: local GPU + PRELUDE_FA4_ARCHS env var
+    // override. Falls back to sm_90 for headless build hosts.
     let mut archs = Vec::new();
     if let Ok(local) = detect_gpu_arch() {
         archs.push(local.clone());
@@ -308,16 +303,15 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_d
         archs.push("sm_90".to_string());
     }
 
-    // Compile for each target arch
+    let workers = env::var("PRELUDE_FA4_WORKERS").unwrap_or_else(|_| {
+        let num_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        num_cpus.min(8).to_string()
+    });
+
     for arch in &archs {
         build_log!("FA4 AOT compiling for {arch}...");
-
-        let workers = std::env::var("PRELUDE_FA4_WORKERS").unwrap_or_else(|_| {
-            let num_cpus = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1);
-            num_cpus.min(8).to_string()
-        });
 
         let status = Command::new(&python)
             .arg(&script)
@@ -330,6 +324,10 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_d
             .env("CUTE_DSL_ARCH", format!("{arch}a"))
             .env("FA_CLC", "0")
             .env("FA_DISABLE_2CTA", "0")
+            // Expose the shared dsl_driver helpers to the compile
+            // script. See prelude_kernelbuild::scripts_dir() for the
+            // resolution mechanism.
+            .env("PRELUDE_KB_SCRIPTS_DIR", prelude_kernelbuild::scripts_dir())
             .status()
             .context("Failed to run FA4 compile script")?;
 
@@ -338,12 +336,15 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_d
         }
     }
 
-    // Verify at least some kernels were produced
     let has_objs = std::fs::read_dir(kernels_dir)
         .ok()
         .into_iter()
         .flatten()
-        .any(|e| e.ok().map(|e| e.path().extension().is_some_and(|x| x == "o")).unwrap_or(false));
+        .any(|e| {
+            e.ok()
+                .map(|e| e.path().extension().is_some_and(|x| x == "o"))
+                .unwrap_or(false)
+        });
     if !has_objs {
         anyhow::bail!(
             "FA4 kernel compilation produced no .o files for archs: {archs:?}.\n\
@@ -354,109 +355,55 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fa4_src: &Path, out_d
     Ok(())
 }
 
-/// Ensure a Python environment with CuTeDSL deps is available.
-/// Uses an existing venv python if cutlass is importable, otherwise creates
-/// a venv in OUT_DIR and installs dependencies automatically.
-fn ensure_python_env(venv_dir: &Path) -> Result<String> {
-    // 1. Check if system/venv python already has cutlass
+/// Provision (or reuse) the FA4 venv with cutlass-dsl + quack + torch
+/// installed. Short-circuits when the venv's `cutlass` import already
+/// works (covers both "system Python already has it" and "cached venv
+/// survives `cargo clean`").
+fn ensure_fa4_python_env(venv_dir: &Path) -> Result<PathBuf> {
+    // 1. Short-circuit: if system python3 already has cutlass, use it
+    //    directly — no venv construction needed.
     for candidate in ["python3", "python"] {
-        if check_cutlass(candidate) {
+        let ok = Command::new(candidate)
+            .args(["-c", "import cutlass"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
             build_log!("Using {candidate} (cutlass already available)");
-            return Ok(candidate.to_string());
+            return Ok(PathBuf::from(candidate));
         }
     }
 
-    // 2. Create venv and install deps (stable location, survives cargo clean)
-    let venv_python = venv_dir.join("bin/python3");
-
-    if check_cutlass(venv_python.to_str().unwrap_or("")) {
+    // 2. Otherwise, construct (or reuse) a persistent venv at venv_dir.
+    let venv = PythonVenv::ensure(venv_dir).map_err(anyhow::Error::msg)?;
+    if venv.check_import("import cutlass") {
         build_log!("Using cached venv at {}", venv_dir.display());
-        return Ok(venv_python.to_string_lossy().into_owned());
+        return Ok(venv.python_path().to_path_buf());
     }
 
-    build_log!("Creating Python venv for FA4 kernel compilation...");
-
-    // Try uv first (fast), fall back to python3 -m venv
-    let venv_created = Command::new("uv")
-        .args(["venv", venv_dir.to_str().unwrap(), "--python", "3.12"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    if !venv_created {
-        let status = Command::new("python3")
-            .args(["-m", "venv", venv_dir.to_str().unwrap()])
-            .status()
-            .context("Failed to create venv (neither uv nor python3 -m venv worked)")?;
-        if !status.success() {
-            anyhow::bail!("Failed to create Python venv");
-        }
-    }
-
-    // Install dependencies
-    // Detect CUDA version to pick matching PyTorch wheel (avoids driver mismatch)
     let torch_index = detect_torch_cuda_index();
     if let Some(ref idx) = torch_index {
         build_log!("Detected CUDA index: {idx}");
     }
-
     build_log!("Installing FA4 Python deps (nvidia-cutlass-dsl, torch)...");
 
-    let venv_python_str = venv_python.to_string_lossy().to_string();
-    let has_uv = Command::new("uv")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    venv.pip_install(
+        &[
+            "nvidia-cutlass-dsl>=4.4.2",
+            "quack-kernels@git+https://github.com/Dao-AILab/quack.git",
+            "torch",
+            "einops",
+        ],
+        InstallOpts::new().extra_index_url(torch_index.as_deref()),
+    )
+    .map_err(anyhow::Error::msg)?;
 
-    let base_pkgs = &[
-        "nvidia-cutlass-dsl>=4.4.2",
-        "quack-kernels@git+https://github.com/Dao-AILab/quack.git",
-        "torch",
-        "einops",
-    ];
-
-    let status = if has_uv {
-        let mut cmd = Command::new("uv");
-        cmd.args(["pip", "install", "--python", &venv_python_str]);
-        if let Some(ref idx) = torch_index {
-            cmd.args(["--extra-index-url", idx]);
-        }
-        cmd.args(base_pkgs);
-        cmd.status().context("uv pip install failed")?
-    } else {
-        let pip_path = venv_dir.join("bin/pip");
-        let mut cmd = Command::new(&pip_path);
-        cmd.arg("install");
-        if let Some(ref idx) = torch_index {
-            cmd.args(["--extra-index-url", idx]);
-        }
-        cmd.args(base_pkgs);
-        cmd.status().context("pip install failed")?
-    };
-
-    if !status.success() {
-        anyhow::bail!(
-            "Failed to install FA4 Python deps.\n\
-             Requires: pip install 'nvidia-cutlass-dsl>=4.4.2' torch"
-        );
-    }
-
-    if !check_cutlass(venv_python.to_str().unwrap_or("")) {
+    if !venv.check_import("import cutlass") {
         anyhow::bail!("cutlass not importable after install — check Python/CUDA setup");
     }
 
     build_log!("FA4 Python env ready at {}", venv_dir.display());
-    Ok(venv_python.to_string_lossy().into_owned())
-}
-
-/// Check if a python binary can import cutlass.
-fn check_cutlass(python: &str) -> bool {
-    Command::new(python)
-        .args(["-c", "import cutlass"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    Ok(venv.python_path().to_path_buf())
 }
 
 fn detect_gpu_arch() -> Result<String> {

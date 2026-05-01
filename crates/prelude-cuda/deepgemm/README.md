@@ -1,8 +1,28 @@
-# prelude-deepgemm
+# deepgemm
 
-DeepGEMM BF16 GEMM integration for Prelude. Based on [deepseek-ai/DeepGEMM](https://github.com/deepseek-ai/DeepGEMM).
+Rust bindings to [DeepSeek DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) BF16/FP8 GEMM CUDA kernels.
 
-Replaces cuBLAS for BF16 matmul — no cuBLAS dependency, statically linked.
+Replaces cuBLAS for BF16 matmul — no cuBLAS dependency, no libtorch, statically linked.
+
+## Scope
+
+| | |
+|---|---|
+| Upstream | [deepseek-ai/DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) |
+| Kernels | Hand-written CUTLASS 3.x warp-specialized persistent kernels with TMA |
+| Arch | SM90 (BF16 + FP8), SM100a (Blackwell BF16 + FP8) |
+| Compile model | Direct `nvcc` compilation at crate build time — no Python, no JIT |
+| Runtime deps | cudart_static, stdc++ — zero third-party libraries at runtime |
+| Cargo deps | None (dev-only: `cudarc`, `half`, `rand`) |
+
+### Environment variable overrides
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DEEPGEMM_ROOT` | `$WORKSPACE/third_party/DeepGEMM` | Upstream DeepGEMM source checkout |
+| `CUTLASS_ROOT` | `$WORKSPACE/third_party/cutlass` | CUTLASS 3.x headers |
+| `CUDA_PATH` | `/opt/cuda` or `/usr/local/cuda` | CUDA toolkit root |
+
 
 ## Performance (H200, SM90)
 
@@ -40,7 +60,7 @@ Runtime:
 cargo build -p prelude-server --release --features deepgemm
 
 # Standalone correctness test
-CUDA_VISIBLE_DEVICES=1 cargo run --manifest-path crates/prelude-deepgemm/Cargo.toml \
+CUDA_VISIBLE_DEVICES=1 cargo run --manifest-path crates/deepgemm/Cargo.toml \
     --example correctness_test --release
 
 # GPU GEMM benchmark (vs candle/cuBLAS)

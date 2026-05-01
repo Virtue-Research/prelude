@@ -11,6 +11,7 @@
 pub const PTX_ADD: &str = include_str!(concat!(env!("OUT_DIR"), "/add.ptx"));
 pub const PTX_SILU_MUL: &str = include_str!(concat!(env!("OUT_DIR"), "/silu_mul.ptx"));
 pub const PTX_RMSNORM: &str = include_str!(concat!(env!("OUT_DIR"), "/rmsnorm.ptx"));
+pub const PTX_RMSNORM_GATED: &str = include_str!(concat!(env!("OUT_DIR"), "/rmsnorm_gated.ptx"));
 pub const PTX_QKNORM_ROPE: &str = include_str!(concat!(env!("OUT_DIR"), "/qknorm_rope.ptx"));
 pub const PTX_MOE_ROUTING: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_routing.ptx"));
 pub const PTX_MOE_GATEUP: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_gateup.ptx"));
@@ -20,6 +21,10 @@ pub const PTX_KNORM_ROPE_KV_WRITE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/knorm_rope_kv_write.ptx"));
 pub const PTX_SCATTER_KV_CACHE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/scatter_kv_cache.ptx"));
+pub const PTX_GDN_POST_CONV: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/gdn_post_conv.ptx"));
+pub const PTX_GATHER_LOG_SOFTMAX: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/gather_log_softmax.ptx"));
 
 // ── General-purpose PTX kernels (ported from candle-kernels) ────
 pub const PTX_UNARY: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_unary.ptx"));
@@ -44,6 +49,8 @@ pub const MOD_MOE_DOWN: &str = "moe_down";
 pub const MOD_KV_APPEND: &str = "kvcache_kv_append";
 pub const MOD_KNORM_ROPE_KV_WRITE: &str = "kvcache_knorm_rope_kv_write";
 pub const MOD_SCATTER_KV_CACHE: &str = "kvcache_scatter_kv_cache";
+pub const MOD_GDN_POST_CONV: &str = "gdn_post_conv";
+pub const MOD_GATHER_LOG_SOFTMAX: &str = "logprobs_gather_log_softmax";
 
 // ── General-purpose module names ────────────────────────────────
 pub const MOD_UNARY: &str = "candle_unary";
@@ -64,12 +71,12 @@ fn cuda_probe() -> bool {
 
 /// Register GPU ops and executor. Call once at startup.
 pub fn register() {
-    // Eagerly install our GEMM dispatch so candle's `Tensor::matmul` on CUDA
-    // routes through CUTLASS/DeepGEMM/cuBLAS. Loading paths can hit matmul
-    // (tied embeddings, weight reshape, etc.) before the engine ever takes
-    // an `ops_for(&Device::Cuda(_))`, which is when the lazy `cuda_ops()`
-    // factory would otherwise register dispatch — too late for those calls.
-    crate::ops::gemm::register_gpu_gemm();
+    // Install the GEMM dispatch immediately so that any model-construction
+    // matmul (e.g. RoPE inv_freq * positions) that runs before the first
+    // `cuda_ops()` lookup still goes through our dispatch.
+    if cuda_probe() {
+        crate::ops::gemm::register_gpu_gemm();
+    }
     prelude_core::ops::register_backend(prelude_core::ops::OpsBackend {
         name: "cuda",
         priority: 100,
@@ -108,9 +115,9 @@ pub use attn::flashinfer::fi_fused_add_rmsnorm;
 
 // ── Sub-crate re-exports ────────────────────────────────────────────
 
-pub use prelude_deepgemm;
-pub use prelude_cutlass_gemm;
-pub use prelude_flash_attn_v4;
-pub use prelude_flashinfer;
-pub use prelude_quant_gemm;
-pub use prelude_cula;
+pub use cula;
+pub use cutlass_gemm;
+pub use deepgemm;
+pub use flash_attn_v4;
+pub use flashinfer;
+pub use quant_gemm;

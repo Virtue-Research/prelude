@@ -142,7 +142,7 @@ unsafe extern "C" {
     ) -> i32;
     /// Extract error message from TVM FFI's thread-local error state.
     /// Defined in src/tvm_error_helper.cc.
-    fn prelude_tvm_get_last_error(out_len: *mut usize) -> *const u8;
+    fn tvm_static_ffi_get_last_error(out_len: *mut usize) -> *const u8;
 }
 
 const CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
@@ -225,7 +225,7 @@ impl KernelRegistry {
             let detail = unsafe {
                 // Try TVM FFI error message first
                 let mut msg_len: usize = 0;
-                let msg_ptr = prelude_tvm_get_last_error(&mut msg_len);
+                let msg_ptr = tvm_static_ffi_get_last_error(&mut msg_len);
                 let tvm_msg = if !msg_ptr.is_null() && msg_len > 0 {
                     String::from_utf8_lossy(std::slice::from_raw_parts(msg_ptr, msg_len)).into_owned()
                 } else {

@@ -32,7 +32,14 @@ WARMUP="${WARMUP:-20}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PRELUDE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-PRELUDE_BIN="$PRELUDE_DIR/target/release/prelude-server"
+# Prefer dist (fat LTO), fall back to release. Override via PRELUDE_BIN env.
+if [ -n "${PRELUDE_BIN:-}" ]; then
+    : # caller overrode
+elif [ -f "$PRELUDE_DIR/target/dist/prelude-server" ]; then
+    PRELUDE_BIN="$PRELUDE_DIR/target/dist/prelude-server"
+else
+    PRELUDE_BIN="$PRELUDE_DIR/target/release/prelude-server"
+fi
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 RESULTS_DIR="${RESULTS_DIR:-$PRELUDE_DIR/bench_results/profile_$TIMESTAMP}"
 

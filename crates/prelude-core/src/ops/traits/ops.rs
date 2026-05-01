@@ -188,6 +188,31 @@ pub trait Ops: Send + Sync {
     fn fused_moe_routing(&self, _logits: &Tensor, _top_k: usize) -> Option<Result<(Tensor, Tensor, Tensor, Tensor)>> { None }
     fn fused_moe_gemm(&self, _input: &Tensor, _weights: &Tensor, _tw: &Tensor, _st: &Tensor, _se: &Tensor, _topk: usize, _prefill: bool) -> Option<Result<Tensor>> { None }
 
+    /// GPU-accelerated sort of expert assignments by expert ID.
+    /// Returns (sorted_expert_ids, sorted_token_ids) both as flat [n] U32 tensors.
+    /// Default: returns None (caller falls back to CPU sort).
+    fn moe_sort_experts(&self, _expert_ids: &Tensor) -> Option<Result<(Tensor, Tensor)>> { None }
+
+    /// Fused RMSNorm + SiLU gate: output = RMSNorm(x, weight) * SiLU(gate).
+    /// Used by GatedDeltaNet's per-head norm. x/gate: BF16, weight: F32.
+    fn rmsnorm_gated(&self, _x: &Tensor, _gate: &Tensor, _weight: &Tensor, _eps: f32) -> Option<Result<Tensor>> { None }
+
+    /// In-place swap of gate/up halves for CUTLASS Swiglu. Call once at load time.
+    fn swap_moe_gate_up(&self, _w1: &Tensor, _inter: usize) -> Option<Result<()>> { None }
+
+    /// Fused MoE: routing permute → GEMM1 (gate_up) → Swiglu → GEMM2 (down) → unpermute.
+    /// Returns None when unavailable; caller falls back to composed ops
+    /// (grouped_gemm + silu_mul + fused_moe_gemm).
+    #[allow(clippy::too_many_arguments)]
+    fn cutlass_fused_moe(
+        &self,
+        _input: &Tensor,
+        _experts_per_tok: &Tensor,
+        _topk_weights: &Tensor,
+        _w1: &Tensor,
+        _w2: &Tensor,
+    ) -> Option<Result<Tensor>> { None }
+
     /// Fused Adaptive Layer Norm (AdaLN-Zero) for diffusion transformers.
     /// Computes: normed = layer_norm(x) * (1 + scale) + shift, gated = normed * gate.
     fn fused_adaln_zero(
@@ -209,6 +234,236 @@ pub trait Ops: Send + Sync {
         _lora_a: &Tensor, _lora_b: &Tensor,
         _adapter_indices: &Tensor, _lora_scale: f32,
     ) -> Option<Result<Tensor>> { None }
+
+    /// Fused Gated DeltaNet (KDA) batched single-token decode.
+    ///
+    /// Runs the full delta rule step for an entire decode batch in one CUDA
+    /// kernel call. Each request's recurrent state lives in the pool at
+    /// `pool_state[slot_ids[i]]` and is updated in place. The kernel does
+    /// its own L2 norm on q/k and its own softplus-based gate computation,
+    /// so inputs are passed raw.
+    ///
+    /// Shapes (one token per request, `N` requests in the batch):
+    /// - `q`, `k`: `[N, H, K]` BF16
+    /// - `v`: `[N, HV, V]` BF16
+    /// - `a_raw`: `[N, HV]` BF16 (from `in_proj_a`)
+    /// - `b_raw`: `[N, HV]` BF16 (from `in_proj_b`)
+    /// - `a_log`: `[HV]` F32 (layer param)
+    /// - `dt_bias`: `[HV]` (any float dtype) — scalar per v-head
+    /// - `pool_state`: `[pool_size, HV, V, K]` F32 (read AND written)
+    /// - `slot_ids`: `[N]` U32 on the same device
+    ///
+    /// Returns `[N, HV, V]` BF16 on success.
+    ///
+    /// Returns `None` if no backend kernel is available for this GPU
+    /// architecture or `(H, HV, K, V)` combination, so the caller can
+    /// fall back to a sequential delta-rule loop.
+    #[allow(clippy::too_many_arguments)]
+    fn kda_decode_batched(
+        &self,
+        _q: &Tensor,
+        _k: &Tensor,
+        _v: &Tensor,
+        _a_raw: &Tensor,
+        _b_raw: &Tensor,
+        _a_log: &Tensor,
+        _dt_bias: &Tensor,
+        _pool_state: &Tensor,
+        _slot_ids: &Tensor,
+    ) -> Option<Result<Tensor>> { None }
+
+    /// True iff `kda_decode_batched` would run successfully on the current
+    /// device and shape. Callers use this to gate the fused decode fast
+    /// path BEFORE they start mutating shared state (e.g. the DeltaNet
+    /// pool's `conv_states`) — running conv1d_update into the pool and
+    /// then falling through to the sequential path on the kda step would
+    /// advance conv_state twice and produce degenerate decode output.
+    ///
+    /// Default: `false` (no kda kernel — caller should pick the
+    /// composed path directly).
+    fn kda_decode_available(&self) -> bool { false }
+
+    /// Fused short causal 1D convolution (Dao-AILab causal-conv1d).
+    ///
+    /// Runs the same kernel Mamba / Mamba-2 / Qwen3-next / Qwen3.5
+    /// DeltaNet rely on for the depthwise conv that precedes the
+    /// recurrent state update. The whole sequence is processed in one
+    /// CUDA launch per call (instead of our `broadcast * weight + sum`
+    /// per-token fallback loop).
+    ///
+    /// Layout is `[batch, dim, seqlen]` (channel-before-time) — note
+    /// that this is NOT the `[batch, seqlen, dim]` our Qwen3.5 model
+    /// uses elsewhere. The caller transposes.
+    ///
+    /// Shapes:
+    /// - `x`: `[batch, dim, seqlen]` BF16/F16/F32
+    /// - `weight`: `[dim, width]` depthwise filter, same dtype class as `x`
+    /// - `bias`: optional `[dim]`
+    /// - `initial_states`: optional `[batch, dim, width - 1]` — the
+    ///   left-context state saved from a previous chunk of the same
+    ///   stream. Pass `None` for a fresh start (kernel treats as zeros).
+    /// - `silu_activation`: if true, fuse a SiLU at the tail.
+    ///
+    /// Returns the output `[batch, dim, seqlen]` in the same dtype as
+    /// `x`. The caller is responsible for saving the last `width - 1`
+    /// positions of the raw input `x` as the new conv_state for the
+    /// next chunk.
+    ///
+    /// Returns `None` when the backend can't serve the call (non-CUDA,
+    /// unsupported dtype, or `width > 4` — upstream's specialization
+    /// matrix).
+    #[allow(clippy::too_many_arguments)]
+    fn causal_conv1d_fn(
+        &self,
+        _x: &Tensor,
+        _weight: &Tensor,
+        _bias: Option<&Tensor>,
+        _initial_states: Option<&Tensor>,
+        _silu_activation: bool,
+    ) -> Option<Result<Tensor>> { None }
+
+    /// Single-token decode step for causal conv1d. Reads the tail of
+    /// `conv_state`, computes the output at the new token, and updates
+    /// `conv_state` in place by shifting left and appending the new
+    /// input.
+    ///
+    /// Shapes:
+    /// - `x`: `[batch, dim]` BF16/F16/F32 (single token)
+    /// - `conv_state`: `[batch, dim, width - 1]` **updated in place**
+    /// - `weight`: `[dim, width]` depthwise filter
+    /// - `bias`: optional `[dim]`
+    ///
+    /// Returns the output `[batch, dim]`.
+    ///
+    /// Returns `None` when the backend can't serve the call.
+    #[allow(clippy::too_many_arguments)]
+    fn causal_conv1d_update(
+        &self,
+        _x: &Tensor,
+        _conv_state: &Tensor,
+        _weight: &Tensor,
+        _bias: Option<&Tensor>,
+        _silu_activation: bool,
+        _conv_state_indices: Option<&Tensor>,
+    ) -> Option<Result<Tensor>> { None }
+
+    /// Fused post-conv1d prep for Qwen3.5 / Qwen3-next DeltaNet.
+    ///
+    /// Collapses ~20 candle ops per layer (QKV narrow, L2 norm Q/K,
+    /// softplus + A_log gate computation, sigmoid beta) into a single
+    /// CUDA kernel launch.
+    ///
+    /// Inputs (all on the same device):
+    /// - `mixed_qkv`: `[L, 2*HK*D + HV*D]` BF16, the output of the
+    ///   causal_conv1d kernel with channel layout `[Q | K | V]`
+    /// - `a_raw`, `b_raw`: `[L, HV]` BF16 — raw scalar gate inputs
+    ///   from the in_proj_a / in_proj_b projections
+    /// - `a_log`: `[HV]` F32 — the learned log-decay parameter
+    /// - `dt_bias`: `[HV]` F32 — the learned delta-t bias
+    ///
+    /// Returns `(q, k, v, alpha, beta)`:
+    /// - `q, k`: `[L, HK, D]` BF16 L2-normalised over the last dim
+    /// - `v`: `[L, HV, D]` BF16 (raw slice out of `mixed_qkv`)
+    /// - `alpha`: `[L, HV]` F32, `= exp(-exp(A_log) * softplus(a + dt_bias))`
+    /// - `beta`: `[L, HV]` F32, `= sigmoid(b_raw)`
+    ///
+    /// Returns `None` when the backend can't serve the call (non-CUDA
+    /// device, unsupported head_dim, or PTX not loaded).
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_post_conv(
+        &self,
+        _mixed_qkv: &Tensor,
+        _a_raw: &Tensor,
+        _b_raw: &Tensor,
+        _a_log: &Tensor,
+        _dt_bias: &Tensor,
+        _num_k_heads: usize,
+        _num_v_heads: usize,
+        _head_dim: usize,
+    ) -> Option<Result<(Tensor, Tensor, Tensor, Tensor, Tensor)>> { None }
+
+    /// Fused gather + log_softmax for prompt_logprobs extraction.
+    ///
+    /// Computes, for each row `t` of `logits`, the numerically-stable
+    /// log-probability of `target_ids[t]`:
+    ///
+    /// ```text
+    /// out[t] = logits[t, target_ids[t]] - logsumexp(logits[t])
+    /// ```
+    ///
+    /// Mirrors vLLM's fused Triton kernel
+    /// (`vllm/v1/worker/gpu/sample/logprob.py::_topk_log_softmax_kernel`):
+    /// two full-vocab reads + one tiny scalar write per token, with
+    /// **no `[T, V]` log_softmax temporary materialised**. For
+    /// Qwen3.5-35B-A3B's `T=1024, V≈152K` that saves ~622 MB of GPU
+    /// allocation and ~2.5× of HBM traffic vs the naive "log_softmax
+    /// then index_select" path.
+    ///
+    /// ## Inputs
+    /// - `logits`: `[num_tokens, vocab_size]` BF16 or F32. Reduction
+    ///   always happens in F32 internally regardless of input dtype
+    ///   (a ~150K-wide logsumexp in BF16 loses precision).
+    /// - `target_ids`: `[num_tokens]` U32 — the token index to gather
+    ///   per row. Out-of-range ids return `-inf` (safety clamp).
+    ///
+    /// ## Output
+    /// `[num_tokens]` F32 — one logprob per row.
+    ///
+    /// ## Backend semantics
+    /// `None` means the backend declines to serve the call (CPU
+    /// backend, unsupported dtype). Returns `Some(Ok(_))` on success
+    /// and `Some(Err(_))` on kernel launch failure. The caller is
+    /// expected to have a fallback path (e.g. the naive
+    /// `log_softmax` + `gather` on-device) when `None` is returned.
+    fn gather_log_softmax(
+        &self,
+        _logits: &Tensor,
+        _target_ids: &Tensor,
+    ) -> Option<Result<Tensor>> {
+        None
+    }
+
+    /// Fused Gated DeltaNet (GDN) varlen prefill — matches FLA's
+    /// `chunk_gated_delta_rule` semantics (Qwen3-next / Qwen3.5 family).
+    ///
+    /// Drives FlashInfer's SM90 `gdn_prefill` CUTLASS warp-specialized TMA
+    /// kernel. The kernel consumes **scalar-per-head linear-space decay**:
+    /// unlike the KDA kernel, there's no chunk cumsum, no `RCP_LN2`
+    /// rescaling, and no `safe_gate` clamp — the caller just computes
+    /// `alpha = exp(-exp(A_log) * softplus(a + dt_bias))` and hands it in.
+    ///
+    /// Shapes (`T = total_seqlen` across all requests, packed as batch-1;
+    /// `num_sab_heads = max(num_q_heads, num_v_heads)`):
+    /// - `q`: `[T, num_q_heads, head_dim]` BF16
+    /// - `k`: `[T, num_k_heads, head_dim]` BF16
+    /// - `v`: `[T, num_v_heads, head_dim]` BF16
+    /// - `alpha`: `[T, num_sab_heads]` F32 (already = exp(per-step g))
+    /// - `beta`:  `[T, num_sab_heads]` F32 (already = sigmoid(raw))
+    /// - `cu_seqlens`: `[num_seqs+1]` **I64** (note: not I32 like KDA)
+    /// - `initial_state`: optional `[num_seqs, num_sab_heads, head_dim, head_dim]` F32
+    ///
+    /// Supports both:
+    /// - **GQA** (`num_q > num_v`, with `num_k == num_v`)
+    /// - **GVA** (`num_v > num_q`, with `num_q == num_k`) — Qwen3.5's layout
+    ///
+    /// Returns `(output, final_state)`:
+    /// - `output`: `[T, num_sab_heads, head_dim]` BF16
+    /// - `final_state`: `[num_seqs, num_sab_heads, head_dim, head_dim]` F32
+    ///
+    /// Returns `None` when the backend can't serve this call (non-CUDA,
+    /// non-SM90 arch, head_dim != 128, or kernel wasn't AOT-compiled).
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_prefill_varlen(
+        &self,
+        _q: &Tensor,
+        _k: &Tensor,
+        _v: &Tensor,
+        _alpha: &Tensor,
+        _beta: &Tensor,
+        _cu_seqlens: &Tensor,
+        _initial_state: Option<&Tensor>,
+        _scale: f32,
+    ) -> Option<Result<(Tensor, Tensor)>> { None }
 
     // ════════════════════════════════════════════════════════════════
     // Convenience: try fused → fallback to composed
@@ -260,6 +515,58 @@ pub trait Ops: Send + Sync {
     }
 
     // ════════════════════════════════════════════════════════════════
+    // TensorHook overrides — intercept candle's basic tensor ops.
+    //
+    // Default: None = candle's built-in kernel runs (zero cost).
+    // Custom backends (AMD, etc.) override these to route through
+    // their own kernels. CUDA leaves them as None.
+    // ════════════════════════════════════════════════════════════════
+
+    fn unary(&self, _x: &Tensor, _op: UnaryOp) -> Option<Result<Tensor>> { None }
+    fn binary(&self, _a: &Tensor, _b: &Tensor, _op: BinaryOp) -> Option<Result<Tensor>> { None }
+    fn matmul(&self, _a: &Tensor, _b: &Tensor) -> Option<Result<Tensor>> { None }
+    fn contiguous(&self, _x: &Tensor) -> Option<Result<Tensor>> { None }
+    fn to_dtype(&self, _x: &Tensor, _dtype: DType) -> Option<Result<Tensor>> { None }
+    fn where_cond(&self, _cond: &Tensor, _on_true: &Tensor, _on_false: &Tensor) -> Option<Result<Tensor>> { None }
+    fn index_select(&self, _x: &Tensor, _ids: &Tensor, _dim: usize) -> Option<Result<Tensor>> { None }
+    fn gather(&self, _x: &Tensor, _ids: &Tensor, _dim: usize) -> Option<Result<Tensor>> { None }
+    fn cat(&self, _tensors: &[&Tensor], _dim: usize) -> Option<Result<Tensor>> { None }
+    fn reduce_sum(&self, _x: &Tensor, _dims: &[usize]) -> Option<Result<Tensor>> { None }
+    fn reduce_max(&self, _x: &Tensor, _dims: &[usize]) -> Option<Result<Tensor>> { None }
+    fn reduce_min(&self, _x: &Tensor, _dims: &[usize]) -> Option<Result<Tensor>> { None }
+    fn affine(&self, _x: &Tensor, _mul: f64, _add: f64) -> Option<Result<Tensor>> { None }
+    fn to_device(&self, _x: &Tensor, _device: &crate::tensor::Device) -> Option<Result<Tensor>> { None }
+
+    // ════════════════════════════════════════════════════════════════
+    // Sampling
+    // ════════════════════════════════════════════════════════════════
+
+    /// Batched sampling from logits on GPU.
+    ///
+    /// Input: `logits` `[batch_size, vocab_size]` F32
+    /// Returns: `[batch_size]` I32 tensor of sampled token IDs (on GPU).
+    ///
+    /// `None` means the backend does not support GPU sampling;
+    /// caller falls back to per-sequence CPU sampling.
+    fn sample_from_logits(
+        &self,
+        _logits: &Tensor,
+        _deterministic: bool,
+    ) -> Option<Result<Tensor>> { None }
+
+    /// Batched top-k + top-p sampling from logits on GPU.
+    ///
+    /// Input: `logits` `[batch_size, vocab_size]` F32
+    /// Returns: `[batch_size]` I32 tensor of sampled token IDs (on GPU).
+    fn top_k_top_p_sample(
+        &self,
+        _logits: &Tensor,
+        _top_k: i64,
+        _top_p: f64,
+        _deterministic: bool,
+    ) -> Option<Result<Tensor>> { None }
+
+    // ════════════════════════════════════════════════════════════════
     // Session lifecycle
     // ════════════════════════════════════════════════════════════════
 
@@ -267,6 +574,7 @@ pub trait Ops: Send + Sync {
     fn end_forward(&self) {}
     fn precompute_paged_plan(&self, _q_shape: (usize, usize, usize), _kc: &Tensor, _csq: &Tensor, _bt: &Tensor, _csk: &Tensor, _scale: f32) -> Result<()> { Ok(()) }
     fn gpu_free_memory(&self) -> Option<usize> { None }
+    fn gpu_total_memory(&self) -> Option<usize> { None }
 }
 
 /// Re-export candle-nn rope_thd for use in default implementations.

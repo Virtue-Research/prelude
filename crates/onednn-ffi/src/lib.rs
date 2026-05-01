@@ -1,5 +1,29 @@
-//! Raw FFI bindings for onednn-ffi shared library.
-//! Only available when the `onednn` feature is enabled.
+//! Minimal Rust FFI bindings to Intel oneDNN, plus a rayon-backed
+//! threadpool adapter. Static link only — the crate build compiles
+//! oneDNN as a static library and links it into the final Rust binary, so
+//! there is no `libdnnl.so` at runtime.
+//!
+//! ## What this crate exposes
+//!
+//! - Raw `extern "C"` declarations for the subset of oneDNN primitives we
+//!   need: F32 matmul, BF16/S8/F8 brgemm micro-kernel paths, packed-weight
+//!   lifetime helpers, post-op fused kernels.
+//! - Three `#[no_mangle]` functions (`rayon_parallel_for`,
+//!   `rayon_get_num_threads`, `rayon_get_in_parallel`) that the C++ side
+//!   calls back into. They are implemented here because oneDNN's
+//!   `THREADPOOL` runtime requires a user-provided parallel scheduler, and
+//!   we delegate that scheduling to rayon.
+//!
+//! ## What this crate does NOT expose
+//!
+//! No safe Rust wrapper — everything here is `unsafe extern "C"` function
+//! pointers. Build your own thin safe layer on top (see e.g.
+//! `prelude-cpu`'s `onednn::ops` module).
+//!
+//! ## Environment variables
+//!
+//! - `ONEDNN_SOURCE_DIR` — path to a oneDNN source checkout. Defaults to
+//!   `$CARGO_WORKSPACE/third_party/oneDNN` (prelude workspace case).
 
 use std::ffi::c_void;
 

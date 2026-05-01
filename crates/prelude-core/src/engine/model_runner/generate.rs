@@ -399,6 +399,7 @@ impl Engine {
                 paged_kv: None,
                 deltanet_pool: None,
                 deltanet_slots: None,
+                deltanet_slots_gpu: None,
             };
 
             let needs_prompt_logprobs = item.request.prompt_logprobs.is_some();
@@ -850,8 +851,26 @@ pub(crate) fn extract_prompt_logprobs_from_hidden_offset(
         }
     }
 
-    // Chunked: compute_logits → log_softmax → gather per chunk.
-    // Only chunk_size × vocab_size logits exist at any time.
+    // Chunked: compute_logits → gather_log_softmax per chunk.
+    //
+    // The chunking is retained to cap peak GPU memory: the `lm_head`
+    // matmul output is `[chunk_len, vocab_size]` which at chunk_len=512
+    // and vocab=152K is ~155 MB per chunk in BF16. For a full prompt
+    // logprobs extract over a 32K-token context, doing it in one shot
+    // would need ~20 GB of contiguous GPU memory.
+    //
+    // Inside each chunk we route through the fused `gather_log_softmax`
+    // op instead of the naive `log_softmax → gather` chain. That
+    // eliminates the per-chunk `[chunk_len, vocab_size] F32` temporary
+    // (another ~311 MB per chunk on Qwen3.5-35B-A3B) and matches vLLM's
+    // `_topk_log_softmax_kernel` asymptote (two full-vocab reads + one
+    // scalar write per token).
+    //
+    // Fallback path: when the backend declines the fused op (CPU or
+    // any backend without a `gather_log_softmax` impl) we drop back to
+    // the old `log_softmax + gather` chain — still O(chunk_len) D2H,
+    // just with the full-matrix temporary.
+    let ops = crate::ops::ops_for(hidden_states.device());
     let mut logprobs_cpu: Vec<f32> = Vec::with_capacity(total_tokens);
     for start in (0..total_tokens).step_by(PROMPT_LOGPROBS_CHUNK_SIZE) {
         let end = (start + PROMPT_LOGPROBS_CHUNK_SIZE).min(total_tokens);
@@ -859,22 +878,41 @@ pub(crate) fn extract_prompt_logprobs_from_hidden_offset(
 
         let chunk_hidden = hidden_states.narrow(0, start, chunk_len).map_err(tensor_err)?;
         let chunk_logits = model.compute_logits(&chunk_hidden).map_err(tensor_err)?;
-        let chunk_log_probs = crate::ops::ops_for(chunk_logits.device()).log_softmax(&chunk_logits, 1).map_err(tensor_err)?;
-        drop(chunk_logits); // free (chunk, vocab_size) before gather allocates
 
-        let chunk_token_ids = Tensor::from_vec(
-            flat_next_tokens[start..end].to_vec(), (chunk_len, 1), &device,
+        let chunk_target_ids = Tensor::from_vec(
+            flat_next_tokens[start..end].to_vec(),
+            (chunk_len,),
+            &device,
         )
-        .map_err(tensor_err)?
-        .to_dtype(crate::tensor::DType::U32)
         .map_err(tensor_err)?;
 
-        let chunk_gathered = chunk_log_probs
-            .gather(&chunk_token_ids, 1).map_err(tensor_err)?
-            .squeeze(1).map_err(tensor_err)?
-            .to_dtype(crate::tensor::DType::F32).map_err(tensor_err)?;
-        logprobs_cpu.extend(chunk_gathered.to_vec1::<f32>().map_err(tensor_err)?);
-        // chunk_log_probs freed here
+        let chunk_logprobs_tensor = match ops.gather_log_softmax(&chunk_logits, &chunk_target_ids) {
+            Some(res) => res.map_err(tensor_err)?,
+            None => {
+                // Fallback: materialise the log_softmax temporary, do
+                // the on-device gather, same O(chunk_len) D2H.
+                let chunk_log_probs = ops
+                    .log_softmax(&chunk_logits, 1)
+                    .map_err(tensor_err)?;
+                drop(chunk_logits);
+                let idx = chunk_target_ids
+                    .reshape((chunk_len, 1))
+                    .map_err(tensor_err)?;
+                chunk_log_probs
+                    .gather(&idx, 1)
+                    .map_err(tensor_err)?
+                    .squeeze(1)
+                    .map_err(tensor_err)?
+                    .to_dtype(crate::tensor::DType::F32)
+                    .map_err(tensor_err)?
+            }
+        };
+
+        logprobs_cpu.extend(
+            chunk_logprobs_tensor
+                .to_vec1::<f32>()
+                .map_err(tensor_err)?,
+        );
     }
 
     Ok(logprobs_cpu)

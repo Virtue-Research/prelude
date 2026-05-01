@@ -111,6 +111,7 @@ impl Engine {
             paged_kv: Some(&paged_kv),
             deltanet_pool: dn_pool_ref,
             deltanet_slots: deltanet_slots.as_deref(),
+            deltanet_slots_gpu: None,
         };
         self.executor.ops.begin_forward();
         let logits = model.forward(&packed_input, &mut ctx).map_err(tensor_err)?;
@@ -251,6 +252,7 @@ impl Engine {
                     paged_kv: Some(&paged_kv),
                     deltanet_pool: dn_pool_ref,
                     deltanet_slots: dn_slots.as_deref(),
+                    deltanet_slots_gpu: None,
                 };
                 self.executor.ops.begin_forward();
                 let logits = model.forward(&input_t, &mut ctx).map_err(tensor_err)?;

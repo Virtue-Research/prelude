@@ -34,6 +34,12 @@ hf-hub.workspace = true
 prelude-core = { path = "../prelude-core", default-features = false }
 prelude-cpu = { path = "../prelude-cpu" }
 prelude-cuda = { path = "../prelude-cuda", optional = true }
+# Disabled: the prelude-amd crate is excluded from the workspace (t0-gpu's
+# broken upstream submodule blocks cargo's manifest resolution). Even with
+# `optional = true`, cargo still parses prelude-amd's Cargo.toml during the
+# workspace-wide dep graph, which triggers the fetch failure. Uncomment once
+# https://github.com/GeisYaO/t0-gpu fixes `.gitmodules tests/t0_original`.
+# prelude-amd = { path = "../prelude-amd", optional = true }
 bc-mimalloc.workspace = true
 base64 = "0.22.1"
 minijinja = "2.18.0"
@@ -54,5 +60,8 @@ cuda = [
     "dep:prelude-cuda",
     "prelude-core/cuda",
 ]
+# AMD GPU inference — bare-metal KFD via t0-gpu (zero HIP/ROCm dependency).
+# Disabled until t0-gpu upstream fixes `tests/t0_original` submodule entry.
+# amd = ["dep:prelude-amd"]
 # Everything
 full = ["cpu", "cuda"]

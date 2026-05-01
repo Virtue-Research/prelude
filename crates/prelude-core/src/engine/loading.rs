@@ -109,31 +109,53 @@ impl Engine {
         )
     }
 
-    // Cleaned -- Reviewed by Minzhou
+    /// Sync wrapper around [`Self::from_hf_hub_with_task_async`] for
+    /// callers outside an async context. Spins up a single-threaded
+    /// tokio runtime to await the async impl. Async callers should use
+    /// `from_hf_hub_with_task_async` directly.
+    ///
+    /// Panics if called from inside an existing tokio runtime — use the
+    /// `_async` variant in that case.
     pub fn from_hf_hub_with_task(
         repo_id: &str,
         task_override: TaskOverride,
         engine_config: EngineConfig,
     ) -> Result<Self, EngineError> {
-        let api = hf_hub::api::sync::Api::new()
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| EngineError::Internal(format!("failed to build tokio runtime: {e}")))?;
+        runtime.block_on(Self::from_hf_hub_with_task_async(
+            repo_id,
+            task_override,
+            engine_config,
+        ))
+    }
+
+    pub async fn from_hf_hub_with_task_async(
+        repo_id: &str,
+        task_override: TaskOverride,
+        engine_config: EngineConfig,
+    ) -> Result<Self, EngineError> {
+        let api = hf_hub::api::tokio::Api::new()
             .map_err(|e| EngineError::Internal(format!("failed to init hf-hub api: {e}")))?;
         let repo = api.model(repo_id.to_string());
 
         tracing::info!(repo = repo_id, "downloading model from HuggingFace Hub");
 
         // Try config.json — if missing, this might be a GGUF-only repo
-        let config_path = match repo.get("config.json") {
+        let config_path = match repo.get("config.json").await {
             Ok(path) => path,
             Err(_) => {
                 tracing::info!("config.json not found, checking for GGUF files");
-                return Self::from_hf_hub_gguf(repo_id, &repo, task_override, engine_config);
+                return Self::from_hf_hub_gguf(repo_id, &repo, task_override, engine_config).await;
             }
         };
-        let tokenizer_path = repo.get("tokenizer.json").map_err(|e| {
+        let tokenizer_path = repo.get("tokenizer.json").await.map_err(|e| {
             EngineError::Internal(format!("failed to download tokenizer.json: {e}"))
         })?;
 
-        let weight_files = load_safetensor_filenames(&repo)?;
+        let weight_files = load_safetensor_filenames(&repo).await?;
 
         let (device, dtype) = select_device(&engine_config.runtime)?;
         init_runtime(&device, &engine_config.runtime);
@@ -145,7 +167,7 @@ impl Engine {
             parse_model_config_for_source(
                 &content,
                 task_override,
-                has_remote_file(&repo, "config_sentence_transformers.json"),
+                has_remote_file(&repo, "config_sentence_transformers.json").await,
             )?
         };
         let embedding_modules = load_embedding_modules_from_repo(
@@ -154,7 +176,7 @@ impl Engine {
             resolved.task,
             DType::F32,
             &device,
-        )?;
+        ).await?;
 
         let vb = load_var_builder_from_filenames(&weight_files, dtype, &device)?;
         let tokenizer = load_tokenizer_file(&tokenizer_path)?;
@@ -173,14 +195,15 @@ impl Engine {
 
     /// Load a GGUF model from an HF Hub repo that contains .gguf files but no config.json.
     /// Auto-selects the best GGUF file (prefers Q8_0 > Q4_K_M > largest).
-    fn from_hf_hub_gguf(
+    async fn from_hf_hub_gguf(
         repo_id: &str,
-        repo: &hf_hub::api::sync::ApiRepo,
+        repo: &hf_hub::api::tokio::ApiRepo,
         task_override: TaskOverride,
         engine_config: EngineConfig,
     ) -> Result<Self, EngineError> {
         let info = repo
             .info()
+            .await
             .map_err(|e| EngineError::Internal(format!("failed to get repo info: {e}")))?;
 
         let gguf_files: Vec<&str> = info
@@ -196,7 +219,6 @@ impl Engine {
             )));
         }
 
-        // Select best GGUF: prefer Q8_0 > Q4_K_M > first available
         let selected = gguf_files
             .iter()
             .find(|f| f.contains("Q8_0"))
@@ -208,10 +230,10 @@ impl Engine {
 
         let gguf_path = repo
             .get(selected)
+            .await
             .map_err(|e| EngineError::Internal(format!("failed to download {selected}: {e}")))?;
 
-        // Resolve tokenizer: try this repo first, then infer base model from GGUF metadata
-        let tokenizer_model_id = resolve_gguf_tokenizer_repo(repo_id, repo, &gguf_path);
+        let tokenizer_model_id = resolve_gguf_tokenizer_repo(repo_id, &gguf_path);
 
         load_gguf(&gguf_path, tokenizer_model_id, task_override, engine_config)
     }
@@ -223,7 +245,6 @@ impl Engine {
 /// 3. Fall back to stripping `-GGUF` suffix from repo_id.
 fn resolve_gguf_tokenizer_repo(
     repo_id: &str,
-    _repo: &hf_hub::api::sync::ApiRepo,
     gguf_path: &Path,
 ) -> String {
     // Check if tokenizer.json exists next to GGUF or in repo
@@ -275,7 +296,7 @@ fn load_safetensor_parts(
     // constructors can read cache/runtime settings via global accessors.
     crate::config::init_global_config(&engine_config);
 
-    let built = build_model_variant(
+    let mut built = build_model_variant(
         &resolved,
         vb,
         embedding_modules.as_ref(),
@@ -288,6 +309,29 @@ fn load_safetensor_parts(
 
     // Read KV sharing map from model before moving it into the executor.
     let kv_sharing = built.model.kv_cache_sharing();
+
+    // ── Activation memory profiling (vLLM-style) ──────────────────
+    //
+    // Before sizing the KV cache, run a dummy forward pass to measure
+    // peak GPU memory consumed by activations. This is the same
+    // approach vLLM uses in `determine_available_memory`:
+    //
+    //   available_kv = total * utilization - weights - peak_activation
+    //
+    // Without this, the 10% reserve from `gpu_memory_utilization=0.9`
+    // can be insufficient for large-vocab MoE models (Qwen3.5-35B-A3B
+    // needs ~8 GB for the lm_head matmul alone at 8192 tokens).
+    let peak_activation_bytes = if device.is_cuda() {
+        profile_peak_activation(
+            &mut built.model,
+            &device,
+            &common_config,
+            dtype,
+            engine_config.runtime.profile_tokens,
+        ).unwrap_or(0)
+    } else {
+        0
+    };
 
     let executor = ModelExecutor {
         model: Mutex::new(built.model),
@@ -306,6 +350,7 @@ fn load_safetensor_parts(
         &executor.runtime_caps,
         &engine_config.cache,
         &kv_sharing,
+        peak_activation_bytes,
     )?;
 
     tracing::info!(
@@ -344,6 +389,47 @@ fn detect_gguf_arch(ct: &crate::tensor::quantized::gguf_file::Content) -> String
         .unwrap_or_else(|| "qwen3".to_string())
 }
 
+/// Guess the HF repo that ships the tokenizer for this GGUF when the
+/// metadata doesn't carry `general.base_model.0.repo_url`. Pieces it
+/// together from `general.basename` + `general.size_label` and a small
+/// per-arch org map (Qwen, Meta-Llama, Google).
+///
+/// Covers the common case of `Qwen/Qwen3-*-GGUF` — those uploads drop
+/// the base_model URL but encode enough metadata to reconstruct the
+/// canonical "Qwen/Qwen3-0.6B" repo. Returns `None` for unmapped arches
+/// (Mistral, DeepSeek, etc.); callers fall back to `model_id` and
+/// surface a clear tokenizer-download error.
+fn guess_tokenizer_repo_from_gguf_metadata(
+    ct: &crate::tensor::quantized::gguf_file::Content,
+    arch: &str,
+) -> Option<String> {
+    let basename = ct
+        .metadata
+        .get("general.basename")
+        .and_then(|v| v.to_string().ok().map(|s| s.to_string()))?;
+    let size_label = ct
+        .metadata
+        .get("general.size_label")
+        .and_then(|v| v.to_string().ok().map(|s| s.to_string()));
+
+    let org = match arch {
+        "qwen3" | "qwen2" | "qwen" => "Qwen",
+        "llama" => "meta-llama",
+        "gemma2" | "gemma3" => "google",
+        _ => return None,
+    };
+
+    let repo = match size_label {
+        Some(size) if !size.is_empty() => format!("{org}/{basename}-{size}"),
+        _ => format!("{org}/{basename}"),
+    };
+    tracing::info!(
+        repo = %repo, arch, basename,
+        "guessing GGUF tokenizer repo from metadata"
+    );
+    Some(repo)
+}
+
 /// Load a quantized model from a GGUF file.
 fn load_gguf(
     gguf_path: &Path,
@@ -375,11 +461,14 @@ fn load_gguf(
     //   2. `general.base_model.0.repo_url` in GGUF metadata → derive HF repo.
     //   3. Strip `-GGUF` suffix from `model_id` (covers `Qwen/X-GGUF` →
     //      `Qwen/X` for users who passed an HF repo).
-    //   4. Fall back to `model_id` as-is.
+    //   4. Per-arch heuristic from `general.basename` + `general.size_label`
+    //      (covers community GGUF uploads that drop the base_model URL —
+    //      most notably `Qwen/Qwen3-*-GGUF`).
+    //   5. Fall back to `model_id` as-is (which 404s — we surface a
+    //      tokenizer download error rather than crashing with a path).
     //
-    // Step 2 is what makes `--model /path/to/foo.gguf` work without
-    // requiring a separate `--tokenizer` flag — well-formed GGUFs from
-    // HF embed their base model URL in the metadata.
+    // Steps 2 and 4 are what make `--model /path/to/foo.gguf` work without
+    // requiring a separate `--tokenizer` flag.
     let tokenizer = if let Some(parent) = gguf_path.parent()
         && parent.join("tokenizer.json").exists()
     {
@@ -393,13 +482,18 @@ fn load_gguf(
                 url.strip_prefix("https://huggingface.co/")
                     .map(str::to_string)
             })
-            .unwrap_or_else(|| {
-                model_id
+            .or_else(|| {
+                let stripped = model_id
                     .strip_suffix("-GGUF")
-                    .or_else(|| model_id.strip_suffix("-gguf"))
-                    .unwrap_or(&model_id)
-                    .to_string()
-            });
+                    .or_else(|| model_id.strip_suffix("-gguf"));
+                // Only useful when model_id is an HF-style "org/repo",
+                // not a filesystem path.
+                stripped
+                    .filter(|s| s.contains('/') && !s.starts_with('/'))
+                    .map(str::to_string)
+            })
+            .or_else(|| guess_tokenizer_repo_from_gguf_metadata(&ct, &arch))
+            .unwrap_or_else(|| model_id.clone());
         tracing::info!(repo = %tokenizer_repo, "resolving GGUF tokenizer");
         download_tokenizer(&tokenizer_repo)?
     };
@@ -487,8 +581,8 @@ fn load_embedding_modules_from_dir(
     )
 }
 
-fn load_embedding_modules_from_repo(
-    repo: &hf_hub::api::sync::ApiRepo,
+async fn load_embedding_modules_from_repo(
+    repo: &hf_hub::api::tokio::ApiRepo,
     arch_name: &str,
     task: TaskKind,
     dtype: DType,
@@ -498,7 +592,7 @@ fn load_embedding_modules_from_repo(
         return Ok(None);
     }
 
-    let modules_path = match repo.get("modules.json") {
+    let modules_path = match repo.get("modules.json").await {
         Ok(path) => path,
         Err(err) => {
             tracing::warn!(error = %err, "failed to resolve embedding modules.json");
@@ -506,17 +600,76 @@ fn load_embedding_modules_from_repo(
         }
     };
 
+    // Walk modules.json once to enumerate every relative path the sync
+    // loader will ask for, await-download them all up front, then hand
+    // the sync loader a closure that just looks each path up in the
+    // resulting map.
+    //
+    // We can't `block_in_place` + `Handle::current().block_on` from
+    // inside the sync closure: tokio panics that combo on a
+    // current_thread runtime, which `#[tokio::test]` defaults to —
+    // meaning embed-loading would crash any test that builds an Engine.
+    let load_dense_auxiliary = arch_name == "gemma3";
+    let needed = enumerate_embedding_module_files(&modules_path, load_dense_auxiliary)?;
+    let mut path_map: std::collections::HashMap<String, PathBuf> =
+        std::collections::HashMap::with_capacity(needed.len());
+    for relative in needed {
+        let local = repo.get(&relative).await.map_err(|err| {
+            EngineError::Internal(format!("failed to download {relative}: {err}"))
+        })?;
+        path_map.insert(relative, local);
+    }
+
     load_embedding_modules_from_file(
         &modules_path,
         |relative| {
-            repo.get(relative).map_err(|err| {
-                EngineError::Internal(format!("failed to download {relative}: {err}"))
+            path_map.get(relative).cloned().ok_or_else(|| {
+                EngineError::Internal(format!(
+                    "embedding module file not pre-downloaded: {relative} \
+                     (enumerate_embedding_module_files missed it)"
+                ))
             })
         },
         dtype,
         device,
-        arch_name == "gemma3",
+        load_dense_auxiliary,
     )
+}
+
+/// Read `modules.json` and return every relative file path the sync
+/// loader will subsequently ask for via its `resolve_path` callback.
+/// Mirrors the matching arms in `load_embedding_modules_from_file` —
+/// keep the two in sync.
+fn enumerate_embedding_module_files(
+    modules_path: &Path,
+    load_dense_auxiliary: bool,
+) -> Result<Vec<String>, EngineError> {
+    let content = std::fs::read_to_string(modules_path).map_err(|err| {
+        EngineError::Internal(format!(
+            "failed to read embedding modules.json {}: {err}",
+            modules_path.display()
+        ))
+    })?;
+    let modules: Vec<SentenceTransformerModuleEntry> =
+        serde_json::from_str(&content).map_err(|err| {
+            EngineError::Internal(format!(
+                "failed to parse embedding modules.json {}: {err}",
+                modules_path.display()
+            ))
+        })?;
+
+    let mut needed = Vec::new();
+    for entry in &modules {
+        if entry.module_type.ends_with(".Pooling") {
+            needed.push(module_relative_path(&entry.path, "config.json"));
+        } else if entry.module_type.ends_with(".Dense") {
+            needed.push(module_relative_path(&entry.path, "config.json"));
+            if load_dense_auxiliary {
+                needed.push(module_relative_path(&entry.path, "model.safetensors"));
+            }
+        }
+    }
+    Ok(needed)
 }
 
 fn load_embedding_modules_from_file<F>(
@@ -744,6 +897,113 @@ fn download_tokenizer(model_id: &str) -> Result<Tokenizer, EngineError> {
         .map_err(|e| EngineError::Internal(format!("failed to download tokenizer.json: {e}")))?;
     Tokenizer::from_file(tokenizer_path.as_path())
         .map_err(|e| EngineError::Internal(format!("failed to load tokenizer: {e}")))
+}
+
+/// Profile peak GPU activation memory via a dummy forward pass.
+///
+/// Mirrors vLLM's `determine_available_memory` approach: measures the
+/// GPU memory consumed by a single forward pass with
+/// `max_num_batched_tokens` tokens, so the KV cache auto-sizer can
+/// subtract this from available memory instead of using a fixed 10%
+/// reserve that's insufficient for large-vocab MoE models.
+///
+/// Since our forward requires a full `BatchAttnContext` (which in turn
+/// requires the KV cache we're trying to size — circular dependency),
+/// we use `forward_with_cache` (the simpler non-paged path) with a
+/// dummy input. This exercises the full model (all layers + lm_head)
+/// without needing a paged KV cache.
+///
+/// Returns 0 on any failure — the caller falls back to the old
+/// heuristic (which works for small models; only large-vocab MoE
+/// models hit the edge case).
+fn profile_peak_activation(
+    model: &mut ModelVariant,
+    device: &Device,
+    config: &crate::engine::CommonModelConfig,
+    dtype: DType,
+    profile_tokens: usize,
+) -> Result<usize, EngineError> {
+    use crate::tensor::Tensor;
+
+    let ops = crate::ops::select_ops(device);
+
+    let free_before = ops.gpu_free_memory().unwrap_or(0);
+    let total = ops.gpu_total_memory().unwrap_or(0);
+    if free_before == 0 || total == 0 {
+        return Ok(0);
+    }
+
+    // Profile at the configured max_num_batched_tokens (matches vLLM's
+    // approach). This avoids linear extrapolation errors from non-linear
+    // costs (attention workspace, MoE dispatch buffers). Caller threads
+    // the value in from `RuntimeConfig::profile_tokens`, which the server
+    // CLI sets from `--max-num-batched-tokens` so the profile shape and
+    // the scheduler's per-step token budget always agree.
+    let profile_tokens = profile_tokens.max(1);
+
+    tracing::info!(
+        profile_tokens,
+        free_before_mb = free_before / (1024 * 1024),
+        "profiling peak activation memory"
+    );
+
+    // Run a dummy forward through the model's cached path (doesn't need
+    // paged KV cache — uses simple per-layer KV caching internally).
+    //
+    // Shape is 1D `(profile_tokens,)`, matching the packed-token layout
+    // every model's `forward_with_cache` expects (the attention layer
+    // reads `seq_len = x.dim(0)`). Earlier versions of this code passed
+    // `(1, profile_tokens)`, which made `seq_len` resolve to 1 and the
+    // profiler measured only one token's worth of activation — the
+    // result was always tiny and KV auto-sizing silently fell back to
+    // the old heuristic. Verified against `qwen3.rs::Attention::forward_with_cache`.
+    let dummy_input = Tensor::zeros(
+        (profile_tokens,),
+        crate::tensor::DType::U32,
+        device,
+    ).map_err(tensor_err)?;
+
+    // forward_with_cache runs through all layers + lm_head, producing
+    // [profile_tokens, vocab_size] logits — this is the peak
+    // activation consumer.
+    if let Some(m) = model.as_kv_cache_model() {
+        let logits_result = m.forward_with_cache(&dummy_input, 0);
+        let _logits = match logits_result {
+            Ok(l) => l,
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    profile_tokens,
+                    "activation profiling forward failed — falling back to old KV sizing heuristic"
+                );
+                model.clear_kv_cache();
+                return Ok(0);
+            }
+        };
+        // logits are alive → peak memory is captured by cudaMemGetInfo
+        let free_during = ops.gpu_free_memory().unwrap_or(free_before);
+        let peak_activation = free_before.saturating_sub(free_during);
+
+        drop(_logits);
+        model.clear_kv_cache();
+
+        tracing::info!(
+            peak_activation_mb = peak_activation / (1024 * 1024),
+            profile_tokens,
+            "activation profiling complete"
+        );
+
+        Ok(peak_activation)
+    } else {
+        // Model doesn't support forward_with_cache (unusual).
+        // Fall back to config-based estimate.
+        let lm_head_bytes = profile_tokens * config.vocab_size * dtype.size_in_bytes();
+        tracing::info!(
+            lm_head_mb = lm_head_bytes / (1024 * 1024),
+            "using config-based activation estimate (no KV cache model)"
+        );
+        Ok(lm_head_bytes)
+    }
 }
 
 pub(crate) struct BuiltModel {

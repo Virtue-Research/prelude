@@ -1,0 +1,17 @@
+[package]
+name = "prelude-kernelbuild"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Shared build-script helpers for Prelude's CUDA kernel crates — CUDA toolkit discovery, nvcc invocation, Python venv provisioning, TVM-FFI dispatch codegen, and AOT compile drivers. Used from build.rs, not at runtime."
+repository = "https://github.com/Virtue-Research/prelude"
+
+[lib]
+name = "prelude_kernelbuild"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"

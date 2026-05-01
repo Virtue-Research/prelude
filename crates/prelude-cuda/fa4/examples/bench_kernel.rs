@@ -1,6 +1,6 @@
 //! FA4 kernel benchmark vs cuBLAS naive baseline.
 //!
-//! Run: cargo run -p prelude-flash-attn-v4 --example bench_kernel --release
+//! Run: cargo run -p flash-attn-v4 --example bench_kernel --release
 //!
 //! cuBLAS baseline = two cublasGemmStridedBatchedEx calls (Q@K^T + S@V).
 //! No fused softmax, no causal mask skip. FA4 speedup grows with seq_len because:
@@ -8,7 +8,7 @@
 //!   - cuBLAS doesn't fuse softmax (+30% overhead not counted)
 //!   - cuBLAS computes full attention (FA4 skips half for causal)
 
-use prelude_flash_attn_v4::{KernelDtype, KernelKey, KernelRegistry};
+use flash_attn_v4::{KernelDtype, KernelKey, KernelRegistry};
 use std::ffi::c_void;
 
 // ── CUDA FFI ────────────────────────────────────────────────────────
@@ -232,7 +232,7 @@ fn bench_varlen(registry: &KernelRegistry, cublas: &CuBlas, cublas_handle: cubla
             // FA4 kernel
             let fa4_ms = cuda_bench(WARMUP, ITERS, || {
                 unsafe {
-                    prelude_flash_attn_v4::fa4_varlen_fwd(
+                    flash_attn_v4::fa4_varlen_fwd(
                         registry, func,
                         q_gpu, k_gpu, v_gpu, o_gpu,
                         std::ptr::null_mut(),
@@ -387,7 +387,7 @@ fn bench_paged(registry: &KernelRegistry) {
 
             let fa4_ms = cuda_bench(WARMUP, ITERS, || {
                 unsafe {
-                    prelude_flash_attn_v4::fa4_varlen_paged_fwd(
+                    flash_attn_v4::fa4_varlen_paged_fwd(
                         registry, func,
                         q_gpu, k_gpu, v_gpu, o_gpu,
                         std::ptr::null_mut(),

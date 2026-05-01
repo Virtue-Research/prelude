@@ -1,0 +1,15 @@
+[package]
+name = "prelude-cutedsl"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Runtime glue for statically-linked CuTeDSL kernels: DslKernelRegistry, DLTensor helpers, and TVM-FFI re-exports. Paired with prelude-kernelbuild at build time."
+repository = "https://github.com/Virtue-Research/prelude"
+
+[lib]
+name = "prelude_cutedsl"
+path = "src/lib.rs"
+
+[dependencies]
+tvm-static-ffi = { workspace = true }
+tracing = "0.1"
