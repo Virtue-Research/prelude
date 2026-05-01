@@ -1000,15 +1000,16 @@ mod meta {
             }
         }
 
-        fn gguf_aliases(&self) -> &'static [&'static str] {
-            &["qwen3"]
-        }
-
-        // No GGUF loader — Qwen3 GGUF support was an experimental
-        // candle-transformers wrapper gated behind a feature flag that
-        // was never enabled. The registry default returns
-        // `"GGUF loading not supported for architecture 'qwen3'"`, which
-        // is what callers see today regardless. Re-add this when there's
-        // a real GGUF loader written against our current Ops trait stack.
+        // No `gguf_aliases` and no `load_gguf` override: Qwen3 GGUF
+        // support was an experimental candle-transformers wrapper gated
+        // behind a feature flag that was never enabled. Registering
+        // "qwen3" as a GGUF alias without a real loader was misleading —
+        // the registry default returns `"GGUF loading not supported for
+        // architecture 'qwen3'"`, which reads like a temporary block
+        // instead of the real "no loader" story. Without the alias,
+        // `find_arch_spec_by_gguf_arch("qwen3")` returns None and
+        // callers get the clearer `unsupported GGUF architecture 'qwen3'`
+        // from the loader. Re-add both together when there's a Qwen3
+        // GGUF loader against the current Ops trait stack.
     }
 }

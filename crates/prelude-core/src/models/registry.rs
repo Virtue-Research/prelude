@@ -201,10 +201,15 @@ mod tests {
     // ── Registry lookup tests ──────────────────────────────────────
 
     #[test]
-    fn find_gguf_arch_qwen3() {
+    fn find_gguf_arch_qwen3_unsupported() {
+        // Qwen3 deliberately does NOT register a GGUF alias — there's no
+        // loader yet (see qwen3.rs comment). This test guards against
+        // accidentally re-adding the alias without also wiring the
+        // loader, which would surface a misleading "not supported for
+        // architecture" error instead of the clearer "unsupported GGUF
+        // architecture" from the registry-not-found path.
         let spec = find_arch_spec_by_gguf_arch("qwen3");
-        assert!(spec.is_some(), "qwen3 should be registered as a GGUF arch");
-        assert_eq!(spec.unwrap().name(), "qwen3");
+        assert!(spec.is_none(), "qwen3 GGUF must not be registered until a loader exists");
     }
 
     #[test]
