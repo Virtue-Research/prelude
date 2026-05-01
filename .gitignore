@@ -25,3 +25,6 @@ genai_bench.log
 
 # Internal analysis/design notes — not checked in.
 analysis/
+
+# Per-developer agent instructions — not checked in.
+CLAUDE.md

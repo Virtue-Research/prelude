@@ -37,7 +37,6 @@ use crate::scheduler::{
     Sequence, SamplingParams,
 };
 use crate::types::{GenerateResult, StreamEvent};
-use crate::tensor::{DType, Tensor};
 
 // ── Response channel ───────────────────────────────────────────────
 
@@ -196,8 +195,9 @@ pub async fn ar_loop(
     }
 
     // Shutdown: fail remaining requests
+    let deltanet_pool_ref = engine.cache.deltanet_pool.as_ref();
     for (id, state) in states.drain() {
-        release_resources(&engine, &mut scheduler, &id);
+        release_resources(deltanet_pool_ref, &mut scheduler, &id);
         fail_state(state, EngineError::Unavailable("AR loop stopped".into()));
     }
     tracing::info!("AR loop exited");
@@ -288,6 +288,11 @@ fn handle_message(
             });
         }
         ArMessage::Abort(request_id) => {
+            // Free the DeltaNet pool slot + any allocated KV blocks before
+            // dropping the sequence: skipping this leaks a slot per cancelled
+            // request, which exhausts the (small) DeltaNet pool under heavy
+            // cancel-and-retry load and starves new admissions.
+            release_resources(deltanet_pool, scheduler, &request_id);
             let _ = scheduler.abort_request(&request_id);
             states.remove(&request_id);
         }
@@ -342,10 +347,26 @@ fn build_step_batch(
         let mut has_dn = false;
         for id in &step.decode_request_ids {
             if let (Some(state), Some(seq)) = (states.get(id), scheduler.get_sequence(id)) {
+                let position = seq.total_len() - 1;
+                // Drop requests whose block_table doesn't cover the
+                // current decode position — happens when allocate_block
+                // returned None above (KV pool exhausted). Including
+                // them here would panic the forward kernel on an
+                // out-of-bounds block_table index. They stay in the
+                // scheduler so the next step can retry once blocks free.
+                if seq.block_table.len() * block_size <= position {
+                    tracing::warn!(
+                        request_id = %id,
+                        position,
+                        blocks = seq.block_table.len(),
+                        "KV block pool exhausted for decode — deferring this request"
+                    );
+                    continue;
+                }
                 tokens.push(state.pending_token.unwrap_or(0));
                 // position = total_len() - 1: the decode token's 0-indexed position
                 // (output_ids already contains this token from on_token_generated)
-                positions.push(seq.total_len() - 1);
+                positions.push(position);
                 block_tables.push(seq.block_table.clone());
                 if let Some(slot) = seq.deltanet_slot {
                     dn_slots.push(slot);
@@ -451,10 +472,23 @@ fn build_step_batch(
     for id in &step.decode_request_ids {
         if let (Some(state), Some(seq)) = (states.get(id), scheduler.get_sequence(id)) {
             let seq_len = seq.total_len();
+            let position = seq_len - 1;
+            // Same defensive skip as the pure-decode branch above:
+            // batch_mixed_paged indexes block_table by position/block_size
+            // and would OOB-panic on a short table.
+            if seq.block_table.len() * block_size <= position {
+                tracing::warn!(
+                    request_id = %id,
+                    position,
+                    blocks = seq.block_table.len(),
+                    "KV block pool exhausted for decode in mixed batch — deferring"
+                );
+                continue;
+            }
             requests.push(StepRequest {
                 tokens: vec![state.pending_token.unwrap_or(0)],
                 context_len: seq_len,
-                position_start: seq_len - 1,
+                position_start: position,
                 block_table: seq.block_table.clone(),
                 is_prefill_final: false,
                 is_prefill_partial: false,
@@ -601,7 +635,7 @@ fn process_step_output(
         let prompt_len = scheduler.get_sequence(&request_id)
             .map(|seq| seq.input_ids.len())
             .unwrap_or(0);
-        release_resources(engine, scheduler, &request_id);
+        release_resources(engine.cache.deltanet_pool.as_ref(), scheduler, &request_id);
         scheduler.finish_request(&request_id, seq_finish_reason(&finish_reason));
         if let Some(state) = states.remove(&request_id) {
             finish_state(engine, state, finish_reason, prompt_len);
@@ -751,7 +785,7 @@ fn fail_step(
     error: EngineError,
 ) {
     for id in step.prefill_request_ids.iter().chain(step.decode_request_ids.iter()) {
-        release_resources(engine, scheduler, id);
+        release_resources(engine.cache.deltanet_pool.as_ref(), scheduler, id);
         let _ = scheduler.abort_request(id);
         if let Some(state) = states.remove(id) {
             fail_state(state, error.clone());
@@ -759,14 +793,18 @@ fn fail_step(
     }
 }
 
-fn release_resources(engine: &Engine, scheduler: &mut Scheduler, request_id: &str) {
+fn release_resources(
+    deltanet_pool: Option<&std::sync::Mutex<crate::cache::deltanet_pool::DeltaNetPool>>,
+    scheduler: &mut Scheduler,
+    request_id: &str,
+) {
     if let Some(seq) = scheduler.get_sequence(request_id) {
         if !seq.block_table.is_empty() {
             let blocks = seq.block_table.clone();
             scheduler.free_blocks(&blocks);
         }
         if let Some(slot) = seq.deltanet_slot {
-            if let Some(pool_mutex) = engine.cache.deltanet_pool.as_ref() {
+            if let Some(pool_mutex) = deltanet_pool {
                 if let Ok(mut pool) = pool_mutex.lock() {
                     pool.free(slot);
                 }

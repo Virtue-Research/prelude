@@ -164,8 +164,11 @@ async fn main() -> anyhow::Result<()> {
     prelude_cpu::register();
     #[cfg(feature = "cuda")]
     prelude_cuda::register();
-    #[cfg(feature = "amd")]
-    prelude_amd::register();
+    // The `amd` feature + `prelude-amd` dep are commented out in
+    // Cargo.toml until t0-gpu's `tests/t0_original` submodule pin is
+    // fixed upstream. Re-add `#[cfg(feature = "amd")] prelude_amd::register();`
+    // when both are uncommented; leaving the gated call here triggers
+    // `unexpected_cfgs` warnings on every build.
 
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -245,7 +248,7 @@ async fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
         Engine::from_local_path_with_task(path, &cli.model, task_override, engine_config)?
     } else {
         info!(repo = %cli.model, "loading model from HuggingFace Hub");
-        Engine::from_hf_hub_with_task(&cli.model, task_override, engine_config).await?
+        Engine::from_hf_hub_with_task_async(&cli.model, task_override, engine_config).await?
     };
 
     // PRELUDE_NO_SCHEDULER=1 bypasses the scheduler and uses the base Engine directly.
