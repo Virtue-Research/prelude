@@ -106,7 +106,7 @@ Request -> Continuous Batching Scheduler -> GPU Queue -> GPU Worker -> Response
 
 **Attention**: FA4 (prefill + decode) -> FlashInfer (fallback) -> CPU fallback. CUDA graph decode. One file per backend, zero `#[cfg]` in model code.
 
-**GEMM**: CUTLASS (SM80+) / DeepGEMM (SM90+ BF16) / oneDNN (CPU BF16). No cuBLAS dependency.
+**GEMM**: DeepGEMM (SM90+ BF16) → CUTLASS (SM80+) → cuBLAS (universal fallback). oneDNN (CPU BF16).
 
 **Runtime**: Paged KV cache, prefix caching, fused CUDA kernels (QKNorm+RoPE, SiLU*Mul, Add+RMSNorm), pure Rust AVX-512 CPU kernels.
 

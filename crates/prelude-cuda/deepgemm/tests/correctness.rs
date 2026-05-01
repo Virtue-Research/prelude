@@ -688,15 +688,6 @@ fn grouped_sm100_skip_if_blackwell(label: &str) -> bool {
     if arch >= 100 { eprintln!("{label}: skip (SM{arch}, grouped SM100 kernel bug)"); true } else { false }
 }
 
-/// New (PR05) BF16 / MQA-logits / einsum / SF-transpose kernels are only
-/// instantiated for SM90 in the upstream DeepGEMM source we vendored.
-/// On Blackwell (B300/SM103) the dispatch falls through to a stub that
-/// returns "launch failed (code -2)". Skip until SM100 instantiations land.
-fn sm90_only_skip_if_blackwell(label: &str) -> bool {
-    let (_, arch) = deepgemm::query_device();
-    if arch >= 100 { eprintln!("{label}: skip (SM{arch}, kernel SM90-only)"); true } else { false }
-}
-
 #[test]
 fn fp8_1d1d_gemm_small() {
     let gpu = match Gpu::new() { Some(g) => g, None => return };
