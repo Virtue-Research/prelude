@@ -159,6 +159,108 @@ template <class E> using Sm90_FP8 = Sm90Runner<
 #endif // CUTLASS_ARCH_MMA_SM90_SUPPORTED
 
 // ============================================================================
+// SM100/SM103: CUTLASS 3.x — Blackwell tcgen05 UMMA via CollectiveBuilder
+// (Pattern from CUTLASS example 71 — same Sm90Runner shape, just different
+//  arch tag + cluster.)
+// ============================================================================
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+
+// 2-CTA cluster (`Use2SmMma=true`): up to MMA tile M=256, N=128, K=64. The
+// builder picks `KernelTmaWarpSpecialized2SmSm100` and pairs it with a 2sm
+// epilogue. 1-CTA falls back to MMA tile M=128, N=128, K=64.
+//
+// Why no `TileSchedulerType` parameter (unlike Sm90Runner)? Blackwell's 2sm
+// schedule requires a matching tile scheduler that the CollectiveBuilder
+// picks internally — passing a stale Sm90 PersistentScheduler here causes
+// the build to fail with `static assertion failed: CollectiveMma can not be
+// constructed for the given tag and arguments`.
+template <
+    class MainloopScheduleType = cutlass::gemm::collective::KernelScheduleAuto,
+    class EpilogueScheduleType = cutlass::epilogue::collective::EpilogueScheduleAuto,
+    class StageCountType = cutlass::gemm::collective::StageCountAuto,
+    bool Use2SmMma = true,
+    class Element = BF16
+>
+struct Sm100Runner {
+
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::ColumnMajor;
+    using LayoutD = cutlass::layout::ColumnMajor;
+
+    using ElementAccumulator = float;
+    using ElementCompute = float;
+    using ElementScalar = float;
+
+    using ClusterShapeMNK = std::conditional_t<
+        Use2SmMma, Shape<_2,_2,_1>, Shape<_1,_1,_1>>;
+    using MmaTileMNK = std::conditional_t<
+        Use2SmMma, Shape<_256,_128,_64>, Shape<_128,_128,_64>>;
+
+    static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<Element>::value;
+    static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<Element>::value;
+    static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<Element>::value;
+    static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<Element>::value;
+
+    static constexpr auto RoundStyle = cutlass::FloatRoundStyle::round_to_nearest;
+
+    using DefaultOperation = cutlass::epilogue::fusion::LinearCombination<
+        Element, ElementCompute, Element, ElementScalar, RoundStyle>;
+
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+        MmaTileMNK, ClusterShapeMNK,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator, ElementCompute,
+        Element, LayoutC, AlignmentC,
+        Element, LayoutD, AlignmentD,
+        EpilogueScheduleType,
+        DefaultOperation
+    >::CollectiveOp;
+
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+        Element, LayoutA, AlignmentA,
+        Element, LayoutB, AlignmentB,
+        ElementAccumulator,
+        MmaTileMNK, ClusterShapeMNK,
+        cute::conditional_t<cute::is_same_v<StageCountType, cutlass::gemm::collective::StageCountAuto>,
+            cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+            StageCountType>,
+        MainloopScheduleType
+    >::CollectiveOp;
+
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        Shape<int, int, int, int>,
+        CollectiveMainloop,
+        CollectiveEpilogue
+    >;
+
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+};
+
+// Default: 2sm cluster (best throughput when M is even-tile-aligned).
+template <class E> using Sm100_Default = Sm100Runner<
+    cutlass::gemm::collective::KernelScheduleAuto,
+    cutlass::epilogue::collective::EpilogueScheduleAuto,
+    cutlass::gemm::collective::StageCountAuto,
+    /*Use2SmMma=*/true, E>;
+
+// 1sm fallback: required when M-tile count is odd (2sm requires cluster M
+// divisible by 2 → M divisible by 256).
+template <class E> using Sm100_1Sm = Sm100Runner<
+    cutlass::gemm::collective::KernelScheduleAuto,
+    cutlass::epilogue::collective::EpilogueScheduleAuto,
+    cutlass::gemm::collective::StageCountAuto,
+    /*Use2SmMma=*/false, E>;
+
+#endif // CUTLASS_ARCH_MMA_SM100_SUPPORTED
+
+// ============================================================================
 // SM80: CUTLASS 3.x — manual CollectiveMma + GemmUniversal
 // (No CollectiveBuilder for SM80, so we specify all types explicitly.
 //  Pattern from test/unit/gemm/device/default_gemm_configuration.hpp)
@@ -569,33 +671,57 @@ extern "C" int cutlass_gemm_dispatch(
     auto s = static_cast<cudaStream_t>(const_cast<void*>(stream));
     cudaGetLastError();
 
+    static int s_cc_major = -1;
+    if (s_cc_major < 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&s_cc_major, cudaDevAttrComputeCapabilityMajor, dev);
+    }
+
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+    // Blackwell (SM100/SM103): native tcgen05/UMMA via CollectiveBuilder.
+    // Same arch-conditional MMA assert applies as SM90 — only enter on
+    // compute major == 10 so SM10x sources don't run on older arches.
+    if (s_cc_major == 10) {
+        int ret = -20;
+        // BF16 only for now — FP16/F32/FP8 fall through to SM80 if hit.
+        if (dtype == 0) {
+            // Try 2sm cluster first (best throughput). It requires M-tile
+            // count divisible by 2 (i.e. M >= 2 × 256-tile = 512 with the
+            // builder's auto schedule). On smaller M the 2sm builder still
+            // succeeds at compile but launch returns InvalidProblem; the
+            // 1sm fallback handles that case.
+            ret = launch<Sm100_Default<BF16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d);
+            if (ret != 0) {
+                ret = launch<Sm100_1Sm<BF16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d);
+            }
+        }
+        if (ret == 0) return 0;
+        // Both SM100 paths failed (e.g. dtype != BF16) — fall through to
+        // SM80. Don't fprintf here: SM80 PTX-JIT'd to SM10x is correct,
+        // it's just slower than the SM100-native path we just missed.
+    }
+#endif
+
 #if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
     // SM90 kernels use `wgmma` — that instruction family only exists on SM90.
     // On Blackwell (SM100/SM103) the fat-binary cubin still links, but running
     // it fires CUTLASS's own `Arch conditional MMA instruction used without
     // targeting appropriate compute capability` assert and kills the process.
     // Gate the SM90 path on the runtime compute major == 9.
-    {
-        static int s_cc_major = -1;
-        if (s_cc_major < 0) {
-            int dev = 0;
-            cudaGetDevice(&dev);
-            cudaDeviceGetAttribute(&s_cc_major, cudaDevAttrComputeCapabilityMajor, dev);
+    if (s_cc_major == 9) {
+        int ret;
+        switch (dtype) {
+            case 0: ret = launch<Sm90_Default<BF16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
+            case 1: ret = launch<Sm90_Default<FP16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
+            case 2: ret = launch<Sm90_F32<float>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
+            case 3: ret = launch<Sm90_FP8<FP8E4M3>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
+            default: ret = -20; break;
         }
-        if (s_cc_major == 9) {
-            int ret;
-            switch (dtype) {
-                case 0: ret = launch<Sm90_Default<BF16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
-                case 1: ret = launch<Sm90_Default<FP16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
-                case 2: ret = launch<Sm90_F32<float>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
-                case 3: ret = launch<Sm90_FP8<FP8E4M3>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d); break;
-                default: ret = -20; break;
-            }
-            if (ret == 0) return 0;
-            // SM90 failed — fall through to SM80
-            fprintf(stderr, "CUTLASS: SM90 failed (code %d) for m=%d n=%d k=%d dtype=%u, falling back to SM80\n",
-                    ret, m, n, k, dtype);
-        }
+        if (ret == 0) return 0;
+        // SM90 failed — fall through to SM80
+        fprintf(stderr, "CUTLASS: SM90 failed (code %d) for m=%d n=%d k=%d dtype=%u, falling back to SM80\n",
+                ret, m, n, k, dtype);
     }
 #endif
 

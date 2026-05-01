@@ -188,11 +188,15 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// Pre-allocated cuBLAS workspace size. 64 MB is the NVIDIA-recommended value
-/// for Hopper/Blackwell. Pre-allocating eliminates `cudaErrorStreamCaptureUnsupported`
-/// errors that cuBLAS would otherwise throw (via bad_alloc) when its internal
-/// workspace allocator tries `cudaMalloc` during an active CUDA graph capture.
-const CUBLAS_WORKSPACE_BYTES: usize = 64 * 1024 * 1024;
+/// Pre-allocated cuBLAS workspace size. 128 MB matches the upper end of
+/// NVIDIA's Hopper/Blackwell guidance — the larger SM10x split-K and
+/// stream-K kernels can request up to ~96 MB of scratch for very wide
+/// GEMMs, so 64 MB silently forces them onto a less-parallel algo path.
+/// Pre-allocating also eliminates `cudaErrorStreamCaptureUnsupported`
+/// errors that cuBLAS would otherwise throw (via bad_alloc) when its
+/// internal workspace allocator tries `cudaMalloc` during an active
+/// CUDA graph capture.
+const CUBLAS_WORKSPACE_BYTES: usize = 128 * 1024 * 1024;
 
 /// Owns one cuBLAS handle and its preallocated workspace, scoped to a
 /// single CUDA device. RAII drop releases both — without this, every
@@ -205,6 +209,16 @@ struct CublasState {
 
 impl Drop for CublasState {
     fn drop(&mut self) {
+        // `cudaFree` and `cublasDestroy_v2` operate on the current
+        // device at call time. If the worker thread switched device
+        // since handle creation (multi-GPU scenarios), freeing without
+        // setting `self.device` first would either invalid-free the
+        // wrong device's allocation or leak our workspace silently.
+        // Save/restore so we don't surprise any later code.
+        let mut prev: c_int = 0;
+        let saved = unsafe { cudaGetDevice(&mut prev) };
+        let switched = saved == 0 && prev != self.device
+            && unsafe { cudaSetDevice(self.device) } == 0;
         unsafe {
             if !self.handle.is_null() {
                 cublasDestroy_v2(self.handle);
@@ -212,6 +226,10 @@ impl Drop for CublasState {
             if !self.workspace.is_null() {
                 cudaFree(self.workspace);
             }
+        }
+        if switched {
+            // Best-effort restore; ignore errors during teardown.
+            unsafe { cudaSetDevice(prev) };
         }
     }
 }
@@ -237,6 +255,20 @@ unsafe fn get_or_init_handle() -> std::result::Result<*mut c_void, String> {
     CUBLAS_HANDLES.with(|slot| {
         if let Some(state) = slot.borrow().iter().find(|s| s.device == device) {
             return Ok(state.handle);
+        }
+
+        // Pin the current device for the rest of init: `cublasCreate_v2`
+        // binds the handle to whatever device is current, and `cudaMalloc`
+        // for the workspace allocates on whatever device is current. If
+        // anything between `cudaGetDevice` and these calls flipped the
+        // current device (cudarc CudaContext switches, library init,
+        // etc.), the handle and workspace would land on different
+        // devices — every subsequent `cublasGemmEx` would then route
+        // through the wrong context and either crash or silently produce
+        // wrong output.
+        let set_status = unsafe { cudaSetDevice(device) };
+        if set_status != 0 {
+            return Err(format!("cudaSetDevice({device}) failed (status {set_status})"));
         }
 
         let mut handle: *mut c_void = std::ptr::null_mut();
