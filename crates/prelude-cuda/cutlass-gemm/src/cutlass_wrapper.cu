@@ -258,6 +258,90 @@ template <class E> using Sm100_1Sm = Sm100Runner<
     cutlass::gemm::collective::StageCountAuto,
     /*Use2SmMma=*/false, E>;
 
+// F32 variant: needs a smaller K-tile because TF32 elements are 4B (vs
+// 2B for BF16/FP16). Reuses the same Sm100Runner machinery but
+// overrides the MmaTileMNK by template-specializing through a wrapper
+// runner. We can't just change the tile in Sm100Runner because the
+// template parameter list is fixed; instead we use a separate runner
+// type that inlines the tile shape.
+
+template <class MainloopScheduleType, class EpilogueScheduleType, class StageCountType,
+          bool Use2SmMma, class Element>
+struct Sm100RunnerF32 {
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::ColumnMajor;
+    using LayoutD = cutlass::layout::ColumnMajor;
+
+    using ElementAccumulator = float;
+    using ElementCompute = float;
+    using ElementScalar = float;
+
+    using ClusterShapeMNK = std::conditional_t<
+        Use2SmMma, Shape<_2,_2,_1>, Shape<_1,_1,_1>>;
+    // K=32 for TF32 (vs K=64 for BF16/FP16) keeps shared-memory usage
+    // reasonable since TF32 is 4 bytes per element.
+    using MmaTileMNK = std::conditional_t<
+        Use2SmMma, Shape<_256,_128,_32>, Shape<_128,_128,_32>>;
+
+    static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<Element>::value;
+    static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<Element>::value;
+    static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<Element>::value;
+    static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<Element>::value;
+
+    static constexpr auto RoundStyle = cutlass::FloatRoundStyle::round_to_nearest;
+
+    using DefaultOperation = cutlass::epilogue::fusion::LinearCombination<
+        Element, ElementCompute, Element, ElementScalar, RoundStyle>;
+
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+        MmaTileMNK, ClusterShapeMNK,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator, ElementCompute,
+        Element, LayoutC, AlignmentC,
+        Element, LayoutD, AlignmentD,
+        EpilogueScheduleType,
+        DefaultOperation
+    >::CollectiveOp;
+
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+        Element, LayoutA, AlignmentA,
+        Element, LayoutB, AlignmentB,
+        ElementAccumulator,
+        MmaTileMNK, ClusterShapeMNK,
+        cute::conditional_t<cute::is_same_v<StageCountType, cutlass::gemm::collective::StageCountAuto>,
+            cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+            StageCountType>,
+        MainloopScheduleType
+    >::CollectiveOp;
+
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        Shape<int, int, int, int>,
+        CollectiveMainloop,
+        CollectiveEpilogue
+    >;
+
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+};
+
+template <class E> using Sm100_F32 = Sm100RunnerF32<
+    cutlass::gemm::collective::KernelScheduleAuto,
+    cutlass::epilogue::collective::EpilogueScheduleAuto,
+    cutlass::gemm::collective::StageCountAuto,
+    /*Use2SmMma=*/true, E>;
+
+template <class E> using Sm100_F32_1Sm = Sm100RunnerF32<
+    cutlass::gemm::collective::KernelScheduleAuto,
+    cutlass::epilogue::collective::EpilogueScheduleAuto,
+    cutlass::gemm::collective::StageCountAuto,
+    /*Use2SmMma=*/false, E>;
+
 #endif // CUTLASS_ARCH_MMA_SM100_SUPPORTED
 
 // ============================================================================
@@ -684,22 +768,33 @@ extern "C" int cutlass_gemm_dispatch(
     // compute major == 10 so SM10x sources don't run on older arches.
     if (s_cc_major == 10) {
         int ret = -20;
-        // BF16 only for now — FP16/F32/FP8 fall through to SM80 if hit.
+        // Try 2sm cluster first (best throughput). It requires M-tile
+        // count divisible by 2 (i.e. M >= 2 × 256-tile = 512 with the
+        // builder's auto schedule). On smaller M the 2sm builder still
+        // succeeds at compile but launch returns InvalidProblem; the
+        // 1sm fallback handles that case.
+        // FP8 still falls through to SM80 for now.
         if (dtype == 0) {
-            // Try 2sm cluster first (best throughput). It requires M-tile
-            // count divisible by 2 (i.e. M >= 2 × 256-tile = 512 with the
-            // builder's auto schedule). On smaller M the 2sm builder still
-            // succeeds at compile but launch returns InvalidProblem; the
-            // 1sm fallback handles that case.
             ret = launch<Sm100_Default<BF16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d);
             if (ret != 0) {
                 ret = launch<Sm100_1Sm<BF16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d);
             }
+        } else if (dtype == 1) {
+            ret = launch<Sm100_Default<FP16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d);
+            if (ret != 0) {
+                ret = launch<Sm100_1Sm<FP16>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d);
+            }
+        } else if (dtype == 2) {
+            ret = launch<Sm100_F32<float>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d);
+            if (ret != 0) {
+                ret = launch<Sm100_F32_1Sm<float>>(A, B, D, m, n, k, s, batch, stride_a, stride_b, stride_d);
+            }
         }
         if (ret == 0) return 0;
-        // Both SM100 paths failed (e.g. dtype != BF16) — fall through to
-        // SM80. Don't fprintf here: SM80 PTX-JIT'd to SM10x is correct,
-        // it's just slower than the SM100-native path we just missed.
+        // SM100 path failed or unsupported dtype (e.g. FP8) — fall
+        // through to SM80. Don't fprintf here: SM80 PTX-JIT'd to SM10x
+        // is correct, it's just slower than the SM100-native path we
+        // just missed.
     }
 #endif
 
