@@ -304,6 +304,7 @@ fn load_safetensor_parts(
             &device,
             &common_config,
             dtype,
+            engine_config.runtime.profile_tokens,
         ).unwrap_or(0)
     } else {
         0
@@ -576,29 +577,76 @@ async fn load_embedding_modules_from_repo(
         }
     };
 
-    // Pre-download any files the embedding modules need, then use the
-    // sync loader with local paths. This keeps the download async
-    // while the file parsing stays sync (it's CPU-bound anyway).
+    // Walk modules.json once to enumerate every relative path the sync
+    // loader will ask for, await-download them all up front, then hand
+    // the sync loader a closure that just looks each path up in the
+    // resulting map.
+    //
+    // We can't `block_in_place` + `Handle::current().block_on` from
+    // inside the sync closure: tokio panics that combo on a
+    // current_thread runtime, which `#[tokio::test]` defaults to —
+    // meaning embed-loading would crash any test that builds an Engine.
+    let load_dense_auxiliary = arch_name == "gemma3";
+    let needed = enumerate_embedding_module_files(&modules_path, load_dense_auxiliary)?;
+    let mut path_map: std::collections::HashMap<String, PathBuf> =
+        std::collections::HashMap::with_capacity(needed.len());
+    for relative in needed {
+        let local = repo.get(&relative).await.map_err(|err| {
+            EngineError::Internal(format!("failed to download {relative}: {err}"))
+        })?;
+        path_map.insert(relative, local);
+    }
+
     load_embedding_modules_from_file(
         &modules_path,
         |relative| {
-            // Block on the async download — we're inside a sync closure
-            // called from the embedding module parser. Since we're already
-            // on a tokio runtime, use Handle::current().block_on().
-            let repo = repo.clone();
-            let relative = relative.to_string();
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    repo.get(&relative).await.map_err(|err| {
-                        EngineError::Internal(format!("failed to download {relative}: {err}"))
-                    })
-                })
+            path_map.get(relative).cloned().ok_or_else(|| {
+                EngineError::Internal(format!(
+                    "embedding module file not pre-downloaded: {relative} \
+                     (enumerate_embedding_module_files missed it)"
+                ))
             })
         },
         dtype,
         device,
-        arch_name == "gemma3",
+        load_dense_auxiliary,
     )
+}
+
+/// Read `modules.json` and return every relative file path the sync
+/// loader will subsequently ask for via its `resolve_path` callback.
+/// Mirrors the matching arms in `load_embedding_modules_from_file` —
+/// keep the two in sync.
+fn enumerate_embedding_module_files(
+    modules_path: &Path,
+    load_dense_auxiliary: bool,
+) -> Result<Vec<String>, EngineError> {
+    let content = std::fs::read_to_string(modules_path).map_err(|err| {
+        EngineError::Internal(format!(
+            "failed to read embedding modules.json {}: {err}",
+            modules_path.display()
+        ))
+    })?;
+    let modules: Vec<SentenceTransformerModuleEntry> =
+        serde_json::from_str(&content).map_err(|err| {
+            EngineError::Internal(format!(
+                "failed to parse embedding modules.json {}: {err}",
+                modules_path.display()
+            ))
+        })?;
+
+    let mut needed = Vec::new();
+    for entry in &modules {
+        if entry.module_type.ends_with(".Pooling") {
+            needed.push(module_relative_path(&entry.path, "config.json"));
+        } else if entry.module_type.ends_with(".Dense") {
+            needed.push(module_relative_path(&entry.path, "config.json"));
+            if load_dense_auxiliary {
+                needed.push(module_relative_path(&entry.path, "model.safetensors"));
+            }
+        }
+    }
+    Ok(needed)
 }
 
 fn load_embedding_modules_from_file<F>(
@@ -850,6 +898,7 @@ fn profile_peak_activation(
     device: &Device,
     config: &crate::engine::CommonModelConfig,
     dtype: DType,
+    profile_tokens: usize,
 ) -> Result<usize, EngineError> {
     use crate::tensor::Tensor;
 
@@ -861,10 +910,13 @@ fn profile_peak_activation(
         return Ok(0);
     }
 
-    // Profile at the actual max_num_batched_tokens (8192), same as vLLM.
-    // This avoids linear extrapolation errors from non-linear costs
-    // (attention workspace, MoE dispatch buffers).
-    let profile_tokens = 8192usize;
+    // Profile at the configured max_num_batched_tokens (matches vLLM's
+    // approach). This avoids linear extrapolation errors from non-linear
+    // costs (attention workspace, MoE dispatch buffers). Caller threads
+    // the value in from `RuntimeConfig::profile_tokens`, which the server
+    // CLI sets from `--max-num-batched-tokens` so the profile shape and
+    // the scheduler's per-step token budget always agree.
+    let profile_tokens = profile_tokens.max(1);
 
     tracing::info!(
         profile_tokens,

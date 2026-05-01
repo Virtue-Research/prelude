@@ -198,7 +198,7 @@ pub async fn ar_loop(
     // Shutdown: fail remaining requests
     for (id, state) in states.drain() {
         release_resources(&engine, &mut scheduler, &id);
-        fail_state(&engine, state, EngineError::Unavailable("AR loop stopped".into()));
+        fail_state(state, EngineError::Unavailable("AR loop stopped".into()));
     }
     tracing::info!("AR loop exited");
 }
@@ -227,18 +227,46 @@ fn handle_message(
             // `allocate` zeros the slot so a fresh request always starts from
             // clean recurrent + conv state; `release_resources` frees it when
             // the sequence finishes.
+            //
+            // Fail the request if the pool is exhausted: `build_step_batch`
+            // only forwards `deltanet_slots` when *every* sequence in the
+            // batch has one, so a single slotless admission flips the whole
+            // batch onto the non-pooled linear-attention path that clears
+            // recurrent state every step — silently corrupting all
+            // co-batched DeltaNet requests, not just the slotless one.
             if let Some(pool_mutex) = deltanet_pool {
-                if let Ok(mut pool) = pool_mutex.lock() {
-                    match pool.allocate() {
-                        Some(slot) => {
-                            seq.deltanet_slot = Some(slot);
-                        }
-                        None => {
-                            tracing::warn!(
-                                rid = %request_id,
-                                "DeltaNet pool exhausted — request will run without per-request state isolation"
-                            );
-                        }
+                let allocated = pool_mutex
+                    .lock()
+                    .ok()
+                    .and_then(|mut pool| pool.allocate());
+                match allocated {
+                    Some(slot) => {
+                        seq.deltanet_slot = Some(slot);
+                    }
+                    None => {
+                        let mut state = ArSequenceState {
+                            request_id: prepared.request.request_id.clone(),
+                            prepared: Some(prepared),
+                            response,
+                            gen_start: Instant::now(),
+                            prefill_ms: 0.0,
+                            started_sent: false,
+                            sent_text_len: 0,
+                            pending_token: None,
+                            output_tokens: Vec::new(),
+                            token_logprobs: Vec::new(),
+                            prompt_token_logprobs: None,
+                            max_new_tokens: 0,
+                        };
+                        state.ensure_started();
+                        fail_state(
+                            state,
+                            EngineError::Unavailable(
+                                "DeltaNet pool exhausted — increase `deltanet_pool_slots` or retry"
+                                    .into(),
+                            ),
+                        );
+                        return;
                     }
                 }
             }
@@ -551,18 +579,7 @@ fn process_step_output(
             let token = if let Some(ref tokens) = batched_tokens {
                 tokens[i]
             } else if let Some(ref row) = row {
-                if state.is_greedy() {
-                    row.argmax(crate::tensor::D::Minus1)
-                        .and_then(|t| t.to_scalar::<u32>())
-                        .unwrap_or(0)
-                } else if let Some(ref mut prepared) = state.prepared {
-                    let row_f32 = row.to_dtype(crate::tensor::DType::F32).unwrap();
-                    prepared.logits_processor.sample(&row_f32).unwrap_or(0)
-                } else {
-                    row.argmax(crate::tensor::D::Minus1)
-                        .and_then(|t| t.to_scalar::<u32>())
-                        .unwrap_or(0)
-                }
+                sample_token(row, state)
             } else {
                 0
             };
@@ -712,7 +729,7 @@ fn finish_state(engine: &Engine, mut state: ArSequenceState, finish_reason: Fini
     }
 }
 
-fn fail_state(_engine: &Engine, mut state: ArSequenceState, error: EngineError) {
+fn fail_state(mut state: ArSequenceState, error: EngineError) {
     state.ensure_started();
     match state.response {
         ResponseChannel::Complete(tx) => {
@@ -737,7 +754,7 @@ fn fail_step(
         release_resources(engine, scheduler, id);
         let _ = scheduler.abort_request(id);
         if let Some(state) = states.remove(id) {
-            fail_state(engine, state, error.clone());
+            fail_state(state, error.clone());
         }
     }
 }

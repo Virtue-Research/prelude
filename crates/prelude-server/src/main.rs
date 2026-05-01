@@ -224,6 +224,12 @@ async fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
     }
     engine_config.cache.gpu_memory_utilization = cli.gpu_memory_utilization;
     engine_config.runtime.cuda_graph = cli.cuda_graph;
+    // Activation profiler probes at this token count so the resulting
+    // peak_activation_bytes matches the largest forward the scheduler
+    // will dispatch. Keeping these in lockstep avoids KV cache being
+    // under-allocated (when CLI < default) or activation under-estimated
+    // (when CLI > default).
+    engine_config.runtime.profile_tokens = cli.max_num_batched_tokens;
     info!(?engine_config, "engine config loaded");
 
     // Auto-detect: explicit --model-path wins. Otherwise, if --model points

@@ -32,6 +32,10 @@ pub fn global_cache_config() -> Option<&'static CacheConfig> {
 
 pub const DEFAULT_GPU_MEMORY_UTILIZATION: f32 = 0.9;
 pub const DEFAULT_CUDA_GRAPH_MAX_BS: usize = 32;
+/// Mirrors the scheduler's `max_num_batched_tokens` default, so the
+/// activation profiler probes the same shape the engine actually runs
+/// in the default config.
+pub const DEFAULT_PROFILE_TOKENS: usize = 8192;
 pub const DEFAULT_PAGED_BLOCK_SIZE: usize = 128;
 pub const DEFAULT_PREFIX_BLOCK_SIZE: usize = 64;
 pub const DEFAULT_DELTANET_POOL_SLOTS: u32 = 8;
@@ -166,6 +170,13 @@ pub struct RuntimeConfig {
     pub cuda_graph: bool,
     /// Maximum batch size for CUDA graph capture (graphs captured for 1..=max_bs powers of 2).
     pub cuda_graph_max_bs: usize,
+    /// Token count to use when profiling peak activation memory at load
+    /// time. Mirrors the scheduler's per-step token budget so the
+    /// resulting `peak_activation_bytes` matches the largest forward
+    /// the engine will actually run. Server CLI sets this from
+    /// `--max-num-batched-tokens`; the env override is for tests /
+    /// non-server callers.
+    pub profile_tokens: usize,
 }
 
 impl RuntimeConfig {
@@ -181,6 +192,7 @@ impl RuntimeConfig {
             dtype: None,
             cuda_graph: true,
             cuda_graph_max_bs: parse_env_usize("PRELUDE_CUDA_GRAPH_MAX_BS", DEFAULT_CUDA_GRAPH_MAX_BS),
+            profile_tokens: parse_env_usize("PRELUDE_PROFILE_TOKENS", DEFAULT_PROFILE_TOKENS),
         }
     }
 }
