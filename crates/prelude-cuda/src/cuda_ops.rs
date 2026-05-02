@@ -136,16 +136,10 @@ impl Ops for CudaOps {
         w1: &Tensor,
         w2: &Tensor,
     ) -> Option<Result<Tensor>> {
-        // Upstream FlashInfer's CUTLASS MoE kernel aborts hard on SM100+
-        // (Blackwell) — it `throw`s a `TllmException("Please recompile with
-        // support for blackwell")` from inside a C++ kernel dispatch. That
-        // crosses the FFI boundary and `std::terminate()`s the process.
-        //
-        // Bail to None on unsupported archs so the model falls through to
-        // the WMMA grouped-GEMM path cleanly.
-        if detect_sm_major() >= 10 {
-            return None;
-        }
+        // The AOT FlashInfer build now includes Blackwell CUTLASS fused-MoE
+        // variants. Unsupported arch/config cases are represented by a
+        // missing runner or a normal `Err`, and the model layer keeps the
+        // grouped-GEMM fallback path intact.
         Some(crate::ops::moe::cutlass_fused_moe_forward(input, experts_per_tok, topk_weights, w1, w2))
     }
 
@@ -241,6 +235,13 @@ impl Ops for CudaOps {
             Ok(t) => t, Err(e) => return Some(Err(e)),
         };
         Some(Ok((q_out, k_out)))
+    }
+
+    fn fused_q_norm_rope(&self, q: &Tensor, q_weight: &Tensor, cos: &Tensor, sin: &Tensor, position_ids: &Tensor, eps: f32) -> Option<Result<Tensor>> {
+        if q.dtype() != DType::BF16 { return None; }
+        let head_dim = q.dims().last().copied().unwrap_or(0);
+        if head_dim > 256 { return None; }
+        Some(crate::ops::rope::fused_qknorm_rope_varlen(q, q_weight, cos, sin, position_ids, eps as f64))
     }
 
     fn fused_knorm_rope_cache_write(&self, k: &Tensor, v: &Tensor, k_weight: &Tensor, cos: &Tensor, sin: &Tensor, position_ids: &Tensor, key_cache: &Tensor, value_cache: &Tensor, slot_mapping: &Tensor, eps: f32) -> Option<Result<()>> {

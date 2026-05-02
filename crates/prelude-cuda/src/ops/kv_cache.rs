@@ -187,6 +187,13 @@ pub fn fused_knorm_rope_kv_cache_write_varlen(
     let total_tokens = k_dims[0];
     let total_kv_rows = total_tokens * num_kv_heads;
 
+    // Token-major stride. K/V are typically NON-contiguous narrows out
+    // of a fused QKV projection — stride[0] = q_size + 2 * kv_size, not
+    // just num_kv_heads * head_dim. The kernel reads via
+    // k_input + token * stride + kv_head * head_dim.
+    let k_token_stride = k_layout.stride()[0] as u32;
+    let v_token_stride = v_layout.stride()[0] as u32;
+
     let k_slice = k_cuda.as_cuda_slice::<half::bf16>()?.slice(k_layout.start_offset()..);
     let v_slice = v_cuda.as_cuda_slice::<half::bf16>()?.slice(v_layout.start_offset()..);
     let w_slice = w_cuda.as_cuda_slice::<half::bf16>()?.slice(w_layout.start_offset()..);
@@ -231,6 +238,8 @@ pub fn fused_knorm_rope_kv_cache_write_varlen(
     builder.arg(&head_dim_val);
     builder.arg(&block_size_val);
     builder.arg(&eps_val);
+    builder.arg(&k_token_stride);
+    builder.arg(&v_token_stride);
     unsafe { builder.launch(cfg) }.w()?;
 
     Ok(())
