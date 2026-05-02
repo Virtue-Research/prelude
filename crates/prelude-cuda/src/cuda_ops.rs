@@ -95,9 +95,18 @@ impl Ops for CudaOps {
         let num_assignments = sorted_token_ids.elem_count();
         let num_tokens = input.dims()[0];
         let topk = if num_tokens > 0 { num_assignments / num_tokens } else { 1 };
-        // Prefer the CUTLASS Blackwell SM100 grouped GEMM (BF16 only) over the
-        // SM75-era WMMA kernel. The helper returns Ok(None) on unsupported
-        // arch / dtype, so fall through to the WMMA path in that case.
+        // Dispatch order, fastest-first:
+        //   1. DeepGEMM `m_grouped_bf16_gemm` (SM90+, BF16, MoE-tuned).
+        //      Pads each expert slice to 128 rows; near-zero overhead at
+        //      typical prefill batch sizes where M_e ≥ 128.
+        //   2. CUTLASS SM100 PtrArray grouped GEMM (Blackwell-only) —
+        //      handles odd M_e but with more per-call overhead.
+        //   3. WMMA SM75-era kernel (universal fallback).
+        // Each helper returns `Ok(None)` on unsupported arch/dtype/shape
+        // so we fall through to the next path cleanly.
+        if let Some(out) = crate::ops::moe::try_grouped_gemm_deepgemm(input, weights, sorted_token_ids, sorted_expert_ids, topk)? {
+            return Ok(out);
+        }
         if let Some(out) = crate::ops::moe::try_grouped_gemm_sm100(input, weights, sorted_token_ids, sorted_expert_ids, topk)? {
             return Ok(out);
         }

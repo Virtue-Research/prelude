@@ -282,6 +282,234 @@ pub fn moe_gemm_wmma(
     }
 }
 
+/// DeepGEMM SM100 grouped MoE GEMM, BF16 only — preferred path on
+/// Hopper/Blackwell when shapes hit a registered kernel variant.
+///
+/// DeepGEMM's `m_grouped_bf16_gemm` requires each expert's slice to
+/// start on a 128-row boundary, so we pad each expert's per-token
+/// slice up to a multiple of 128 with zeros before the GEMM and skip
+/// padding rows during scatter. For balanced routing this padding
+/// is essentially free (avg M_e at conc=32 prefill is already a
+/// multiple of 128), and the kernel itself is significantly faster
+/// than the CUTLASS PtrArray fallback.
+///
+/// Returns `Ok(Some(out))` on success, `Ok(None)` when unavailable
+/// (non-Blackwell, FP16/F32 input, no kernel variant for the shape).
+///
+/// Contract matches `try_grouped_gemm_sm100` (drop-in earlier in the
+/// dispatch chain).
+pub fn try_grouped_gemm_deepgemm(
+    input: &Tensor,
+    weights: &Tensor,
+    sorted_token_ids: &Tensor,
+    sorted_expert_ids: &Tensor,
+    topk: usize,
+) -> Result<Option<Tensor>> {
+    use std::ffi::c_void;
+
+    // Arch + dtype gate. SM90+ only (DeepGEMM has SM90 + SM100 paths).
+    if crate::cuda_ops::detect_sm_major() < 9 {
+        return Ok(None);
+    }
+    if input.dtype() != DType::BF16 || weights.dtype() != DType::BF16 {
+        return Ok(None);
+    }
+    if !input.device().is_cuda() {
+        return Ok(None);
+    }
+    // Skip when padding overhead would dominate. The padded_total
+    // upper bound used below is `n_real + num_experts*127`; at small
+    // n_real this is many times larger than n_real itself, so the
+    // GEMM does mostly wasted compute on padding rows. Only let
+    // DeepGEMM through when `n_real ≥ num_experts*128`, i.e. avg
+    // M_e ≥ 128 → padding shrinks to 0%-50% overhead.
+    //
+    // Also skips decode (small n_tokens), so the CUDA-graph-captured
+    // decode batches keep using the SM100 PtrArray path.
+    let n_real_check = sorted_token_ids.elem_count();
+    let num_experts_check = weights.dims()[0];
+    if n_real_check < num_experts_check * 128 {
+        return Ok(None);
+    }
+
+    let (num_tokens, k1) = input.dims2()?;
+    let (num_experts, size_n, size_k) = weights.dims3()?;
+    if size_k != k1 {
+        bail!("grouped_gemm_deepgemm: input K={k1} vs weights K={size_k} mismatch");
+    }
+    let n_real = sorted_token_ids.elem_count();
+    if n_real != num_tokens * topk {
+        bail!(
+            "grouped_gemm_deepgemm: sorted_token_ids length {n_real} != num_tokens*topk = {}",
+            num_tokens * topk
+        );
+    }
+    if n_real == 0 {
+        return Ok(None);
+    }
+
+    let (input_g, _) = input.storage_and_layout();
+    let input_cuda = as_candle_cuda(&input_g, "grouped_gemm_deepgemm/input")?;
+    let input_s = input_cuda.as_cuda_slice::<half::bf16>()?;
+
+    let (weights_g, _) = weights.storage_and_layout();
+    let weights_cuda = as_candle_cuda(&weights_g, "grouped_gemm_deepgemm/weights")?;
+    let weights_s = weights_cuda.as_cuda_slice::<half::bf16>()?;
+
+    let (sti_g, _) = sorted_token_ids.storage_and_layout();
+    let sti_cuda = as_candle_cuda(&sti_g, "grouped_gemm_deepgemm/sorted_token_ids")?;
+    let sti_s = sti_cuda.as_cuda_slice::<u32>()?;
+
+    let (sei_g, _) = sorted_expert_ids.storage_and_layout();
+    let sei_cuda = as_candle_cuda(&sei_g, "grouped_gemm_deepgemm/sorted_expert_ids")?;
+    let sei_s = sei_cuda.as_cuda_slice::<u32>()?;
+
+    let dev = input_cuda.device().clone();
+    let stream = dev.cuda_stream();
+    let cu_stream = stream.cu_stream() as i64;
+
+    // Single workspace covering all per-call scratch. Layout:
+    //   [real_counts | real_offsets | padded_offsets | grouped_layout
+    //    | gathered_padded | gemm_out_padded]
+    // Output is allocated separately (returned to the caller).
+    //
+    // padded_total upper bound = n_real + num_experts * 127 (worst case
+    // when every expert has exactly 1 row → padded to 128). For
+    // balanced prefill routing this is ≤ 1.25× n_real.
+    let padded_total = n_real + num_experts * (128 - 1);
+    let bf16_size = std::mem::size_of::<half::bf16>();
+    let i32_size = std::mem::size_of::<i32>();
+
+    // Sub-buffer sizes in bytes. Each padded to 256 for alignment.
+    let align = |b: usize| (b + 255) & !255usize;
+    let off_real_counts    = 0usize;
+    let off_real_offsets   = off_real_counts    + align(num_experts * i32_size);
+    let off_padded_offsets = off_real_offsets   + align((num_experts + 1) * i32_size);
+    let off_grouped_layout = off_padded_offsets + align((num_experts + 1) * i32_size);
+    let off_gathered       = off_grouped_layout + align(padded_total * i32_size);
+    let off_gemm_out       = off_gathered       + align(padded_total * size_k * bf16_size);
+    let total_ws_bytes     = off_gemm_out       + align(padded_total * size_n * bf16_size);
+
+    let workspace = unsafe { dev.alloc::<u8>(total_ws_bytes) }?;
+    let ws_base = workspace.device_ptr(&stream).0;
+    let real_counts_ptr     = (ws_base + off_real_counts as u64) as *mut i32;
+    let real_offsets_ptr    = (ws_base + off_real_offsets as u64) as *mut i32;
+    let padded_offsets_ptr  = (ws_base + off_padded_offsets as u64) as *mut i32;
+    let grouped_layout_ptr  = (ws_base + off_grouped_layout as u64) as *mut i32;
+    let gathered_ptr        = (ws_base + off_gathered as u64) as *mut c_void;
+    let gemm_out_ptr        = (ws_base + off_gemm_out as u64) as *mut c_void;
+
+    // Zero-fill grouped_layout (tail is sentinel) and gathered_padded
+    // (padding rows must be 0). Single contiguous memset covers both.
+    unsafe {
+        use cudarc::driver::result::memset_d8_async;
+        let zero_start = ws_base + off_grouped_layout as u64;
+        let zero_end = ws_base + off_gemm_out as u64;
+        memset_d8_async(
+            zero_start,
+            0,
+            (zero_end - zero_start) as usize,
+            stream.cu_stream(),
+        ).map_err(|e| candle_core::Error::Msg(format!("memset workspace: {e:?}")))?;
+    }
+
+    // Real per-expert prefix-sum offsets (light variant: no thrust).
+    unsafe {
+        ffi::moe_compute_expert_offsets_light(
+            sei_s.device_ptr(&stream).0 as *const i32,
+            n_real as i32,
+            num_experts as i32,
+            real_counts_ptr,
+            real_offsets_ptr,
+            cu_stream,
+        );
+    }
+
+    // Padded layout: prefix-sum of ceil(real_count/128)*128 + fill
+    // grouped_layout[i] = expert that owns row i.
+    unsafe {
+        ffi::moe_dg_compute_padded_layout(
+            real_offsets_ptr as *const i32,
+            padded_offsets_ptr,
+            grouped_layout_ptr,
+            num_experts as i32,
+            cu_stream,
+        );
+    }
+
+    // Output is the only allocation that escapes this call.
+    let output = unsafe { dev.alloc_zeros::<half::bf16>(n_real * size_n) }?;
+
+    // Step 1: gather A into padded layout.
+    unsafe {
+        ffi::moe_dg_gather_padded(
+            input_s.device_ptr(&stream).0 as *const c_void,
+            sti_s.device_ptr(&stream).0 as *const u32,
+            sei_s.device_ptr(&stream).0 as *const u32,
+            real_offsets_ptr as *const i32,
+            padded_offsets_ptr as *const i32,
+            gathered_ptr,
+            n_real as i32,
+            size_k as i32,
+            topk as i32,
+            /*dtype=*/ 1,
+            cu_stream,
+        );
+    }
+
+    // Step 2: DeepGEMM grouped BF16 GEMM.
+    let dg_ret = unsafe {
+        deepgemm::m_grouped_bf16_gemm(
+            gathered_ptr,
+            weights_s.device_ptr(&stream).0 as *mut c_void,
+            gemm_out_ptr,
+            grouped_layout_ptr as *mut c_void,
+            padded_total as i32,
+            size_n as i32,
+            size_k as i32,
+            num_experts as i32,
+            stream.cu_stream() as *mut c_void,
+        )
+    };
+    if let Err(e) = dg_ret {
+        // No kernel variant or launch failure — caller falls back.
+        tracing::debug!("grouped_gemm_deepgemm → fallback: {e}");
+        drop(workspace);
+        return Ok(None);
+    }
+
+    // Step 3: scatter into assignment-flat output.
+    unsafe {
+        ffi::moe_dg_scatter_padded(
+            gemm_out_ptr as *const c_void,
+            sti_s.device_ptr(&stream).0 as *const u32,
+            sei_s.device_ptr(&stream).0 as *const u32,
+            real_offsets_ptr as *const i32,
+            padded_offsets_ptr as *const i32,
+            output.device_ptr(&stream).0 as *mut c_void,
+            n_real as i32,
+            size_n as i32,
+            /*dtype=*/ 1,
+            cu_stream,
+        );
+    }
+
+    drop(workspace);
+    drop(input_g);
+    drop(weights_g);
+    drop(sti_g);
+    drop(sei_g);
+
+    let storage = candle_core::CudaStorage::wrap_cuda_slice(output, dev);
+    let out = Tensor::from_storage(
+        candle_core::Storage::Cuda(storage),
+        (n_real, size_n),
+        candle_core::op::BackpropOp::none(),
+        false,
+    );
+    Ok(Some(out))
+}
+
 /// CUTLASS Blackwell SM100 grouped MoE GEMM, BF16 only.
 ///
 /// Returns `Ok(Some(out))` on success, `Ok(None)` when the path isn't

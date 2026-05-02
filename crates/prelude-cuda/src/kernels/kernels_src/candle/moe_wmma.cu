@@ -405,3 +405,193 @@ extern "C" void moe_sort_expert_assignments(
 
     cudaFreeAsync(scratch, stream);
 }
+
+// ════════════════════════════════════════════════════════════════════
+// DeepGEMM grouped GEMM padding helpers
+//
+// DeepGEMM's `m_grouped_bf16_gemm` requires each expert's slice of the
+// gathered input/output to start on a 128-row boundary. Our sort gives
+// us per-expert counts that aren't 128-aligned, so we have to round
+// each up and gather into a padded layout.
+//
+// Layout produced for `n_real` real assignments routed to `num_experts`:
+//
+//   gathered_padded :: [padded_total, K]   (zero-init; per-expert
+//                                           padding rows hold zeros so
+//                                           the GEMM is a no-op there)
+//   grouped_layout  :: [padded_total]      (one entry per padded row,
+//                                           stating which expert owns it)
+//   padded_offsets  :: [num_experts + 1]   (cumulative padded starts;
+//                                           padded_offsets[E] = padded_total)
+//
+// After the GEMM produces gemm_out_padded, scatter writes only the
+// real rows back to the caller's flat `output[sorted_token_ids[i]]`.
+// ════════════════════════════════════════════════════════════════════
+
+constexpr int MOE_DG_ALIGN = 128;
+
+/// Compute padded prefix-sum offsets from per-expert real counts.
+/// Single block; serial sweep is fine because num_experts is small (<=256).
+static __global__ void compute_padded_offsets_kernel(
+    const int32_t* __restrict__ real_offsets,   // [num_experts + 1]
+    int32_t* __restrict__ padded_offsets,       // [num_experts + 1]
+    int num_experts
+) {
+    if (threadIdx.x != 0) return;
+    int padded = 0;
+    padded_offsets[0] = 0;
+    for (int e = 0; e < num_experts; e++) {
+        int count = real_offsets[e + 1] - real_offsets[e];
+        int aligned = ((count + MOE_DG_ALIGN - 1) / MOE_DG_ALIGN) * MOE_DG_ALIGN;
+        padded += aligned;
+        padded_offsets[e + 1] = padded;
+    }
+}
+
+/// Fill grouped_layout[i] = expert that owns padded row i.
+///   For padded rows i in [padded_offsets[e], padded_offsets[e+1]) → e.
+/// One block per expert.
+static __global__ void fill_grouped_layout_kernel(
+    const int32_t* __restrict__ padded_offsets, // [num_experts + 1]
+    int32_t* __restrict__ grouped_layout,       // [padded_total]
+    int num_experts
+) {
+    int e = blockIdx.x;
+    if (e >= num_experts) return;
+    int beg = padded_offsets[e];
+    int end = padded_offsets[e + 1];
+    for (int i = beg + threadIdx.x; i < end; i += blockDim.x) {
+        grouped_layout[i] = e;
+    }
+}
+
+/// Gather A into padded layout. One block per real assignment.
+///
+/// padded_row(i) = padded_offsets[expert] + (i - real_offsets[expert])
+template <class Element>
+static __global__ void moe_gather_padded_kernel(
+    const Element* __restrict__ input,           // [num_tokens, K]
+    const uint32_t* __restrict__ sorted_token_ids, // [n_real]
+    const uint32_t* __restrict__ sorted_expert_ids, // [n_real]
+    const int32_t* __restrict__ real_offsets,    // [num_experts + 1]
+    const int32_t* __restrict__ padded_offsets,  // [num_experts + 1]
+    Element* __restrict__ gathered_padded,       // [padded_total, K]
+    int n_real, int K, int topk
+) {
+    int i = blockIdx.x;
+    if (i >= n_real) return;
+    int e = (int)sorted_expert_ids[i];
+    int intra = i - real_offsets[e];
+    int padded_row = padded_offsets[e] + intra;
+    int token = (int)sorted_token_ids[i] / topk;
+
+    const Element* src = input + (size_t)token * K;
+    Element* dst = gathered_padded + (size_t)padded_row * K;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        dst[k] = src[k];
+    }
+}
+
+/// Scatter D from padded layout back to assignment-flat output.
+template <class Element>
+static __global__ void moe_scatter_padded_kernel(
+    const Element* __restrict__ gemm_out_padded, // [padded_total, N]
+    const uint32_t* __restrict__ sorted_token_ids, // [n_real]
+    const uint32_t* __restrict__ sorted_expert_ids, // [n_real]
+    const int32_t* __restrict__ real_offsets,    // [num_experts + 1]
+    const int32_t* __restrict__ padded_offsets,  // [num_experts + 1]
+    Element* __restrict__ output,                // [n_real, N]
+    int n_real, int N
+) {
+    int i = blockIdx.x;
+    if (i >= n_real) return;
+    int e = (int)sorted_expert_ids[i];
+    int intra = i - real_offsets[e];
+    int padded_row = padded_offsets[e] + intra;
+    int dst_row = (int)sorted_token_ids[i];
+
+    const Element* src = gemm_out_padded + (size_t)padded_row * N;
+    Element* dst = output + (size_t)dst_row * N;
+    for (int n = threadIdx.x; n < N; n += blockDim.x) {
+        dst[n] = src[n];
+    }
+}
+
+/// Plan a padded layout: from sorted_expert_ids, write padded_offsets
+/// and grouped_layout, and return padded_total via a 1-element output.
+extern "C" void moe_dg_compute_padded_layout(
+    const int32_t* real_offsets,        // [num_experts + 1] device, prefix-sum already computed
+    int32_t* padded_offsets,            // [num_experts + 1] device output
+    int32_t* grouped_layout,            // [padded_total] device output (caller sized for upper bound)
+    int num_experts,
+    cudaStream_t stream
+) {
+    compute_padded_offsets_kernel<<<1, 1, 0, stream>>>(
+        real_offsets, padded_offsets, num_experts);
+    int threads = 256;
+    fill_grouped_layout_kernel<<<num_experts, threads, 0, stream>>>(
+        padded_offsets, grouped_layout, num_experts);
+}
+
+/// Padded gather wrapper. Output `gathered_padded` must be pre-zeroed
+/// (cudaMemsetAsync) by the caller — padding rows depend on it.
+/// dtype: 0 = fp16, 1 = bf16.
+extern "C" void moe_dg_gather_padded(
+    const void* input,
+    const uint32_t* sorted_token_ids,
+    const uint32_t* sorted_expert_ids,
+    const int32_t* real_offsets,
+    const int32_t* padded_offsets,
+    void* gathered_padded,
+    int n_real, int K, int topk, int dtype,
+    cudaStream_t stream
+) {
+    int threads = 256;
+    if (dtype == 1) {
+        moe_gather_padded_kernel<__nv_bfloat16><<<n_real, threads, 0, stream>>>(
+            (const __nv_bfloat16*)input,
+            sorted_token_ids, sorted_expert_ids,
+            real_offsets, padded_offsets,
+            (__nv_bfloat16*)gathered_padded,
+            n_real, K, topk);
+    } else {
+        moe_gather_padded_kernel<__half><<<n_real, threads, 0, stream>>>(
+            (const __half*)input,
+            sorted_token_ids, sorted_expert_ids,
+            real_offsets, padded_offsets,
+            (__half*)gathered_padded,
+            n_real, K, topk);
+    }
+}
+
+/// Padded scatter wrapper. Caller's `output` is overwritten only at
+/// rows that appear in sorted_token_ids — caller must zero-init for
+/// rows that may not be touched (e.g. when topk-reduction expects
+/// per-(token,expert) contributions written exactly once).
+extern "C" void moe_dg_scatter_padded(
+    const void* gemm_out_padded,
+    const uint32_t* sorted_token_ids,
+    const uint32_t* sorted_expert_ids,
+    const int32_t* real_offsets,
+    const int32_t* padded_offsets,
+    void* output,
+    int n_real, int N, int dtype,
+    cudaStream_t stream
+) {
+    int threads = 256;
+    if (dtype == 1) {
+        moe_scatter_padded_kernel<__nv_bfloat16><<<n_real, threads, 0, stream>>>(
+            (const __nv_bfloat16*)gemm_out_padded,
+            sorted_token_ids, sorted_expert_ids,
+            real_offsets, padded_offsets,
+            (__nv_bfloat16*)output,
+            n_real, N);
+    } else {
+        moe_scatter_padded_kernel<__half><<<n_real, threads, 0, stream>>>(
+            (const __half*)gemm_out_padded,
+            sorted_token_ids, sorted_expert_ids,
+            real_offsets, padded_offsets,
+            (__half*)output,
+            n_real, N);
+    }
+}
