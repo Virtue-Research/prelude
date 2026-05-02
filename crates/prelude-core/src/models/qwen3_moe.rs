@@ -307,8 +307,6 @@ impl Qwen3SparseMoeBlock {
         experts_per_tok: &Tensor,
         hidden_dim: usize,
     ) -> Result<Tensor> {
-        let gate_w = self.gate_w.as_ref().unwrap();
-        let up_w = self.up_w.as_ref().unwrap();
         let down_w = self.down_w.as_ref().unwrap();
         let (total_tokens, _) = xs.dims2()?;
         nvtx_push!("moe_sort");
@@ -321,22 +319,52 @@ impl Qwen3SparseMoeBlock {
         // Pass a zero-length placeholder to preserve the trait signature.
         let num_tokens_per_expert = Tensor::zeros((0,), DType::U32, xs.device())?;
 
-        nvtx_push!("moe_gate_gemm");
-        let gate = ops.grouped_gemm(
-            xs, gate_w,
-            &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
-        )?;
-        nvtx_pop!();
-        nvtx_push!("moe_up_gemm");
-        let up = ops.grouped_gemm(
-            xs, up_w,
-            &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
-        )?;
-        nvtx_pop!();
-
-        nvtx_push!("moe_silu_mul");
-        let down_input = ops.silu_mul(&gate, &up)?;
-        nvtx_pop!();
+        // Try the fused `experts_gate_up` path: one grouped GEMM
+        // produces [M, 2*inter] (stacked [up; gate]), then a fused
+        // silu(gate)*up kernel collapses to [M, inter]. Saves one full
+        // grouped-GEMM kernel launch and one full input read per layer
+        // vs the legacy gate_w + up_w split.
+        let down_input = if let Some(egu) = self.experts_gate_up.as_ref() {
+            let inter = egu.dim(1)? / 2;
+            nvtx_push!("moe_gate_up_gemm");
+            let gate_up = ops.grouped_gemm(
+                xs, egu,
+                &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
+            )?;
+            nvtx_pop!();
+            nvtx_push!("moe_silu_mul_swap");
+            let r = match ops.silu_mul_concat_swap(&gate_up, inter) {
+                Some(r) => r?,
+                None => {
+                    // Backend without the fused swap kernel — narrow + silu_mul.
+                    let up = gate_up.narrow(D::Minus1, 0, inter)?.contiguous()?;
+                    let gate = gate_up.narrow(D::Minus1, inter, inter)?.contiguous()?;
+                    ops.silu_mul(&gate, &up)?
+                }
+            };
+            nvtx_pop!();
+            r
+        } else {
+            // Legacy 2-GEMM split path (CPU / non-CUDA backends).
+            let gate_w = self.gate_w.as_ref().unwrap();
+            let up_w = self.up_w.as_ref().unwrap();
+            nvtx_push!("moe_gate_gemm");
+            let gate = ops.grouped_gemm(
+                xs, gate_w,
+                &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
+            )?;
+            nvtx_pop!();
+            nvtx_push!("moe_up_gemm");
+            let up = ops.grouped_gemm(
+                xs, up_w,
+                &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
+            )?;
+            nvtx_pop!();
+            nvtx_push!("moe_silu_mul");
+            let r = ops.silu_mul(&gate, &up)?;
+            nvtx_pop!();
+            r
+        };
 
         // Always take the grouped-GEMM + external weighted-sum path.
         //

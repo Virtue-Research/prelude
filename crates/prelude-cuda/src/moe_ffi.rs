@@ -106,6 +106,18 @@ unsafe extern "C" {
         stream: i64,
     );
 
+    /// Fused `silu(gate) * up` for a [tokens, 2*I] BF16 tensor in
+    /// CUTLASS Swiglu stack order: first half = up, second half = gate.
+    /// Output: [tokens, I] BF16. `dtype`: 0=fp16, 1=bf16.
+    pub fn moe_silu_mul_swap(
+        gate_up: *const std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        tokens: i32,
+        inter: i32,
+        dtype: i32,
+        stream: i64,
+    );
+
     /// Scatter the padded GEMM output back into the assignment-flat
     /// `output` buffer, one row per real assignment.
     pub fn moe_dg_scatter_padded(

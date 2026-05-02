@@ -182,6 +182,12 @@ pub trait Ops: Send + Sync {
     /// Splits the last dimension internally. Returns `[tokens, dim]`.
     /// Avoids the narrow+contiguous copy that separate gate/up tensors need.
     fn silu_mul_concat(&self, _gate_up: &Tensor) -> Option<Result<Tensor>> { None }
+    /// Like `silu_mul_concat` but the input stack is in CUTLASS Swiglu
+    /// order: `[tokens, [up | gate]]`. Returns `silu(gate) * up`.
+    /// Lets the MoE forward fuse `experts_gate_up` (stacked as `[up;
+    /// gate]` for the FlashInfer CUTLASS path) into a single grouped
+    /// GEMM without a separate re-stack.
+    fn silu_mul_concat_swap(&self, _gate_up: &Tensor, _inter: usize) -> Option<Result<Tensor>> { None }
     fn fused_qknorm_rope(&self, _q: &Tensor, _k: &Tensor, _qw: &Tensor, _kw: &Tensor, _cos: &Tensor, _sin: &Tensor, _pos: &Tensor, _eps: f32) -> Option<Result<(Tensor, Tensor)>> { None }
     fn fused_knorm_rope_cache_write(&self, _k: &Tensor, _v: &Tensor, _kw: &Tensor, _cos: &Tensor, _sin: &Tensor, _pos: &Tensor, _kc: &Tensor, _vc: &Tensor, _sm: &Tensor, _eps: f32) -> Option<Result<()>> { None }
     fn fused_add(&self, _a: &Tensor, _b: &Tensor) -> Option<Result<Tensor>> { None }

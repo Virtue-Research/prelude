@@ -564,6 +564,54 @@ extern "C" void moe_dg_gather_padded(
     }
 }
 
+/// `silu(gate) * up` where the input is [tokens, 2*I] in CUTLASS
+/// Swiglu stack order: first half = `up`, second half = `gate`.
+/// FlashInfer's `silu_and_mul` assumes the opposite order, so this
+/// kernel exists specifically to consume the `experts_gate_up`
+/// weight-stack output without re-stacking.
+template <class Element>
+__global__ void silu_mul_swap_kernel(
+    const Element* __restrict__ gate_up,   // [tokens, 2*I]
+    Element* __restrict__ out,             // [tokens, I]
+    int tokens, int inter
+) {
+    int t = blockIdx.x;
+    if (t >= tokens) return;
+    const Element* gu = gate_up + (size_t)t * 2 * inter;
+    Element* o = out + (size_t)t * inter;
+    const Element* up_ptr = gu;            // first half = up
+    const Element* gate_ptr = gu + inter;  // second half = gate
+    for (int i = threadIdx.x; i < inter; i += blockDim.x) {
+        float g = (float)gate_ptr[i];
+        float u = (float)up_ptr[i];
+        // silu(g) = g / (1 + exp(-g))
+        float silu_g = g / (1.0f + __expf(-g));
+        float v = silu_g * u;
+        o[i] = (Element)v;
+    }
+}
+
+extern "C" void moe_silu_mul_swap(
+    const void* gate_up,   // [tokens, 2*I] BF16
+    void* out,             // [tokens, I] BF16
+    int tokens, int inter, int dtype,
+    cudaStream_t stream
+) {
+    int threads = inter < 512 ? inter : 512;
+    if (threads <= 0) threads = 32;
+    if (dtype == 1) {
+        silu_mul_swap_kernel<__nv_bfloat16><<<tokens, threads, 0, stream>>>(
+            (const __nv_bfloat16*)gate_up,
+            (__nv_bfloat16*)out,
+            tokens, inter);
+    } else {
+        silu_mul_swap_kernel<__half><<<tokens, threads, 0, stream>>>(
+            (const __half*)gate_up,
+            (__half*)out,
+            tokens, inter);
+    }
+}
+
 /// Padded scatter wrapper. Caller's `output` is overwritten only at
 /// rows that appear in sorted_token_ids — caller must zero-init for
 /// rows that may not be touched (e.g. when topk-reduction expects

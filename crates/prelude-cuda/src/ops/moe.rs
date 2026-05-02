@@ -282,6 +282,60 @@ pub fn moe_gemm_wmma(
     }
 }
 
+/// `silu(gate) * up` for a `[tokens, 2*inter]` BF16 tensor in CUTLASS
+/// Swiglu stack order (first half = up, second half = gate) — produced
+/// by a single grouped GEMM against `experts_gate_up`.
+///
+/// Returns `[tokens, inter]` BF16. FlashInfer's `silu_and_mul` can't
+/// be used directly because it assumes the opposite stack order.
+pub fn silu_mul_swap(gate_up: &Tensor, inter: usize) -> Result<Tensor> {
+    use std::ffi::c_void;
+    let dims = gate_up.dims();
+    if dims.len() < 2 {
+        bail!("silu_mul_swap: gate_up must have rank >= 2, got {:?}", dims);
+    }
+    let last = dims[dims.len() - 1];
+    if last != 2 * inter {
+        bail!("silu_mul_swap: last dim {last} != 2 * inter ({})", 2 * inter);
+    }
+    if gate_up.dtype() != DType::BF16 {
+        bail!("silu_mul_swap: requires BF16, got {:?}", gate_up.dtype());
+    }
+
+    let tokens: usize = dims[..dims.len() - 1].iter().product();
+
+    let (gu_g, _) = gate_up.storage_and_layout();
+    let gu_cuda = as_candle_cuda(&gu_g, "silu_mul_swap")?;
+    let gu_s = gu_cuda.as_cuda_slice::<half::bf16>()?;
+
+    let dev = gu_cuda.device().clone();
+    let stream = dev.cuda_stream();
+    let cu_stream = stream.cu_stream() as i64;
+
+    let out = unsafe { dev.alloc::<half::bf16>(tokens * inter) }?;
+    unsafe {
+        ffi::moe_silu_mul_swap(
+            gu_s.device_ptr(&stream).0 as *const c_void,
+            out.device_ptr(&stream).0 as *mut c_void,
+            tokens as i32,
+            inter as i32,
+            /*dtype=*/ 1,
+            cu_stream,
+        );
+    }
+    drop(gu_g);
+
+    let mut out_shape: Vec<usize> = dims[..dims.len() - 1].to_vec();
+    out_shape.push(inter);
+    let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(storage),
+        out_shape,
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
+}
+
 /// DeepGEMM SM100 grouped MoE GEMM, BF16 only — preferred path on
 /// Hopper/Blackwell when shapes hit a registered kernel variant.
 ///
