@@ -56,7 +56,7 @@ struct Cli {
 
     #[arg(
         long,
-        default_value_t = 8,
+        default_value_t = 256,
         help = "Max concurrent running requests in scheduler"
     )]
     max_running_requests: usize,

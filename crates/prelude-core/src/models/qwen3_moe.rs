@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::profiling::{nvtx_push, nvtx_pop};
 use crate::tensor::{DType, Device, Module, Result, Tensor, D};
 use crate::loading::var_builder::VarBuilder;
 use crate::models::commons::activation::Activation;
@@ -310,24 +311,32 @@ impl Qwen3SparseMoeBlock {
         let up_w = self.up_w.as_ref().unwrap();
         let down_w = self.down_w.as_ref().unwrap();
         let (total_tokens, _) = xs.dims2()?;
+        nvtx_push!("moe_sort");
         let (sorted_expert_ids, sorted_token_ids) =
             self.sort_expert_assignments(ops, experts_per_tok, xs.device())?;
+        nvtx_pop!();
 
         // `num_tokens_per_expert` used to be computed here via a GPU→CPU→GPU
         // histogram pass, but the CUDA impl of `grouped_gemm` ignores it.
         // Pass a zero-length placeholder to preserve the trait signature.
         let num_tokens_per_expert = Tensor::zeros((0,), DType::U32, xs.device())?;
 
+        nvtx_push!("moe_gate_gemm");
         let gate = ops.grouped_gemm(
             xs, gate_w,
             &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
         )?;
+        nvtx_pop!();
+        nvtx_push!("moe_up_gemm");
         let up = ops.grouped_gemm(
             xs, up_w,
             &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
         )?;
+        nvtx_pop!();
 
+        nvtx_push!("moe_silu_mul");
         let down_input = ops.silu_mul(&gate, &up)?;
+        nvtx_pop!();
 
         // Always take the grouped-GEMM + external weighted-sum path.
         //
@@ -345,15 +354,20 @@ impl Qwen3SparseMoeBlock {
         // (token, expert) pair, no collisions) + a Rust-side weighted
         // reduction is deterministic. A small extra launch + a multiply+sum
         // over (topk, hidden_dim) is cheap vs the kernel call itself.
+        nvtx_push!("moe_down_gemm");
         let raw = ops.grouped_gemm(
             &down_input, down_w,
             &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
         )?;
+        nvtx_pop!();
+        nvtx_push!("moe_topk_reduce");
         let raw = raw.reshape((total_tokens, self.num_experts_per_tok, hidden_dim))?;
         // topk_weights is F32 but raw is BF16. Candle's mul is strict on
         // both shape and dtype — use broadcast_mul + explicit cast.
         let w = topk_weights.unsqueeze(D::Minus1)?.to_dtype(raw.dtype())?;
-        raw.broadcast_mul(&w)?.sum(D::Minus2)
+        let out = raw.broadcast_mul(&w)?.sum(D::Minus2);
+        nvtx_pop!();
+        out
     }
 
     /// Sequential per-expert dispatch (CPU fallback).
@@ -404,7 +418,9 @@ impl Qwen3SparseMoeBlock {
     /// Forward for varlen packed sequences: xs is (total_tokens, hidden_dim).
     #[allow(clippy::too_many_arguments)]
     fn forward_varlen(&self, ops: &dyn crate::ops::Ops, xs: &Tensor) -> Result<Tensor> {
+        nvtx_push!("moe_routing");
         let (topk_weights, experts_per_tok, hidden_dim) = self.compute_routing_2d(ops, xs)?;
+        nvtx_pop!();
 
         // Preferred path: FlashInfer's CUTLASS fused MoE handles
         // gate+up+silu+down+topk-weighted-sum in one kernel. The ops impl
@@ -540,10 +556,18 @@ impl MoeDecoderLayer {
 
     fn forward(&self, hidden: &Tensor, residual: Option<&Tensor>, ctx: &LayerAttnContext) -> Result<(Tensor, Tensor)> {
         let ops = ctx.ops;
+        nvtx_push!("input_norm");
         let (residual, hidden) = self.input_layernorm.forward_residual(hidden, residual, ops)?;
+        nvtx_pop!();
+        nvtx_push!("attn");
         let hidden = self.self_attn.forward(&hidden, ctx)?;
+        nvtx_pop!();
+        nvtx_push!("post_attn_norm");
         let (residual, hidden) = self.post_attention_layernorm.forward_residual(&hidden, Some(&residual), ops)?;
+        nvtx_pop!();
+        nvtx_push!("ffn");
         let hidden = self.feed_forward.forward_2d(ops, &hidden)?;
+        nvtx_pop!();
         Ok((hidden, residual))
     }
 }
@@ -586,9 +610,12 @@ impl MoeModel {
     }
 
     fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> Result<Tensor> {
+        nvtx_push!("embed");
         let mut hidden = self.embed_tokens.forward(packed_input)?;
+        nvtx_pop!();
         let mut residual: Option<Tensor> = None;
         for (i, layer) in self.layers.iter_mut().enumerate() {
+            nvtx_push!("layer[{}]", i);
             let layer_kv = ctx.paged_kv.map(|kv| kv.layer(i));
             let layer_ctx = LayerAttnContext {
                 ops: ctx.ops,
@@ -600,8 +627,11 @@ impl MoeModel {
             let (h, r) = layer.forward(&hidden, residual.as_ref(), &layer_ctx)?;
             hidden = h;
             residual = Some(r);
+            nvtx_pop!();
         }
+        nvtx_push!("final_norm");
         let (_, normed) = self.norm.forward_residual(&hidden, residual.as_ref(), ctx.ops)?;
+        nvtx_pop!();
         Ok(normed)
     }
 }
