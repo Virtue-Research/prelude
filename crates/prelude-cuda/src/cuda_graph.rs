@@ -207,12 +207,19 @@ impl DecodeGraphCache {
         config: &EngineConfig,
         block_size: usize,
         has_deltanet: bool,
+        model_supports_graph: bool,
     ) -> Self {
-        let enabled = config.runtime.cuda_graph && !has_deltanet;
+        let enabled =
+            config.runtime.cuda_graph && !has_deltanet && model_supports_graph;
         let max_bs = config.runtime.cuda_graph_max_bs;
 
         if enabled {
             tracing::info!(max_bs, block_size, "CUDA graph decode enabled");
+        } else if config.runtime.cuda_graph && !model_supports_graph {
+            tracing::info!(
+                "CUDA graph decode disabled: model does not support graph capture \
+                 (e.g. MoE with dynamic expert shapes)"
+            );
         }
 
         Self {

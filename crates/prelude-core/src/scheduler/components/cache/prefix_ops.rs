@@ -8,6 +8,23 @@ fn tensor_err(e: crate::tensor::Error) -> EngineError {
 }
 
 impl CacheManager {
+    /// Retain paged KV blocks that a sequence is about to reuse from prefix
+    /// cache. The cache itself already owns one reference; active sequences
+    /// need their own reference so normal request finalization can free them.
+    pub(crate) fn retain_paged_blocks(&self, block_ids: &[u32]) -> Result<(), EngineError> {
+        if block_ids.is_empty() {
+            return Ok(());
+        }
+        let Some(ref bm_mutex) = self.block_manager else {
+            return Ok(());
+        };
+        let mut bm = bm_mutex
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
+        bm.increment_refs(block_ids);
+        Ok(())
+    }
+
     /// Match prefix cache for paged-attention runs and return only block IDs.
     /// This avoids assembling per-layer KV tensors when the caller can consume
     /// paged blocks directly.

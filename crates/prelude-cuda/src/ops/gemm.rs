@@ -16,7 +16,7 @@
 
 use prelude_core::tensor::{bail, DType, Module, Result, Tensor};
 use crate::device::{self as cb, DeviceRepr, DevicePtr};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::os::raw::c_int;
@@ -89,7 +89,7 @@ pub(crate) unsafe fn gemm_dispatch_impl(
             match &ret {
                 Ok(()) => return 0,
                 Err(e) => {
-                    tracing::warn!("DeepGEMM → CUTLASS fallback: {e}");
+                    tracing::debug!("DeepGEMM → CUTLASS fallback: {e}");
                     DEEPGEMM_FAILED.with(|s| { s.borrow_mut().insert(key); });
                 }
             }
@@ -108,7 +108,7 @@ pub(crate) unsafe fn gemm_dispatch_impl(
             match ret {
                 Ok(()) => return 0,
                 Err(e) => {
-                    tracing::warn!("CUTLASS → cuBLAS fallback: {e}");
+                    tracing::debug!("CUTLASS → cuBLAS fallback: {e}");
                     CUTLASS_FAILED.with(|s| { s.borrow_mut().insert(key); });
                 }
             }
@@ -154,11 +154,15 @@ const CUBLAS_GEMM_DEFAULT: c_int = -1;
 
 unsafe extern "C" {
     fn cublasCreate_v2(handle: *mut *mut c_void) -> c_int;
+    fn cublasDestroy_v2(handle: *mut c_void) -> c_int;
     fn cublasSetStream_v2(handle: *mut c_void, stream: *mut c_void) -> c_int;
     fn cublasSetWorkspace_v2(
         handle: *mut c_void, workspace: *mut c_void, workspace_size: usize,
     ) -> c_int;
     fn cudaMalloc(ptr: *mut *mut c_void, size: usize) -> c_int;
+    fn cudaFree(ptr: *mut c_void) -> c_int;
+    fn cudaGetDevice(device: *mut c_int) -> c_int;
+    fn cudaSetDevice(device: c_int) -> c_int;
     fn cublasGemmEx(
         handle: *mut c_void,
         transa: c_int, transb: c_int,
@@ -184,53 +188,118 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-// cuBLAS handles are not thread-safe to share, but are cheap to create.
-// Keep one per worker thread — the GPU queue uses a single dedicated OS
-// thread anyway, so in practice this is a single handle.
-thread_local! {
-    static CUBLAS_HANDLE: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
+/// Pre-allocated cuBLAS workspace size. 128 MB matches the upper end of
+/// NVIDIA's Hopper/Blackwell guidance — the larger SM10x split-K and
+/// stream-K kernels can request up to ~96 MB of scratch for very wide
+/// GEMMs, so 64 MB silently forces them onto a less-parallel algo path.
+/// Pre-allocating also eliminates `cudaErrorStreamCaptureUnsupported`
+/// errors that cuBLAS would otherwise throw (via bad_alloc) when its
+/// internal workspace allocator tries `cudaMalloc` during an active
+/// CUDA graph capture.
+const CUBLAS_WORKSPACE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Owns one cuBLAS handle and its preallocated workspace, scoped to a
+/// single CUDA device. RAII drop releases both — without this, every
+/// thread that ever calls a cuBLAS GEMM leaks a handle + 64 MiB.
+struct CublasState {
+    handle: *mut c_void,
+    workspace: *mut c_void,
+    device: c_int,
 }
 
-/// Pre-allocated cuBLAS workspace size. 64 MB is the NVIDIA-recommended value
-/// for Hopper/Blackwell. Pre-allocating eliminates `cudaErrorStreamCaptureUnsupported`
-/// errors that cuBLAS would otherwise throw (via bad_alloc) when its internal
-/// workspace allocator tries `cudaMalloc` during an active CUDA graph capture.
-const CUBLAS_WORKSPACE_BYTES: usize = 64 * 1024 * 1024;
+impl Drop for CublasState {
+    fn drop(&mut self) {
+        // `cudaFree` and `cublasDestroy_v2` operate on the current
+        // device at call time. If the worker thread switched device
+        // since handle creation (multi-GPU scenarios), freeing without
+        // setting `self.device` first would either invalid-free the
+        // wrong device's allocation or leak our workspace silently.
+        // Save/restore so we don't surprise any later code.
+        let mut prev: c_int = 0;
+        let saved = unsafe { cudaGetDevice(&mut prev) };
+        let switched = saved == 0 && prev != self.device
+            && unsafe { cudaSetDevice(self.device) } == 0;
+        unsafe {
+            if !self.handle.is_null() {
+                cublasDestroy_v2(self.handle);
+            }
+            if !self.workspace.is_null() {
+                cudaFree(self.workspace);
+            }
+        }
+        if switched {
+            // Best-effort restore; ignore errors during teardown.
+            unsafe { cudaSetDevice(prev) };
+        }
+    }
+}
+
+// cuBLAS handles are not thread-safe to share, but are cheap to create.
+// Keep one per worker thread — the GPU queue uses a single dedicated OS
+// thread anyway, so in practice this is a single handle. We key the
+// thread-local on the device id so that a thread that drives multiple
+// devices (rare, but possible in tests / multi-GPU configs) gets a
+// fresh handle bound to the right context instead of routing GEMMs to
+// the wrong GPU.
+thread_local! {
+    static CUBLAS_HANDLES: RefCell<Vec<CublasState>> = const { RefCell::new(Vec::new()) };
+}
 
 unsafe fn get_or_init_handle() -> std::result::Result<*mut c_void, String> {
-    CUBLAS_HANDLE.with(|slot| {
-        let existing = slot.get();
-        if !existing.is_null() {
-            return Ok(existing);
+    let mut device: c_int = 0;
+    let dev_status = unsafe { cudaGetDevice(&mut device) };
+    if dev_status != 0 {
+        return Err(format!("cudaGetDevice failed (status {dev_status})"));
+    }
+
+    CUBLAS_HANDLES.with(|slot| {
+        if let Some(state) = slot.borrow().iter().find(|s| s.device == device) {
+            return Ok(state.handle);
         }
+
+        // Pin the current device for the rest of init: `cublasCreate_v2`
+        // binds the handle to whatever device is current, and `cudaMalloc`
+        // for the workspace allocates on whatever device is current. If
+        // anything between `cudaGetDevice` and these calls flipped the
+        // current device (cudarc CudaContext switches, library init,
+        // etc.), the handle and workspace would land on different
+        // devices — every subsequent `cublasGemmEx` would then route
+        // through the wrong context and either crash or silently produce
+        // wrong output.
+        let set_status = unsafe { cudaSetDevice(device) };
+        if set_status != 0 {
+            return Err(format!("cudaSetDevice({device}) failed (status {set_status})"));
+        }
+
         let mut handle: *mut c_void = std::ptr::null_mut();
         let status = unsafe { cublasCreate_v2(&mut handle) };
         if status != 0 || handle.is_null() {
-            return Err(format!("cublasCreate_v2 failed (status {status})"));
+            return Err(format!("cublasCreate_v2 failed (status {status}) on device {device}"));
         }
 
-        // Pre-allocate workspace so subsequent cublasGemmEx calls never
-        // request device memory during a CUDA graph capture.
         let mut workspace: *mut c_void = std::ptr::null_mut();
         let cuda_status = unsafe { cudaMalloc(&mut workspace, CUBLAS_WORKSPACE_BYTES) };
         if cuda_status != 0 || workspace.is_null() {
             tracing::warn!(
+                device,
                 "cuBLAS workspace preallocation failed (cudaMalloc status {cuda_status}); \
                  GPU matmul inside a captured CUDA graph may fail"
             );
+            workspace = std::ptr::null_mut();
         } else {
             let ws_status = unsafe {
                 cublasSetWorkspace_v2(handle, workspace, CUBLAS_WORKSPACE_BYTES)
             };
             if ws_status != 0 {
                 tracing::warn!(
+                    device,
                     "cublasSetWorkspace_v2 failed (status {ws_status}); \
                      CUDA graph capture may bad_alloc"
                 );
             }
         }
 
-        slot.set(handle);
+        slot.borrow_mut().push(CublasState { handle, workspace, device });
         Ok(handle)
     })
 }
@@ -265,6 +334,7 @@ unsafe fn cublas_gemm_ex(
     if status != 0 {
         return Err(format!("cublasSetStream_v2 failed (status {status})"));
     }
+
 
     let status = unsafe {
         if batch == 1 {

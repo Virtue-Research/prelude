@@ -25,6 +25,7 @@ use prelude_kernelbuild::nvcc::{
 fn main() {
     println!("cargo:rerun-if-changed=src/cutlass_wrapper.cu");
     println!("cargo:rerun-if-changed=src/naive_gemm.cu");
+    println!("cargo:rerun-if-changed=src/grouped_moe_sm100.cu");
     println!("cargo:rerun-if-changed=build.rs");
     track_submodule("cutlass");
 
@@ -89,15 +90,38 @@ fn main() {
     }
     compile_cu_to_obj(&nvcc, &naive_opts);
 
-    // ── Archive both objects into libcutlass_gemm.a ─────────────────
+    // ── TU 3: SM100 grouped GEMM for MoE (Blackwell only) ──────────
+    let grouped_obj = if sm100 {
+        let grouped_src = manifest_dir.join("src/grouped_moe_sm100.cu");
+        let grouped_obj = out_dir.join("grouped_moe_sm100.o");
+        let mut grouped_opts = ObjCompile::new(&grouped_src, &grouped_obj)
+            .include(cutlass_dir.join("include"))
+            .include(cutlass_dir.join("tools/util/include"))
+            .include(cuda_path.join("include"))
+            .cpp_std("-std=c++17");
+        // Only emit SM100/SM103 cubins — the kernel uses tcgen05/UMMA
+        // and won't compile against earlier arches.
+        grouped_opts = grouped_opts.gencode("-gencode=arch=compute_100a,code=sm_100a");
+        if sm103 {
+            grouped_opts = grouped_opts.gencode("-gencode=arch=compute_103a,code=sm_103a");
+        }
+        compile_cu_to_obj(&nvcc, &grouped_opts);
+        Some(grouped_obj)
+    } else {
+        None
+    };
+
+    // ── Archive objects into libcutlass_gemm.a ─────────────────────
     let lib = out_dir.join("libcutlass_gemm.a");
-    let status = Command::new(&nvcc)
-        .arg("--lib")
+    let mut nvcc_lib = Command::new(&nvcc);
+    nvcc_lib.arg("--lib")
         .args(["-o", lib.to_str().unwrap()])
         .arg(&wrapper_obj)
-        .arg(&naive_obj)
-        .status()
-        .expect("Failed to run nvcc --lib");
+        .arg(&naive_obj);
+    if let Some(ref obj) = grouped_obj {
+        nvcc_lib.arg(obj);
+    }
+    let status = nvcc_lib.status().expect("Failed to run nvcc --lib");
     if !status.success() {
         panic!("nvcc --lib failed for libcutlass_gemm.a");
     }

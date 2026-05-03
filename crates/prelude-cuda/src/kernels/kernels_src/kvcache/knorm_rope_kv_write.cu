@@ -128,8 +128,8 @@ extern "C" __global__ void fused_knorm_rope_kv_cache_write_thd_bf16(
 // Value cache: [num_blocks, block_size, num_kv_heads, head_dim]
 // Position from explicit pos_ids tensor.
 extern "C" __global__ void fused_knorm_rope_kv_cache_write_varlen_bf16(
-    const __nv_bfloat16* __restrict__ k_input,        // [total_tokens * num_kv_heads, head_dim]
-    const __nv_bfloat16* __restrict__ v_input,        // [total_tokens * num_kv_heads, head_dim]
+    const __nv_bfloat16* __restrict__ k_input,        // [total_tokens, num_kv_heads, head_dim] possibly strided
+    const __nv_bfloat16* __restrict__ v_input,        // [total_tokens, num_kv_heads, head_dim] possibly strided
     const __nv_bfloat16* __restrict__ k_norm_weight,  // [head_dim]
     const __nv_bfloat16* __restrict__ cos_table,      // [max_seq_len, head_dim/2]
     const __nv_bfloat16* __restrict__ sin_table,      // [max_seq_len, head_dim/2]
@@ -141,7 +141,9 @@ extern "C" __global__ void fused_knorm_rope_kv_cache_write_varlen_bf16(
     uint32_t num_kv_heads,
     uint32_t head_dim,
     uint32_t block_size,
-    float eps
+    float eps,
+    uint32_t k_token_stride,    // elements between successive token rows in k_input
+    uint32_t v_token_stride     // elements between successive token rows in v_input
 ) {
     const uint32_t warp_id = threadIdx.x / 32;
     const uint32_t lane_id = threadIdx.x % 32;
@@ -155,7 +157,13 @@ extern "C" __global__ void fused_knorm_rope_kv_cache_write_varlen_bf16(
     const uint32_t kv_head_idx = row % num_kv_heads;
     const uint32_t pos = pos_ids[token_idx];
 
-    const __nv_bfloat16* k_row = k_input + (uint64_t)row * head_dim;
+    // Stride-aware row addressing: K and V can be non-contiguous narrows
+    // out of a fused QKV projection (token stride = N_fused, not just
+    // num_kv_heads * head_dim). The row index decomposes into
+    // token × stride + kv_head × head_dim.
+    const __nv_bfloat16* k_row = k_input
+        + (uint64_t)token_idx * k_token_stride
+        + (uint64_t)kv_head_idx * head_dim;
     const uint32_t dim_start = lane_id * epl;
 
     // ── K: RMSNorm ──
@@ -208,8 +216,10 @@ extern "C" __global__ void fused_knorm_rope_kv_cache_write_varlen_bf16(
         key_cache[flash_base + dim_start + e] = __float2bfloat16(vals[e]);
     }
 
-    // ── Scatter-write V to flash paged cache ──
-    const __nv_bfloat16* v_row = v_input + (uint64_t)row * head_dim;
+    // ── Scatter-write V to flash paged cache (stride-aware) ──
+    const __nv_bfloat16* v_row = v_input
+        + (uint64_t)token_idx * v_token_stride
+        + (uint64_t)kv_head_idx * head_dim;
     for (uint32_t e = 0; e < epl; e++) {
         value_cache[flash_base + dim_start + e] = v_row[dim_start + e];
     }

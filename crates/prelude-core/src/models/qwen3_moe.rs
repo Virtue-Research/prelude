@@ -1,16 +1,18 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use crate::tensor::{DType, Device, Module, Result, Tensor, D};
+use crate::config::{MoeBackendPolicy, global_runtime};
 use crate::loading::var_builder::VarBuilder;
 use crate::models::commons::activation::Activation;
 use crate::models::commons::embedding::Embedding;
 use crate::models::commons::linear::DenseLinear;
 use crate::models::config::Qwen3Config;
+use crate::profiling::{nvtx_pop, nvtx_push};
+use crate::tensor::{D, DType, Module, Result, Tensor};
 
 // Shared layer primitives (extracted from qwen3 into reusable modules)
 use crate::models::commons::{
+    BatchAttnContext, BatchState, LayerAttnContext, Linear, RmsNorm, RotaryEmbedding,
     last_token_select,
-    BatchAttnContext, BatchState, LayerAttnContext, RotaryEmbedding, Linear, RmsNorm,
 };
 
 // Model-specific attention (still lives in qwen3)
@@ -18,11 +20,68 @@ use super::qwen3::Qwen3Attention;
 
 // ── Config ──────────────────────────────────────────────────────────────
 
-use crate::models::model_config;
+fn moe_backend_policy() -> MoeBackendPolicy {
+    global_runtime()
+        .map(|runtime| runtime.moe_backend)
+        .unwrap_or_default()
+}
 
-model_config! {
-    pub struct Qwen3MoeConfig("Qwen3MoE") {
-        required {
+fn log_moe_backend_once(requested: MoeBackendPolicy, actual: &'static str) {
+    static CUTLASS: OnceLock<()> = OnceLock::new();
+    static SEQUENTIAL: OnceLock<()> = OnceLock::new();
+
+    let logged = match actual {
+        "flashinfer_cutlass" => &CUTLASS,
+        "sequential" => &SEQUENTIAL,
+        _ => &SEQUENTIAL,
+    };
+    logged.get_or_init(|| {
+        tracing::info!(
+            requested = requested.as_str(),
+            actual,
+            "Qwen3 MoE backend selected"
+        );
+    });
+}
+
+#[derive(Debug, Clone)]
+pub struct Qwen3MoeConfig {
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub head_dim: usize,
+    pub num_key_value_heads: usize,
+    pub max_position_embeddings: usize,
+    pub moe_intermediate_size: usize,
+    pub num_experts_per_tok: usize,
+    pub num_experts: usize,
+    pub attention_bias: bool,
+    pub sliding_window: Option<usize>,
+    pub max_window_layers: usize,
+    pub tie_word_embeddings: bool,
+    pub use_sliding_window: bool,
+    pub norm_topk_prob: bool,
+    pub rope_theta: f64,
+    pub rms_norm_eps: f64,
+    pub hidden_act: Activation,
+    pub decoder_sparse_step: usize,
+}
+
+impl<'de> serde::Deserialize<'de> for Qwen3MoeConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct RopeParameters {
+            #[serde(default)]
+            rope_theta: Option<f64>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct Raw {
             vocab_size: usize,
             hidden_size: usize,
             intermediate_size: usize,
@@ -33,22 +92,80 @@ model_config! {
             max_position_embeddings: usize,
             moe_intermediate_size: usize,
             num_experts_per_tok: usize,
+            #[serde(alias = "num_local_experts")]
             num_experts: usize,
-        }
-        serde_default {
+            #[serde(default)]
             attention_bias: bool,
+            #[serde(default)]
             sliding_window: Option<usize>,
+            #[serde(default)]
             max_window_layers: usize,
+            #[serde(default)]
             tie_word_embeddings: bool,
+            #[serde(default)]
             use_sliding_window: bool,
+            #[serde(default)]
             norm_topk_prob: bool,
+            #[serde(default)]
+            rope_theta: Option<f64>,
+            #[serde(default)]
+            rope_parameters: Option<RopeParameters>,
+            #[serde(default)]
+            rms_norm_eps: Option<f64>,
+            #[serde(default)]
+            hidden_act: Option<Activation>,
+            #[serde(default)]
+            decoder_sparse_step: Option<usize>,
         }
-        warn_default {
-            rope_theta: f64 = 1_000_000.0,
-            rms_norm_eps: f64 = 1e-6,
-            hidden_act: Activation = Activation::Silu,
-            decoder_sparse_step: usize = 1,
-        }
+
+        let r = Raw::deserialize(deserializer)?;
+        let rope_theta = r
+            .rope_theta
+            .or_else(|| r.rope_parameters.and_then(|p| p.rope_theta));
+        const MODEL: &str = "Qwen3MoE";
+        Ok(Self {
+            vocab_size: r.vocab_size,
+            hidden_size: r.hidden_size,
+            intermediate_size: r.intermediate_size,
+            num_hidden_layers: r.num_hidden_layers,
+            num_attention_heads: r.num_attention_heads,
+            head_dim: r.head_dim,
+            num_key_value_heads: r.num_key_value_heads,
+            max_position_embeddings: r.max_position_embeddings,
+            moe_intermediate_size: r.moe_intermediate_size,
+            num_experts_per_tok: r.num_experts_per_tok,
+            num_experts: r.num_experts,
+            attention_bias: r.attention_bias,
+            sliding_window: r.sliding_window,
+            max_window_layers: r.max_window_layers,
+            tie_word_embeddings: r.tie_word_embeddings,
+            use_sliding_window: r.use_sliding_window,
+            norm_topk_prob: r.norm_topk_prob,
+            rope_theta: crate::models::resolve_or_warn!(
+                rope_theta,
+                1_000_000.0,
+                "rope_theta",
+                MODEL
+            ),
+            rms_norm_eps: crate::models::resolve_or_warn!(
+                r.rms_norm_eps,
+                1e-6,
+                "rms_norm_eps",
+                MODEL
+            ),
+            hidden_act: crate::models::resolve_or_warn!(
+                r.hidden_act,
+                Activation::Silu,
+                "hidden_act",
+                MODEL
+            ),
+            decoder_sparse_step: crate::models::resolve_or_warn!(
+                r.decoder_sparse_step,
+                1,
+                "decoder_sparse_step",
+                MODEL
+            ),
+        })
     }
 }
 
@@ -88,9 +205,24 @@ struct Qwen3MoeExpert {
 impl Qwen3MoeExpert {
     fn new(cfg: &Qwen3MoeConfig, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            gate_proj: Linear::load(vb.pp("gate_proj"), cfg.hidden_size, cfg.moe_intermediate_size, false)?,
-            up_proj: Linear::load(vb.pp("up_proj"), cfg.hidden_size, cfg.moe_intermediate_size, false)?,
-            down_proj: Linear::load(vb.pp("down_proj"), cfg.moe_intermediate_size, cfg.hidden_size, false)?,
+            gate_proj: Linear::load(
+                vb.pp("gate_proj"),
+                cfg.hidden_size,
+                cfg.moe_intermediate_size,
+                false,
+            )?,
+            up_proj: Linear::load(
+                vb.pp("up_proj"),
+                cfg.hidden_size,
+                cfg.moe_intermediate_size,
+                false,
+            )?,
+            down_proj: Linear::load(
+                vb.pp("down_proj"),
+                cfg.moe_intermediate_size,
+                cfg.hidden_size,
+                false,
+            )?,
         })
     }
 
@@ -102,25 +234,17 @@ impl Qwen3MoeExpert {
     }
 }
 
-fn count_tokens_per_expert(sorted_expert_ids: &Tensor, num_experts: usize, device: &Device) -> Result<Tensor> {
-    let ids: Vec<u32> = sorted_expert_ids.to_vec1()?;
-    let mut counts = vec![0u32; num_experts];
-    for &id in &ids {
-        if (id as usize) < num_experts { counts[id as usize] += 1; }
-    }
-    Tensor::from_vec(counts, (num_experts,), device)
-}
-
 // ── Sparse MoE Block ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 struct Qwen3SparseMoeBlock {
     gate: DenseLinear,
     experts: Vec<Qwen3MoeExpert>,
-    // Stacked expert weights for fused GEMM [num_experts, N, K]
-    gate_w: Option<Tensor>,
-    up_w: Option<Tensor>,
-    down_w: Option<Tensor>,
+    // Pre-fused CUTLASS layout: [num_experts, 2*inter, hidden] ([up;gate])
+    // and [num_experts, hidden, inter]. Enables FlashInfer's fused MoE
+    // on supported CUDA architectures.
+    experts_gate_up: Option<Tensor>,
+    experts_down: Option<Tensor>,
     norm_topk_prob: bool,
     num_experts_per_tok: usize,
 }
@@ -138,8 +262,13 @@ impl Qwen3SparseMoeBlock {
             experts.push(Qwen3MoeExpert::new(cfg, vb_e.pp(idx))?);
         }
 
-        // Stack expert weights for fused MoE GEMM (GPU only)
-        let (gate_w, up_w, down_w) = if experts.first().map_or(false, |e| e.gate_proj.weight().device().is_cuda()) {
+        // Stack expert weights once in FlashInfer CUTLASS layout (GPU only).
+        // `experts_gate_up` is [num_experts, 2*inter, hidden] with [up; gate]
+        // concatenation, matching CUTLASS's SwiGLU convention.
+        let (experts_gate_up, experts_down) = if experts
+            .first()
+            .map_or(false, |e| e.gate_proj.weight().device().is_cuda())
+        {
             let gate_ws: Vec<Tensor> = experts
                 .iter()
                 .map(|e| e.gate_proj.weight().clone())
@@ -149,31 +278,56 @@ impl Qwen3SparseMoeBlock {
                 .iter()
                 .map(|e| e.down_proj.weight().clone())
                 .collect();
-            (
-                Some(Tensor::stack(&gate_ws, 0)?.contiguous()?),
-                Some(Tensor::stack(&up_ws, 0)?.contiguous()?),
-                Some(Tensor::stack(&down_ws, 0)?.contiguous()?),
-            )
+
+            let gate_w = Tensor::stack(&gate_ws, 0)?.contiguous()?;
+            let up_w = Tensor::stack(&up_ws, 0)?.contiguous()?;
+            let down_w = Tensor::stack(&down_ws, 0)?.contiguous()?;
+
+            let experts_gate_up = Some(Tensor::cat(&[&up_w, &gate_w], 1)?.contiguous()?);
+            let experts_down = Some(down_w);
+
+            (experts_gate_up, experts_down)
         } else {
-            (None, None, None)
+            (None, None)
         };
 
         Ok(Self {
             gate,
             experts,
-            gate_w,
-            up_w,
-            down_w,
+            experts_gate_up,
+            experts_down,
             norm_topk_prob: cfg.norm_topk_prob,
             num_experts_per_tok: cfg.num_experts_per_tok,
         })
     }
 
     /// Compute routing for 2D (varlen) input.
+    ///
     /// Returns (topk_weights, experts_per_tok, hidden_dim).
-    fn compute_routing_2d(&self, xs: &Tensor) -> Result<(Tensor, Tensor, usize)> {
-        let (_total_tokens, hidden_dim) = xs.dims2()?;
+    fn compute_routing_2d(
+        &self,
+        ops: &dyn crate::ops::Ops,
+        xs: &Tensor,
+    ) -> Result<(Tensor, Tensor, usize)> {
+        let (n_tokens, hidden_dim) = xs.dims2()?;
         let router_logits = xs.apply(&self.gate)?;
+
+        // Fast path: single fused CUDA kernel (softmax + top-k + optional
+        // renorm, FP32 softmax internally). FlashInfer CUTLASS fused MoE
+        // only needs weights and top-k ids, so the sort outputs are ignored.
+        if let Some(result) = ops.fused_moe_routing(
+            &router_logits,
+            self.num_experts_per_tok,
+            self.norm_topk_prob,
+        ) {
+            let (tw, topk_ids, _sorted_exp, _sorted_tok) = result?;
+            return Ok((
+                tw,
+                topk_ids.reshape((n_tokens, self.num_experts_per_tok))?,
+                hidden_dim,
+            ));
+        }
+
         let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
 
         let experts_per_tok = routing_weights
@@ -189,88 +343,6 @@ impl Qwen3SparseMoeBlock {
         }
 
         Ok((topk_weights, experts_per_tok, hidden_dim))
-    }
-
-    /// Sort expert assignments by expert ID to produce sorted_token_ids and sorted_expert_ids.
-    /// Uses GPU bitonic sort for small arrays (<=1024 elements, fits in shared memory),
-    /// falls back to CPU argsort for larger arrays (prefill with many tokens).
-    fn sort_expert_assignments(
-        &self,
-        experts_per_tok: &Tensor,
-        device: &Device,
-    ) -> Result<(Tensor, Tensor)> {
-        let flat = experts_per_tok.flatten_all()?;
-        let n = flat.elem_count();
-
-        // GPU sort for small arrays: shared_mem = next_power_of_2(n) * 4 bytes.
-        // For n <= 1024, that's at most 4096 bytes — well within CUDA limits.
-        if n <= 1024 && device.is_cuda() {
-            let flat_2d = flat.reshape((1, n))?;
-            let (sorted_vals, sorted_idx) = flat_2d.sort_last_dim(true)?;
-            return Ok((sorted_vals.flatten_all()?, sorted_idx.flatten_all()?));
-        }
-
-        // CPU fallback for large prefills (>128 tokens × 8 experts = >1024 elements)
-        let flat_vec = flat.to_vec1::<u32>()?;
-        let mut indices: Vec<u32> = (0..n as u32).collect();
-        indices.sort_by_key(|&i| flat_vec[i as usize]);
-        let sorted_expert_ids: Vec<u32> = indices.iter().map(|&i| flat_vec[i as usize]).collect();
-        Ok((
-            Tensor::from_vec(sorted_expert_ids, (n,), device)?,
-            Tensor::from_vec(indices, (n,), device)?,
-        ))
-    }
-
-    /// Fused MoE forward for varlen (2D) input.
-    fn forward_fused_varlen(
-        &self,
-        ops: &dyn crate::ops::Ops,
-        xs: &Tensor,
-        topk_weights: &Tensor,
-        experts_per_tok: &Tensor,
-        hidden_dim: usize,
-    ) -> Result<Tensor> {
-        let gate_w = self.gate_w.as_ref().unwrap();
-        let up_w = self.up_w.as_ref().unwrap();
-        let down_w = self.down_w.as_ref().unwrap();
-        let (total_tokens, _) = xs.dims2()?;
-        let (sorted_expert_ids, sorted_token_ids) =
-            self.sort_expert_assignments(experts_per_tok, xs.device())?;
-
-        let is_prefill = total_tokens > 1;
-        let num_tokens_per_expert = count_tokens_per_expert(&sorted_expert_ids, self.experts.len(), xs.device())?;
-
-        let gate = ops.grouped_gemm(
-            xs, gate_w,
-            &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
-        )?;
-
-        let up = ops.grouped_gemm(
-            xs, up_w,
-            &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
-        )?;
-
-        let down_input = ops.silu_mul(&gate, &up)?;
-
-        let ys = match ops.fused_moe_gemm(
-            &down_input, down_w, topk_weights,
-            &sorted_token_ids, &sorted_expert_ids,
-            self.num_experts_per_tok, is_prefill,
-        ) {
-            Some(r) => r?,
-            None => {
-                let raw = ops.grouped_gemm(
-                    &down_input, down_w,
-                    &sorted_token_ids, &sorted_expert_ids, &num_tokens_per_expert,
-                )?;
-                let raw = raw.reshape((total_tokens, self.num_experts_per_tok, hidden_dim))?;
-                let w = topk_weights.unsqueeze(D::Minus1)?;
-                return (raw * w)?.sum(D::Minus2);
-            }
-        };
-
-        ys.reshape((total_tokens, self.num_experts_per_tok, hidden_dim))?
-            .sum(D::Minus2)
     }
 
     /// Sequential per-expert dispatch (CPU fallback).
@@ -319,16 +391,70 @@ impl Qwen3SparseMoeBlock {
     }
 
     /// Forward for varlen packed sequences: xs is (total_tokens, hidden_dim).
+    #[allow(clippy::too_many_arguments)]
     fn forward_varlen(&self, ops: &dyn crate::ops::Ops, xs: &Tensor) -> Result<Tensor> {
-        let (topk_weights, experts_per_tok, hidden_dim) = self.compute_routing_2d(xs)?;
+        nvtx_push!("moe_routing");
+        let (topk_weights, experts_per_tok, hidden_dim) = self.compute_routing_2d(ops, xs)?;
+        nvtx_pop!();
+        let backend_policy = moe_backend_policy();
 
-        if xs.device().is_cuda() && self.gate_w.is_some() {
-            return self.forward_fused_varlen(ops, xs, &topk_weights, &experts_per_tok, hidden_dim);
+        let input_is_cuda = xs.device().is_cuda();
+
+        // Production path: FlashInfer's CUTLASS fused MoE handles
+        // gate+up+silu+down+topk-weighted-sum in one kernel. On CUDA, `auto`
+        // fails closed instead of silently measuring a slower fallback.
+        // Forced `cutlass` also fails closed so benchmarks cannot
+        // accidentally measure the reference path.
+        if matches!(
+            backend_policy,
+            MoeBackendPolicy::Auto | MoeBackendPolicy::Cutlass
+        ) {
+            if !input_is_cuda && backend_policy == MoeBackendPolicy::Cutlass {
+                return Err(candle_core::Error::Msg(
+                    "MoE backend policy requires CUTLASS, but the input device is not CUDA".into(),
+                ));
+            }
+            let require_cutlass = backend_policy == MoeBackendPolicy::Cutlass
+                || (backend_policy == MoeBackendPolicy::Auto && input_is_cuda);
+            if let (Some(egu), Some(ed)) =
+                (self.experts_gate_up.as_ref(), self.experts_down.as_ref())
+            {
+                match ops.cutlass_fused_moe(xs, &experts_per_tok, &topk_weights, egu, ed) {
+                    Some(Ok(out)) => {
+                        log_moe_backend_once(backend_policy, "flashinfer_cutlass");
+                        return Ok(out);
+                    }
+                    Some(Err(e)) if require_cutlass => {
+                        return Err(candle_core::Error::Msg(format!(
+                            "MoE backend policy '{}' requires FlashInfer CUTLASS, but fused MoE failed: {e}",
+                            backend_policy.as_str(),
+                        )));
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!(error = %e, "CUTLASS fused MoE failed at runtime, falling back to reference MoE");
+                    }
+                    None if require_cutlass => {
+                        return Err(candle_core::Error::Msg(format!(
+                            "MoE backend policy '{}' requires FlashInfer CUTLASS, but the ops backend did not provide cutlass_fused_moe",
+                            backend_policy.as_str(),
+                        )));
+                    }
+                    None => {}
+                }
+            } else if backend_policy == MoeBackendPolicy::Cutlass
+                || (backend_policy == MoeBackendPolicy::Auto && input_is_cuda)
+            {
+                return Err(candle_core::Error::Msg(format!(
+                    "MoE backend policy '{}' requires FlashInfer CUTLASS, but CUTLASS expert weights are unavailable",
+                    backend_policy.as_str(),
+                )));
+            }
         }
 
+        // Reference path (CPU / explicit sequential / non-CUDA auto).
+        log_moe_backend_once(backend_policy, "sequential");
         self.forward_sequential(ops, xs, &topk_weights, &experts_per_tok, hidden_dim)
     }
-
 }
 
 // ── Gated MLP (SiLU-gated FFN, for dense layers) ──────────────────────
@@ -343,9 +469,24 @@ struct GatedMlp {
 
 impl GatedMlp {
     fn new(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = Linear::load(vb.pp("gate_proj"), cfg.hidden_size, cfg.intermediate_size, false)?;
-        let up_proj = Linear::load(vb.pp("up_proj"), cfg.hidden_size, cfg.intermediate_size, false)?;
-        let down_proj = Linear::load(vb.pp("down_proj"), cfg.intermediate_size, cfg.hidden_size, false)?;
+        let gate_proj = Linear::load(
+            vb.pp("gate_proj"),
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            false,
+        )?;
+        let up_proj = Linear::load(
+            vb.pp("up_proj"),
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            false,
+        )?;
+        let down_proj = Linear::load(
+            vb.pp("down_proj"),
+            cfg.intermediate_size,
+            cfg.hidden_size,
+            false,
+        )?;
 
         let gate_up_proj = {
             let gw = gate_proj.weight();
@@ -357,7 +498,12 @@ impl GatedMlp {
             }
         };
 
-        Ok(Self { gate_proj, up_proj, down_proj, gate_up_proj })
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+            gate_up_proj,
+        })
     }
 
     fn forward(&self, x: &Tensor, ops: &dyn crate::ops::Ops) -> Result<Tensor> {
@@ -422,18 +568,45 @@ impl MoeDecoderLayer {
             MoeFeedForward::Mlp(GatedMlp::new(&dense_cfg, vb.pp("mlp"))?)
         };
 
-        let input_layernorm = RmsNorm::load(vb.pp("input_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let post_attention_layernorm = RmsNorm::load(vb.pp("post_attention_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let input_layernorm =
+            RmsNorm::load(vb.pp("input_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let post_attention_layernorm = RmsNorm::load(
+            vb.pp("post_attention_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
 
-        Ok(Self { self_attn, feed_forward, input_layernorm, post_attention_layernorm })
+        Ok(Self {
+            self_attn,
+            feed_forward,
+            input_layernorm,
+            post_attention_layernorm,
+        })
     }
 
-    fn forward(&self, hidden: &Tensor, residual: Option<&Tensor>, ctx: &LayerAttnContext) -> Result<(Tensor, Tensor)> {
+    fn forward(
+        &self,
+        hidden: &Tensor,
+        residual: Option<&Tensor>,
+        ctx: &LayerAttnContext,
+    ) -> Result<(Tensor, Tensor)> {
         let ops = ctx.ops;
-        let (residual, hidden) = self.input_layernorm.forward_residual(hidden, residual, ops)?;
+        nvtx_push!("input_norm");
+        let (residual, hidden) = self
+            .input_layernorm
+            .forward_residual(hidden, residual, ops)?;
+        nvtx_pop!();
+        nvtx_push!("attn");
         let hidden = self.self_attn.forward(&hidden, ctx)?;
-        let (residual, hidden) = self.post_attention_layernorm.forward_residual(&hidden, Some(&residual), ops)?;
+        nvtx_pop!();
+        nvtx_push!("post_attn_norm");
+        let (residual, hidden) =
+            self.post_attention_layernorm
+                .forward_residual(&hidden, Some(&residual), ops)?;
+        nvtx_pop!();
+        nvtx_push!("ffn");
         let hidden = self.feed_forward.forward_2d(ops, &hidden)?;
+        nvtx_pop!();
         Ok((hidden, residual))
     }
 }
@@ -455,11 +628,7 @@ impl MoeModel {
             let weight = emb_vb.get((cfg.vocab_size, cfg.hidden_size), "weight")?;
             Embedding::new(weight, cfg.hidden_size)
         };
-        let rotary = Arc::new(RotaryEmbedding::new(
-            vb.dtype(),
-            &dense_cfg,
-            vb.device(),
-        )?);
+        let rotary = Arc::new(RotaryEmbedding::new(vb.dtype(), &dense_cfg, vb.device())?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb.pp("model.layers");
         for i in 0..cfg.num_hidden_layers {
@@ -468,7 +637,11 @@ impl MoeModel {
 
         let norm = RmsNorm::load(vb.pp("model.norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
 
-        Ok(Self { embed_tokens, layers, norm })
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+        })
     }
 
     fn clear_kv_cache(&mut self) {
@@ -476,9 +649,12 @@ impl MoeModel {
     }
 
     fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> Result<Tensor> {
+        nvtx_push!("embed");
         let mut hidden = self.embed_tokens.forward(packed_input)?;
+        nvtx_pop!();
         let mut residual: Option<Tensor> = None;
         for (i, layer) in self.layers.iter_mut().enumerate() {
+            nvtx_push!("layer[{}]", i);
             let layer_kv = ctx.paged_kv.map(|kv| kv.layer(i));
             let layer_ctx = LayerAttnContext {
                 ops: ctx.ops,
@@ -490,8 +666,13 @@ impl MoeModel {
             let (h, r) = layer.forward(&hidden, residual.as_ref(), &layer_ctx)?;
             hidden = h;
             residual = Some(r);
+            nvtx_pop!();
         }
-        let (_, normed) = self.norm.forward_residual(&hidden, residual.as_ref(), ctx.ops)?;
+        nvtx_push!("final_norm");
+        let (_, normed) = self
+            .norm
+            .forward_residual(&hidden, residual.as_ref(), ctx.ops)?;
+        nvtx_pop!();
         Ok(normed)
     }
 }
@@ -521,7 +702,8 @@ impl Qwen3MoeModelForCausalLM {
         let hidden = self.base.forward(packed_input, ctx)?;
         self.lm_head.forward(
             &last_token_select(&hidden, ctx.seq_lens)?.unsqueeze(1)?,
-            &BatchState::no_lora(), ctx.ops,
+            &BatchState::no_lora(),
+            ctx.ops,
         )
     }
 
@@ -540,7 +722,11 @@ impl crate::models::LogitsSplitModel for Qwen3MoeModelForCausalLM {
     }
 
     fn compute_logits(&self, hidden: &Tensor) -> crate::tensor::Result<Tensor> {
-        self.lm_head.forward(hidden, &BatchState::no_lora(), crate::ops::select_ops(hidden.device()))
+        self.lm_head.forward(
+            hidden,
+            &BatchState::no_lora(),
+            crate::ops::select_ops(hidden.device()),
+        )
     }
 }
 
@@ -574,9 +760,7 @@ mod meta {
     use super::{Qwen3MoeConfig, Qwen3MoeModelForCausalLM};
     use crate::engine::EngineError;
     use crate::engine::{CommonModelConfig, RuntimeCaps, TaskKind, WeightsBackend};
-    use crate::models::registry::{
-        candle_model_err, parse_json, ArchSpec, ParsedModelConfig,
-    };
+    use crate::models::registry::{ArchSpec, ParsedModelConfig, candle_model_err, parse_json};
 
     const ARCHITECTURE_ALIASES: &[&str] = &["Qwen3Moe", "Qwen3MoeModel"];
     const MODEL_TYPE_ALIASES: &[&str] = &["qwen3_moe"];
@@ -585,7 +769,9 @@ mod meta {
     pub(crate) struct Qwen3MoeArchSpec;
 
     pub(crate) static QWEN3_MOE_ARCH_SPEC: Qwen3MoeArchSpec = Qwen3MoeArchSpec;
-    inventory::submit!(crate::models::registry::ArchSpecEntry::new(&QWEN3_MOE_ARCH_SPEC));
+    inventory::submit!(crate::models::registry::ArchSpecEntry::new(
+        &QWEN3_MOE_ARCH_SPEC
+    ));
 
     impl ArchSpec for Qwen3MoeArchSpec {
         fn name(&self) -> &'static str {
@@ -651,13 +837,40 @@ mod meta {
             let is_generate = task == TaskKind::Generate;
 
             let is_cuda = device.is_cuda();
+            // CUDA graph capture for MoE decode. cudarc 0.19's
+            // `CudaStream::alloc` uses `cuMemAllocAsync` whenever the
+            // device supports memory pools (true on SM90+), which IS
+            // graph-capturable — so most intermediate tensor allocations
+            // are safe during capture.
+            //
+            // Known remaining blockers fire on PREFILL, not decode:
+            //   - `moe_sort_experts_gpu` (thrust::sort_by_key) — only
+            //     used when n > 1024 assignments; decode max_bs=32 caps
+            //     n=128 so candle's bitonic sort is used instead.
+            //   - `calculate_expert_offsets` (thrust::inclusive_scan) —
+            //     only used when `is_prefill=true`; decode uses the
+            //     custom `_light` kernel path.
+            //
+            // Default ON — bench measured 16ms → 10ms TPOT (and 3.55
+            // → 5.33 RPS @ conc=32) on Qwen3-30B-A3B with no failures
+            // across 200 requests. PRELUDE_MOE_CUDA_GRAPH=0 keeps the
+            // historical opt-out for triage.
+            let moe_graph = std::env::var("PRELUDE_MOE_CUDA_GRAPH")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .map(|v| v != 0)
+                .unwrap_or(true);
             RuntimeCaps {
                 supports_kv_cache: is_safetensors && is_generate,
                 supports_prefix_cache: is_safetensors && is_cuda,
                 supports_paged_attn: is_cuda && is_safetensors,
                 supports_varlen: is_cuda && is_safetensors,
                 supports_deltanet: false,
-                supports_cuda_graph: false,
+                // Must AND with `is_cuda`: the env-var check above doesn't
+                // know what device we're on, and a CPU run with the flag
+                // set would otherwise tell DecodeGraphCache the model
+                // supports graphs on a non-CUDA device.
+                supports_cuda_graph: is_cuda && moe_graph,
             }
         }
     }

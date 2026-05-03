@@ -183,9 +183,19 @@ pub trait Ops: Send + Sync {
     /// Avoids the narrow+contiguous copy that separate gate/up tensors need.
     fn silu_mul_concat(&self, _gate_up: &Tensor) -> Option<Result<Tensor>> { None }
     fn fused_qknorm_rope(&self, _q: &Tensor, _k: &Tensor, _qw: &Tensor, _kw: &Tensor, _cos: &Tensor, _sin: &Tensor, _pos: &Tensor, _eps: f32) -> Option<Result<(Tensor, Tensor)>> { None }
+    /// Q-only norm + rope. Used when the K path is fused into the KV
+    /// cache write so K doesn't need to be materialized separately.
+    fn fused_q_norm_rope(&self, _q: &Tensor, _q_weight: &Tensor, _cos: &Tensor, _sin: &Tensor, _pos: &Tensor, _eps: f32) -> Option<Result<Tensor>> { None }
     fn fused_knorm_rope_cache_write(&self, _k: &Tensor, _v: &Tensor, _kw: &Tensor, _cos: &Tensor, _sin: &Tensor, _pos: &Tensor, _kc: &Tensor, _vc: &Tensor, _sm: &Tensor, _eps: f32) -> Option<Result<()>> { None }
     fn fused_add(&self, _a: &Tensor, _b: &Tensor) -> Option<Result<Tensor>> { None }
-    fn fused_moe_routing(&self, _logits: &Tensor, _top_k: usize) -> Option<Result<(Tensor, Tensor, Tensor, Tensor)>> { None }
+    /// Fused softmax + top-k expert routing.
+    ///
+    /// `norm_topk_prob`: when true, the kernel divides each row of
+    /// top-k probabilities by their sum so they sum to 1. Match what
+    /// the model config says — passing `true` for a model trained with
+    /// `norm_topk_prob=false` silently re-normalizes weights and
+    /// changes the math.
+    fn fused_moe_routing(&self, _logits: &Tensor, _top_k: usize, _norm_topk_prob: bool) -> Option<Result<(Tensor, Tensor, Tensor, Tensor)>> { None }
     fn fused_moe_gemm(&self, _input: &Tensor, _weights: &Tensor, _tw: &Tensor, _st: &Tensor, _se: &Tensor, _topk: usize, _prefill: bool) -> Option<Result<Tensor>> { None }
 
     /// GPU-accelerated sort of expert assignments by expert ID.
@@ -497,6 +507,34 @@ pub trait Ops: Send + Sync {
         cos: &Tensor, sin: &Tensor, position_ids: &Tensor, eps: f32,
         kv_cache: Option<(&Tensor, &Tensor, &Tensor)>,
     ) -> Result<(Tensor, Tensor)> {
+        // Fast path: when paged KV cache is provided, fuse K-norm,
+        // K-rope, and the K/V cache write into one kernel — saves a
+        // full kernel launch + a Q-output-sized HBM round-trip per
+        // attention layer. Q is processed by a separate fused
+        // norm+rope kernel. The caller using paged_attention reads K
+        // from the cache, so the returned `k` here is unused; we
+        // hand back the input `k` unchanged so the signature still
+        // works on the (rare) non-paged branch.
+        if let Some((kc, vc, sm)) = kv_cache {
+            if let Some(kr) = self.fused_knorm_rope_cache_write(
+                k, v, k_weight, cos, sin, position_ids, kc, vc, sm, eps,
+            ) {
+                kr?;
+                let q_out = if let Some(r) = self.fused_q_norm_rope(
+                    q, q_weight, cos, sin, position_ids, eps,
+                ) {
+                    r?
+                } else {
+                    let q_normed = self.rms_norm(q, q_weight, eps)?;
+                    let q_cos = cos.index_select(position_ids, 0)?;
+                    let q_sin = sin.index_select(position_ids, 0)?;
+                    let (total, hq, d) = q_normed.dims3()?;
+                    rope_thd(&q_normed.reshape((1, total, hq, d))?, &q_cos, &q_sin)?
+                        .reshape((total, hq, d))?
+                };
+                return Ok((q_out, k.clone()));
+            }
+        }
         if let Some(r) = self.fused_qknorm_rope(q, k, q_weight, k_weight, cos, sin, position_ids, eps) {
             let (q_out, k_out) = r?;
             if let Some((kc, vc, sm)) = kv_cache { self.reshape_and_cache(&k_out, v, kc, vc, sm)?; }
@@ -601,7 +639,7 @@ mod tests {
         assert!(ops.fused_silu_mul(&t, &t).is_none());
         assert!(ops.fused_gelu_mul(&t, &t).is_none());
         assert!(ops.fused_add(&t, &t).is_none());
-        assert!(ops.fused_moe_routing(&t, 2).is_none());
+        assert!(ops.fused_moe_routing(&t, 2, true).is_none());
 
         // New fused ops from design
         assert!(ops.fused_adaln_zero(&t, &t, None, &t, &t, &t, 1e-5).is_none());

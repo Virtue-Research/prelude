@@ -163,9 +163,12 @@ impl Qwen3Attention {
         let bs = BatchState::no_lora();
         let ops = ctx.ops;
 
+        nvtx_push!("attn_qkv_proj");
         let (q, k, v) = self.fused_qkv_projection(x, total_q, &bs, ops)?;
+        nvtx_pop!();
 
         // QK-norm + RoPE + optional cache write (OpsBundle picks optimal fuse path)
+        nvtx_push!("attn_qknorm_rope_cache");
         let kv_cache = ctx.paged_kv.map(|kv| (kv.key_cache, kv.value_cache, kv.slot_mapping));
         let (q, k) = ops.qknorm_rope_and_cache(
             &q, &k, &v,
@@ -174,8 +177,10 @@ impl Qwen3Attention {
             ctx.position_ids, self.rms_norm_eps as f32,
             kv_cache,
         )?;
+        nvtx_pop!();
 
         // Attention
+        nvtx_push!("attn_kernel");
         let attn_out = if let Some(kv) = ctx.paged_kv {
             ops.paged_attention(&q, kv.key_cache, kv.value_cache, &crate::ops::PagedParams {
                 block_tables: kv.block_tables,
@@ -190,8 +195,12 @@ impl Qwen3Attention {
                 scale: self.softmax_scale, mask: crate::ops::MaskType::Causal, softcap: None,
             })?
         };
+        nvtx_pop!();
 
-        self.o_proj.forward(&attn_out.reshape((total_q, self.hidden_size))?, &bs, ops)
+        nvtx_push!("attn_o_proj");
+        let r = self.o_proj.forward(&attn_out.reshape((total_q, self.hidden_size))?, &bs, ops);
+        nvtx_pop!();
+        r
     }
 
     /// Cached forward for CPU decode: handles both prefill (L=prompt_len) and

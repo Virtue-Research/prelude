@@ -33,12 +33,12 @@ use std::process::Command;
 use prelude_kernelbuild::archive::{self, ArMode};
 use prelude_kernelbuild::build_log;
 use prelude_kernelbuild::dispatch;
-use prelude_kernelbuild::dsl::{self, DslCompile, CULA_BOOTSTRAP};
+use prelude_kernelbuild::dsl::{self, CULA_BOOTSTRAP, DslCompile};
 use prelude_kernelbuild::nvcc::{
-    compile_cu_to_obj, find_cuda, link_cuda_runtime_static, locate_source, nvcc_path,
-    nvcc_supports_sm100, track_submodule, ObjCompile,
+    ObjCompile, compile_cu_to_obj, find_cuda, link_cuda_runtime_static, locate_source, nvcc_path,
+    nvcc_supports_sm100, track_submodule,
 };
-use prelude_kernelbuild::venv::{detect_torch_cuda_index, InstallOpts, PythonVenv};
+use prelude_kernelbuild::venv::{InstallOpts, PythonVenv, detect_torch_cuda_index};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -411,8 +411,7 @@ fn ensure_cula_python_env(out_dir: &Path, cula_src: &Path) -> Result<PathBuf, St
 
 fn generate_dispatch_code(kernels_dir: &Path, out_dir: &Path, has_kernels: bool) {
     let dispatch_path = out_dir.join("cula_dsl_dispatch.rs");
-    let stub_signature =
-        "pub(crate) fn lookup_dsl(_kernel_type: &str, _key: &str, _arch: u32) \
+    let stub_signature = "pub(crate) fn lookup_dsl(_kernel_type: &str, _key: &str, _arch: u32) \
          -> Option<crate::dsl::TVMSafeCallFn>";
 
     if !has_kernels {

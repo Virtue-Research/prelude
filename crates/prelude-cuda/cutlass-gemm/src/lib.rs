@@ -36,6 +36,21 @@ unsafe extern "C" {
         config: i32,
         stream: *const c_void,
     ) -> i32;
+
+    fn moe_grouped_gemm_sm100(
+        input: *const c_void,
+        weights: *const c_void,
+        sorted_token_ids: *const u32,
+        expert_offsets: *const i32,
+        output: *mut c_void,
+        m_total: i32,
+        n: i32,
+        k: i32,
+        num_experts: i32,
+        topk: i32,
+        data_type: i32,
+        stream: *const c_void,
+    ) -> i32;
 }
 
 /// cuBLAS-compatible GEMM dispatch via CUTLASS.
@@ -88,6 +103,61 @@ pub unsafe fn gemm_dispatch(
         code => Err(format!(
             "CUTLASS GEMM failed (code {code}) for m={m} n={n} k={k} batch={batch} dtype={dtype}"
         )),
+    }
+}
+
+/// CUTLASS Blackwell SM100 grouped MoE GEMM. Replaces the legacy
+/// SM75-era `nvcuda::wmma` `moe_gemm_wmma` kernel on B300+ for BF16
+/// MoE forward.
+///
+/// Inputs:
+/// - `input`: `[num_tokens, K]` BF16
+/// - `weights`: `[num_experts, N, K]` BF16
+/// - `sorted_token_ids`: `[m_total]` U32, sorted by expert id; flat
+///   index into `[num_tokens × topk]` (caller divides by `topk` to
+///   recover the token id during gather).
+/// - `expert_offsets`: `[num_experts + 1]` I32, prefix-sum of per-expert
+///   assignment counts.
+/// - `output`: `[m_total, N]` BF16, written in flat (sorted_token_id)
+///   layout to match the existing `moe_gemm_wmma` semantics.
+///
+/// Returns `Err` with `Ok(())` mapped to 0; only BF16 supported.
+///
+/// # Safety
+/// All device pointers must be valid; layouts must match the contract
+/// above.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn grouped_moe_sm100(
+    input: *const c_void,
+    weights: *const c_void,
+    sorted_token_ids: *const u32,
+    expert_offsets: *const i32,
+    output: *mut c_void,
+    m_total: i32,
+    n: i32,
+    k: i32,
+    num_experts: i32,
+    topk: i32,
+    data_type: i32,
+    stream: *const c_void,
+) -> Result<(), String> {
+    let ret = unsafe {
+        moe_grouped_gemm_sm100(
+            input, weights, sorted_token_ids, expert_offsets, output,
+            m_total, n, k, num_experts, topk, data_type, stream,
+        )
+    };
+    match ret {
+        0 => Ok(()),
+        -100 => Err("grouped_moe_sm100: built without SM100 support".into()),
+        -20 => Err(format!("grouped_moe_sm100: unsupported dtype {data_type} (BF16 only)")),
+        -21 => Err(format!("grouped_moe_sm100: invalid shape m={m_total} n={n} k={k} experts={num_experts}")),
+        -22 => Err("grouped_moe_sm100: workspace cudaMalloc failed".into()),
+        -10 => Err("grouped_moe_sm100: per-group metadata cudaMalloc failed".into()),
+        -11 => Err("grouped_moe_sm100: CUTLASS can_implement returned not-implemented (problem-shape misalignment?)".into()),
+        -12 => Err("grouped_moe_sm100: CUTLASS initialize() failed".into()),
+        -13 => Err("grouped_moe_sm100: CUTLASS run() returned non-success".into()),
+        code => Err(format!("grouped_moe_sm100 failed (code {code})")),
     }
 }
 

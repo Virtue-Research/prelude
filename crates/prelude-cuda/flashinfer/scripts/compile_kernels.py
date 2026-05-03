@@ -957,15 +957,21 @@ def generate_utility_sources(
             pass  # source file already contains TVM FFI export
         else:
             binding_path = csrc / binding_file
-            if binding_path.exists() and not (out / binding_file).exists():
-                if kind == "norm":
-                    # Remove layernorm binding export
-                    src_text = binding_path.read_text()
-                    lines = [l for l in src_text.split('\n')
-                             if 'layernorm' not in l]
-                    (out / binding_file).write_text('\n'.join(lines))
-                else:
-                    shutil.copy2(binding_path, out / binding_file)
+            if binding_path.exists():
+                # Bug fix: always add the binding to the sources list so it gets
+                # compiled. The previous `and not (out / binding_file).exists()`
+                # short-circuit would skip the append on incremental builds
+                # where the staged binding .cu was already present, leaving the
+                # TVM FFI exports (e.g. __tvm_ffi_sampling_from_probs) undefined.
+                if not (out / binding_file).exists():
+                    if kind == "norm":
+                        # Remove layernorm binding export
+                        src_text = binding_path.read_text()
+                        lines = [l for l in src_text.split('\n')
+                                 if 'layernorm' not in l]
+                        (out / binding_file).write_text('\n'.join(lines))
+                    else:
+                        shutil.copy2(binding_path, out / binding_file)
                 sources.append(out / binding_file)
 
         vinfo = {
@@ -1178,6 +1184,13 @@ def compile_source(
         p = cutlass_base / sub
         if p.exists():
             include_dirs.append(str(p))
+    # FlashInfer v0.6.9+ vendors CCCL and expects it ahead of CTK-bundled
+    # headers, matching flashinfer.jit.cpp_ext.get_cccl_includes().
+    cccl_base = fi_src / "3rdparty" / "cccl"
+    for sub in ["cub", "libcudacxx/include", "thrust"]:
+        p = cccl_base / sub
+        if p.exists():
+            include_dirs.append(str(p))
 
     # Find TVM FFI headers (+ dlpack sub-dependency)
     tvm_ffi_include = _find_tvm_ffi_include(fi_src)
@@ -1209,6 +1222,121 @@ def compile_source(
     return obj
 
 
+def _configure_flashinfer_jit_env(fi_src: Path, gen_dir: Path):
+    """Point FlashInfer JIT helpers at the source checkout and AOT gen dir."""
+    from flashinfer.jit import env as jit_env
+
+    jit_env.FLASHINFER_CSRC_DIR = fi_src / "csrc"
+    jit_env.FLASHINFER_INCLUDE_DIR = fi_src / "include"
+    jit_env.FLASHINFER_GEN_SRC_DIR = gen_dir / "flashinfer_jit"
+    jit_env.CUTLASS_INCLUDE_DIRS = [
+        fi_src / "3rdparty" / "cutlass" / "include",
+        fi_src / "3rdparty" / "cutlass" / "tools" / "util" / "include",
+    ]
+    jit_env.SPDLOG_INCLUDE_DIR = fi_src / "3rdparty" / "spdlog" / "include"
+    jit_env.CCCL_INCLUDE_DIRS = [
+        fi_src / "3rdparty" / "cccl" / "cub",
+        fi_src / "3rdparty" / "cccl" / "libcudacxx" / "include",
+        fi_src / "3rdparty" / "cccl" / "thrust",
+    ]
+    jit_env.FLASHINFER_GEN_SRC_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _jit_spec_compile_flags(spec) -> List[str]:
+    flags = []
+    if spec.extra_cuda_cflags:
+        flags.extend(str(flag) for flag in spec.extra_cuda_cflags if flag)
+    # gen_cutlass_fused_moe_* puts FAST_BUILD in extra_cflags. We compile
+    # every source with nvcc in this AOT path, so carry preprocessor defines.
+    if spec.extra_cflags:
+        flags.extend(str(flag) for flag in spec.extra_cflags if str(flag).startswith("-D"))
+    if spec.extra_include_dirs:
+        for include_dir in spec.extra_include_dirs:
+            flags.extend(["-I", str(include_dir)])
+    return flags
+
+
+_BLACKWELL_CUTLASS_MOE_QUANT_FLAGS = {
+    "-DENABLE_FP8",
+    "-DENABLE_FP8_BLOCK_SCALE",
+    "-DENABLE_FP4",
+    "-DFLASHINFER_ENABLE_FP8_E8M0",
+    "-DFLASHINFER_ENABLE_FP4_E2M1",
+}
+
+
+_BLACKWELL_CUTLASS_MOE_COMMON_SOURCES = {
+    "moe_gemm_tma_warp_specialized_input.cu",
+    "moe_gemm_kernels_bf16_bf16.cu",
+    "cutlass_heuristic.cpp",
+    "lora.cpp",
+    "flashinfer_cutlass_fused_moe_binding.cu",
+    "deepgemm_jit_setup.cu",
+    "cutlass_fused_moe_instantiation.cu",
+}
+
+
+def _cutlass_moe_blackwell_compile_flags(flags: List[str]) -> List[str]:
+    """Keep Prelude's Blackwell fused-MoE AOT build on the dense BF16 path."""
+    filtered = [flag for flag in flags if flag not in _BLACKWELL_CUTLASS_MOE_QUANT_FLAGS]
+    filtered.append("-DPRELUDE_FLASHINFER_BLACKWELL_BF16_ONLY")
+    return filtered
+
+
+def _should_compile_cutlass_moe_blackwell_source(src: Path, archs: List[int]) -> bool:
+    # TopicGuard/Qwen3 production weights are dense BF16. The upstream
+    # SM100/SM103 JIT spec is broad and also pulls in fp16, uint, FP8/FP4 and
+    # older generated kernels. Several of those translation units compile very
+    # slowly or stall under static AOT, so keep the AOT archive to the BF16
+    # dense path plus the generated kernels for the requested Blackwell arch.
+    name = src.name
+    if name in _BLACKWELL_CUTLASS_MOE_COMMON_SOURCES:
+        return True
+    if not name.startswith("cutlass_kernel_file_gemm_grouped_"):
+        return False
+    if any(a >= 103 and a < 120 for a in archs):
+        # The BF16 dispatcher still references upstream Sm100 launcher
+        # instantiations for some tile/cluster choices, while the SM103
+        # generated files cover Blackwell-specific grouped kernels.
+        return "_sm103_" in name or "_sm100_" in name
+    return "_sm100_" in name
+
+
+def _add_cutlass_fused_moe_from_jit_spec(compile_jobs, fi_src: Path, gen_dir: Path,
+                                         archs: List[int], vinfo: dict) -> int:
+    _configure_flashinfer_jit_env(fi_src, gen_dir)
+    from flashinfer.jit.fused_moe import (
+        gen_cutlass_fused_moe_sm100_module,
+        gen_cutlass_fused_moe_sm103_module,
+    )
+
+    if any(a >= 103 and a < 120 for a in archs):
+        spec = gen_cutlass_fused_moe_sm103_module(use_fast_build=True)
+    else:
+        spec = gen_cutlass_fused_moe_sm100_module(use_fast_build=True)
+
+    flags = _cutlass_moe_blackwell_compile_flags(_jit_spec_compile_flags(spec))
+    shared_common_dir = fi_src / "csrc" / "nv_internal" / "cpp" / "common"
+    compiled = 0
+    skipped = 0
+    for src in spec.sources:
+        src = Path(src)
+        # The monolithic AOT archive already includes TRT-LLM common support
+        # objects through fi_moe_routing. Upstream JIT specs are standalone and
+        # include them per module; whole-archive static linking would duplicate
+        # symbols such as tensorrt_llm::common::getIntEnv.
+        if src.parent == shared_common_dir and src.suffix in (".cpp", ".cu"):
+            continue
+        if not _should_compile_cutlass_moe_blackwell_source(src, archs):
+            skipped += 1
+            continue
+        compile_jobs.append((src, [], flags, vinfo))
+        compiled += 1
+    if skipped:
+        print(f"  Blackwell CUTLASS MoE: skipped {skipped} non-production AOT sources")
+    return compiled
+
+
 def _find_tvm_ffi_include(fi_src: Path) -> Optional[Path]:
     """Find TVM FFI include directory from third_party/tvm-ffi."""
     script_dir = Path(__file__).resolve().parent.parent  # prelude-flashinfer crate
@@ -1220,6 +1348,28 @@ def _find_tvm_ffi_include(fi_src: Path) -> Optional[Path]:
 
 
 # ── Variant matrix ─────────────────────────────────────────────────────
+
+def fa2_arch_flags(archs: List[int]) -> List[str]:
+    # Keep a PTX fallback for forward-compatible FA2 dispatch, but only emit
+    # native SM90 cubins when SM90 was explicitly requested.
+    flags = ["-gencode", "arch=compute_80,code=compute_80"]
+    if 90 in archs:
+        flags += ["-gencode", "arch=compute_90a,code=sm_90a"]
+    return flags
+
+
+def flashinfer_cuda_arch_list(archs: List[int]) -> str:
+    return " ".join(f"{arch // 10}.{arch % 10}" for arch in sorted(set(archs)))
+
+
+def blackwell_arch_flags(archs: List[int]) -> List[str]:
+    flags = []
+    for arch in sorted(set(archs)):
+        if arch >= 100:
+            suffix = f"{arch}a"
+            flags += ["-gencode", f"arch=compute_{suffix},code=sm_{suffix}"]
+    return flags or ["-gencode", "arch=compute_100a,code=sm_100a"]
+
 
 def build_variant_matrix(
     archs: List[int], head_dims: List[int], dtypes: List[str],
@@ -1240,10 +1390,9 @@ def build_variant_matrix(
         mla_dims = [(512, 64)]  # DeepSeek V2/V3 default
 
     variants = []
-    sm80_flags = ["-gencode", "arch=compute_80,code=compute_80",
-                  "-gencode", "arch=compute_90a,code=sm_90a"]
+    sm80_flags = fa2_arch_flags(archs)
     sm90_flags = ["-gencode", "arch=compute_90a,code=sm_90a"]
-    has_sm90 = any(a >= 90 for a in archs)
+    has_sm90 = 90 in archs
 
     swa_softcap_combos = [(False, False), (True, False), (False, True), (True, True)]
 
@@ -1389,6 +1538,7 @@ def main():
     archs = [int(a.replace("sm_", "")) for a in args.archs.split(",")]
     head_dims = [int(d) for d in args.head_dims.split(",")]
     dtypes = args.dtypes.split(",")
+    os.environ["FLASHINFER_CUDA_ARCH_LIST"] = flashinfer_cuda_arch_list(archs)
 
     # Parse MLA dims (e.g., "512x64,256x64")
     mla_dims_str = os.environ.get("PRELUDE_FLASHINFER_MLA_DIMS", "512x64")
@@ -1458,8 +1608,7 @@ def main():
 
     # Utility kernels (non-templated, compiled once)
     # Use sm_90a (arch-specific) to satisfy arch_condition.h check in CUDA 12.9+
-    sm80_flags = ["-gencode", "arch=compute_80,code=compute_80",
-                  "-gencode", "arch=compute_90a,code=sm_90a"]
+    sm80_flags = fa2_arch_flags(archs)
     utility_variants = generate_utility_sources(fi_src, gen_dir)
 
     # Activation fusions (silu_and_mul, gelu_and_mul, gelu_tanh_and_mul)
@@ -1478,7 +1627,7 @@ def main():
         sm100_out = gen_dir / "fi_fmha_sm100"
         sm100_out.mkdir(parents=True, exist_ok=True)
         sm100_sources = []
-        sm100_flags = ["-gencode", "arch=compute_100a,code=sm_100a"]
+        sm100_flags = blackwell_arch_flags(archs)
         for src_file in ["fmha_cutlass_sm100.cu", "blackwell_fmha_plan.cu"]:
             src_path = sm100_csrc / src_file
             if src_path.exists():
@@ -1509,7 +1658,7 @@ def main():
         print(f"  SM100 FMHA: {len(sm100_sources)} sources (requires CUDA 12.8+)")
 
     # ── SM90 modules (matching upstream aot.py has_sm90 blocks) ────────
-    has_sm90 = any(a >= 90 for a in archs)
+    has_sm90 = 90 in archs
     sm90_flags = ["-gencode", "arch=compute_90a,code=sm_90a"]
     if has_sm90:
         import jinja2
@@ -1710,7 +1859,7 @@ def main():
             utility_variants.append(([], [], vinfo))
 
     # ── SM100 modules (matching upstream aot.py has_sm100 blocks) ──────
-    sm100_flags = ["-gencode", "arch=compute_100a,code=sm_100a"]
+    sm100_flags = blackwell_arch_flags(archs)
     if has_sm100:
         import jinja2
         sm100_modules = []
@@ -1737,35 +1886,40 @@ def main():
                 compile_jobs.append((src, sm100_flags, ef, vinfo))
             sm100_modules.append(vinfo)
 
-        # gen_gemm_sm100_module_cutlass_fp8: FP8 GEMM via jinja (12 instances)
-        fp8_out = gen_dir / "fi_fp8_gemm_cutlass"
-        fp8_out.mkdir(parents=True, exist_ok=True)
-        fp8_sources = []
-        # Copy main dispatch file
-        sp = csrc / "fp8_gemm_cutlass.cu"
-        if sp.exists():
-            shutil.copy2(sp, fp8_out / "fp8_gemm_cutlass.cu")
-            fp8_sources.append(fp8_out / "fp8_gemm_cutlass.cu")
-        # Generate SM100 instantiation files from upstream jinja
-        with open(csrc / "fp8_gemm_cutlass.jinja") as f:
-            fp8_templ = jinja2.Template(f.read())
-        cta_configs = [(64,64,128), (64,128,128), (64,256,128),
-                       (128,64,128), (128,128,128), (128,256,128)]
-        for cta_m, cta_n, cta_k in cta_configs:
-            for dtype in ["__nv_bfloat16", "half"]:
-                src_text = fp8_templ.render(type=dtype, cta_m=cta_m, cta_n=cta_n, cta_k=cta_k)
-                fname = f"fp8_gemm_cutlass_{dtype}_{cta_m}_{cta_n}_{cta_k}.cu"
-                fpath = fp8_out / fname
-                fpath.write_text(src_text)
-                fp8_sources.append(fpath)
-        fp8_vinfo = {"vid": "fi_fp8_gemm_cutlass", "kind": "gemm",
-                     "symbols": {"fp8_gemm": "__tvm_ffi_fp8_gemm",
-                                 "fp8_gemm_tactic_num": "__tvm_ffi_fp8_gemm_tactic_num"}}
-        fp8_extra = ["-DENABLE_BF16", "-DCUTLASS_ENABLE_GDC_FOR_SM100=1"]
-        for src in fp8_sources:
-            compile_jobs.append((src, sm100_flags, fp8_extra, fp8_vinfo))
-        sm100_modules.append(fp8_vinfo)
-        print(f"  SM100 FP8 GEMM: {len(fp8_sources)} sources (12 jinja + 1 dispatch)")
+        # gen_gemm_sm100_module_cutlass_fp8: FP8 GEMM via jinja. Production
+        # BF16-only builds do not call these kernels, and they dominate AOT
+        # build time on Blackwell, so only emit them for explicit FP8 builds.
+        if any(dtype.lower().startswith("fp8") for dtype in dtypes):
+            fp8_out = gen_dir / "fi_fp8_gemm_cutlass"
+            fp8_out.mkdir(parents=True, exist_ok=True)
+            fp8_sources = []
+            # Copy main dispatch file
+            sp = csrc / "fp8_gemm_cutlass.cu"
+            if sp.exists():
+                shutil.copy2(sp, fp8_out / "fp8_gemm_cutlass.cu")
+                fp8_sources.append(fp8_out / "fp8_gemm_cutlass.cu")
+            # Generate SM100 instantiation files from upstream jinja
+            with open(csrc / "fp8_gemm_cutlass.jinja") as f:
+                fp8_templ = jinja2.Template(f.read())
+            cta_configs = [(64,64,128), (64,128,128), (64,256,128),
+                           (128,64,128), (128,128,128), (128,256,128)]
+            for cta_m, cta_n, cta_k in cta_configs:
+                for dtype in ["__nv_bfloat16", "half"]:
+                    src_text = fp8_templ.render(type=dtype, cta_m=cta_m, cta_n=cta_n, cta_k=cta_k)
+                    fname = f"fp8_gemm_cutlass_{dtype}_{cta_m}_{cta_n}_{cta_k}.cu"
+                    fpath = fp8_out / fname
+                    fpath.write_text(src_text)
+                    fp8_sources.append(fpath)
+            fp8_vinfo = {"vid": "fi_fp8_gemm_cutlass", "kind": "gemm",
+                         "symbols": {"fp8_gemm": "__tvm_ffi_fp8_gemm",
+                                     "fp8_gemm_tactic_num": "__tvm_ffi_fp8_gemm_tactic_num"}}
+            fp8_extra = ["-DENABLE_BF16", "-DCUTLASS_ENABLE_GDC_FOR_SM100=1"]
+            for src in fp8_sources:
+                compile_jobs.append((src, sm100_flags, fp8_extra, fp8_vinfo))
+            sm100_modules.append(fp8_vinfo)
+            print(f"  SM100 FP8 GEMM: {len(fp8_sources)} sources (12 jinja + 1 dispatch)")
+        else:
+            print("  SM100 FP8 GEMM: skipped for non-FP8 build")
 
         # gen_tgv_gemm_sm10x_module: TGV decode GEMM via jinja (11 tile configs per dtype)
         with open(csrc / "tgv_gemm.jinja") as f:
@@ -1777,15 +1931,20 @@ def main():
             (64, 64, 6),
             (128, 16, 6),
         ]
-        for tgv_dtype in ["bf16", "fp16"]:
+        tgv_dtypes = [dt for dt in ["bf16", "fp16"] if dt in dtypes]
+        for tgv_dtype in tgv_dtypes:
             tgv_out = gen_dir / f"fi_tgv_gemm_{tgv_dtype}"
             tgv_out.mkdir(parents=True, exist_ok=True)
             tgv_sources = []
-            # Copy main dispatch file
-            sp = csrc / "tgv_gemm.cu"
-            if sp.exists():
-                shutil.copy2(sp, tgv_out / "tgv_gemm.cu")
-                tgv_sources.append(tgv_out / "tgv_gemm.cu")
+            # Dispatch TU (tgv_gemm.cu) defines torch_ext::tgv_gemm /
+            # bf16_gemm + TVM_FFI exports — compile it once (under bf16) so
+            # we don't get duplicate symbols when linked into a single static
+            # archive. fp16 variant just provides the extra kernel tile .o's.
+            if tgv_dtype == "bf16":
+                sp = csrc / "tgv_gemm.cu"
+                if sp.exists():
+                    shutil.copy2(sp, tgv_out / "tgv_gemm.cu")
+                    tgv_sources.append(tgv_out / "tgv_gemm.cu")
             for cta_m, cta_n, dma_stage in tgv_cta_configs:
                 src_text = tgv_templ.render(cta_m=cta_m, cta_n=cta_n,
                                             dma_stage=dma_stage, dtype=tgv_dtype)
@@ -1793,29 +1952,34 @@ def main():
                 fpath = tgv_out / fname
                 fpath.write_text(src_text)
                 tgv_sources.append(fpath)
+            # Upstream tgv_gemm.cu only emits TVM_FFI_DLL_EXPORT for tgv_gemm
+            # and tgv_gemm_tactic_num; bf16_gemm / bf16_gemm_tactic_num are
+            # C++ wrappers without TVM FFI exports, so don't advertise them.
             tgv_vinfo = {"vid": f"fi_tgv_gemm_{tgv_dtype}", "kind": "gemm",
                          "symbols": {"tgv_gemm": "__tvm_ffi_tgv_gemm",
-                                     "tgv_gemm_tactic_num": "__tvm_ffi_tgv_gemm_tactic_num",
-                                     "bf16_gemm": "__tvm_ffi_bf16_gemm",
-                                     "bf16_gemm_tactic_num": "__tvm_ffi_bf16_gemm_tactic_num"}}
+                                     "tgv_gemm_tactic_num": "__tvm_ffi_tgv_gemm_tactic_num"}}
             tgv_extra = ["-DCUTLASS_ENABLE_GDC_FOR_SM100=1"]
             for src in tgv_sources:
                 compile_jobs.append((src, sm100_flags, tgv_extra, tgv_vinfo))
             sm100_modules.append(tgv_vinfo)
-        print(f"  SM100 TGV GEMM: 2 dtypes × {len(tgv_cta_configs)+1} sources each")
+        print(f"  SM100 TGV GEMM: {len(tgv_dtypes)} dtypes × {len(tgv_cta_configs)+1} sources each")
 
         # gen_gemm_sm100_module: groupwise GEMM + binding
         _add_sm100_module("fi_gemm_sm100",
                           ["gemm_groupwise_sm100.cu"], "gemm_sm100_binding.cu",
                           ["gemm_fp8_nt_groupwise"])
-        # gen_gemm_sm100_module_cutlass_fp4: FP4 GEMM
-        _add_sm100_module("fi_fp4_gemm_sm100",
-                          ["fp4_gemm_cutlass.cu"], None,
-                          ["fp4_gemm", "fp4_gemm_tactic_num"])
-        # gen_gemm_sm100_module_cutlass_mxfp8: MXFP8 GEMM
-        _add_sm100_module("fi_mxfp8_gemm",
-                          ["mxfp8_gemm_cutlass.cu"], None,
-                          ["mxfp8_gemm", "mxfp8_gemm_tactic_num"])
+        # gen_gemm_sm100_module_cutlass_fp4: FP4 GEMM (DISABLED)
+        # The upstream jinja instantiations for genericFp4GemmKernelLauncher
+        # are not expanded here, so the dispatch TU leaves undefined symbols.
+        # Not needed for BF16/FP16 models.
+        # _add_sm100_module("fi_fp4_gemm_sm100",
+        #                   ["fp4_gemm_cutlass.cu"], None,
+        #                   ["fp4_gemm", "fp4_gemm_tactic_num"])
+        # gen_gemm_sm100_module_cutlass_mxfp8: MXFP8 GEMM (DISABLED — same
+        # reason as FP4: template instantiations not generated).
+        # _add_sm100_module("fi_mxfp8_gemm",
+        #                   ["mxfp8_gemm_cutlass.cu"], None,
+        #                   ["mxfp8_gemm", "mxfp8_gemm_tactic_num"])
         # Group GEMM SM100 (FP8 + MXFP4)
         _add_sm100_module("fi_group_gemm_sm100",
                           ["group_gemm_fp8_groupwise_sm100.cu",
@@ -1823,22 +1987,28 @@ def main():
                           "group_gemm_sm100_binding.cu",
                           ["group_gemm_fp8_nt_groupwise", "group_gemm_mxfp4_nt_groupwise"])
 
-        # ── add_comm: gen_trtllm_comm_module() — SM100+ ──────────────
-        # Upstream: if has_sm100: jit_specs.append(gen_trtllm_comm_module())
-        _add_sm100_module("fi_trtllm_comm",
-                          ["trtllm_allreduce.cu", "trtllm_allreduce_fusion.cu",
-                           "trtllm_moe_allreduce_fusion.cu"], None,
-                          ["trtllm_lamport_initialize", "trtllm_lamport_initialize_all",
-                           "trtllm_custom_all_reduce", "trtllm_allreduce_fusion",
-                           "trtllm_moe_allreduce_fusion", "trtllm_moe_finalize_allreduce_fusion"],
-                          kind="comm")
+        # ── CUTLASS Fused MoE Blackwell (BF16 path used by Qwen3 MoE) ──
+        #
+        # The Rust runner looks up a generic "init" utility symbol. Avoid
+        # emitting both SM90 and Blackwell fused-MoE modules in one archive
+        # until the loader grows arch-specific symbol names; production B300
+        # builds pass only sm_103, so this is the path that matters.
+        if not has_sm90:
+            cutlass_moe_arch = 103 if any(a >= 103 and a < 120 for a in archs) else 100
+            cutlass_moe_vinfo = {
+                "vid": f"fi_cutlass_moe_sm{cutlass_moe_arch}",
+                "kind": "cutlass_moe",
+                "symbols": {"init": "__tvm_ffi_init"},
+            }
+            cutlass_moe_compiled = _add_cutlass_fused_moe_from_jit_spec(
+                compile_jobs, fi_src, gen_dir, archs, cutlass_moe_vinfo,
+            )
+            sm100_modules.append(cutlass_moe_vinfo)
+            print(f"  SM{cutlass_moe_arch} CUTLASS MoE: {cutlass_moe_compiled} sources (upstream JIT spec)")
 
-        # ── add_comm: gen_trtllm_mnnvl_comm_module() — SM100+ ───────
-        # Upstream: if has_sm100: jit_specs.append(gen_trtllm_mnnvl_comm_module())
-        _add_sm100_module("fi_trtllm_mnnvl",
-                          ["trtllm_mnnvl_allreduce.cu"], None,
-                          ["trtllm_mnnvl_allreduce_fusion"],
-                          kind="comm")
+        # Prelude's static AOT runtime does not load FlashInfer's TRT-LLM
+        # allreduce/MNNVL modules. Keeping them out of single-node builds cuts
+        # compile time and avoids widening the static link surface.
 
         for vinfo in sm100_modules:
             utility_variants.append(([], [], vinfo))
@@ -1871,10 +2041,10 @@ def main():
                 compile_jobs.append((src, sm120_flags, [], vinfo))
             sm120_modules.append(vinfo)
 
-        # FP4 GEMM SM120
-        _add_sm120_module("fi_fp4_gemm_sm120",
-                          ["fp4_gemm_cutlass_sm120.cu"], None,
-                          ["fp4_gemm", "fp4_gemm_tactic_num"])
+        # FP4 GEMM SM120 (DISABLED — see SM100 comment)
+        # _add_sm120_module("fi_fp4_gemm_sm120",
+        #                   ["fp4_gemm_cutlass_sm120.cu"], None,
+        #                   ["fp4_gemm", "fp4_gemm_tactic_num"])
         # Groupwise GEMM SM120
         _add_sm120_module("fi_gemm_groupwise_sm120",
                           ["gemm_groupwise_sm120.cu"], "gemm_sm120_binding.cu",

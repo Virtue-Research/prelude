@@ -8,8 +8,11 @@
 
 mod common;
 
+use prelude_core::ops::{
+    self,
+    traits::{BinaryOp, Ops, UnaryOp},
+};
 use prelude_core::tensor::{DType, Device, Result, Tensor};
-use prelude_core::ops::{self, traits::{Ops, UnaryOp, BinaryOp}};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ── Test Ops that counts hook invocations ────────────────────────
@@ -27,15 +30,17 @@ static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 struct CountingOps;
 
 impl Ops for CountingOps {
-    fn default_impl(&self) -> &dyn Ops { self }
+    fn default_impl(&self) -> &dyn Ops {
+        self
+    }
 
     fn unary(&self, x: &Tensor, op: UnaryOp) -> Option<Result<Tensor>> {
         UNARY_COUNT.fetch_add(1, Ordering::Relaxed);
         match op {
             // Override exp: return 42.0 filled tensor (proves hook ran)
-            UnaryOp::Exp => {
-                Some(Tensor::ones(x.shape(), x.dtype(), x.device()).and_then(|t| t.affine(42.0, 0.0)))
-            }
+            UnaryOp::Exp => Some(
+                Tensor::ones(x.shape(), x.dtype(), x.device()).and_then(|t| t.affine(42.0, 0.0)),
+            ),
             // Override sqrt: use candle's own sqrt (tests recursion guard)
             UnaryOp::Sqrt => {
                 // Inside hook, the hook is cleared, so x.sqrt() goes through candle default
@@ -95,8 +100,11 @@ fn hook_intercepts_exp() -> Result<()> {
         let out = t.exp()?;
         let vals: Vec<f32> = out.to_vec1()?;
         // Should be 42.0, not e^1, e^2, e^3
-        assert!(vals.iter().all(|&v| (v - 42.0).abs() < 1e-5),
-            "expected 42.0 from hooked exp, got {:?}", vals);
+        assert!(
+            vals.iter().all(|&v| (v - 42.0).abs() < 1e-5),
+            "expected 42.0 from hooked exp, got {:?}",
+            vals
+        );
         assert_eq!(UNARY_COUNT.load(Ordering::Relaxed), 1);
         Ok(())
     })

@@ -4,10 +4,10 @@ static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 use prelude_core::{
-    Engine, EngineConfig, InferenceEngine, PseudoEngine, ScheduledEngine, SchedulerConfig,
-    TaskOverride,
+    Engine, EngineConfig, InferenceEngine, MoeBackendPolicy, PseudoEngine, ScheduledEngine,
+    SchedulerConfig, TaskOverride,
 };
 use prelude_server::chat_template::ModelChatTemplate;
 use tracing::info;
@@ -56,7 +56,7 @@ struct Cli {
 
     #[arg(
         long,
-        default_value_t = 8,
+        default_value_t = 256,
         help = "Max concurrent running requests in scheduler"
     )]
     max_running_requests: usize,
@@ -94,9 +94,17 @@ struct Cli {
     #[arg(
         long,
         default_value_t = true,
+        action = ArgAction::SetTrue,
         help = "Enable chunked prefill: interleave prefill with decode steps for lower TPOT"
     )]
     chunked_prefill: bool,
+
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Disable chunked prefill and schedule waiting prefills before decode"
+    )]
+    no_chunked_prefill: bool,
 
     #[arg(
         long,
@@ -126,14 +134,34 @@ struct Cli {
 
     #[arg(
         long,
+        value_enum,
+        help = "Qwen3-MoE backend policy: auto, cutlass, or sequential. \
+                CUDA auto requires FlashInfer CUTLASS for Qwen3-MoE. \
+                Defaults to PRELUDE_MOE_BACKEND or auto."
+    )]
+    moe_backend: Option<CliMoeBackend>,
+
+    #[arg(
+        long,
         default_value_t = prelude_core::config::DEFAULT_GPU_MEMORY_UTILIZATION,
         help = "Fraction of free GPU memory for KV cache (0.0-1.0). \
                 Ignored when PRELUDE_PAGED_ATTN_BLOCKS is set explicitly."
     )]
     gpu_memory_utilization: f32,
 
-    #[arg(long, default_value_t = true, help = "CUDA graph capture for decode steps (use --no-cuda-graph to disable)")]
+    #[arg(
+        long,
+        default_value_t = true,
+        help = "Enable CUDA graph capture for decode steps"
+    )]
     cuda_graph: bool,
+
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Disable CUDA graph capture for decode steps"
+    )]
+    no_cuda_graph: bool,
 
     #[arg(long, default_value = "auto", help = "Device: auto, cpu, cuda, cuda:N")]
     device: String,
@@ -145,6 +173,24 @@ enum CliTaskOverride {
     Classify,
     Embedding,
     Generation,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliMoeBackend {
+    Auto,
+    Cutlass,
+    #[value(alias = "ref", alias = "reference")]
+    Sequential,
+}
+
+impl From<CliMoeBackend> for MoeBackendPolicy {
+    fn from(value: CliMoeBackend) -> Self {
+        match value {
+            CliMoeBackend::Auto => MoeBackendPolicy::Auto,
+            CliMoeBackend::Cutlass => MoeBackendPolicy::Cutlass,
+            CliMoeBackend::Sequential => MoeBackendPolicy::Sequential,
+        }
+    }
 }
 
 impl From<CliTaskOverride> for TaskOverride {
@@ -173,9 +219,8 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "prelude_server=info,prelude_core=info,tower_http=info".into()
-            }),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "prelude_server=info,prelude_core=info,tower_http=info".into()),
         )
         .init();
 
@@ -225,8 +270,11 @@ async fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
     if let Some(ref dtype) = cli.dtype {
         engine_config.runtime.dtype = Some(dtype.clone());
     }
+    if let Some(moe_backend) = cli.moe_backend {
+        engine_config.runtime.moe_backend = moe_backend.into();
+    }
     engine_config.cache.gpu_memory_utilization = cli.gpu_memory_utilization;
-    engine_config.runtime.cuda_graph = cli.cuda_graph;
+    engine_config.runtime.cuda_graph = cli.cuda_graph && !cli.no_cuda_graph;
     // Activation profiler probes at this token count so the resulting
     // peak_activation_bytes matches the largest forward the scheduler
     // will dispatch. Keeping these in lockstep avoids KV cache being
@@ -239,10 +287,11 @@ async fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
     // at a real file or directory on disk, treat it as a local path so users
     // can pass `--model /path/to/checkpoint.gguf` directly without having to
     // know about a separate flag. Falls back to HF Hub.
-    let local_path: Option<&str> = cli
-        .model_path
-        .as_deref()
-        .or_else(|| std::path::Path::new(&cli.model).exists().then(|| cli.model.as_str()));
+    let local_path: Option<&str> = cli.model_path.as_deref().or_else(|| {
+        std::path::Path::new(&cli.model)
+            .exists()
+            .then(|| cli.model.as_str())
+    });
     let base_engine = if let Some(path) = local_path {
         info!(path = %path, "loading model from local path");
         Engine::from_local_path_with_task(path, &cli.model, task_override, engine_config)?
@@ -279,7 +328,7 @@ async fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
         long_prefill_token_threshold: cli.long_prefill_token_threshold,
         max_total_tokens,
         decode_reservation_cap,
-        chunked_prefill: cli.chunked_prefill,
+        chunked_prefill: cli.chunked_prefill && !cli.no_chunked_prefill,
         ..SchedulerConfig::default()
     };
     info!(

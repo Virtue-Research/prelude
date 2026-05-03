@@ -63,5 +63,7 @@ cuda = [
 # AMD GPU inference — bare-metal KFD via t0-gpu (zero HIP/ROCm dependency).
 # Disabled until t0-gpu upstream fixes `tests/t0_original` submodule entry.
 # amd = ["dep:prelude-amd"]
+# NVTX profiling annotations (no-op without this feature).
+nvtx = ["prelude-core/nvtx"]
 # Everything
 full = ["cpu", "cuda"]

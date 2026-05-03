@@ -37,7 +37,7 @@ pub const DEFAULT_CUDA_GRAPH_MAX_BS: usize = 32;
 /// in the default config.
 pub const DEFAULT_PROFILE_TOKENS: usize = 8192;
 pub const DEFAULT_PAGED_BLOCK_SIZE: usize = 128;
-pub const DEFAULT_PREFIX_BLOCK_SIZE: usize = 64;
+pub const DEFAULT_PREFIX_BLOCK_SIZE: usize = DEFAULT_PAGED_BLOCK_SIZE;
 pub const DEFAULT_DELTANET_POOL_SLOTS: u32 = 8;
 pub const DEFAULT_TEMPERATURE: f32 = 1.0;
 pub const DEFAULT_TOP_P: f32 = 1.0;
@@ -64,7 +64,7 @@ impl EngineConfig {
         let config = Self {
             cache: CacheConfig::from_env(),
             sampling: SamplingDefaults::from_env(),
-            runtime: RuntimeConfig::from_env(),
+            runtime: RuntimeConfig::from_env()?,
             adaptive: AdaptiveConfig::from_env(),
         };
         config.validate()?;
@@ -117,13 +117,18 @@ pub struct CacheConfig {
 
 impl CacheConfig {
     fn from_env() -> Self {
+        let paged_block_size =
+            parse_env_usize("PRELUDE_PAGED_BLOCK_SIZE", DEFAULT_PAGED_BLOCK_SIZE);
         Self {
-            paged_block_size: parse_env_usize("PRELUDE_PAGED_BLOCK_SIZE", DEFAULT_PAGED_BLOCK_SIZE),
+            paged_block_size,
             paged_attn_blocks: parse_env_usize("PRELUDE_PAGED_ATTN_BLOCKS", 0),
             gpu_memory_utilization: DEFAULT_GPU_MEMORY_UTILIZATION,
             prefix_cache_blocks: parse_env_usize("PRELUDE_PREFIX_CACHE_BLOCKS", 0),
-            prefix_block_size: parse_env_usize("PRELUDE_PREFIX_BLOCK_SIZE", DEFAULT_PREFIX_BLOCK_SIZE),
-            deltanet_pool_slots: parse_env_u32("PRELUDE_DELTANET_POOL_SLOTS", DEFAULT_DELTANET_POOL_SLOTS),
+            prefix_block_size: parse_env_usize("PRELUDE_PREFIX_BLOCK_SIZE", paged_block_size),
+            deltanet_pool_slots: parse_env_u32(
+                "PRELUDE_DELTANET_POOL_SLOTS",
+                DEFAULT_DELTANET_POOL_SLOTS,
+            ),
         }
     }
 }
@@ -168,6 +173,8 @@ pub struct RuntimeConfig {
     pub dtype: Option<String>,
     /// Enable CUDA graph capture for decode (Q=1) steps.
     pub cuda_graph: bool,
+    /// MoE backend selection policy for Qwen3-MoE sparse layers.
+    pub moe_backend: MoeBackendPolicy,
     /// Maximum batch size for CUDA graph capture (graphs captured for 1..=max_bs powers of 2).
     pub cuda_graph_max_bs: usize,
     /// Token count to use when profiling peak activation memory at load
@@ -179,9 +186,46 @@ pub struct RuntimeConfig {
     pub profile_tokens: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoeBackendPolicy {
+    /// Prefer the production backend. CUDA Qwen3-MoE requires FlashInfer CUTLASS.
+    Auto,
+    /// Require FlashInfer CUTLASS fused MoE.
+    Cutlass,
+    /// Use the per-expert reference path.
+    Sequential,
+}
+
+impl Default for MoeBackendPolicy {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl MoeBackendPolicy {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "cutlass" | "flashinfer" | "flashinfer-cutlass" => Ok(Self::Cutlass),
+            "sequential" | "reference" | "ref" => Ok(Self::Sequential),
+            other => Err(format!(
+                "invalid MoE backend '{other}', expected auto, cutlass, or sequential"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cutlass => "cutlass",
+            Self::Sequential => "sequential",
+        }
+    }
+}
+
 impl RuntimeConfig {
-    fn from_env() -> Self {
-        Self {
+    fn from_env() -> Result<Self, String> {
+        Ok(Self {
             device: "auto".to_string(),
             sync_timing: parse_env_bool("PRELUDE_SYNC_TIMING"),
             force_varlen_prefill: parse_env_bool("PRELUDE_FORCE_VARLEN_PREFILL"),
@@ -191,9 +235,13 @@ impl RuntimeConfig {
                 .filter(|s| !s.is_empty()),
             dtype: None,
             cuda_graph: true,
-            cuda_graph_max_bs: parse_env_usize("PRELUDE_CUDA_GRAPH_MAX_BS", DEFAULT_CUDA_GRAPH_MAX_BS),
+            moe_backend: parse_env_moe_backend()?,
+            cuda_graph_max_bs: parse_env_usize(
+                "PRELUDE_CUDA_GRAPH_MAX_BS",
+                DEFAULT_CUDA_GRAPH_MAX_BS,
+            ),
             profile_tokens: parse_env_usize("PRELUDE_PROFILE_TOKENS", DEFAULT_PROFILE_TOKENS),
-        }
+        })
     }
 }
 
@@ -266,3 +314,9 @@ fn parse_env_bool_eq1(name: &str) -> bool {
     std::env::var(name).map_or(false, |v| v == "1")
 }
 
+fn parse_env_moe_backend() -> Result<MoeBackendPolicy, String> {
+    match std::env::var("PRELUDE_MOE_BACKEND") {
+        Ok(value) if !value.is_empty() => MoeBackendPolicy::parse(&value),
+        _ => Ok(MoeBackendPolicy::Auto),
+    }
+}

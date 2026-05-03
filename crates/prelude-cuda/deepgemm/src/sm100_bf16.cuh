@@ -246,18 +246,73 @@ static SM100Config select_sm100_grouped_config(int m, int n, int k, int num_sms)
         if (legal) multicast = 2;
     }
 
+    // Demote multicast=2 → 1 for `bn` values that don't have a mc=2
+    // kernel registered below (160 and 224). Without this, lookup hits
+    // nullptr → -1 even though the heuristic chose a sensible bn.
+    if (multicast == 2 && (best_bn == 160 || best_bn == 224)) {
+        multicast = 1;
+    }
+    // Blackwell-Ultra (SM103) MGroupedContiguous mc=2 kernels OOB on
+    // shared memory across multiple bn values (compute-sanitizer
+    // catches it inside `sm100_bf16_gemm_impl<…, mc=2, MGrouped, …>`,
+    // first repro: M=1024 N=768 K=2048 G=8 → bn=64 mc=2). Same bug
+    // family as the (256, 128) Normal-path workaround and the small-N
+    // mc=2 workaround above; the grouped path can't downgrade BM
+    // (fixed at 128 by MGroupedContiguous), so the only knob left is
+    // mc. Force mc=1 for the entire SM103 grouped path until upstream
+    // fixes the kernel.
+    if (g_gpu_arch == 103 && multicast == 2) {
+        multicast = 1;
+    }
+
+    // Clamp `(stages, swizzle_d)` to whatever variant is actually
+    // compiled below for this `best_bn`. The upstream `select_num_stages`
+    // returns a smem-fit-driven optimum that doesn't know about our
+    // limited static kernel set, so on shapes like (M=1024, N=768,
+    // K=2048) it lands on stages=9 while only stages=8 is registered
+    // for bn=64 — `get_sm100_grouped_kernel` then returns nullptr → -1.
+    static const int reg_bns[9]   = {16, 32, 64,  96, 128, 160, 192, 224, 256};
+    static const int reg_stages[9]= {12, 10,  8,   7,   6,   5,   4,   4,   4};
+    static const int reg_swdy[9]  = {32, 64,128,  64, 128,  64, 128,  64, 128};
+    int forced_stages = -1, forced_swd = -1;
+    for (int i = 0; i < 9; i++) {
+        if (best_bn == reg_bns[i]) {
+            forced_stages = reg_stages[i];
+            forced_swd = reg_swdy[i];
+            break;
+        }
+    }
+
     SmemConfig scfg;
     int best_stages = select_num_stages<SM100Arch>(
         KernelKind::NoSF, MmaKindLocal::BF16,
         bm, best_bn, block_k, multicast, false,
         2, 2, m, n, 0, scfg);
 
+    int swizzle_d = scfg.swizzle_cd;
+    int smem_size = scfg.smem_size;
+
+    if (forced_stages > 0) {
+        // After forcing stages, the smem layout the registered kernel
+        // expects no longer matches the one `select_num_stages` chose
+        // for its larger stage count — passing the wrong smem_size to
+        // the launch hangs the SM. Recompute the smem layout for the
+        // exact (stages, swizzle_d) that the registered kernel uses.
+        best_stages = forced_stages;
+        swizzle_d = forced_swd;
+        SmemConfig recomp = compute_smem_config<SM100Arch>(
+            KernelKind::NoSF, MmaKindLocal::BF16,
+            bm, best_bn, block_k, best_stages, multicast, false,
+            2, 2, m, n, 0);
+        smem_size = recomp.smem_size;
+    }
+
     return SM100Config{
         .block_m = bm, .block_n = best_bn, .block_k = block_k,
         .num_stages = best_stages,
         .num_multicast = multicast, .multicast_on_a = false,
-        .swizzle_a = scfg.swizzle_a, .swizzle_b = scfg.swizzle_b, .swizzle_d = scfg.swizzle_cd,
-        .smem_size = scfg.smem_size,
+        .swizzle_a = scfg.swizzle_a, .swizzle_b = scfg.swizzle_b, .swizzle_d = swizzle_d,
+        .smem_size = smem_size,
     };
 }
 
@@ -316,6 +371,16 @@ static int sm100_m_grouped_bf16_gemm(
 ) {
     cudaGetLastError();
     auto cfg = select_sm100_grouped_config(M, N, K, g_num_sms);
+    if (getenv("DEEPGEMM_DEBUG")) {
+        fprintf(stderr,
+            "[deepgemm sm100 grouped] M=%d N=%d K=%d G=%d "
+            "→ bm=%d bn=%d bk=%d stages=%d sw_a=%d sw_b=%d sw_d=%d mc=%d mc_on_a=%d smem=%d\n",
+            M, N, K, num_groups,
+            cfg.block_m, cfg.block_n, cfg.block_k, cfg.num_stages,
+            cfg.swizzle_a, cfg.swizzle_b, cfg.swizzle_d,
+            cfg.num_multicast, cfg.multicast_on_a ? 1 : 0,
+            cfg.smem_size);
+    }
     auto kernel_ptr = get_sm100_grouped_kernel(cfg);
     if (!kernel_ptr) return -1;
 
@@ -343,8 +408,15 @@ static SM100Config select_sm100_masked_config(int expected_m, int n, int k, int 
     int block_ms[2] = {64, 128};
     int n_block_ms = 2;
 
-    int block_ns[9] = {16, 32, 64, 96, 128, 160, 192, 224, 256};
-    int n_block_ns = 9;
+    // NOTE: restricted to the block_n values that actually have compiled
+    // kernel instantiations below (see SM100_MASKED_CONFIGS). The full
+    // {96, 160, 192, 224} set is covered for *non-masked* SM100 GEMMs but
+    // not for masked yet — the heuristic previously included them and
+    // then returned a nullptr at dispatch for shapes like
+    // (M=256, N=4096, K=1024, G=4). Expand the instantiation table below
+    // if those tiles turn out to be optimal for real workloads.
+    int block_ns[5] = {16, 32, 64, 128, 256};
+    int n_block_ns = 5;
 
     int best_bm = 0, best_bn = 0, best_waves = 0, best_last = 0;
     auto ceil_div = [](int a, int b) { return (a + b - 1) / b; };

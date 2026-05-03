@@ -23,10 +23,10 @@ pub mod loading {
 pub use cache::deltanet_pool;
 pub use cache::prefix_cache;
 pub use cache::prefix_index;
-pub use config::EngineConfig;
+pub use config::{EngineConfig, MoeBackendPolicy};
+pub use engine::ScheduledEngine;
+pub use engine::scheduled as scheduled_engine;
 pub use engine::{Engine, TaskOverride};
 pub use engine::{EngineError, InferenceEngine, PseudoEngine};
-pub use engine::scheduled as scheduled_engine;
-pub use engine::ScheduledEngine;
 pub use scheduler::SchedulerConfig;
 pub use types::*;

@@ -114,13 +114,14 @@ fn main() {
         h.join().expect("nvcc PTX compilation thread panicked");
     }
 
-    // ── Phase 2: MOE WMMA static lib (FFI, not PTX) ─────────────────
-    let moe_src = kernels_dir.join("candle").join("moe_wmma.cu");
-    if moe_src.exists() {
-        println!("cargo:rerun-if-changed={}", moe_src.display());
+    // ── Phase 2: MOE WMMA + GEMV static lib (FFI, not PTX) ──────────
+    let moe_wmma_src = kernels_dir.join("candle").join("moe_wmma.cu");
+    let moe_gemv_src = kernels_dir.join("candle").join("moe_gemv.cu");
+    if moe_wmma_src.exists() {
+        println!("cargo:rerun-if-changed={}", moe_wmma_src.display());
 
-        let moe_obj = out_dir.join("moe_wmma.o");
-        let mut opts = ObjCompile::new(&moe_src, &moe_obj)
+        let moe_wmma_obj = out_dir.join("moe_wmma.o");
+        let mut opts = ObjCompile::new(&moe_wmma_src, &moe_wmma_obj)
             .include(kernels_dir.join("candle"))
             .gencode(format!("-arch=sm_{compute_cap}"))
             .cpp_std("-std=c++17");
@@ -129,11 +130,34 @@ fn main() {
         }
         compile_cu_to_obj(&nvcc, &opts);
 
-        // Archive the single object into libmoe_wmma.a so the linker
+        let mut obj_paths = vec![moe_wmma_obj];
+
+        if moe_gemv_src.exists() {
+            println!("cargo:rerun-if-changed={}", moe_gemv_src.display());
+            let moe_gemv_obj = out_dir.join("moe_gemv.o");
+            let mut gemv_opts = ObjCompile::new(&moe_gemv_src, &moe_gemv_obj)
+                .include(kernels_dir.join("candle"))
+                .gencode(format!("-arch=sm_{compute_cap}"))
+                .cpp_std("-std=c++17");
+            if compute_cap < 80 {
+                gemv_opts = gemv_opts.define("-DNO_BF16_KERNEL");
+            }
+            compile_cu_to_obj(&nvcc, &gemv_opts);
+            obj_paths.push(moe_gemv_obj);
+        }
+
+        // Archive both objects into libmoe_wmma.a so the linker
         // treats it as a normal static lib dependency.
         let moe_lib = out_dir.join("libmoe_wmma.a");
+        let mut ar_args: Vec<String> = vec![
+            "rcs".to_string(),
+            moe_lib.to_str().unwrap().to_string(),
+        ];
+        for o in &obj_paths {
+            ar_args.push(o.to_str().unwrap().to_string());
+        }
         let status = std::process::Command::new("ar")
-            .args(["rcs", moe_lib.to_str().unwrap(), moe_obj.to_str().unwrap()])
+            .args(&ar_args)
             .status()
             .unwrap_or_else(|e| panic!("Failed to create libmoe_wmma.a: {e}"));
         assert!(status.success(), "ar failed for moe_wmma");

@@ -1423,7 +1423,23 @@ impl Qwen3_5SparseMoeBlock {
             xs, &experts_per_tok, &topk_weights,
             &self.experts_gate_up, &self.experts_down,
         ) {
-            r?
+            match r {
+                Ok(out) => out,
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        "CUTLASS fused MoE failed; falling back to composed MoE"
+                    );
+                    self.forward_composed(
+                        ops,
+                        xs,
+                        &topk_weights,
+                        &experts_per_tok,
+                        n_tokens,
+                        hidden_dim,
+                    )?
+                }
+            }
         } else {
             self.forward_composed(ops, xs, &topk_weights, &experts_per_tok, n_tokens, hidden_dim)?
         };
@@ -1450,14 +1466,17 @@ impl Qwen3_5SparseMoeBlock {
         router_logits: &Tensor,
         n_tokens: usize,
     ) -> Result<(Tensor, Tensor)> {
-        // Try fused routing (single CUDA kernel, F32 softmax internally)
-        if self.norm_topk_prob {
-            if let Some(result) = ops.fused_moe_routing(router_logits, self.num_experts_per_tok) {
-                let (tw, topk_ids, _, _) = result?;
-                return Ok((tw, topk_ids.reshape((n_tokens, self.num_experts_per_tok))?));
-            }
+        // Try fused routing (single CUDA kernel, F32 softmax internally).
+        // norm_topk_prob is now part of the kernel call instead of an
+        // outer gate; passing the wrong value would silently change the
+        // routing math.
+        if let Some(result) = ops.fused_moe_routing(
+            router_logits, self.num_experts_per_tok, self.norm_topk_prob,
+        ) {
+            let (tw, topk_ids, _, _) = result?;
+            return Ok((tw, topk_ids.reshape((n_tokens, self.num_experts_per_tok))?));
         }
-        // Decomposed fallback (CPU, non-BF16, or norm_topk_prob=false)
+        // Decomposed fallback (CPU or non-BF16)
         let routing_weights = ops.softmax(&router_logits.to_dtype(DType::F32)?, router_logits.rank() - 1)?;
         let experts_per_tok = routing_weights
             .arg_sort_last_dim(false)?
@@ -1472,12 +1491,13 @@ impl Qwen3_5SparseMoeBlock {
         Ok((topk_weights, experts_per_tok))
     }
 
-    /// Fused MoE dispatch (CUDA fast path).
+    /// Composed MoE dispatch fallback.
     ///
     /// One `grouped_gemm` over the stacked `[E, 2*inter, hidden]` gate_up
-    /// weight handles all experts in a single kernel, then `silu_mul_concat`
-    /// fuses the activation, then `fused_moe_gemm` applies the down projection
-    /// with topk-weighted accumulation. This replaces a sequential
+    /// weight handles all experts in a single kernel, then the `[up|gate]`
+    /// halves are split and `silu(gate) * up` is applied before
+    /// `fused_moe_gemm` applies the down projection with topk-weighted
+    /// accumulation. This replaces a sequential
     /// `for t { for k in 0..topk { two tiny matmuls } }` loop that did two
     /// D2H syncs per layer via `to_vec2()` and launched ~`n_tokens * topk * 2`
     /// tiny GEMMs — catastrophic for a 40-layer 256-expert top-8 model.

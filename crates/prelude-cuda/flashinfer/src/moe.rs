@@ -9,9 +9,8 @@
 //!   runner.run_moe(&output, &input, &expert_ids, &expert_weights,
 //!                  &w1, &w2, num_experts, top_k, ...)?;
 
-use crate::loader::{KernelRegistry, TVMSafeCallFn};
+use crate::loader::KernelRegistry;
 use crate::types::*;
-use std::ffi::c_void;
 use std::sync::OnceLock;
 use tvm_static_ffi::TVMModuleHandle;
 
@@ -41,18 +40,23 @@ impl FusedMoeRunner {
         });
 
         let registry = get_registry();
-        let init_fn = registry.get_utility("init")
+        let init_fn = registry
+            .get_utility("init")
             .ok_or("CUTLASS fused MoE kernel not compiled (missing 'init' symbol)")?;
 
         // init(activation_dtype, weight_dtype, output_dtype,
         //      use_deepseek_fp8, use_w4_group_scaling, use_mxfp8_act_scaling, use_packed_weights)
         // DLDataType for BF16: code=4 (kDLBfloat), bits=16, lanes=1
-        let bf16_dtype = TVMFFIAny::dlpack_dtype(DLDataType { code: KDLBFLOAT, bits: 16, lanes: 1 });
+        let bf16_dtype = TVMFFIAny::dlpack_dtype(DLDataType {
+            code: KDLBFLOAT,
+            bits: 16,
+            lanes: 1,
+        });
 
         let args = [
-            bf16_dtype,              // activation_dtype
-            bf16_dtype,              // weight_dtype
-            bf16_dtype,              // output_dtype
+            bf16_dtype,                 // activation_dtype
+            bf16_dtype,                 // weight_dtype
+            bf16_dtype,                 // output_dtype
             TVMFFIAny::bool_val(false), // use_deepseek_fp8_block_scale
             TVMFFIAny::bool_val(false), // use_w4_group_scaling
             TVMFFIAny::bool_val(false), // use_mxfp8_act_scaling
@@ -94,31 +98,31 @@ impl FusedMoeRunner {
         ep_rank: i64,
     ) -> Result<(), String> {
         let args = [
-            TVMFFIAny::dltensor(output),                // output
-            TVMFFIAny::dltensor(input),                 // input
+            TVMFFIAny::dltensor(output),                 // output
+            TVMFFIAny::dltensor(input),                  // input
             TVMFFIAny::dltensor(token_selected_experts), // token_selected_experts
-            TVMFFIAny::dltensor(token_final_scales),    // token_final_scales (Optional: present)
-            TVMFFIAny::dltensor(w1),                    // fc1_expert_weights
-            TVMFFIAny::none(),                          // fc1_expert_biases (None)
-            TVMFFIAny::dltensor(w2),                    // fc2_expert_weights
-            TVMFFIAny::none(),                          // fc2_expert_biases (None)
-            TVMFFIAny::none(),                          // quant_scales (None)
-            TVMFFIAny::none(),                          // input_sf (None)
-            TVMFFIAny::none(),                          // swiglu_alpha (None)
-            TVMFFIAny::none(),                          // swiglu_beta (None)
-            TVMFFIAny::none(),                          // swiglu_limit (None)
-            TVMFFIAny::bool_val(false),                 // swizzled_input_sf
-            TVMFFIAny::int64(tp_size),                  // tp_size
-            TVMFFIAny::int64(tp_rank),                  // tp_rank
-            TVMFFIAny::int64(ep_size),                  // ep_size
-            TVMFFIAny::int64(ep_rank),                  // ep_rank
-            TVMFFIAny::int64(1),                        // cluster_size
-            TVMFFIAny::int64(0),                        // cluster_rank
-            TVMFFIAny::bool_val(false),                 // enable_alltoall
-            TVMFFIAny::bool_val(false),                 // min_latency_mode
-            TVMFFIAny::none(),                          // profile_ids (None = auto)
-            TVMFFIAny::bool_val(false),                 // enable_pdl
-            TVMFFIAny::int64(ACTIVATION_SWIGLU),        // base_activation_type
+            TVMFFIAny::dltensor(token_final_scales),     // token_final_scales (Optional: present)
+            TVMFFIAny::dltensor(w1),                     // fc1_expert_weights
+            TVMFFIAny::none(),                           // fc1_expert_biases (None)
+            TVMFFIAny::dltensor(w2),                     // fc2_expert_weights
+            TVMFFIAny::none(),                           // fc2_expert_biases (None)
+            TVMFFIAny::none(),                           // quant_scales (None)
+            TVMFFIAny::none(),                           // input_sf (None)
+            TVMFFIAny::none(),                           // swiglu_alpha (None)
+            TVMFFIAny::none(),                           // swiglu_beta (None)
+            TVMFFIAny::none(),                           // swiglu_limit (None)
+            TVMFFIAny::bool_val(false),                  // swizzled_input_sf
+            TVMFFIAny::int64(tp_size),                   // tp_size
+            TVMFFIAny::int64(tp_rank),                   // tp_rank
+            TVMFFIAny::int64(ep_size),                   // ep_size
+            TVMFFIAny::int64(ep_rank),                   // ep_rank
+            TVMFFIAny::int64(1),                         // cluster_size
+            TVMFFIAny::int64(0),                         // cluster_rank
+            TVMFFIAny::bool_val(false),                  // enable_alltoall
+            TVMFFIAny::bool_val(false),                  // min_latency_mode
+            TVMFFIAny::none(),                           // profile_ids (None = auto)
+            TVMFFIAny::bool_val(false),                  // enable_pdl
+            TVMFFIAny::int64(ACTIVATION_SWIGLU),         // base_activation_type
         ];
 
         unsafe { self.module.call(b"run_moe\0", &args) }?;

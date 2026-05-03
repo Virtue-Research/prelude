@@ -97,6 +97,9 @@ pub struct Sequence {
     pub kv_computed_len: usize,
     /// Real GPU block IDs (authoritative source, managed by scheduler).
     pub block_table: Vec<u32>,
+    /// Coarse hash of the leading prompt blocks used to avoid scheduling
+    /// multiple uncached copies of the same prefix in one prefill step.
+    pub prefix_cache_key: Option<u64>,
     pub deltanet_slot: Option<u32>,
     pub preempt_count: u32,
 }
@@ -125,6 +128,7 @@ impl Sequence {
             priority,
             kv_computed_len: 0,
             block_table: Vec::new(),
+            prefix_cache_key: None,
             deltanet_slot: None,
             preempt_count: 0,
         }
@@ -292,10 +296,7 @@ impl Scheduler {
     }
 
     /// Attach a shared block manager (called once during ScheduledEngine init).
-    pub fn set_block_manager(
-        &mut self,
-        bm: std::sync::Arc<std::sync::Mutex<super::BlockManager>>,
-    ) {
+    pub fn set_block_manager(&mut self, bm: std::sync::Arc<std::sync::Mutex<super::BlockManager>>) {
         self.block_manager = Some(bm);
     }
 
@@ -315,7 +316,11 @@ impl Scheduler {
 
     /// Allocate blocks for `num_tokens` tokens. Returns None if not enough blocks.
     pub fn allocate_blocks_for_tokens(&self, num_tokens: usize) -> Option<Vec<u32>> {
-        self.block_manager.as_ref()?.lock().ok()?.allocate_for_tokens(num_tokens)
+        self.block_manager
+            .as_ref()?
+            .lock()
+            .ok()?
+            .allocate_for_tokens(num_tokens)
     }
 
     /// Free blocks back to the pool.
@@ -428,6 +433,12 @@ impl Scheduler {
         self.running = kept;
         for sequence in returned.into_iter().rev() {
             self.waiting_queue.push_front(sequence);
+        }
+    }
+
+    pub(crate) fn for_each_waiting_mut(&mut self, mut f: impl FnMut(&mut Sequence)) {
+        for sequence in &mut self.waiting_queue {
+            f(sequence);
         }
     }
 

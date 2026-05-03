@@ -486,7 +486,8 @@ fn run_grouped_test(ms: &[usize], n: usize, k: usize, gpu: &Gpu) {
 #[test]
 fn grouped_gemm_small() {
     let gpu = match Gpu::new() { Some(g) => g, None => return };
-    if grouped_sm100_skip_if_blackwell("grouped_gemm_small") { return; }
+    // SM103 grouped path is now safe under the mc=2→1 downgrade in
+    // src/sm100_bf16.cuh. Don't skip on Blackwell anymore.
     // 2 groups, each 128 rows (aligned to 128)
     run_grouped_test(&[128, 128], 256, 256, &gpu);
     // 4 groups, each 128 rows
@@ -496,7 +497,7 @@ fn grouped_gemm_small() {
 #[test]
 fn grouped_gemm_moe_shapes() {
     let gpu = match Gpu::new() { Some(g) => g, None => return };
-    if grouped_sm100_skip_if_blackwell("grouped_gemm_moe_shapes") { return; }
+    // SM103 grouped path is now safe under the mc=2→1 downgrade.
     // DeepSeek-V3 MoE: 8 experts, hidden=7168, intermediate=4096
     for (ms, n, k) in [
         (vec![128; 4], 4096, 1024),
@@ -510,7 +511,7 @@ fn grouped_gemm_moe_shapes() {
 #[test]
 fn grouped_gemm_unequal_groups() {
     let gpu = match Gpu::new() { Some(g) => g, None => return };
-    if grouped_sm100_skip_if_blackwell("grouped_gemm_unequal_groups") { return; }
+    // SM103 grouped path is now safe under the mc=2→1 downgrade.
     // Unequal per-group M sizes (all aligned to 128)
     run_grouped_test(&[128, 256, 128], 1024, 1024, &gpu);
     run_grouped_test(&[256, 128, 384, 128], 4096, 1024, &gpu);
