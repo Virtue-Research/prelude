@@ -3,8 +3,8 @@
 //! Overrides tensor primitives with CUDA kernels, plus norm, fused, attention, etc.
 //! Methods not overridden inherit defaults from `trait Ops`.
 
-use prelude_core::tensor::{bail, DType, Result, Tensor};
 use prelude_core::ops::traits::*;
+use prelude_core::tensor::{DType, Result, Tensor, bail};
 
 pub struct CudaOps;
 
@@ -41,7 +41,9 @@ pub(crate) fn detect_sm_major() -> i32 {
     const CUDA_DEV_ATTR_MAJOR: i32 = 75;
 
     let mut dev = 0i32;
-    if unsafe { cudaGetDevice(&mut dev) } != 0 { return 0; }
+    if unsafe { cudaGetDevice(&mut dev) } != 0 {
+        return 0;
+    }
 
     static CACHE: Mutex<Option<HashMap<i32, i32>>> = Mutex::new(None);
     let mut guard = match CACHE.lock() {
@@ -73,7 +75,9 @@ fn cu_seqlens_to_lens(cu_seqlens: &Tensor) -> Result<Tensor> {
 // CudaOps only overrides fused/inference-specific ops.
 
 impl Ops for CudaOps {
-    fn default_impl(&self) -> &dyn Ops { self }
+    fn default_impl(&self) -> &dyn Ops {
+        self
+    }
 
     // ── Normalization (CUDA kernels) ──────────────────────────────
 
@@ -91,10 +95,21 @@ impl Ops for CudaOps {
 
     // ── GEMM ──────────────────────────────────────────────────────
 
-    fn grouped_gemm(&self, input: &Tensor, weights: &Tensor, sorted_token_ids: &Tensor, sorted_expert_ids: &Tensor, _num_tokens_per_expert: &Tensor) -> Result<Tensor> {
+    fn grouped_gemm(
+        &self,
+        input: &Tensor,
+        weights: &Tensor,
+        sorted_token_ids: &Tensor,
+        sorted_expert_ids: &Tensor,
+        _num_tokens_per_expert: &Tensor,
+    ) -> Result<Tensor> {
         let num_assignments = sorted_token_ids.elem_count();
         let num_tokens = input.dims()[0];
-        let topk = if num_tokens > 0 { num_assignments / num_tokens } else { 1 };
+        let topk = if num_tokens > 0 {
+            num_assignments / num_tokens
+        } else {
+            1
+        };
         // Dispatch order, fastest-first:
         //   1. DeepGEMM `m_grouped_bf16_gemm` (SM90+, BF16, MoE-tuned).
         //      Pads each expert slice to 128 rows; near-zero overhead at
@@ -104,22 +119,50 @@ impl Ops for CudaOps {
         //   3. WMMA SM75-era kernel (universal fallback).
         // Each helper returns `Ok(None)` on unsupported arch/dtype/shape
         // so we fall through to the next path cleanly.
-        if let Some(out) = crate::ops::moe::try_grouped_gemm_deepgemm(input, weights, sorted_token_ids, sorted_expert_ids, topk)? {
+        if let Some(out) = crate::ops::moe::try_grouped_gemm_deepgemm(
+            input,
+            weights,
+            sorted_token_ids,
+            sorted_expert_ids,
+            topk,
+        )? {
             return Ok(out);
         }
-        if let Some(out) = crate::ops::moe::try_grouped_gemm_sm100(input, weights, sorted_token_ids, sorted_expert_ids, topk)? {
+        if let Some(out) = crate::ops::moe::try_grouped_gemm_sm100(
+            input,
+            weights,
+            sorted_token_ids,
+            sorted_expert_ids,
+            topk,
+        )? {
             return Ok(out);
         }
-        crate::ops::moe::moe_gemm_wmma(input, weights, &None, sorted_token_ids, sorted_expert_ids, topk, num_tokens > 1)
+        crate::ops::moe::moe_gemm_wmma(
+            input,
+            weights,
+            &None,
+            sorted_token_ids,
+            sorted_expert_ids,
+            topk,
+            num_tokens > 1,
+        )
     }
 
     fn moe_sort_experts(&self, expert_ids: &Tensor) -> Option<Result<(Tensor, Tensor)>> {
         Some(crate::ops::moe::moe_sort_experts_gpu(expert_ids))
     }
 
-    fn rmsnorm_gated(&self, x: &Tensor, gate: &Tensor, weight: &Tensor, eps: f32) -> Option<Result<Tensor>> {
+    fn rmsnorm_gated(
+        &self,
+        x: &Tensor,
+        gate: &Tensor,
+        weight: &Tensor,
+        eps: f32,
+    ) -> Option<Result<Tensor>> {
         if x.dtype() == DType::BF16 && weight.dtype() == DType::F32 {
-            return Some(crate::ops::rmsnorm::fast_rmsnorm_gated(x, gate, weight, eps as f64));
+            return Some(crate::ops::rmsnorm::fast_rmsnorm_gated(
+                x, gate, weight, eps as f64,
+            ));
         }
         None
     }
@@ -140,39 +183,87 @@ impl Ops for CudaOps {
         // variants. Unsupported arch/config cases are represented by a
         // missing runner or a normal `Err`, and the model layer keeps the
         // grouped-GEMM fallback path intact.
-        Some(crate::ops::moe::cutlass_fused_moe_forward(input, experts_per_tok, topk_weights, w1, w2))
+        Some(crate::ops::moe::cutlass_fused_moe_forward(
+            input,
+            experts_per_tok,
+            topk_weights,
+            w1,
+            w2,
+        ))
     }
 
     // ── KV cache ──────────────────────────────────────────────────
 
-    fn reshape_and_cache(&self, key: &Tensor, value: &Tensor, key_cache: &Tensor, value_cache: &Tensor, slot_mapping: &Tensor) -> Result<()> {
-        crate::ops::kv_cache::scatter_kv_cache_flash(key, value, key_cache, value_cache, slot_mapping)
+    fn reshape_and_cache(
+        &self,
+        key: &Tensor,
+        value: &Tensor,
+        key_cache: &Tensor,
+        value_cache: &Tensor,
+        slot_mapping: &Tensor,
+    ) -> Result<()> {
+        crate::ops::kv_cache::scatter_kv_cache_flash(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+        )
     }
 
     // ── Attention ─────────────────────────────────────────────────
     // Runtime dispatch: try FA4 first (has runtime kernel registry with SM detection),
     // fall back to FlashInfer, then composed CPU fallback.
 
-    fn attn_name(&self) -> &str { "cuda" }
+    fn attn_name(&self) -> &str {
+        "cuda"
+    }
 
-    fn varlen_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, params: &VarlenParams) -> Result<Tensor> {
+    fn varlen_attention(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        params: &VarlenParams,
+    ) -> Result<Tensor> {
         // All three backends are stride-aware on Q/K/V (requires only stride(-1) == 1):
         // FA4 reads strides from DLTensor, FlashInfer reads q.stride(0)/stride(1) in
         // its C++ wrapper, and the composed SDPA fallback materializes via to_dtype.
-        if let Some(r) = try_fa4_varlen(q, k, v, params) { return r; }
-        if let Some(r) = try_flashinfer_varlen(q, k, v, params) { return r; }
+        if let Some(r) = try_fa4_varlen(q, k, v, params) {
+            return r;
+        }
+        if let Some(r) = try_flashinfer_varlen(q, k, v, params) {
+            return r;
+        }
         prelude_core::ops::traits::attention::varlen_attention(q, k, v, params)
     }
 
-    fn paged_attention(&self, q: &Tensor, key_cache: &Tensor, value_cache: &Tensor, params: &PagedParams) -> Result<Tensor> {
+    fn paged_attention(
+        &self,
+        q: &Tensor,
+        key_cache: &Tensor,
+        value_cache: &Tensor,
+        params: &PagedParams,
+    ) -> Result<Tensor> {
         // FA4 paged: handles both prefill (Q>1) and decode (Q=1).
         let seqused_k = cu_seqlens_to_lens(params.cu_seqlens_k)?;
         if let Some(r) = crate::attn::flash_v4::try_varlen_paged(
-            q, key_cache, value_cache, params.block_tables,
-            params.cu_seqlens_q, &seqused_k, params.max_seqlen_q, params.max_seqlen_k, params.scale,
-        ) { return r; }
+            q,
+            key_cache,
+            value_cache,
+            params.block_tables,
+            params.cu_seqlens_q,
+            &seqused_k,
+            params.max_seqlen_q,
+            params.max_seqlen_k,
+            params.scale,
+        ) {
+            return r;
+        }
         // FlashInfer fallback (SM80 without FA4, or non-BF16).
-        if let Some(r) = try_flashinfer_paged(q, key_cache, value_cache, params) { return r; }
+        if let Some(r) = try_flashinfer_paged(q, key_cache, value_cache, params) {
+            return r;
+        }
         bail!("paged_attention: no kernel available for this configuration")
     }
 
@@ -190,82 +281,222 @@ impl Ops for CudaOps {
 
     // ── Fused ops (CUDA kernels) ─────────────────────────────────
 
-    fn fused_add_rmsnorm(&self, residual: &Tensor, x: &Tensor, weight: &Tensor, eps: f32) -> Option<Result<(Tensor, Tensor)>> {
-        if x.dtype() != DType::BF16 { return None; }
+    fn fused_add_rmsnorm(
+        &self,
+        residual: &Tensor,
+        x: &Tensor,
+        weight: &Tensor,
+        eps: f32,
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        if x.dtype() != DType::BF16 {
+            return None;
+        }
         // FlashInfer's fused kernel applies weight in BF16; fall through to the
         // composed path when weight is F32 so the multiply happens in F32 (HF
         // parity for models with small `+1` residual norm weights).
-        if weight.dtype() != DType::BF16 { return None; }
+        if weight.dtype() != DType::BF16 {
+            return None;
+        }
         // FlashInfer in-place: after call, x = rmsnorm(x + residual), residual = x + residual.
         // Safe because residual flows linearly through layers (never branched).
-        Some(crate::attn::flashinfer::fi_fused_add_rmsnorm(x, residual, weight, eps as f64)
-            .map(|()| (residual.clone(), x.clone())))
+        Some(
+            crate::attn::flashinfer::fi_fused_add_rmsnorm(x, residual, weight, eps as f64)
+                .map(|()| (residual.clone(), x.clone())),
+        )
     }
 
     fn fused_silu_mul(&self, gate: &Tensor, up: &Tensor) -> Option<Result<Tensor>> {
-        if gate.dtype() != DType::BF16 { return None; }
+        if gate.dtype() != DType::BF16 {
+            return None;
+        }
         Some(crate::ops::elementwise::fused_silu_mul(gate, up))
     }
 
     fn silu_mul_concat(&self, gate_up: &Tensor) -> Option<Result<Tensor>> {
-        if gate_up.dtype() != DType::BF16 { return None; }
+        if gate_up.dtype() != DType::BF16 {
+            return None;
+        }
         Some(crate::attn::flashinfer::silu_and_mul(gate_up))
     }
 
     fn silu_mul_concat_swap(&self, gate_up: &Tensor, inter: usize) -> Option<Result<Tensor>> {
-        if gate_up.dtype() != DType::BF16 { return None; }
+        if gate_up.dtype() != DType::BF16 {
+            return None;
+        }
         Some(crate::ops::moe::silu_mul_swap(gate_up, inter))
     }
 
     fn fused_add(&self, a: &Tensor, b: &Tensor) -> Option<Result<Tensor>> {
         if a.dtype() == DType::BF16 && b.dtype() == DType::BF16 {
             Some(crate::ops::elementwise::vectorized_add(a, b))
-        } else { None }
+        } else {
+            None
+        }
     }
 
-    fn fused_qknorm_rope(&self, q: &Tensor, k: &Tensor, q_weight: &Tensor, k_weight: &Tensor, cos: &Tensor, sin: &Tensor, position_ids: &Tensor, eps: f32) -> Option<Result<(Tensor, Tensor)>> {
-        if q.dtype() != DType::BF16 { return None; }
+    fn fused_qknorm_rope(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        q_weight: &Tensor,
+        k_weight: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        position_ids: &Tensor,
+        eps: f32,
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        if q.dtype() != DType::BF16 {
+            return None;
+        }
         // CUDA kernel supports head_dim <= 256 (8 elements per lane, vals[8])
         let head_dim = q.dims().last().copied().unwrap_or(0);
-        if head_dim > 256 { return None; }
-        let q_out = match crate::ops::rope::fused_qknorm_rope_varlen(q, q_weight, cos, sin, position_ids, eps as f64) {
-            Ok(t) => t, Err(e) => return Some(Err(e)),
+        if head_dim > 256 {
+            return None;
+        }
+        let q_out = match crate::ops::rope::fused_qknorm_rope_varlen(
+            q,
+            q_weight,
+            cos,
+            sin,
+            position_ids,
+            eps as f64,
+        ) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e)),
         };
-        let k_out = match crate::ops::rope::fused_qknorm_rope_varlen(k, k_weight, cos, sin, position_ids, eps as f64) {
-            Ok(t) => t, Err(e) => return Some(Err(e)),
+        let k_out = match crate::ops::rope::fused_qknorm_rope_varlen(
+            k,
+            k_weight,
+            cos,
+            sin,
+            position_ids,
+            eps as f64,
+        ) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e)),
         };
         Some(Ok((q_out, k_out)))
     }
 
-    fn fused_q_norm_rope(&self, q: &Tensor, q_weight: &Tensor, cos: &Tensor, sin: &Tensor, position_ids: &Tensor, eps: f32) -> Option<Result<Tensor>> {
-        if q.dtype() != DType::BF16 { return None; }
+    fn fused_q_norm_rope(
+        &self,
+        q: &Tensor,
+        q_weight: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        position_ids: &Tensor,
+        eps: f32,
+    ) -> Option<Result<Tensor>> {
+        if q.dtype() != DType::BF16 {
+            return None;
+        }
         let head_dim = q.dims().last().copied().unwrap_or(0);
-        if head_dim > 256 { return None; }
-        Some(crate::ops::rope::fused_qknorm_rope_varlen(q, q_weight, cos, sin, position_ids, eps as f64))
-    }
-
-    fn fused_knorm_rope_cache_write(&self, k: &Tensor, v: &Tensor, k_weight: &Tensor, cos: &Tensor, sin: &Tensor, position_ids: &Tensor, key_cache: &Tensor, value_cache: &Tensor, slot_mapping: &Tensor, eps: f32) -> Option<Result<()>> {
-        if k.dtype() != DType::BF16 { return None; }
-        if !crate::ops::kv_cache::fused_kv_cache_write_enabled() { return None; }
-        let k_dims = k.dims();
-        let kc_dims = key_cache.dims();
-        let num_kv_heads = if k_dims.len() == 3 { k_dims[1] } else { return None };
-        let head_dim = if k_dims.len() == 3 { k_dims[2] } else { return None };
-        let block_size = if kc_dims.len() == 4 { kc_dims[1] } else { return None };
-        Some(crate::ops::kv_cache::fused_knorm_rope_kv_cache_write_varlen(
-            k, v, k_weight, cos, sin, position_ids, key_cache, value_cache, slot_mapping,
-            num_kv_heads, head_dim, block_size, eps as f64,
+        if head_dim > 256 {
+            return None;
+        }
+        Some(crate::ops::rope::fused_qknorm_rope_varlen(
+            q,
+            q_weight,
+            cos,
+            sin,
+            position_ids,
+            eps as f64,
         ))
     }
 
-    fn fused_moe_routing(&self, gate_logits: &Tensor, top_k: usize, norm_topk_prob: bool) -> Option<Result<(Tensor, Tensor, Tensor, Tensor)>> {
-        if gate_logits.dtype() != DType::BF16 { return None; }
-        Some(crate::ops::moe::fused_moe_routing(gate_logits, top_k, norm_topk_prob))
+    fn fused_knorm_rope_cache_write(
+        &self,
+        k: &Tensor,
+        v: &Tensor,
+        k_weight: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        position_ids: &Tensor,
+        key_cache: &Tensor,
+        value_cache: &Tensor,
+        slot_mapping: &Tensor,
+        eps: f32,
+    ) -> Option<Result<()>> {
+        if k.dtype() != DType::BF16 {
+            return None;
+        }
+        if !crate::ops::kv_cache::fused_kv_cache_write_enabled() {
+            return None;
+        }
+        let k_dims = k.dims();
+        let kc_dims = key_cache.dims();
+        let num_kv_heads = if k_dims.len() == 3 {
+            k_dims[1]
+        } else {
+            return None;
+        };
+        let head_dim = if k_dims.len() == 3 {
+            k_dims[2]
+        } else {
+            return None;
+        };
+        let block_size = if kc_dims.len() == 4 {
+            kc_dims[1]
+        } else {
+            return None;
+        };
+        Some(
+            crate::ops::kv_cache::fused_knorm_rope_kv_cache_write_varlen(
+                k,
+                v,
+                k_weight,
+                cos,
+                sin,
+                position_ids,
+                key_cache,
+                value_cache,
+                slot_mapping,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                eps as f64,
+            ),
+        )
     }
 
-    fn fused_moe_gemm(&self, input: &Tensor, weights: &Tensor, topk_weights: &Tensor, sorted_token_ids: &Tensor, sorted_expert_ids: &Tensor, topk: usize, is_prefill: bool) -> Option<Result<Tensor>> {
-        if !matches!(input.dtype(), DType::BF16 | DType::F16) { return None; }
-        Some(crate::ops::moe::moe_gemm_wmma(input, weights, &Some(topk_weights.clone()), sorted_token_ids, sorted_expert_ids, topk, is_prefill))
+    fn fused_moe_routing(
+        &self,
+        gate_logits: &Tensor,
+        top_k: usize,
+        norm_topk_prob: bool,
+    ) -> Option<Result<(Tensor, Tensor, Tensor, Tensor)>> {
+        if gate_logits.dtype() != DType::BF16 {
+            return None;
+        }
+        Some(crate::ops::moe::fused_moe_routing(
+            gate_logits,
+            top_k,
+            norm_topk_prob,
+        ))
+    }
+
+    fn fused_moe_gemm(
+        &self,
+        input: &Tensor,
+        weights: &Tensor,
+        topk_weights: &Tensor,
+        sorted_token_ids: &Tensor,
+        sorted_expert_ids: &Tensor,
+        topk: usize,
+        is_prefill: bool,
+    ) -> Option<Result<Tensor>> {
+        if !matches!(input.dtype(), DType::BF16 | DType::F16) {
+            return None;
+        }
+        Some(crate::ops::moe::moe_gemm_wmma(
+            input,
+            weights,
+            &Some(topk_weights.clone()),
+            sorted_token_ids,
+            sorted_expert_ids,
+            topk,
+            is_prefill,
+        ))
     }
 
     fn kda_decode_batched(
@@ -296,7 +527,6 @@ impl Ops for CudaOps {
         crate::attn::kda_decode::supported_on_current_arch()
     }
 
-
     fn causal_conv1d_fn(
         &self,
         x: &Tensor,
@@ -305,9 +535,8 @@ impl Ops for CudaOps {
         initial_states: Option<&Tensor>,
         silu_activation: bool,
     ) -> Option<Result<Tensor>> {
-        match crate::attn::causal_conv1d::try_fwd(
-            x, weight, bias, initial_states, silu_activation,
-        ) {
+        match crate::attn::causal_conv1d::try_fwd(x, weight, bias, initial_states, silu_activation)
+        {
             Ok(Some(t)) => Some(Ok(t)),
             Ok(None) => None,
             Err(e) => Some(Err(e)),
@@ -324,7 +553,12 @@ impl Ops for CudaOps {
         conv_state_indices: Option<&Tensor>,
     ) -> Option<Result<Tensor>> {
         match crate::attn::causal_conv1d::try_update(
-            x, conv_state, weight, bias, silu_activation, conv_state_indices,
+            x,
+            conv_state,
+            weight,
+            bias,
+            silu_activation,
+            conv_state_indices,
         ) {
             Ok(Some(t)) => Some(Ok(t)),
             Ok(None) => None,
@@ -344,16 +578,18 @@ impl Ops for CudaOps {
         head_dim: usize,
     ) -> Option<Result<(Tensor, Tensor, Tensor, Tensor, Tensor)>> {
         Some(crate::ops::gdn_post_conv::gdn_post_conv(
-            mixed_qkv, a_raw, b_raw, a_log, dt_bias,
-            num_k_heads, num_v_heads, head_dim,
+            mixed_qkv,
+            a_raw,
+            b_raw,
+            a_log,
+            dt_bias,
+            num_k_heads,
+            num_v_heads,
+            head_dim,
         ))
     }
 
-    fn gather_log_softmax(
-        &self,
-        logits: &Tensor,
-        target_ids: &Tensor,
-    ) -> Option<Result<Tensor>> {
+    fn gather_log_softmax(&self, logits: &Tensor, target_ids: &Tensor) -> Option<Result<Tensor>> {
         Some(crate::ops::gather_log_softmax::gather_log_softmax(
             logits, target_ids,
         ))
@@ -371,7 +607,14 @@ impl Ops for CudaOps {
         scale: f32,
     ) -> Option<Result<(Tensor, Tensor)>> {
         match crate::attn::gdn_prefill::try_prefill(
-            q, k, v, alpha, beta, cu_seqlens, initial_state, scale,
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            cu_seqlens,
+            initial_state,
+            scale,
         ) {
             Ok(Some(pair)) => Some(Ok(pair)),
             Ok(None) => None,
@@ -381,12 +624,11 @@ impl Ops for CudaOps {
 
     // ── Sampling ──────────────────────────────────────────────────
 
-    fn sample_from_logits(
-        &self,
-        logits: &Tensor,
-        deterministic: bool,
-    ) -> Option<Result<Tensor>> {
-        Some(crate::ops::sampling::sample_from_logits(logits, deterministic))
+    fn sample_from_logits(&self, logits: &Tensor, deterministic: bool) -> Option<Result<Tensor>> {
+        Some(crate::ops::sampling::sample_from_logits(
+            logits,
+            deterministic,
+        ))
     }
 
     fn top_k_top_p_sample(
@@ -396,7 +638,12 @@ impl Ops for CudaOps {
         top_p: f64,
         deterministic: bool,
     ) -> Option<Result<Tensor>> {
-        Some(crate::ops::sampling::top_k_top_p_sample(logits, top_k, top_p, deterministic))
+        Some(crate::ops::sampling::top_k_top_p_sample(
+            logits,
+            top_k,
+            top_p,
+            deterministic,
+        ))
     }
 
     // ── Session ───────────────────────────────────────────────────
@@ -407,19 +654,46 @@ impl Ops for CudaOps {
     fn end_forward(&self) {
         crate::attn::flashinfer::end_forward();
     }
-    fn precompute_paged_plan(&self, q_shape: (usize, usize, usize), key_cache: &Tensor, cu_seqlens_q: &Tensor, block_tables: &Tensor, cu_seqlens_k: &Tensor, softmax_scale: f32) -> Result<()> {
-        crate::attn::flashinfer::precompute_paged_plan(q_shape, key_cache, cu_seqlens_q, block_tables, cu_seqlens_k, softmax_scale)?;
+    fn precompute_paged_plan(
+        &self,
+        q_shape: (usize, usize, usize),
+        key_cache: &Tensor,
+        cu_seqlens_q: &Tensor,
+        block_tables: &Tensor,
+        cu_seqlens_k: &Tensor,
+        softmax_scale: f32,
+    ) -> Result<()> {
+        crate::attn::flashinfer::precompute_paged_plan(
+            q_shape,
+            key_cache,
+            cu_seqlens_q,
+            block_tables,
+            cu_seqlens_k,
+            softmax_scale,
+        )?;
         Ok(())
     }
     fn gpu_free_memory(&self) -> Option<usize> {
-        unsafe extern "C" { fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32; }
+        unsafe extern "C" {
+            fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
+        }
         let (mut free, mut total) = (0usize, 0usize);
-        if unsafe { cudaMemGetInfo(&mut free, &mut total) } == 0 { Some(free) } else { None }
+        if unsafe { cudaMemGetInfo(&mut free, &mut total) } == 0 {
+            Some(free)
+        } else {
+            None
+        }
     }
     fn gpu_total_memory(&self) -> Option<usize> {
-        unsafe extern "C" { fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32; }
+        unsafe extern "C" {
+            fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
+        }
         let (mut free, mut total) = (0usize, 0usize);
-        if unsafe { cudaMemGetInfo(&mut free, &mut total) } == 0 { Some(total) } else { None }
+        if unsafe { cudaMemGetInfo(&mut free, &mut total) } == 0 {
+            Some(total)
+        } else {
+            None
+        }
     }
 }
 
@@ -429,24 +703,91 @@ impl Ops for CudaOps {
 fn try_fa4_varlen(q: &Tensor, k: &Tensor, v: &Tensor, p: &VarlenParams) -> Option<Result<Tensor>> {
     use crate::attn::flash_v4;
     match &p.mask {
-        MaskType::Causal => flash_v4::try_varlen_causal(q, k, v, p.cu_seqlens_q, p.cu_seqlens_k, p.max_seqlen_q, p.max_seqlen_k, p.scale),
-        MaskType::Bidirectional => flash_v4::try_varlen_bidirectional(q, k, v, p.cu_seqlens_q, p.cu_seqlens_k, p.max_seqlen_q, p.max_seqlen_k, p.scale),
-        MaskType::SlidingWindow { left, right } => flash_v4::try_varlen_windowed(q, k, v, p.cu_seqlens_q, p.cu_seqlens_k, p.max_seqlen_q, p.max_seqlen_k, p.scale, Some(*left), Some(*right)),
+        MaskType::Causal => flash_v4::try_varlen_causal(
+            q,
+            k,
+            v,
+            p.cu_seqlens_q,
+            p.cu_seqlens_k,
+            p.max_seqlen_q,
+            p.max_seqlen_k,
+            p.scale,
+        ),
+        MaskType::Bidirectional => flash_v4::try_varlen_bidirectional(
+            q,
+            k,
+            v,
+            p.cu_seqlens_q,
+            p.cu_seqlens_k,
+            p.max_seqlen_q,
+            p.max_seqlen_k,
+            p.scale,
+        ),
+        MaskType::SlidingWindow { left, right } => flash_v4::try_varlen_windowed(
+            q,
+            k,
+            v,
+            p.cu_seqlens_q,
+            p.cu_seqlens_k,
+            p.max_seqlen_q,
+            p.max_seqlen_k,
+            p.scale,
+            Some(*left),
+            Some(*right),
+        ),
         MaskType::Custom(_) => None, // FA4 doesn't support custom masks
     }
 }
 
 /// Try FlashInfer for varlen attention. Returns None if FlashInfer can't handle this.
-fn try_flashinfer_varlen(q: &Tensor, k: &Tensor, v: &Tensor, p: &VarlenParams) -> Option<Result<Tensor>> {
+fn try_flashinfer_varlen(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    p: &VarlenParams,
+) -> Option<Result<Tensor>> {
     use crate::attn::flashinfer;
     // FlashInfer supports BF16/FP16 on SM80+; head_dim up to 256 (FA2/FA3 limit)
-    if !matches!(q.dtype(), DType::BF16 | DType::F16) { return None; }
+    if !matches!(q.dtype(), DType::BF16 | DType::F16) {
+        return None;
+    }
     let head_dim = q.dims().last().copied().unwrap_or(0);
-    if head_dim > 256 { return None; }
+    if head_dim > 256 {
+        return None;
+    }
     let result = match &p.mask {
-        MaskType::Causal => flashinfer::varlen_causal(q, k, v, p.cu_seqlens_q, p.cu_seqlens_k, p.max_seqlen_q, p.max_seqlen_k, p.scale),
-        MaskType::Bidirectional => flashinfer::varlen_bidirectional(q, k, v, p.cu_seqlens_q, p.cu_seqlens_k, p.max_seqlen_q, p.max_seqlen_k, p.scale),
-        MaskType::SlidingWindow { left, right } => flashinfer::varlen_windowed(q, k, v, p.cu_seqlens_q, p.cu_seqlens_k, p.max_seqlen_q, p.max_seqlen_k, p.scale, Some(*left), Some(*right)),
+        MaskType::Causal => flashinfer::varlen_causal(
+            q,
+            k,
+            v,
+            p.cu_seqlens_q,
+            p.cu_seqlens_k,
+            p.max_seqlen_q,
+            p.max_seqlen_k,
+            p.scale,
+        ),
+        MaskType::Bidirectional => flashinfer::varlen_bidirectional(
+            q,
+            k,
+            v,
+            p.cu_seqlens_q,
+            p.cu_seqlens_k,
+            p.max_seqlen_q,
+            p.max_seqlen_k,
+            p.scale,
+        ),
+        MaskType::SlidingWindow { left, right } => flashinfer::varlen_windowed(
+            q,
+            k,
+            v,
+            p.cu_seqlens_q,
+            p.cu_seqlens_k,
+            p.max_seqlen_q,
+            p.max_seqlen_k,
+            p.scale,
+            Some(*left),
+            Some(*right),
+        ),
         MaskType::Custom(_) => return None,
     };
     // If FlashInfer fails due to missing kernel variant, return None to fall through to SDPA
@@ -460,10 +801,24 @@ fn try_flashinfer_varlen(q: &Tensor, k: &Tensor, v: &Tensor, p: &VarlenParams) -
 }
 
 /// Try FlashInfer for paged attention.
-fn try_flashinfer_paged(q: &Tensor, key_cache: &Tensor, value_cache: &Tensor, p: &PagedParams) -> Option<Result<Tensor>> {
-    if !matches!(q.dtype(), DType::BF16 | DType::F16) { return None; }
+fn try_flashinfer_paged(
+    q: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    p: &PagedParams,
+) -> Option<Result<Tensor>> {
+    if !matches!(q.dtype(), DType::BF16 | DType::F16) {
+        return None;
+    }
     Some(crate::attn::flashinfer::varlen_paged(
-        q, key_cache, value_cache, p.block_tables,
-        p.cu_seqlens_q, p.cu_seqlens_k, p.max_seqlen_q, p.max_seqlen_k, p.scale,
+        q,
+        key_cache,
+        value_cache,
+        p.block_tables,
+        p.cu_seqlens_q,
+        p.cu_seqlens_k,
+        p.max_seqlen_q,
+        p.max_seqlen_k,
+        p.scale,
     ))
 }

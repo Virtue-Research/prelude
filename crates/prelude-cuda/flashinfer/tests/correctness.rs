@@ -20,10 +20,26 @@ unsafe extern "C" {
 const H2D: i32 = 1;
 const D2H: i32 = 2;
 
-const BF16_DT: DLDataType = DLDataType { code: KDLBFLOAT, bits: 16, lanes: 1 };
-const FP32_DT: DLDataType = DLDataType { code: KDLFLOAT, bits: 32, lanes: 1 };
-const I32_DT: DLDataType = DLDataType { code: KDLINT, bits: 32, lanes: 1 };
-const U8_DT: DLDataType = DLDataType { code: KDLUINT, bits: 8, lanes: 1 };
+const BF16_DT: DLDataType = DLDataType {
+    code: KDLBFLOAT,
+    bits: 16,
+    lanes: 1,
+};
+const FP32_DT: DLDataType = DLDataType {
+    code: KDLFLOAT,
+    bits: 32,
+    lanes: 1,
+};
+const I32_DT: DLDataType = DLDataType {
+    code: KDLINT,
+    bits: 32,
+    lanes: 1,
+};
+const U8_DT: DLDataType = DLDataType {
+    code: KDLUINT,
+    bits: 8,
+    lanes: 1,
+};
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -38,7 +54,10 @@ fn contiguous_strides(shape: &[i64]) -> Vec<i64> {
 fn gpu_dl(data: *mut c_void, dtype: DLDataType, shape: &[i64], strides: &[i64]) -> DLTensor {
     DLTensor {
         data,
-        device: DLDevice { device_type: KDLCUDA, device_id: 0 },
+        device: DLDevice {
+            device_type: KDLCUDA,
+            device_id: 0,
+        },
         ndim: shape.len() as i32,
         dtype,
         shape: shape.as_ptr(),
@@ -50,7 +69,10 @@ fn gpu_dl(data: *mut c_void, dtype: DLDataType, shape: &[i64], strides: &[i64]) 
 fn cpu_dl(data: *mut c_void, dtype: DLDataType, shape: &[i64], strides: &[i64]) -> DLTensor {
     DLTensor {
         data,
-        device: DLDevice { device_type: KDLCPU, device_id: 0 },
+        device: DLDevice {
+            device_type: KDLCPU,
+            device_id: 0,
+        },
         ndim: shape.len() as i32,
         dtype,
         shape: shape.as_ptr(),
@@ -123,7 +145,13 @@ impl Workspace {
         let int_ws = gpu_alloc(int_size);
         let pinned_layout = std::alloc::Layout::from_size_align(int_size, 64).unwrap();
         let pinned_ws = unsafe { std::alloc::alloc_zeroed(pinned_layout) as *mut c_void };
-        Self { float_ws, int_ws, pinned_ws, float_size, int_size }
+        Self {
+            float_ws,
+            int_ws,
+            pinned_ws,
+            float_size,
+            int_size,
+        }
     }
 
     fn dl_float(&self) -> (DLTensor, [i64; 1], [i64; 1]) {
@@ -163,7 +191,10 @@ fn registry_creation() {
     let reg = KernelRegistry::new();
     let arch = reg.arch();
     assert!(arch >= 70, "Expected GPU with SM >= 70, got SM{arch}");
-    println!("GPU: SM{arch}, default backend: {:?}", reg.default_backend());
+    println!(
+        "GPU: SM{arch}, default backend: {:?}",
+        reg.default_backend()
+    );
 }
 
 #[test]
@@ -179,12 +210,21 @@ fn prefill_variant_lookup() {
         logits_soft_cap: false,
         backend: Backend::FA2,
     };
-    assert!(reg.get_prefill(&key).is_some(), "FA2 BF16 h128 prefill not found");
+    assert!(
+        reg.get_prefill(&key).is_some(),
+        "FA2 BF16 h128 prefill not found"
+    );
 
     // FA3 BF16 h128 — SM90+ only
     if reg.arch() >= 90 {
-        let key_fa3 = PrefillKey { backend: Backend::FA3, ..key };
-        assert!(reg.get_prefill(&key_fa3).is_some(), "FA3 BF16 h128 prefill not found");
+        let key_fa3 = PrefillKey {
+            backend: Backend::FA3,
+            ..key
+        };
+        assert!(
+            reg.get_prefill(&key_fa3).is_some(),
+            "FA3 BF16 h128 prefill not found"
+        );
     }
 }
 
@@ -209,7 +249,10 @@ fn mla_decode_variant_lookup() {
         head_dim_ckv: 512,
         head_dim_kpe: 64,
     };
-    assert!(reg.get_mla_decode(&key).is_some(), "MLA decode BF16 c512k64 not found");
+    assert!(
+        reg.get_mla_decode(&key).is_some(),
+        "MLA decode BF16 c512k64 not found"
+    );
 }
 
 #[test]
@@ -220,7 +263,10 @@ fn mla_paged_variant_lookup() {
         head_dim_ckv: 512,
         head_dim_kpe: 64,
     };
-    assert!(reg.get_mla_paged(&key).is_some(), "MLA paged BF16 c512k64 not found");
+    assert!(
+        reg.get_mla_paged(&key).is_some(),
+        "MLA paged BF16 c512k64 not found"
+    );
 }
 
 #[test]
@@ -235,29 +281,47 @@ fn fp8_prefill_variant_lookup() {
         head_dim: 128,
         sliding_window: false,
     };
-    assert!(reg.get_fp8_prefill(&key).is_some(), "FP8 E4M3 h128 prefill not found");
+    assert!(
+        reg.get_fp8_prefill(&key).is_some(),
+        "FP8 E4M3 h128 prefill not found"
+    );
 
     // With sliding window
     let key_swa = FP8PrefillKey {
         head_dim: 128,
         sliding_window: true,
     };
-    assert!(reg.get_fp8_prefill(&key_swa).is_some(), "FP8 E4M3 h128 swa prefill not found");
+    assert!(
+        reg.get_fp8_prefill(&key_swa).is_some(),
+        "FP8 E4M3 h128 swa prefill not found"
+    );
 }
 
 #[test]
 fn activation_kernel_lookup() {
     let reg = KernelRegistry::new();
 
-    assert!(reg.get_utility("silu_and_mul").is_some(), "silu_and_mul not found");
-    assert!(reg.get_utility("gelu_and_mul").is_some(), "gelu_and_mul not found");
-    assert!(reg.get_utility("gelu_tanh_and_mul").is_some(), "gelu_tanh_and_mul not found");
+    assert!(
+        reg.get_utility("silu_and_mul").is_some(),
+        "silu_and_mul not found"
+    );
+    assert!(
+        reg.get_utility("gelu_and_mul").is_some(),
+        "gelu_and_mul not found"
+    );
+    assert!(
+        reg.get_utility("gelu_tanh_and_mul").is_some(),
+        "gelu_tanh_and_mul not found"
+    );
 }
 
 #[test]
 fn moe_routing_kernel_lookup() {
     let reg = KernelRegistry::new();
-    assert!(reg.get_utility("NoAuxTc").is_some(), "NoAuxTc (MoE routing) not found");
+    assert!(
+        reg.get_utility("NoAuxTc").is_some(),
+        "NoAuxTc (MoE routing) not found"
+    );
 }
 
 #[test]
@@ -266,27 +330,58 @@ fn utility_kernel_lookup() {
 
     // Sampling
     assert!(reg.get_utility("softmax").is_some(), "softmax not found");
-    assert!(reg.get_utility("sampling_from_probs").is_some(), "sampling_from_probs not found");
-    assert!(reg.get_utility("top_k_sampling_from_probs").is_some(), "top_k not found");
-    assert!(reg.get_utility("top_p_sampling_from_probs").is_some(), "top_p not found");
+    assert!(
+        reg.get_utility("sampling_from_probs").is_some(),
+        "sampling_from_probs not found"
+    );
+    assert!(
+        reg.get_utility("top_k_sampling_from_probs").is_some(),
+        "top_k not found"
+    );
+    assert!(
+        reg.get_utility("top_p_sampling_from_probs").is_some(),
+        "top_p not found"
+    );
 
     // Norm
     assert!(reg.get_utility("rmsnorm").is_some(), "rmsnorm not found");
-    assert!(reg.get_utility("fused_add_rmsnorm").is_some(), "fused_add_rmsnorm not found");
+    assert!(
+        reg.get_utility("fused_add_rmsnorm").is_some(),
+        "fused_add_rmsnorm not found"
+    );
 
     // RoPE
-    assert!(reg.get_utility("apply_rope").is_some(), "apply_rope not found");
-    assert!(reg.get_utility("apply_rope_pos_ids_cos_sin_cache").is_some(), "rope cos_sin not found");
+    assert!(
+        reg.get_utility("apply_rope").is_some(),
+        "apply_rope not found"
+    );
+    assert!(
+        reg.get_utility("apply_rope_pos_ids_cos_sin_cache")
+            .is_some(),
+        "rope cos_sin not found"
+    );
 
     // Page
-    assert!(reg.get_utility("append_paged_kv_cache").is_some(), "append_paged_kv not found");
+    assert!(
+        reg.get_utility("append_paged_kv_cache").is_some(),
+        "append_paged_kv not found"
+    );
 
     // Cascade
-    assert!(reg.get_utility("merge_state").is_some(), "merge_state not found");
+    assert!(
+        reg.get_utility("merge_state").is_some(),
+        "merge_state not found"
+    );
 
     // FP4 KV cache
-    assert!(reg.get_utility("nvfp4_kv_quant").is_some(), "nvfp4_kv_quant not found");
-    assert!(reg.get_utility("nvfp4_kv_dequant").is_some(), "nvfp4_kv_dequant not found");
+    assert!(
+        reg.get_utility("nvfp4_kv_quant").is_some(),
+        "nvfp4_kv_quant not found"
+    );
+    assert!(
+        reg.get_utility("nvfp4_kv_dequant").is_some(),
+        "nvfp4_kv_dequant not found"
+    );
 }
 
 // ── New module lookup tests ─────────────────────────────────────────
@@ -296,27 +391,48 @@ fn new_utility_kernel_lookup() {
     let reg = KernelRegistry::new();
 
     // TopK
-    assert!(reg.get_utility("radix_topk").is_some(), "radix_topk not found");
-    assert!(reg.get_utility("can_implement_filtered_topk").is_some(), "can_implement_filtered_topk not found");
+    assert!(
+        reg.get_utility("radix_topk").is_some(),
+        "radix_topk not found"
+    );
+    assert!(
+        reg.get_utility("can_implement_filtered_topk").is_some(),
+        "can_implement_filtered_topk not found"
+    );
 
     // Concat MLA
-    assert!(reg.get_utility("concat_mla_k").is_some(), "concat_mla_k not found");
+    assert!(
+        reg.get_utility("concat_mla_k").is_some(),
+        "concat_mla_k not found"
+    );
 
     // add_moe: gen_gemm_module (segment GEMM + bmm_fp8)
-    assert!(reg.get_utility("cutlass_segment_gemm").is_some(), "cutlass_segment_gemm not found");
+    assert!(
+        reg.get_utility("cutlass_segment_gemm").is_some(),
+        "cutlass_segment_gemm not found"
+    );
     assert!(reg.get_utility("bmm_fp8").is_some(), "bmm_fp8 not found");
 
     // add_moe: DSv3 router
-    assert!(reg.get_utility("dsv3_router_gemm_op").is_some(), "dsv3_router_gemm_op not found");
+    assert!(
+        reg.get_utility("dsv3_router_gemm_op").is_some(),
+        "dsv3_router_gemm_op not found"
+    );
 
     // add_moe: MoE routing (NoAuxTc)
     assert!(reg.get_utility("NoAuxTc").is_some(), "NoAuxTc not found");
 
     // CUTLASS MLA
-    assert!(reg.get_utility("cutlass_mla_paged_attention").is_some(), "cutlass_mla_paged_attention not found");
+    assert!(
+        reg.get_utility("cutlass_mla_paged_attention").is_some(),
+        "cutlass_mla_paged_attention not found"
+    );
 
     // Comm: vLLM AllReduce (all archs)
-    assert!(reg.get_utility("init_custom_ar").is_some(), "init_custom_ar not found");
+    assert!(
+        reg.get_utility("init_custom_ar").is_some(),
+        "init_custom_ar not found"
+    );
 
     // TRT-LLM comm is SM100+, tested in sm100_module_lookup
 }
@@ -330,11 +446,16 @@ fn sm90_module_lookup() {
     }
 
     // add_misc: gen_gdn_prefill_sm90_module
-    assert!(reg.get_utility("gdn_prefill").is_some(), "gdn_prefill not found (SM90 required)");
+    assert!(
+        reg.get_utility("gdn_prefill").is_some(),
+        "gdn_prefill not found (SM90 required)"
+    );
 
     // add_moe: gen_gemm_sm90_module
-    assert!(reg.get_utility("cutlass_segment_gemm_sm90").is_some(),
-            "cutlass_segment_gemm_sm90 not found (SM90 required)");
+    assert!(
+        reg.get_utility("cutlass_segment_gemm_sm90").is_some(),
+        "cutlass_segment_gemm_sm90 not found (SM90 required)"
+    );
 }
 
 #[test]
@@ -350,15 +471,26 @@ fn sm100_module_lookup() {
     // present instead of asserting all; the test still validates that the
     // registry doesn't blow up when queried for them on Blackwell.
     let required = [
-        "fp8_gemm", "tgv_gemm", "bf16_gemm",
+        "fp8_gemm",
+        "tgv_gemm",
+        "bf16_gemm",
         "trtllm_custom_all_reduce",
-        "fp4_gemm", "mxfp8_gemm",
+        "fp4_gemm",
+        "mxfp8_gemm",
         "gemm_fp8_nt_groupwise",
-        "group_gemm_fp8_nt_groupwise", "group_gemm_mxfp4_nt_groupwise",
+        "group_gemm_fp8_nt_groupwise",
+        "group_gemm_mxfp4_nt_groupwise",
     ];
     for name in required {
         let present = reg.get_utility(name).is_some();
-        println!("SM100 utility {name}: {}", if present { "present" } else { "absent (not compiled)" });
+        println!(
+            "SM100 utility {name}: {}",
+            if present {
+                "present"
+            } else {
+                "absent (not compiled)"
+            }
+        );
     }
 }
 
@@ -369,7 +501,10 @@ fn radix_topk_correctness() {
     let reg = KernelRegistry::new();
     let topk_fn = match reg.get_utility("radix_topk") {
         Some(f) => f,
-        None => { println!("radix_topk not compiled, skipping"); return; }
+        None => {
+            println!("radix_topk not compiled, skipping");
+            return;
+        }
     };
 
     let batch = 4i64;
@@ -389,8 +524,10 @@ fn radix_topk_correctness() {
     let values_ptr = gpu_alloc((batch * k) as usize * 4);
     let indices_ptr = gpu_alloc((batch * k) as usize * 4); // int32
 
-    let in_s = [batch, d]; let in_st = contiguous_strides(&in_s);
-    let out_s = [batch, k]; let out_st = contiguous_strides(&out_s);
+    let in_s = [batch, d];
+    let in_st = contiguous_strides(&in_s);
+    let out_s = [batch, k];
+    let out_st = contiguous_strides(&out_s);
 
     let dl_in = gpu_dl(input_ptr, FP32_DT, &in_s, &in_st);
     let dl_vals = gpu_dl(values_ptr, FP32_DT, &out_s, &out_st);
@@ -403,10 +540,10 @@ fn radix_topk_correctness() {
             TVMFFIAny::dltensor(&dl_in),
             TVMFFIAny::dltensor(&dl_idxs),
             TVMFFIAny::dltensor(&dl_vals),
-            TVMFFIAny::none(),          // row_states_buffer
+            TVMFFIAny::none(), // row_states_buffer
             TVMFFIAny::int64(k),
-            TVMFFIAny::bool_val(true),  // sorted
-            TVMFFIAny::bool_val(true),  // deterministic
+            TVMFFIAny::bool_val(true), // sorted
+            TVMFFIAny::bool_val(true), // deterministic
         ];
         reg.call(topk_fn, &args).expect("radix_topk call failed");
         cudaDeviceSynchronize();
@@ -418,7 +555,12 @@ fn radix_topk_correctness() {
     // CPU reference: top-k of each row (descending)
     for b in 0..batch as usize {
         let row = &input_f32[b * d as usize..(b + 1) * d as usize];
-        let mut indexed: Vec<(f32, usize)> = row.iter().copied().enumerate().map(|(i, v)| (v, i)).collect();
+        let mut indexed: Vec<(f32, usize)> = row
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, v)| (v, i))
+            .collect();
         indexed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
 
         for j in 0..k as usize {
@@ -427,15 +569,23 @@ fn radix_topk_correctness() {
             let ref_val = indexed[j].0;
             let ref_idx = indexed[j].1;
 
-            assert!((gpu_val - ref_val).abs() < 1e-4,
-                    "TopK batch={b} rank={j}: val {gpu_val} vs ref {ref_val}");
-            assert_eq!(gpu_idx, ref_idx,
-                    "TopK batch={b} rank={j}: idx {gpu_idx} vs ref {ref_idx}");
+            assert!(
+                (gpu_val - ref_val).abs() < 1e-4,
+                "TopK batch={b} rank={j}: val {gpu_val} vs ref {ref_val}"
+            );
+            assert_eq!(
+                gpu_idx, ref_idx,
+                "TopK batch={b} rank={j}: idx {gpu_idx} vs ref {ref_idx}"
+            );
         }
     }
     println!("radix_topk [{batch}×{d}, k={k}]: PASS");
 
-    unsafe { cudaFree(input_ptr); cudaFree(values_ptr); cudaFree(indices_ptr); }
+    unsafe {
+        cudaFree(input_ptr);
+        cudaFree(values_ptr);
+        cudaFree(indices_ptr);
+    }
 }
 
 // ── TGV GEMM correctness ───────────────────────────────────────────
@@ -445,7 +595,10 @@ fn tgv_gemm_correctness() {
     let reg = KernelRegistry::new();
     let gemm = match reg.get_utility("tgv_gemm") {
         Some(f) => f,
-        None => { println!("tgv_gemm not compiled, skipping"); return; }
+        None => {
+            println!("tgv_gemm not compiled, skipping");
+            return;
+        }
     };
 
     // TGV is optimized for decode (small M)
@@ -474,9 +627,12 @@ fn tgv_gemm_correctness() {
     let b_ptr = gpu_upload(&b_bf16);
     let c_ptr = gpu_alloc((m * n) as usize * 2);
 
-    let a_s = [m, k]; let a_st = contiguous_strides(&a_s);
-    let b_s = [n, k]; let b_st = contiguous_strides(&b_s);
-    let c_s = [m, n]; let c_st = contiguous_strides(&c_s);
+    let a_s = [m, k];
+    let a_st = contiguous_strides(&a_s);
+    let b_s = [n, k];
+    let b_st = contiguous_strides(&b_s);
+    let c_s = [m, n];
+    let c_st = contiguous_strides(&c_s);
 
     let dl_a = gpu_dl(a_ptr, BF16_DT, &a_s, &a_st);
     let dl_b = gpu_dl(b_ptr, BF16_DT, &b_s, &b_st);
@@ -486,9 +642,10 @@ fn tgv_gemm_correctness() {
         reg.set_stream(0, std::ptr::null_mut());
         // tgv_gemm(mat1, mat2, bias?, tactic, out, pdl)
         let args = [
-            TVMFFIAny::dltensor(&dl_a), TVMFFIAny::dltensor(&dl_b),
-            TVMFFIAny::none(),          // no bias
-            TVMFFIAny::int64(-1),       // auto tactic
+            TVMFFIAny::dltensor(&dl_a),
+            TVMFFIAny::dltensor(&dl_b),
+            TVMFFIAny::none(),    // no bias
+            TVMFFIAny::int64(-1), // auto tactic
             TVMFFIAny::dltensor(&dl_c),
             TVMFFIAny::bool_val(false), // no pdl
         ];
@@ -505,10 +662,17 @@ fn tgv_gemm_correctness() {
         let denom = r.abs().max(1e-6);
         max_rel = max_rel.max(err / denom);
     }
-    assert!(max_rel < 0.05, "tgv_gemm: max_rel={max_rel} exceeds 5% tolerance");
+    assert!(
+        max_rel < 0.05,
+        "tgv_gemm: max_rel={max_rel} exceeds 5% tolerance"
+    );
     println!("tgv_gemm [{m}×{n}×{k}]: PASS (max_rel={max_rel:.4})");
 
-    unsafe { cudaFree(a_ptr); cudaFree(b_ptr); cudaFree(c_ptr); }
+    unsafe {
+        cudaFree(a_ptr);
+        cudaFree(b_ptr);
+        cudaFree(c_ptr);
+    }
 }
 
 // ── Concat MLA K correctness ────────────────────────────────────────
@@ -518,7 +682,10 @@ fn concat_mla_k_correctness() {
     let reg = KernelRegistry::new();
     let concat_fn = match reg.get_utility("concat_mla_k") {
         Some(f) => f,
-        None => { println!("concat_mla_k not compiled, skipping"); return; }
+        None => {
+            println!("concat_mla_k not compiled, skipping");
+            return;
+        }
     };
 
     // DeepSeek MLA specific: num_heads=128, nope_dim=128, rope_dim=64 (hardcoded in kernel)
@@ -534,16 +701,23 @@ fn concat_mla_k_correctness() {
     let full_elems = (tokens * num_heads * full_dim) as usize;
 
     // Generate known patterns
-    let nope_bf16: Vec<u16> = (0..nope_elems).map(|i| f32_to_bf16(1.0 + i as f32 * 0.001)).collect();
-    let rope_bf16: Vec<u16> = (0..rope_elems).map(|i| f32_to_bf16(-1.0 - i as f32 * 0.001)).collect();
+    let nope_bf16: Vec<u16> = (0..nope_elems)
+        .map(|i| f32_to_bf16(1.0 + i as f32 * 0.001))
+        .collect();
+    let rope_bf16: Vec<u16> = (0..rope_elems)
+        .map(|i| f32_to_bf16(-1.0 - i as f32 * 0.001))
+        .collect();
 
     let nope_ptr = gpu_upload(&nope_bf16);
     let rope_ptr = gpu_upload(&rope_bf16);
     let k_ptr = gpu_alloc(full_elems * 2);
 
-    let k_s = [tokens, num_heads, full_dim]; let k_st = contiguous_strides(&k_s);
-    let nope_s = [tokens, num_heads, nope_dim]; let nope_st = contiguous_strides(&nope_s);
-    let rope_s = [tokens, 1i64, rope_dim]; let rope_st = contiguous_strides(&rope_s);
+    let k_s = [tokens, num_heads, full_dim];
+    let k_st = contiguous_strides(&k_s);
+    let nope_s = [tokens, num_heads, nope_dim];
+    let nope_st = contiguous_strides(&nope_s);
+    let rope_s = [tokens, 1i64, rope_dim];
+    let rope_st = contiguous_strides(&rope_s);
 
     let dl_k = gpu_dl(k_ptr, BF16_DT, &k_s, &k_st);
     let dl_nope = gpu_dl(nope_ptr, BF16_DT, &nope_s, &nope_st);
@@ -557,7 +731,8 @@ fn concat_mla_k_correctness() {
             TVMFFIAny::dltensor(&dl_nope),
             TVMFFIAny::dltensor(&dl_rope),
         ];
-        reg.call(concat_fn, &args).expect("concat_mla_k call failed");
+        reg.call(concat_fn, &args)
+            .expect("concat_mla_k call failed");
         cudaDeviceSynchronize();
     }
 
@@ -575,17 +750,28 @@ fn concat_mla_k_correctness() {
                     nope_bf16[ni]
                 } else {
                     // rope has num_heads=1, broadcast to all heads
-                    let ri = t * (1 * rope_dim) as usize + 0 * rope_dim as usize + (d - nope_dim as usize);
+                    let ri = t * (1 * rope_dim) as usize
+                        + 0 * rope_dim as usize
+                        + (d - nope_dim as usize);
                     rope_bf16[ri]
                 };
-                if got != expected { mismatches += 1; }
+                if got != expected {
+                    mismatches += 1;
+                }
             }
         }
     }
-    assert_eq!(mismatches, 0, "concat_mla_k: {mismatches}/{full_elems} mismatches");
+    assert_eq!(
+        mismatches, 0,
+        "concat_mla_k: {mismatches}/{full_elems} mismatches"
+    );
     println!("concat_mla_k [{tokens}×{num_heads}×({nope_dim}+{rope_dim})]: PASS");
 
-    unsafe { cudaFree(nope_ptr); cudaFree(rope_ptr); cudaFree(k_ptr); }
+    unsafe {
+        cudaFree(nope_ptr);
+        cudaFree(rope_ptr);
+        cudaFree(k_ptr);
+    }
 }
 
 // ── Comm module lookup (multi-GPU needed for execution) ─────────────
@@ -595,8 +781,14 @@ fn comm_module_lookup() {
     let reg = KernelRegistry::new();
 
     // add_comm: gen_vllm_comm_module (all archs)
-    assert!(reg.get_utility("init_custom_ar").is_some(), "init_custom_ar not found");
-    assert!(reg.get_utility("all_reduce").is_some(), "vllm all_reduce not found");
+    assert!(
+        reg.get_utility("init_custom_ar").is_some(),
+        "init_custom_ar not found"
+    );
+    assert!(
+        reg.get_utility("all_reduce").is_some(),
+        "vllm all_reduce not found"
+    );
 
     // TRT-LLM comm is SM100+, tested in sm100_module_lookup
     println!("comm_module_lookup: PASS");
@@ -618,7 +810,10 @@ fn gdn_prefill_smoke() {
     }
     let gdn = match reg.get_utility("gdn_prefill") {
         Some(f) => f,
-        None => { println!("gdn_prefill not compiled, skipping"); return; }
+        None => {
+            println!("gdn_prefill not compiled, skipping");
+            return;
+        }
     };
 
     // Use upstream test dimensions: head_size=128, GQA (4 q heads, 1 kv head)
@@ -635,21 +830,29 @@ fn gdn_prefill_smoke() {
 
     // Q: [packed_seq, num_q_heads, head_dim] BF16
     let q_elems = (packed_seq * num_q_heads * head_dim) as usize;
-    let q_bf16: Vec<u16> = (0..q_elems).map(|i| f32_to_bf16(0.01 * ((i as f32) % 13.0 - 6.0))).collect();
+    let q_bf16: Vec<u16> = (0..q_elems)
+        .map(|i| f32_to_bf16(0.01 * ((i as f32) % 13.0 - 6.0)))
+        .collect();
 
     // K: [packed_seq, num_k_heads, head_dim] BF16 — L2 normalized per upstream
     let k_elems = (packed_seq * num_k_heads * head_dim) as usize;
-    let mut k_f32: Vec<f32> = (0..k_elems).map(|i| 0.1 * ((i as f32) % 7.0 - 3.0)).collect();
+    let mut k_f32: Vec<f32> = (0..k_elems)
+        .map(|i| 0.1 * ((i as f32) % 7.0 - 3.0))
+        .collect();
     // L2 normalize each [head_dim] vector
     for row in k_f32.chunks_mut(head_dim as usize) {
         let norm: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-12);
-        for v in row.iter_mut() { *v /= norm; }
+        for v in row.iter_mut() {
+            *v /= norm;
+        }
     }
     let k_bf16: Vec<u16> = k_f32.iter().map(|v| f32_to_bf16(*v)).collect();
 
     // V: [packed_seq, num_v_heads, head_dim] BF16
     let v_elems = (packed_seq * num_v_heads * head_dim) as usize;
-    let v_bf16: Vec<u16> = (0..v_elems).map(|i| f32_to_bf16(0.005 * ((i as f32) % 11.0 - 5.0))).collect();
+    let v_bf16: Vec<u16> = (0..v_elems)
+        .map(|i| f32_to_bf16(0.005 * ((i as f32) % 11.0 - 5.0)))
+        .collect();
 
     // Output: [packed_seq, num_sab_heads, head_dim] BF16
     let o_elems = (packed_seq * num_sab_heads * head_dim) as usize;
@@ -659,8 +862,12 @@ fn gdn_prefill_smoke() {
 
     // Alpha, Beta: [packed_seq, num_sab_heads] FP32
     let ab_elems = (packed_seq * num_sab_heads) as usize;
-    let alpha_f32: Vec<f32> = (0..ab_elems).map(|i| 0.5 + 0.01 * (i as f32 % 10.0)).collect();
-    let beta_f32: Vec<f32> = (0..ab_elems).map(|i| 0.3 + 0.01 * (i as f32 % 8.0)).collect();
+    let alpha_f32: Vec<f32> = (0..ab_elems)
+        .map(|i| 0.5 + 0.01 * (i as f32 % 10.0))
+        .collect();
+    let beta_f32: Vec<f32> = (0..ab_elems)
+        .map(|i| 0.3 + 0.01 * (i as f32 % 8.0))
+        .collect();
 
     // cu_seqlens: [num_seqs + 1] I64
     let cu_seqlens: Vec<i64> = vec![0, seq_len];
@@ -675,17 +882,28 @@ fn gdn_prefill_smoke() {
     let cu_ptr = gpu_upload(&cu_seqlens);
     let ws_ptr = gpu_alloc(128 * 1024 * 1024);
 
-    let q_s = [packed_seq, num_q_heads, head_dim]; let q_st = contiguous_strides(&q_s);
-    let k_s = [packed_seq, num_k_heads, head_dim]; let k_st = contiguous_strides(&k_s);
-    let v_s = [packed_seq, num_v_heads, head_dim]; let v_st = contiguous_strides(&v_s);
-    let o_s = [packed_seq, num_sab_heads, head_dim]; let o_st = contiguous_strides(&o_s);
+    let q_s = [packed_seq, num_q_heads, head_dim];
+    let q_st = contiguous_strides(&q_s);
+    let k_s = [packed_seq, num_k_heads, head_dim];
+    let k_st = contiguous_strides(&k_s);
+    let v_s = [packed_seq, num_v_heads, head_dim];
+    let v_st = contiguous_strides(&v_s);
+    let o_s = [packed_seq, num_sab_heads, head_dim];
+    let o_st = contiguous_strides(&o_s);
     let state_s = [num_seqs, num_sab_heads, head_dim, head_dim];
     let state_st = contiguous_strides(&state_s);
-    let ab_s = [packed_seq, num_sab_heads]; let ab_st = contiguous_strides(&ab_s);
-    let cu_s = [num_seqs + 1]; let cu_st = [1i64];
-    let ws_s = [128 * 1024 * 1024i64]; let ws_st = [1i64];
+    let ab_s = [packed_seq, num_sab_heads];
+    let ab_st = contiguous_strides(&ab_s);
+    let cu_s = [num_seqs + 1];
+    let cu_st = [1i64];
+    let ws_s = [128 * 1024 * 1024i64];
+    let ws_st = [1i64];
 
-    let i64_dt = DLDataType { code: KDLINT, bits: 64, lanes: 1 };
+    let i64_dt = DLDataType {
+        code: KDLINT,
+        bits: 64,
+        lanes: 1,
+    };
 
     let dl_o = gpu_dl(o_ptr, BF16_DT, &o_s, &o_st);
     let dl_state = gpu_dl(state_ptr, FP32_DT, &state_s, &state_st);
@@ -720,9 +938,9 @@ fn gdn_prefill_smoke() {
             TVMFFIAny::dltensor(&dl_beta),  // beta
             TVMFFIAny::float64(0.0),        // scale (0 = auto: 1/sqrt(head_dim))
             TVMFFIAny::dltensor(&dl_ws),
-            TVMFFIAny::none(),              // state_checkpoints (unused)
-            TVMFFIAny::none(),              // checkpoint_cu_starts (unused)
-            TVMFFIAny::int64(0),            // checkpoint_every_n_tokens
+            TVMFFIAny::none(),   // state_checkpoints (unused)
+            TVMFFIAny::none(),   // checkpoint_cu_starts (unused)
+            TVMFFIAny::int64(0), // checkpoint_every_n_tokens
         ];
         reg.call(gdn, &args).expect("gdn_prefill call failed");
         cudaDeviceSynchronize();
@@ -733,23 +951,35 @@ fn gdn_prefill_smoke() {
     let finite = out_f32.iter().filter(|v| v.is_finite()).count();
     let nonzero = out_f32.iter().filter(|v| v.abs() > 1e-10).count();
 
-    println!("gdn_prefill [seq={seq_len}, q_heads={num_q_heads}, kv_heads={num_k_heads}, d={head_dim}]: \
-              {finite}/{o_elems} finite, {nonzero}/{o_elems} nonzero");
+    println!(
+        "gdn_prefill [seq={seq_len}, q_heads={num_q_heads}, kv_heads={num_k_heads}, d={head_dim}]: \
+              {finite}/{o_elems} finite, {nonzero}/{o_elems} nonzero"
+    );
     assert_eq!(finite, o_elems, "GDN output has NaN/Inf");
-    assert!(nonzero > o_elems / 2, "GDN output is mostly zeros ({nonzero}/{o_elems})");
+    assert!(
+        nonzero > o_elems / 2,
+        "GDN output is mostly zeros ({nonzero}/{o_elems})"
+    );
 
     // Also verify state is populated
     let state_f32 = gpu_download::<f32>(state_ptr, state_elems);
     let state_finite = state_f32.iter().filter(|v| v.is_finite()).count();
     let state_nonzero = state_f32.iter().filter(|v| v.abs() > 1e-10).count();
-    println!("  output_state: {state_finite}/{state_elems} finite, {state_nonzero}/{state_elems} nonzero");
+    println!(
+        "  output_state: {state_finite}/{state_elems} finite, {state_nonzero}/{state_elems} nonzero"
+    );
     assert_eq!(state_finite, state_elems, "GDN state has NaN/Inf");
 
     unsafe {
-        cudaFree(q_ptr); cudaFree(k_ptr); cudaFree(v_ptr);
-        cudaFree(o_ptr); cudaFree(state_ptr);
-        cudaFree(alpha_ptr); cudaFree(beta_ptr);
-        cudaFree(cu_ptr); cudaFree(ws_ptr);
+        cudaFree(q_ptr);
+        cudaFree(k_ptr);
+        cudaFree(v_ptr);
+        cudaFree(o_ptr);
+        cudaFree(state_ptr);
+        cudaFree(alpha_ptr);
+        cudaFree(beta_ptr);
+        cudaFree(cu_ptr);
+        cudaFree(ws_ptr);
     }
 }
 
@@ -778,9 +1008,15 @@ fn prefill_ragged_causal_bf16() {
         // Generate Q, K, V with known pattern (small values for BF16 precision)
         let total = (seq_len * num_qo_heads * head_dim) as usize;
         let kv_total = (seq_len * num_kv_heads * head_dim) as usize;
-        let q_bf16: Vec<u16> = (0..total).map(|i| f32_to_bf16(0.01 * (i as f32 % 10.0))).collect();
-        let k_bf16: Vec<u16> = (0..kv_total).map(|i| f32_to_bf16(0.01 * ((i + 3) as f32 % 10.0))).collect();
-        let v_bf16: Vec<u16> = (0..kv_total).map(|i| f32_to_bf16(0.02 * ((i + 7) as f32 % 10.0))).collect();
+        let q_bf16: Vec<u16> = (0..total)
+            .map(|i| f32_to_bf16(0.01 * (i as f32 % 10.0)))
+            .collect();
+        let k_bf16: Vec<u16> = (0..kv_total)
+            .map(|i| f32_to_bf16(0.01 * ((i + 3) as f32 % 10.0)))
+            .collect();
+        let v_bf16: Vec<u16> = (0..kv_total)
+            .map(|i| f32_to_bf16(0.02 * ((i + 7) as f32 % 10.0)))
+            .collect();
 
         let q_ptr = gpu_upload(&q_bf16);
         let k_ptr = gpu_upload(&k_bf16);
@@ -831,17 +1067,18 @@ fn prefill_ragged_causal_bf16() {
             TVMFFIAny::int64(batch_size),
             TVMFFIAny::int64(num_qo_heads),
             TVMFFIAny::int64(num_kv_heads),
-            TVMFFIAny::int64(1),           // page_size (ragged=1)
-            TVMFFIAny::bool_val(false),    // cuda_graph
+            TVMFFIAny::int64(1),        // page_size (ragged=1)
+            TVMFFIAny::bool_val(false), // cuda_graph
             TVMFFIAny::int64(head_dim),
             TVMFFIAny::int64(head_dim),
-            TVMFFIAny::bool_val(true),     // causal
-            TVMFFIAny::int64(-1),          // window_left
-            TVMFFIAny::int64(-1),          // fixed_split_size
-            TVMFFIAny::bool_val(false),    // disable_split_kv
-            TVMFFIAny::int64(0),           // num_colocated_ctas
+            TVMFFIAny::bool_val(true),  // causal
+            TVMFFIAny::int64(-1),       // window_left
+            TVMFFIAny::int64(-1),       // fixed_split_size
+            TVMFFIAny::bool_val(false), // disable_split_kv
+            TVMFFIAny::int64(0),        // num_colocated_ctas
         ];
-        let plan_info = reg.call(variant.plan, &plan_args)
+        let plan_info = reg
+            .call(variant.plan, &plan_args)
             .expect("Prefill plan failed");
 
         // Ragged run
@@ -856,22 +1093,22 @@ fn prefill_ragged_causal_bf16() {
             TVMFFIAny::dltensor(&dl_cuq_gpu),
             TVMFFIAny::dltensor(&dl_cuk_gpu),
             TVMFFIAny::dltensor(&dl_o),
-            TVMFFIAny::none(),             // maybe_lse
-            TVMFFIAny::int64(1),           // mask_mode = Causal
-            TVMFFIAny::int64(0),           // layout = NHD
-            TVMFFIAny::int64(-1),          // window_left
-            TVMFFIAny::bool_val(false),    // enable_pdl
-            TVMFFIAny::none(),             // custom_mask
-            TVMFFIAny::none(),             // mask_indptr
-            TVMFFIAny::none(),             // alibi_slopes
-            TVMFFIAny::none(),             // prefix_len_ptr
-            TVMFFIAny::none(),             // token_pos_in_items_ptr
-            TVMFFIAny::none(),             // max_item_len_ptr
-            TVMFFIAny::float64(0.0),       // logits_soft_cap
+            TVMFFIAny::none(),          // maybe_lse
+            TVMFFIAny::int64(1),        // mask_mode = Causal
+            TVMFFIAny::int64(0),        // layout = NHD
+            TVMFFIAny::int64(-1),       // window_left
+            TVMFFIAny::bool_val(false), // enable_pdl
+            TVMFFIAny::none(),          // custom_mask
+            TVMFFIAny::none(),          // mask_indptr
+            TVMFFIAny::none(),          // alibi_slopes
+            TVMFFIAny::none(),          // prefix_len_ptr
+            TVMFFIAny::none(),          // token_pos_in_items_ptr
+            TVMFFIAny::none(),          // max_item_len_ptr
+            TVMFFIAny::float64(0.0),    // logits_soft_cap
             TVMFFIAny::float64(sm_scale),
-            TVMFFIAny::float64(1.0),       // rope_rcp_scale
-            TVMFFIAny::float64(1e4),       // rope_rcp_theta
-            TVMFFIAny::int64(0),           // token_pos_in_items_len
+            TVMFFIAny::float64(1.0), // rope_rcp_scale
+            TVMFFIAny::float64(1e4), // rope_rcp_theta
+            TVMFFIAny::int64(0),     // token_pos_in_items_len
         ];
         reg.call(variant.ragged_run, &run_args)
             .expect("Prefill ragged_run failed");
@@ -895,14 +1132,20 @@ fn prefill_ragged_causal_bf16() {
             let expected = v_f32[d]; // V token 0, head 0, dim d
             max_diff = max_diff.max((got - expected).abs());
         }
-        assert!(max_diff < 0.05,
-            "First token output should ≈ V[0] for causal attention, max_diff={max_diff}");
+        assert!(
+            max_diff < 0.05,
+            "First token output should ≈ V[0] for causal attention, max_diff={max_diff}"
+        );
 
         println!("Prefill causal BF16: PASS (max_diff={max_diff:.6})");
 
         // Cleanup
-        cudaFree(q_ptr); cudaFree(k_ptr); cudaFree(v_ptr); cudaFree(o_ptr);
-        cudaFree(cu_q_gpu); cudaFree(cu_k_gpu);
+        cudaFree(q_ptr);
+        cudaFree(k_ptr);
+        cudaFree(v_ptr);
+        cudaFree(o_ptr);
+        cudaFree(cu_q_gpu);
+        cudaFree(cu_k_gpu);
     }
 }
 
@@ -927,14 +1170,22 @@ fn prefill_sliding_window_dispatch() {
         logits_soft_cap: false,
         backend: Backend::FA2,
     };
-    let variant = reg.get_prefill(&key).expect("SWA prefill variant not found");
+    let variant = reg
+        .get_prefill(&key)
+        .expect("SWA prefill variant not found");
 
     unsafe {
         let total = (seq_len * num_qo_heads * head_dim) as usize;
         let kv_total = (seq_len * num_kv_heads * head_dim) as usize;
-        let q_bf16: Vec<u16> = (0..total).map(|i| f32_to_bf16(0.01 * (i as f32 % 10.0))).collect();
-        let k_bf16: Vec<u16> = (0..kv_total).map(|i| f32_to_bf16(0.01 * ((i + 3) as f32 % 10.0))).collect();
-        let v_bf16: Vec<u16> = (0..kv_total).map(|i| f32_to_bf16(0.02 * ((i + 7) as f32 % 10.0))).collect();
+        let q_bf16: Vec<u16> = (0..total)
+            .map(|i| f32_to_bf16(0.01 * (i as f32 % 10.0)))
+            .collect();
+        let k_bf16: Vec<u16> = (0..kv_total)
+            .map(|i| f32_to_bf16(0.01 * ((i + 3) as f32 % 10.0)))
+            .collect();
+        let v_bf16: Vec<u16> = (0..kv_total)
+            .map(|i| f32_to_bf16(0.02 * ((i + 7) as f32 % 10.0)))
+            .collect();
         let q_ptr = gpu_upload(&q_bf16);
         let k_ptr = gpu_upload(&k_bf16);
         let v_ptr = gpu_upload(&v_bf16);
@@ -948,10 +1199,14 @@ fn prefill_sliding_window_dispatch() {
         let (dl_fws, _fws_s, _fws_st) = ws.dl_float();
         let (dl_iws, _iws_s, _iws_st) = ws.dl_int();
         let (dl_pws, _pws_s, _pws_st) = ws.dl_pinned();
-        let cu_s = [batch_size + 1]; let cu_st = contiguous_strides(&cu_s);
-        let kvl_s = [batch_size]; let kvl_st = contiguous_strides(&kvl_s);
-        let q_s = [seq_len, num_qo_heads, head_dim]; let q_st = contiguous_strides(&q_s);
-        let k_s = [seq_len, num_kv_heads, head_dim]; let k_st = contiguous_strides(&k_s);
+        let cu_s = [batch_size + 1];
+        let cu_st = contiguous_strides(&cu_s);
+        let kvl_s = [batch_size];
+        let kvl_st = contiguous_strides(&kvl_s);
+        let q_s = [seq_len, num_qo_heads, head_dim];
+        let q_st = contiguous_strides(&q_s);
+        let k_s = [seq_len, num_kv_heads, head_dim];
+        let k_st = contiguous_strides(&k_s);
 
         let dl_cuq = cpu_dl(cu_q_data.as_ptr() as *mut c_void, I32_DT, &cu_s, &cu_st);
         let dl_cuk = cpu_dl(cu_k_data.as_ptr() as *mut c_void, I32_DT, &cu_s, &cu_st);
@@ -966,51 +1221,77 @@ fn prefill_sliding_window_dispatch() {
         reg.set_stream(0, std::ptr::null_mut());
 
         let plan_args = [
-            TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws),
-            TVMFFIAny::dltensor(&dl_pws), TVMFFIAny::dltensor(&dl_cuq),
-            TVMFFIAny::dltensor(&dl_cuk), TVMFFIAny::dltensor(&dl_kvl),
-            TVMFFIAny::int64(seq_len), TVMFFIAny::int64(batch_size),
-            TVMFFIAny::int64(num_qo_heads), TVMFFIAny::int64(num_kv_heads),
-            TVMFFIAny::int64(1), TVMFFIAny::bool_val(false),
-            TVMFFIAny::int64(head_dim), TVMFFIAny::int64(head_dim),
-            TVMFFIAny::bool_val(true),  // causal
-            TVMFFIAny::int64(4),        // window_left = 4 (sliding window!)
-            TVMFFIAny::int64(-1), TVMFFIAny::bool_val(false), TVMFFIAny::int64(0),
+            TVMFFIAny::dltensor(&dl_fws),
+            TVMFFIAny::dltensor(&dl_iws),
+            TVMFFIAny::dltensor(&dl_pws),
+            TVMFFIAny::dltensor(&dl_cuq),
+            TVMFFIAny::dltensor(&dl_cuk),
+            TVMFFIAny::dltensor(&dl_kvl),
+            TVMFFIAny::int64(seq_len),
+            TVMFFIAny::int64(batch_size),
+            TVMFFIAny::int64(num_qo_heads),
+            TVMFFIAny::int64(num_kv_heads),
+            TVMFFIAny::int64(1),
+            TVMFFIAny::bool_val(false),
+            TVMFFIAny::int64(head_dim),
+            TVMFFIAny::int64(head_dim),
+            TVMFFIAny::bool_val(true), // causal
+            TVMFFIAny::int64(4),       // window_left = 4 (sliding window!)
+            TVMFFIAny::int64(-1),
+            TVMFFIAny::bool_val(false),
+            TVMFFIAny::int64(0),
         ];
         let plan_info = reg.call(variant.plan, &plan_args).expect("SWA plan failed");
 
         let sm_scale = 1.0 / (head_dim as f64).sqrt();
         let run_args = [
-            TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws),
+            TVMFFIAny::dltensor(&dl_fws),
+            TVMFFIAny::dltensor(&dl_iws),
             plan_info,
-            TVMFFIAny::dltensor(&dl_q), TVMFFIAny::dltensor(&dl_k),
-            TVMFFIAny::dltensor(&dl_v), TVMFFIAny::dltensor(&dl_cuq_gpu),
-            TVMFFIAny::dltensor(&dl_cuk_gpu), TVMFFIAny::dltensor(&dl_o),
-            TVMFFIAny::none(),         // lse
-            TVMFFIAny::int64(1),       // causal
-            TVMFFIAny::int64(0),       // NHD
-            TVMFFIAny::int64(4),       // window_left = 4 (triggers SWA runtime path)
+            TVMFFIAny::dltensor(&dl_q),
+            TVMFFIAny::dltensor(&dl_k),
+            TVMFFIAny::dltensor(&dl_v),
+            TVMFFIAny::dltensor(&dl_cuq_gpu),
+            TVMFFIAny::dltensor(&dl_cuk_gpu),
+            TVMFFIAny::dltensor(&dl_o),
+            TVMFFIAny::none(),   // lse
+            TVMFFIAny::int64(1), // causal
+            TVMFFIAny::int64(0), // NHD
+            TVMFFIAny::int64(4), // window_left = 4 (triggers SWA runtime path)
             TVMFFIAny::bool_val(false),
-            TVMFFIAny::none(), TVMFFIAny::none(), TVMFFIAny::none(),
-            TVMFFIAny::none(), TVMFFIAny::none(), TVMFFIAny::none(),
-            TVMFFIAny::float64(0.0),   // logits_soft_cap = 0 (no softcap)
+            TVMFFIAny::none(),
+            TVMFFIAny::none(),
+            TVMFFIAny::none(),
+            TVMFFIAny::none(),
+            TVMFFIAny::none(),
+            TVMFFIAny::none(),
+            TVMFFIAny::float64(0.0), // logits_soft_cap = 0 (no softcap)
             TVMFFIAny::float64(sm_scale),
-            TVMFFIAny::float64(1.0), TVMFFIAny::float64(1e4),
+            TVMFFIAny::float64(1.0),
+            TVMFFIAny::float64(1e4),
             TVMFFIAny::int64(0),
         ];
-        reg.call(variant.ragged_run, &run_args).expect("SWA ragged_run failed");
+        reg.call(variant.ragged_run, &run_args)
+            .expect("SWA ragged_run failed");
         cudaDeviceSynchronize();
 
         let out = gpu_download::<u16>(o_ptr, total);
         let out_f32: Vec<f32> = out.iter().map(|&v| bf16_to_f32(v)).collect();
         let sum: f32 = out_f32.iter().map(|v| v.abs()).sum();
         assert!(sum > 0.0, "SWA prefill output is all zeros");
-        assert!(out_f32.iter().all(|v| v.is_finite()), "SWA prefill has NaN/Inf");
+        assert!(
+            out_f32.iter().all(|v| v.is_finite()),
+            "SWA prefill has NaN/Inf"
+        );
 
         println!("Prefill SWA dispatch: PASS (sum={sum:.4})");
 
-        cudaFree(q_ptr); cudaFree(k_ptr); cudaFree(v_ptr); cudaFree(o_ptr);
-        cudaFree(cu_q_gpu); cudaFree(cu_k_gpu);
+        cudaFree(q_ptr);
+        cudaFree(k_ptr);
+        cudaFree(v_ptr);
+        cudaFree(o_ptr);
+        cudaFree(cu_q_gpu);
+        cudaFree(cu_k_gpu);
     }
 }
 
@@ -1027,18 +1308,28 @@ fn prefill_softcap_dispatch() {
 
     let key = PrefillKey {
         dtype: KernelDtype::BF16,
-        head_dim_qk: head_dim as u32, head_dim_vo: head_dim as u32,
-        sliding_window: false, logits_soft_cap: true,
+        head_dim_qk: head_dim as u32,
+        head_dim_vo: head_dim as u32,
+        sliding_window: false,
+        logits_soft_cap: true,
         backend: Backend::FA2,
     };
-    let variant = reg.get_prefill(&key).expect("Softcap prefill variant not found");
+    let variant = reg
+        .get_prefill(&key)
+        .expect("Softcap prefill variant not found");
 
     unsafe {
         let total = (seq_len * num_qo_heads * head_dim) as usize;
         let kv_total = (seq_len * num_kv_heads * head_dim) as usize;
-        let q_bf16: Vec<u16> = (0..total).map(|i| f32_to_bf16(0.01 * (i as f32 % 10.0))).collect();
-        let k_bf16: Vec<u16> = (0..kv_total).map(|i| f32_to_bf16(0.01 * ((i+3) as f32 % 10.0))).collect();
-        let v_bf16: Vec<u16> = (0..kv_total).map(|i| f32_to_bf16(0.02 * ((i+7) as f32 % 10.0))).collect();
+        let q_bf16: Vec<u16> = (0..total)
+            .map(|i| f32_to_bf16(0.01 * (i as f32 % 10.0)))
+            .collect();
+        let k_bf16: Vec<u16> = (0..kv_total)
+            .map(|i| f32_to_bf16(0.01 * ((i + 3) as f32 % 10.0)))
+            .collect();
+        let v_bf16: Vec<u16> = (0..kv_total)
+            .map(|i| f32_to_bf16(0.02 * ((i + 7) as f32 % 10.0)))
+            .collect();
         let q_ptr = gpu_upload(&q_bf16);
         let k_ptr = gpu_upload(&k_bf16);
         let v_ptr = gpu_upload(&v_bf16);
@@ -1052,10 +1343,14 @@ fn prefill_softcap_dispatch() {
         let (dl_fws, _fws_s, _fws_st) = ws.dl_float();
         let (dl_iws, _iws_s, _iws_st) = ws.dl_int();
         let (dl_pws, _pws_s, _pws_st) = ws.dl_pinned();
-        let cu_s = [2i64]; let cu_st = [1i64];
-        let kvl_s = [1i64]; let kvl_st = [1i64];
-        let q_s = [seq_len, num_qo_heads, head_dim]; let q_st = contiguous_strides(&q_s);
-        let k_s = [seq_len, num_kv_heads, head_dim]; let k_st = contiguous_strides(&k_s);
+        let cu_s = [2i64];
+        let cu_st = [1i64];
+        let kvl_s = [1i64];
+        let kvl_st = [1i64];
+        let q_s = [seq_len, num_qo_heads, head_dim];
+        let q_st = contiguous_strides(&q_s);
+        let k_s = [seq_len, num_kv_heads, head_dim];
+        let k_st = contiguous_strides(&k_s);
 
         let dl_cuq = cpu_dl(cu_q_data.as_ptr() as *mut c_void, I32_DT, &cu_s, &cu_st);
         let dl_cuk = cpu_dl(cu_k_data.as_ptr() as *mut c_void, I32_DT, &cu_s, &cu_st);
@@ -1070,48 +1365,79 @@ fn prefill_softcap_dispatch() {
         reg.set_stream(0, std::ptr::null_mut());
 
         let plan_args = [
-            TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws),
-            TVMFFIAny::dltensor(&dl_pws), TVMFFIAny::dltensor(&dl_cuq),
-            TVMFFIAny::dltensor(&dl_cuk), TVMFFIAny::dltensor(&dl_kvl),
-            TVMFFIAny::int64(seq_len), TVMFFIAny::int64(1),
-            TVMFFIAny::int64(num_qo_heads), TVMFFIAny::int64(num_kv_heads),
-            TVMFFIAny::int64(1), TVMFFIAny::bool_val(false),
-            TVMFFIAny::int64(head_dim), TVMFFIAny::int64(head_dim),
-            TVMFFIAny::bool_val(true), TVMFFIAny::int64(-1),
-            TVMFFIAny::int64(-1), TVMFFIAny::bool_val(false), TVMFFIAny::int64(0),
+            TVMFFIAny::dltensor(&dl_fws),
+            TVMFFIAny::dltensor(&dl_iws),
+            TVMFFIAny::dltensor(&dl_pws),
+            TVMFFIAny::dltensor(&dl_cuq),
+            TVMFFIAny::dltensor(&dl_cuk),
+            TVMFFIAny::dltensor(&dl_kvl),
+            TVMFFIAny::int64(seq_len),
+            TVMFFIAny::int64(1),
+            TVMFFIAny::int64(num_qo_heads),
+            TVMFFIAny::int64(num_kv_heads),
+            TVMFFIAny::int64(1),
+            TVMFFIAny::bool_val(false),
+            TVMFFIAny::int64(head_dim),
+            TVMFFIAny::int64(head_dim),
+            TVMFFIAny::bool_val(true),
+            TVMFFIAny::int64(-1),
+            TVMFFIAny::int64(-1),
+            TVMFFIAny::bool_val(false),
+            TVMFFIAny::int64(0),
         ];
-        let plan_info = reg.call(variant.plan, &plan_args).expect("Softcap plan failed");
+        let plan_info = reg
+            .call(variant.plan, &plan_args)
+            .expect("Softcap plan failed");
 
         let sm_scale = 1.0 / (head_dim as f64).sqrt();
         let run_args = [
-            TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws),
+            TVMFFIAny::dltensor(&dl_fws),
+            TVMFFIAny::dltensor(&dl_iws),
             plan_info,
-            TVMFFIAny::dltensor(&dl_q), TVMFFIAny::dltensor(&dl_k),
-            TVMFFIAny::dltensor(&dl_v), TVMFFIAny::dltensor(&dl_cuq_gpu),
-            TVMFFIAny::dltensor(&dl_cuk_gpu), TVMFFIAny::dltensor(&dl_o),
-            TVMFFIAny::none(), TVMFFIAny::int64(1), TVMFFIAny::int64(0),
-            TVMFFIAny::int64(-1),       // window_left = -1 (no swa)
+            TVMFFIAny::dltensor(&dl_q),
+            TVMFFIAny::dltensor(&dl_k),
+            TVMFFIAny::dltensor(&dl_v),
+            TVMFFIAny::dltensor(&dl_cuq_gpu),
+            TVMFFIAny::dltensor(&dl_cuk_gpu),
+            TVMFFIAny::dltensor(&dl_o),
+            TVMFFIAny::none(),
+            TVMFFIAny::int64(1),
+            TVMFFIAny::int64(0),
+            TVMFFIAny::int64(-1), // window_left = -1 (no swa)
             TVMFFIAny::bool_val(false),
-            TVMFFIAny::none(), TVMFFIAny::none(), TVMFFIAny::none(),
-            TVMFFIAny::none(), TVMFFIAny::none(), TVMFFIAny::none(),
-            TVMFFIAny::float64(30.0),   // logits_soft_cap = 30.0 (Gemma-style, triggers softcap path)
+            TVMFFIAny::none(),
+            TVMFFIAny::none(),
+            TVMFFIAny::none(),
+            TVMFFIAny::none(),
+            TVMFFIAny::none(),
+            TVMFFIAny::none(),
+            TVMFFIAny::float64(30.0), // logits_soft_cap = 30.0 (Gemma-style, triggers softcap path)
             TVMFFIAny::float64(sm_scale),
-            TVMFFIAny::float64(1.0), TVMFFIAny::float64(1e4),
+            TVMFFIAny::float64(1.0),
+            TVMFFIAny::float64(1e4),
             TVMFFIAny::int64(0),
         ];
-        reg.call(variant.ragged_run, &run_args).expect("Softcap ragged_run failed");
+        reg.call(variant.ragged_run, &run_args)
+            .expect("Softcap ragged_run failed");
         cudaDeviceSynchronize();
 
         let out = gpu_download::<u16>(o_ptr, total);
         let out_f32: Vec<f32> = out.iter().map(|&v| bf16_to_f32(v)).collect();
         let sum: f32 = out_f32.iter().map(|v| v.abs()).sum();
         assert!(sum > 0.0, "Softcap prefill output is all zeros");
-        assert!(out_f32.iter().all(|v| v.is_finite()), "Softcap prefill has NaN/Inf");
+        assert!(
+            out_f32.iter().all(|v| v.is_finite()),
+            "Softcap prefill has NaN/Inf"
+        );
 
         println!("Prefill softcap dispatch: PASS (sum={sum:.4})");
 
-        cudaFree(q_ptr); cudaFree(k_ptr); cudaFree(v_ptr); cudaFree(o_ptr);
-        cudaFree(cu_q_gpu); cudaFree(cu_k_gpu);
+        cudaFree(q_ptr);
+        cudaFree(k_ptr);
+        cudaFree(v_ptr);
+        cudaFree(o_ptr);
+        cudaFree(cu_q_gpu);
+        cudaFree(cu_k_gpu);
     }
 }
 
@@ -1119,7 +1445,10 @@ fn prefill_softcap_dispatch() {
 fn fa3_prefill_execution() {
     let reg = KernelRegistry::new();
     // FA3 cubins are sm_90 only; Blackwell (arch >= 100) has no matching image.
-    if reg.arch() != 90 { println!("Skipping FA3 — requires SM90 (got SM{})", reg.arch()); return; }
+    if reg.arch() != 90 {
+        println!("Skipping FA3 — requires SM90 (got SM{})", reg.arch());
+        return;
+    }
 
     let ws = Workspace::new();
     let seq_len = 8i64;
@@ -1129,8 +1458,10 @@ fn fa3_prefill_execution() {
 
     let key = PrefillKey {
         dtype: KernelDtype::BF16,
-        head_dim_qk: head_dim as u32, head_dim_vo: head_dim as u32,
-        sliding_window: false, logits_soft_cap: false,
+        head_dim_qk: head_dim as u32,
+        head_dim_vo: head_dim as u32,
+        sliding_window: false,
+        logits_soft_cap: false,
         backend: Backend::FA3,
     };
     let variant = reg.get_prefill(&key).expect("FA3 prefill not found");
@@ -1138,9 +1469,15 @@ fn fa3_prefill_execution() {
     unsafe {
         let total = (seq_len * num_qo_heads * head_dim) as usize;
         let kv_total = (seq_len * num_kv_heads * head_dim) as usize;
-        let q_bf16: Vec<u16> = (0..total).map(|i| f32_to_bf16(0.01 * (i as f32 % 10.0))).collect();
-        let k_bf16: Vec<u16> = (0..kv_total).map(|i| f32_to_bf16(0.01 * ((i+3) as f32 % 10.0))).collect();
-        let v_bf16: Vec<u16> = (0..kv_total).map(|i| f32_to_bf16(0.02 * ((i+7) as f32 % 10.0))).collect();
+        let q_bf16: Vec<u16> = (0..total)
+            .map(|i| f32_to_bf16(0.01 * (i as f32 % 10.0)))
+            .collect();
+        let k_bf16: Vec<u16> = (0..kv_total)
+            .map(|i| f32_to_bf16(0.01 * ((i + 3) as f32 % 10.0)))
+            .collect();
+        let v_bf16: Vec<u16> = (0..kv_total)
+            .map(|i| f32_to_bf16(0.02 * ((i + 7) as f32 % 10.0)))
+            .collect();
         let q_ptr = gpu_upload(&q_bf16);
         let k_ptr = gpu_upload(&k_bf16);
         let v_ptr = gpu_upload(&v_bf16);
@@ -1154,10 +1491,14 @@ fn fa3_prefill_execution() {
         let (dl_fws, _fws_s, _fws_st) = ws.dl_float();
         let (dl_iws, _iws_s, _iws_st) = ws.dl_int();
         let (dl_pws, _pws_s, _pws_st) = ws.dl_pinned();
-        let cu_s = [2i64]; let cu_st = [1i64];
-        let kvl_s = [1i64]; let kvl_st = [1i64];
-        let q_s = [seq_len, num_qo_heads, head_dim]; let q_st = contiguous_strides(&q_s);
-        let k_s = [seq_len, num_kv_heads, head_dim]; let k_st = contiguous_strides(&k_s);
+        let cu_s = [2i64];
+        let cu_st = [1i64];
+        let kvl_s = [1i64];
+        let kvl_st = [1i64];
+        let q_s = [seq_len, num_qo_heads, head_dim];
+        let q_st = contiguous_strides(&q_s);
+        let k_s = [seq_len, num_kv_heads, head_dim];
+        let k_st = contiguous_strides(&k_s);
 
         let dl_cuq = cpu_dl(cu_q_data.as_ptr() as *mut c_void, I32_DT, &cu_s, &cu_st);
         let dl_cuk = cpu_dl(cu_k_data.as_ptr() as *mut c_void, I32_DT, &cu_s, &cu_st);
@@ -1167,15 +1508,22 @@ fn fa3_prefill_execution() {
 
         // FA3 SM90 plan: 16 params (no fixed_split_size, disable_split_kv, num_colocated_ctas)
         let plan_args = [
-            TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws),
+            TVMFFIAny::dltensor(&dl_fws),
+            TVMFFIAny::dltensor(&dl_iws),
             TVMFFIAny::dltensor(&dl_pws),
-            TVMFFIAny::dltensor(&dl_cuq), TVMFFIAny::dltensor(&dl_cuk),
+            TVMFFIAny::dltensor(&dl_cuq),
+            TVMFFIAny::dltensor(&dl_cuk),
             TVMFFIAny::dltensor(&dl_kvl),
-            TVMFFIAny::int64(seq_len), TVMFFIAny::int64(1),
-            TVMFFIAny::int64(num_qo_heads), TVMFFIAny::int64(num_kv_heads),
-            TVMFFIAny::int64(1), TVMFFIAny::bool_val(false),
-            TVMFFIAny::int64(head_dim), TVMFFIAny::int64(head_dim),
-            TVMFFIAny::bool_val(true), TVMFFIAny::int64(-1),
+            TVMFFIAny::int64(seq_len),
+            TVMFFIAny::int64(1),
+            TVMFFIAny::int64(num_qo_heads),
+            TVMFFIAny::int64(num_kv_heads),
+            TVMFFIAny::int64(1),
+            TVMFFIAny::bool_val(false),
+            TVMFFIAny::int64(head_dim),
+            TVMFFIAny::int64(head_dim),
+            TVMFFIAny::bool_val(true),
+            TVMFFIAny::int64(-1),
         ];
         let plan_info = reg.call(variant.plan, &plan_args).expect("FA3 plan failed");
 
@@ -1189,36 +1537,51 @@ fn fa3_prefill_execution() {
 
         // FA3 SM90 ragged_run: 22 params with SM90 additional params
         let run_args = [
-            TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws),
+            TVMFFIAny::dltensor(&dl_fws),
+            TVMFFIAny::dltensor(&dl_iws),
             plan_info,
-            TVMFFIAny::dltensor(&dl_q), TVMFFIAny::dltensor(&dl_k),
-            TVMFFIAny::dltensor(&dl_v), TVMFFIAny::dltensor(&dl_cuq_gpu),
-            TVMFFIAny::dltensor(&dl_cuk_gpu), TVMFFIAny::dltensor(&dl_o),
-            TVMFFIAny::none(),         // lse
-            TVMFFIAny::int64(1),       // causal
-            TVMFFIAny::int64(0),       // NHD
-            TVMFFIAny::int64(-1),      // window_left
-            TVMFFIAny::bool_val(false),// enable_pdl
+            TVMFFIAny::dltensor(&dl_q),
+            TVMFFIAny::dltensor(&dl_k),
+            TVMFFIAny::dltensor(&dl_v),
+            TVMFFIAny::dltensor(&dl_cuq_gpu),
+            TVMFFIAny::dltensor(&dl_cuk_gpu),
+            TVMFFIAny::dltensor(&dl_o),
+            TVMFFIAny::none(),          // lse
+            TVMFFIAny::int64(1),        // causal
+            TVMFFIAny::int64(0),        // NHD
+            TVMFFIAny::int64(-1),       // window_left
+            TVMFFIAny::bool_val(false), // enable_pdl
             // SM90 additional params: prefix_len_ptr, token_pos, max_item_len, scale_v
-            TVMFFIAny::none(), TVMFFIAny::none(), TVMFFIAny::none(), TVMFFIAny::none(),
-            TVMFFIAny::float64(0.0),   // logits_soft_cap
+            TVMFFIAny::none(),
+            TVMFFIAny::none(),
+            TVMFFIAny::none(),
+            TVMFFIAny::none(),
+            TVMFFIAny::float64(0.0), // logits_soft_cap
             TVMFFIAny::float64(sm_scale),
-            TVMFFIAny::float64(1.0),   // scale_v_scalar
-            TVMFFIAny::int64(0),       // token_pos_in_items_len
+            TVMFFIAny::float64(1.0), // scale_v_scalar
+            TVMFFIAny::int64(0),     // token_pos_in_items_len
         ];
-        reg.call(variant.ragged_run, &run_args).expect("FA3 ragged_run failed");
+        reg.call(variant.ragged_run, &run_args)
+            .expect("FA3 ragged_run failed");
         cudaDeviceSynchronize();
 
         let out = gpu_download::<u16>(o_ptr, total);
         let out_f32: Vec<f32> = out.iter().map(|&v| bf16_to_f32(v)).collect();
         let sum: f32 = out_f32.iter().map(|v| v.abs()).sum();
         assert!(sum > 0.0, "FA3 prefill output is all zeros");
-        assert!(out_f32.iter().all(|v| v.is_finite()), "FA3 prefill has NaN/Inf");
+        assert!(
+            out_f32.iter().all(|v| v.is_finite()),
+            "FA3 prefill has NaN/Inf"
+        );
 
         println!("FA3 prefill: PASS (sum={sum:.4})");
 
-        cudaFree(q_ptr); cudaFree(k_ptr); cudaFree(v_ptr); cudaFree(o_ptr);
-        cudaFree(cu_q_gpu); cudaFree(cu_k_gpu);
+        cudaFree(q_ptr);
+        cudaFree(k_ptr);
+        cudaFree(v_ptr);
+        cudaFree(o_ptr);
+        cudaFree(cu_q_gpu);
+        cudaFree(cu_k_gpu);
     }
 }
 
@@ -1248,14 +1611,20 @@ fn decode_plan_and_run() {
     unsafe {
         // Q: [batch, num_qo_heads, head_dim]
         let q_elems = (batch_size * num_qo_heads * head_dim) as usize;
-        let q_bf16: Vec<u16> = (0..q_elems).map(|i| f32_to_bf16(0.01 * (i as f32 % 7.0))).collect();
+        let q_bf16: Vec<u16> = (0..q_elems)
+            .map(|i| f32_to_bf16(0.01 * (i as f32 % 7.0)))
+            .collect();
         let q_ptr = gpu_upload(&q_bf16);
         let o_ptr = gpu_alloc(q_elems * 2);
 
         // KV cache: [total_pages, page_size, num_kv_heads, head_dim]
         let kv_elems = (total_pages * page_size * num_kv_heads * head_dim) as usize;
-        let k_bf16: Vec<u16> = (0..kv_elems).map(|i| f32_to_bf16(0.005 * (i as f32 % 11.0))).collect();
-        let v_bf16: Vec<u16> = (0..kv_elems).map(|i| f32_to_bf16(0.01 * (i as f32 % 5.0))).collect();
+        let k_bf16: Vec<u16> = (0..kv_elems)
+            .map(|i| f32_to_bf16(0.005 * (i as f32 % 11.0)))
+            .collect();
+        let v_bf16: Vec<u16> = (0..kv_elems)
+            .map(|i| f32_to_bf16(0.01 * (i as f32 % 5.0)))
+            .collect();
         let k_cache = gpu_upload(&k_bf16);
         let v_cache = gpu_upload(&v_bf16);
 
@@ -1285,7 +1654,12 @@ fn decode_plan_and_run() {
 
         let indptr_s = [batch_size + 1];
         let indptr_st = contiguous_strides(&indptr_s);
-        let dl_indptr_cpu = cpu_dl(kv_indptr_cpu.as_ptr() as *mut c_void, I32_DT, &indptr_s, &indptr_st);
+        let dl_indptr_cpu = cpu_dl(
+            kv_indptr_cpu.as_ptr() as *mut c_void,
+            I32_DT,
+            &indptr_s,
+            &indptr_st,
+        );
 
         let empty_s = [0i64];
         let empty_st = [1i64];
@@ -1304,15 +1678,16 @@ fn decode_plan_and_run() {
             TVMFFIAny::int64(num_qo_heads),
             TVMFFIAny::int64(num_kv_heads),
             TVMFFIAny::int64(page_size),
-            TVMFFIAny::bool_val(false),    // cuda_graph
-            TVMFFIAny::int64(-1),          // window_left
-            TVMFFIAny::float64(0.0),       // logits_soft_cap
+            TVMFFIAny::bool_val(false), // cuda_graph
+            TVMFFIAny::int64(-1),       // window_left
+            TVMFFIAny::float64(0.0),    // logits_soft_cap
             TVMFFIAny::int64(head_dim),
             TVMFFIAny::int64(head_dim),
             TVMFFIAny::dltensor(&dl_eq),
             TVMFFIAny::dltensor(&dl_ek),
         ];
-        let plan_info = reg.call(variant.plan, &plan_args)
+        let plan_info = reg
+            .call(variant.plan, &plan_args)
             .expect("Decode plan failed");
 
         // Run
@@ -1348,24 +1723,23 @@ fn decode_plan_and_run() {
             TVMFFIAny::dltensor(&dl_iws),
             plan_info,
             TVMFFIAny::dltensor(&dl_q),
-            TVMFFIAny::dltensor(&dl_k),          // paged_k_cache
-            TVMFFIAny::dltensor(&dl_v),           // paged_v_cache
+            TVMFFIAny::dltensor(&dl_k), // paged_k_cache
+            TVMFFIAny::dltensor(&dl_v), // paged_v_cache
             TVMFFIAny::dltensor(&dl_kv_indptr),
             TVMFFIAny::dltensor(&dl_kvi),
             TVMFFIAny::dltensor(&dl_kv_last),
             TVMFFIAny::dltensor(&dl_o),
-            TVMFFIAny::none(),              // maybe_lse
-            TVMFFIAny::int64(0),            // layout = NHD
-            TVMFFIAny::int64(-1),           // window_left
-            TVMFFIAny::bool_val(false),     // enable_pdl
-            TVMFFIAny::none(),              // alibi_slopes
-            TVMFFIAny::float64(0.0),        // logits_soft_cap
+            TVMFFIAny::none(),          // maybe_lse
+            TVMFFIAny::int64(0),        // layout = NHD
+            TVMFFIAny::int64(-1),       // window_left
+            TVMFFIAny::bool_val(false), // enable_pdl
+            TVMFFIAny::none(),          // alibi_slopes
+            TVMFFIAny::float64(0.0),    // logits_soft_cap
             TVMFFIAny::float64(sm_scale),
-            TVMFFIAny::float64(1.0),        // rope_rcp_scale
-            TVMFFIAny::float64(1e4),        // rope_rcp_theta
+            TVMFFIAny::float64(1.0), // rope_rcp_scale
+            TVMFFIAny::float64(1e4), // rope_rcp_theta
         ];
-        reg.call(variant.run, &run_args)
-            .expect("Decode run failed");
+        reg.call(variant.run, &run_args).expect("Decode run failed");
         cudaDeviceSynchronize();
 
         // Verify: output should be nonzero
@@ -1382,9 +1756,13 @@ fn decode_plan_and_run() {
 
         println!("Decode paged BF16: PASS (sum={sum:.4})");
 
-        cudaFree(q_ptr); cudaFree(o_ptr);
-        cudaFree(k_cache); cudaFree(v_cache);
-        cudaFree(kvi_ptr); cudaFree(kv_indptr_gpu); cudaFree(kv_last_gpu);
+        cudaFree(q_ptr);
+        cudaFree(o_ptr);
+        cudaFree(k_cache);
+        cudaFree(v_cache);
+        cudaFree(kvi_ptr);
+        cudaFree(kv_indptr_gpu);
+        cudaFree(kv_last_gpu);
     }
 }
 
@@ -1422,7 +1800,9 @@ fn decode_multiblock_batch() {
     unsafe {
         // ── Q: [batch, num_qo_heads, head_dim] ──
         let q_elems = (batch_size * num_qo_heads * head_dim) as usize;
-        let q_bf16: Vec<u16> = (0..q_elems).map(|i| f32_to_bf16(0.01 * (i as f32 % 7.0))).collect();
+        let q_bf16: Vec<u16> = (0..q_elems)
+            .map(|i| f32_to_bf16(0.01 * (i as f32 % 7.0)))
+            .collect();
         let q_ptr = gpu_upload(&q_bf16);
         let o_ptr = gpu_alloc(q_elems * 2);
 
@@ -1440,8 +1820,10 @@ fn decode_multiblock_batch() {
                 let block_off = t % page_size as usize;
                 let cache_base = (block_idx * page_size as usize + block_off) * kv_stride;
                 for i in 0..kv_stride {
-                    k_flat[cache_base + i] = 0.005 * (((seq_i * 1000 + t * kv_stride + i) % 11) as f32);
-                    v_flat[cache_base + i] = 0.01 * (((seq_i * 1000 + t * kv_stride + i) % 5) as f32) + 0.01;
+                    k_flat[cache_base + i] =
+                        0.005 * (((seq_i * 1000 + t * kv_stride + i) % 11) as f32);
+                    v_flat[cache_base + i] =
+                        0.01 * (((seq_i * 1000 + t * kv_stride + i) % 5) as f32) + 0.01;
                 }
             }
         }
@@ -1473,7 +1855,12 @@ fn decode_multiblock_batch() {
 
         let indptr_s = [batch_size + 1];
         let indptr_st = contiguous_strides(&indptr_s);
-        let dl_indptr_cpu = cpu_dl(kv_indptr_cpu.as_ptr() as *mut c_void, I32_DT, &indptr_s, &indptr_st);
+        let dl_indptr_cpu = cpu_dl(
+            kv_indptr_cpu.as_ptr() as *mut c_void,
+            I32_DT,
+            &indptr_s,
+            &indptr_st,
+        );
 
         let empty_s = [0i64];
         let empty_st = [1i64];
@@ -1483,23 +1870,28 @@ fn decode_multiblock_batch() {
         reg.set_stream(0, std::ptr::null_mut());
 
         // Plan
-        let plan_info = reg.call(variant.plan, &[
-            TVMFFIAny::dltensor(&dl_fws),
-            TVMFFIAny::dltensor(&dl_iws),
-            TVMFFIAny::dltensor(&dl_pws),
-            TVMFFIAny::dltensor(&dl_indptr_cpu),
-            TVMFFIAny::int64(batch_size),
-            TVMFFIAny::int64(num_qo_heads),
-            TVMFFIAny::int64(num_kv_heads),
-            TVMFFIAny::int64(page_size),
-            TVMFFIAny::bool_val(false),    // cuda_graph
-            TVMFFIAny::int64(-1),          // window_left
-            TVMFFIAny::float64(0.0),       // logits_soft_cap
-            TVMFFIAny::int64(head_dim),
-            TVMFFIAny::int64(head_dim),
-            TVMFFIAny::dltensor(&dl_eq),
-            TVMFFIAny::dltensor(&dl_ek),
-        ]).expect("Decode plan failed");
+        let plan_info = reg
+            .call(
+                variant.plan,
+                &[
+                    TVMFFIAny::dltensor(&dl_fws),
+                    TVMFFIAny::dltensor(&dl_iws),
+                    TVMFFIAny::dltensor(&dl_pws),
+                    TVMFFIAny::dltensor(&dl_indptr_cpu),
+                    TVMFFIAny::int64(batch_size),
+                    TVMFFIAny::int64(num_qo_heads),
+                    TVMFFIAny::int64(num_kv_heads),
+                    TVMFFIAny::int64(page_size),
+                    TVMFFIAny::bool_val(false), // cuda_graph
+                    TVMFFIAny::int64(-1),       // window_left
+                    TVMFFIAny::float64(0.0),    // logits_soft_cap
+                    TVMFFIAny::int64(head_dim),
+                    TVMFFIAny::int64(head_dim),
+                    TVMFFIAny::dltensor(&dl_eq),
+                    TVMFFIAny::dltensor(&dl_ek),
+                ],
+            )
+            .expect("Decode plan failed");
 
         // Run
         let q_s = [batch_size, num_qo_heads, head_dim];
@@ -1522,27 +1914,31 @@ fn decode_multiblock_batch() {
         let dl_kv_last = gpu_dl(kv_last_gpu, I32_DT, &kvlp_s, &kvlp_st);
 
         let sm_scale = 1.0 / (head_dim as f64).sqrt();
-        reg.call(variant.run, &[
-            TVMFFIAny::dltensor(&dl_fws),
-            TVMFFIAny::dltensor(&dl_iws),
-            plan_info,
-            TVMFFIAny::dltensor(&dl_q),
-            TVMFFIAny::dltensor(&dl_k),
-            TVMFFIAny::dltensor(&dl_v),
-            TVMFFIAny::dltensor(&dl_kv_indptr),
-            TVMFFIAny::dltensor(&dl_kvi),
-            TVMFFIAny::dltensor(&dl_kv_last),
-            TVMFFIAny::dltensor(&dl_o),
-            TVMFFIAny::none(),              // lse
-            TVMFFIAny::int64(0),            // layout = NHD
-            TVMFFIAny::int64(-1),           // window_left
-            TVMFFIAny::bool_val(false),     // enable_pdl
-            TVMFFIAny::none(),              // alibi
-            TVMFFIAny::float64(0.0),        // logits_soft_cap
-            TVMFFIAny::float64(sm_scale),
-            TVMFFIAny::float64(1.0),        // rope_rcp_scale
-            TVMFFIAny::float64(1e4),        // rope_rcp_theta
-        ]).expect("Decode run failed");
+        reg.call(
+            variant.run,
+            &[
+                TVMFFIAny::dltensor(&dl_fws),
+                TVMFFIAny::dltensor(&dl_iws),
+                plan_info,
+                TVMFFIAny::dltensor(&dl_q),
+                TVMFFIAny::dltensor(&dl_k),
+                TVMFFIAny::dltensor(&dl_v),
+                TVMFFIAny::dltensor(&dl_kv_indptr),
+                TVMFFIAny::dltensor(&dl_kvi),
+                TVMFFIAny::dltensor(&dl_kv_last),
+                TVMFFIAny::dltensor(&dl_o),
+                TVMFFIAny::none(),          // lse
+                TVMFFIAny::int64(0),        // layout = NHD
+                TVMFFIAny::int64(-1),       // window_left
+                TVMFFIAny::bool_val(false), // enable_pdl
+                TVMFFIAny::none(),          // alibi
+                TVMFFIAny::float64(0.0),    // logits_soft_cap
+                TVMFFIAny::float64(sm_scale),
+                TVMFFIAny::float64(1.0), // rope_rcp_scale
+                TVMFFIAny::float64(1e4), // rope_rcp_theta
+            ],
+        )
+        .expect("Decode run failed");
         cudaDeviceSynchronize();
 
         // ── CPU reference ──
@@ -1567,31 +1963,48 @@ fn decode_multiblock_batch() {
             let q_start = seq_i * qo_stride;
             let ref_out = cpu_attention_ref(
                 &q_f32_rt[q_start..q_start + qo_stride],
-                &k_read, &v_read,
-                num_qo_heads as usize, num_kv_heads as usize, head_dim as usize,
-                kv_len as usize, sm_scale as f32,
+                &k_read,
+                &v_read,
+                num_qo_heads as usize,
+                num_kv_heads as usize,
+                head_dim as usize,
+                kv_len as usize,
+                sm_scale as f32,
             );
 
             let gpu_start = seq_i * qo_stride;
             let mut max_abs_err = 0.0f32;
-            let gpu_sum: f32 = (0..qo_stride).map(|i| bf16_to_f32(out_bf16[gpu_start + i]).abs()).sum();
+            let gpu_sum: f32 = (0..qo_stride)
+                .map(|i| bf16_to_f32(out_bf16[gpu_start + i]).abs())
+                .sum();
             let ref_sum: f32 = ref_out.iter().map(|v| v.abs()).sum();
             for i in 0..qo_stride {
                 let g = bf16_to_f32(out_bf16[gpu_start + i]);
                 let err = (g - ref_out[i]).abs();
-                if err > max_abs_err { max_abs_err = err; }
+                if err > max_abs_err {
+                    max_abs_err = err;
+                }
             }
-            println!("  seq {seq_i} (kv_len={kv_len}, blocks={}): max_abs_err={max_abs_err:.6}, ref_sum={ref_sum:.4}, gpu_sum={gpu_sum:.4}",
-                     bt.len());
+            println!(
+                "  seq {seq_i} (kv_len={kv_len}, blocks={}): max_abs_err={max_abs_err:.6}, ref_sum={ref_sum:.4}, gpu_sum={gpu_sum:.4}",
+                bt.len()
+            );
             assert!(gpu_sum > 0.001, "seq {seq_i}: GPU output is all zeros");
-            assert!(max_abs_err < 0.02, "seq {seq_i}: max_abs_err={max_abs_err:.6} exceeds threshold 0.02");
+            assert!(
+                max_abs_err < 0.02,
+                "seq {seq_i}: max_abs_err={max_abs_err:.6} exceeds threshold 0.02"
+            );
         }
 
         println!("Decode multiblock batch: PASS");
 
-        cudaFree(q_ptr); cudaFree(o_ptr);
-        cudaFree(k_cache); cudaFree(v_cache);
-        cudaFree(kvi_ptr); cudaFree(kv_indptr_gpu); cudaFree(kv_last_gpu);
+        cudaFree(q_ptr);
+        cudaFree(o_ptr);
+        cudaFree(k_cache);
+        cudaFree(v_cache);
+        cudaFree(kvi_ptr);
+        cudaFree(kv_indptr_gpu);
+        cudaFree(kv_last_gpu);
     }
 }
 
@@ -1623,7 +2036,9 @@ fn decode_single_batch_multiblock() {
 
     unsafe {
         let q_elems = (batch_size * num_qo_heads * head_dim) as usize;
-        let q_bf16: Vec<u16> = (0..q_elems).map(|i| f32_to_bf16(0.01 * (i as f32 % 7.0))).collect();
+        let q_bf16: Vec<u16> = (0..q_elems)
+            .map(|i| f32_to_bf16(0.01 * (i as f32 % 7.0)))
+            .collect();
         let q_ptr = gpu_upload(&q_bf16);
         let o_ptr = gpu_alloc(q_elems * 2);
 
@@ -1665,7 +2080,12 @@ fn decode_single_batch_multiblock() {
 
         let indptr_s = [batch_size + 1];
         let indptr_st = contiguous_strides(&indptr_s);
-        let dl_indptr_cpu = cpu_dl(kv_indptr_cpu.as_ptr() as *mut c_void, I32_DT, &indptr_s, &indptr_st);
+        let dl_indptr_cpu = cpu_dl(
+            kv_indptr_cpu.as_ptr() as *mut c_void,
+            I32_DT,
+            &indptr_s,
+            &indptr_st,
+        );
 
         let empty_s = [0i64];
         let empty_st = [1i64];
@@ -1674,16 +2094,28 @@ fn decode_single_batch_multiblock() {
 
         reg.set_stream(0, std::ptr::null_mut());
 
-        let plan_info = reg.call(variant.plan, &[
-            TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws), TVMFFIAny::dltensor(&dl_pws),
-            TVMFFIAny::dltensor(&dl_indptr_cpu),
-            TVMFFIAny::int64(batch_size),
-            TVMFFIAny::int64(num_qo_heads), TVMFFIAny::int64(num_kv_heads),
-            TVMFFIAny::int64(page_size),
-            TVMFFIAny::bool_val(false), TVMFFIAny::int64(-1), TVMFFIAny::float64(0.0),
-            TVMFFIAny::int64(head_dim), TVMFFIAny::int64(head_dim),
-            TVMFFIAny::dltensor(&dl_eq), TVMFFIAny::dltensor(&dl_ek),
-        ]).expect("Decode plan failed");
+        let plan_info = reg
+            .call(
+                variant.plan,
+                &[
+                    TVMFFIAny::dltensor(&dl_fws),
+                    TVMFFIAny::dltensor(&dl_iws),
+                    TVMFFIAny::dltensor(&dl_pws),
+                    TVMFFIAny::dltensor(&dl_indptr_cpu),
+                    TVMFFIAny::int64(batch_size),
+                    TVMFFIAny::int64(num_qo_heads),
+                    TVMFFIAny::int64(num_kv_heads),
+                    TVMFFIAny::int64(page_size),
+                    TVMFFIAny::bool_val(false),
+                    TVMFFIAny::int64(-1),
+                    TVMFFIAny::float64(0.0),
+                    TVMFFIAny::int64(head_dim),
+                    TVMFFIAny::int64(head_dim),
+                    TVMFFIAny::dltensor(&dl_eq),
+                    TVMFFIAny::dltensor(&dl_ek),
+                ],
+            )
+            .expect("Decode plan failed");
 
         let q_s = [batch_size, num_qo_heads, head_dim];
         let q_st = contiguous_strides(&q_s);
@@ -1705,17 +2137,31 @@ fn decode_single_batch_multiblock() {
         let dl_kv_last = gpu_dl(kv_last_gpu, I32_DT, &kvlp_s, &kvlp_st);
 
         let sm_scale = 1.0 / (head_dim as f64).sqrt();
-        reg.call(variant.run, &[
-            TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws),
-            plan_info,
-            TVMFFIAny::dltensor(&dl_q),
-            TVMFFIAny::dltensor(&dl_k), TVMFFIAny::dltensor(&dl_v),
-            TVMFFIAny::dltensor(&dl_kv_indptr), TVMFFIAny::dltensor(&dl_kvi), TVMFFIAny::dltensor(&dl_kv_last),
-            TVMFFIAny::dltensor(&dl_o), TVMFFIAny::none(),
-            TVMFFIAny::int64(0), TVMFFIAny::int64(-1), TVMFFIAny::bool_val(false),
-            TVMFFIAny::none(), TVMFFIAny::float64(0.0), TVMFFIAny::float64(sm_scale),
-            TVMFFIAny::float64(1.0), TVMFFIAny::float64(1e4),
-        ]).expect("Decode run failed");
+        reg.call(
+            variant.run,
+            &[
+                TVMFFIAny::dltensor(&dl_fws),
+                TVMFFIAny::dltensor(&dl_iws),
+                plan_info,
+                TVMFFIAny::dltensor(&dl_q),
+                TVMFFIAny::dltensor(&dl_k),
+                TVMFFIAny::dltensor(&dl_v),
+                TVMFFIAny::dltensor(&dl_kv_indptr),
+                TVMFFIAny::dltensor(&dl_kvi),
+                TVMFFIAny::dltensor(&dl_kv_last),
+                TVMFFIAny::dltensor(&dl_o),
+                TVMFFIAny::none(),
+                TVMFFIAny::int64(0),
+                TVMFFIAny::int64(-1),
+                TVMFFIAny::bool_val(false),
+                TVMFFIAny::none(),
+                TVMFFIAny::float64(0.0),
+                TVMFFIAny::float64(sm_scale),
+                TVMFFIAny::float64(1.0),
+                TVMFFIAny::float64(1e4),
+            ],
+        )
+        .expect("Decode run failed");
         cudaDeviceSynchronize();
 
         let out_bf16 = gpu_download::<u16>(o_ptr, q_elems);
@@ -1734,9 +2180,16 @@ fn decode_single_batch_multiblock() {
             }
         }
 
-        let ref_out = cpu_attention_ref(&q_f32_rt, &k_read, &v_read,
-            num_qo_heads as usize, num_kv_heads as usize, head_dim as usize,
-            kv_len as usize, sm_scale as f32);
+        let ref_out = cpu_attention_ref(
+            &q_f32_rt,
+            &k_read,
+            &v_read,
+            num_qo_heads as usize,
+            num_kv_heads as usize,
+            head_dim as usize,
+            kv_len as usize,
+            sm_scale as f32,
+        );
 
         let ref_sum: f32 = ref_out.iter().map(|v| v.abs()).sum();
         let gpu_sum: f32 = out_bf16.iter().map(|&v| bf16_to_f32(v).abs()).sum();
@@ -1744,24 +2197,41 @@ fn decode_single_batch_multiblock() {
         for i in 0..q_elems {
             let g = bf16_to_f32(out_bf16[i]);
             let err = (g - ref_out[i]).abs();
-            if err > max_abs_err { max_abs_err = err; }
+            if err > max_abs_err {
+                max_abs_err = err;
+            }
         }
-        println!("  single-batch multiblock (kv_len={kv_len}): max_abs_err={max_abs_err:.6}, ref_sum={ref_sum:.4}, gpu_sum={gpu_sum:.4}");
+        println!(
+            "  single-batch multiblock (kv_len={kv_len}): max_abs_err={max_abs_err:.6}, ref_sum={ref_sum:.4}, gpu_sum={gpu_sum:.4}"
+        );
         assert!(gpu_sum > 0.001, "GPU output is all zeros (sum={gpu_sum})");
-        assert!(max_abs_err < 0.02, "max_abs_err={max_abs_err:.6} exceeds threshold 0.02");
+        assert!(
+            max_abs_err < 0.02,
+            "max_abs_err={max_abs_err:.6} exceeds threshold 0.02"
+        );
         println!("Decode single-batch multiblock: PASS");
 
-        cudaFree(q_ptr); cudaFree(o_ptr);
-        cudaFree(k_cache); cudaFree(v_cache);
-        cudaFree(kvi_ptr); cudaFree(kv_indptr_gpu); cudaFree(kv_last_gpu);
+        cudaFree(q_ptr);
+        cudaFree(o_ptr);
+        cudaFree(k_cache);
+        cudaFree(v_cache);
+        cudaFree(kvi_ptr);
+        cudaFree(kv_indptr_gpu);
+        cudaFree(kv_last_gpu);
     }
 }
 
 /// CPU attention reference for decode (single Q token attending to KV sequence).
 /// Handles GQA: num_qo_heads / num_kv_heads groups.
 fn cpu_attention_ref(
-    q: &[f32], k: &[f32], v: &[f32],
-    num_qo: usize, num_kv: usize, head_dim: usize, seq_len: usize, scale: f32,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    num_qo: usize,
+    num_kv: usize,
+    head_dim: usize,
+    seq_len: usize,
+    scale: f32,
 ) -> Vec<f32> {
     let gqa = num_qo / num_kv;
     let mut out = vec![0.0f32; num_qo * head_dim];
@@ -1771,15 +2241,19 @@ fn cpu_attention_ref(
         for t in 0..seq_len {
             let mut dot = 0.0f32;
             for d in 0..head_dim {
-                dot += q[h * head_dim + d]
-                    * k[t * num_kv * head_dim + kh * head_dim + d];
+                dot += q[h * head_dim + d] * k[t * num_kv * head_dim + kh * head_dim + d];
             }
             scores[t] = dot * scale;
         }
         let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0f32;
-        for s in &mut scores { *s = (*s - max_s).exp(); sum += *s; }
-        for s in &mut scores { *s /= sum; }
+        for s in &mut scores {
+            *s = (*s - max_s).exp();
+            sum += *s;
+        }
+        for s in &mut scores {
+            *s /= sum;
+        }
         for d in 0..head_dim {
             let mut val = 0.0f32;
             for t in 0..seq_len {
@@ -1801,8 +2275,12 @@ fn rmsnorm_utility() {
 
     // Generate input and weight
     let n = (tokens * hidden) as usize;
-    let input_bf16: Vec<u16> = (0..n).map(|i| f32_to_bf16(0.5 + 0.01 * (i as f32 % 20.0))).collect();
-    let weight_bf16: Vec<u16> = (0..hidden as usize).map(|i| f32_to_bf16(1.0 + 0.001 * i as f32)).collect();
+    let input_bf16: Vec<u16> = (0..n)
+        .map(|i| f32_to_bf16(0.5 + 0.01 * (i as f32 % 20.0)))
+        .collect();
+    let weight_bf16: Vec<u16> = (0..hidden as usize)
+        .map(|i| f32_to_bf16(1.0 + 0.001 * i as f32))
+        .collect();
 
     unsafe {
         let input_ptr = gpu_upload(&input_bf16);
@@ -1824,8 +2302,8 @@ fn rmsnorm_utility() {
             TVMFFIAny::dltensor(&dl_out),
             TVMFFIAny::dltensor(&dl_in),
             TVMFFIAny::dltensor(&dl_w),
-            TVMFFIAny::float64(1e-6),    // eps
-            TVMFFIAny::bool_val(false),   // enable_pdl
+            TVMFFIAny::float64(1e-6),   // eps
+            TVMFFIAny::bool_val(false), // enable_pdl
         ];
         reg.call(rmsnorm, &args).expect("rmsnorm failed");
         cudaDeviceSynchronize();
@@ -1841,7 +2319,8 @@ fn rmsnorm_utility() {
         let mut max_diff: f32 = 0.0;
         for t in 0..tokens as usize {
             let row = &in_f32[t * hidden as usize..(t + 1) * hidden as usize];
-            let mean_sq: f64 = row.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / hidden as f64;
+            let mean_sq: f64 =
+                row.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / hidden as f64;
             let rms = (mean_sq + eps).sqrt();
             for d in 0..hidden as usize {
                 let expected = (row[d] as f64 / rms * w_f32[d] as f64) as f32;
@@ -1849,17 +2328,24 @@ fn rmsnorm_utility() {
                 max_diff = max_diff.max((got - expected).abs());
             }
         }
-        assert!(max_diff < 0.05, "RMSNorm max_diff={max_diff} exceeds tolerance");
+        assert!(
+            max_diff < 0.05,
+            "RMSNorm max_diff={max_diff} exceeds tolerance"
+        );
         println!("RMSNorm: PASS (max_diff={max_diff:.6})");
 
-        cudaFree(input_ptr); cudaFree(weight_ptr); cudaFree(output_ptr);
+        cudaFree(input_ptr);
+        cudaFree(weight_ptr);
+        cudaFree(output_ptr);
     }
 }
 
 #[test]
 fn silu_and_mul_activation() {
     let reg = KernelRegistry::new();
-    let silu_fn = reg.get_utility("silu_and_mul").expect("silu_and_mul not found");
+    let silu_fn = reg
+        .get_utility("silu_and_mul")
+        .expect("silu_and_mul not found");
 
     let tokens = 4i64;
     let hidden = 256i64;
@@ -1909,7 +2395,10 @@ fn silu_and_mul_activation() {
                 max_diff = max_diff.max((got - expected).abs());
             }
         }
-        assert!(max_diff < 0.05, "silu_and_mul max_diff={max_diff} exceeds tolerance");
+        assert!(
+            max_diff < 0.05,
+            "silu_and_mul max_diff={max_diff} exceeds tolerance"
+        );
         println!("silu_and_mul: PASS (max_diff={max_diff:.6})");
 
         cudaFree(input_ptr);
@@ -1920,8 +2409,12 @@ fn silu_and_mul_activation() {
 #[test]
 fn fp4_quant_dequant_roundtrip() {
     let reg = KernelRegistry::new();
-    let quant_fn = reg.get_utility("nvfp4_kv_quant").expect("nvfp4_kv_quant not found");
-    let dequant_fn = reg.get_utility("nvfp4_kv_dequant").expect("nvfp4_kv_dequant not found");
+    let quant_fn = reg
+        .get_utility("nvfp4_kv_quant")
+        .expect("nvfp4_kv_quant not found");
+    let dequant_fn = reg
+        .get_utility("nvfp4_kv_dequant")
+        .expect("nvfp4_kv_dequant not found");
 
     let m = 4i64;
     let k = 64i64; // must be divisible by 16 (NVFP4_BLOCK_SIZE)
@@ -1934,17 +2427,22 @@ fn fp4_quant_dequant_roundtrip() {
 
     unsafe {
         let input_ptr = gpu_upload(&input_bf16);
-        let fp4_ptr = gpu_alloc(n / 2);                  // [M, K/2] packed FP4
+        let fp4_ptr = gpu_alloc(n / 2); // [M, K/2] packed FP4
         let scales_ptr = gpu_alloc((m * k / 16) as usize); // [M, K/16] FP8 block scales
         let global_scale_val: f32 = 1.0;
         let gs_ptr = gpu_upload(&[global_scale_val]);
-        let output_ptr = gpu_alloc(n * 2);               // [M, K] BF16 output
+        let output_ptr = gpu_alloc(n * 2); // [M, K] BF16 output
 
-        let in_s = [m, k]; let in_st = contiguous_strides(&in_s);
-        let fp4_s = [m, k / 2]; let fp4_st = contiguous_strides(&fp4_s);
-        let sc_s = [m, k / 16]; let sc_st = contiguous_strides(&sc_s);
-        let gs_s = [1i64]; let gs_st = [1i64];
-        let out_s = [m, k]; let out_st = contiguous_strides(&out_s);
+        let in_s = [m, k];
+        let in_st = contiguous_strides(&in_s);
+        let fp4_s = [m, k / 2];
+        let fp4_st = contiguous_strides(&fp4_s);
+        let sc_s = [m, k / 16];
+        let sc_st = contiguous_strides(&sc_s);
+        let gs_s = [1i64];
+        let gs_st = [1i64];
+        let out_s = [m, k];
+        let out_st = contiguous_strides(&out_s);
 
         let dl_in = gpu_dl(input_ptr, BF16_DT, &in_s, &in_st);
         let dl_fp4 = gpu_dl(fp4_ptr, U8_DT, &fp4_s, &fp4_st);
@@ -1961,7 +2459,8 @@ fn fp4_quant_dequant_roundtrip() {
             TVMFFIAny::dltensor(&dl_fp4),
             TVMFFIAny::dltensor(&dl_sc),
         ];
-        reg.call(quant_fn, &quant_args).expect("nvfp4_kv_quant failed");
+        reg.call(quant_fn, &quant_args)
+            .expect("nvfp4_kv_quant failed");
         cudaDeviceSynchronize();
 
         // Dequantize: FP4 + block scales → BF16
@@ -1971,7 +2470,8 @@ fn fp4_quant_dequant_roundtrip() {
             TVMFFIAny::dltensor(&dl_gs),
             TVMFFIAny::dltensor(&dl_out),
         ];
-        reg.call(dequant_fn, &dequant_args).expect("nvfp4_kv_dequant failed");
+        reg.call(dequant_fn, &dequant_args)
+            .expect("nvfp4_kv_dequant failed");
         cudaDeviceSynchronize();
 
         // Compare: roundtrip error should be bounded
@@ -1990,13 +2490,19 @@ fn fp4_quant_dequant_roundtrip() {
 
         // FP4 E2M1 has very limited precision (values: 0, 0.5, 1, 1.5, 2, 3, 4, 6)
         // so max error can be large, but RMSE should be reasonable
-        assert!(!out_f32.iter().any(|v| v.is_nan()), "FP4 roundtrip produced NaN");
+        assert!(
+            !out_f32.iter().any(|v| v.is_nan()),
+            "FP4 roundtrip produced NaN"
+        );
         assert!(rmse < 1.5, "FP4 roundtrip RMSE={rmse:.4} too large");
 
         println!("FP4 roundtrip: PASS (max_diff={max_diff:.4}, RMSE={rmse:.4})");
 
-        cudaFree(input_ptr); cudaFree(fp4_ptr); cudaFree(scales_ptr);
-        cudaFree(gs_ptr); cudaFree(output_ptr);
+        cudaFree(input_ptr);
+        cudaFree(fp4_ptr);
+        cudaFree(scales_ptr);
+        cudaFree(gs_ptr);
+        cudaFree(output_ptr);
     }
 }
 
@@ -2006,28 +2512,38 @@ fn cascade_merge_state() {
     // Two-level cascade: level 0 = shared prefix (non-causal), level 1 = unique (causal)
     let keys = [
         PrefillKey {
-            dtype: KernelDtype::BF16, head_dim_qk: 128, head_dim_vo: 128,
-            sliding_window: false, logits_soft_cap: false,
+            dtype: KernelDtype::BF16,
+            head_dim_qk: 128,
+            head_dim_vo: 128,
+            sliding_window: false,
+            logits_soft_cap: false,
             backend: Backend::FA2,
         },
         PrefillKey {
-            dtype: KernelDtype::BF16, head_dim_qk: 128, head_dim_vo: 128,
-            sliding_window: false, logits_soft_cap: false,
+            dtype: KernelDtype::BF16,
+            head_dim_qk: 128,
+            head_dim_vo: 128,
+            sliding_window: false,
+            logits_soft_cap: false,
             backend: Backend::FA2,
         },
     ];
-    let cascade = flashinfer::cascade::CascadeAttention::new(&reg, &keys)
-        .expect("Cascade kernels not found");
+    let cascade =
+        flashinfer::cascade::CascadeAttention::new(&reg, &keys).expect("Cascade kernels not found");
 
-    let n = 4i64;   // tokens
-    let h = 2i64;   // heads
-    let d = 128i64;  // head_dim
+    let n = 4i64; // tokens
+    let h = 2i64; // heads
+    let d = 128i64; // head_dim
     let elems = (n * h * d) as usize;
     let lse_elems = (n * h) as usize;
 
     // Create two attention states with different values
-    let v_a_bf16: Vec<u16> = (0..elems).map(|i| f32_to_bf16(0.1 * (i as f32 % 7.0))).collect();
-    let v_b_bf16: Vec<u16> = (0..elems).map(|i| f32_to_bf16(0.2 * (i as f32 % 5.0))).collect();
+    let v_a_bf16: Vec<u16> = (0..elems)
+        .map(|i| f32_to_bf16(0.1 * (i as f32 % 7.0)))
+        .collect();
+    let v_b_bf16: Vec<u16> = (0..elems)
+        .map(|i| f32_to_bf16(0.2 * (i as f32 % 5.0)))
+        .collect();
     let s_a_f32: Vec<f32> = (0..lse_elems).map(|i| 1.0 + 0.1 * i as f32).collect();
     let s_b_f32: Vec<f32> = (0..lse_elems).map(|i| 0.5 + 0.2 * i as f32).collect();
 
@@ -2039,8 +2555,10 @@ fn cascade_merge_state() {
         let v_out = gpu_alloc(elems * 2);
         let s_out = gpu_alloc(lse_elems * 4);
 
-        let v_s = [n, h, d]; let v_st = contiguous_strides(&v_s);
-        let s_s = [n, h]; let s_st = contiguous_strides(&s_s);
+        let v_s = [n, h, d];
+        let v_st = contiguous_strides(&v_s);
+        let s_s = [n, h];
+        let s_st = contiguous_strides(&s_s);
 
         let dl_va = gpu_dl(v_a, BF16_DT, &v_s, &v_st);
         let dl_sa = gpu_dl(s_a, FP32_DT, &s_s, &s_st);
@@ -2052,9 +2570,12 @@ fn cascade_merge_state() {
         reg.set_stream(0, std::ptr::null_mut());
 
         let args = [
-            TVMFFIAny::dltensor(&dl_va), TVMFFIAny::dltensor(&dl_sa),
-            TVMFFIAny::dltensor(&dl_vb), TVMFFIAny::dltensor(&dl_sb),
-            TVMFFIAny::dltensor(&dl_vo), TVMFFIAny::dltensor(&dl_so),
+            TVMFFIAny::dltensor(&dl_va),
+            TVMFFIAny::dltensor(&dl_sa),
+            TVMFFIAny::dltensor(&dl_vb),
+            TVMFFIAny::dltensor(&dl_sb),
+            TVMFFIAny::dltensor(&dl_vo),
+            TVMFFIAny::dltensor(&dl_so),
         ];
         cascade.merge(&reg, &args).expect("merge_state failed");
         cudaDeviceSynchronize();
@@ -2066,13 +2587,23 @@ fn cascade_merge_state() {
         let v_f32: Vec<f32> = out_v.iter().map(|&v| bf16_to_f32(v)).collect();
         let sum: f32 = v_f32.iter().map(|v| v.abs()).sum();
         assert!(sum > 0.0, "merge_state output is all zeros");
-        assert!(v_f32.iter().all(|v| v.is_finite()), "merge_state output has NaN/Inf");
-        assert!(out_s.iter().all(|v| v.is_finite()), "merge_state LSE has NaN/Inf");
+        assert!(
+            v_f32.iter().all(|v| v.is_finite()),
+            "merge_state output has NaN/Inf"
+        );
+        assert!(
+            out_s.iter().all(|v| v.is_finite()),
+            "merge_state LSE has NaN/Inf"
+        );
 
         println!("Cascade merge_state: PASS (output sum={sum:.4})");
 
-        cudaFree(v_a); cudaFree(v_b); cudaFree(s_a); cudaFree(s_b);
-        cudaFree(v_out); cudaFree(s_out);
+        cudaFree(v_a);
+        cudaFree(v_b);
+        cudaFree(s_a);
+        cudaFree(s_b);
+        cudaFree(v_out);
+        cudaFree(s_out);
     }
 }
 
@@ -2110,9 +2641,9 @@ fn softmax_utility() {
             TVMFFIAny::dltensor(&dl_ws),
             TVMFFIAny::dltensor(&dl_logits),
             TVMFFIAny::dltensor(&dl_out),
-            TVMFFIAny::none(),             // temperature_arr
-            TVMFFIAny::float64(1.0),       // temperature_val
-            TVMFFIAny::bool_val(false),    // enable_pdl
+            TVMFFIAny::none(),          // temperature_arr
+            TVMFFIAny::float64(1.0),    // temperature_val
+            TVMFFIAny::bool_val(false), // enable_pdl
         ];
         reg.call(softmax, &args).expect("softmax failed");
         cudaDeviceSynchronize();
@@ -2122,14 +2653,21 @@ fn softmax_utility() {
         for b in 0..batch as usize {
             let row = &out_f32[b * vocab as usize..(b + 1) * vocab as usize];
             let sum: f32 = row.iter().sum();
-            assert!((sum - 1.0).abs() < 0.01, "Softmax row {b} sum={sum}, expected ≈ 1.0");
-            assert!(row.iter().all(|&v| v >= 0.0 && v.is_finite()),
-                "Softmax row {b} has negative or non-finite values");
+            assert!(
+                (sum - 1.0).abs() < 0.01,
+                "Softmax row {b} sum={sum}, expected ≈ 1.0"
+            );
+            assert!(
+                row.iter().all(|&v| v >= 0.0 && v.is_finite()),
+                "Softmax row {b} has negative or non-finite values"
+            );
         }
 
         println!("Softmax: PASS");
 
-        cudaFree(logits_ptr); cudaFree(output_ptr); cudaFree(ws_ptr);
+        cudaFree(logits_ptr);
+        cudaFree(output_ptr);
+        cudaFree(ws_ptr);
     }
 }
 
@@ -2158,13 +2696,19 @@ fn decode_sliding_window_dispatch() {
 
     unsafe {
         let q_elems = (batch_size * num_qo_heads * head_dim) as usize;
-        let q_bf16: Vec<u16> = (0..q_elems).map(|i| f32_to_bf16(0.01 * (i as f32 % 7.0))).collect();
+        let q_bf16: Vec<u16> = (0..q_elems)
+            .map(|i| f32_to_bf16(0.01 * (i as f32 % 7.0)))
+            .collect();
         let q_ptr = gpu_upload(&q_bf16);
         let o_ptr = gpu_alloc(q_elems * 2);
 
         let kv_elems = (total_pages * page_size * num_kv_heads * head_dim) as usize;
-        let k_bf16: Vec<u16> = (0..kv_elems).map(|i| f32_to_bf16(0.005 * (i as f32 % 11.0))).collect();
-        let v_bf16: Vec<u16> = (0..kv_elems).map(|i| f32_to_bf16(0.01 * (i as f32 % 5.0))).collect();
+        let k_bf16: Vec<u16> = (0..kv_elems)
+            .map(|i| f32_to_bf16(0.005 * (i as f32 % 11.0)))
+            .collect();
+        let v_bf16: Vec<u16> = (0..kv_elems)
+            .map(|i| f32_to_bf16(0.01 * (i as f32 % 5.0)))
+            .collect();
         let k_cache = gpu_upload(&k_bf16);
         let v_cache = gpu_upload(&v_bf16);
 
@@ -2192,7 +2736,12 @@ fn decode_sliding_window_dispatch() {
 
         let indptr_s = [batch_size + 1];
         let indptr_st = contiguous_strides(&indptr_s);
-        let dl_indptr_cpu = cpu_dl(kv_indptr_cpu.as_ptr() as *mut c_void, I32_DT, &indptr_s, &indptr_st);
+        let dl_indptr_cpu = cpu_dl(
+            kv_indptr_cpu.as_ptr() as *mut c_void,
+            I32_DT,
+            &indptr_s,
+            &indptr_st,
+        );
 
         let empty_s = [0i64];
         let empty_st = [1i64];
@@ -2211,15 +2760,16 @@ fn decode_sliding_window_dispatch() {
             TVMFFIAny::int64(num_qo_heads),
             TVMFFIAny::int64(num_kv_heads),
             TVMFFIAny::int64(page_size),
-            TVMFFIAny::bool_val(false),    // cuda_graph
-            TVMFFIAny::int64(16),          // window_left = 16 (SWA!)
-            TVMFFIAny::float64(0.0),       // logits_soft_cap
+            TVMFFIAny::bool_val(false), // cuda_graph
+            TVMFFIAny::int64(16),       // window_left = 16 (SWA!)
+            TVMFFIAny::float64(0.0),    // logits_soft_cap
             TVMFFIAny::int64(head_dim),
             TVMFFIAny::int64(head_dim),
             TVMFFIAny::dltensor(&dl_eq),
             TVMFFIAny::dltensor(&dl_ek),
         ];
-        let plan_info = reg.call(variant.plan, &plan_args)
+        let plan_info = reg
+            .call(variant.plan, &plan_args)
             .expect("SWA decode plan failed");
 
         // Run — arg index 12 is window_left
@@ -2258,15 +2808,15 @@ fn decode_sliding_window_dispatch() {
             TVMFFIAny::dltensor(&dl_kvi),
             TVMFFIAny::dltensor(&dl_kv_last),
             TVMFFIAny::dltensor(&dl_o),
-            TVMFFIAny::none(),              // maybe_lse
-            TVMFFIAny::int64(0),            // layout = NHD
-            TVMFFIAny::int64(16),           // window_left = 16 (SWA!)
-            TVMFFIAny::bool_val(false),     // enable_pdl
-            TVMFFIAny::none(),              // alibi_slopes
-            TVMFFIAny::float64(0.0),        // logits_soft_cap
+            TVMFFIAny::none(),          // maybe_lse
+            TVMFFIAny::int64(0),        // layout = NHD
+            TVMFFIAny::int64(16),       // window_left = 16 (SWA!)
+            TVMFFIAny::bool_val(false), // enable_pdl
+            TVMFFIAny::none(),          // alibi_slopes
+            TVMFFIAny::float64(0.0),    // logits_soft_cap
             TVMFFIAny::float64(sm_scale),
-            TVMFFIAny::float64(1.0),        // rope_rcp_scale
-            TVMFFIAny::float64(1e4),        // rope_rcp_theta
+            TVMFFIAny::float64(1.0), // rope_rcp_scale
+            TVMFFIAny::float64(1e4), // rope_rcp_theta
         ];
         reg.call(variant.run, &run_args)
             .expect("SWA decode run failed");
@@ -2276,13 +2826,20 @@ fn decode_sliding_window_dispatch() {
         let out_f32: Vec<f32> = out_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
         let sum: f32 = out_f32.iter().map(|v| v.abs()).sum();
         assert!(sum > 0.0, "SWA decode output is all zeros");
-        assert!(out_f32.iter().all(|v| v.is_finite()), "SWA decode output has NaN/Inf");
+        assert!(
+            out_f32.iter().all(|v| v.is_finite()),
+            "SWA decode output has NaN/Inf"
+        );
 
         println!("Decode SWA dispatch: PASS (sum={sum:.4})");
 
-        cudaFree(q_ptr); cudaFree(o_ptr);
-        cudaFree(k_cache); cudaFree(v_cache);
-        cudaFree(kvi_ptr); cudaFree(kv_indptr_gpu); cudaFree(kv_last_gpu);
+        cudaFree(q_ptr);
+        cudaFree(o_ptr);
+        cudaFree(k_cache);
+        cudaFree(v_cache);
+        cudaFree(kvi_ptr);
+        cudaFree(kv_indptr_gpu);
+        cudaFree(kv_last_gpu);
     }
 }
 
@@ -2307,17 +2864,25 @@ fn decode_softcap_dispatch() {
         sliding_window: false,
         logits_soft_cap: true,
     };
-    let variant = reg.get_decode(&key).expect("Softcap decode variant not found");
+    let variant = reg
+        .get_decode(&key)
+        .expect("Softcap decode variant not found");
 
     unsafe {
         let q_elems = (batch_size * num_qo_heads * head_dim) as usize;
-        let q_bf16: Vec<u16> = (0..q_elems).map(|i| f32_to_bf16(0.01 * (i as f32 % 7.0))).collect();
+        let q_bf16: Vec<u16> = (0..q_elems)
+            .map(|i| f32_to_bf16(0.01 * (i as f32 % 7.0)))
+            .collect();
         let q_ptr = gpu_upload(&q_bf16);
         let o_ptr = gpu_alloc(q_elems * 2);
 
         let kv_elems = (total_pages * page_size * num_kv_heads * head_dim) as usize;
-        let k_bf16: Vec<u16> = (0..kv_elems).map(|i| f32_to_bf16(0.005 * (i as f32 % 11.0))).collect();
-        let v_bf16: Vec<u16> = (0..kv_elems).map(|i| f32_to_bf16(0.01 * (i as f32 % 5.0))).collect();
+        let k_bf16: Vec<u16> = (0..kv_elems)
+            .map(|i| f32_to_bf16(0.005 * (i as f32 % 11.0)))
+            .collect();
+        let v_bf16: Vec<u16> = (0..kv_elems)
+            .map(|i| f32_to_bf16(0.01 * (i as f32 % 5.0)))
+            .collect();
         let k_cache = gpu_upload(&k_bf16);
         let v_cache = gpu_upload(&v_bf16);
 
@@ -2345,7 +2910,12 @@ fn decode_softcap_dispatch() {
 
         let indptr_s = [batch_size + 1];
         let indptr_st = contiguous_strides(&indptr_s);
-        let dl_indptr_cpu = cpu_dl(kv_indptr_cpu.as_ptr() as *mut c_void, I32_DT, &indptr_s, &indptr_st);
+        let dl_indptr_cpu = cpu_dl(
+            kv_indptr_cpu.as_ptr() as *mut c_void,
+            I32_DT,
+            &indptr_s,
+            &indptr_st,
+        );
 
         let empty_s = [0i64];
         let empty_st = [1i64];
@@ -2364,15 +2934,16 @@ fn decode_softcap_dispatch() {
             TVMFFIAny::int64(num_qo_heads),
             TVMFFIAny::int64(num_kv_heads),
             TVMFFIAny::int64(page_size),
-            TVMFFIAny::bool_val(false),    // cuda_graph
-            TVMFFIAny::int64(-1),          // window_left
-            TVMFFIAny::float64(30.0),      // logits_soft_cap = 30.0
+            TVMFFIAny::bool_val(false), // cuda_graph
+            TVMFFIAny::int64(-1),       // window_left
+            TVMFFIAny::float64(30.0),   // logits_soft_cap = 30.0
             TVMFFIAny::int64(head_dim),
             TVMFFIAny::int64(head_dim),
             TVMFFIAny::dltensor(&dl_eq),
             TVMFFIAny::dltensor(&dl_ek),
         ];
-        let plan_info = reg.call(variant.plan, &plan_args)
+        let plan_info = reg
+            .call(variant.plan, &plan_args)
             .expect("Softcap decode plan failed");
 
         // Run — arg index 15 is logits_soft_cap
@@ -2411,15 +2982,15 @@ fn decode_softcap_dispatch() {
             TVMFFIAny::dltensor(&dl_kvi),
             TVMFFIAny::dltensor(&dl_kv_last),
             TVMFFIAny::dltensor(&dl_o),
-            TVMFFIAny::none(),              // maybe_lse
-            TVMFFIAny::int64(0),            // layout = NHD
-            TVMFFIAny::int64(-1),           // window_left
-            TVMFFIAny::bool_val(false),     // enable_pdl
-            TVMFFIAny::none(),              // alibi_slopes
-            TVMFFIAny::float64(30.0),       // logits_soft_cap = 30.0
+            TVMFFIAny::none(),          // maybe_lse
+            TVMFFIAny::int64(0),        // layout = NHD
+            TVMFFIAny::int64(-1),       // window_left
+            TVMFFIAny::bool_val(false), // enable_pdl
+            TVMFFIAny::none(),          // alibi_slopes
+            TVMFFIAny::float64(30.0),   // logits_soft_cap = 30.0
             TVMFFIAny::float64(sm_scale),
-            TVMFFIAny::float64(1.0),        // rope_rcp_scale
-            TVMFFIAny::float64(1e4),        // rope_rcp_theta
+            TVMFFIAny::float64(1.0), // rope_rcp_scale
+            TVMFFIAny::float64(1e4), // rope_rcp_theta
         ];
         reg.call(variant.run, &run_args)
             .expect("Softcap decode run failed");
@@ -2429,13 +3000,20 @@ fn decode_softcap_dispatch() {
         let out_f32: Vec<f32> = out_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
         let sum: f32 = out_f32.iter().map(|v| v.abs()).sum();
         assert!(sum > 0.0, "Softcap decode output is all zeros");
-        assert!(out_f32.iter().all(|v| v.is_finite()), "Softcap decode output has NaN/Inf");
+        assert!(
+            out_f32.iter().all(|v| v.is_finite()),
+            "Softcap decode output has NaN/Inf"
+        );
 
         println!("Decode softcap dispatch: PASS (sum={sum:.4})");
 
-        cudaFree(q_ptr); cudaFree(o_ptr);
-        cudaFree(k_cache); cudaFree(v_cache);
-        cudaFree(kvi_ptr); cudaFree(kv_indptr_gpu); cudaFree(kv_last_gpu);
+        cudaFree(q_ptr);
+        cudaFree(o_ptr);
+        cudaFree(k_cache);
+        cudaFree(v_cache);
+        cudaFree(kvi_ptr);
+        cudaFree(kv_indptr_gpu);
+        cudaFree(kv_last_gpu);
     }
 }
 
@@ -2461,19 +3039,27 @@ fn prefill_paged_fa2() {
         logits_soft_cap: false,
         backend: Backend::FA2,
     };
-    let variant = reg.get_prefill(&key).expect("Paged prefill variant not found");
+    let variant = reg
+        .get_prefill(&key)
+        .expect("Paged prefill variant not found");
 
     unsafe {
         // Q: [seq_len, num_qo_heads, head_dim]
         let total = (seq_len * num_qo_heads * head_dim) as usize;
-        let q_bf16: Vec<u16> = (0..total).map(|i| f32_to_bf16(0.01 * (i as f32 % 10.0))).collect();
+        let q_bf16: Vec<u16> = (0..total)
+            .map(|i| f32_to_bf16(0.01 * (i as f32 % 10.0)))
+            .collect();
         let q_ptr = gpu_upload(&q_bf16);
         let o_ptr = gpu_alloc(total * 2);
 
         // Paged KV cache: [total_pages, page_size, num_kv_heads, head_dim]
         let kv_elems = (total_pages * page_size * num_kv_heads * head_dim) as usize;
-        let k_bf16: Vec<u16> = (0..kv_elems).map(|i| f32_to_bf16(0.01 * ((i + 3) as f32 % 10.0))).collect();
-        let v_bf16: Vec<u16> = (0..kv_elems).map(|i| f32_to_bf16(0.02 * ((i + 7) as f32 % 10.0))).collect();
+        let k_bf16: Vec<u16> = (0..kv_elems)
+            .map(|i| f32_to_bf16(0.01 * ((i + 3) as f32 % 10.0)))
+            .collect();
+        let v_bf16: Vec<u16> = (0..kv_elems)
+            .map(|i| f32_to_bf16(0.02 * ((i + 7) as f32 % 10.0)))
+            .collect();
         let k_cache = gpu_upload(&k_bf16);
         let v_cache = gpu_upload(&v_bf16);
 
@@ -2488,8 +3074,11 @@ fn prefill_paged_fa2() {
         }
         let paged_kv_last_page_len = {
             let rem = seq_len as i32 % page_size as i32;
-            if rem == 0 { vec![page_size as i32; batch_size as usize] }
-            else { vec![rem; batch_size as usize] }
+            if rem == 0 {
+                vec![page_size as i32; batch_size as usize]
+            } else {
+                vec![rem; batch_size as usize]
+            }
         };
 
         // Indptrs for plan (CPU)
@@ -2506,9 +3095,12 @@ fn prefill_paged_fa2() {
         let (dl_fws, _fws_s, _fws_st) = ws.dl_float();
         let (dl_iws, _iws_s, _iws_st) = ws.dl_int();
         let (dl_pws, _pws_s, _pws_st) = ws.dl_pinned();
-        let cu_s = [batch_size + 1]; let cu_st = contiguous_strides(&cu_s);
-        let kvl_s = [batch_size]; let kvl_st = contiguous_strides(&kvl_s);
-        let q_s = [seq_len, num_qo_heads, head_dim]; let q_st = contiguous_strides(&q_s);
+        let cu_s = [batch_size + 1];
+        let cu_st = contiguous_strides(&cu_s);
+        let kvl_s = [batch_size];
+        let kvl_st = contiguous_strides(&kvl_s);
+        let q_s = [seq_len, num_qo_heads, head_dim];
+        let q_st = contiguous_strides(&q_s);
 
         let dl_cuq = cpu_dl(cu_q_data.as_ptr() as *mut c_void, I32_DT, &cu_s, &cu_st);
         let dl_cuk = cpu_dl(cu_k_data.as_ptr() as *mut c_void, I32_DT, &cu_s, &cu_st);
@@ -2522,30 +3114,42 @@ fn prefill_paged_fa2() {
         let dl_v_cache = gpu_dl(v_cache, BF16_DT, &kv_s, &kv_st);
 
         let dl_cuq_gpu = gpu_dl(cu_q_gpu, I32_DT, &cu_s, &cu_st);
-        let pki_s = [paged_kv_indptr.len() as i64]; let pki_st = contiguous_strides(&pki_s);
+        let pki_s = [paged_kv_indptr.len() as i64];
+        let pki_st = contiguous_strides(&pki_s);
         let dl_paged_kv_indptr = gpu_dl(paged_kv_indptr_gpu, I32_DT, &pki_s, &pki_st);
-        let pkidx_s = [paged_kv_indices.len() as i64]; let pkidx_st = contiguous_strides(&pkidx_s);
+        let pkidx_s = [paged_kv_indices.len() as i64];
+        let pkidx_st = contiguous_strides(&pkidx_s);
         let dl_paged_kv_indices = gpu_dl(paged_kv_indices_gpu, I32_DT, &pkidx_s, &pkidx_st);
-        let pklp_s = [batch_size]; let pklp_st = contiguous_strides(&pklp_s);
+        let pklp_s = [batch_size];
+        let pklp_st = contiguous_strides(&pklp_s);
         let dl_paged_kv_last = gpu_dl(paged_kv_last_gpu, I32_DT, &pklp_s, &pklp_st);
 
         reg.set_stream(0, std::ptr::null_mut());
 
         // Plan (uses page_size, not 1 like ragged)
         let plan_args = [
-            TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws),
-            TVMFFIAny::dltensor(&dl_pws), TVMFFIAny::dltensor(&dl_cuq),
-            TVMFFIAny::dltensor(&dl_cuk), TVMFFIAny::dltensor(&dl_kvl),
-            TVMFFIAny::int64(seq_len), TVMFFIAny::int64(batch_size),
-            TVMFFIAny::int64(num_qo_heads), TVMFFIAny::int64(num_kv_heads),
-            TVMFFIAny::int64(page_size),   // page_size (paged, not 1!)
+            TVMFFIAny::dltensor(&dl_fws),
+            TVMFFIAny::dltensor(&dl_iws),
+            TVMFFIAny::dltensor(&dl_pws),
+            TVMFFIAny::dltensor(&dl_cuq),
+            TVMFFIAny::dltensor(&dl_cuk),
+            TVMFFIAny::dltensor(&dl_kvl),
+            TVMFFIAny::int64(seq_len),
+            TVMFFIAny::int64(batch_size),
+            TVMFFIAny::int64(num_qo_heads),
+            TVMFFIAny::int64(num_kv_heads),
+            TVMFFIAny::int64(page_size), // page_size (paged, not 1!)
             TVMFFIAny::bool_val(false),
-            TVMFFIAny::int64(head_dim), TVMFFIAny::int64(head_dim),
-            TVMFFIAny::bool_val(true),     // causal
-            TVMFFIAny::int64(-1),          // window_left
-            TVMFFIAny::int64(-1), TVMFFIAny::bool_val(false), TVMFFIAny::int64(0),
+            TVMFFIAny::int64(head_dim),
+            TVMFFIAny::int64(head_dim),
+            TVMFFIAny::bool_val(true), // causal
+            TVMFFIAny::int64(-1),      // window_left
+            TVMFFIAny::int64(-1),
+            TVMFFIAny::bool_val(false),
+            TVMFFIAny::int64(0),
         ];
-        let plan_info = reg.call(variant.plan, &plan_args)
+        let plan_info = reg
+            .call(variant.plan, &plan_args)
             .expect("Paged prefill plan failed");
 
         // Paged run
@@ -2562,22 +3166,22 @@ fn prefill_paged_fa2() {
             TVMFFIAny::dltensor(&dl_paged_kv_indices),
             TVMFFIAny::dltensor(&dl_paged_kv_last),
             TVMFFIAny::dltensor(&dl_o),
-            TVMFFIAny::none(),             // maybe_lse
-            TVMFFIAny::int64(1),           // mask_mode = Causal
-            TVMFFIAny::int64(0),           // layout = NHD
-            TVMFFIAny::int64(-1),          // window_left
-            TVMFFIAny::bool_val(false),    // enable_pdl
-            TVMFFIAny::none(),             // custom_mask
-            TVMFFIAny::none(),             // mask_indptr
-            TVMFFIAny::none(),             // alibi_slopes
-            TVMFFIAny::none(),             // prefix_len_ptr
-            TVMFFIAny::none(),             // token_pos_in_items_ptr
-            TVMFFIAny::none(),             // max_item_len_ptr
-            TVMFFIAny::float64(0.0),       // logits_soft_cap
+            TVMFFIAny::none(),          // maybe_lse
+            TVMFFIAny::int64(1),        // mask_mode = Causal
+            TVMFFIAny::int64(0),        // layout = NHD
+            TVMFFIAny::int64(-1),       // window_left
+            TVMFFIAny::bool_val(false), // enable_pdl
+            TVMFFIAny::none(),          // custom_mask
+            TVMFFIAny::none(),          // mask_indptr
+            TVMFFIAny::none(),          // alibi_slopes
+            TVMFFIAny::none(),          // prefix_len_ptr
+            TVMFFIAny::none(),          // token_pos_in_items_ptr
+            TVMFFIAny::none(),          // max_item_len_ptr
+            TVMFFIAny::float64(0.0),    // logits_soft_cap
             TVMFFIAny::float64(sm_scale),
-            TVMFFIAny::float64(1.0),       // rope_rcp_scale
-            TVMFFIAny::float64(1e4),       // rope_rcp_theta
-            TVMFFIAny::int64(0),           // token_pos_in_items_len
+            TVMFFIAny::float64(1.0), // rope_rcp_scale
+            TVMFFIAny::float64(1e4), // rope_rcp_theta
+            TVMFFIAny::int64(0),     // token_pos_in_items_len
         ];
         reg.call(variant.paged_run, &run_args)
             .expect("Paged prefill run failed");
@@ -2587,14 +3191,21 @@ fn prefill_paged_fa2() {
         let out_f32: Vec<f32> = out_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
         let sum: f32 = out_f32.iter().map(|v| v.abs()).sum();
         assert!(sum > 0.0, "Paged prefill output is all zeros");
-        assert!(out_f32.iter().all(|v| v.is_finite()), "Paged prefill output has NaN/Inf");
+        assert!(
+            out_f32.iter().all(|v| v.is_finite()),
+            "Paged prefill output has NaN/Inf"
+        );
 
         println!("Prefill paged FA2: PASS (sum={sum:.4})");
 
-        cudaFree(q_ptr); cudaFree(o_ptr);
-        cudaFree(k_cache); cudaFree(v_cache);
-        cudaFree(cu_q_gpu); cudaFree(paged_kv_indptr_gpu);
-        cudaFree(paged_kv_indices_gpu); cudaFree(paged_kv_last_gpu);
+        cudaFree(q_ptr);
+        cudaFree(o_ptr);
+        cudaFree(k_cache);
+        cudaFree(v_cache);
+        cudaFree(cu_q_gpu);
+        cudaFree(paged_kv_indptr_gpu);
+        cudaFree(paged_kv_indices_gpu);
+        cudaFree(paged_kv_last_gpu);
     }
 }
 
@@ -2603,7 +3214,9 @@ fn prefill_custom_mask() {
     // Custom mask requires Optional<ffi::Tensor> (TVM Tensor objects, not raw DLTensors).
     // Creating TVM Tensor objects requires TVM runtime allocator setup which isn't available
     // in standalone tests. Skip until we integrate with the full runtime.
-    println!("Skipping prefill_custom_mask — requires TVM Tensor allocator for Optional<ffi::Tensor> params");
+    println!(
+        "Skipping prefill_custom_mask — requires TVM Tensor allocator for Optional<ffi::Tensor> params"
+    );
     return;
 
     #[allow(unreachable_code)]
@@ -2629,9 +3242,15 @@ fn prefill_custom_mask() {
     unsafe {
         let total = (seq_len * num_qo_heads * head_dim) as usize;
         let kv_total = (seq_len * num_kv_heads * head_dim) as usize;
-        let q_bf16: Vec<u16> = (0..total).map(|i| f32_to_bf16(0.01 * (i as f32 % 10.0))).collect();
-        let k_bf16: Vec<u16> = (0..kv_total).map(|i| f32_to_bf16(0.01 * ((i + 3) as f32 % 10.0))).collect();
-        let v_bf16: Vec<u16> = (0..kv_total).map(|i| f32_to_bf16(0.02 * ((i + 7) as f32 % 10.0))).collect();
+        let q_bf16: Vec<u16> = (0..total)
+            .map(|i| f32_to_bf16(0.01 * (i as f32 % 10.0)))
+            .collect();
+        let k_bf16: Vec<u16> = (0..kv_total)
+            .map(|i| f32_to_bf16(0.01 * ((i + 3) as f32 % 10.0)))
+            .collect();
+        let v_bf16: Vec<u16> = (0..kv_total)
+            .map(|i| f32_to_bf16(0.02 * ((i + 7) as f32 % 10.0)))
+            .collect();
         let q_ptr = gpu_upload(&q_bf16);
         let k_ptr = gpu_upload(&k_bf16);
         let v_ptr = gpu_upload(&v_bf16);
@@ -2656,10 +3275,14 @@ fn prefill_custom_mask() {
         let (dl_fws, _fws_s, _fws_st) = ws.dl_float();
         let (dl_iws, _iws_s, _iws_st) = ws.dl_int();
         let (dl_pws, _pws_s, _pws_st) = ws.dl_pinned();
-        let cu_s = [batch_size + 1]; let cu_st = contiguous_strides(&cu_s);
-        let kvl_s = [batch_size]; let kvl_st = contiguous_strides(&kvl_s);
-        let q_s = [seq_len, num_qo_heads, head_dim]; let q_st = contiguous_strides(&q_s);
-        let k_s = [seq_len, num_kv_heads, head_dim]; let k_st = contiguous_strides(&k_s);
+        let cu_s = [batch_size + 1];
+        let cu_st = contiguous_strides(&cu_s);
+        let kvl_s = [batch_size];
+        let kvl_st = contiguous_strides(&kvl_s);
+        let q_s = [seq_len, num_qo_heads, head_dim];
+        let q_st = contiguous_strides(&q_s);
+        let k_s = [seq_len, num_kv_heads, head_dim];
+        let k_st = contiguous_strides(&k_s);
 
         let dl_cuq = cpu_dl(cu_q_data.as_ptr() as *mut c_void, I32_DT, &cu_s, &cu_st);
         let dl_cuk = cpu_dl(cu_k_data.as_ptr() as *mut c_void, I32_DT, &cu_s, &cu_st);
@@ -2671,53 +3294,68 @@ fn prefill_custom_mask() {
         let dl_v = gpu_dl(v_ptr, BF16_DT, &k_s, &k_st);
         let dl_o = gpu_dl(o_ptr, BF16_DT, &q_s, &q_st);
 
-        let mask_s = [mask_bytes as i64]; let mask_st = [1i64];
+        let mask_s = [mask_bytes as i64];
+        let mask_st = [1i64];
         let dl_custom_mask = gpu_dl(custom_mask_gpu, U8_DT, &mask_s, &mask_st);
-        let mi_s = [batch_size + 1]; let mi_st = contiguous_strides(&mi_s);
+        let mi_s = [batch_size + 1];
+        let mi_st = contiguous_strides(&mi_s);
         let dl_mask_indptr = gpu_dl(mask_indptr_gpu, I32_DT, &mi_s, &mi_st);
 
         reg.set_stream(0, std::ptr::null_mut());
 
         // Plan (same as causal — mask_mode is only used at run time)
         let plan_args = [
-            TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws),
-            TVMFFIAny::dltensor(&dl_pws), TVMFFIAny::dltensor(&dl_cuq),
-            TVMFFIAny::dltensor(&dl_cuk), TVMFFIAny::dltensor(&dl_kvl),
-            TVMFFIAny::int64(seq_len), TVMFFIAny::int64(batch_size),
-            TVMFFIAny::int64(num_qo_heads), TVMFFIAny::int64(num_kv_heads),
-            TVMFFIAny::int64(1),           // page_size (ragged=1)
+            TVMFFIAny::dltensor(&dl_fws),
+            TVMFFIAny::dltensor(&dl_iws),
+            TVMFFIAny::dltensor(&dl_pws),
+            TVMFFIAny::dltensor(&dl_cuq),
+            TVMFFIAny::dltensor(&dl_cuk),
+            TVMFFIAny::dltensor(&dl_kvl),
+            TVMFFIAny::int64(seq_len),
+            TVMFFIAny::int64(batch_size),
+            TVMFFIAny::int64(num_qo_heads),
+            TVMFFIAny::int64(num_kv_heads),
+            TVMFFIAny::int64(1), // page_size (ragged=1)
             TVMFFIAny::bool_val(false),
-            TVMFFIAny::int64(head_dim), TVMFFIAny::int64(head_dim),
-            TVMFFIAny::bool_val(false),    // causal=false (custom mask)
+            TVMFFIAny::int64(head_dim),
+            TVMFFIAny::int64(head_dim),
+            TVMFFIAny::bool_val(false), // causal=false (custom mask)
             TVMFFIAny::int64(-1),
-            TVMFFIAny::int64(-1), TVMFFIAny::bool_val(false), TVMFFIAny::int64(0),
+            TVMFFIAny::int64(-1),
+            TVMFFIAny::bool_val(false),
+            TVMFFIAny::int64(0),
         ];
-        let plan_info = reg.call(variant.plan, &plan_args)
+        let plan_info = reg
+            .call(variant.plan, &plan_args)
             .expect("Custom mask prefill plan failed");
 
         let sm_scale = 1.0 / (head_dim as f64).sqrt();
         let run_args = [
-            TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws),
+            TVMFFIAny::dltensor(&dl_fws),
+            TVMFFIAny::dltensor(&dl_iws),
             plan_info,
-            TVMFFIAny::dltensor(&dl_q), TVMFFIAny::dltensor(&dl_k),
-            TVMFFIAny::dltensor(&dl_v), TVMFFIAny::dltensor(&dl_cuq_gpu),
-            TVMFFIAny::dltensor(&dl_cuk_gpu), TVMFFIAny::dltensor(&dl_o),
-            TVMFFIAny::none(),             // maybe_lse
-            TVMFFIAny::int64(2),           // mask_mode = Custom
-            TVMFFIAny::int64(0),           // layout = NHD
-            TVMFFIAny::int64(-1),          // window_left
-            TVMFFIAny::bool_val(false),    // enable_pdl
-            TVMFFIAny::dltensor(&dl_custom_mask),  // custom_mask (Optional<ffi::Tensor>)
-            TVMFFIAny::dltensor(&dl_mask_indptr),  // mask_indptr (Optional<ffi::Tensor>)
-            TVMFFIAny::none(),             // alibi_slopes
-            TVMFFIAny::none(),             // prefix_len_ptr
-            TVMFFIAny::none(),             // token_pos_in_items_ptr
-            TVMFFIAny::none(),             // max_item_len_ptr
-            TVMFFIAny::float64(0.0),       // logits_soft_cap
+            TVMFFIAny::dltensor(&dl_q),
+            TVMFFIAny::dltensor(&dl_k),
+            TVMFFIAny::dltensor(&dl_v),
+            TVMFFIAny::dltensor(&dl_cuq_gpu),
+            TVMFFIAny::dltensor(&dl_cuk_gpu),
+            TVMFFIAny::dltensor(&dl_o),
+            TVMFFIAny::none(),                    // maybe_lse
+            TVMFFIAny::int64(2),                  // mask_mode = Custom
+            TVMFFIAny::int64(0),                  // layout = NHD
+            TVMFFIAny::int64(-1),                 // window_left
+            TVMFFIAny::bool_val(false),           // enable_pdl
+            TVMFFIAny::dltensor(&dl_custom_mask), // custom_mask (Optional<ffi::Tensor>)
+            TVMFFIAny::dltensor(&dl_mask_indptr), // mask_indptr (Optional<ffi::Tensor>)
+            TVMFFIAny::none(),                    // alibi_slopes
+            TVMFFIAny::none(),                    // prefix_len_ptr
+            TVMFFIAny::none(),                    // token_pos_in_items_ptr
+            TVMFFIAny::none(),                    // max_item_len_ptr
+            TVMFFIAny::float64(0.0),              // logits_soft_cap
             TVMFFIAny::float64(sm_scale),
-            TVMFFIAny::float64(1.0),       // rope_rcp_scale
-            TVMFFIAny::float64(1e4),       // rope_rcp_theta
-            TVMFFIAny::int64(0),           // token_pos_in_items_len
+            TVMFFIAny::float64(1.0), // rope_rcp_scale
+            TVMFFIAny::float64(1e4), // rope_rcp_theta
+            TVMFFIAny::int64(0),     // token_pos_in_items_len
         ];
         reg.call(variant.ragged_run, &run_args)
             .expect("Custom mask prefill run failed");
@@ -2727,23 +3365,41 @@ fn prefill_custom_mask() {
         let out_f32: Vec<f32> = out_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
         let sum: f32 = out_f32.iter().map(|v| v.abs()).sum();
         assert!(sum > 0.0, "Custom mask prefill output is all zeros");
-        assert!(out_f32.iter().all(|v| v.is_finite()), "Custom mask prefill has NaN/Inf");
+        assert!(
+            out_f32.iter().all(|v| v.is_finite()),
+            "Custom mask prefill has NaN/Inf"
+        );
 
         println!("Prefill custom mask: PASS (sum={sum:.4})");
 
-        cudaFree(q_ptr); cudaFree(k_ptr); cudaFree(v_ptr); cudaFree(o_ptr);
-        cudaFree(cu_q_gpu); cudaFree(cu_k_gpu);
-        cudaFree(custom_mask_gpu); cudaFree(mask_indptr_gpu);
+        cudaFree(q_ptr);
+        cudaFree(k_ptr);
+        cudaFree(v_ptr);
+        cudaFree(o_ptr);
+        cudaFree(cu_q_gpu);
+        cudaFree(cu_k_gpu);
+        cudaFree(custom_mask_gpu);
+        cudaFree(mask_indptr_gpu);
     }
 }
 
-const FP8_E4M3_DT: DLDataType = DLDataType { code: 32, bits: 8, lanes: 1 };
+const FP8_E4M3_DT: DLDataType = DLDataType {
+    code: 32,
+    bits: 8,
+    lanes: 1,
+};
 
 #[test]
 fn fp8_prefill_execution() {
     let reg = KernelRegistry::new();
     // FP8 prefill variants are sm_90 only — skip on non-Hopper.
-    if reg.arch() != 90 { println!("Skipping FP8 prefill — requires SM90 (got SM{})", reg.arch()); return; }
+    if reg.arch() != 90 {
+        println!(
+            "Skipping FP8 prefill — requires SM90 (got SM{})",
+            reg.arch()
+        );
+        return;
+    }
 
     let ws = Workspace::new();
     let seq_len = 8i64;
@@ -2755,7 +3411,9 @@ fn fp8_prefill_execution() {
         head_dim: head_dim as u32,
         sliding_window: false,
     };
-    let variant = reg.get_fp8_prefill(&key).expect("FP8 prefill variant not found");
+    let variant = reg
+        .get_fp8_prefill(&key)
+        .expect("FP8 prefill variant not found");
 
     unsafe {
         let total = (seq_len * num_qo_heads * head_dim) as usize;
@@ -2763,8 +3421,12 @@ fn fp8_prefill_execution() {
         // FP8 E4M3: generate small values. 0x3C = 1.0 in E4M3, 0x38 = 0.5, etc.
         // Use small positive values to avoid overflow.
         let q_fp8: Vec<u8> = (0..total).map(|i| (0x20 + (i % 16)) as u8).collect();
-        let k_fp8: Vec<u8> = (0..kv_total).map(|i| (0x20 + ((i + 3) % 16)) as u8).collect();
-        let v_fp8: Vec<u8> = (0..kv_total).map(|i| (0x20 + ((i + 7) % 16)) as u8).collect();
+        let k_fp8: Vec<u8> = (0..kv_total)
+            .map(|i| (0x20 + ((i + 3) % 16)) as u8)
+            .collect();
+        let v_fp8: Vec<u8> = (0..kv_total)
+            .map(|i| (0x20 + ((i + 7) % 16)) as u8)
+            .collect();
         let q_ptr = gpu_upload(&q_fp8);
         let k_ptr = gpu_upload(&k_fp8);
         let v_ptr = gpu_upload(&v_fp8);
@@ -2779,10 +3441,14 @@ fn fp8_prefill_execution() {
         let (dl_fws, _fws_s, _fws_st) = ws.dl_float();
         let (dl_iws, _iws_s, _iws_st) = ws.dl_int();
         let (dl_pws, _pws_s, _pws_st) = ws.dl_pinned();
-        let cu_s = [2i64]; let cu_st = [1i64];
-        let kvl_s = [1i64]; let kvl_st = [1i64];
-        let q_s = [seq_len, num_qo_heads, head_dim]; let q_st = contiguous_strides(&q_s);
-        let k_s = [seq_len, num_kv_heads, head_dim]; let k_st = contiguous_strides(&k_s);
+        let cu_s = [2i64];
+        let cu_st = [1i64];
+        let kvl_s = [1i64];
+        let kvl_st = [1i64];
+        let q_s = [seq_len, num_qo_heads, head_dim];
+        let q_st = contiguous_strides(&q_s);
+        let k_s = [seq_len, num_kv_heads, head_dim];
+        let k_st = contiguous_strides(&k_s);
 
         let dl_cuq = cpu_dl(cu_q_data.as_ptr() as *mut c_void, I32_DT, &cu_s, &cu_st);
         let dl_cuk = cpu_dl(cu_k_data.as_ptr() as *mut c_void, I32_DT, &cu_s, &cu_st);
@@ -2792,17 +3458,25 @@ fn fp8_prefill_execution() {
 
         // FA3 SM90 plan: 16 args
         let plan_args = [
-            TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws),
+            TVMFFIAny::dltensor(&dl_fws),
+            TVMFFIAny::dltensor(&dl_iws),
             TVMFFIAny::dltensor(&dl_pws),
-            TVMFFIAny::dltensor(&dl_cuq), TVMFFIAny::dltensor(&dl_cuk),
+            TVMFFIAny::dltensor(&dl_cuq),
+            TVMFFIAny::dltensor(&dl_cuk),
             TVMFFIAny::dltensor(&dl_kvl),
-            TVMFFIAny::int64(seq_len), TVMFFIAny::int64(1),
-            TVMFFIAny::int64(num_qo_heads), TVMFFIAny::int64(num_kv_heads),
-            TVMFFIAny::int64(1), TVMFFIAny::bool_val(false),
-            TVMFFIAny::int64(head_dim), TVMFFIAny::int64(head_dim),
-            TVMFFIAny::bool_val(true), TVMFFIAny::int64(-1),
+            TVMFFIAny::int64(seq_len),
+            TVMFFIAny::int64(1),
+            TVMFFIAny::int64(num_qo_heads),
+            TVMFFIAny::int64(num_kv_heads),
+            TVMFFIAny::int64(1),
+            TVMFFIAny::bool_val(false),
+            TVMFFIAny::int64(head_dim),
+            TVMFFIAny::int64(head_dim),
+            TVMFFIAny::bool_val(true),
+            TVMFFIAny::int64(-1),
         ];
-        let plan_info = reg.call(variant.plan, &plan_args)
+        let plan_info = reg
+            .call(variant.plan, &plan_args)
             .expect("FP8 prefill plan failed");
 
         let sm_scale = 1.0 / (head_dim as f64).sqrt();
@@ -2819,23 +3493,27 @@ fn fp8_prefill_execution() {
         // ADDITIONAL: maybe_scale_q, maybe_scale_k, maybe_scale_v, sm_scale,
         //             scale_q_scalar, scale_k_scalar, scale_v_scalar
         let run_args = [
-            TVMFFIAny::dltensor(&dl_fws), TVMFFIAny::dltensor(&dl_iws),
+            TVMFFIAny::dltensor(&dl_fws),
+            TVMFFIAny::dltensor(&dl_iws),
             plan_info,
-            TVMFFIAny::dltensor(&dl_q), TVMFFIAny::dltensor(&dl_k),
-            TVMFFIAny::dltensor(&dl_v), TVMFFIAny::dltensor(&dl_cuq_gpu),
-            TVMFFIAny::dltensor(&dl_cuk_gpu), TVMFFIAny::dltensor(&dl_o),
-            TVMFFIAny::none(),         // lse
-            TVMFFIAny::int64(1),       // causal
-            TVMFFIAny::int64(0),       // NHD
-            TVMFFIAny::int64(-1),      // window_left
-            TVMFFIAny::bool_val(false),// enable_pdl
-            TVMFFIAny::none(),         // maybe_scale_q
-            TVMFFIAny::none(),         // maybe_scale_k
-            TVMFFIAny::none(),         // maybe_scale_v
+            TVMFFIAny::dltensor(&dl_q),
+            TVMFFIAny::dltensor(&dl_k),
+            TVMFFIAny::dltensor(&dl_v),
+            TVMFFIAny::dltensor(&dl_cuq_gpu),
+            TVMFFIAny::dltensor(&dl_cuk_gpu),
+            TVMFFIAny::dltensor(&dl_o),
+            TVMFFIAny::none(),          // lse
+            TVMFFIAny::int64(1),        // causal
+            TVMFFIAny::int64(0),        // NHD
+            TVMFFIAny::int64(-1),       // window_left
+            TVMFFIAny::bool_val(false), // enable_pdl
+            TVMFFIAny::none(),          // maybe_scale_q
+            TVMFFIAny::none(),          // maybe_scale_k
+            TVMFFIAny::none(),          // maybe_scale_v
             TVMFFIAny::float64(sm_scale),
-            TVMFFIAny::float64(1.0),   // scale_q_scalar
-            TVMFFIAny::float64(1.0),   // scale_k_scalar
-            TVMFFIAny::float64(1.0),   // scale_v_scalar
+            TVMFFIAny::float64(1.0), // scale_q_scalar
+            TVMFFIAny::float64(1.0), // scale_k_scalar
+            TVMFFIAny::float64(1.0), // scale_v_scalar
         ];
         reg.call(variant.ragged_run, &run_args)
             .expect("FP8 prefill ragged_run failed");
@@ -2845,12 +3523,19 @@ fn fp8_prefill_execution() {
         let out_f32: Vec<f32> = out.iter().map(|&v| bf16_to_f32(v)).collect();
         let sum: f32 = out_f32.iter().map(|v| v.abs()).sum();
         assert!(sum > 0.0, "FP8 prefill output is all zeros");
-        assert!(out_f32.iter().all(|v| v.is_finite()), "FP8 prefill has NaN/Inf");
+        assert!(
+            out_f32.iter().all(|v| v.is_finite()),
+            "FP8 prefill has NaN/Inf"
+        );
 
         println!("FP8 prefill: PASS (sum={sum:.4})");
 
-        cudaFree(q_ptr); cudaFree(k_ptr); cudaFree(v_ptr); cudaFree(o_ptr);
-        cudaFree(cu_q_gpu); cudaFree(cu_k_gpu);
+        cudaFree(q_ptr);
+        cudaFree(k_ptr);
+        cudaFree(v_ptr);
+        cudaFree(o_ptr);
+        cudaFree(cu_q_gpu);
+        cudaFree(cu_k_gpu);
     }
 }
 
@@ -2873,14 +3558,20 @@ fn mla_decode_execution() {
         head_dim_ckv: head_dim_ckv as u32,
         head_dim_kpe: head_dim_kpe as u32,
     };
-    let variant = reg.get_mla_decode(&key).expect("MLA decode variant not found");
+    let variant = reg
+        .get_mla_decode(&key)
+        .expect("MLA decode variant not found");
 
     unsafe {
         // Q: q_nope [batch, num_qo_heads, head_dim_ckv], q_pe [batch, num_qo_heads, head_dim_kpe]
         let q_nope_elems = (batch_size * num_qo_heads * head_dim_ckv) as usize;
         let q_pe_elems = (batch_size * num_qo_heads * head_dim_kpe) as usize;
-        let q_nope_bf16: Vec<u16> = (0..q_nope_elems).map(|i| f32_to_bf16(0.005 * (i as f32 % 7.0))).collect();
-        let q_pe_bf16: Vec<u16> = (0..q_pe_elems).map(|i| f32_to_bf16(0.01 * (i as f32 % 5.0))).collect();
+        let q_nope_bf16: Vec<u16> = (0..q_nope_elems)
+            .map(|i| f32_to_bf16(0.005 * (i as f32 % 7.0)))
+            .collect();
+        let q_pe_bf16: Vec<u16> = (0..q_pe_elems)
+            .map(|i| f32_to_bf16(0.01 * (i as f32 % 5.0)))
+            .collect();
         let q_nope_ptr = gpu_upload(&q_nope_bf16);
         let q_pe_ptr = gpu_upload(&q_pe_bf16);
         let o_elems = (batch_size * num_qo_heads * head_dim_ckv) as usize;
@@ -2889,8 +3580,12 @@ fn mla_decode_execution() {
         // Paged CKV cache: [total_pages, page_size, 1, head_dim_ckv] (single-head MLA)
         let ckv_elems = (total_pages * page_size * 1 * head_dim_ckv) as usize;
         let kpe_elems = (total_pages * page_size * 1 * head_dim_kpe) as usize;
-        let ckv_bf16: Vec<u16> = (0..ckv_elems).map(|i| f32_to_bf16(0.003 * (i as f32 % 9.0))).collect();
-        let kpe_bf16: Vec<u16> = (0..kpe_elems).map(|i| f32_to_bf16(0.005 * (i as f32 % 6.0))).collect();
+        let ckv_bf16: Vec<u16> = (0..ckv_elems)
+            .map(|i| f32_to_bf16(0.003 * (i as f32 % 9.0)))
+            .collect();
+        let kpe_bf16: Vec<u16> = (0..kpe_elems)
+            .map(|i| f32_to_bf16(0.005 * (i as f32 % 6.0)))
+            .collect();
         let ckv_cache = gpu_upload(&ckv_bf16);
         let kpe_cache = gpu_upload(&kpe_bf16);
 
@@ -2921,7 +3616,12 @@ fn mla_decode_execution() {
 
         let indptr_s = [batch_size + 1];
         let indptr_st = contiguous_strides(&indptr_s);
-        let dl_indptr_cpu = cpu_dl(kv_indptr_cpu.as_ptr() as *mut c_void, I32_DT, &indptr_s, &indptr_st);
+        let dl_indptr_cpu = cpu_dl(
+            kv_indptr_cpu.as_ptr() as *mut c_void,
+            I32_DT,
+            &indptr_s,
+            &indptr_st,
+        );
 
         reg.set_stream(0, std::ptr::null_mut());
 
@@ -2935,9 +3635,10 @@ fn mla_decode_execution() {
             TVMFFIAny::int64(batch_size),
             TVMFFIAny::int64(num_qo_heads),
             TVMFFIAny::int64(page_size),
-            TVMFFIAny::bool_val(false),    // cuda_graph
+            TVMFFIAny::bool_val(false), // cuda_graph
         ];
-        let plan_info = reg.call(variant.plan, &plan_args)
+        let plan_info = reg
+            .call(variant.plan, &plan_args)
             .expect("MLA decode plan failed");
 
         // Build run DLTensors
@@ -2986,12 +3687,12 @@ fn mla_decode_execution() {
             TVMFFIAny::dltensor(&dl_kv_last),
             TVMFFIAny::dltensor(&dl_o),
             TVMFFIAny::float64(sm_scale),
-            TVMFFIAny::int64(-1),          // window_left
-            TVMFFIAny::float64(0.0),       // logits_soft_cap
-            TVMFFIAny::float64(1.0),       // rope_scale
-            TVMFFIAny::float64(1e6),       // rope_theta
-            TVMFFIAny::none(),             // maybe_lse
-            TVMFFIAny::bool_val(false),    // enable_pdl
+            TVMFFIAny::int64(-1),       // window_left
+            TVMFFIAny::float64(0.0),    // logits_soft_cap
+            TVMFFIAny::float64(1.0),    // rope_scale
+            TVMFFIAny::float64(1e6),    // rope_theta
+            TVMFFIAny::none(),          // maybe_lse
+            TVMFFIAny::bool_val(false), // enable_pdl
         ];
         reg.call(variant.run, &run_args)
             .expect("MLA decode run failed");
@@ -3001,13 +3702,21 @@ fn mla_decode_execution() {
         let out_f32: Vec<f32> = out_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
         let sum: f32 = out_f32.iter().map(|v| v.abs()).sum();
         assert!(sum > 0.0, "MLA decode output is all zeros");
-        assert!(out_f32.iter().all(|v| v.is_finite()), "MLA decode output has NaN/Inf");
+        assert!(
+            out_f32.iter().all(|v| v.is_finite()),
+            "MLA decode output has NaN/Inf"
+        );
 
         println!("MLA decode: PASS (sum={sum:.4})");
 
-        cudaFree(q_nope_ptr); cudaFree(q_pe_ptr); cudaFree(o_ptr);
-        cudaFree(ckv_cache); cudaFree(kpe_cache);
-        cudaFree(kvi_ptr); cudaFree(kv_indptr_gpu); cudaFree(kv_last_gpu);
+        cudaFree(q_nope_ptr);
+        cudaFree(q_pe_ptr);
+        cudaFree(o_ptr);
+        cudaFree(ckv_cache);
+        cudaFree(kpe_cache);
+        cudaFree(kvi_ptr);
+        cudaFree(kv_indptr_gpu);
+        cudaFree(kv_last_gpu);
     }
 }
 
@@ -3026,8 +3735,12 @@ fn apply_rope_execution() {
     let total_q = (seq_len * num_qo_heads * head_dim) as usize;
     let total_k = (seq_len * num_kv_heads * head_dim) as usize;
 
-    let q_bf16: Vec<u16> = (0..total_q).map(|i| f32_to_bf16(0.01 * (i as f32 % 10.0))).collect();
-    let k_bf16: Vec<u16> = (0..total_k).map(|i| f32_to_bf16(0.01 * ((i + 3) as f32 % 10.0))).collect();
+    let q_bf16: Vec<u16> = (0..total_q)
+        .map(|i| f32_to_bf16(0.01 * (i as f32 % 10.0)))
+        .collect();
+    let k_bf16: Vec<u16> = (0..total_k)
+        .map(|i| f32_to_bf16(0.01 * ((i + 3) as f32 % 10.0)))
+        .collect();
 
     unsafe {
         let q_ptr = gpu_upload(&q_bf16);
@@ -3042,10 +3755,14 @@ fn apply_rope_execution() {
         let offsets_data: [i32; 1] = [0];
         let offsets_gpu = gpu_upload(&offsets_data);
 
-        let q_s = [seq_len, num_qo_heads, head_dim]; let q_st = contiguous_strides(&q_s);
-        let k_s = [seq_len, num_kv_heads, head_dim]; let k_st = contiguous_strides(&k_s);
-        let indptr_s = [batch_size + 1]; let indptr_st = contiguous_strides(&indptr_s);
-        let offsets_s = [batch_size]; let offsets_st = contiguous_strides(&offsets_s);
+        let q_s = [seq_len, num_qo_heads, head_dim];
+        let q_st = contiguous_strides(&q_s);
+        let k_s = [seq_len, num_kv_heads, head_dim];
+        let k_st = contiguous_strides(&k_s);
+        let indptr_s = [batch_size + 1];
+        let indptr_st = contiguous_strides(&indptr_s);
+        let offsets_s = [batch_size];
+        let offsets_st = contiguous_strides(&offsets_s);
 
         let dl_q = gpu_dl(q_ptr, BF16_DT, &q_s, &q_st);
         let dl_k = gpu_dl(k_ptr, BF16_DT, &k_s, &k_st);
@@ -3065,9 +3782,9 @@ fn apply_rope_execution() {
             TVMFFIAny::dltensor(&dl_indptr),
             TVMFFIAny::dltensor(&dl_offsets),
             TVMFFIAny::int64(rotary_dim),
-            TVMFFIAny::bool_val(false),    // interleave
-            TVMFFIAny::float64(1.0),       // rope_scale
-            TVMFFIAny::float64(1e4),       // rope_theta
+            TVMFFIAny::bool_val(false), // interleave
+            TVMFFIAny::float64(1.0),    // rope_scale
+            TVMFFIAny::float64(1e4),    // rope_theta
         ];
         reg.call(rope_fn, &args).expect("apply_rope failed");
         cudaDeviceSynchronize();
@@ -3081,21 +3798,32 @@ fn apply_rope_execution() {
         let sum_k: f32 = k_f32.iter().map(|v| v.abs()).sum();
         assert!(sum_q > 0.0, "apply_rope q output is all zeros");
         assert!(sum_k > 0.0, "apply_rope k output is all zeros");
-        assert!(q_f32.iter().all(|v| v.is_finite()), "apply_rope q has NaN/Inf");
-        assert!(k_f32.iter().all(|v| v.is_finite()), "apply_rope k has NaN/Inf");
+        assert!(
+            q_f32.iter().all(|v| v.is_finite()),
+            "apply_rope q has NaN/Inf"
+        );
+        assert!(
+            k_f32.iter().all(|v| v.is_finite()),
+            "apply_rope k has NaN/Inf"
+        );
 
         println!("apply_rope: PASS (q_sum={sum_q:.4}, k_sum={sum_k:.4})");
 
-        cudaFree(q_ptr); cudaFree(k_ptr);
-        cudaFree(q_rope_ptr); cudaFree(k_rope_ptr);
-        cudaFree(indptr_gpu); cudaFree(offsets_gpu);
+        cudaFree(q_ptr);
+        cudaFree(k_ptr);
+        cudaFree(q_rope_ptr);
+        cudaFree(k_rope_ptr);
+        cudaFree(indptr_gpu);
+        cudaFree(offsets_gpu);
     }
 }
 
 #[test]
 fn moe_routing_execution() {
     let reg = KernelRegistry::new();
-    let noaux_fn = reg.get_utility("NoAuxTc").expect("NoAuxTc (MoE routing) not found");
+    let noaux_fn = reg
+        .get_utility("NoAuxTc")
+        .expect("NoAuxTc (MoE routing) not found");
 
     let num_tokens = 4i64;
     let num_experts = 8i64;
@@ -3144,12 +3872,13 @@ fn moe_routing_execution() {
             TVMFFIAny::int64(n_group),
             TVMFFIAny::int64(topk_group),
             TVMFFIAny::int64(topk),
-            TVMFFIAny::float64(1.0),       // routed_scaling_factor
+            TVMFFIAny::float64(1.0), // routed_scaling_factor
             TVMFFIAny::dltensor(&dl_topk_values),
             TVMFFIAny::dltensor(&dl_topk_indices),
-            TVMFFIAny::bool_val(false),    // launch_with_pdl
+            TVMFFIAny::bool_val(false), // launch_with_pdl
         ];
-        reg.call(noaux_fn, &args).expect("NoAuxTc MoE routing failed");
+        reg.call(noaux_fn, &args)
+            .expect("NoAuxTc MoE routing failed");
         cudaDeviceSynchronize();
 
         let out_values = gpu_download::<u16>(topk_values_ptr, topk_elems);
@@ -3158,17 +3887,24 @@ fn moe_routing_execution() {
 
         let sum: f32 = values_f32.iter().map(|v| v.abs()).sum();
         assert!(sum > 0.0, "MoE routing output values are all zeros");
-        assert!(values_f32.iter().all(|v| v.is_finite()), "MoE routing values have NaN/Inf");
+        assert!(
+            values_f32.iter().all(|v| v.is_finite()),
+            "MoE routing values have NaN/Inf"
+        );
         // Indices should be valid expert ids [0, num_experts)
         assert!(
-            out_indices.iter().all(|&idx| idx >= 0 && idx < num_experts as i32),
+            out_indices
+                .iter()
+                .all(|&idx| idx >= 0 && idx < num_experts as i32),
             "MoE routing indices out of range"
         );
 
         println!("MoE routing (NoAuxTc): PASS (sum={sum:.4}, indices={out_indices:?})");
 
-        cudaFree(scores_ptr); cudaFree(bias_ptr);
-        cudaFree(topk_values_ptr); cudaFree(topk_indices_ptr);
+        cudaFree(scores_ptr);
+        cudaFree(bias_ptr);
+        cudaFree(topk_values_ptr);
+        cudaFree(topk_indices_ptr);
     }
 }
 
@@ -3176,7 +3912,14 @@ fn moe_routing_execution() {
 
 /// CPU reference: fused add + rmsnorm.
 /// sum = x + residual; normed = sum / sqrt(mean(sum^2) + eps) * weight
-fn cpu_fused_add_rmsnorm(x: &[f32], residual: &[f32], weight: &[f32], eps: f64, tokens: usize, hidden: usize) -> (Vec<f32>, Vec<f32>) {
+fn cpu_fused_add_rmsnorm(
+    x: &[f32],
+    residual: &[f32],
+    weight: &[f32],
+    eps: f64,
+    tokens: usize,
+    hidden: usize,
+) -> (Vec<f32>, Vec<f32>) {
     let mut sum_out = vec![0.0f32; tokens * hidden];
     let mut norm_out = vec![0.0f32; tokens * hidden];
     for t in 0..tokens {
@@ -3198,7 +3941,8 @@ fn cpu_fused_add_rmsnorm(x: &[f32], residual: &[f32], weight: &[f32], eps: f64, 
 #[test]
 fn fused_add_rmsnorm_correctness() {
     let reg = KernelRegistry::new();
-    let fused = reg.get_utility("fused_add_rmsnorm")
+    let fused = reg
+        .get_utility("fused_add_rmsnorm")
         .expect("fused_add_rmsnorm not found");
 
     // Test shapes: (tokens, hidden)
@@ -3210,11 +3954,16 @@ fn fused_add_rmsnorm_correctness() {
 
         // Generate random input data
         let x_f32: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.01).sin() * 0.5)).collect();
-        let r_f32: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.007 + 1.0).cos() * 0.3)).collect();
-        let w_f32: Vec<f32> = (0..hidden).map(|i| 0.8 + (i as f32 * 0.003).sin() * 0.2).collect();
+        let r_f32: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 0.007 + 1.0).cos() * 0.3))
+            .collect();
+        let w_f32: Vec<f32> = (0..hidden)
+            .map(|i| 0.8 + (i as f32 * 0.003).sin() * 0.2)
+            .collect();
 
         // CPU reference (in f32)
-        let (ref_sum, ref_norm) = cpu_fused_add_rmsnorm(&x_f32, &r_f32, &w_f32, eps, tokens, hidden);
+        let (ref_sum, ref_norm) =
+            cpu_fused_add_rmsnorm(&x_f32, &r_f32, &w_f32, eps, tokens, hidden);
 
         // Convert to BF16 and upload
         let x_bf16: Vec<u16> = x_f32.iter().map(|&v| f32_to_bf16(v)).collect();
@@ -3234,7 +3983,9 @@ fn fused_add_rmsnorm_correctness() {
         let dl_r = gpu_dl(r_gpu, BF16_DT, &in_s, &in_st);
         let dl_w = gpu_dl(w_gpu, BF16_DT, &w_s, &w_st);
 
-        unsafe { reg.set_stream(0, std::ptr::null_mut()); }
+        unsafe {
+            reg.set_stream(0, std::ptr::null_mut());
+        }
 
         // FlashInfer fused_add_rmsnorm is in-place:
         // after call, x_gpu = rmsnorm(x+residual), r_gpu = x+residual
@@ -3251,32 +4002,46 @@ fn fused_add_rmsnorm_correctness() {
         }
 
         // Download results
-        let out_norm_bf16: Vec<u16> = gpu_download(x_gpu, n);  // x now holds normed output
-        let out_sum_bf16: Vec<u16> = gpu_download(r_gpu, n);   // residual now holds sum
+        let out_norm_bf16: Vec<u16> = gpu_download(x_gpu, n); // x now holds normed output
+        let out_sum_bf16: Vec<u16> = gpu_download(r_gpu, n); // residual now holds sum
 
         let out_norm: Vec<f32> = out_norm_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
         let out_sum: Vec<f32> = out_sum_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
 
         // Compare sum (x + residual)
-        let max_diff_sum: f32 = out_sum.iter().zip(ref_sum.iter())
+        let max_diff_sum: f32 = out_sum
+            .iter()
+            .zip(ref_sum.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
 
         // Compare normed output
-        let max_diff_norm: f32 = out_norm.iter().zip(ref_norm.iter())
+        let max_diff_norm: f32 = out_norm
+            .iter()
+            .zip(ref_norm.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
 
         // BF16 tolerance: ~0.8% relative error typical
         let tol = 0.05;
-        assert!(max_diff_sum < tol,
-            "fused_add_rmsnorm sum mismatch ({tokens}×{hidden}): max_diff={max_diff_sum}");
-        assert!(max_diff_norm < tol,
-            "fused_add_rmsnorm norm mismatch ({tokens}×{hidden}): max_diff={max_diff_norm}");
+        assert!(
+            max_diff_sum < tol,
+            "fused_add_rmsnorm sum mismatch ({tokens}×{hidden}): max_diff={max_diff_sum}"
+        );
+        assert!(
+            max_diff_norm < tol,
+            "fused_add_rmsnorm norm mismatch ({tokens}×{hidden}): max_diff={max_diff_norm}"
+        );
 
-        println!("fused_add_rmsnorm ({tokens}×{hidden}): PASS (sum_diff={max_diff_sum:.6}, norm_diff={max_diff_norm:.6})");
+        println!(
+            "fused_add_rmsnorm ({tokens}×{hidden}): PASS (sum_diff={max_diff_sum:.6}, norm_diff={max_diff_norm:.6})"
+        );
 
-        unsafe { cudaFree(x_gpu); cudaFree(r_gpu); cudaFree(w_gpu); }
+        unsafe {
+            cudaFree(x_gpu);
+            cudaFree(r_gpu);
+            cudaFree(w_gpu);
+        }
     }
 }
 
@@ -3290,8 +4055,8 @@ fn cutlass_fused_moe_init() {
         return;
     }
 
-    let runner = flashinfer::moe::FusedMoeRunner::new()
-        .expect("Failed to create CUTLASS FusedMoeRunner");
+    let runner =
+        flashinfer::moe::FusedMoeRunner::new().expect("Failed to create CUTLASS FusedMoeRunner");
     println!("CUTLASS fused MoE runner created successfully");
     drop(runner);
 }
@@ -3303,24 +4068,15 @@ fn cutlass_fused_moe_execution() {
         println!("CUTLASS fused MoE kernel not compiled — skipping test");
         return;
     }
-    // TRT-LLM's MoE config-search currently has no valid tile config for
-    // SM10x — calling `run_moe` fails with "Could not find valid config
-    // when calculating workspace size". The CUTLASS MoE templates we
-    // vendor are sm_90a-only. Skip on Blackwell until upstream lands
-    // SM100/SM103 specialisations.
-    if reg.arch() >= 100 {
-        println!("cutlass_fused_moe: skip (SM{}, kernel SM90-only)", reg.arch());
-        return;
-    }
+    let runner =
+        flashinfer::moe::FusedMoeRunner::new().expect("Failed to create CUTLASS FusedMoeRunner");
 
-    let runner = flashinfer::moe::FusedMoeRunner::new()
-        .expect("Failed to create CUTLASS FusedMoeRunner");
-
-    // Qwen3.5-like dimensions: 32 tokens, 256 experts, top-8, inter=512, hidden=2048
+    // Production Qwen3-15B MoE dimensions: 32 decode tokens, 64 experts, top-4,
+    // inter=768, hidden=2048.
     let num_tokens = 32i64;
-    let num_experts = 256i64;
-    let top_k = 8i64;
-    let inter_size = 512i64;
+    let num_experts = 64i64;
+    let top_k = 4i64;
+    let inter_size = 768i64;
     let hidden_size = 2048i64;
 
     // Create random input data
@@ -3330,12 +4086,20 @@ fn cutlass_fused_moe_execution() {
     let expert_elems = (num_tokens * top_k) as usize;
 
     // Input: BF16 random
-    let input_bf16: Vec<u16> = (0..input_elems).map(|i| f32_to_bf16(0.01 * ((i % 97) as f32 - 48.0))).collect();
+    let input_bf16: Vec<u16> = (0..input_elems)
+        .map(|i| f32_to_bf16(0.01 * ((i % 97) as f32 - 48.0)))
+        .collect();
     // Weights: BF16 small random
-    let w1_bf16: Vec<u16> = (0..w1_elems).map(|i| f32_to_bf16(0.001 * ((i % 113) as f32 - 56.0))).collect();
-    let w2_bf16: Vec<u16> = (0..w2_elems).map(|i| f32_to_bf16(0.001 * ((i % 89) as f32 - 44.0))).collect();
+    let w1_bf16: Vec<u16> = (0..w1_elems)
+        .map(|i| f32_to_bf16(0.001 * ((i % 113) as f32 - 56.0)))
+        .collect();
+    let w2_bf16: Vec<u16> = (0..w2_elems)
+        .map(|i| f32_to_bf16(0.001 * ((i % 89) as f32 - 44.0)))
+        .collect();
     // Expert indices: random in [0, num_experts)
-    let expert_ids: Vec<i32> = (0..expert_elems).map(|i| ((i * 37 + 13) % num_experts as usize) as i32).collect();
+    let expert_ids: Vec<i32> = (0..expert_elems)
+        .map(|i| ((i * 37 + 13) % num_experts as usize) as i32)
+        .collect();
     // Expert weights: uniform F32
     let expert_weights: Vec<f32> = vec![1.0 / top_k as f32; expert_elems];
     // Output: zeros
@@ -3365,18 +4129,31 @@ fn cutlass_fused_moe_execution() {
         let dl_output = gpu_dl(output_ptr, BF16_DT, &output_s, &output_st);
         let dl_input = gpu_dl(input_ptr, BF16_DT, &input_s, &input_st);
         let dl_expert_ids = gpu_dl(expert_ids_ptr, I32_DT, &expert_ids_s, &expert_ids_st);
-        let dl_expert_weights = gpu_dl(expert_weights_ptr, FP32_DT, &expert_weights_s, &expert_weights_st);
+        let dl_expert_weights = gpu_dl(
+            expert_weights_ptr,
+            FP32_DT,
+            &expert_weights_s,
+            &expert_weights_st,
+        );
         let dl_w1 = gpu_dl(w1_ptr, BF16_DT, &w1_s, &w1_st);
         let dl_w2 = gpu_dl(w2_ptr, BF16_DT, &w2_s, &w2_st);
 
         reg.set_stream(0, std::ptr::null_mut());
 
-        runner.run_moe(
-            &dl_output, &dl_input,
-            &dl_expert_ids, &dl_expert_weights,
-            &dl_w1, &dl_w2,
-            1, 0, 1, 0,
-        ).expect("CUTLASS fused MoE run_moe failed");
+        runner
+            .run_moe(
+                &dl_output,
+                &dl_input,
+                &dl_expert_ids,
+                &dl_expert_weights,
+                &dl_w1,
+                &dl_w2,
+                1,
+                0,
+                1,
+                0,
+            )
+            .expect("CUTLASS fused MoE run_moe failed");
         cudaDeviceSynchronize();
 
         let out_data = gpu_download::<u16>(output_ptr, input_elems);
@@ -3384,15 +4161,25 @@ fn cutlass_fused_moe_execution() {
 
         // Sanity: output should not be all zeros (MoE processed something)
         let nonzero_count = out_f32.iter().filter(|&&v| v.abs() > 1e-6).count();
-        assert!(nonzero_count > input_elems / 2,
-            "CUTLASS fused MoE output mostly zeros: {nonzero_count}/{input_elems} nonzero");
-        assert!(out_f32.iter().all(|v| v.is_finite()),
-            "CUTLASS fused MoE output has NaN/Inf");
+        assert!(
+            nonzero_count > input_elems / 2,
+            "CUTLASS fused MoE output mostly zeros: {nonzero_count}/{input_elems} nonzero"
+        );
+        assert!(
+            out_f32.iter().all(|v| v.is_finite()),
+            "CUTLASS fused MoE output has NaN/Inf"
+        );
 
         let out_sum: f32 = out_f32.iter().map(|v| v.abs()).sum::<f32>() / input_elems as f32;
-        println!("CUTLASS fused MoE ({num_tokens} tokens, {num_experts} experts, top-{top_k}): PASS (mean_abs={out_sum:.6}, nonzero={nonzero_count}/{input_elems})");
+        println!(
+            "CUTLASS fused MoE ({num_tokens} tokens, {num_experts} experts, top-{top_k}): PASS (mean_abs={out_sum:.6}, nonzero={nonzero_count}/{input_elems})"
+        );
 
-        cudaFree(input_ptr); cudaFree(w1_ptr); cudaFree(w2_ptr);
-        cudaFree(expert_ids_ptr); cudaFree(expert_weights_ptr); cudaFree(output_ptr);
+        cudaFree(input_ptr);
+        cudaFree(w1_ptr);
+        cudaFree(w2_ptr);
+        cudaFree(expert_ids_ptr);
+        cudaFree(expert_weights_ptr);
+        cudaFree(output_ptr);
     }
 }

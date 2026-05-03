@@ -1,7 +1,7 @@
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::WrapErr;
 use cudarc::driver::{DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg};
-use prelude_core::tensor::{bail, DType, Result, Tensor};
+use prelude_core::tensor::{DType, Result, Tensor, bail};
 
 use crate::moe_ffi as ffi;
 use crate::{MOD_MOE_ROUTING, PTX_MOE_ROUTING};
@@ -89,13 +89,33 @@ pub fn fused_moe_routing(
 
     // Wrap outputs as tensors
     let tw_storage = candle_core::CudaStorage::wrap_cuda_slice(topk_weights, dev.clone());
-    let tw_tensor = Tensor::from_storage(candle_core::Storage::Cuda(tw_storage), (num_tokens, topk), candle_core::op::BackpropOp::none(), false);
+    let tw_tensor = Tensor::from_storage(
+        candle_core::Storage::Cuda(tw_storage),
+        (num_tokens, topk),
+        candle_core::op::BackpropOp::none(),
+        false,
+    );
     let ti_storage = candle_core::CudaStorage::wrap_cuda_slice(topk_ids, dev.clone());
-    let ti_tensor = Tensor::from_storage(candle_core::Storage::Cuda(ti_storage), (num_tokens * topk,), candle_core::op::BackpropOp::none(), false);
+    let ti_tensor = Tensor::from_storage(
+        candle_core::Storage::Cuda(ti_storage),
+        (num_tokens * topk,),
+        candle_core::op::BackpropOp::none(),
+        false,
+    );
     let se_storage = candle_core::CudaStorage::wrap_cuda_slice(sorted_expert_ids, dev.clone());
-    let se_tensor = Tensor::from_storage(candle_core::Storage::Cuda(se_storage), (num_tokens * topk,), candle_core::op::BackpropOp::none(), false);
+    let se_tensor = Tensor::from_storage(
+        candle_core::Storage::Cuda(se_storage),
+        (num_tokens * topk,),
+        candle_core::op::BackpropOp::none(),
+        false,
+    );
     let st_storage = candle_core::CudaStorage::wrap_cuda_slice(sorted_token_ids, dev.clone());
-    let st_tensor = Tensor::from_storage(candle_core::Storage::Cuda(st_storage), (num_tokens * topk,), candle_core::op::BackpropOp::none(), false);
+    let st_tensor = Tensor::from_storage(
+        candle_core::Storage::Cuda(st_storage),
+        (num_tokens * topk,),
+        candle_core::op::BackpropOp::none(),
+        false,
+    );
 
     Ok((tw_tensor, ti_tensor, se_tensor, st_tensor))
 }
@@ -143,21 +163,27 @@ pub fn moe_gemm_wmma(
             candle_core::Storage::Cuda(s) => s,
             _ => candle_core::bail!("moe_gemm: input requires CUDA"),
         };
-        let input_s = input_cuda.as_cuda_slice::<T>()?.slice(input_l.start_offset()..);
+        let input_s = input_cuda
+            .as_cuda_slice::<T>()?
+            .slice(input_l.start_offset()..);
 
         let (weights_g, weights_l) = weights.storage_and_layout();
         let weights_cuda = match &*weights_g {
             candle_core::Storage::Cuda(s) => s,
             _ => candle_core::bail!("moe_gemm: weights requires CUDA"),
         };
-        let weights_s = weights_cuda.as_cuda_slice::<T>()?.slice(weights_l.start_offset()..);
+        let weights_s = weights_cuda
+            .as_cuda_slice::<T>()?
+            .slice(weights_l.start_offset()..);
 
         let (sti_g, sti_l) = sorted_token_ids.storage_and_layout();
         let sti_cuda = match &*sti_g {
             candle_core::Storage::Cuda(s) => s,
             _ => candle_core::bail!("moe_gemm: sorted_token_ids requires CUDA"),
         };
-        let sti = sti_cuda.as_cuda_slice::<u32>()?.slice(sti_l.start_offset()..);
+        let sti = sti_cuda
+            .as_cuda_slice::<u32>()?
+            .slice(sti_l.start_offset()..);
 
         let (ei_g, ei_l) = experts_ids.storage_and_layout();
         let ei_cuda = match &*ei_g {
@@ -276,8 +302,24 @@ pub fn moe_gemm_wmma(
     }
 
     match input.dtype() {
-        DType::F16 => cuda_fwd::<f16>(input, weights, topk_weights, sorted_token_ids, experts_ids, topk, is_prefill),
-        DType::BF16 => cuda_fwd::<bf16>(input, weights, topk_weights, sorted_token_ids, experts_ids, topk, is_prefill),
+        DType::F16 => cuda_fwd::<f16>(
+            input,
+            weights,
+            topk_weights,
+            sorted_token_ids,
+            experts_ids,
+            topk,
+            is_prefill,
+        ),
+        DType::BF16 => cuda_fwd::<bf16>(
+            input,
+            weights,
+            topk_weights,
+            sorted_token_ids,
+            experts_ids,
+            topk,
+            is_prefill,
+        ),
         _ => bail!("moe_gemm only accepts f16/bf16 inputs"),
     }
 }
@@ -296,7 +338,10 @@ pub fn silu_mul_swap(gate_up: &Tensor, inter: usize) -> Result<Tensor> {
     }
     let last = dims[dims.len() - 1];
     if last != 2 * inter {
-        bail!("silu_mul_swap: last dim {last} != 2 * inter ({})", 2 * inter);
+        bail!(
+            "silu_mul_swap: last dim {last} != 2 * inter ({})",
+            2 * inter
+        );
     }
     if gate_up.dtype() != DType::BF16 {
         bail!("silu_mul_swap: requires BF16, got {:?}", gate_up.dtype());
@@ -436,22 +481,22 @@ pub fn try_grouped_gemm_deepgemm(
 
     // Sub-buffer sizes in bytes. Each padded to 256 for alignment.
     let align = |b: usize| (b + 255) & !255usize;
-    let off_real_counts    = 0usize;
-    let off_real_offsets   = off_real_counts    + align(num_experts * i32_size);
-    let off_padded_offsets = off_real_offsets   + align((num_experts + 1) * i32_size);
+    let off_real_counts = 0usize;
+    let off_real_offsets = off_real_counts + align(num_experts * i32_size);
+    let off_padded_offsets = off_real_offsets + align((num_experts + 1) * i32_size);
     let off_grouped_layout = off_padded_offsets + align((num_experts + 1) * i32_size);
-    let off_gathered       = off_grouped_layout + align(padded_total * i32_size);
-    let off_gemm_out       = off_gathered       + align(padded_total * size_k * bf16_size);
-    let total_ws_bytes     = off_gemm_out       + align(padded_total * size_n * bf16_size);
+    let off_gathered = off_grouped_layout + align(padded_total * i32_size);
+    let off_gemm_out = off_gathered + align(padded_total * size_k * bf16_size);
+    let total_ws_bytes = off_gemm_out + align(padded_total * size_n * bf16_size);
 
     let workspace = unsafe { dev.alloc::<u8>(total_ws_bytes) }?;
     let ws_base = workspace.device_ptr(&stream).0;
-    let real_counts_ptr     = (ws_base + off_real_counts as u64) as *mut i32;
-    let real_offsets_ptr    = (ws_base + off_real_offsets as u64) as *mut i32;
-    let padded_offsets_ptr  = (ws_base + off_padded_offsets as u64) as *mut i32;
-    let grouped_layout_ptr  = (ws_base + off_grouped_layout as u64) as *mut i32;
-    let gathered_ptr        = (ws_base + off_gathered as u64) as *mut c_void;
-    let gemm_out_ptr        = (ws_base + off_gemm_out as u64) as *mut c_void;
+    let real_counts_ptr = (ws_base + off_real_counts as u64) as *mut i32;
+    let real_offsets_ptr = (ws_base + off_real_offsets as u64) as *mut i32;
+    let padded_offsets_ptr = (ws_base + off_padded_offsets as u64) as *mut i32;
+    let grouped_layout_ptr = (ws_base + off_grouped_layout as u64) as *mut i32;
+    let gathered_ptr = (ws_base + off_gathered as u64) as *mut c_void;
+    let gemm_out_ptr = (ws_base + off_gemm_out as u64) as *mut c_void;
 
     // Zero-fill grouped_layout (tail is sentinel) and gathered_padded
     // (padding rows must be 0). Single contiguous memset covers both.
@@ -464,7 +509,8 @@ pub fn try_grouped_gemm_deepgemm(
             0,
             (zero_end - zero_start) as usize,
             stream.cu_stream(),
-        ).map_err(|e| candle_core::Error::Msg(format!("memset workspace: {e:?}")))?;
+        )
+        .map_err(|e| candle_core::Error::Msg(format!("memset workspace: {e:?}")))?;
     }
 
     // Real per-expert prefix-sum offsets (light variant: no thrust).
@@ -664,7 +710,7 @@ pub fn try_grouped_gemm_sm100(
             size_k as i32,
             num_experts as i32,
             topk as i32,
-            /*data_type=*/ 1,  // bf16
+            /*data_type=*/ 1, // bf16
             cu_stream as *const c_void,
         )
     };
@@ -703,7 +749,10 @@ pub fn moe_sort_experts_gpu(expert_ids: &Tensor) -> Result<(Tensor, Tensor)> {
     let (storage, layout) = expert_ids.storage_and_layout();
     let cuda = as_candle_cuda(&storage, "moe_sort_experts_gpu")?;
     if cuda.dtype() != DType::U32 {
-        bail!("moe_sort_experts_gpu: requires U32 input, got {:?}", cuda.dtype());
+        bail!(
+            "moe_sort_experts_gpu: requires U32 input, got {:?}",
+            cuda.dtype()
+        );
     }
     let dev = cuda.device().clone();
     let stream = dev.cuda_stream();
@@ -727,8 +776,18 @@ pub fn moe_sort_experts_gpu(expert_ids: &Tensor) -> Result<(Tensor, Tensor)> {
 
     let se_storage = candle_core::CudaStorage::wrap_cuda_slice(sorted_experts, dev.clone());
     let st_storage = candle_core::CudaStorage::wrap_cuda_slice(sorted_tokens, dev);
-    let se = Tensor::from_storage(candle_core::Storage::Cuda(se_storage), (n,), candle_core::op::BackpropOp::none(), false);
-    let st = Tensor::from_storage(candle_core::Storage::Cuda(st_storage), (n,), candle_core::op::BackpropOp::none(), false);
+    let se = Tensor::from_storage(
+        candle_core::Storage::Cuda(se_storage),
+        (n,),
+        candle_core::op::BackpropOp::none(),
+        false,
+    );
+    let st = Tensor::from_storage(
+        candle_core::Storage::Cuda(st_storage),
+        (n,),
+        candle_core::op::BackpropOp::none(),
+        false,
+    );
     Ok((se, st))
 }
 
@@ -760,24 +819,24 @@ pub fn swap_gate_up_inplace(w1: &Tensor, inter: usize) -> Result<()> {
 /// Get or create the CUTLASS fused MoE runner singleton.
 fn get_cutlass_moe_runner() -> Option<&'static flashinfer::moe::FusedMoeRunner> {
     static RUNNER: OnceLock<Option<flashinfer::moe::FusedMoeRunner>> = OnceLock::new();
-    RUNNER.get_or_init(|| {
-        match flashinfer::moe::FusedMoeRunner::new() {
+    RUNNER
+        .get_or_init(|| match flashinfer::moe::FusedMoeRunner::new() {
             Ok(r) => Some(r),
             Err(e) => {
                 tracing::warn!("CUTLASS fused MoE unavailable: {e}");
                 None
             }
-        }
-    }).as_ref()
+        })
+        .as_ref()
 }
 
 /// CUTLASS fused MoE forward: converts candle tensors to DLTensor and calls the runner.
 pub fn cutlass_fused_moe_forward(
-    input: &Tensor,            // [n_tokens, hidden] BF16
-    experts_per_tok: &Tensor,  // [n_tokens, topk] U32
-    topk_weights: &Tensor,     // [n_tokens, topk] F32
-    w1: &Tensor,               // [num_experts, 2*inter, hidden] BF16
-    w2: &Tensor,               // [num_experts, hidden, inter] BF16
+    input: &Tensor,           // [n_tokens, hidden] BF16
+    experts_per_tok: &Tensor, // [n_tokens, topk] U32
+    topk_weights: &Tensor,    // [n_tokens, topk] F32
+    w1: &Tensor,              // [num_experts, 2*inter, hidden] BF16
+    w2: &Tensor,              // [num_experts, hidden, inter] BF16
 ) -> Result<Tensor> {
     use flashinfer::types::*;
 
@@ -829,7 +888,10 @@ pub fn cutlass_fused_moe_forward(
         let data_ptr = base_ptr + (elem_offset * t.dtype().size_in_bytes()) as u64;
         Ok(DLTensor {
             data: data_ptr as *mut std::ffi::c_void,
-            device: DLDevice { device_type: KDLCUDA, device_id: 0 },
+            device: DLDevice {
+                device_type: KDLCUDA,
+                device_id: 0,
+            },
             ndim: shapes.len() as i32,
             dtype: dt,
             shape: shapes.as_ptr(),
@@ -838,9 +900,21 @@ pub fn cutlass_fused_moe_forward(
         })
     }
 
-    let bf16_dt = DLDataType { code: KDLBFLOAT, bits: 16, lanes: 1 };
-    let f32_dt = DLDataType { code: KDLFLOAT, bits: 32, lanes: 1 };
-    let i32_dt = DLDataType { code: KDLINT, bits: 32, lanes: 1 };
+    let bf16_dt = DLDataType {
+        code: KDLBFLOAT,
+        bits: 16,
+        lanes: 1,
+    };
+    let f32_dt = DLDataType {
+        code: KDLFLOAT,
+        bits: 32,
+        lanes: 1,
+    };
+    let i32_dt = DLDataType {
+        code: KDLINT,
+        bits: 32,
+        lanes: 1,
+    };
 
     let to_shape = |t: &Tensor| -> Vec<i64> { t.dims().iter().map(|&d| d as i64).collect() };
 
@@ -875,13 +949,14 @@ pub fn cutlass_fused_moe_forward(
         tracing::debug!(
             "CUTLASS MoE: n={n_tokens} h={hidden} w1={:?} w2={:?} \
              w1_ptr={:?} w1_offset={w1_off}",
-            w1.dims(), w2.dims(), dl_w1.data,
+            w1.dims(),
+            w2.dims(),
+            dl_w1.data,
         );
     }
 
-    unsafe {
-        runner.run_moe(&dl_out, &dl_in, &dl_ept, &dl_tw, &dl_w1, &dl_w2, 1, 0, 1, 0)
-    }.map_err(|e| candle_core::Error::Msg(format!("CUTLASS fused MoE failed: {e}")))?;
+    unsafe { runner.run_moe(&dl_out, &dl_in, &dl_ept, &dl_tw, &dl_w1, &dl_w2, 1, 0, 1, 0) }
+        .map_err(|e| candle_core::Error::Msg(format!("CUTLASS fused MoE failed: {e}")))?;
 
     Ok(output)
 }

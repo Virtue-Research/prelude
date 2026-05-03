@@ -1,4 +1,6 @@
-use super::{Scheduler, SchedulerStep, SeqFinishReason, SequenceStatus};
+use std::collections::{HashSet, VecDeque};
+
+use super::{Scheduler, SchedulerStep, SeqFinishReason, Sequence, SequenceStatus};
 
 impl Scheduler {
     /// Schedule one step using a unified per-step token budget.
@@ -192,18 +194,41 @@ impl Scheduler {
         let block_size = self.config.block_size;
 
         let mut admitted = 0usize;
-        while !self.waiting_queue.is_empty()
-            && admitted < available_slots
-            && token_budget > 0
-        {
+        let mut admitted_uncached_prefixes: HashSet<u64> = HashSet::new();
+        let mut deferred_same_prefix: VecDeque<Sequence> = VecDeque::new();
+        while !self.waiting_queue.is_empty() && admitted < available_slots && token_budget > 0 {
             let seq = self.waiting_queue.front().expect("queue checked non-empty");
 
+            // Cold prefix-cache runs often receive many requests with the same
+            // long system prompt at once. If none of them has a cache hit yet,
+            // scheduling all of them in the same prefill step recomputes the
+            // same prefix repeatedly. Let one uncached "leader" populate the
+            // cache, then the deferred peers can be refreshed to suffix-only
+            // work on the next scheduler iteration.
+            if seq.kv_computed_len == 0
+                && seq.block_table.is_empty()
+                && let Some(key) = seq.prefix_cache_key
+                && admitted_uncached_prefixes.contains(&key)
+            {
+                let seq = self
+                    .waiting_queue
+                    .pop_front()
+                    .expect("queue checked non-empty");
+                deferred_same_prefix.push_back(seq);
+                continue;
+            }
+
             // Block-level KV cache capacity check (like vLLM's allocate_slots).
-            // Reserve blocks for the full prompt + capped future decode tokens.
+            // Prefix-cache hits arrive with shared blocks already attached to
+            // the Sequence, so admission only needs to reserve the suffix and
+            // capped future decode blocks that are not covered yet.
             let total_tokens = seq.total_len()
-                + seq.remaining_tokens().min(self.config.decode_reservation_cap as u32) as usize;
+                + seq
+                    .remaining_tokens()
+                    .min(self.config.decode_reservation_cap as u32) as usize;
             let blocks_needed = total_tokens.div_ceil(block_size);
-            if blocks_needed > self.available_blocks {
+            let new_blocks_needed = blocks_needed.saturating_sub(seq.block_table.len());
+            if new_blocks_needed > self.available_blocks {
                 break;
             }
 
@@ -224,11 +249,21 @@ impl Scheduler {
                 break;
             }
 
-            let mut seq = self.waiting_queue.pop_front().expect("queue checked non-empty");
+            let mut seq = self
+                .waiting_queue
+                .pop_front()
+                .expect("queue checked non-empty");
+            if seq.kv_computed_len == 0
+                && seq.block_table.is_empty()
+                && let Some(key) = seq.prefix_cache_key
+            {
+                admitted_uncached_prefixes.insert(key);
+            }
             seq.status = SequenceStatus::Prefilling;
             self.tokens_in_use += seq.input_ids.len();
-            // Reserve blocks for the entire request upfront (conservative).
-            self.available_blocks = self.available_blocks.saturating_sub(blocks_needed);
+            // Reserve only newly needed blocks for this scheduling decision;
+            // cached/shared prefix blocks are already ref-counted.
+            self.available_blocks = self.available_blocks.saturating_sub(new_blocks_needed);
             self.running.push(seq);
 
             let request_id = self.running.last().unwrap().request_id.clone();
@@ -236,6 +271,10 @@ impl Scheduler {
             prefill_chunk_lens.push(chunk);
             token_budget = token_budget.saturating_sub(chunk);
             admitted += 1;
+        }
+
+        while let Some(seq) = deferred_same_prefix.pop_back() {
+            self.waiting_queue.push_front(seq);
         }
     }
 }
@@ -265,7 +304,10 @@ impl Scheduler {
                 .expect("queue was checked non-empty")
                 .prefill_len();
             let estimated_total = {
-                let sequence = self.waiting_queue.front().expect("queue was checked non-empty");
+                let sequence = self
+                    .waiting_queue
+                    .front()
+                    .expect("queue was checked non-empty");
                 sequence.total_len() + sequence.remaining_tokens() as usize
             };
 
@@ -279,12 +321,10 @@ impl Scheduler {
                     .pop_front()
                     .expect("queue was checked non-empty");
                 sequence.status = SequenceStatus::Finished;
-                sequence.finish_reason = Some(SeqFinishReason::Abort(
-                    format!(
-                        "prompt length {prompt_len} exceeds max_num_batched_tokens={global_prefill_cap}; \
+                sequence.finish_reason = Some(SeqFinishReason::Abort(format!(
+                    "prompt length {prompt_len} exceeds max_num_batched_tokens={global_prefill_cap}; \
                          raise --max-num-batched-tokens or shorten the prompt"
-                    ),
-                ));
+                )));
                 self.finished.push(sequence);
                 continue;
             }
@@ -307,7 +347,10 @@ impl Scheduler {
                 }
             }
 
-            let mut sequence = self.waiting_queue.pop_front().expect("queue was checked non-empty");
+            let mut sequence = self
+                .waiting_queue
+                .pop_front()
+                .expect("queue was checked non-empty");
             sequence.status = SequenceStatus::Prefilling;
             prefill_token_budget = prefill_token_budget.saturating_sub(prompt_len);
             total_token_budget = total_token_budget.saturating_sub(estimated_total);

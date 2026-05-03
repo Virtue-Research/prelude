@@ -12,6 +12,17 @@ fn make_seq(id: &str, prompt_len: usize, max_new: u32) -> Sequence {
     )
 }
 
+fn make_seq_with_prefix_key(
+    id: &str,
+    prompt_len: usize,
+    max_new: u32,
+    prefix_cache_key: u64,
+) -> Sequence {
+    let mut seq = make_seq(id, prompt_len, max_new);
+    seq.prefix_cache_key = Some(prefix_cache_key);
+    seq
+}
+
 #[test]
 fn test_basic_prefill_then_decode() {
     let config = SchedulerConfig {
@@ -181,6 +192,34 @@ fn test_chunked_prefill_emits_mixed_step() {
     assert_eq!(second.prefill_request_ids, vec!["r2"]);
     assert_eq!(second.prefill_chunk_lens, vec![6]);
     assert_eq!(second.decode_request_ids, vec!["r1"]);
+}
+
+#[test]
+fn test_chunked_prefill_defers_duplicate_uncached_prefix_key() {
+    let config = SchedulerConfig {
+        chunked_prefill: true,
+        max_running_requests: 4,
+        max_num_batched_tokens: 1024,
+        max_total_tokens: 65536,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    sched.add_request(make_seq_with_prefix_key("r1", 100, 1, 42));
+    sched.add_request(make_seq_with_prefix_key("r2", 100, 1, 42));
+    sched.add_request(make_seq_with_prefix_key("r3", 100, 1, 7));
+
+    let step = sched.schedule_step().unwrap();
+    assert_eq!(step.forward_mode, ForwardMode::Prefill);
+    assert_eq!(step.prefill_request_ids, vec!["r1", "r3"]);
+    assert_eq!(sched.num_waiting(), 1);
+    assert_eq!(
+        sched
+            .waiting_queue
+            .front()
+            .map(|seq| seq.request_id.as_str()),
+        Some("r2")
+    );
 }
 
 // ── Chunked prefill specific tests ───────────────────────────────
@@ -414,7 +453,12 @@ fn test_only_decode_requests_gets_full_budget() {
     let _ = sched.schedule_step(); // prefills all 3 (9 tokens < budget 10)
 
     // All should be decoding now
-    assert!(sched.running.iter().all(|s| s.status == SequenceStatus::Decoding));
+    assert!(
+        sched
+            .running
+            .iter()
+            .all(|s| s.status == SequenceStatus::Decoding)
+    );
 
     // Decode step: 3 tokens, well within budget
     let step = sched.schedule_step().unwrap();
@@ -447,13 +491,26 @@ fn test_new_request_while_partial_prefill_in_running() {
     assert!(step.prefill_request_ids.contains(&"r1".to_string()));
     assert!(step.prefill_request_ids.contains(&"r2".to_string()));
 
-    let r1_idx = step.prefill_request_ids.iter().position(|id| id == "r1").unwrap();
-    let r2_idx = step.prefill_request_ids.iter().position(|id| id == "r2").unwrap();
+    let r1_idx = step
+        .prefill_request_ids
+        .iter()
+        .position(|id| id == "r1")
+        .unwrap();
+    let r2_idx = step
+        .prefill_request_ids
+        .iter()
+        .position(|id| id == "r2")
+        .unwrap();
     assert_eq!(step.prefill_chunk_lens[r1_idx], 50); // r1's remaining
     assert_eq!(step.prefill_chunk_lens[r2_idx], 30); // r2 fully admitted
 
     // After this step: r1 is Decoding, r2 is Decoding
-    assert!(sched.running.iter().all(|s| s.status == SequenceStatus::Decoding));
+    assert!(
+        sched
+            .running
+            .iter()
+            .all(|s| s.status == SequenceStatus::Decoding)
+    );
 }
 
 #[test]

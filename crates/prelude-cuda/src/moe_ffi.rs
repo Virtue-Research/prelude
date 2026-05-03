@@ -53,7 +53,6 @@ unsafe extern "C" {
         stream: i64,
     );
 
-
     /// GPU sort of expert assignments using thrust::sort_by_key.
     pub fn moe_sort_expert_assignments(
         expert_ids_in: *const u32,
