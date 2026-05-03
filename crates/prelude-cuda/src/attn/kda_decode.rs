@@ -14,17 +14,29 @@
 
 use candle_core::backend::BackendStorage;
 use cudarc::driver::DevicePtr;
-use half::bf16;
-use prelude_core::tensor::{bail, DType, DeviceExt, Result, Tensor, D};
 use cula::dsl::{
-    DLDataType, DLDevice, DLTensor, DslKernelRegistry, TVMFFIAny, KDLBFLOAT, KDLCUDA, KDLFLOAT,
-    KDLINT,
+    DLDataType, DLDevice, DLTensor, DslKernelRegistry, KDLBFLOAT, KDLCUDA, KDLFLOAT, KDLINT,
+    TVMFFIAny,
 };
+use half::bf16;
+use prelude_core::tensor::{D, DType, DeviceExt, Result, Tensor, bail};
 use std::ffi::c_void;
 
-const BF16_DT: DLDataType = DLDataType { code: KDLBFLOAT, bits: 16, lanes: 1 };
-const F32_DT: DLDataType = DLDataType { code: KDLFLOAT, bits: 32, lanes: 1 };
-const I32_DT: DLDataType = DLDataType { code: KDLINT, bits: 32, lanes: 1 };
+const BF16_DT: DLDataType = DLDataType {
+    code: KDLBFLOAT,
+    bits: 16,
+    lanes: 1,
+};
+const F32_DT: DLDataType = DLDataType {
+    code: KDLFLOAT,
+    bits: 32,
+    lanes: 1,
+};
+const I32_DT: DLDataType = DLDataType {
+    code: KDLINT,
+    bits: 32,
+    lanes: 1,
+};
 
 /// Delegate to cuLA's own singleton registry — cuLA knows which
 /// `lookup_dsl` function to bind to, so we don't duplicate the
@@ -42,12 +54,18 @@ fn contiguous_strides(shape: &[i64]) -> Vec<i64> {
 }
 
 fn gpu_dl(
-    data: *mut c_void, dev_id: i32, dtype: DLDataType,
-    shape: &[i64], strides: &[i64],
+    data: *mut c_void,
+    dev_id: i32,
+    dtype: DLDataType,
+    shape: &[i64],
+    strides: &[i64],
 ) -> DLTensor {
     DLTensor {
         data,
-        device: DLDevice { device_type: KDLCUDA, device_id: dev_id },
+        device: DLDevice {
+            device_type: KDLCUDA,
+            device_id: dev_id,
+        },
         ndim: shape.len() as i32,
         dtype,
         shape: shape.as_ptr(),
@@ -65,9 +83,7 @@ const SMALL_BATCH_THRESHOLD: usize = 32;
 /// variants here because the wrapper always submits a `[1, N, ...]`
 /// packing.
 fn kernel_name(variant: &str, h: usize, hv: usize, v: usize, arch: u32) -> String {
-    format!(
-        "cula_kda_decode_{variant}_h{h}_hv{hv}_v{v}_l2norm_sm{arch}"
-    )
+    format!("cula_kda_decode_{variant}_h{h}_hv{hv}_v{v}_l2norm_sm{arch}")
 }
 
 /// True iff the current CUDA device has an AOT-compiled `kda_decode`
@@ -81,7 +97,6 @@ pub(crate) fn supported_on_current_arch() -> bool {
     let arch = registry().arch();
     arch == 90 || arch == 100
 }
-
 
 /// Try to run the fused cuLA `kda_decode` kernel over a decode batch.
 ///
@@ -157,7 +172,11 @@ pub(crate) fn try_decode(
 
     // Look up the variant that matches this (HV, V, arch). `small_varlen`
     // uses a tighter SMEM tile and is faster for N < 32.
-    let variant = if n < SMALL_BATCH_THRESHOLD { "small_varlen" } else { "large_varlen" };
+    let variant = if n < SMALL_BATCH_THRESHOLD {
+        "small_varlen"
+    } else {
+        "large_varlen"
+    };
     let name = kernel_name(variant, h, hv, val_dim, arch);
     let Some(kernel) = reg.get("kda_decode", &name) else {
         return Ok(None);
@@ -206,7 +225,7 @@ pub(crate) fn try_decode(
     //  slot_ids:    [N] U32      ->  [N] I32       (cast if needed)
     //  output:      [1, N, HV, V] BF16             (allocated here)
 
-    let q4 = q.unsqueeze(0)?.contiguous()?;  // [1, N, H, K]
+    let q4 = q.unsqueeze(0)?.contiguous()?; // [1, N, H, K]
     let k4 = k.unsqueeze(0)?.contiguous()?;
     let v4 = v.unsqueeze(0)?.contiguous()?;
 
@@ -228,7 +247,8 @@ pub(crate) fn try_decode(
     let a_log1 = a_log.reshape((hv,))?.contiguous()?; // [HV] F32
 
     let slot_ids_i32 = if slot_ids_gpu.dtype() == DType::I64 {
-        slot_ids_gpu.to_dtype(DType::I64)? // candle lacks direct i64→i32, stage through
+        slot_ids_gpu
+            .to_dtype(DType::I64)? // candle lacks direct i64→i32, stage through
             .to_dtype(DType::U32)?
             .contiguous()?
     } else {
@@ -237,13 +257,10 @@ pub(crate) fn try_decode(
 
     // cu_seqlens = [0, 1, 2, ..., N] I32 on the same device.
     let cu_seqlens_host: Vec<i32> = (0..=n as i32).collect();
-    let cu_seqlens_gpu =
-        Tensor::from_vec(cu_seqlens_host, (n + 1,), device)?; // I32 on device
+    let cu_seqlens_gpu = Tensor::from_vec(cu_seqlens_host, (n + 1,), device)?; // I32 on device
 
     // Output buffer: [1, N, HV, V] BF16.
-    let out = unsafe {
-        Tensor::zeros((1, n, hv, val_dim), DType::BF16, device)?
-    };
+    let out = unsafe { Tensor::zeros((1, n, hv, val_dim), DType::BF16, device)? };
 
     // Grab raw device pointers — the macro drops its RwLockReadGuard at
     // the end of the macro scope, same pattern flashinfer.rs uses. The
@@ -256,9 +273,7 @@ pub(crate) fn try_decode(
                 candle_core::Storage::Cuda(s) => s,
                 _ => bail!("kda_decode: tensor not on CUDA"),
             };
-            let slice = cuda
-                .as_cuda_slice::<$ty>()?
-                .slice(layout.start_offset()..);
+            let slice = cuda.as_cuda_slice::<$ty>()?.slice(layout.start_offset()..);
             let (ptr, _guard) = slice.device_ptr($stream);
             ptr as u64 as *mut c_void
         }};
@@ -311,7 +326,13 @@ pub(crate) fn try_decode(
     let dl_a = gpu_dl(a_ptr, dev_id, BF16_DT, &a_shape, &a_strides);
     let dl_b = gpu_dl(b_ptr, dev_id, BF16_DT, &b_shape, &b_strides);
     let dl_a_log = gpu_dl(a_log_ptr, dev_id, F32_DT, &a_log_shape, &a_log_strides);
-    let dl_dt_bias = gpu_dl(dt_bias_ptr, dev_id, F32_DT, &dt_bias_shape, &dt_bias_strides);
+    let dl_dt_bias = gpu_dl(
+        dt_bias_ptr,
+        dev_id,
+        F32_DT,
+        &dt_bias_shape,
+        &dt_bias_strides,
+    );
     let dl_pool = gpu_dl(pool_ptr, dev_id, F32_DT, &pool_shape, &pool_strides);
     let dl_slot = gpu_dl(slot_ids_ptr, dev_id, I32_DT, &slot_shape, &slot_strides);
     let dl_cu = gpu_dl(cu_seqlens_ptr, dev_id, I32_DT, &cu_shape, &cu_strides);

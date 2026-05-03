@@ -86,14 +86,22 @@ pub fn find_cuda() -> PathBuf {
     panic!(
         "CUDA toolkit not found. Set CUDA_HOME or CUDA_PATH to point at \
          a directory containing bin/nvcc{}.",
-        if cfg!(target_os = "windows") { ".exe" } else { "" }
+        if cfg!(target_os = "windows") {
+            ".exe"
+        } else {
+            ""
+        }
     );
 }
 
 /// Return the nvcc binary path for a given CUDA root. On Windows the
 /// binary is `bin/nvcc.exe`.
 pub fn nvcc_path(cuda_root: &Path) -> PathBuf {
-    let name = if cfg!(target_os = "windows") { "bin/nvcc.exe" } else { "bin/nvcc" };
+    let name = if cfg!(target_os = "windows") {
+        "bin/nvcc.exe"
+    } else {
+        "bin/nvcc"
+    };
     let nvcc = cuda_root.join(name);
     if !nvcc.exists() {
         panic!(
@@ -178,7 +186,6 @@ pub fn nvcc_supports_sm103(nvcc: &Path) -> bool {
         .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("compute_103"))
         .unwrap_or(false)
 }
-
 
 // ─────────────────────────────────────────────────────────────────────
 // Workspace / submodule helpers
@@ -301,7 +308,10 @@ fn emit_cuda_lib_search_paths(cuda_path: &Path) {
         }
         let cuda_targets_lib = cuda_path.join("targets/x86_64-linux/lib");
         if cuda_targets_lib.exists() {
-            println!("cargo:rustc-link-search=native={}", cuda_targets_lib.display());
+            println!(
+                "cargo:rustc-link-search=native={}",
+                cuda_targets_lib.display()
+            );
         }
     }
 
@@ -379,7 +389,10 @@ pub fn compile_cu_to_ptx(nvcc: &Path, opts: &PtxCompile<'_>) {
     if !status.success() {
         panic!(
             "nvcc PTX compilation failed for {}",
-            opts.src.file_name().map(|s| s.to_string_lossy()).unwrap_or_default()
+            opts.src
+                .file_name()
+                .map(|s| s.to_string_lossy())
+                .unwrap_or_default()
         );
     }
 }
@@ -457,7 +470,11 @@ pub fn compile_cu_to_obj(nvcc: &Path, opts: &ObjCompile<'_>) {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let primary_arch = opts.gencodes.first().cloned().unwrap_or_else(|| "default".into());
+    let primary_arch = opts
+        .gencodes
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "default".into());
     build_log!("[nvcc] {src_name} ({primary_arch})");
 
     let mut cmd = Command::new(nvcc);
