@@ -1,4 +1,8 @@
 <p align="center">
+  <img src="assets/Prelude_logo_readme.svg" alt="Prelude" width="600">
+</p>
+
+<p align="center">
   Fast LLM inference engine in Rust.
 </p>
 
