@@ -1423,7 +1423,23 @@ impl Qwen3_5SparseMoeBlock {
             xs, &experts_per_tok, &topk_weights,
             &self.experts_gate_up, &self.experts_down,
         ) {
-            r?
+            match r {
+                Ok(out) => out,
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        "CUTLASS fused MoE failed; falling back to composed MoE"
+                    );
+                    self.forward_composed(
+                        ops,
+                        xs,
+                        &topk_weights,
+                        &experts_per_tok,
+                        n_tokens,
+                        hidden_dim,
+                    )?
+                }
+            }
         } else {
             self.forward_composed(ops, xs, &topk_weights, &experts_per_tok, n_tokens, hidden_dim)?
         };
@@ -1475,12 +1491,13 @@ impl Qwen3_5SparseMoeBlock {
         Ok((topk_weights, experts_per_tok))
     }
 
-    /// Fused MoE dispatch (CUDA fast path).
+    /// Composed MoE dispatch fallback.
     ///
     /// One `grouped_gemm` over the stacked `[E, 2*inter, hidden]` gate_up
-    /// weight handles all experts in a single kernel, then `silu_mul_concat`
-    /// fuses the activation, then `fused_moe_gemm` applies the down projection
-    /// with topk-weighted accumulation. This replaces a sequential
+    /// weight handles all experts in a single kernel, then the `[up|gate]`
+    /// halves are split and `silu(gate) * up` is applied before
+    /// `fused_moe_gemm` applies the down projection with topk-weighted
+    /// accumulation. This replaces a sequential
     /// `for t { for k in 0..topk { two tiny matmuls } }` loop that did two
     /// D2H syncs per layer via `to_vec2()` and launched ~`n_tokens * topk * 2`
     /// tiny GEMMs — catastrophic for a 40-layer 256-expert top-8 model.

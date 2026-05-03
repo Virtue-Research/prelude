@@ -135,8 +135,8 @@ struct Cli {
     #[arg(
         long,
         value_enum,
-        help = "MoE backend policy: auto, cutlass, or sequential. \
-                CUDA auto requires FlashInfer CUTLASS. \
+        help = "Qwen3-MoE backend policy: auto, cutlass, or sequential. \
+                CUDA auto requires FlashInfer CUTLASS for Qwen3-MoE. \
                 Defaults to PRELUDE_MOE_BACKEND or auto."
     )]
     moe_backend: Option<CliMoeBackend>,
@@ -152,9 +152,16 @@ struct Cli {
     #[arg(
         long,
         default_value_t = true,
-        help = "CUDA graph capture for decode steps (use --no-cuda-graph to disable)"
+        help = "Enable CUDA graph capture for decode steps"
     )]
     cuda_graph: bool,
+
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Disable CUDA graph capture for decode steps"
+    )]
+    no_cuda_graph: bool,
 
     #[arg(long, default_value = "auto", help = "Device: auto, cpu, cuda, cuda:N")]
     device: String,
@@ -267,7 +274,7 @@ async fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
         engine_config.runtime.moe_backend = moe_backend.into();
     }
     engine_config.cache.gpu_memory_utilization = cli.gpu_memory_utilization;
-    engine_config.runtime.cuda_graph = cli.cuda_graph;
+    engine_config.runtime.cuda_graph = cli.cuda_graph && !cli.no_cuda_graph;
     // Activation profiler probes at this token count so the resulting
     // peak_activation_bytes matches the largest forward the scheduler
     // will dispatch. Keeping these in lockstep avoids KV cache being

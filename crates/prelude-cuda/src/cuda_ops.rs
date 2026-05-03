@@ -4,7 +4,7 @@
 //! Methods not overridden inherit defaults from `trait Ops`.
 
 use prelude_core::ops::traits::*;
-use prelude_core::tensor::{DType, Result, Tensor, bail};
+use prelude_core::tensor::{DType, DeviceExt, Result, Tensor, bail};
 
 pub struct CudaOps;
 
@@ -23,14 +23,12 @@ pub fn cuda_ops() -> &'static dyn Ops {
 
 /// Detect the major compute capability of the **current** CUDA device,
 /// cached per-device for the process lifetime. Used to gate kernels
-/// whose FlashInfer bindings abort on unsupported archs (e.g. CUTLASS
-/// fused MoE: SM90 only).
+/// whose bindings are architecture-specific.
 ///
 /// Per-device cache (not process-wide) because the calling thread's
 /// current device is what determines kernel availability. With a
-/// process-wide cache, an init call on a Hopper GPU could mask a later
-/// call from a Blackwell-current thread, letting the unsafe sm_90a
-/// CUTLASS kernel launch and `std::terminate`.
+/// process-wide cache, an init call on one GPU could mask a later
+/// call from a different-current-device thread.
 pub(crate) fn detect_sm_major() -> i32 {
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -179,10 +177,19 @@ impl Ops for CudaOps {
         w1: &Tensor,
         w2: &Tensor,
     ) -> Option<Result<Tensor>> {
-        // The AOT FlashInfer build now includes Blackwell CUTLASS fused-MoE
-        // variants. Unsupported arch/config cases are represented by a
-        // missing runner or a normal `Err`, and the model layer keeps the
-        // grouped-GEMM fallback path intact.
+        if !input.device().is_cuda()
+            || input.dtype() != DType::BF16
+            || w1.dtype() != DType::BF16
+            || w2.dtype() != DType::BF16
+            || topk_weights.dtype() != DType::F32
+            || experts_per_tok.dtype() != DType::U32
+        {
+            return None;
+        }
+        let device_id = input.device().ordinal() as i32;
+        if !crate::ops::moe::cutlass_fused_moe_available(device_id) {
+            return None;
+        }
         Some(crate::ops::moe::cutlass_fused_moe_forward(
             input,
             experts_per_tok,
@@ -317,13 +324,6 @@ impl Ops for CudaOps {
             return None;
         }
         Some(crate::attn::flashinfer::silu_and_mul(gate_up))
-    }
-
-    fn silu_mul_concat_swap(&self, gate_up: &Tensor, inter: usize) -> Option<Result<Tensor>> {
-        if gate_up.dtype() != DType::BF16 {
-            return None;
-        }
-        Some(crate::ops::moe::silu_mul_swap(gate_up, inter))
     }
 
     fn fused_add(&self, a: &Tensor, b: &Tensor) -> Option<Result<Tensor>> {

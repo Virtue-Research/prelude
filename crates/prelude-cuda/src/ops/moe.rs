@@ -1,12 +1,15 @@
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::WrapErr;
 use cudarc::driver::{DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg};
-use prelude_core::tensor::{DType, Result, Tensor, bail};
+use prelude_core::tensor::{DType, DeviceExt, Result, Tensor, bail};
 
 use crate::moe_ffi as ffi;
 use crate::{MOD_MOE_ROUTING, PTX_MOE_ROUTING};
 
-use std::sync::OnceLock;
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
 
 /// Helper: extract candle CUDA storage or bail.
 fn as_candle_cuda<'a>(
@@ -322,63 +325,6 @@ pub fn moe_gemm_wmma(
         ),
         _ => bail!("moe_gemm only accepts f16/bf16 inputs"),
     }
-}
-
-/// `silu(gate) * up` for a `[tokens, 2*inter]` BF16 tensor in CUTLASS
-/// Swiglu stack order (first half = up, second half = gate) — produced
-/// by a single grouped GEMM against `experts_gate_up`.
-///
-/// Returns `[tokens, inter]` BF16. FlashInfer's `silu_and_mul` can't
-/// be used directly because it assumes the opposite stack order.
-pub fn silu_mul_swap(gate_up: &Tensor, inter: usize) -> Result<Tensor> {
-    use std::ffi::c_void;
-    let dims = gate_up.dims();
-    if dims.len() < 2 {
-        bail!("silu_mul_swap: gate_up must have rank >= 2, got {:?}", dims);
-    }
-    let last = dims[dims.len() - 1];
-    if last != 2 * inter {
-        bail!(
-            "silu_mul_swap: last dim {last} != 2 * inter ({})",
-            2 * inter
-        );
-    }
-    if gate_up.dtype() != DType::BF16 {
-        bail!("silu_mul_swap: requires BF16, got {:?}", gate_up.dtype());
-    }
-
-    let tokens: usize = dims[..dims.len() - 1].iter().product();
-
-    let (gu_g, _) = gate_up.storage_and_layout();
-    let gu_cuda = as_candle_cuda(&gu_g, "silu_mul_swap")?;
-    let gu_s = gu_cuda.as_cuda_slice::<half::bf16>()?;
-
-    let dev = gu_cuda.device().clone();
-    let stream = dev.cuda_stream();
-    let cu_stream = stream.cu_stream() as i64;
-
-    let out = unsafe { dev.alloc::<half::bf16>(tokens * inter) }?;
-    unsafe {
-        ffi::moe_silu_mul_swap(
-            gu_s.device_ptr(&stream).0 as *const c_void,
-            out.device_ptr(&stream).0 as *mut c_void,
-            tokens as i32,
-            inter as i32,
-            /*dtype=*/ 1,
-            cu_stream,
-        );
-    }
-    drop(gu_g);
-
-    let mut out_shape: Vec<usize> = dims[..dims.len() - 1].to_vec();
-    out_shape.push(inter);
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
-    Ok(Tensor::from_storage(
-        candle_core::Storage::Cuda(storage),
-        out_shape,
-        candle_core::op::BackpropOp::none(),
-        false,
-    ))
 }
 
 /// DeepGEMM SM100 grouped MoE GEMM, BF16 only — preferred path on
@@ -816,18 +762,33 @@ pub fn swap_gate_up_inplace(w1: &Tensor, inter: usize) -> Result<()> {
 
 // ── CUTLASS Fused MoE forward ─────────────────────────────────────
 
-/// Get or create the CUTLASS fused MoE runner singleton.
-fn get_cutlass_moe_runner() -> Option<&'static flashinfer::moe::FusedMoeRunner> {
-    static RUNNER: OnceLock<Option<flashinfer::moe::FusedMoeRunner>> = OnceLock::new();
-    RUNNER
-        .get_or_init(|| match flashinfer::moe::FusedMoeRunner::new() {
-            Ok(r) => Some(r),
+/// Get or create the CUTLASS fused MoE runner singleton for one CUDA device.
+fn get_cutlass_moe_runner(device_id: i32) -> Option<&'static flashinfer::moe::FusedMoeRunner> {
+    static RUNNERS: OnceLock<
+        Mutex<HashMap<i32, Option<&'static flashinfer::moe::FusedMoeRunner>>>,
+    > = OnceLock::new();
+
+    let runners = RUNNERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match runners.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if !guard.contains_key(&device_id) {
+        let runner = match flashinfer::moe::FusedMoeRunner::new() {
+            Ok(r) => Some(Box::leak(Box::new(r)) as &'static flashinfer::moe::FusedMoeRunner),
             Err(e) => {
-                tracing::warn!("CUTLASS fused MoE unavailable: {e}");
+                tracing::warn!(device_id, "CUTLASS fused MoE unavailable: {e}");
                 None
             }
-        })
-        .as_ref()
+        };
+        guard.insert(device_id, runner);
+    }
+
+    guard.get(&device_id).copied().flatten()
+}
+
+pub fn cutlass_fused_moe_available(device_id: i32) -> bool {
+    get_cutlass_moe_runner(device_id).is_some()
 }
 
 /// CUTLASS fused MoE forward: converts candle tensors to DLTensor and calls the runner.
@@ -840,7 +801,11 @@ pub fn cutlass_fused_moe_forward(
 ) -> Result<Tensor> {
     use flashinfer::types::*;
 
-    let runner = get_cutlass_moe_runner()
+    if !input.device().is_cuda() {
+        bail!("cutlass_fused_moe: input must be on CUDA");
+    }
+    let device_id = input.device().ordinal() as i32;
+    let runner = get_cutlass_moe_runner(device_id)
         .ok_or_else(|| candle_core::Error::Msg("CUTLASS fused MoE runner not available".into()))?;
 
     let (n_tokens, hidden) = input.dims2()?;
@@ -863,7 +828,12 @@ pub fn cutlass_fused_moe_forward(
     // Extract raw CUDA device pointer from a candle tensor.
     // GPU device addresses are stable — the pointer remains valid after
     // dropping the storage guard.
-    fn tensor_to_dl(t: &Tensor, shapes: &[i64], dt: DLDataType) -> Result<DLTensor> {
+    fn tensor_to_dl(
+        t: &Tensor,
+        shapes: &[i64],
+        dt: DLDataType,
+        device_id: i32,
+    ) -> Result<DLTensor> {
         let (storage, layout) = t.storage_and_layout();
         let cuda = as_candle_cuda(&storage, "cutlass_fused_moe")?;
         let dev = cuda.device().clone();
@@ -890,7 +860,7 @@ pub fn cutlass_fused_moe_forward(
             data: data_ptr as *mut std::ffi::c_void,
             device: DLDevice {
                 device_type: KDLCUDA,
-                device_id: 0,
+                device_id,
             },
             ndim: shapes.len() as i32,
             dtype: dt,
@@ -925,12 +895,12 @@ pub fn cutlass_fused_moe_forward(
     let w1_shape = to_shape(&w1);
     let w2_shape = to_shape(&w2);
 
-    let dl_out = tensor_to_dl(&output, &out_shape, bf16_dt)?;
-    let dl_in = tensor_to_dl(&input, &in_shape, bf16_dt)?;
-    let dl_ept = tensor_to_dl(&experts_i32, &ept_shape, i32_dt)?;
-    let dl_tw = tensor_to_dl(&topk_weights, &tw_shape, f32_dt)?;
-    let dl_w1 = tensor_to_dl(&w1, &w1_shape, bf16_dt)?;
-    let dl_w2 = tensor_to_dl(&w2, &w2_shape, bf16_dt)?;
+    let dl_out = tensor_to_dl(&output, &out_shape, bf16_dt, device_id)?;
+    let dl_in = tensor_to_dl(&input, &in_shape, bf16_dt, device_id)?;
+    let dl_ept = tensor_to_dl(&experts_i32, &ept_shape, i32_dt, device_id)?;
+    let dl_tw = tensor_to_dl(&topk_weights, &tw_shape, f32_dt, device_id)?;
+    let dl_w1 = tensor_to_dl(&w1, &w1_shape, bf16_dt, device_id)?;
+    let dl_w2 = tensor_to_dl(&w2, &w2_shape, bf16_dt, device_id)?;
 
     // Set CUDA stream for TVM-FFI (must match the stream used by the engine)
     let registry = flashinfer::KernelRegistry::new();
@@ -939,7 +909,7 @@ pub fn cutlass_fused_moe_forward(
     let dev = cuda_storage.device().clone();
     let stream = dev.cuda_stream();
     let raw_stream = unsafe { stream.cu_stream() } as *mut std::ffi::c_void;
-    registry.set_stream(0, raw_stream);
+    registry.set_stream(device_id, raw_stream);
     drop(storage);
 
     {

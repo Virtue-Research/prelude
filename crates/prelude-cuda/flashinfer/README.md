@@ -14,11 +14,11 @@ step + cached workspace buffers) is preserved.
 
 | | |
 |---|---|
-| Upstream | [flashinfer-ai/flashinfer](https://github.com/flashinfer-ai/flashinfer) |
-| Kernel paths | Prefill (FA2 / FA3 backends), paged decode, MLA, sampling utilities |
+| Source | `third_party/flashinfer` tracks the Virtue fork, which carries Prelude AOT patches on top of upstream [flashinfer-ai/flashinfer](https://github.com/flashinfer-ai/flashinfer) |
+| Kernel paths | Prefill (FA2 / FA3 backends), paged decode, MLA, sampling utilities, CUTLASS fused MoE |
 | Compile model | Python AOT at build time → `.o` → static archive |
 | Dispatch | `KernelRegistry` + `{Prefill,Decode}Key` → statically-linked `__tvm_ffi_<variant>` |
-| Arch | SM80+ (FA2 default), SM90+ (FA3 fast path) |
+| Arch | SM80+ (FA2 default), SM90+ (FA3 fast path), SM100/SM103 for Blackwell fused MoE |
 | Runtime deps | cudart_static, libbacktrace, stdc++ — no libtorch, no Python |
 
 ## Features

@@ -242,7 +242,7 @@ struct Qwen3SparseMoeBlock {
     experts: Vec<Qwen3MoeExpert>,
     // Pre-fused CUTLASS layout: [num_experts, 2*inter, hidden] ([up;gate])
     // and [num_experts, hidden, inter]. Enables FlashInfer's fused MoE
-    // on SM90+.
+    // on supported CUDA architectures.
     experts_gate_up: Option<Tensor>,
     experts_down: Option<Tensor>,
     norm_topk_prob: bool,

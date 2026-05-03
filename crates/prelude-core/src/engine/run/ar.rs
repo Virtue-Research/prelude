@@ -340,17 +340,7 @@ fn handle_message(
             // request, which exhausts the (small) DeltaNet pool under heavy
             // cancel-and-retry load and starves new admissions.
             release_resources(deltanet_pool, scheduler, &request_id);
-            if let Some(seq) = scheduler.abort_request(&request_id) {
-                if !seq.block_table.is_empty() {
-                    scheduler.free_blocks(&seq.block_table);
-                }
-                if let Some(slot) = seq.deltanet_slot
-                    && let Some(pool_mutex) = deltanet_pool
-                    && let Ok(mut pool) = pool_mutex.lock()
-                {
-                    pool.free(slot);
-                }
-            }
+            let _ = scheduler.abort_request(&request_id);
             states.remove(&request_id);
         }
     }

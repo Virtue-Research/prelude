@@ -173,7 +173,7 @@ pub struct RuntimeConfig {
     pub dtype: Option<String>,
     /// Enable CUDA graph capture for decode (Q=1) steps.
     pub cuda_graph: bool,
-    /// MoE backend selection policy for sparse MoE layers.
+    /// MoE backend selection policy for Qwen3-MoE sparse layers.
     pub moe_backend: MoeBackendPolicy,
     /// Maximum batch size for CUDA graph capture (graphs captured for 1..=max_bs powers of 2).
     pub cuda_graph_max_bs: usize,
@@ -188,7 +188,7 @@ pub struct RuntimeConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MoeBackendPolicy {
-    /// Prefer the production backend. CUDA Qwen3 MoE requires FlashInfer CUTLASS.
+    /// Prefer the production backend. CUDA Qwen3-MoE requires FlashInfer CUTLASS.
     Auto,
     /// Require FlashInfer CUTLASS fused MoE.
     Cutlass,
