@@ -1,4 +1,8 @@
 <p align="center">
+  <img src="assets/Prelude_logo_readme.svg" alt="Prelude" width="600">
+</p>
+
+<p align="center">
   Fast LLM inference engine in Rust.
 </p>
 
@@ -76,7 +80,8 @@ curl http://localhost:8000/v1/chat/completions \
 | Qwen3.5 (0.8B–27B) | Hybrid (DeltaNet) | ✔ | — | — | FlashInfer / FA4 |
 | Qwen3.5-MoE (35B-A3B) | Hybrid (DeltaNet + MoE) | ✔ | — | — | FlashInfer / FA4 |
 | Gemma3 | Dense | ✔ | ✔ | ✔ | FlashInfer / FA4 |
-| GGUF (Qwen3, Qwen3.5, LLaMA, Gemma, Phi3) | Quantized | ✔ | — | — | CUDA / CPU |
+| Gemma4 | Dense / MoE | ✔ | — | — | FlashInfer / FA4 |
+| GGUF (Qwen3.5, Qwen3.5-MoE) | Quantized | ✔ | — | — | CUDA / CPU |
 
 GGUF models are auto-detected from HuggingFace Hub or local `.gguf` files.
 
