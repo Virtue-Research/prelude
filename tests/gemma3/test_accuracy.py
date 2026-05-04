@@ -2,12 +2,16 @@
 """Gemma 3 endpoint accuracy wrapper with public smoke defaults.
 
 Defaults:
-  completion: nmaroulis/tiny-random-Gemma3ForCausalLM
-  classify:   nmaroulis/tiny-random-Gemma3ForSequenceClassification
-  embedding:  michaelfeil/embeddinggemma-300m
+  completion: google/gemma-3-1b-it
+  classify:   tomaarsen/Qwen3-Reranker-0.6B-seq-cls
+  embedding:  google/embeddinggemma-300m
 
 Canonical Google repos remain opt-in via --use-canonical-google-models or the
 PRELUDE_GEMMA3_CANONICAL_* environment variables.
+
+The public Gemma3ForSequenceClassification smoke repo currently ships without
+a tokenizer artifact, so classify uses the shared endpoint-suite default unless
+PRELUDE_GEMMA3_CLASSIFY_MODEL or --classify-model is provided.
 """
 
 from __future__ import annotations
@@ -22,9 +26,9 @@ SCRIPT_DIR = Path(__file__).parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
 ENDPOINT_SUITE = REPO_ROOT / "tests" / "accuracy" / "test_endpoint_accuracy.py"
 
-PUBLIC_COMPLETION_MODEL = "nmaroulis/tiny-random-Gemma3ForCausalLM"
-PUBLIC_CLASSIFY_MODEL = "nmaroulis/tiny-random-Gemma3ForSequenceClassification"
-PUBLIC_EMBEDDING_MODEL = "michaelfeil/embeddinggemma-300m"
+PUBLIC_COMPLETION_MODEL = "google/gemma-3-1b-it"
+PUBLIC_CLASSIFY_MODEL = "tomaarsen/Qwen3-Reranker-0.6B-seq-cls"
+PUBLIC_EMBEDDING_MODEL = "google/embeddinggemma-300m"
 
 CANONICAL_COMPLETION_MODEL = "google/gemma-3-1b-it"
 CANONICAL_EMBEDDING_MODEL = "google/embeddinggemma-300m"
