@@ -20,7 +20,8 @@ fn build_cache_allocation_entries(
         let total_blocks = prompt_len.div_ceil(block_size);
         if total_blocks < shared_block_count {
             return Err(EngineError::Internal(
-                "cache allocation plan produced fewer total blocks than shared prefix blocks".into(),
+                "cache allocation plan produced fewer total blocks than shared prefix blocks"
+                    .into(),
             ));
         }
 
@@ -82,7 +83,8 @@ impl Engine {
             .cache
             .try_prefix_cache_match_paged_only(&candidate.common_prefix_tokens)?;
 
-        if cached_len == 0 || cached_block_ids.is_empty() || cached_len >= candidate.min_prompt_len {
+        if cached_len == 0 || cached_block_ids.is_empty() || cached_len >= candidate.min_prompt_len
+        {
             return Ok(ResolvedPrefixReuse::default());
         }
 
@@ -156,8 +158,7 @@ mod tests {
 
     #[test]
     fn builds_entries_without_prefix_reuse() {
-        let (entries, max_blocks) =
-            build_cache_allocation_entries(&[8, 17], 0, 0, 16).unwrap();
+        let (entries, max_blocks) = build_cache_allocation_entries(&[8, 17], 0, 0, 16).unwrap();
 
         assert_eq!(
             entries,

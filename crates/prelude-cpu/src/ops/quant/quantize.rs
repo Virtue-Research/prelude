@@ -15,7 +15,10 @@ use super::types::*;
 ///
 /// `x.len()` must be a multiple of 32. Output length = `x.len() / 32`.
 pub fn quantize_row_q8_0_scalar(x: &[f32]) -> Vec<BlockQ8_0> {
-    assert!(x.len() % QK8_0 == 0, "input length must be multiple of {QK8_0}");
+    assert!(
+        x.len() % QK8_0 == 0,
+        "input length must be multiple of {QK8_0}"
+    );
     let nb = x.len() / QK8_0;
     let mut output = Vec::with_capacity(nb);
 
@@ -92,14 +95,30 @@ mod avx2 {
             let max_scalar = _mm_cvtss_f32(max1);
 
             let d = max_scalar / 127.0f32;
-            let id = if max_scalar != 0.0 { 127.0f32 / max_scalar } else { 0.0f32 };
+            let id = if max_scalar != 0.0 {
+                127.0f32 / max_scalar
+            } else {
+                0.0f32
+            };
             let mul = _mm256_set1_ps(id);
 
             // Scale + round
-            let v0 = _mm256_round_ps(_mm256_mul_ps(v0, mul), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-            let v1 = _mm256_round_ps(_mm256_mul_ps(v1, mul), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-            let v2 = _mm256_round_ps(_mm256_mul_ps(v2, mul), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-            let v3 = _mm256_round_ps(_mm256_mul_ps(v3, mul), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            let v0 = _mm256_round_ps(
+                _mm256_mul_ps(v0, mul),
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+            );
+            let v1 = _mm256_round_ps(
+                _mm256_mul_ps(v1, mul),
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+            );
+            let v2 = _mm256_round_ps(
+                _mm256_mul_ps(v2, mul),
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+            );
+            let v3 = _mm256_round_ps(
+                _mm256_mul_ps(v3, mul),
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+            );
 
             // f32 → i32 → i16 → i8
             let i0 = _mm256_cvtps_epi32(v0);
@@ -274,7 +293,10 @@ pub fn quantize_row_q8_0(x: &[f32]) -> Vec<BlockQ8_0> {
 /// `x.len()` must be a multiple of 256. Output length = `x.len() / 256`.
 /// Q8_K uses f32 scale and pre-computes 16-element sub-block sums (`bsums`).
 pub fn quantize_row_q8k_scalar(x: &[f32]) -> Vec<BlockQ8K> {
-    assert!(x.len() % QK_K == 0, "input length must be multiple of {QK_K}");
+    assert!(
+        x.len() % QK_K == 0,
+        "input length must be multiple of {QK_K}"
+    );
     let nb = x.len() / QK_K;
     let mut output = Vec::with_capacity(nb);
 
@@ -334,7 +356,10 @@ pub fn quantize_row_q8k(x: &[f32]) -> Vec<BlockQ8K> {
 ///
 /// Like Q8_0 but also precomputes `s = d * sum(qs)` for asymmetric dot products.
 pub fn quantize_row_q8_1_scalar(x: &[f32]) -> Vec<BlockQ8_1> {
-    assert!(x.len() % QK8_0 == 0, "input length must be multiple of {QK8_0}");
+    assert!(
+        x.len() % QK8_0 == 0,
+        "input length must be multiple of {QK8_0}"
+    );
     let nb = x.len() / QK8_0;
     let mut output = Vec::with_capacity(nb);
 
@@ -344,7 +369,9 @@ pub fn quantize_row_q8_1_scalar(x: &[f32]) -> Vec<BlockQ8_1> {
         let mut amax: f32 = 0.0;
         for &v in block {
             let av = v.abs();
-            if av > amax { amax = av; }
+            if av > amax {
+                amax = av;
+            }
         }
 
         let d = amax / 127.0;
@@ -412,7 +439,9 @@ mod tests {
     #[test]
     fn scalar_symmetric() {
         // Symmetric values: [-1, 1, -1, 1, ...]
-        let input: Vec<f32> = (0..32).map(|i| if i % 2 == 0 { -1.0 } else { 1.0 }).collect();
+        let input: Vec<f32> = (0..32)
+            .map(|i| if i % 2 == 0 { -1.0 } else { 1.0 })
+            .collect();
         let blocks = quantize_row_q8_0_scalar(&input);
         let d = fp16_to_f32(blocks[0].d);
         // Scale should be 1.0/127 ≈ 0.00787
@@ -479,7 +508,8 @@ mod tests {
             for (bi, (sb, ab)) in scalar_blocks.iter().zip(avx2_blocks.iter()).enumerate() {
                 // Scales should match exactly (both compute the same max + FP16 conversion)
                 assert_eq!(
-                    sb.d, ab.d,
+                    sb.d,
+                    ab.d,
                     "block {bi}: scale mismatch scalar={} avx2={}",
                     fp16_to_f32(sb.d),
                     fp16_to_f32(ab.d)
@@ -548,7 +578,8 @@ mod tests {
                 assert!(
                     (sb.d - ab.d).abs() < 1e-6,
                     "block {bi}: scale mismatch scalar={} avx2={}",
-                    sb.d, ab.d,
+                    sb.d,
+                    ab.d,
                 );
 
                 for j in 0..QK_K {

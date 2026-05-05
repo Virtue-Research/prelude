@@ -15,16 +15,19 @@ use super::common::{bf16_to_f32, bf16x16_load_as_f32};
 /// Use `dim` for contiguous gathered buffers, or `num_kv_heads * dim` for strided access.
 #[target_feature(enable = "avx512f,avx512bw")]
 pub(super) fn weight_v_accum_bf16_avx512(
-    acc: *mut f32,         // v_prime row: [dim] F32, read-modify-write
-    v_bf16: *const u16,    // V buffer: [n_size rows × v_stride], BF16
-    weights: *const f32,   // softmax weights: [n_size] F32
+    acc: *mut f32,       // v_prime row: [dim] F32, read-modify-write
+    v_bf16: *const u16,  // V buffer: [n_size rows × v_stride], BF16
+    weights: *const f32, // softmax weights: [n_size] F32
     n_size: usize,
     dim: usize,
-    v_stride: usize,       // row stride in u16 elements
+    v_stride: usize, // row stride in u16 elements
 ) {
     use core::arch::x86_64::*;
     let chunks = dim / 16;
-    debug_assert!(chunks <= 16, "head_dim > 256 not supported by fixed-size accumulator array");
+    debug_assert!(
+        chunks <= 16,
+        "head_dim > 256 not supported by fixed-size accumulator array"
+    );
 
     // Load all accumulators into zmm registers (up to 16 × __m512 = head_dim ≤ 256)
     let mut accs = [_mm512_setzero_ps(); 16];

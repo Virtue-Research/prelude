@@ -55,9 +55,7 @@ mod tests {
 
     /// Scalar reference matmul: same algorithm as quantized_matmul_f32,
     /// but uses scalar (non-SIMD) dot product. This is the ground truth.
-    fn ref_quantized_matmul(
-        x: &[f32], w: &[BlockQ4_0], m: usize, n: usize, k: usize,
-    ) -> Vec<f32> {
+    fn ref_quantized_matmul(x: &[f32], w: &[BlockQ4_0], m: usize, n: usize, k: usize) -> Vec<f32> {
         let nb = k / QK8_0;
         let mut out = vec![0.0f32; m * n];
         for i in 0..m {
@@ -89,7 +87,10 @@ mod tests {
                 let hi = ((chunk[j + 16] * id).round() as i32).clamp(-8, 7) + 8;
                 qs[j] = (lo as u8) | ((hi as u8) << 4);
             }
-            blocks.push(BlockQ4_0 { d: f32_to_fp16(d), qs });
+            blocks.push(BlockQ4_0 {
+                d: f32_to_fp16(d),
+                qs,
+            });
         }
         blocks
     }
@@ -98,9 +99,12 @@ mod tests {
     fn dot_product_error(result: &[f32], reference: &[f32]) -> f32 {
         assert_eq!(result.len(), reference.len());
         let n = result.len() as f32;
-        result.iter().zip(reference.iter())
+        result
+            .iter()
+            .zip(reference.iter())
             .map(|(a, b)| (a - b).abs())
-            .sum::<f32>() / n
+            .sum::<f32>()
+            / n
     }
 
     #[test]
@@ -111,7 +115,9 @@ mod tests {
         let m = 1;
 
         let x: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.01).sin()).collect();
-        let w_f32: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.007).cos() * 0.5).collect();
+        let w_f32: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32) * 0.007).cos() * 0.5)
+            .collect();
         let w = quantize_f32_to_q4_0(&w_f32);
 
         let ref_out = ref_quantized_matmul(&x, &w, m, n, k);
@@ -129,7 +135,9 @@ mod tests {
         let n = 64;
         let m = 8;
 
-        let x: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.013).sin() * 2.0).collect();
+        let x: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32) * 0.013).sin() * 2.0)
+            .collect();
         let w_f32: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.009).cos()).collect();
         let w = quantize_f32_to_q4_0(&w_f32);
 
@@ -149,7 +157,9 @@ mod tests {
         let m = 1;
 
         let x: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.003).sin()).collect();
-        let w_f32: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.002).cos() * 0.3).collect();
+        let w_f32: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32) * 0.002).cos() * 0.3)
+            .collect();
         let w = quantize_f32_to_q4_0(&w_f32);
 
         let ref_out = ref_quantized_matmul(&x, &w, m, n, k);

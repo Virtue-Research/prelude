@@ -1,4 +1,4 @@
-use crate::tensor::{Module, Result, Tensor, D};
+use crate::tensor::{D, Module, Result, Tensor};
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize, serde::Serialize, Default)]
 #[serde(rename_all = "lowercase")]

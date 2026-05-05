@@ -6,7 +6,6 @@
 //! for the kernel itself and the `delta_rule_prefill_gdn` path in
 //! `models/qwen3_5.rs` for the caller.
 
-use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::WrapErr;
 use candle_core::{DType, Device, Result, Shape, Tensor};
 use cudarc::driver::{LaunchConfig, PushKernelArg};
@@ -96,7 +95,9 @@ pub fn gdn_post_conv(
     // per-token warp reductions cover the full dim cleanly, and must
     // satisfy `BLOCK_T * head_dim ≤ 1024` (SM90 max threads/block).
     if head_dim % 32 != 0 || head_dim == 0 {
-        candle_core::bail!("gdn_post_conv: head_dim must be a nonzero multiple of 32 (got {head_dim})");
+        candle_core::bail!(
+            "gdn_post_conv: head_dim must be a nonzero multiple of 32 (got {head_dim})"
+        );
     }
     let block_t = BLOCK_T as usize;
     if block_t * head_dim > 1024 {
@@ -179,8 +180,11 @@ pub fn gdn_post_conv(
     let shared_mem_floats = block_t as u32 * (warps_per_token * 2 + 2);
     let shared_mem_bytes = shared_mem_floats * 4;
 
-    let func =
-        cuda_dev.get_or_load_custom_func("gdn_post_conv_bf16", MOD_GDN_POST_CONV, PTX_GDN_POST_CONV)?;
+    let func = cuda_dev.get_or_load_custom_func(
+        "gdn_post_conv_bf16",
+        MOD_GDN_POST_CONV,
+        PTX_GDN_POST_CONV,
+    )?;
     let cfg = LaunchConfig {
         grid_dim: (grid_x, grid_y, 1),
         block_dim: (block_dim, 1, 1),

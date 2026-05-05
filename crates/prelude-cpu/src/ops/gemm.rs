@@ -69,13 +69,18 @@ pub fn small_m_threshold() -> usize {
 /// More threads = more DRAM bandwidth (each thread adds an independent memory stream).
 /// With the spinning pool (no futex parking), 48 threads on Xeon 8480+ achieves
 /// ~162 GB/s DRAM bandwidth, matching SGLang's OpenMP-based threading.
-pub fn gemm_thread_count_pub() -> usize { gemm_thread_count() }
+pub fn gemm_thread_count_pub() -> usize {
+    gemm_thread_count()
+}
 
 fn gemm_thread_count() -> usize {
     use std::sync::OnceLock;
     static CACHED: OnceLock<usize> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        if let Some(v) = std::env::var("CPU_GEMM_THREADS").ok().and_then(|v| v.parse().ok()) {
+        if let Some(v) = std::env::var("CPU_GEMM_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
             return v;
         }
         // Default: all physical cores across all NUMA nodes (override with CPU_GEMM_THREADS=N)
@@ -130,7 +135,10 @@ pub fn bf16_gemm_small_m(
         out_ptr: out.as_mut_ptr() as usize,
         in_ptr: input.as_ptr() as usize,
         w_ptr: weight.as_ptr() as usize,
-        m, k, n, pf_dist,
+        m,
+        k,
+        n,
+        pf_dist,
     };
 
     unsafe fn avx_gemm_work(tid: usize, n_threads: usize, ctx_raw: *const u8) {
@@ -139,14 +147,19 @@ pub fn bf16_gemm_small_m(
             let n_per_thread = (ctx.n + n_threads - 1) / n_threads;
             let n_start = tid * n_per_thread;
             let n_end = (n_start + n_per_thread).min(ctx.n);
-            if n_start >= n_end { return; }
+            if n_start >= n_end {
+                return;
+            }
 
             bf16_gemm_tile_avx512_v2(
                 ctx.out_ptr as *mut u16,
                 ctx.in_ptr as *const u16,
                 ctx.w_ptr as *const u16,
-                ctx.m, ctx.k, ctx.n,
-                n_start, n_end,
+                ctx.m,
+                ctx.k,
+                ctx.n,
+                n_start,
+                n_end,
                 ctx.pf_dist,
             );
         }
@@ -187,257 +200,264 @@ fn bf16_gemm_tile_avx512_v2(
     // Safety: caller guarantees all pointers valid for the given dimensions
     // and the N range [n_start, n_end) doesn't overlap with other threads
     unsafe {
-    use core::arch::x86_64::*;
+        use core::arch::x86_64::*;
 
-    let k_chunks = k / 32;
+        let k_chunks = k / 32;
 
-    // ── NR=4 blocked path ──────────────────────────────────────────────
-    let mut col = n_start;
-    while col + NR <= n_end {
-        // MR=4 × NR=4 tiled: process 4 input rows × 4 weight columns
-        let mut row = 0;
-        while row + 4 <= m {
-            // 16 accumulators: acc[mr][nr]
-            let mut acc00 = _mm512_setzero_ps();
-            let mut acc01 = _mm512_setzero_ps();
-            let mut acc02 = _mm512_setzero_ps();
-            let mut acc03 = _mm512_setzero_ps();
-            let mut acc10 = _mm512_setzero_ps();
-            let mut acc11 = _mm512_setzero_ps();
-            let mut acc12 = _mm512_setzero_ps();
-            let mut acc13 = _mm512_setzero_ps();
-            let mut acc20 = _mm512_setzero_ps();
-            let mut acc21 = _mm512_setzero_ps();
-            let mut acc22 = _mm512_setzero_ps();
-            let mut acc23 = _mm512_setzero_ps();
-            let mut acc30 = _mm512_setzero_ps();
-            let mut acc31 = _mm512_setzero_ps();
-            let mut acc32 = _mm512_setzero_ps();
-            let mut acc33 = _mm512_setzero_ps();
+        // ── NR=4 blocked path ──────────────────────────────────────────────
+        let mut col = n_start;
+        while col + NR <= n_end {
+            // MR=4 × NR=4 tiled: process 4 input rows × 4 weight columns
+            let mut row = 0;
+            while row + 4 <= m {
+                // 16 accumulators: acc[mr][nr]
+                let mut acc00 = _mm512_setzero_ps();
+                let mut acc01 = _mm512_setzero_ps();
+                let mut acc02 = _mm512_setzero_ps();
+                let mut acc03 = _mm512_setzero_ps();
+                let mut acc10 = _mm512_setzero_ps();
+                let mut acc11 = _mm512_setzero_ps();
+                let mut acc12 = _mm512_setzero_ps();
+                let mut acc13 = _mm512_setzero_ps();
+                let mut acc20 = _mm512_setzero_ps();
+                let mut acc21 = _mm512_setzero_ps();
+                let mut acc22 = _mm512_setzero_ps();
+                let mut acc23 = _mm512_setzero_ps();
+                let mut acc30 = _mm512_setzero_ps();
+                let mut acc31 = _mm512_setzero_ps();
+                let mut acc32 = _mm512_setzero_ps();
+                let mut acc33 = _mm512_setzero_ps();
 
-            let in0 = input.add(row * k);
-            let in1 = input.add((row + 1) * k);
-            let in2 = input.add((row + 2) * k);
-            let in3 = input.add((row + 3) * k);
-            let w0 = weight.add(col * k);
-            let w1 = weight.add((col + 1) * k);
-            let w2 = weight.add((col + 2) * k);
-            let w3 = weight.add((col + 3) * k);
+                let in0 = input.add(row * k);
+                let in1 = input.add((row + 1) * k);
+                let in2 = input.add((row + 2) * k);
+                let in3 = input.add((row + 3) * k);
+                let w0 = weight.add(col * k);
+                let w1 = weight.add((col + 1) * k);
+                let w2 = weight.add((col + 2) * k);
+                let w3 = weight.add((col + 3) * k);
 
-            for c in 0..k_chunks {
-                let off = c * 32;
+                for c in 0..k_chunks {
+                    let off = c * 32;
 
-                // Software prefetch: load future K-chunks into L1
-                if c + pf_dist < k_chunks {
-                    let pf_off = (c + pf_dist) * 32;
-                    _mm_prefetch(w0.add(pf_off) as *const i8, _MM_HINT_T0);
-                    _mm_prefetch(w1.add(pf_off) as *const i8, _MM_HINT_T0);
-                    _mm_prefetch(w2.add(pf_off) as *const i8, _MM_HINT_T0);
-                    _mm_prefetch(w3.add(pf_off) as *const i8, _MM_HINT_T0);
-                }
-
-                // Load 4 input rows (from L1 — input is small)
-                let a0 = _mm512_loadu_si512(in0.add(off) as *const _).as_bf16();
-                let a1 = _mm512_loadu_si512(in1.add(off) as *const _).as_bf16();
-                let a2 = _mm512_loadu_si512(in2.add(off) as *const _).as_bf16();
-                let a3 = _mm512_loadu_si512(in3.add(off) as *const _).as_bf16();
-
-                // Load NR=4 weight columns (from DRAM — 4 independent streams)
-                let wv0 = _mm512_loadu_si512(w0.add(off) as *const _).as_bf16();
-                let wv1 = _mm512_loadu_si512(w1.add(off) as *const _).as_bf16();
-                let wv2 = _mm512_loadu_si512(w2.add(off) as *const _).as_bf16();
-                let wv3 = _mm512_loadu_si512(w3.add(off) as *const _).as_bf16();
-
-                // 16 dpbf16ps: each input reused NR times, each weight reused MR times
-                acc00 = _mm512_dpbf16_ps(acc00, a0, wv0);
-                acc01 = _mm512_dpbf16_ps(acc01, a0, wv1);
-                acc02 = _mm512_dpbf16_ps(acc02, a0, wv2);
-                acc03 = _mm512_dpbf16_ps(acc03, a0, wv3);
-
-                acc10 = _mm512_dpbf16_ps(acc10, a1, wv0);
-                acc11 = _mm512_dpbf16_ps(acc11, a1, wv1);
-                acc12 = _mm512_dpbf16_ps(acc12, a1, wv2);
-                acc13 = _mm512_dpbf16_ps(acc13, a1, wv3);
-
-                acc20 = _mm512_dpbf16_ps(acc20, a2, wv0);
-                acc21 = _mm512_dpbf16_ps(acc21, a2, wv1);
-                acc22 = _mm512_dpbf16_ps(acc22, a2, wv2);
-                acc23 = _mm512_dpbf16_ps(acc23, a2, wv3);
-
-                acc30 = _mm512_dpbf16_ps(acc30, a3, wv0);
-                acc31 = _mm512_dpbf16_ps(acc31, a3, wv1);
-                acc32 = _mm512_dpbf16_ps(acc32, a3, wv2);
-                acc33 = _mm512_dpbf16_ps(acc33, a3, wv3);
-            }
-
-            // Reduce + scalar remainder + store
-            let k_tail_start = k_chunks * 32;
-            macro_rules! reduce_store {
-                ($acc:expr, $in_ptr:expr, $mr:expr, $nr:expr) => {{
-                    let mut sum = _mm512_reduce_add_ps($acc);
-                    let w_row = weight.add((col + $nr) * k);
-                    for r in k_tail_start..k {
-                        sum += bf16_to_f32(*$in_ptr.add(r))
-                            * bf16_to_f32(*w_row.add(r));
+                    // Software prefetch: load future K-chunks into L1
+                    if c + pf_dist < k_chunks {
+                        let pf_off = (c + pf_dist) * 32;
+                        _mm_prefetch(w0.add(pf_off) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(w1.add(pf_off) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(w2.add(pf_off) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(w3.add(pf_off) as *const i8, _MM_HINT_T0);
                     }
-                    *out.add((row + $mr) * n + col + $nr) = f32_to_bf16(sum);
-                }};
-            }
-            reduce_store!(acc00, in0, 0, 0);
-            reduce_store!(acc01, in0, 0, 1);
-            reduce_store!(acc02, in0, 0, 2);
-            reduce_store!(acc03, in0, 0, 3);
-            reduce_store!(acc10, in1, 1, 0);
-            reduce_store!(acc11, in1, 1, 1);
-            reduce_store!(acc12, in1, 1, 2);
-            reduce_store!(acc13, in1, 1, 3);
-            reduce_store!(acc20, in2, 2, 0);
-            reduce_store!(acc21, in2, 2, 1);
-            reduce_store!(acc22, in2, 2, 2);
-            reduce_store!(acc23, in2, 2, 3);
-            reduce_store!(acc30, in3, 3, 0);
-            reduce_store!(acc31, in3, 3, 1);
-            reduce_store!(acc32, in3, 3, 2);
-            reduce_store!(acc33, in3, 3, 3);
-            row += 4;
-        }
 
-        // Remaining M rows (< 4): 1 row × NR=4 columns
-        while row < m {
-            let in_row = input.add(row * k);
-            let mut a0 = _mm512_setzero_ps();
-            let mut a1 = _mm512_setzero_ps();
-            let mut a2 = _mm512_setzero_ps();
-            let mut a3 = _mm512_setzero_ps();
+                    // Load 4 input rows (from L1 — input is small)
+                    let a0 = _mm512_loadu_si512(in0.add(off) as *const _).as_bf16();
+                    let a1 = _mm512_loadu_si512(in1.add(off) as *const _).as_bf16();
+                    let a2 = _mm512_loadu_si512(in2.add(off) as *const _).as_bf16();
+                    let a3 = _mm512_loadu_si512(in3.add(off) as *const _).as_bf16();
 
-            let w0 = weight.add(col * k);
-            let w1 = weight.add((col + 1) * k);
-            let w2 = weight.add((col + 2) * k);
-            let w3 = weight.add((col + 3) * k);
+                    // Load NR=4 weight columns (from DRAM — 4 independent streams)
+                    let wv0 = _mm512_loadu_si512(w0.add(off) as *const _).as_bf16();
+                    let wv1 = _mm512_loadu_si512(w1.add(off) as *const _).as_bf16();
+                    let wv2 = _mm512_loadu_si512(w2.add(off) as *const _).as_bf16();
+                    let wv3 = _mm512_loadu_si512(w3.add(off) as *const _).as_bf16();
 
-            for c in 0..k_chunks {
-                let off = c * 32;
+                    // 16 dpbf16ps: each input reused NR times, each weight reused MR times
+                    acc00 = _mm512_dpbf16_ps(acc00, a0, wv0);
+                    acc01 = _mm512_dpbf16_ps(acc01, a0, wv1);
+                    acc02 = _mm512_dpbf16_ps(acc02, a0, wv2);
+                    acc03 = _mm512_dpbf16_ps(acc03, a0, wv3);
 
-                if c + pf_dist < k_chunks {
-                    let pf_off = (c + pf_dist) * 32;
-                    _mm_prefetch(w0.add(pf_off) as *const i8, _MM_HINT_T0);
-                    _mm_prefetch(w1.add(pf_off) as *const i8, _MM_HINT_T0);
-                    _mm_prefetch(w2.add(pf_off) as *const i8, _MM_HINT_T0);
-                    _mm_prefetch(w3.add(pf_off) as *const i8, _MM_HINT_T0);
+                    acc10 = _mm512_dpbf16_ps(acc10, a1, wv0);
+                    acc11 = _mm512_dpbf16_ps(acc11, a1, wv1);
+                    acc12 = _mm512_dpbf16_ps(acc12, a1, wv2);
+                    acc13 = _mm512_dpbf16_ps(acc13, a1, wv3);
+
+                    acc20 = _mm512_dpbf16_ps(acc20, a2, wv0);
+                    acc21 = _mm512_dpbf16_ps(acc21, a2, wv1);
+                    acc22 = _mm512_dpbf16_ps(acc22, a2, wv2);
+                    acc23 = _mm512_dpbf16_ps(acc23, a2, wv3);
+
+                    acc30 = _mm512_dpbf16_ps(acc30, a3, wv0);
+                    acc31 = _mm512_dpbf16_ps(acc31, a3, wv1);
+                    acc32 = _mm512_dpbf16_ps(acc32, a3, wv2);
+                    acc33 = _mm512_dpbf16_ps(acc33, a3, wv3);
                 }
 
-                let iv = _mm512_loadu_si512(in_row.add(off) as *const _).as_bf16();
-                let wv0 = _mm512_loadu_si512(w0.add(off) as *const _).as_bf16();
-                let wv1 = _mm512_loadu_si512(w1.add(off) as *const _).as_bf16();
-                let wv2 = _mm512_loadu_si512(w2.add(off) as *const _).as_bf16();
-                let wv3 = _mm512_loadu_si512(w3.add(off) as *const _).as_bf16();
-
-                a0 = _mm512_dpbf16_ps(a0, iv, wv0);
-                a1 = _mm512_dpbf16_ps(a1, iv, wv1);
-                a2 = _mm512_dpbf16_ps(a2, iv, wv2);
-                a3 = _mm512_dpbf16_ps(a3, iv, wv3);
+                // Reduce + scalar remainder + store
+                let k_tail_start = k_chunks * 32;
+                macro_rules! reduce_store {
+                    ($acc:expr, $in_ptr:expr, $mr:expr, $nr:expr) => {{
+                        let mut sum = _mm512_reduce_add_ps($acc);
+                        let w_row = weight.add((col + $nr) * k);
+                        for r in k_tail_start..k {
+                            sum += bf16_to_f32(*$in_ptr.add(r)) * bf16_to_f32(*w_row.add(r));
+                        }
+                        *out.add((row + $mr) * n + col + $nr) = f32_to_bf16(sum);
+                    }};
+                }
+                reduce_store!(acc00, in0, 0, 0);
+                reduce_store!(acc01, in0, 0, 1);
+                reduce_store!(acc02, in0, 0, 2);
+                reduce_store!(acc03, in0, 0, 3);
+                reduce_store!(acc10, in1, 1, 0);
+                reduce_store!(acc11, in1, 1, 1);
+                reduce_store!(acc12, in1, 1, 2);
+                reduce_store!(acc13, in1, 1, 3);
+                reduce_store!(acc20, in2, 2, 0);
+                reduce_store!(acc21, in2, 2, 1);
+                reduce_store!(acc22, in2, 2, 2);
+                reduce_store!(acc23, in2, 2, 3);
+                reduce_store!(acc30, in3, 3, 0);
+                reduce_store!(acc31, in3, 3, 1);
+                reduce_store!(acc32, in3, 3, 2);
+                reduce_store!(acc33, in3, 3, 3);
+                row += 4;
             }
 
-            let k_tail_start = k_chunks * 32;
-            macro_rules! reduce_store_1 {
-                ($acc:expr, $nr:expr) => {{
-                    let mut sum = _mm512_reduce_add_ps($acc);
-                    let w_row = weight.add((col + $nr) * k);
-                    for r in k_tail_start..k {
-                        sum += bf16_to_f32(*in_row.add(r))
-                            * bf16_to_f32(*w_row.add(r));
+            // Remaining M rows (< 4): 1 row × NR=4 columns
+            while row < m {
+                let in_row = input.add(row * k);
+                let mut a0 = _mm512_setzero_ps();
+                let mut a1 = _mm512_setzero_ps();
+                let mut a2 = _mm512_setzero_ps();
+                let mut a3 = _mm512_setzero_ps();
+
+                let w0 = weight.add(col * k);
+                let w1 = weight.add((col + 1) * k);
+                let w2 = weight.add((col + 2) * k);
+                let w3 = weight.add((col + 3) * k);
+
+                for c in 0..k_chunks {
+                    let off = c * 32;
+
+                    if c + pf_dist < k_chunks {
+                        let pf_off = (c + pf_dist) * 32;
+                        _mm_prefetch(w0.add(pf_off) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(w1.add(pf_off) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(w2.add(pf_off) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(w3.add(pf_off) as *const i8, _MM_HINT_T0);
                     }
-                    *out.add(row * n + col + $nr) = f32_to_bf16(sum);
-                }};
-            }
-            reduce_store_1!(a0, 0);
-            reduce_store_1!(a1, 1);
-            reduce_store_1!(a2, 2);
-            reduce_store_1!(a3, 3);
-            row += 1;
-        }
-        col += NR;
-    }
 
-    // ── Remaining N columns (< NR) — single-column path ───────────────
-    while col < n_end {
-        let w_row = weight.add(col * k);
-        let mut row = 0;
-        while row + 4 <= m {
-            let mut acc0 = _mm512_setzero_ps();
-            let mut acc1 = _mm512_setzero_ps();
-            let mut acc2 = _mm512_setzero_ps();
-            let mut acc3 = _mm512_setzero_ps();
+                    let iv = _mm512_loadu_si512(in_row.add(off) as *const _).as_bf16();
+                    let wv0 = _mm512_loadu_si512(w0.add(off) as *const _).as_bf16();
+                    let wv1 = _mm512_loadu_si512(w1.add(off) as *const _).as_bf16();
+                    let wv2 = _mm512_loadu_si512(w2.add(off) as *const _).as_bf16();
+                    let wv3 = _mm512_loadu_si512(w3.add(off) as *const _).as_bf16();
 
-            let in0 = input.add(row * k);
-            let in1 = input.add((row + 1) * k);
-            let in2 = input.add((row + 2) * k);
-            let in3 = input.add((row + 3) * k);
-
-            for c in 0..k_chunks {
-                let off = c * 32;
-                if c + pf_dist < k_chunks {
-                    _mm_prefetch(w_row.add((c + pf_dist) * 32) as *const i8, _MM_HINT_T0);
+                    a0 = _mm512_dpbf16_ps(a0, iv, wv0);
+                    a1 = _mm512_dpbf16_ps(a1, iv, wv1);
+                    a2 = _mm512_dpbf16_ps(a2, iv, wv2);
+                    a3 = _mm512_dpbf16_ps(a3, iv, wv3);
                 }
-                let wv = _mm512_loadu_si512(w_row.add(off) as *const _).as_bf16();
-                acc0 = _mm512_dpbf16_ps(acc0, _mm512_loadu_si512(in0.add(off) as *const _).as_bf16(), wv);
-                acc1 = _mm512_dpbf16_ps(acc1, _mm512_loadu_si512(in1.add(off) as *const _).as_bf16(), wv);
-                acc2 = _mm512_dpbf16_ps(acc2, _mm512_loadu_si512(in2.add(off) as *const _).as_bf16(), wv);
-                acc3 = _mm512_dpbf16_ps(acc3, _mm512_loadu_si512(in3.add(off) as *const _).as_bf16(), wv);
-            }
 
-            let k_tail_start = k_chunks * 32;
-            let mut s0 = _mm512_reduce_add_ps(acc0);
-            let mut s1 = _mm512_reduce_add_ps(acc1);
-            let mut s2 = _mm512_reduce_add_ps(acc2);
-            let mut s3 = _mm512_reduce_add_ps(acc3);
-            for r in k_tail_start..k {
-                let wf = bf16_to_f32(*w_row.add(r));
-                s0 += bf16_to_f32(*in0.add(r)) * wf;
-                s1 += bf16_to_f32(*in1.add(r)) * wf;
-                s2 += bf16_to_f32(*in2.add(r)) * wf;
-                s3 += bf16_to_f32(*in3.add(r)) * wf;
-            }
-            *out.add(row * n + col) = f32_to_bf16(s0);
-            *out.add((row + 1) * n + col) = f32_to_bf16(s1);
-            *out.add((row + 2) * n + col) = f32_to_bf16(s2);
-            *out.add((row + 3) * n + col) = f32_to_bf16(s3);
-            row += 4;
-        }
-
-        while row < m {
-            let in_row = input.add(row * k);
-            let mut acc = _mm512_setzero_ps();
-            for c in 0..k_chunks {
-                let off = c * 32;
-                if c + pf_dist < k_chunks {
-                    _mm_prefetch(w_row.add((c + pf_dist) * 32) as *const i8, _MM_HINT_T0);
+                let k_tail_start = k_chunks * 32;
+                macro_rules! reduce_store_1 {
+                    ($acc:expr, $nr:expr) => {{
+                        let mut sum = _mm512_reduce_add_ps($acc);
+                        let w_row = weight.add((col + $nr) * k);
+                        for r in k_tail_start..k {
+                            sum += bf16_to_f32(*in_row.add(r)) * bf16_to_f32(*w_row.add(r));
+                        }
+                        *out.add(row * n + col + $nr) = f32_to_bf16(sum);
+                    }};
                 }
-                let wv = _mm512_loadu_si512(w_row.add(off) as *const _);
-                let av = _mm512_loadu_si512(in_row.add(off) as *const _);
-                acc = _mm512_dpbf16_ps(acc, av.as_bf16(), wv.as_bf16());
+                reduce_store_1!(a0, 0);
+                reduce_store_1!(a1, 1);
+                reduce_store_1!(a2, 2);
+                reduce_store_1!(a3, 3);
+                row += 1;
             }
-            let mut sum = _mm512_reduce_add_ps(acc);
-            for r in (k_chunks * 32)..k {
-                sum += bf16_to_f32(*in_row.add(r)) * bf16_to_f32(*w_row.add(r));
-            }
-            *out.add(row * n + col) = f32_to_bf16(sum);
-            row += 1;
+            col += NR;
         }
-        col += 1;
-    }
+
+        // ── Remaining N columns (< NR) — single-column path ───────────────
+        while col < n_end {
+            let w_row = weight.add(col * k);
+            let mut row = 0;
+            while row + 4 <= m {
+                let mut acc0 = _mm512_setzero_ps();
+                let mut acc1 = _mm512_setzero_ps();
+                let mut acc2 = _mm512_setzero_ps();
+                let mut acc3 = _mm512_setzero_ps();
+
+                let in0 = input.add(row * k);
+                let in1 = input.add((row + 1) * k);
+                let in2 = input.add((row + 2) * k);
+                let in3 = input.add((row + 3) * k);
+
+                for c in 0..k_chunks {
+                    let off = c * 32;
+                    if c + pf_dist < k_chunks {
+                        _mm_prefetch(w_row.add((c + pf_dist) * 32) as *const i8, _MM_HINT_T0);
+                    }
+                    let wv = _mm512_loadu_si512(w_row.add(off) as *const _).as_bf16();
+                    acc0 = _mm512_dpbf16_ps(
+                        acc0,
+                        _mm512_loadu_si512(in0.add(off) as *const _).as_bf16(),
+                        wv,
+                    );
+                    acc1 = _mm512_dpbf16_ps(
+                        acc1,
+                        _mm512_loadu_si512(in1.add(off) as *const _).as_bf16(),
+                        wv,
+                    );
+                    acc2 = _mm512_dpbf16_ps(
+                        acc2,
+                        _mm512_loadu_si512(in2.add(off) as *const _).as_bf16(),
+                        wv,
+                    );
+                    acc3 = _mm512_dpbf16_ps(
+                        acc3,
+                        _mm512_loadu_si512(in3.add(off) as *const _).as_bf16(),
+                        wv,
+                    );
+                }
+
+                let k_tail_start = k_chunks * 32;
+                let mut s0 = _mm512_reduce_add_ps(acc0);
+                let mut s1 = _mm512_reduce_add_ps(acc1);
+                let mut s2 = _mm512_reduce_add_ps(acc2);
+                let mut s3 = _mm512_reduce_add_ps(acc3);
+                for r in k_tail_start..k {
+                    let wf = bf16_to_f32(*w_row.add(r));
+                    s0 += bf16_to_f32(*in0.add(r)) * wf;
+                    s1 += bf16_to_f32(*in1.add(r)) * wf;
+                    s2 += bf16_to_f32(*in2.add(r)) * wf;
+                    s3 += bf16_to_f32(*in3.add(r)) * wf;
+                }
+                *out.add(row * n + col) = f32_to_bf16(s0);
+                *out.add((row + 1) * n + col) = f32_to_bf16(s1);
+                *out.add((row + 2) * n + col) = f32_to_bf16(s2);
+                *out.add((row + 3) * n + col) = f32_to_bf16(s3);
+                row += 4;
+            }
+
+            while row < m {
+                let in_row = input.add(row * k);
+                let mut acc = _mm512_setzero_ps();
+                for c in 0..k_chunks {
+                    let off = c * 32;
+                    if c + pf_dist < k_chunks {
+                        _mm_prefetch(w_row.add((c + pf_dist) * 32) as *const i8, _MM_HINT_T0);
+                    }
+                    let wv = _mm512_loadu_si512(w_row.add(off) as *const _);
+                    let av = _mm512_loadu_si512(in_row.add(off) as *const _);
+                    acc = _mm512_dpbf16_ps(acc, av.as_bf16(), wv.as_bf16());
+                }
+                let mut sum = _mm512_reduce_add_ps(acc);
+                for r in (k_chunks * 32)..k {
+                    sum += bf16_to_f32(*in_row.add(r)) * bf16_to_f32(*w_row.add(r));
+                }
+                *out.add(row * n + col) = f32_to_bf16(sum);
+                row += 1;
+            }
+            col += 1;
+        }
     } // unsafe
 }
 
 /// Scalar fallback for non-AVX512BF16 CPUs.
-fn bf16_gemm_scalar(
-    out: &mut [u16],
-    input: &[u16],
-    weight: &[u16],
-    m: usize,
-    k: usize,
-    n: usize,
-) {
+fn bf16_gemm_scalar(out: &mut [u16], input: &[u16], weight: &[u16], m: usize, k: usize, n: usize) {
     for row in 0..m {
         for col in 0..n {
             let mut sum: f32 = 0.0;

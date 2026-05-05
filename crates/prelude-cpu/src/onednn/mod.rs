@@ -19,14 +19,29 @@ pub mod ops;
 
 // Re-export key public items so callers can use `crate::onednn::init`, etc.
 pub use ops::{
-    brgemm_available, brgemm_fused_silu_mul, brgemm_fused_silu_mul_raw, brgemm_gemm_forward_pub,
-    brgemm_gemm_raw, bind_threads, init, set_num_threads, BrgemmPackedWeight, OnednnF32PackedWeight,
+    BRGEMM_POSTOP_BIAS,
+    BRGEMM_POSTOP_GELU_ERF,
+    BRGEMM_POSTOP_GELU_TANH,
+    BRGEMM_POSTOP_RELU,
+    BrgemmF8PackedWeight,
+    BrgemmPackedWeight,
+    BrgemmS8PackedWeight,
+    OnednnF32PackedWeight,
     OnednnLinear,
-    // INT8 W8A8
-    brgemm_s8_available, brgemm_quantize_bf16_s8, brgemm_s8_gemm_forward, BrgemmS8PackedWeight,
+    bind_threads,
+    brgemm_available,
     // FP8 E4M3
-    brgemm_f8_available, BrgemmF8PackedWeight,
+    brgemm_f8_available,
+    brgemm_fused_silu_mul,
+    brgemm_fused_silu_mul_raw,
     // Post-ops
-    brgemm_gemm_forward_postops, BRGEMM_POSTOP_BIAS, BRGEMM_POSTOP_GELU_TANH,
-    BRGEMM_POSTOP_GELU_ERF, BRGEMM_POSTOP_RELU,
+    brgemm_gemm_forward_postops,
+    brgemm_gemm_forward_pub,
+    brgemm_gemm_raw,
+    brgemm_quantize_bf16_s8,
+    // INT8 W8A8
+    brgemm_s8_available,
+    brgemm_s8_gemm_forward,
+    init,
+    set_num_threads,
 };

@@ -5,10 +5,7 @@ use crate::models::commons::PagedKvBatchContext;
 impl Engine {
     /// Batched decode step: N sequences, each with Q=1 (one new token),
     /// different context lengths. Returns logits (N, vocab_size).
-    pub fn batch_decode_paged(
-        &self,
-        seqs: &[BatchDecodeSeq],
-    ) -> Result<Tensor, EngineError> {
+    pub fn batch_decode_paged(&self, seqs: &[BatchDecodeSeq]) -> Result<Tensor, EngineError> {
         // Set thread-local ops for operator overload dispatch.
         let _ops_guard = crate::ops::OpsGuard::new(self.executor.ops);
         let pool = self.cache.paged_pool.as_ref().ok_or_else(|| {
@@ -53,7 +50,11 @@ impl Engine {
         let slots: Vec<i64> = seqs
             .iter()
             .map(|s| {
-                crate::cache::block_manager::BlockManager::slot(s.block_table, s.position, pool.block_size)
+                crate::cache::block_manager::BlockManager::slot(
+                    s.block_table,
+                    s.position,
+                    pool.block_size,
+                )
             })
             .collect();
         let slot_mapping_t =
@@ -211,8 +212,11 @@ impl Engine {
                 let pos_ids = Tensor::from_vec(vec![pos as u32], (1,), &self.executor.device)
                     .map_err(tensor_err)?;
 
-                let slot =
-                    crate::cache::block_manager::BlockManager::slot(&block_table, pos, pool.block_size);
+                let slot = crate::cache::block_manager::BlockManager::slot(
+                    &block_table,
+                    pos,
+                    pool.block_size,
+                );
                 let slot_mapping =
                     Tensor::new(&[slot], &self.executor.device).map_err(tensor_err)?;
 

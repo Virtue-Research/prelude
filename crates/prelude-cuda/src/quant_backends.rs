@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use prelude_core::models::commons::linear::{LinearBackend, QuantFormat, QuantFormatEntry};
 use prelude_core::tensor::quantized::{GgmlDType, QTensor};
-use prelude_core::tensor::{bail, DType, Module, Result, Tensor};
+use prelude_core::tensor::{DType, Module, Result, Tensor, bail};
 
 use crate::device::{self, CuResultExt};
 
@@ -22,11 +22,11 @@ fn to_ggml_type(dtype: GgmlDType) -> Option<quant_gemm::GgmlType> {
         GgmlDType::Q5_0 => GgmlType::Q5_0,
         GgmlDType::Q5_1 => GgmlType::Q5_1,
         GgmlDType::Q8_0 => GgmlType::Q8_0,
-        GgmlDType::Q2K  => GgmlType::Q2K,
-        GgmlDType::Q3K  => GgmlType::Q3K,
-        GgmlDType::Q4K  => GgmlType::Q4K,
-        GgmlDType::Q5K  => GgmlType::Q5K,
-        GgmlDType::Q6K  => GgmlType::Q6K,
+        GgmlDType::Q2K => GgmlType::Q2K,
+        GgmlDType::Q3K => GgmlType::Q3K,
+        GgmlDType::Q4K => GgmlType::Q4K,
+        GgmlDType::Q5K => GgmlType::Q5K,
+        GgmlDType::Q6K => GgmlType::Q6K,
         _ => return None,
     })
 }
@@ -52,7 +52,10 @@ impl Module for GpuQuantLinear {
         let m: usize = x_dims[..x_dims.len() - 1].iter().product();
         let x_k = *x_dims.last().unwrap();
         if x_k != self.k {
-            bail!("GPU quantized matmul: x inner dim {x_k} != weight dim {}", self.k);
+            bail!(
+                "GPU quantized matmul: x inner dim {x_k} != weight dim {}",
+                self.k
+            );
         }
 
         let x_flat = if x_dims.len() > 2 {
@@ -62,8 +65,11 @@ impl Module for GpuQuantLinear {
         };
 
         let out = crate::ops::tiled_mmq::tiled_mmq(
-            &self.gpu_weights, &x_flat,
-            m, self.n, self.k,
+            &self.gpu_weights,
+            &x_flat,
+            m,
+            self.n,
+            self.k,
             self.ggml_type,
         )?;
 
@@ -79,10 +85,18 @@ impl Module for GpuQuantLinear {
 }
 
 impl LinearBackend for GpuQuantLinear {
-    fn name(&self) -> &str { "gpu/quant-gemm" }
-    fn is_quantized(&self) -> bool { true }
-    fn clone_box(&self) -> Box<dyn LinearBackend> { Box::new(self.clone()) }
-    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str {
+        "gpu/quant-gemm"
+    }
+    fn is_quantized(&self) -> bool {
+        true
+    }
+    fn clone_box(&self) -> Box<dyn LinearBackend> {
+        Box::new(self.clone())
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ── QuantFormat registration ─────────────────────────────────────────
@@ -90,17 +104,21 @@ impl LinearBackend for GpuQuantLinear {
 struct GpuQuantFormat;
 
 impl QuantFormat for GpuQuantFormat {
-    fn name(&self) -> &str { "gpu/quant-gemm" }
+    fn name(&self) -> &str {
+        "gpu/quant-gemm"
+    }
 
     fn can_handle(&self, dtype: GgmlDType) -> bool {
         to_ggml_type(dtype).is_some()
     }
 
     fn load(&self, qtensor: Arc<QTensor>) -> Result<Box<dyn LinearBackend>> {
-        let ggml_type = to_ggml_type(qtensor.dtype())
-            .ok_or_else(|| prelude_core::tensor::Error::Msg(
-                format!("GPU quant: unsupported dtype {:?}", qtensor.dtype())
-            ))?;
+        let ggml_type = to_ggml_type(qtensor.dtype()).ok_or_else(|| {
+            prelude_core::tensor::Error::Msg(format!(
+                "GPU quant: unsupported dtype {:?}",
+                qtensor.dtype()
+            ))
+        })?;
 
         let shape = qtensor.shape();
         let dims = shape.dims();
@@ -109,10 +127,11 @@ impl QuantFormat for GpuQuantFormat {
         // Upload raw quantized bytes to GPU
         let cuda_dev = prelude_core::tensor::Device::new_cuda(0)
             .map_err(|e| prelude_core::tensor::Error::Msg(format!("CUDA device: {e}")))?;
-        let dev = cuda_dev.as_cuda_device()
+        let dev = cuda_dev
+            .as_cuda_device()
             .map_err(|e| prelude_core::tensor::Error::Msg(format!("as_cuda_device: {e}")))?;
         let stream = dev.cuda_stream();
-        let gpu_data = unsafe { stream.clone_htod(qtensor.data()) }.ce()?;
+        let gpu_data = stream.clone_htod(qtensor.data()).ce()?;
         let gpu_weights = device::tensor_from_cuda(gpu_data, dev, (qtensor.data().len(),));
 
         Ok(Box::new(GpuQuantLinear {

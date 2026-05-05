@@ -1,7 +1,7 @@
 use super::*;
 use crate::models::registry::{
-    find_arch_spec_by_model_type, resolve_architecture_name, unsupported_task_error, ArchSpec,
-    ParsedModelConfig,
+    ArchSpec, ParsedModelConfig, find_arch_spec_by_model_type, resolve_architecture_name,
+    unsupported_task_error,
 };
 use tracing::info;
 
@@ -31,7 +31,11 @@ pub(crate) fn parse_model_config_for_source(
     task_override: TaskOverride,
     has_sentence_transformers_config: bool,
 ) -> Result<ResolvedModelConfig, EngineError> {
-    parse_model_config(content.to_string(), task_override, has_sentence_transformers_config)
+    parse_model_config(
+        content.to_string(),
+        task_override,
+        has_sentence_transformers_config,
+    )
 }
 
 fn parse_model_config(
@@ -152,7 +156,7 @@ fn extract_eos_token_ids(raw: &serde_json::Value, task: TaskKind) -> Result<Vec<
         _ => {
             return Err(EngineError::InvalidRequest(
                 "generation model config has invalid `eos_token_id` type".into(),
-            ))
+            ));
         }
     };
 

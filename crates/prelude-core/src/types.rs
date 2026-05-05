@@ -363,7 +363,6 @@ pub enum PromptInput {
     TokenIds(Vec<u32>),
 }
 
-
 #[derive(Debug, Clone, Default)]
 pub struct StopConfig {
     pub strings: Vec<String>,
@@ -385,7 +384,6 @@ pub struct GenerateRequest {
     /// If Some(k), return top-k log probabilities per prompt token (vLLM extension).
     pub prompt_logprobs: Option<u32>,
 }
-
 
 #[derive(Debug, Clone)]
 pub struct DecodeMetrics {
@@ -426,9 +424,7 @@ pub enum StreamEvent {
         metrics: DecodeMetrics,
     },
     /// Generation failed with an error.
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
 // ── Classification API (Virtue Guardrail) ──
@@ -693,7 +689,9 @@ pub struct EmbeddingUsage {
 }
 
 fn validate_single_choice(n: Option<u32>) -> Result<(), String> {
-    if let Some(value) = n && value != 1 {
+    if let Some(value) = n
+        && value != 1
+    {
         return Err(format!("n={value} is not supported; only n=1 is supported"));
     }
     Ok(())

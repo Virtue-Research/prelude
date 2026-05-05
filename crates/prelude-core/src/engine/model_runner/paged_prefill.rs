@@ -118,8 +118,7 @@ impl Engine {
                 .to_dtype(DType::U32)
                 .map_err(tensor_err)?
         } else {
-            Tensor::zeros((batch_size, 0), DType::U32, &self.executor.device)
-                .map_err(tensor_err)?
+            Tensor::zeros((batch_size, 0), DType::U32, &self.executor.device).map_err(tensor_err)?
         };
 
         // Build slot_mapping for new tokens only (suffix tokens).
@@ -140,29 +139,35 @@ impl Engine {
         // Allocate DeltaNet pool slots if this is a hybrid model.
         // For chunked prefill continuation, the slot was already allocated in a previous chunk
         // and is tracked in ArSequenceState. Only allocate for new requests (no existing blocks).
-        let deltanet_slots: Option<Vec<u32>> = if let Some(ref dn_pool_mutex) =
-            self.cache.deltanet_pool
-        {
-            let mut dn_pool = dn_pool_mutex
-                .lock()
-                .map_err(|e| EngineError::Internal(format!("deltanet pool lock: {e}")))?;
-            let mut slots = Vec::with_capacity(batch_size);
-            for i in 0..batch_size {
-                if has_chunked && !prefill_plan.existing_block_tables.get(i).map_or(true, |bt| bt.is_empty()) {
-                    // Continuation chunk — slot already allocated, use placeholder.
-                    // The actual slot is tracked in ArSequenceState.deltanet_slot.
-                    slots.push(u32::MAX);
-                } else {
-                    let slot = dn_pool.allocate().ok_or_else(|| {
-                        EngineError::Internal("batch_prefill_paged: no free DeltaNet pool slots".into())
-                    })?;
-                    slots.push(slot);
+        let deltanet_slots: Option<Vec<u32>> =
+            if let Some(ref dn_pool_mutex) = self.cache.deltanet_pool {
+                let mut dn_pool = dn_pool_mutex
+                    .lock()
+                    .map_err(|e| EngineError::Internal(format!("deltanet pool lock: {e}")))?;
+                let mut slots = Vec::with_capacity(batch_size);
+                for i in 0..batch_size {
+                    if has_chunked
+                        && !prefill_plan
+                            .existing_block_tables
+                            .get(i)
+                            .map_or(true, |bt| bt.is_empty())
+                    {
+                        // Continuation chunk — slot already allocated, use placeholder.
+                        // The actual slot is tracked in ArSequenceState.deltanet_slot.
+                        slots.push(u32::MAX);
+                    } else {
+                        let slot = dn_pool.allocate().ok_or_else(|| {
+                            EngineError::Internal(
+                                "batch_prefill_paged: no free DeltaNet pool slots".into(),
+                            )
+                        })?;
+                        slots.push(slot);
+                    }
                 }
-            }
-            Some(slots)
-        } else {
-            None
-        };
+                Some(slots)
+            } else {
+                None
+            };
 
         // Forward
         let prefill_start = Instant::now();
@@ -194,31 +199,46 @@ impl Engine {
             deltanet_slots: deltanet_slots.as_deref(),
             deltanet_slots_gpu: None,
         };
-        let needs_prompt_logprobs = items.iter().any(|item| item.request.prompt_logprobs.is_some());
+        let needs_prompt_logprobs = items
+            .iter()
+            .any(|item| item.request.prompt_logprobs.is_some());
 
         self.executor.ops.begin_forward();
 
         // When prompt logprobs needed: get hidden states, apply compute_logits in chunks.
         // This avoids materializing the full (total_tokens, vocab_size) logits tensor.
         let (logits, prompt_logprobs_cpu) = if needs_prompt_logprobs {
-            let lm = model.as_logits_model_mut()
-                .ok_or_else(|| EngineError::InvalidRequest(
-                    "prompt_logprobs requested but model doesn't support LogitsSplitModel".into()
-                ))?;
-            let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(tensor_err)?;
+            let lm = model.as_logits_model_mut().ok_or_else(|| {
+                EngineError::InvalidRequest(
+                    "prompt_logprobs requested but model doesn't support LogitsSplitModel".into(),
+                )
+            })?;
+            let hidden = lm
+                .forward_hidden_states(&packed_input, &mut ctx)
+                .map_err(tensor_err)?;
             let last_hidden = crate::models::commons::last_token_select(&hidden, &q_seq_lens)
                 .map_err(tensor_err)?;
-            let last_logits = lm.compute_logits(&last_hidden).map_err(tensor_err)?
-                .unsqueeze(1).map_err(tensor_err)?;
+            let last_logits = lm
+                .compute_logits(&last_hidden)
+                .map_err(tensor_err)?
+                .unsqueeze(1)
+                .map_err(tensor_err)?;
 
             // Chunked prompt logprobs extraction while model lock is still held.
             let logprobs_cpu = super::generate::extract_prompt_logprobs_from_hidden_offset(
-                &hidden, lm, items, &q_seq_lens, global_cached_len,
+                &hidden,
+                lm,
+                items,
+                &q_seq_lens,
+                global_cached_len,
             )?;
             drop(hidden);
             (last_logits, Some(logprobs_cpu))
         } else {
-            (model.forward(&packed_input, &mut ctx).map_err(tensor_err)?, None)
+            (
+                model.forward(&packed_input, &mut ctx).map_err(tensor_err)?,
+                None,
+            )
         };
         self.executor.ops.end_forward();
         drop(dn_pool_guard);
@@ -231,35 +251,39 @@ impl Engine {
         let mut results: Vec<BatchPrefillResult> = Vec::with_capacity(batch_size);
 
         // Build prompt logprobs per item from pre-extracted CPU data.
-        let prompt_logprobs_per_item: Vec<Option<Vec<TokenLogprobInfo>>> = if let Some(ref logprobs_cpu) = prompt_logprobs_cpu {
-            let mut per_item = Vec::with_capacity(batch_size);
-            let mut offset = 0usize;
-            for (i, item) in items.iter().enumerate() {
-                let q_len = q_seq_lens[i];
-                let cached = per_request_cached[i];
-                if item.request.prompt_logprobs.is_some() {
-                    let prompt_tokens = &item.prompt_tokens[cached..];
-                    let plps: Vec<TokenLogprobInfo> = (0..q_len.saturating_sub(1))
-                        .map(|pos| {
-                            let next_token = prompt_tokens[pos + 1];
-                            TokenLogprobInfo {
-                                token: self.tokenizer.decode(&[next_token], false).unwrap_or_default(),
-                                token_id: next_token,
-                                logprob: logprobs_cpu[offset + pos],
-                                top_logprobs: Vec::new(),
-                            }
-                        })
-                        .collect();
-                    per_item.push(Some(plps));
-                } else {
-                    per_item.push(None);
+        let prompt_logprobs_per_item: Vec<Option<Vec<TokenLogprobInfo>>> =
+            if let Some(ref logprobs_cpu) = prompt_logprobs_cpu {
+                let mut per_item = Vec::with_capacity(batch_size);
+                let mut offset = 0usize;
+                for (i, item) in items.iter().enumerate() {
+                    let q_len = q_seq_lens[i];
+                    let cached = per_request_cached[i];
+                    if item.request.prompt_logprobs.is_some() {
+                        let prompt_tokens = &item.prompt_tokens[cached..];
+                        let plps: Vec<TokenLogprobInfo> = (0..q_len.saturating_sub(1))
+                            .map(|pos| {
+                                let next_token = prompt_tokens[pos + 1];
+                                TokenLogprobInfo {
+                                    token: self
+                                        .tokenizer
+                                        .decode(&[next_token], false)
+                                        .unwrap_or_default(),
+                                    token_id: next_token,
+                                    logprob: logprobs_cpu[offset + pos],
+                                    top_logprobs: Vec::new(),
+                                }
+                            })
+                            .collect();
+                        per_item.push(Some(plps));
+                    } else {
+                        per_item.push(None);
+                    }
+                    offset += q_len;
                 }
-                offset += q_len;
-            }
-            per_item
-        } else {
-            vec![None; batch_size]
-        };
+                per_item
+            } else {
+                vec![None; batch_size]
+            };
 
         // Fast path: all greedy → batch GPU argmax (avoids F32 conversion + CPU transfer)
         if prefill_plan.all_greedy {
@@ -335,10 +359,7 @@ impl Engine {
         let mut block_tables = Vec::with_capacity(seq_lens.len());
         for (i, &total_tokens) in seq_lens.iter().enumerate() {
             let total_blocks_needed = total_tokens.div_ceil(block_size);
-            let existing = existing_block_tables
-                .get(i)
-                .cloned()
-                .unwrap_or_default();
+            let existing = existing_block_tables.get(i).cloned().unwrap_or_default();
             let existing_blocks = existing.len();
 
             let mut bt = existing;

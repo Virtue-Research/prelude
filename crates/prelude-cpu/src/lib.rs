@@ -28,12 +28,11 @@ pub fn register() {
 
 // ── CPU kernel modules ─────────────────────────────────────────────
 
-pub mod ops;
+pub mod attn_cpu;
+mod cpu_ops;
 #[cfg(feature = "onednn")]
 pub mod onednn;
-mod cpu_ops;
-pub mod raw_cpu;
-pub mod attn_cpu;
+pub mod ops;
 
 pub use cpu_ops::cpu_ops;
 pub mod executor;

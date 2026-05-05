@@ -155,7 +155,7 @@ pub fn init_numa_rayon_pool() -> String {
 pub(crate) fn pin_current_thread_to_core(cpu_id: usize) {
     #[cfg(target_os = "linux")]
     {
-        use nix::sched::{sched_setaffinity, CpuSet};
+        use nix::sched::{CpuSet, sched_setaffinity};
         use nix::unistd::Pid;
         let mut cpuset = CpuSet::new();
         if cpuset.set(cpu_id).is_ok() {

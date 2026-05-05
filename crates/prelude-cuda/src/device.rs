@@ -1,21 +1,18 @@
 //! CUDA device helpers and own storage types.
 //!
-//! - `CudaStorageSlice` / `CudaStorage`: typed GPU memory (used by tensor_ops_kernels)
+//! - `CudaStorageSlice` / `CudaStorage`: typed GPU memory used by kernel wrappers
 //! - `GpuDType` trait: type-safe access to typed slices
 //! - `tensor_from_cuda()`: wrap a CudaSlice into a candle Tensor
 //! - `tensor_stream()`: get CudaStream from a Tensor's device
 //! - PTX module loading and caching
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice,
-};
+use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice};
 use half::{bf16, f16};
 use prelude_core::tensor::{
-    bail, CpuStorage, DType, Device, Layout, Result, Shape,
-    Storage, Tensor,
+    CpuStorage, DType, Device, Layout, Result, Shape, Storage, Tensor, bail,
 };
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 // ── Error conversion ────────��─────────────────────────────────────
 
@@ -124,7 +121,12 @@ impl CudaStorageSlice {
 
 impl std::fmt::Debug for CudaStorageSlice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CudaStorageSlice({:?}, len={})", self.dtype(), self.len())
+        write!(
+            f,
+            "CudaStorageSlice({:?}, len={})",
+            self.dtype(),
+            self.len()
+        )
     }
 }
 
@@ -168,7 +170,10 @@ impl CudaStorage {
             DType::F64 => CudaStorageSlice::F64(stream.alloc_zeros::<f64>(n).ce()?),
             dt => bail!("CudaStorage::zeros: unsupported dtype {dt:?}"),
         };
-        Ok(Self { slice, stream: stream.clone() })
+        Ok(Self {
+            slice,
+            stream: stream.clone(),
+        })
     }
 
     /// Upload contiguous CPU data to GPU.
@@ -180,7 +185,10 @@ impl CudaStorage {
                 CudaStorageSlice::$variant(stream.clone_htod(&$data[start..start + len]).ce()?)
             }};
         }
-        assert!(layout.is_contiguous(), "from_cpu: non-contiguous layout; use tensor.contiguous() first");
+        assert!(
+            layout.is_contiguous(),
+            "from_cpu: non-contiguous layout; use tensor.contiguous() first"
+        );
         let slice = match cpu {
             CpuStorage::U8(v) => upload!(v, U8),
             CpuStorage::U32(v) => upload!(v, U32),
@@ -192,15 +200,16 @@ impl CudaStorage {
             CpuStorage::F64(v) => upload!(v, F64),
             _ => bail!("from_cpu: unsupported dtype"),
         };
-        Ok(Self { slice, stream: stream.clone() })
+        Ok(Self {
+            slice,
+            stream: stream.clone(),
+        })
     }
 
     /// Download contiguous GPU data to CPU storage.
     pub fn to_cpu(&self, _layout: &Layout) -> Result<CpuStorage> {
         macro_rules! download {
-            ($slice:expr, $variant:ident) => {{
-                CpuStorage::$variant(self.stream.clone_dtoh($slice).ce()?)
-            }};
+            ($slice:expr, $variant:ident) => {{ CpuStorage::$variant(self.stream.clone_dtoh($slice).ce()?) }};
         }
         Ok(match &self.slice {
             CudaStorageSlice::U8(s) => download!(s, U8),
@@ -225,7 +234,6 @@ impl std::fmt::Debug for CudaStorage {
         )
     }
 }
-
 
 // ── GpuDType trait ─────────���─────────────────────────────────────
 
@@ -255,7 +263,10 @@ macro_rules! impl_gpu_dtype {
             fn as_cuda_slice_mut(s: &mut CudaStorageSlice) -> Result<&mut CudaSlice<Self>> {
                 match s {
                     CudaStorageSlice::$variant(s) => Ok(s),
-                    other => bail!(concat!("expected mut ", $suffix, ", got {:?}"), other.dtype()),
+                    other => bail!(
+                        concat!("expected mut ", $suffix, ", got {:?}"),
+                        other.dtype()
+                    ),
                 }
             }
             fn wrap_cuda_slice(s: CudaSlice<Self>) -> CudaStorageSlice {
@@ -310,4 +321,3 @@ pub fn tensor_stream(t: &Tensor) -> Result<Arc<CudaStream>> {
 pub fn synchronize(device: &Device) -> Result<()> {
     device_stream(device)?.synchronize().ce()
 }
-

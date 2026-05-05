@@ -14,12 +14,10 @@ pub(super) struct AttnBuffers {
     pub(super) k_buf: Vec<u16>,
     pub(super) v_buf: Vec<u16>,
     pub(super) k_f32: Vec<f32>,
-    pub(super) v_f32: Vec<f32>,
     pub(super) s_i: Vec<f32>,
     pub(super) v_prime: Vec<f32>,
     pub(super) s_prime: Vec<f32>,
     pub(super) m_prime: Vec<f32>,
-    pub(super) q_bf16_block: Vec<u16>,
     pub(super) q_f32_block: Vec<f32>,
 }
 
@@ -29,12 +27,10 @@ impl AttnBuffers {
             k_buf: Vec::new(),
             v_buf: Vec::new(),
             k_f32: Vec::new(),
-            v_f32: Vec::new(),
             s_i: Vec::new(),
             v_prime: Vec::new(),
             s_prime: Vec::new(),
             m_prime: Vec::new(),
-            q_bf16_block: Vec::new(),
             q_f32_block: Vec::new(),
         }
     }

@@ -50,11 +50,8 @@ impl KvBuf {
                 if self.len + n > cap {
                     let new_cap = (cap * 2).max(self.len + n).next_power_of_two();
                     let shape = buf.dims();
-                    let new_buf = Tensor::zeros(
-                        (new_cap, shape[1], shape[2]),
-                        buf.dtype(),
-                        buf.device(),
-                    )?;
+                    let new_buf =
+                        Tensor::zeros((new_cap, shape[1], shape[2]), buf.dtype(), buf.device())?;
                     let existing = buf.narrow(0, 0, self.len)?;
                     new_buf.slice_set(&existing, 0, 0)?;
                     new_buf.slice_set(new_tokens, 0, self.len)?;

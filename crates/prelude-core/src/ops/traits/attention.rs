@@ -4,10 +4,15 @@
 //! Computes entirely in F32 for numerical stability, with per-head matmul
 //! to avoid CUTLASS alignment issues. Uses naive F32 GEMM for small matrices.
 
-use crate::tensor::{DType, Result, Tensor};
 use super::ops::{MaskType, VarlenParams};
+use crate::tensor::{DType, Result, Tensor};
 
-pub fn varlen_attention(q: &Tensor, k: &Tensor, v: &Tensor, params: &VarlenParams) -> Result<Tensor> {
+pub fn varlen_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    params: &VarlenParams,
+) -> Result<Tensor> {
     let cu_q: Vec<u32> = params.cu_seqlens_q.to_vec1()?;
     let cu_k: Vec<u32> = params.cu_seqlens_k.to_vec1()?;
     let batch = cu_q.len() - 1;
@@ -23,8 +28,8 @@ pub fn varlen_attention(q: &Tensor, k: &Tensor, v: &Tensor, params: &VarlenParam
     let v = v.to_dtype(DType::F32)?;
     let mut outs = Vec::with_capacity(batch);
     for b in 0..batch {
-        let (qs, qe) = (cu_q[b] as usize, cu_q[b+1] as usize);
-        let (ks, ke) = (cu_k[b] as usize, cu_k[b+1] as usize);
+        let (qs, qe) = (cu_q[b] as usize, cu_q[b + 1] as usize);
+        let (ks, ke) = (cu_k[b] as usize, cu_k[b + 1] as usize);
         let (sq, sk) = (qe - qs, ke - ks);
         let q_seq = q.narrow(0, qs, sq)?;
         let k_seq = k.narrow(0, ks, sk)?;
@@ -44,17 +49,33 @@ pub fn varlen_attention(q: &Tensor, k: &Tensor, v: &Tensor, params: &VarlenParam
         let head_refs: Vec<&Tensor> = head_outs.iter().collect();
         outs.push(Tensor::cat(&head_refs, 1)?);
     }
-    let result = if outs.len() == 1 { outs.into_iter().next().unwrap() }
-    else { let refs: Vec<&Tensor> = outs.iter().collect(); Tensor::cat(&refs, 0)? };
+    let result = if outs.len() == 1 {
+        outs.into_iter().next().unwrap()
+    } else {
+        let refs: Vec<&Tensor> = outs.iter().collect();
+        Tensor::cat(&refs, 0)?
+    };
     result.to_dtype(orig_dtype)
 }
 
-fn apply_mask_2d(scores: &Tensor, mask: &MaskType, sq: usize, sk: usize, device: &crate::tensor::Device) -> Result<Tensor> {
+fn apply_mask_2d(
+    scores: &Tensor,
+    mask: &MaskType,
+    sq: usize,
+    sk: usize,
+    device: &crate::tensor::Device,
+) -> Result<Tensor> {
     match mask {
         MaskType::Causal if sq == 1 => Ok(scores.clone()),
         MaskType::Causal => {
             let mut d = vec![f32::NEG_INFINITY; sq * sk];
-            for i in 0..sq { for j in 0..sk { if j <= i + (sk - sq) { d[i*sk+j] = 0.0; } } }
+            for i in 0..sq {
+                for j in 0..sk {
+                    if j <= i + (sk - sq) {
+                        d[i * sk + j] = 0.0;
+                    }
+                }
+            }
             let mask = Tensor::from_vec(d, (sq, sk), device)?.to_dtype(scores.dtype())?;
             scores.broadcast_add(&mask)
         }
@@ -63,10 +84,14 @@ fn apply_mask_2d(scores: &Tensor, mask: &MaskType, sq: usize, sk: usize, device:
         MaskType::SlidingWindow { left, right } => {
             let mut d = vec![f32::NEG_INFINITY; sq * sk];
             let ko = sk.saturating_sub(sq);
-            for i in 0..sq { for j in 0..sk {
-                let rel = (j as i64) - (i as i64 + ko as i64);
-                if rel >= -(*left as i64) && rel <= (*right as i64) { d[i*sk+j] = 0.0; }
-            }}
+            for i in 0..sq {
+                for j in 0..sk {
+                    let rel = (j as i64) - (i as i64 + ko as i64);
+                    if rel >= -(*left as i64) && rel <= (*right as i64) {
+                        d[i * sk + j] = 0.0;
+                    }
+                }
+            }
             let mask = Tensor::from_vec(d, (sq, sk), device)?.to_dtype(scores.dtype())?;
             scores.broadcast_add(&mask)
         }

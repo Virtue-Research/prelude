@@ -74,24 +74,36 @@ pub trait ModelForward: Send {
     // ── Capability accessors ────────────────────────────────────────
 
     /// Access hidden-states / logits splitting (for prompt logprobs).
-    fn as_logits_model(&self) -> Option<&dyn LogitsSplitModel> { None }
+    fn as_logits_model(&self) -> Option<&dyn LogitsSplitModel> {
+        None
+    }
     /// Mutable access for `forward_hidden_states` which takes `&mut self`.
-    fn as_logits_model_mut(&mut self) -> Option<&mut dyn LogitsSplitModel> { None }
+    fn as_logits_model_mut(&mut self) -> Option<&mut dyn LogitsSplitModel> {
+        None
+    }
 
     /// Access CPU KV-cache decode capability.
-    fn as_kv_cache_model(&mut self) -> Option<&mut dyn KvCacheModel> { None }
+    fn as_kv_cache_model(&mut self) -> Option<&mut dyn KvCacheModel> {
+        None
+    }
 
     /// Access classifier-specific metadata.
-    fn as_classifier(&self) -> Option<&dyn ClassifierModel> { None }
+    fn as_classifier(&self) -> Option<&dyn ClassifierModel> {
+        None
+    }
 
     /// Access embedding-specific metadata.
-    fn as_embedding(&self) -> Option<&dyn EmbeddingModel> { None }
+    fn as_embedding(&self) -> Option<&dyn EmbeddingModel> {
+        None
+    }
 
     /// KV cache sharing: per-layer mapping from shared layers to source layers.
     /// `result[i] = Some(j)` means layer `i` shares KV cache with layer `j`.
     /// `result[i] = None` means layer `i` has its own independent KV cache.
     /// Default: empty (no sharing, all layers independent).
-    fn kv_cache_sharing(&self) -> Vec<Option<usize>> { vec![] }
+    fn kv_cache_sharing(&self) -> Vec<Option<usize>> {
+        vec![]
+    }
 
     /// Direct generation: prefill + decode loop handled internally (e.g. by llama.cpp FFI).
     /// Returns (generated_token_ids, last_logits_f32). Default: not supported.

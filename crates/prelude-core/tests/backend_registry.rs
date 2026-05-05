@@ -10,14 +10,22 @@ use prelude_core::tensor::Device;
 
 struct HighPriorityOps;
 impl ops::traits::Ops for HighPriorityOps {
-    fn default_impl(&self) -> &dyn ops::traits::Ops { ops::bare_ops() }
-    fn attn_name(&self) -> &str { "high_priority" }
+    fn default_impl(&self) -> &dyn ops::traits::Ops {
+        ops::bare_ops()
+    }
+    fn attn_name(&self) -> &str {
+        "high_priority"
+    }
 }
 
 struct LowPriorityOps;
 impl ops::traits::Ops for LowPriorityOps {
-    fn default_impl(&self) -> &dyn ops::traits::Ops { ops::bare_ops() }
-    fn attn_name(&self) -> &str { "low_priority" }
+    fn default_impl(&self) -> &dyn ops::traits::Ops {
+        ops::bare_ops()
+    }
+    fn attn_name(&self) -> &str {
+        "low_priority"
+    }
 }
 
 static HIGH: HighPriorityOps = HighPriorityOps;
@@ -54,7 +62,8 @@ fn priority_probe_and_device_matching() {
     // CPU: should pick high_cpu (priority 100 > 10).
     let cpu_ops = ops::select_ops(&Device::Cpu);
     assert_eq!(
-        cpu_ops.attn_name(), "high_priority",
+        cpu_ops.attn_name(),
+        "high_priority",
         "should select highest-priority CPU backend"
     );
 
@@ -68,12 +77,17 @@ fn priority_probe_and_device_matching() {
         let cuda_dev = prelude_core::tensor::Device::new_cuda(0).expect("need GPU for this test");
         let gpu_ops = ops::select_ops(&cuda_dev);
         assert_eq!(
-            gpu_ops.attn_name(), "default",
+            gpu_ops.attn_name(),
+            "default",
             "should fall back to bare_ops when GPU probe fails"
         );
     }
 
     // Calling again should return the same cached result.
     let cpu_ops2 = ops::select_ops(&Device::Cpu);
-    assert_eq!(cpu_ops2.attn_name(), "high_priority", "cached result should be stable");
+    assert_eq!(
+        cpu_ops2.attn_name(),
+        "high_priority",
+        "cached result should be stable"
+    );
 }

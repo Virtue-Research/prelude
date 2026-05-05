@@ -260,7 +260,7 @@ pub(crate) fn try_decode(
     let cu_seqlens_gpu = Tensor::from_vec(cu_seqlens_host, (n + 1,), device)?; // I32 on device
 
     // Output buffer: [1, N, HV, V] BF16.
-    let out = unsafe { Tensor::zeros((1, n, hv, val_dim), DType::BF16, device)? };
+    let out = Tensor::zeros((1, n, hv, val_dim), DType::BF16, device)?;
 
     // Grab raw device pointers — the macro drops its RwLockReadGuard at
     // the end of the macro scope, same pattern flashinfer.rs uses. The
@@ -345,7 +345,7 @@ pub(crate) fn try_decode(
     // regular (non-`EnvStream`) param, so the TVM FFI wrapper expects it
     // as an opaque-ptr runtime arg. We also call `set_stream` so any
     // env-based lookups still work.
-    let raw_stream = unsafe { stream.cu_stream() } as *mut c_void;
+    let raw_stream = stream.cu_stream() as *mut c_void;
     reg.set_stream(dev_id, raw_stream);
     let args = [
         TVMFFIAny::dltensor(&dl_cu),

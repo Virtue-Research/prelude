@@ -22,40 +22,38 @@
 //! Each format has scalar + AVX2 implementations. The public `vec_dot_*` function
 //! auto-dispatches to the fastest available at runtime via `is_x86_feature_detected!`.
 
-pub mod types;
-pub mod q4_0;
-pub mod q4_1;
-pub mod q5_0;
-pub mod q5_1;
-pub mod q2_k;
-pub mod q3_k;
-pub mod q4_k;
-pub mod q5_k;
-pub mod q6_k;
 pub mod iq4_nl;
-pub mod quantize;
 pub mod matmul;
-pub mod weight_quantize;
 #[cfg(target_arch = "aarch64")]
 pub mod neon;
+pub mod q2_k;
+pub mod q3_k;
+pub mod q4_0;
+pub mod q4_1;
+pub mod q4_k;
+pub mod q5_0;
+pub mod q5_1;
+pub mod q5_k;
+pub mod q6_k;
+pub mod quantize;
+pub mod types;
+pub mod weight_quantize;
 
-pub use types::{
-    BlockQ4_0, BlockQ4_1, BlockQ5_0, BlockQ5_1, BlockQ8_0, BlockQ8_1,
-    BlockQ2K, BlockQ3K, BlockQ4K, BlockQ5K, BlockQ6K, BlockQ8K,
-    BlockIQ4NL, BlockIQ4XS, BlockIQ3S, BlockIQ3XXS,
-    BlockIQ2S, BlockIQ2XS, BlockIQ2XXS, BlockIQ1S, BlockIQ1M,
-    BlockMXFP4, BlockNVFP4,
-};
-pub use q4_0::vec_dot_q4_0_q8_0;
-pub use q4_1::vec_dot_q4_1_q8_1;
-pub use q5_0::vec_dot_q5_0_q8_0;
-pub use q5_1::vec_dot_q5_1_q8_1;
+pub use iq4_nl::vec_dot_iq4_nl_q8_0;
+pub use matmul::quantized_matmul_f32;
 pub use q2_k::vec_dot_q2k_q8k;
 pub use q3_k::vec_dot_q3k_q8k;
+pub use q4_0::vec_dot_q4_0_q8_0;
+pub use q4_1::vec_dot_q4_1_q8_1;
 pub use q4_k::vec_dot_q4k_q8k;
+pub use q5_0::vec_dot_q5_0_q8_0;
+pub use q5_1::vec_dot_q5_1_q8_1;
 pub use q5_k::vec_dot_q5k_q8k;
 pub use q6_k::vec_dot_q6k_q8k;
-pub use iq4_nl::vec_dot_iq4_nl_q8_0;
 pub use quantize::{quantize_row_q8_0, quantize_row_q8_1, quantize_row_q8k};
-pub use matmul::quantized_matmul_f32;
+pub use types::{
+    BlockIQ1M, BlockIQ1S, BlockIQ2S, BlockIQ2XS, BlockIQ2XXS, BlockIQ3S, BlockIQ3XXS, BlockIQ4NL,
+    BlockIQ4XS, BlockMXFP4, BlockNVFP4, BlockQ2K, BlockQ3K, BlockQ4_0, BlockQ4_1, BlockQ4K,
+    BlockQ5_0, BlockQ5_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K,
+};
 pub use weight_quantize::*;

@@ -72,8 +72,7 @@ impl CacheManager {
         let mut pc = pc_mutex
             .lock()
             .map_err(|e| EngineError::Internal(format!("prefix cache lock poisoned: {e}")))?;
-        let stored_paged_ids =
-            pc.insert_paged_blocks_only(tokens, paged_block_size, block_table);
+        let stored_paged_ids = pc.insert_paged_blocks_only(tokens, paged_block_size, block_table);
         if !stored_paged_ids.is_empty()
             && let Some(ref bm_mutex) = self.block_manager
         {

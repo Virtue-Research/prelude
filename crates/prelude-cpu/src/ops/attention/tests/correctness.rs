@@ -59,7 +59,9 @@ fn test_prefill_attention_single_seq() {
 
     let expected = naive_attention(&q_f32, &ks, &vs, sm_scale);
     let o_off = t * num_heads * head_dim + head * head_dim;
-    let actual: Vec<f32> = (0..head_dim).map(|d| from_bf16(output[o_off + d])).collect();
+    let actual: Vec<f32> = (0..head_dim)
+        .map(|d| from_bf16(output[o_off + d]))
+        .collect();
 
     let violation = max_sglang_violation(&actual, &expected);
     assert!(
@@ -113,19 +115,29 @@ fn test_prefill_attention_gqa() {
             .map(|d| from_bf16(q_data[t * num_heads * head_dim + head * head_dim + d]))
             .collect();
         let ks: Vec<Vec<f32>> = (0..seq_len)
-            .map(|j| (0..head_dim)
-                .map(|d| from_bf16(k_data[j * num_kv_heads * head_dim + kv_head * head_dim + d]))
-                .collect())
+            .map(|j| {
+                (0..head_dim)
+                    .map(|d| {
+                        from_bf16(k_data[j * num_kv_heads * head_dim + kv_head * head_dim + d])
+                    })
+                    .collect()
+            })
             .collect();
         let vs: Vec<Vec<f32>> = (0..seq_len)
-            .map(|j| (0..head_dim)
-                .map(|d| from_bf16(v_data[j * num_kv_heads * head_dim + kv_head * head_dim + d]))
-                .collect())
+            .map(|j| {
+                (0..head_dim)
+                    .map(|d| {
+                        from_bf16(v_data[j * num_kv_heads * head_dim + kv_head * head_dim + d])
+                    })
+                    .collect()
+            })
             .collect();
 
         let expected = naive_attention(&q_f32, &ks, &vs, sm_scale);
         let o_off = t * num_heads * head_dim + head * head_dim;
-        let actual: Vec<f32> = (0..head_dim).map(|d| from_bf16(output[o_off + d])).collect();
+        let actual: Vec<f32> = (0..head_dim)
+            .map(|d| from_bf16(output[o_off + d]))
+            .collect();
 
         let violation = max_sglang_violation(&actual, &expected);
         assert!(
@@ -181,19 +193,33 @@ fn test_prefill_attention_multi_seq() {
             .map(|d| from_bf16(q_data[(offset + t) * num_heads * head_dim + head * head_dim + d]))
             .collect();
         let ks: Vec<Vec<f32>> = (0..slen)
-            .map(|j| (0..head_dim)
-                .map(|d| from_bf16(k_data[(offset + j) * num_kv_heads * head_dim + head * head_dim + d]))
-                .collect())
+            .map(|j| {
+                (0..head_dim)
+                    .map(|d| {
+                        from_bf16(
+                            k_data[(offset + j) * num_kv_heads * head_dim + head * head_dim + d],
+                        )
+                    })
+                    .collect()
+            })
             .collect();
         let vs: Vec<Vec<f32>> = (0..slen)
-            .map(|j| (0..head_dim)
-                .map(|d| from_bf16(v_data[(offset + j) * num_kv_heads * head_dim + head * head_dim + d]))
-                .collect())
+            .map(|j| {
+                (0..head_dim)
+                    .map(|d| {
+                        from_bf16(
+                            v_data[(offset + j) * num_kv_heads * head_dim + head * head_dim + d],
+                        )
+                    })
+                    .collect()
+            })
             .collect();
 
         let expected = naive_attention(&q_f32, &ks, &vs, sm_scale);
         let o_off = (offset + t) * num_heads * head_dim + head * head_dim;
-        let actual: Vec<f32> = (0..head_dim).map(|d| from_bf16(output[o_off + d])).collect();
+        let actual: Vec<f32> = (0..head_dim)
+            .map(|d| from_bf16(output[o_off + d]))
+            .collect();
 
         let violation = max_sglang_violation(&actual, &expected);
         assert!(
@@ -267,28 +293,22 @@ fn test_decode_attention() {
     let ks: Vec<Vec<f32>> = (0..cache_len)
         .map(|j| {
             (0..head_dim)
-                .map(|d| {
-                    from_bf16(
-                        k_cache[j * num_kv_heads * head_dim + kv_head * head_dim + d],
-                    )
-                })
+                .map(|d| from_bf16(k_cache[j * num_kv_heads * head_dim + kv_head * head_dim + d]))
                 .collect()
         })
         .collect();
     let vs: Vec<Vec<f32>> = (0..cache_len)
         .map(|j| {
             (0..head_dim)
-                .map(|d| {
-                    from_bf16(
-                        v_cache[j * num_kv_heads * head_dim + kv_head * head_dim + d],
-                    )
-                })
+                .map(|d| from_bf16(v_cache[j * num_kv_heads * head_dim + kv_head * head_dim + d]))
                 .collect()
         })
         .collect();
 
     let expected = naive_attention(&q_f32, &ks, &vs, sm_scale);
-    let actual: Vec<f32> = (0..head_dim).map(|d| from_bf16(output[head * head_dim + d])).collect();
+    let actual: Vec<f32> = (0..head_dim)
+        .map(|d| from_bf16(output[head * head_dim + d]))
+        .collect();
 
     let violation = max_sglang_violation(&actual, &expected);
     assert!(
@@ -303,9 +323,7 @@ fn test_dot_bf16_f32() {
     let b: Vec<u16> = (0..128).map(|i| to_bf16((i as f32 * 0.02).cos())).collect();
 
     let result = dot_bf16_f32(&a, &b, 128);
-    let expected: f32 = (0..128)
-        .map(|i| from_bf16(a[i]) * from_bf16(b[i]))
-        .sum();
+    let expected: f32 = (0..128).map(|i| from_bf16(a[i]) * from_bf16(b[i])).sum();
 
     let diff = (result - expected).abs();
     assert!(
@@ -375,7 +393,9 @@ fn test_prefill_causal_early_tokens() {
             .collect();
         let expected = naive_causal_attention(&q_f32, &ks, &vs, t, sm_scale);
         let o_off = t * num_heads * head_dim + head * head_dim;
-        let actual: Vec<f32> = (0..head_dim).map(|d| from_bf16(output[o_off + d])).collect();
+        let actual: Vec<f32> = (0..head_dim)
+            .map(|d| from_bf16(output[o_off + d]))
+            .collect();
 
         let violation = max_sglang_violation(&actual, &expected);
         assert!(
@@ -445,7 +465,9 @@ fn test_prefill_attention_large_dim() {
 
     let expected = naive_attention(&q_f32, &ks, &vs, sm_scale);
     let o_off = t * num_heads * head_dim + head * head_dim;
-    let actual: Vec<f32> = (0..head_dim).map(|d| from_bf16(output[o_off + d])).collect();
+    let actual: Vec<f32> = (0..head_dim)
+        .map(|d| from_bf16(output[o_off + d]))
+        .collect();
 
     // Check for NaN/Inf first
     for (d, &val) in actual.iter().enumerate() {
@@ -491,8 +513,15 @@ fn verify_prefill_config(
 
     let mut output = vec![0u16; seq_len * num_heads * head_dim];
     prefill_attention_bf16(
-        &mut output, &q_data, &k_data, &v_data, &[seq_len],
-        num_heads, num_kv_heads, head_dim, sm_scale,
+        &mut output,
+        &q_data,
+        &k_data,
+        &v_data,
+        &[seq_len],
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        sm_scale,
     );
 
     // Verify last token across multiple heads
@@ -505,24 +534,33 @@ fn verify_prefill_config(
         let ks: Vec<Vec<f32>> = (0..seq_len)
             .map(|j| {
                 (0..head_dim)
-                    .map(|d| from_bf16(k_data[j * num_kv_heads * head_dim + kv_head * head_dim + d]))
+                    .map(|d| {
+                        from_bf16(k_data[j * num_kv_heads * head_dim + kv_head * head_dim + d])
+                    })
                     .collect()
             })
             .collect();
         let vs: Vec<Vec<f32>> = (0..seq_len)
             .map(|j| {
                 (0..head_dim)
-                    .map(|d| from_bf16(v_data[j * num_kv_heads * head_dim + kv_head * head_dim + d]))
+                    .map(|d| {
+                        from_bf16(v_data[j * num_kv_heads * head_dim + kv_head * head_dim + d])
+                    })
                     .collect()
             })
             .collect();
 
         let expected = naive_attention(&q_f32, &ks, &vs, sm_scale);
         let o_off = t * num_heads * head_dim + head * head_dim;
-        let actual: Vec<f32> = (0..head_dim).map(|d| from_bf16(output[o_off + d])).collect();
+        let actual: Vec<f32> = (0..head_dim)
+            .map(|d| from_bf16(output[o_off + d]))
+            .collect();
 
         for (d, &val) in actual.iter().enumerate() {
-            assert!(val.is_finite(), "{label} head={head} output[{d}] not finite: {val}");
+            assert!(
+                val.is_finite(),
+                "{label} head={head} output[{d}] not finite: {val}"
+            );
         }
         let violation = max_sglang_violation(&actual, &expected);
         assert!(
@@ -560,9 +598,18 @@ fn verify_decode_config(
     let mut output = vec![0u16; num_seqs * num_heads * head_dim];
 
     decode_attention_bf16(
-        &mut output, &q_data, &k_cache, &v_cache,
-        &req_to_token, &seq_lens, num_seqs, max_context_len,
-        num_heads, num_kv_heads, head_dim, sm_scale,
+        &mut output,
+        &q_data,
+        &k_cache,
+        &v_cache,
+        &req_to_token,
+        &seq_lens,
+        num_seqs,
+        max_context_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        sm_scale,
     );
 
     for head in [0, num_heads / 2, num_heads - 1] {
@@ -574,7 +621,9 @@ fn verify_decode_config(
             .map(|j| {
                 let slot = j;
                 (0..head_dim)
-                    .map(|d| from_bf16(k_cache[slot * num_kv_heads * head_dim + kv_head * head_dim + d]))
+                    .map(|d| {
+                        from_bf16(k_cache[slot * num_kv_heads * head_dim + kv_head * head_dim + d])
+                    })
                     .collect()
             })
             .collect();
@@ -582,17 +631,24 @@ fn verify_decode_config(
             .map(|j| {
                 let slot = j;
                 (0..head_dim)
-                    .map(|d| from_bf16(v_cache[slot * num_kv_heads * head_dim + kv_head * head_dim + d]))
+                    .map(|d| {
+                        from_bf16(v_cache[slot * num_kv_heads * head_dim + kv_head * head_dim + d])
+                    })
                     .collect()
             })
             .collect();
 
         let expected = naive_attention(&q_f32, &ks, &vs, sm_scale);
         let o_off = head * head_dim;
-        let actual: Vec<f32> = (0..head_dim).map(|d| from_bf16(output[o_off + d])).collect();
+        let actual: Vec<f32> = (0..head_dim)
+            .map(|d| from_bf16(output[o_off + d]))
+            .collect();
 
         for (d, &val) in actual.iter().enumerate() {
-            assert!(val.is_finite(), "{label} head={head} output[{d}] not finite: {val}");
+            assert!(
+                val.is_finite(),
+                "{label} head={head} output[{d}] not finite: {val}"
+            );
         }
         let violation = max_sglang_violation(&actual, &expected);
         assert!(

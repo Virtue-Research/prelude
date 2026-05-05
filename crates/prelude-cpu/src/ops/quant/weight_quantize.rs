@@ -50,7 +50,11 @@ fn make_qkx1_quants(nmax: i32, ntry: usize, x: &[f32]) -> (f32, f32) {
         }
         scale = sumlx / suml2 as f32;
 
-        let sum: f32 = x.iter().zip(l.iter()).map(|(&xi, &li)| xi - scale * li as f32).sum();
+        let sum: f32 = x
+            .iter()
+            .zip(l.iter())
+            .map(|(&xi, &li)| xi - scale * li as f32)
+            .sum();
         min = sum / n as f32;
         if min > 0.0 {
             min = 0.0;
@@ -418,7 +422,10 @@ pub fn quantize_f32_q5_1(data: &[f32]) -> Vec<BlockQ5_1> {
 /// 16 sub-blocks of 16 elements each. Each sub-block has a 4-bit scale and
 /// 4-bit minimum packed in `scales[16]`. Values are 2-bit [0..3].
 pub fn quantize_f32_q2k(data: &[f32]) -> Vec<BlockQ2K> {
-    assert!(data.len() % QK_K == 0, "data length must be multiple of {QK_K}");
+    assert!(
+        data.len() % QK_K == 0,
+        "data length must be multiple of {QK_K}"
+    );
     let nb = data.len() / QK_K;
     let mut output = Vec::with_capacity(nb);
 
@@ -504,7 +511,10 @@ pub fn quantize_f32_q2k(data: &[f32]) -> Vec<BlockQ2K> {
 /// 16 sub-blocks of 16 elements. Scales are 6-bit signed (stored + 32).
 /// Values are 3-bit: 2 low bits in qs, 1 high bit in hmask.
 pub fn quantize_f32_q3k(data: &[f32]) -> Vec<BlockQ3K> {
-    assert!(data.len() % QK_K == 0, "data length must be multiple of {QK_K}");
+    assert!(
+        data.len() % QK_K == 0,
+        "data length must be multiple of {QK_K}"
+    );
     let nb = data.len() / QK_K;
     let mut output = Vec::with_capacity(nb);
 
@@ -607,7 +617,10 @@ pub fn quantize_f32_q3k(data: &[f32]) -> Vec<BlockQ3K> {
 /// 8 sub-blocks of 32 elements. Each has a 6-bit scale and 6-bit minimum
 /// packed into 12 bytes. Values are 4-bit [0..15].
 pub fn quantize_f32_q4k(data: &[f32]) -> Vec<BlockQ4K> {
-    assert!(data.len() % QK_K == 0, "data length must be multiple of {QK_K}");
+    assert!(
+        data.len() % QK_K == 0,
+        "data length must be multiple of {QK_K}"
+    );
     let nb = data.len() / QK_K;
     let mut output = Vec::with_capacity(nb);
 
@@ -632,7 +645,11 @@ pub fn quantize_f32_q4k(data: &[f32]) -> Vec<BlockQ4K> {
         let max_scale = scales.iter().copied().fold(0.0f32, f32::max);
         let max_min = mins.iter().copied().fold(0.0f32, f32::max);
 
-        let inv_scale = if max_scale > 0.0 { 63.0 / max_scale } else { 0.0 };
+        let inv_scale = if max_scale > 0.0 {
+            63.0 / max_scale
+        } else {
+            0.0
+        };
         let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
 
         for j in 0..QK_K / 32 {
@@ -687,7 +704,10 @@ pub fn quantize_f32_q4k(data: &[f32]) -> Vec<BlockQ4K> {
 /// Same scale/min packing as Q4_K. Values are 5-bit [0..31]:
 /// low 4 bits in qs, high bit in qh.
 pub fn quantize_f32_q5k(data: &[f32]) -> Vec<BlockQ5K> {
-    assert!(data.len() % QK_K == 0, "data length must be multiple of {QK_K}");
+    assert!(
+        data.len() % QK_K == 0,
+        "data length must be multiple of {QK_K}"
+    );
     let nb = data.len() / QK_K;
     let mut output = Vec::with_capacity(nb);
 
@@ -713,7 +733,11 @@ pub fn quantize_f32_q5k(data: &[f32]) -> Vec<BlockQ5K> {
         let max_scale = scales.iter().copied().fold(0.0f32, f32::max);
         let max_min = mins.iter().copied().fold(0.0f32, f32::max);
 
-        let inv_scale = if max_scale > 0.0 { 63.0 / max_scale } else { 0.0 };
+        let inv_scale = if max_scale > 0.0 {
+            63.0 / max_scale
+        } else {
+            0.0
+        };
         let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
 
         for j in 0..QK_K / 32 {
@@ -785,7 +809,10 @@ pub fn quantize_f32_q5k(data: &[f32]) -> Vec<BlockQ5K> {
 /// Values are 6-bit [0..63] → subtract 32 for signed interpretation.
 /// Low 4 bits in ql, high 2 bits in qh.
 pub fn quantize_f32_q6k(data: &[f32]) -> Vec<BlockQ6K> {
-    assert!(data.len() % QK_K == 0, "data length must be multiple of {QK_K}");
+    assert!(
+        data.len() % QK_K == 0,
+        "data length must be multiple of {QK_K}"
+    );
     let nb = data.len() / QK_K;
     let mut output = Vec::with_capacity(nb);
 
@@ -837,8 +864,8 @@ pub fn quantize_f32_q6k(data: &[f32]) -> Vec<BlockQ6K> {
 
         // Pack: low 4 bits in ql, high 2 bits in qh
         for j in (0..QK_K).step_by(128) {
-            let ql_base = j / 2;  // 128 elements -> 64 ql bytes
-            let qh_base = j / 4;  // 128 elements -> 32 qh bytes
+            let ql_base = j / 2; // 128 elements -> 64 ql bytes
+            let qh_base = j / 4; // 128 elements -> 32 qh bytes
             for lv in 0..32 {
                 let q1 = l[j + lv] & 0xF;
                 let q2 = l[j + lv + 32] & 0xF;
@@ -891,11 +918,19 @@ mod tests {
     }
 
     fn max_abs_error(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
     }
 
     fn rms_error(a: &[f32], b: &[f32]) -> f32 {
-        let mse: f32 = a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum::<f32>() / a.len() as f32;
+        let mse: f32 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).powi(2))
+            .sum::<f32>()
+            / a.len() as f32;
         mse.sqrt()
     }
 
@@ -912,7 +947,9 @@ mod tests {
 
     #[test]
     fn q4_1_roundtrip() {
-        let data: Vec<f32> = (0..128).map(|i| ((i as f32) * 0.05).sin() * 2.0 + 1.0).collect();
+        let data: Vec<f32> = (0..128)
+            .map(|i| ((i as f32) * 0.05).sin() * 2.0 + 1.0)
+            .collect();
         let blocks = quantize_f32_q4_1(&data);
         assert_eq!(blocks.len(), 4);
         // Verify blocks are valid (d, m should be reasonable)
@@ -931,7 +968,9 @@ mod tests {
 
     #[test]
     fn q5_1_roundtrip() {
-        let data: Vec<f32> = (0..64).map(|i| ((i as f32) * 0.1).sin() * 2.0 + 3.0).collect();
+        let data: Vec<f32> = (0..64)
+            .map(|i| ((i as f32) * 0.1).sin() * 2.0 + 3.0)
+            .collect();
         let blocks = quantize_f32_q5_1(&data);
         assert_eq!(blocks.len(), 2);
     }

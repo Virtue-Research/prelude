@@ -288,10 +288,10 @@ const _: () = assert!(core::mem::size_of::<BlockIQ4XS>() == 136);
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct BlockIQ3S {
     pub d: u16,
-    pub qs: [u8; QK_K / 4],       // 64 bytes: low 8 bits of 3-bit indices
-    pub qh: [u8; QK_K / 32],      // 8 bytes: high bit of indices
-    pub signs: [u8; QK_K / 8],    // 32 bytes: sign bits
-    pub scales: [u8; QK_K / 64],   // 4 bytes: sub-block scales
+    pub qs: [u8; QK_K / 4],      // 64 bytes: low 8 bits of 3-bit indices
+    pub qh: [u8; QK_K / 32],     // 8 bytes: high bit of indices
+    pub signs: [u8; QK_K / 8],   // 32 bytes: sign bits
+    pub scales: [u8; QK_K / 64], // 4 bytes: sub-block scales
 }
 
 const _: () = assert!(core::mem::size_of::<BlockIQ3S>() == 110);
@@ -304,7 +304,7 @@ const _: () = assert!(core::mem::size_of::<BlockIQ3S>() == 110);
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct BlockIQ3XXS {
     pub d: u16,
-    pub qs: [u8; 3 * QK_K / 8],   // 96 bytes
+    pub qs: [u8; 3 * QK_K / 8], // 96 bytes
 }
 
 const _: () = assert!(core::mem::size_of::<BlockIQ3XXS>() == 98);
@@ -316,9 +316,9 @@ const _: () = assert!(core::mem::size_of::<BlockIQ3XXS>() == 98);
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct BlockIQ2S {
     pub d: u16,
-    pub qs: [u8; QK_K / 4],       // 64 bytes
-    pub qh: [u8; QK_K / 32],      // 8 bytes
-    pub scales: [u8; QK_K / 32],   // 8 bytes
+    pub qs: [u8; QK_K / 4],      // 64 bytes
+    pub qh: [u8; QK_K / 32],     // 8 bytes
+    pub scales: [u8; QK_K / 32], // 8 bytes
 }
 
 const _: () = assert!(core::mem::size_of::<BlockIQ2S>() == 82);
@@ -330,8 +330,8 @@ const _: () = assert!(core::mem::size_of::<BlockIQ2S>() == 82);
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct BlockIQ2XS {
     pub d: u16,
-    pub qs: [u16; QK_K / 8],      // 64 bytes (32 × u16)
-    pub scales: [u8; QK_K / 32],   // 8 bytes
+    pub qs: [u16; QK_K / 8],     // 64 bytes (32 × u16)
+    pub scales: [u8; QK_K / 32], // 8 bytes
 }
 
 const _: () = assert!(core::mem::size_of::<BlockIQ2XS>() == 74);
@@ -343,7 +343,7 @@ const _: () = assert!(core::mem::size_of::<BlockIQ2XS>() == 74);
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct BlockIQ2XXS {
     pub d: u16,
-    pub qs: [u16; QK_K / 8],      // 64 bytes (32 × u16)
+    pub qs: [u16; QK_K / 8], // 64 bytes (32 × u16)
 }
 
 const _: () = assert!(core::mem::size_of::<BlockIQ2XXS>() == 66);
@@ -355,8 +355,8 @@ const _: () = assert!(core::mem::size_of::<BlockIQ2XXS>() == 66);
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct BlockIQ1S {
     pub d: u16,
-    pub qs: [u8; QK_K / 8],       // 32 bytes: grid index low bits
-    pub qh: [u16; QK_K / 32],     // 16 bytes: grid index high bits + scale
+    pub qs: [u8; QK_K / 8],   // 32 bytes: grid index low bits
+    pub qh: [u16; QK_K / 32], // 16 bytes: grid index high bits + scale
 }
 
 const _: () = assert!(core::mem::size_of::<BlockIQ1S>() == 50);
@@ -367,9 +367,9 @@ const _: () = assert!(core::mem::size_of::<BlockIQ1S>() == 50);
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct BlockIQ1M {
-    pub qs: [u8; QK_K / 8],       // 32 bytes: grid index low bits
-    pub qh: [u8; QK_K / 16],      // 16 bytes: grid index high + shift
-    pub scales: [u8; QK_K / 32],   // 8 bytes: 3-bit block scales
+    pub qs: [u8; QK_K / 8],      // 32 bytes: grid index low bits
+    pub qh: [u8; QK_K / 16],     // 16 bytes: grid index high + shift
+    pub scales: [u8; QK_K / 32], // 8 bytes: 3-bit block scales
 }
 
 const _: () = assert!(core::mem::size_of::<BlockIQ1M>() == 56);

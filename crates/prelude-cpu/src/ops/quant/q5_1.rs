@@ -25,7 +25,7 @@ pub fn vec_dot_q5_1_q8_1_scalar(x: &[BlockQ5_1], y: &[BlockQ8_1]) -> f32 {
 
         for j in 0..16 {
             let xh_0 = (((qh >> j) << 4) & 0x10) as u8;
-            let xh_1 = (((qh >> (j + 12))) & 0x10) as u8;
+            let xh_1 = ((qh >> (j + 12)) & 0x10) as u8;
 
             let x0 = ((xb.qs[j] & 0x0F) | xh_0) as i32;
             let x1 = ((xb.qs[j] >> 4) | xh_1) as i32;
@@ -36,7 +36,7 @@ pub fn vec_dot_q5_1_q8_1_scalar(x: &[BlockQ5_1], y: &[BlockQ8_1]) -> f32 {
 
         let sumi = sumi0 + sumi1;
         sumf += (fp16_to_f32(xb.d) * fp16_to_f32(yb.d)) * sumi as f32
-              + fp16_to_f32(xb.m) * fp16_to_f32(yb.s);
+            + fp16_to_f32(xb.m) * fp16_to_f32(yb.s);
     }
     sumf
 }
@@ -93,10 +93,7 @@ mod avx2 {
 
                 // Unpack nibbles
                 let q4bits = _mm_loadu_si128(xb.qs.as_ptr() as *const __m128i);
-                let q4 = _mm256_set_m128i(
-                    _mm_srli_epi16(q4bits, 4),
-                    q4bits,
-                );
+                let q4 = _mm256_set_m128i(_mm_srli_epi16(q4bits, 4), q4bits);
                 let q4 = _mm256_and_si256(q4, m4);
 
                 // Add high bit
@@ -110,11 +107,7 @@ mod avx2 {
                 let ones = _mm256_set1_epi16(1);
                 let p32 = _mm256_madd_epi16(p, ones);
 
-                acc = _mm256_fmadd_ps(
-                    _mm256_set1_ps(d),
-                    _mm256_cvtepi32_ps(p32),
-                    acc,
-                );
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(p32), acc);
             }
 
             hsum_float_8(acc) + summs
@@ -147,8 +140,12 @@ pub fn vec_dot_q5_1_q8_1(x: &[BlockQ5_1], y: &[BlockQ8_1]) -> f32 {
 
 /// Q5_1 matmul: y[M,N] = x[M,K] @ W[N,K]^T.
 pub fn quantized_matmul_q5_1(
-    x: &[f32], w: &[BlockQ5_1], out: &mut [f32],
-    m: usize, n: usize, k: usize,
+    x: &[f32],
+    w: &[BlockQ5_1],
+    out: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
 ) {
     assert_eq!(k % QK8_0, 0);
     let nb = k / QK8_0;
@@ -156,8 +153,8 @@ pub fn quantized_matmul_q5_1(
     assert_eq!(w.len(), n * nb);
     assert_eq!(out.len(), m * n);
 
-    use rayon::prelude::*;
     use super::quantize::quantize_row_q8_1;
+    use rayon::prelude::*;
 
     out.par_chunks_mut(n).enumerate().for_each(|(i, out_row)| {
         let x_row = &x[i * k..(i + 1) * k];
@@ -212,13 +209,18 @@ mod tests {
         let ref_dot: f32 = w_deq.iter().zip(x_vals.iter()).map(|(w, x)| w * x).sum();
 
         let rel_err = (our_dot - ref_dot).abs() / ref_dot.abs().max(1e-6);
-        assert!(rel_err < 0.05, "our={our_dot}, ref={ref_dot}, rel_err={rel_err}");
+        assert!(
+            rel_err < 0.05,
+            "our={our_dot}, ref={ref_dot}, rel_err={rel_err}"
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx2_matches_scalar() {
-        if !is_x86_feature_detected!("avx2") { return; }
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
         let values: Vec<f32> = (0..128).map(|i| ((i as f32) * 0.007).sin() * 2.0).collect();
         let x_vals: Vec<f32> = (0..128).map(|i| ((i as f32) * 0.013).cos()).collect();
         let q5 = make_test_blocks(&values);
@@ -226,6 +228,9 @@ mod tests {
         let scalar = vec_dot_q5_1_q8_1_scalar(&q5, &q8);
         let avx2 = unsafe { avx2::vec_dot_q5_1_q8_1_avx2(&q5, &q8) };
         let rel_err = (scalar - avx2).abs() / scalar.abs().max(1e-6);
-        assert!(rel_err < 1e-5, "scalar={scalar}, avx2={avx2}, rel_err={rel_err}");
+        assert!(
+            rel_err < 1e-5,
+            "scalar={scalar}, avx2={avx2}, rel_err={rel_err}"
+        );
     }
 }

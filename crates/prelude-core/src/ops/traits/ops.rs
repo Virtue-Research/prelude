@@ -11,25 +11,60 @@
 //! Users call `tensor.exp()`, `tensor.matmul()` etc. — not `ops.exp()`.
 //! The trait only exposes methods that models need to call on ops directly.
 
-use crate::tensor::{DType, Tensor, Result};
+use crate::tensor::{DType, Result, Tensor};
 
 // ── Op enums ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
 pub enum UnaryOp {
-    Exp, Log, Sin, Cos, Abs, Neg, Sqr, Sqrt, Recip, Tanh,
-    Relu, Ceil, Floor, Round, Sign,
-    Gelu, GeluErf, Silu,
+    Exp,
+    Log,
+    Sin,
+    Cos,
+    Abs,
+    Neg,
+    Sqr,
+    Sqrt,
+    Recip,
+    Tanh,
+    Relu,
+    Ceil,
+    Floor,
+    Round,
+    Sign,
+    Gelu,
+    GeluErf,
+    Silu,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum BinaryOp { Add, Sub, Mul, Div, Min, Max }
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Min,
+    Max,
+}
 
 #[derive(Debug, Clone, Copy)]
-pub enum CompareOp { Eq, Ne, Lt, Gt, Ge, Le }
+pub enum CompareOp {
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Ge,
+    Le,
+}
 
 #[derive(Debug, Clone, Copy)]
-pub enum ReduceOp { Sum, Max, Min, ArgMax, ArgMin }
+pub enum ReduceOp {
+    Sum,
+    Max,
+    Min,
+    ArgMax,
+    ArgMin,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum QuantScheme {
@@ -94,100 +129,299 @@ pub trait Ops: Send + Sync {
     // Low-level pointers (needed by CUDA interop)
     // ════════════════════════════════════════════════════════════════
 
-    unsafe fn data_ptr(&self, x: &Tensor) -> Result<*const u8> { unsafe { self.default_impl().data_ptr(x) }}
-    unsafe fn data_ptr_mut(&self, x: &Tensor) -> Result<*mut u8> { unsafe { self.default_impl().data_ptr_mut(x) }}
+    unsafe fn data_ptr(&self, x: &Tensor) -> Result<*const u8> {
+        unsafe { self.default_impl().data_ptr(x) }
+    }
+    unsafe fn data_ptr_mut(&self, x: &Tensor) -> Result<*mut u8> {
+        unsafe { self.default_impl().data_ptr_mut(x) }
+    }
 
     // ════════════════════════════════════════════════════════════════
     // Normalization — models call ops.rms_norm() directly
     // ════════════════════════════════════════════════════════════════
 
-    fn rms_norm(&self, x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> { super::norm::rms_norm(x, weight, eps) }
-    fn layer_norm(&self, x: &Tensor, weight: &Tensor, bias: Option<&Tensor>, eps: f32) -> Result<Tensor> { super::norm::layer_norm(x, weight, bias, eps) }
-    fn group_norm(&self, x: &Tensor, weight: &Tensor, bias: Option<&Tensor>, num_groups: usize, eps: f32) -> Result<Tensor> { super::norm::group_norm(x, weight, bias, num_groups, eps) }
+    fn rms_norm(&self, x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
+        super::norm::rms_norm(x, weight, eps)
+    }
+    fn layer_norm(
+        &self,
+        x: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        eps: f32,
+    ) -> Result<Tensor> {
+        super::norm::layer_norm(x, weight, bias, eps)
+    }
+    fn group_norm(
+        &self,
+        x: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        num_groups: usize,
+        eps: f32,
+    ) -> Result<Tensor> {
+        super::norm::group_norm(x, weight, bias, num_groups, eps)
+    }
 
     // ════════════════════════════════════════════════════════════════
     // Activation — models call ops.silu(), ops.softmax() etc.
     // ════════════════════════════════════════════════════════════════
 
-    fn silu(&self, x: &Tensor) -> Result<Tensor> { candle_nn::ops::silu(x) }
-    fn gelu(&self, x: &Tensor) -> Result<Tensor> { x.gelu() }
-    fn gelu_approximate(&self, x: &Tensor) -> Result<Tensor> { x.gelu_erf() }
-    fn softmax(&self, x: &Tensor, dim: usize) -> Result<Tensor> { candle_nn::ops::softmax(x, dim) }
-    fn sigmoid(&self, x: &Tensor) -> Result<Tensor> { candle_nn::ops::sigmoid(x) }
-    fn log_softmax(&self, x: &Tensor, dim: usize) -> Result<Tensor> { candle_nn::ops::log_softmax(x, dim) }
+    fn silu(&self, x: &Tensor) -> Result<Tensor> {
+        candle_nn::ops::silu(x)
+    }
+    fn gelu(&self, x: &Tensor) -> Result<Tensor> {
+        x.gelu()
+    }
+    fn gelu_approximate(&self, x: &Tensor) -> Result<Tensor> {
+        x.gelu_erf()
+    }
+    fn softmax(&self, x: &Tensor, dim: usize) -> Result<Tensor> {
+        candle_nn::ops::softmax(x, dim)
+    }
+    fn sigmoid(&self, x: &Tensor) -> Result<Tensor> {
+        candle_nn::ops::sigmoid(x)
+    }
+    fn log_softmax(&self, x: &Tensor, dim: usize) -> Result<Tensor> {
+        candle_nn::ops::log_softmax(x, dim)
+    }
 
     // ════════════════════════════════════════════════════════════════
     // Convolution
     // ════════════════════════════════════════════════════════════════
 
-    fn conv1d(&self, input: &Tensor, weight: &Tensor, bias: Option<&Tensor>, stride: usize, padding: usize) -> Result<Tensor> { super::conv::conv1d(input, weight, bias, stride, padding) }
-    fn conv_transpose1d(&self, input: &Tensor, weight: &Tensor, bias: Option<&Tensor>, stride: usize, padding: usize, output_padding: usize) -> Result<Tensor> { super::conv::conv_transpose1d(input, weight, bias, stride, padding, output_padding) }
-    fn conv2d(&self, input: &Tensor, weight: &Tensor, bias: Option<&Tensor>, stride: [usize; 2], padding: [usize; 2]) -> Result<Tensor> { super::conv::conv2d(input, weight, bias, stride, padding) }
+    fn conv1d(
+        &self,
+        input: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        stride: usize,
+        padding: usize,
+    ) -> Result<Tensor> {
+        super::conv::conv1d(input, weight, bias, stride, padding)
+    }
+    fn conv_transpose1d(
+        &self,
+        input: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        stride: usize,
+        padding: usize,
+        output_padding: usize,
+    ) -> Result<Tensor> {
+        super::conv::conv_transpose1d(input, weight, bias, stride, padding, output_padding)
+    }
+    fn conv2d(
+        &self,
+        input: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        stride: [usize; 2],
+        padding: [usize; 2],
+    ) -> Result<Tensor> {
+        super::conv::conv2d(input, weight, bias, stride, padding)
+    }
 
     // ════════════════════════════════════════════════════════════════
     // GEMM (quantized / grouped)
     // ════════════════════════════════════════════════════════════════
 
-    fn quantized_matmul(&self, _a: &Tensor, _b: &Tensor, _sa: Option<&Tensor>, _sb: Option<&Tensor>, _q: QuantScheme) -> Result<Tensor> { crate::bail!("quantized_matmul: requires device backend") }
-    fn grouped_gemm(&self, _input: &Tensor, _weights: &Tensor, _st: &Tensor, _se: &Tensor, _nt: &Tensor) -> Result<Tensor> { crate::bail!("grouped_gemm: requires device backend") }
+    fn quantized_matmul(
+        &self,
+        _a: &Tensor,
+        _b: &Tensor,
+        _sa: Option<&Tensor>,
+        _sb: Option<&Tensor>,
+        _q: QuantScheme,
+    ) -> Result<Tensor> {
+        crate::bail!("quantized_matmul: requires device backend")
+    }
+    fn grouped_gemm(
+        &self,
+        _input: &Tensor,
+        _weights: &Tensor,
+        _st: &Tensor,
+        _se: &Tensor,
+        _nt: &Tensor,
+    ) -> Result<Tensor> {
+        crate::bail!("grouped_gemm: requires device backend")
+    }
 
     // ════════════════════════════════════════════════════════════════
     // Attention
     // ════════════════════════════════════════════════════════════════
 
-    fn attn_name(&self) -> &str { "default" }
-    fn varlen_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, params: &VarlenParams) -> Result<Tensor> { super::attention::varlen_attention(q, k, v, params) }
-    fn paged_attention(&self, _q: &Tensor, _kc: &Tensor, _vc: &Tensor, _p: &PagedParams) -> Result<Tensor> { crate::bail!("paged_attention: requires device backend") }
+    fn attn_name(&self) -> &str {
+        "default"
+    }
+    fn varlen_attention(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        params: &VarlenParams,
+    ) -> Result<Tensor> {
+        super::attention::varlen_attention(q, k, v, params)
+    }
+    fn paged_attention(
+        &self,
+        _q: &Tensor,
+        _kc: &Tensor,
+        _vc: &Tensor,
+        _p: &PagedParams,
+    ) -> Result<Tensor> {
+        crate::bail!("paged_attention: requires device backend")
+    }
 
     // ════════════════════════════════════════════════════════════════
     // KV cache
     // ════════════════════════════════════════════════════════════════
 
-    fn cache_slot_spec(&self, head_dim: usize, dtype: DType) -> CacheSlotSpec { CacheSlotSpec { slot_size: head_dim, dtype } }
-    fn paged_block_size_hint(&self, _head_dim: usize) -> usize { 16 }
-    fn reshape_and_cache(&self, _key: &Tensor, _value: &Tensor, _kc: &Tensor, _vc: &Tensor, _sm: &Tensor) -> Result<()> { crate::bail!("reshape_and_cache: requires device backend") }
+    fn cache_slot_spec(&self, head_dim: usize, dtype: DType) -> CacheSlotSpec {
+        CacheSlotSpec {
+            slot_size: head_dim,
+            dtype,
+        }
+    }
+    fn paged_block_size_hint(&self, _head_dim: usize) -> usize {
+        16
+    }
+    fn reshape_and_cache(
+        &self,
+        _key: &Tensor,
+        _value: &Tensor,
+        _kc: &Tensor,
+        _vc: &Tensor,
+        _sm: &Tensor,
+    ) -> Result<()> {
+        crate::bail!("reshape_and_cache: requires device backend")
+    }
 
     // ════════════════════════════════════════════════════════════════
     // Communication (single-device defaults)
     // ════════════════════════════════════════════════════════════════
 
-    fn world_size(&self) -> usize { 1 }
-    fn rank(&self) -> usize { 0 }
-    fn all_reduce_sum(&self, x: &Tensor) -> Result<Tensor> { Ok(x.clone()) }
-    fn all_gather(&self, x: &Tensor, _dim: usize) -> Result<Tensor> { Ok(x.clone()) }
-    fn reduce_scatter(&self, x: &Tensor, _dim: usize) -> Result<Tensor> { Ok(x.clone()) }
-    fn all_to_all(&self, x: &Tensor, _input_splits: &[usize], _output_splits: &[usize]) -> Result<Tensor> { Ok(x.clone()) }
-    fn send(&self, _x: &Tensor, _dst: RemoteTarget) -> Result<()> { crate::bail!("send: not supported") }
-    fn recv(&self, _src: RemoteTarget) -> Result<Tensor> { crate::bail!("recv: not supported") }
+    fn world_size(&self) -> usize {
+        1
+    }
+    fn rank(&self) -> usize {
+        0
+    }
+    fn all_reduce_sum(&self, x: &Tensor) -> Result<Tensor> {
+        Ok(x.clone())
+    }
+    fn all_gather(&self, x: &Tensor, _dim: usize) -> Result<Tensor> {
+        Ok(x.clone())
+    }
+    fn reduce_scatter(&self, x: &Tensor, _dim: usize) -> Result<Tensor> {
+        Ok(x.clone())
+    }
+    fn all_to_all(
+        &self,
+        x: &Tensor,
+        _input_splits: &[usize],
+        _output_splits: &[usize],
+    ) -> Result<Tensor> {
+        Ok(x.clone())
+    }
+    fn send(&self, _x: &Tensor, _dst: RemoteTarget) -> Result<()> {
+        crate::bail!("send: not supported")
+    }
+    fn recv(&self, _src: RemoteTarget) -> Result<Tensor> {
+        crate::bail!("recv: not supported")
+    }
 
     /// Fused MoE dispatch: quantize to FP8 + send to expert owners.
     /// None = not supported, fallback to all_to_all.
     fn ep_dispatch_fused(
-        &self, _x: &Tensor, _topk_ids: &Tensor, _num_experts: usize, _use_fp8: bool,
-    ) -> Option<Result<(Tensor, Tensor)>> { None }
+        &self,
+        _x: &Tensor,
+        _topk_ids: &Tensor,
+        _num_experts: usize,
+        _use_fp8: bool,
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        None
+    }
 
     /// Fused MoE combine: receive + weighted accumulate expert outputs.
     fn ep_combine_fused(
-        &self, _x: &Tensor, _topk_weights: &Tensor, _topk_ids: &Tensor,
-    ) -> Option<Result<Tensor>> { None }
+        &self,
+        _x: &Tensor,
+        _topk_weights: &Tensor,
+        _topk_ids: &Tensor,
+    ) -> Option<Result<Tensor>> {
+        None
+    }
 
     // ════════════════════════════════════════════════════════════════
     // Fused ops (optional — return None = no fused kernel)
     // ════════════════════════════════════════════════════════════════
 
-    fn fused_add_rmsnorm(&self, _residual: &Tensor, _x: &Tensor, _weight: &Tensor, _eps: f32) -> Option<Result<(Tensor, Tensor)>> { None }
-    fn fused_silu_mul(&self, _gate: &Tensor, _up: &Tensor) -> Option<Result<Tensor>> { None }
-    fn fused_gelu_mul(&self, _gate: &Tensor, _up: &Tensor) -> Option<Result<Tensor>> { None }
+    fn fused_add_rmsnorm(
+        &self,
+        _residual: &Tensor,
+        _x: &Tensor,
+        _weight: &Tensor,
+        _eps: f32,
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        None
+    }
+    fn fused_silu_mul(&self, _gate: &Tensor, _up: &Tensor) -> Option<Result<Tensor>> {
+        None
+    }
+    fn fused_gelu_mul(&self, _gate: &Tensor, _up: &Tensor) -> Option<Result<Tensor>> {
+        None
+    }
     /// `silu(gate) * up` on a concatenated `[tokens, 2*dim]` tensor.
     /// Splits the last dimension internally. Returns `[tokens, dim]`.
     /// Avoids the narrow+contiguous copy that separate gate/up tensors need.
-    fn silu_mul_concat(&self, _gate_up: &Tensor) -> Option<Result<Tensor>> { None }
-    fn fused_qknorm_rope(&self, _q: &Tensor, _k: &Tensor, _qw: &Tensor, _kw: &Tensor, _cos: &Tensor, _sin: &Tensor, _pos: &Tensor, _eps: f32) -> Option<Result<(Tensor, Tensor)>> { None }
+    fn silu_mul_concat(&self, _gate_up: &Tensor) -> Option<Result<Tensor>> {
+        None
+    }
+    fn fused_qknorm_rope(
+        &self,
+        _q: &Tensor,
+        _k: &Tensor,
+        _qw: &Tensor,
+        _kw: &Tensor,
+        _cos: &Tensor,
+        _sin: &Tensor,
+        _pos: &Tensor,
+        _eps: f32,
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        None
+    }
     /// Q-only norm + rope. Used when the K path is fused into the KV
     /// cache write so K doesn't need to be materialized separately.
-    fn fused_q_norm_rope(&self, _q: &Tensor, _q_weight: &Tensor, _cos: &Tensor, _sin: &Tensor, _pos: &Tensor, _eps: f32) -> Option<Result<Tensor>> { None }
-    fn fused_knorm_rope_cache_write(&self, _k: &Tensor, _v: &Tensor, _kw: &Tensor, _cos: &Tensor, _sin: &Tensor, _pos: &Tensor, _kc: &Tensor, _vc: &Tensor, _sm: &Tensor, _eps: f32) -> Option<Result<()>> { None }
-    fn fused_add(&self, _a: &Tensor, _b: &Tensor) -> Option<Result<Tensor>> { None }
+    fn fused_q_norm_rope(
+        &self,
+        _q: &Tensor,
+        _q_weight: &Tensor,
+        _cos: &Tensor,
+        _sin: &Tensor,
+        _pos: &Tensor,
+        _eps: f32,
+    ) -> Option<Result<Tensor>> {
+        None
+    }
+    fn fused_knorm_rope_cache_write(
+        &self,
+        _k: &Tensor,
+        _v: &Tensor,
+        _kw: &Tensor,
+        _cos: &Tensor,
+        _sin: &Tensor,
+        _pos: &Tensor,
+        _kc: &Tensor,
+        _vc: &Tensor,
+        _sm: &Tensor,
+        _eps: f32,
+    ) -> Option<Result<()>> {
+        None
+    }
+    fn fused_add(&self, _a: &Tensor, _b: &Tensor) -> Option<Result<Tensor>> {
+        None
+    }
     /// Fused softmax + top-k expert routing.
     ///
     /// `norm_topk_prob`: when true, the kernel divides each row of
@@ -195,20 +429,50 @@ pub trait Ops: Send + Sync {
     /// the model config says — passing `true` for a model trained with
     /// `norm_topk_prob=false` silently re-normalizes weights and
     /// changes the math.
-    fn fused_moe_routing(&self, _logits: &Tensor, _top_k: usize, _norm_topk_prob: bool) -> Option<Result<(Tensor, Tensor, Tensor, Tensor)>> { None }
-    fn fused_moe_gemm(&self, _input: &Tensor, _weights: &Tensor, _tw: &Tensor, _st: &Tensor, _se: &Tensor, _topk: usize, _prefill: bool) -> Option<Result<Tensor>> { None }
+    fn fused_moe_routing(
+        &self,
+        _logits: &Tensor,
+        _top_k: usize,
+        _norm_topk_prob: bool,
+    ) -> Option<Result<(Tensor, Tensor, Tensor, Tensor)>> {
+        None
+    }
+    fn fused_moe_gemm(
+        &self,
+        _input: &Tensor,
+        _weights: &Tensor,
+        _tw: &Tensor,
+        _st: &Tensor,
+        _se: &Tensor,
+        _topk: usize,
+        _prefill: bool,
+    ) -> Option<Result<Tensor>> {
+        None
+    }
 
     /// GPU-accelerated sort of expert assignments by expert ID.
     /// Returns (sorted_expert_ids, sorted_token_ids) both as flat [n] U32 tensors.
     /// Default: returns None (caller falls back to CPU sort).
-    fn moe_sort_experts(&self, _expert_ids: &Tensor) -> Option<Result<(Tensor, Tensor)>> { None }
+    fn moe_sort_experts(&self, _expert_ids: &Tensor) -> Option<Result<(Tensor, Tensor)>> {
+        None
+    }
 
     /// Fused RMSNorm + SiLU gate: output = RMSNorm(x, weight) * SiLU(gate).
     /// Used by GatedDeltaNet's per-head norm. x/gate: BF16, weight: F32.
-    fn rmsnorm_gated(&self, _x: &Tensor, _gate: &Tensor, _weight: &Tensor, _eps: f32) -> Option<Result<Tensor>> { None }
+    fn rmsnorm_gated(
+        &self,
+        _x: &Tensor,
+        _gate: &Tensor,
+        _weight: &Tensor,
+        _eps: f32,
+    ) -> Option<Result<Tensor>> {
+        None
+    }
 
     /// In-place swap of gate/up halves for CUTLASS Swiglu. Call once at load time.
-    fn swap_moe_gate_up(&self, _w1: &Tensor, _inter: usize) -> Option<Result<()>> { None }
+    fn swap_moe_gate_up(&self, _w1: &Tensor, _inter: usize) -> Option<Result<()>> {
+        None
+    }
 
     /// Fused MoE: routing permute → GEMM1 (gate_up) → Swiglu → GEMM2 (down) → unpermute.
     /// Returns None when unavailable; caller falls back to composed ops
@@ -221,29 +485,52 @@ pub trait Ops: Send + Sync {
         _topk_weights: &Tensor,
         _w1: &Tensor,
         _w2: &Tensor,
-    ) -> Option<Result<Tensor>> { None }
+    ) -> Option<Result<Tensor>> {
+        None
+    }
 
     /// Fused Adaptive Layer Norm (AdaLN-Zero) for diffusion transformers.
     /// Computes: normed = layer_norm(x) * (1 + scale) + shift, gated = normed * gate.
     fn fused_adaln_zero(
-        &self, _x: &Tensor, _weight: &Tensor, _bias: Option<&Tensor>,
-        _scale: &Tensor, _shift: &Tensor, _gate: &Tensor, _eps: f32,
-    ) -> Option<Result<(Tensor, Tensor)>> { None }
+        &self,
+        _x: &Tensor,
+        _weight: &Tensor,
+        _bias: Option<&Tensor>,
+        _scale: &Tensor,
+        _shift: &Tensor,
+        _gate: &Tensor,
+        _eps: f32,
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        None
+    }
 
     /// Fused scale + shift (continuous AdaLN variant, no gate).
     /// Computes: layer_norm(x) * (1 + scale) + shift.
     fn fused_scale_shift(
-        &self, _x: &Tensor, _weight: &Tensor, _bias: Option<&Tensor>,
-        _scale: &Tensor, _shift: &Tensor, _eps: f32,
-    ) -> Option<Result<Tensor>> { None }
+        &self,
+        _x: &Tensor,
+        _weight: &Tensor,
+        _bias: Option<&Tensor>,
+        _scale: &Tensor,
+        _shift: &Tensor,
+        _eps: f32,
+    ) -> Option<Result<Tensor>> {
+        None
+    }
 
     /// Fused multi-LoRA matmul: y = base_weight @ x + scale * (lora_b @ lora_a @ x).
     /// adapter_indices: [batch] mapping each token to its adapter (-1 = no LoRA).
     fn fused_lora_matmul(
-        &self, _x: &Tensor, _base_weight: &Tensor,
-        _lora_a: &Tensor, _lora_b: &Tensor,
-        _adapter_indices: &Tensor, _lora_scale: f32,
-    ) -> Option<Result<Tensor>> { None }
+        &self,
+        _x: &Tensor,
+        _base_weight: &Tensor,
+        _lora_a: &Tensor,
+        _lora_b: &Tensor,
+        _adapter_indices: &Tensor,
+        _lora_scale: f32,
+    ) -> Option<Result<Tensor>> {
+        None
+    }
 
     /// Fused Gated DeltaNet (KDA) batched single-token decode.
     ///
@@ -280,7 +567,9 @@ pub trait Ops: Send + Sync {
         _dt_bias: &Tensor,
         _pool_state: &Tensor,
         _slot_ids: &Tensor,
-    ) -> Option<Result<Tensor>> { None }
+    ) -> Option<Result<Tensor>> {
+        None
+    }
 
     /// True iff `kda_decode_batched` would run successfully on the current
     /// device and shape. Callers use this to gate the fused decode fast
@@ -291,7 +580,9 @@ pub trait Ops: Send + Sync {
     ///
     /// Default: `false` (no kda kernel — caller should pick the
     /// composed path directly).
-    fn kda_decode_available(&self) -> bool { false }
+    fn kda_decode_available(&self) -> bool {
+        false
+    }
 
     /// Fused short causal 1D convolution (Dao-AILab causal-conv1d).
     ///
@@ -330,7 +621,9 @@ pub trait Ops: Send + Sync {
         _bias: Option<&Tensor>,
         _initial_states: Option<&Tensor>,
         _silu_activation: bool,
-    ) -> Option<Result<Tensor>> { None }
+    ) -> Option<Result<Tensor>> {
+        None
+    }
 
     /// Single-token decode step for causal conv1d. Reads the tail of
     /// `conv_state`, computes the output at the new token, and updates
@@ -355,7 +648,9 @@ pub trait Ops: Send + Sync {
         _bias: Option<&Tensor>,
         _silu_activation: bool,
         _conv_state_indices: Option<&Tensor>,
-    ) -> Option<Result<Tensor>> { None }
+    ) -> Option<Result<Tensor>> {
+        None
+    }
 
     /// Fused post-conv1d prep for Qwen3.5 / Qwen3-next DeltaNet.
     ///
@@ -390,7 +685,9 @@ pub trait Ops: Send + Sync {
         _num_k_heads: usize,
         _num_v_heads: usize,
         _head_dim: usize,
-    ) -> Option<Result<(Tensor, Tensor, Tensor, Tensor, Tensor)>> { None }
+    ) -> Option<Result<(Tensor, Tensor, Tensor, Tensor, Tensor)>> {
+        None
+    }
 
     /// Fused gather + log_softmax for prompt_logprobs extraction.
     ///
@@ -425,11 +722,7 @@ pub trait Ops: Send + Sync {
     /// and `Some(Err(_))` on kernel launch failure. The caller is
     /// expected to have a fallback path (e.g. the naive
     /// `log_softmax` + `gather` on-device) when `None` is returned.
-    fn gather_log_softmax(
-        &self,
-        _logits: &Tensor,
-        _target_ids: &Tensor,
-    ) -> Option<Result<Tensor>> {
+    fn gather_log_softmax(&self, _logits: &Tensor, _target_ids: &Tensor) -> Option<Result<Tensor>> {
         None
     }
 
@@ -473,38 +766,61 @@ pub trait Ops: Send + Sync {
         _cu_seqlens: &Tensor,
         _initial_state: Option<&Tensor>,
         _scale: f32,
-    ) -> Option<Result<(Tensor, Tensor)>> { None }
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        None
+    }
 
     // ════════════════════════════════════════════════════════════════
     // Convenience: try fused → fallback to composed
     // ════════════════════════════════════════════════════════════════
 
-    fn add_rmsnorm(&self, residual: &Tensor, x: &Tensor, weight: &Tensor, eps: f32) -> Result<(Tensor, Tensor)> {
-        if let Some(r) = self.fused_add_rmsnorm(residual, x, weight, eps) { return r; }
+    fn add_rmsnorm(
+        &self,
+        residual: &Tensor,
+        x: &Tensor,
+        weight: &Tensor,
+        eps: f32,
+    ) -> Result<(Tensor, Tensor)> {
+        if let Some(r) = self.fused_add_rmsnorm(residual, x, weight, eps) {
+            return r;
+        }
         let sum = (residual + x)?;
         let normed = self.rms_norm(&sum, weight, eps)?;
         Ok((sum, normed))
     }
 
     fn silu_mul(&self, gate: &Tensor, up: &Tensor) -> Result<Tensor> {
-        if let Some(r) = self.fused_silu_mul(gate, up) { return r; }
+        if let Some(r) = self.fused_silu_mul(gate, up) {
+            return r;
+        }
         gate.silu()?.broadcast_mul(up)
     }
 
     fn gelu_mul(&self, gate: &Tensor, up: &Tensor) -> Result<Tensor> {
-        if let Some(r) = self.fused_gelu_mul(gate, up) { return r; }
+        if let Some(r) = self.fused_gelu_mul(gate, up) {
+            return r;
+        }
         gate.gelu()?.broadcast_mul(up)
     }
 
     fn add_or_fused(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
-        if let Some(r) = self.fused_add(a, b) { return r; }
+        if let Some(r) = self.fused_add(a, b) {
+            return r;
+        }
         a.broadcast_add(b)
     }
 
     fn qknorm_rope_and_cache(
-        &self, q: &Tensor, k: &Tensor, v: &Tensor,
-        q_weight: &Tensor, k_weight: &Tensor,
-        cos: &Tensor, sin: &Tensor, position_ids: &Tensor, eps: f32,
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        q_weight: &Tensor,
+        k_weight: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        position_ids: &Tensor,
+        eps: f32,
         kv_cache: Option<(&Tensor, &Tensor, &Tensor)>,
     ) -> Result<(Tensor, Tensor)> {
         // Fast path: when paged KV cache is provided, fuse K-norm,
@@ -517,12 +833,21 @@ pub trait Ops: Send + Sync {
         // works on the (rare) non-paged branch.
         if let Some((kc, vc, sm)) = kv_cache {
             if let Some(kr) = self.fused_knorm_rope_cache_write(
-                k, v, k_weight, cos, sin, position_ids, kc, vc, sm, eps,
+                k,
+                v,
+                k_weight,
+                cos,
+                sin,
+                position_ids,
+                kc,
+                vc,
+                sm,
+                eps,
             ) {
                 kr?;
-                let q_out = if let Some(r) = self.fused_q_norm_rope(
-                    q, q_weight, cos, sin, position_ids, eps,
-                ) {
+                let q_out = if let Some(r) =
+                    self.fused_q_norm_rope(q, q_weight, cos, sin, position_ids, eps)
+                {
                     r?
                 } else {
                     let q_normed = self.rms_norm(q, q_weight, eps)?;
@@ -535,9 +860,13 @@ pub trait Ops: Send + Sync {
                 return Ok((q_out, k.clone()));
             }
         }
-        if let Some(r) = self.fused_qknorm_rope(q, k, q_weight, k_weight, cos, sin, position_ids, eps) {
+        if let Some(r) =
+            self.fused_qknorm_rope(q, k, q_weight, k_weight, cos, sin, position_ids, eps)
+        {
             let (q_out, k_out) = r?;
-            if let Some((kc, vc, sm)) = kv_cache { self.reshape_and_cache(&k_out, v, kc, vc, sm)?; }
+            if let Some((kc, vc, sm)) = kv_cache {
+                self.reshape_and_cache(&k_out, v, kc, vc, sm)?;
+            }
             return Ok((q_out, k_out));
         }
         let q_normed = self.rms_norm(q, q_weight, eps)?;
@@ -546,9 +875,13 @@ pub trait Ops: Send + Sync {
         let q_sin = sin.index_select(position_ids, 0)?;
         let (total, hq, d) = q_normed.dims3()?;
         let hk = k_normed.dim(1)?;
-        let q_out = rope_thd(&q_normed.reshape((1, total, hq, d))?, &q_cos, &q_sin)?.reshape((total, hq, d))?;
-        let k_out = rope_thd(&k_normed.reshape((1, total, hk, d))?, &q_cos, &q_sin)?.reshape((total, hk, d))?;
-        if let Some((kc, vc, sm)) = kv_cache { self.reshape_and_cache(&k_out, v, kc, vc, sm)?; }
+        let q_out = rope_thd(&q_normed.reshape((1, total, hq, d))?, &q_cos, &q_sin)?
+            .reshape((total, hq, d))?;
+        let k_out = rope_thd(&k_normed.reshape((1, total, hk, d))?, &q_cos, &q_sin)?
+            .reshape((total, hk, d))?;
+        if let Some((kc, vc, sm)) = kv_cache {
+            self.reshape_and_cache(&k_out, v, kc, vc, sm)?;
+        }
         Ok((q_out, k_out))
     }
 
@@ -560,20 +893,53 @@ pub trait Ops: Send + Sync {
     // their own kernels. CUDA leaves them as None.
     // ════════════════════════════════════════════════════════════════
 
-    fn unary(&self, _x: &Tensor, _op: UnaryOp) -> Option<Result<Tensor>> { None }
-    fn binary(&self, _a: &Tensor, _b: &Tensor, _op: BinaryOp) -> Option<Result<Tensor>> { None }
-    fn matmul(&self, _a: &Tensor, _b: &Tensor) -> Option<Result<Tensor>> { None }
-    fn contiguous(&self, _x: &Tensor) -> Option<Result<Tensor>> { None }
-    fn to_dtype(&self, _x: &Tensor, _dtype: DType) -> Option<Result<Tensor>> { None }
-    fn where_cond(&self, _cond: &Tensor, _on_true: &Tensor, _on_false: &Tensor) -> Option<Result<Tensor>> { None }
-    fn index_select(&self, _x: &Tensor, _ids: &Tensor, _dim: usize) -> Option<Result<Tensor>> { None }
-    fn gather(&self, _x: &Tensor, _ids: &Tensor, _dim: usize) -> Option<Result<Tensor>> { None }
-    fn cat(&self, _tensors: &[&Tensor], _dim: usize) -> Option<Result<Tensor>> { None }
-    fn reduce_sum(&self, _x: &Tensor, _dims: &[usize]) -> Option<Result<Tensor>> { None }
-    fn reduce_max(&self, _x: &Tensor, _dims: &[usize]) -> Option<Result<Tensor>> { None }
-    fn reduce_min(&self, _x: &Tensor, _dims: &[usize]) -> Option<Result<Tensor>> { None }
-    fn affine(&self, _x: &Tensor, _mul: f64, _add: f64) -> Option<Result<Tensor>> { None }
-    fn to_device(&self, _x: &Tensor, _device: &crate::tensor::Device) -> Option<Result<Tensor>> { None }
+    fn unary(&self, _x: &Tensor, _op: UnaryOp) -> Option<Result<Tensor>> {
+        None
+    }
+    fn binary(&self, _a: &Tensor, _b: &Tensor, _op: BinaryOp) -> Option<Result<Tensor>> {
+        None
+    }
+    fn matmul(&self, _a: &Tensor, _b: &Tensor) -> Option<Result<Tensor>> {
+        None
+    }
+    fn contiguous(&self, _x: &Tensor) -> Option<Result<Tensor>> {
+        None
+    }
+    fn to_dtype(&self, _x: &Tensor, _dtype: DType) -> Option<Result<Tensor>> {
+        None
+    }
+    fn where_cond(
+        &self,
+        _cond: &Tensor,
+        _on_true: &Tensor,
+        _on_false: &Tensor,
+    ) -> Option<Result<Tensor>> {
+        None
+    }
+    fn index_select(&self, _x: &Tensor, _ids: &Tensor, _dim: usize) -> Option<Result<Tensor>> {
+        None
+    }
+    fn gather(&self, _x: &Tensor, _ids: &Tensor, _dim: usize) -> Option<Result<Tensor>> {
+        None
+    }
+    fn cat(&self, _tensors: &[&Tensor], _dim: usize) -> Option<Result<Tensor>> {
+        None
+    }
+    fn reduce_sum(&self, _x: &Tensor, _dims: &[usize]) -> Option<Result<Tensor>> {
+        None
+    }
+    fn reduce_max(&self, _x: &Tensor, _dims: &[usize]) -> Option<Result<Tensor>> {
+        None
+    }
+    fn reduce_min(&self, _x: &Tensor, _dims: &[usize]) -> Option<Result<Tensor>> {
+        None
+    }
+    fn affine(&self, _x: &Tensor, _mul: f64, _add: f64) -> Option<Result<Tensor>> {
+        None
+    }
+    fn to_device(&self, _x: &Tensor, _device: &crate::tensor::Device) -> Option<Result<Tensor>> {
+        None
+    }
 
     // ════════════════════════════════════════════════════════════════
     // Sampling
@@ -586,11 +952,9 @@ pub trait Ops: Send + Sync {
     ///
     /// `None` means the backend does not support GPU sampling;
     /// caller falls back to per-sequence CPU sampling.
-    fn sample_from_logits(
-        &self,
-        _logits: &Tensor,
-        _deterministic: bool,
-    ) -> Option<Result<Tensor>> { None }
+    fn sample_from_logits(&self, _logits: &Tensor, _deterministic: bool) -> Option<Result<Tensor>> {
+        None
+    }
 
     /// Batched top-k + top-p sampling from logits on GPU.
     ///
@@ -602,7 +966,9 @@ pub trait Ops: Send + Sync {
         _top_k: i64,
         _top_p: f64,
         _deterministic: bool,
-    ) -> Option<Result<Tensor>> { None }
+    ) -> Option<Result<Tensor>> {
+        None
+    }
 
     // ════════════════════════════════════════════════════════════════
     // Session lifecycle
@@ -610,9 +976,23 @@ pub trait Ops: Send + Sync {
 
     fn begin_forward(&self) {}
     fn end_forward(&self) {}
-    fn precompute_paged_plan(&self, _q_shape: (usize, usize, usize), _kc: &Tensor, _csq: &Tensor, _bt: &Tensor, _csk: &Tensor, _scale: f32) -> Result<()> { Ok(()) }
-    fn gpu_free_memory(&self) -> Option<usize> { None }
-    fn gpu_total_memory(&self) -> Option<usize> { None }
+    fn precompute_paged_plan(
+        &self,
+        _q_shape: (usize, usize, usize),
+        _kc: &Tensor,
+        _csq: &Tensor,
+        _bt: &Tensor,
+        _csk: &Tensor,
+        _scale: f32,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn gpu_free_memory(&self) -> Option<usize> {
+        None
+    }
+    fn gpu_total_memory(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Re-export candle-nn rope_thd for use in default implementations.
@@ -626,7 +1006,9 @@ mod tests {
     /// Minimal Ops impl — all defaults inherited.
     struct StubOps;
     impl Ops for StubOps {
-        fn default_impl(&self) -> &dyn Ops { self }
+        fn default_impl(&self) -> &dyn Ops {
+            self
+        }
     }
 
     #[test]
@@ -642,7 +1024,10 @@ mod tests {
         assert!(ops.fused_moe_routing(&t, 2, true).is_none());
 
         // New fused ops from design
-        assert!(ops.fused_adaln_zero(&t, &t, None, &t, &t, &t, 1e-5).is_none());
+        assert!(
+            ops.fused_adaln_zero(&t, &t, None, &t, &t, &t, 1e-5)
+                .is_none()
+        );
         assert!(ops.fused_scale_shift(&t, &t, None, &t, &t, 1e-5).is_none());
         assert!(ops.fused_lora_matmul(&t, &t, &t, &t, &t, 1.0).is_none());
 

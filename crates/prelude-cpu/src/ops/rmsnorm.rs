@@ -30,7 +30,14 @@ pub fn cpu_rmsnorm(input: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> 
             let in_slice = super::tensor_as_u16_slice(&input_2d)?;
             let w_slice = super::tensor_as_u16_slice(weight)?;
             let mut out_buf = vec![0u16; batch_size * hidden_size];
-            rmsnorm_bf16(&mut out_buf, in_slice, w_slice, batch_size, hidden_size, eps as f32);
+            rmsnorm_bf16(
+                &mut out_buf,
+                in_slice,
+                w_slice,
+                batch_size,
+                hidden_size,
+                eps as f32,
+            );
             super::u16_vec_to_bf16_tensor(out_buf, dims, input.device())
         }
         DType::F32 => {
@@ -39,7 +46,14 @@ pub fn cpu_rmsnorm(input: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> 
             let w_data = weight.to_vec1::<f32>()?;
             let n = batch_size * hidden_size;
             let mut out_buf = vec![0f32; n];
-            rmsnorm_f32(&mut out_buf, &in_data[..n], &w_data, batch_size, hidden_size, eps as f32);
+            rmsnorm_f32(
+                &mut out_buf,
+                &in_data[..n],
+                &w_data,
+                batch_size,
+                hidden_size,
+                eps as f32,
+            );
             Tensor::from_vec(out_buf, dims, input.device())
         }
         _ => cpu_rmsnorm_typed::<half::f16>(input, weight, batch_size, hidden_size, eps, dims),
@@ -47,8 +61,11 @@ pub fn cpu_rmsnorm(input: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> 
 }
 
 fn cpu_rmsnorm_typed<T: CpuFloat>(
-    input: &Tensor, weight: &Tensor,
-    batch_size: usize, hidden_size: usize, eps: f64,
+    input: &Tensor,
+    weight: &Tensor,
+    batch_size: usize,
+    hidden_size: usize,
+    eps: f64,
     dims: &[usize],
 ) -> Result<Tensor> {
     let input_t = input.to_dtype(T::DTYPE)?;
@@ -62,11 +79,19 @@ fn cpu_rmsnorm_typed<T: CpuFloat>(
 
     const RAYON_MIN_ELEMS: usize = 16384;
     if !super::should_parallelize(n, batch_size, RAYON_MIN_ELEMS) {
-        rmsnorm_generic(&mut out_buf, &in_data[..n], &w_data, batch_size, hidden_size, eps_f32);
+        rmsnorm_generic(
+            &mut out_buf,
+            &in_data[..n],
+            &w_data,
+            batch_size,
+            hidden_size,
+            eps_f32,
+        );
     } else {
         use rayon::prelude::*;
         let hs = hidden_size;
-        out_buf.par_chunks_mut(hs)
+        out_buf
+            .par_chunks_mut(hs)
             .zip(in_data[..n].par_chunks(hs))
             .for_each(|(out_row, in_row)| {
                 rmsnorm_generic(out_row, in_row, &w_data, 1, hs, eps_f32);
@@ -102,11 +127,19 @@ pub fn cpu_fused_add_rmsnorm(
             let mut norm_buf = Vec::with_capacity(n);
             let mut res_buf = Vec::with_capacity(n);
             // SAFETY: fused_add_rmsnorm_bf16_oop writes every element before returning.
-            unsafe { norm_buf.set_len(n); res_buf.set_len(n); }
+            unsafe {
+                norm_buf.set_len(n);
+                res_buf.set_len(n);
+            }
             fused_add_rmsnorm_bf16_oop(
-                &in_slice[..n], &res_slice[..n],
-                &mut norm_buf, &mut res_buf,
-                w_slice, batch_size, hidden_size, eps as f32,
+                &in_slice[..n],
+                &res_slice[..n],
+                &mut norm_buf,
+                &mut res_buf,
+                w_slice,
+                batch_size,
+                hidden_size,
+                eps as f32,
             );
             let res_out = super::u16_vec_to_bf16_tensor(res_buf, dims, input.device())?;
             let norm_out = super::u16_vec_to_bf16_tensor(norm_buf, dims, input.device())?;
@@ -120,23 +153,45 @@ pub fn cpu_fused_add_rmsnorm(
             let w_data = weight.to_vec1::<f32>()?;
             let mut norm_buf = Vec::with_capacity(n);
             let mut res_buf = Vec::with_capacity(n);
-            unsafe { norm_buf.set_len(n); res_buf.set_len(n); }
+            unsafe {
+                norm_buf.set_len(n);
+                res_buf.set_len(n);
+            }
             fused_add_rmsnorm_f32_oop(
-                &in_data[..n], &res_data[..n],
-                &mut norm_buf, &mut res_buf,
-                &w_data, batch_size, hidden_size, eps as f32,
+                &in_data[..n],
+                &res_data[..n],
+                &mut norm_buf,
+                &mut res_buf,
+                &w_data,
+                batch_size,
+                hidden_size,
+                eps as f32,
             );
             let res_out = Tensor::from_vec(res_buf, dims, input.device())?;
             let norm_out = Tensor::from_vec(norm_buf, dims, input.device())?;
             Ok((res_out, norm_out))
         }
-        _ => cpu_fused_add_rmsnorm_typed::<half::f16>(input, residual, weight, batch_size, hidden_size, n, eps, dims),
+        _ => cpu_fused_add_rmsnorm_typed::<half::f16>(
+            input,
+            residual,
+            weight,
+            batch_size,
+            hidden_size,
+            n,
+            eps,
+            dims,
+        ),
     }
 }
 
 fn cpu_fused_add_rmsnorm_typed<T: CpuFloat>(
-    input: &Tensor, residual: &Tensor, weight: &Tensor,
-    batch_size: usize, hidden_size: usize, n: usize, eps: f64,
+    input: &Tensor,
+    residual: &Tensor,
+    weight: &Tensor,
+    batch_size: usize,
+    hidden_size: usize,
+    n: usize,
+    eps: f64,
     dims: &[usize],
 ) -> Result<(Tensor, Tensor)> {
     let input_t = input.to_dtype(T::DTYPE)?.contiguous()?;
@@ -153,20 +208,29 @@ fn cpu_fused_add_rmsnorm_typed<T: CpuFloat>(
     const RAYON_MIN_ELEMS: usize = 16384;
     if !super::should_parallelize(n, batch_size, RAYON_MIN_ELEMS) {
         fused_add_rmsnorm_generic_oop(
-            &in_data[..n], &res_data[..n], &mut norm_buf, &mut res_buf,
-            &w_data, batch_size, hidden_size, eps_f32,
+            &in_data[..n],
+            &res_data[..n],
+            &mut norm_buf,
+            &mut res_buf,
+            &w_data,
+            batch_size,
+            hidden_size,
+            eps_f32,
         );
     } else {
         // Parallel: split rows across rayon threads.
         // (GemmPool requires non-generic fn pointers; rayon handles generics via closures.)
         use rayon::prelude::*;
         let hs = hidden_size;
-        norm_buf.par_chunks_mut(hs)
+        norm_buf
+            .par_chunks_mut(hs)
             .zip(res_buf.par_chunks_mut(hs))
             .zip(in_data[..n].par_chunks(hs))
             .zip(res_data[..n].par_chunks(hs))
             .for_each(|(((norm_row, res_row), in_row), res_in_row)| {
-                fused_add_rmsnorm_generic_oop(in_row, res_in_row, norm_row, res_row, &w_data, 1, hs, eps_f32);
+                fused_add_rmsnorm_generic_oop(
+                    in_row, res_in_row, norm_row, res_row, &w_data, 1, hs, eps_f32,
+                );
             });
     }
 
@@ -194,7 +258,7 @@ impl Module for CpuRmsNorm {
     }
 }
 
-// ── Raw kernel API (u16 slices, used by raw_cpu.rs) ─────────────────────
+// ── Raw kernel API (u16/f32 slices, used by Tensor-level wrappers) ───────
 
 /// Minimum elements per thread to justify parallelization overhead.
 /// With mimalloc (no mmap page faults), GemmPool dispatch is ~5µs.
@@ -227,8 +291,12 @@ pub fn rmsnorm_bf16(
     // Use GemmPool (spinning threads) instead of rayon to avoid contention
     #[repr(C)]
     struct Ctx {
-        out_ptr: usize, in_ptr: usize, w_ptr: usize,
-        batch_size: usize, hidden_size: usize, eps: f32,
+        out_ptr: usize,
+        in_ptr: usize,
+        w_ptr: usize,
+        batch_size: usize,
+        hidden_size: usize,
+        eps: f32,
     }
     unsafe fn work(tid: usize, n_threads: usize, ctx_raw: *const u8) {
         unsafe {
@@ -236,30 +304,48 @@ pub fn rmsnorm_bf16(
             let rows_per = (c.batch_size + n_threads - 1) / n_threads;
             let start = tid * rows_per;
             let end = (start + rows_per).min(c.batch_size);
-            if start >= end { return; }
+            if start >= end {
+                return;
+            }
             let chunk = end - start;
             let off = start * c.hidden_size;
-            let out = std::slice::from_raw_parts_mut((c.out_ptr as *mut u16).add(off), chunk * c.hidden_size);
-            let inp = std::slice::from_raw_parts((c.in_ptr as *const u16).add(off), chunk * c.hidden_size);
+            let out = std::slice::from_raw_parts_mut(
+                (c.out_ptr as *mut u16).add(off),
+                chunk * c.hidden_size,
+            );
+            let inp = std::slice::from_raw_parts(
+                (c.in_ptr as *const u16).add(off),
+                chunk * c.hidden_size,
+            );
             let w = std::slice::from_raw_parts(c.w_ptr as *const u16, c.hidden_size);
             rmsnorm_impl(out, inp, w, chunk, c.hidden_size, c.eps);
         }
     }
     let ctx = Ctx {
-        out_ptr: output.as_mut_ptr() as usize, in_ptr: input.as_ptr() as usize,
-        w_ptr: weight.as_ptr() as usize, batch_size, hidden_size, eps,
+        out_ptr: output.as_mut_ptr() as usize,
+        in_ptr: input.as_ptr() as usize,
+        w_ptr: weight.as_ptr() as usize,
+        batch_size,
+        hidden_size,
+        eps,
     };
     let pool = super::gemm_pool::gemm_pool();
     // Adaptive thread count: ensure each thread gets enough work to amortize dispatch overhead
     let max_by_work = total / MIN_ELEMS_PER_THREAD;
     let n = pool.num_threads().min(batch_size).min(max_by_work.max(1));
-    unsafe { pool.dispatch(work, &ctx as *const Ctx as *const u8, n); }
+    unsafe {
+        pool.dispatch(work, &ctx as *const Ctx as *const u8, n);
+    }
 }
 
 /// RMSNorm for F32 data. AVX-512 kernel + GemmPool parallel dispatch.
 fn rmsnorm_f32(
-    output: &mut [f32], input: &[f32], weight: &[f32],
-    batch_size: usize, hidden_size: usize, eps: f32,
+    output: &mut [f32],
+    input: &[f32],
+    weight: &[f32],
+    batch_size: usize,
+    hidden_size: usize,
+    eps: f32,
 ) {
     let total = batch_size * hidden_size;
     if !super::should_parallelize(total, batch_size, MIN_ELEMS_PER_THREAD) {
@@ -268,8 +354,12 @@ fn rmsnorm_f32(
     }
     #[repr(C)]
     struct Ctx {
-        out_ptr: usize, in_ptr: usize, w_ptr: usize,
-        batch_size: usize, hidden_size: usize, eps: f32,
+        out_ptr: usize,
+        in_ptr: usize,
+        w_ptr: usize,
+        batch_size: usize,
+        hidden_size: usize,
+        eps: f32,
     }
     unsafe fn work(tid: usize, n_threads: usize, ctx_raw: *const u8) {
         unsafe {
@@ -277,28 +367,46 @@ fn rmsnorm_f32(
             let rows_per = (c.batch_size + n_threads - 1) / n_threads;
             let start = tid * rows_per;
             let end = (start + rows_per).min(c.batch_size);
-            if start >= end { return; }
+            if start >= end {
+                return;
+            }
             let chunk = end - start;
             let off = start * c.hidden_size;
-            let out = std::slice::from_raw_parts_mut((c.out_ptr as *mut f32).add(off), chunk * c.hidden_size);
-            let inp = std::slice::from_raw_parts((c.in_ptr as *const f32).add(off), chunk * c.hidden_size);
+            let out = std::slice::from_raw_parts_mut(
+                (c.out_ptr as *mut f32).add(off),
+                chunk * c.hidden_size,
+            );
+            let inp = std::slice::from_raw_parts(
+                (c.in_ptr as *const f32).add(off),
+                chunk * c.hidden_size,
+            );
             let w = std::slice::from_raw_parts(c.w_ptr as *const f32, c.hidden_size);
             rmsnorm_f32_impl(out, inp, w, chunk, c.hidden_size, c.eps);
         }
     }
     let ctx = Ctx {
-        out_ptr: output.as_mut_ptr() as usize, in_ptr: input.as_ptr() as usize,
-        w_ptr: weight.as_ptr() as usize, batch_size, hidden_size, eps,
+        out_ptr: output.as_mut_ptr() as usize,
+        in_ptr: input.as_ptr() as usize,
+        w_ptr: weight.as_ptr() as usize,
+        batch_size,
+        hidden_size,
+        eps,
     };
     let pool = super::gemm_pool::gemm_pool();
     let max_by_work = total / MIN_ELEMS_PER_THREAD;
     let n = pool.num_threads().min(batch_size).min(max_by_work.max(1));
-    unsafe { pool.dispatch(work, &ctx as *const Ctx as *const u8, n); }
+    unsafe {
+        pool.dispatch(work, &ctx as *const Ctx as *const u8, n);
+    }
 }
 
 fn rmsnorm_f32_impl(
-    output: &mut [f32], input: &[f32], weight: &[f32],
-    batch_size: usize, hidden_size: usize, eps: f32,
+    output: &mut [f32],
+    input: &[f32],
+    weight: &[f32],
+    batch_size: usize,
+    hidden_size: usize,
+    eps: f32,
 ) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -314,44 +422,50 @@ fn rmsnorm_f32_impl(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn rmsnorm_f32_avx512(
-    output: &mut [f32], input: &[f32], weight: &[f32],
-    batch_size: usize, hidden_size: usize, eps: f32,
-) { unsafe {
-    use core::arch::x86_64::*;
-    let chunks = hidden_size / 16;
-    let inv_n = 1.0f32 / hidden_size as f32;
+    output: &mut [f32],
+    input: &[f32],
+    weight: &[f32],
+    batch_size: usize,
+    hidden_size: usize,
+    eps: f32,
+) {
+    unsafe {
+        use core::arch::x86_64::*;
+        let chunks = hidden_size / 16;
+        let inv_n = 1.0f32 / hidden_size as f32;
 
-    for b in 0..batch_size {
-        let off = b * hidden_size;
-        let in_ptr = input.as_ptr().add(off);
-        let out_ptr = output.as_mut_ptr().add(off);
-        let w_ptr = weight.as_ptr();
+        for b in 0..batch_size {
+            let off = b * hidden_size;
+            let in_ptr = input.as_ptr().add(off);
+            let out_ptr = output.as_mut_ptr().add(off);
+            let w_ptr = weight.as_ptr();
 
-        let mut sum_sq = _mm512_setzero_ps();
-        for i in 0..chunks {
-            let x = _mm512_loadu_ps(in_ptr.add(i * 16));
-            sum_sq = _mm512_fmadd_ps(x, x, sum_sq);
-        }
-        let mut total_sq = _mm512_reduce_add_ps(sum_sq);
-        for j in (chunks * 16)..hidden_size {
-            let v = *in_ptr.add(j);
-            total_sq += v * v;
-        }
+            let mut sum_sq = _mm512_setzero_ps();
+            for i in 0..chunks {
+                let x = _mm512_loadu_ps(in_ptr.add(i * 16));
+                sum_sq = _mm512_fmadd_ps(x, x, sum_sq);
+            }
+            let mut total_sq = _mm512_reduce_add_ps(sum_sq);
+            for j in (chunks * 16)..hidden_size {
+                let v = *in_ptr.add(j);
+                total_sq += v * v;
+            }
 
-        let scale = 1.0f32 / (total_sq * inv_n + eps).sqrt();
-        let scale_v = _mm512_set1_ps(scale);
+            let scale = 1.0f32 / (total_sq * inv_n + eps).sqrt();
+            let scale_v = _mm512_set1_ps(scale);
 
-        for i in 0..chunks {
-            let x = _mm512_loadu_ps(in_ptr.add(i * 16));
-            let w = _mm512_loadu_ps(w_ptr.add(i * 16));
-            let r = _mm512_mul_ps(_mm512_mul_ps(x, w), scale_v);
-            _mm512_storeu_ps(out_ptr.add(i * 16), r);
-        }
-        for j in (chunks * 16)..hidden_size {
-            output[off + j] = input[off + j] * weight[j] * scale;
+            for i in 0..chunks {
+                let x = _mm512_loadu_ps(in_ptr.add(i * 16));
+                let w = _mm512_loadu_ps(w_ptr.add(i * 16));
+                let r = _mm512_mul_ps(_mm512_mul_ps(x, w), scale_v);
+                _mm512_storeu_ps(out_ptr.add(i * 16), r);
+            }
+            for j in (chunks * 16)..hidden_size {
+                output[off + j] = input[off + j] * weight[j] * scale;
+            }
         }
     }
-}}
+}
 
 /// Out-of-place fused residual-add + RMSNorm for BF16 data.
 ///
@@ -380,16 +494,29 @@ fn fused_add_rmsnorm_bf16_oop(
 
     let total = batch_size * hidden_size;
     if !super::should_parallelize(total, batch_size, MIN_ELEMS_PER_THREAD) {
-        fused_add_rmsnorm_oop_impl(input, residual, norm_out, res_out, weight, batch_size, hidden_size, eps);
+        fused_add_rmsnorm_oop_impl(
+            input,
+            residual,
+            norm_out,
+            res_out,
+            weight,
+            batch_size,
+            hidden_size,
+            eps,
+        );
         return;
     }
 
     #[repr(C)]
     struct Ctx {
-        in_ptr: usize, res_ptr: usize,
-        nout_ptr: usize, rout_ptr: usize,
+        in_ptr: usize,
+        res_ptr: usize,
+        nout_ptr: usize,
+        rout_ptr: usize,
         w_ptr: usize,
-        batch_size: usize, hidden_size: usize, eps: f32,
+        batch_size: usize,
+        hidden_size: usize,
+        eps: f32,
     }
     unsafe fn work(tid: usize, n_threads: usize, ctx_raw: *const u8) {
         unsafe {
@@ -397,47 +524,85 @@ fn fused_add_rmsnorm_bf16_oop(
             let rows_per = (c.batch_size + n_threads - 1) / n_threads;
             let start = tid * rows_per;
             let end = (start + rows_per).min(c.batch_size);
-            if start >= end { return; }
+            if start >= end {
+                return;
+            }
             let chunk = end - start;
             let off = start * c.hidden_size;
-            let inp = std::slice::from_raw_parts((c.in_ptr as *const u16).add(off), chunk * c.hidden_size);
-            let res = std::slice::from_raw_parts((c.res_ptr as *const u16).add(off), chunk * c.hidden_size);
-            let nout = std::slice::from_raw_parts_mut((c.nout_ptr as *mut u16).add(off), chunk * c.hidden_size);
-            let rout = std::slice::from_raw_parts_mut((c.rout_ptr as *mut u16).add(off), chunk * c.hidden_size);
+            let inp = std::slice::from_raw_parts(
+                (c.in_ptr as *const u16).add(off),
+                chunk * c.hidden_size,
+            );
+            let res = std::slice::from_raw_parts(
+                (c.res_ptr as *const u16).add(off),
+                chunk * c.hidden_size,
+            );
+            let nout = std::slice::from_raw_parts_mut(
+                (c.nout_ptr as *mut u16).add(off),
+                chunk * c.hidden_size,
+            );
+            let rout = std::slice::from_raw_parts_mut(
+                (c.rout_ptr as *mut u16).add(off),
+                chunk * c.hidden_size,
+            );
             let w = std::slice::from_raw_parts(c.w_ptr as *const u16, c.hidden_size);
             fused_add_rmsnorm_oop_impl(inp, res, nout, rout, w, chunk, c.hidden_size, c.eps);
         }
     }
     let ctx = Ctx {
-        in_ptr: input.as_ptr() as usize, res_ptr: residual.as_ptr() as usize,
-        nout_ptr: norm_out.as_mut_ptr() as usize, rout_ptr: res_out.as_mut_ptr() as usize,
-        w_ptr: weight.as_ptr() as usize, batch_size, hidden_size, eps,
+        in_ptr: input.as_ptr() as usize,
+        res_ptr: residual.as_ptr() as usize,
+        nout_ptr: norm_out.as_mut_ptr() as usize,
+        rout_ptr: res_out.as_mut_ptr() as usize,
+        w_ptr: weight.as_ptr() as usize,
+        batch_size,
+        hidden_size,
+        eps,
     };
     let pool = super::gemm_pool::gemm_pool();
     let max_by_work = total / MIN_ELEMS_PER_THREAD;
     let n = pool.num_threads().min(batch_size).min(max_by_work.max(1));
-    unsafe { pool.dispatch(work, &ctx as *const Ctx as *const u8, n); }
+    unsafe {
+        pool.dispatch(work, &ctx as *const Ctx as *const u8, n);
+    }
 }
 
 /// Out-of-place fused residual-add + RMSNorm for F32 data.
 /// Same structure as the BF16 variant: AVX-512 kernel + GemmPool parallel dispatch.
 fn fused_add_rmsnorm_f32_oop(
-    input: &[f32], residual: &[f32],
-    norm_out: &mut [f32], res_out: &mut [f32],
+    input: &[f32],
+    residual: &[f32],
+    norm_out: &mut [f32],
+    res_out: &mut [f32],
     weight: &[f32],
-    batch_size: usize, hidden_size: usize, eps: f32,
+    batch_size: usize,
+    hidden_size: usize,
+    eps: f32,
 ) {
     let total = batch_size * hidden_size;
     if !super::should_parallelize(total, batch_size, MIN_ELEMS_PER_THREAD) {
-        fused_add_rmsnorm_f32_oop_impl(input, residual, norm_out, res_out, weight, batch_size, hidden_size, eps);
+        fused_add_rmsnorm_f32_oop_impl(
+            input,
+            residual,
+            norm_out,
+            res_out,
+            weight,
+            batch_size,
+            hidden_size,
+            eps,
+        );
         return;
     }
     #[repr(C)]
     struct Ctx {
-        in_ptr: usize, res_ptr: usize,
-        nout_ptr: usize, rout_ptr: usize,
+        in_ptr: usize,
+        res_ptr: usize,
+        nout_ptr: usize,
+        rout_ptr: usize,
         w_ptr: usize,
-        batch_size: usize, hidden_size: usize, eps: f32,
+        batch_size: usize,
+        hidden_size: usize,
+        eps: f32,
     }
     unsafe fn work(tid: usize, n_threads: usize, ctx_raw: *const u8) {
         unsafe {
@@ -445,40 +610,72 @@ fn fused_add_rmsnorm_f32_oop(
             let rows_per = (c.batch_size + n_threads - 1) / n_threads;
             let start = tid * rows_per;
             let end = (start + rows_per).min(c.batch_size);
-            if start >= end { return; }
+            if start >= end {
+                return;
+            }
             let chunk = end - start;
             let off = start * c.hidden_size;
-            let inp = std::slice::from_raw_parts((c.in_ptr as *const f32).add(off), chunk * c.hidden_size);
-            let res = std::slice::from_raw_parts((c.res_ptr as *const f32).add(off), chunk * c.hidden_size);
-            let nout = std::slice::from_raw_parts_mut((c.nout_ptr as *mut f32).add(off), chunk * c.hidden_size);
-            let rout = std::slice::from_raw_parts_mut((c.rout_ptr as *mut f32).add(off), chunk * c.hidden_size);
+            let inp = std::slice::from_raw_parts(
+                (c.in_ptr as *const f32).add(off),
+                chunk * c.hidden_size,
+            );
+            let res = std::slice::from_raw_parts(
+                (c.res_ptr as *const f32).add(off),
+                chunk * c.hidden_size,
+            );
+            let nout = std::slice::from_raw_parts_mut(
+                (c.nout_ptr as *mut f32).add(off),
+                chunk * c.hidden_size,
+            );
+            let rout = std::slice::from_raw_parts_mut(
+                (c.rout_ptr as *mut f32).add(off),
+                chunk * c.hidden_size,
+            );
             let w = std::slice::from_raw_parts(c.w_ptr as *const f32, c.hidden_size);
             fused_add_rmsnorm_f32_oop_impl(inp, res, nout, rout, w, chunk, c.hidden_size, c.eps);
         }
     }
     let ctx = Ctx {
-        in_ptr: input.as_ptr() as usize, res_ptr: residual.as_ptr() as usize,
-        nout_ptr: norm_out.as_mut_ptr() as usize, rout_ptr: res_out.as_mut_ptr() as usize,
-        w_ptr: weight.as_ptr() as usize, batch_size, hidden_size, eps,
+        in_ptr: input.as_ptr() as usize,
+        res_ptr: residual.as_ptr() as usize,
+        nout_ptr: norm_out.as_mut_ptr() as usize,
+        rout_ptr: res_out.as_mut_ptr() as usize,
+        w_ptr: weight.as_ptr() as usize,
+        batch_size,
+        hidden_size,
+        eps,
     };
     let pool = super::gemm_pool::gemm_pool();
     let max_by_work = total / MIN_ELEMS_PER_THREAD;
     let n = pool.num_threads().min(batch_size).min(max_by_work.max(1));
-    unsafe { pool.dispatch(work, &ctx as *const Ctx as *const u8, n); }
+    unsafe {
+        pool.dispatch(work, &ctx as *const Ctx as *const u8, n);
+    }
 }
 
 fn fused_add_rmsnorm_f32_oop_impl(
-    input: &[f32], residual: &[f32],
-    norm_out: &mut [f32], res_out: &mut [f32],
+    input: &[f32],
+    residual: &[f32],
+    norm_out: &mut [f32],
+    res_out: &mut [f32],
     weight: &[f32],
-    batch_size: usize, hidden_size: usize, eps: f32,
+    batch_size: usize,
+    hidden_size: usize,
+    eps: f32,
 ) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f") {
             unsafe {
                 return fused_add_rmsnorm_f32_oop_avx512(
-                    input, residual, norm_out, res_out, weight, batch_size, hidden_size, eps,
+                    input,
+                    residual,
+                    norm_out,
+                    res_out,
+                    weight,
+                    batch_size,
+                    hidden_size,
+                    eps,
                 );
             }
         }
@@ -504,58 +701,64 @@ fn fused_add_rmsnorm_f32_oop_impl(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn fused_add_rmsnorm_f32_oop_avx512(
-    input: &[f32], residual: &[f32],
-    norm_out: &mut [f32], res_out: &mut [f32],
+    input: &[f32],
+    residual: &[f32],
+    norm_out: &mut [f32],
+    res_out: &mut [f32],
     weight: &[f32],
-    batch_size: usize, hidden_size: usize, eps: f32,
-) { unsafe {
-    use core::arch::x86_64::*;
+    batch_size: usize,
+    hidden_size: usize,
+    eps: f32,
+) {
+    unsafe {
+        use core::arch::x86_64::*;
 
-    let chunks = hidden_size / 16;
-    let inv_n = 1.0f32 / hidden_size as f32;
+        let chunks = hidden_size / 16;
+        let inv_n = 1.0f32 / hidden_size as f32;
 
-    for b in 0..batch_size {
-        let off = b * hidden_size;
-        let in_ptr = input.as_ptr().add(off);
-        let res_ptr = residual.as_ptr().add(off);
-        let nout_ptr = norm_out.as_mut_ptr().add(off);
-        let rout_ptr = res_out.as_mut_ptr().add(off);
-        let w_ptr = weight.as_ptr();
+        for b in 0..batch_size {
+            let off = b * hidden_size;
+            let in_ptr = input.as_ptr().add(off);
+            let res_ptr = residual.as_ptr().add(off);
+            let nout_ptr = norm_out.as_mut_ptr().add(off);
+            let rout_ptr = res_out.as_mut_ptr().add(off);
+            let w_ptr = weight.as_ptr();
 
-        // Pass 1: sum of squares
-        let mut sum_sq = _mm512_setzero_ps();
-        for i in 0..chunks {
-            let x = _mm512_loadu_ps(in_ptr.add(i * 16));
-            let r = _mm512_loadu_ps(res_ptr.add(i * 16));
-            let added = _mm512_add_ps(x, r);
-            sum_sq = _mm512_fmadd_ps(added, added, sum_sq);
-        }
-        let mut total_sq = _mm512_reduce_add_ps(sum_sq);
-        for j in (chunks * 16)..hidden_size {
-            let added = input[off + j] + residual[off + j];
-            total_sq += added * added;
-        }
+            // Pass 1: sum of squares
+            let mut sum_sq = _mm512_setzero_ps();
+            for i in 0..chunks {
+                let x = _mm512_loadu_ps(in_ptr.add(i * 16));
+                let r = _mm512_loadu_ps(res_ptr.add(i * 16));
+                let added = _mm512_add_ps(x, r);
+                sum_sq = _mm512_fmadd_ps(added, added, sum_sq);
+            }
+            let mut total_sq = _mm512_reduce_add_ps(sum_sq);
+            for j in (chunks * 16)..hidden_size {
+                let added = input[off + j] + residual[off + j];
+                total_sq += added * added;
+            }
 
-        let scale = 1.0f32 / (total_sq * inv_n + eps).sqrt();
-        let scale_v = _mm512_set1_ps(scale);
+            let scale = 1.0f32 / (total_sq * inv_n + eps).sqrt();
+            let scale_v = _mm512_set1_ps(scale);
 
-        // Pass 2: write to separate output buffers
-        for i in 0..chunks {
-            let x = _mm512_loadu_ps(in_ptr.add(i * 16));
-            let r = _mm512_loadu_ps(res_ptr.add(i * 16));
-            let added = _mm512_add_ps(x, r);
-            let w = _mm512_loadu_ps(w_ptr.add(i * 16));
-            _mm512_storeu_ps(rout_ptr.add(i * 16), added);
-            let result = _mm512_mul_ps(_mm512_mul_ps(added, w), scale_v);
-            _mm512_storeu_ps(nout_ptr.add(i * 16), result);
-        }
-        for j in (chunks * 16)..hidden_size {
-            let added = input[off + j] + residual[off + j];
-            res_out[off + j] = added;
-            norm_out[off + j] = added * weight[j] * scale;
+            // Pass 2: write to separate output buffers
+            for i in 0..chunks {
+                let x = _mm512_loadu_ps(in_ptr.add(i * 16));
+                let r = _mm512_loadu_ps(res_ptr.add(i * 16));
+                let added = _mm512_add_ps(x, r);
+                let w = _mm512_loadu_ps(w_ptr.add(i * 16));
+                _mm512_storeu_ps(rout_ptr.add(i * 16), added);
+                let result = _mm512_mul_ps(_mm512_mul_ps(added, w), scale_v);
+                _mm512_storeu_ps(nout_ptr.add(i * 16), result);
+            }
+            for j in (chunks * 16)..hidden_size {
+                let added = input[off + j] + residual[off + j];
+                res_out[off + j] = added;
+                norm_out[off + j] = added * weight[j] * scale;
+            }
         }
     }
-}}
+}
 
 // ── Implementation dispatch (feature detect once, loop inside) ──────────
 
@@ -593,7 +796,6 @@ fn rmsnorm_bf16_scalar_via_generic(
     let w = unsafe { &*(weight as *const [u16] as *const [half::bf16]) };
     rmsnorm_generic(out, inp, w, batch_size, hidden_size, eps);
 }
-
 
 // ── Generic scalar kernels (any CpuFloat dtype) ────────────────────────
 
@@ -720,19 +922,39 @@ fn fused_add_rmsnorm_oop_impl(
         if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
             unsafe {
                 return fused_add_rmsnorm_oop_avx512(
-                    input, residual, norm_out, res_out, weight, batch_size, hidden_size, eps,
+                    input,
+                    residual,
+                    norm_out,
+                    res_out,
+                    weight,
+                    batch_size,
+                    hidden_size,
+                    eps,
                 );
             }
         }
     }
-    fused_add_rmsnorm_oop_scalar(input, residual, norm_out, res_out, weight, batch_size, hidden_size, eps);
+    fused_add_rmsnorm_oop_scalar(
+        input,
+        residual,
+        norm_out,
+        res_out,
+        weight,
+        batch_size,
+        hidden_size,
+        eps,
+    );
 }
 
 fn fused_add_rmsnorm_oop_scalar(
-    input: &[u16], residual: &[u16],
-    norm_out: &mut [u16], res_out: &mut [u16],
+    input: &[u16],
+    residual: &[u16],
+    norm_out: &mut [u16],
+    res_out: &mut [u16],
     weight: &[u16],
-    batch_size: usize, hidden_size: usize, eps: f32,
+    batch_size: usize,
+    hidden_size: usize,
+    eps: f32,
 ) {
     let inv_n = 1.0f32 / hidden_size as f32;
     for b in 0..batch_size {
@@ -754,10 +976,14 @@ fn fused_add_rmsnorm_oop_scalar(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
 fn fused_add_rmsnorm_oop_avx512(
-    input: &[u16], residual: &[u16],
-    norm_out: &mut [u16], res_out: &mut [u16],
+    input: &[u16],
+    residual: &[u16],
+    norm_out: &mut [u16],
+    res_out: &mut [u16],
     weight: &[u16],
-    batch_size: usize, hidden_size: usize, eps: f32,
+    batch_size: usize,
+    hidden_size: usize,
+    eps: f32,
 ) {
     use core::arch::x86_64::*;
 
@@ -813,7 +1039,7 @@ fn fused_add_rmsnorm_oop_avx512(
 mod tests {
     use super::*;
 
-    use super::super::bf16_utils::{make_bf16_vec, to_f32_vec, bf16_to_f32, f32_to_bf16};
+    use super::super::bf16_utils::{bf16_to_f32, f32_to_bf16, make_bf16_vec, to_f32_vec};
     use super::super::max_sglang_violation;
 
     /// Reference RMSNorm in f64 for accuracy comparison.
@@ -913,7 +1139,16 @@ mod tests {
         let mut norm_out = vec![0u16; hidden];
         let mut res_out = vec![0u16; hidden];
 
-        fused_add_rmsnorm_oop_scalar(&input, &residual, &mut norm_out, &mut res_out, &weight, 1, hidden, eps);
+        fused_add_rmsnorm_oop_scalar(
+            &input,
+            &residual,
+            &mut norm_out,
+            &mut res_out,
+            &weight,
+            1,
+            hidden,
+            eps,
+        );
 
         let actual: Vec<f32> = (0..hidden).map(|j| bf16_to_f32(res_out[j])).collect();
         let expected: Vec<f32> = (0..hidden).map(|j| h_f32[j] + res_f32[j]).collect();
@@ -940,12 +1175,30 @@ mod tests {
         let res = make_bf16_vec(&res_f32);
         let mut norm_s = vec![0u16; n];
         let mut res_s = vec![0u16; n];
-        fused_add_rmsnorm_oop_scalar(&inp, &res, &mut norm_s, &mut res_s, &weight, batch, hidden, 1e-6);
+        fused_add_rmsnorm_oop_scalar(
+            &inp,
+            &res,
+            &mut norm_s,
+            &mut res_s,
+            &weight,
+            batch,
+            hidden,
+            1e-6,
+        );
 
         // Dispatched (via oop parallel path)
         let mut norm_d = vec![0u16; n];
         let mut res_d = vec![0u16; n];
-        fused_add_rmsnorm_bf16_oop(&inp, &res, &mut norm_d, &mut res_d, &weight, batch, hidden, 1e-6);
+        fused_add_rmsnorm_bf16_oop(
+            &inp,
+            &res,
+            &mut norm_d,
+            &mut res_d,
+            &weight,
+            batch,
+            hidden,
+            1e-6,
+        );
 
         assert_eq!(norm_s, norm_d, "fused norm should match");
         assert_eq!(res_s, res_d, "fused residual should match");
@@ -972,9 +1225,7 @@ mod tests {
             let row_in: Vec<f32> = (0..hidden)
                 .map(|d| bf16_to_f32(input[row * hidden + d]))
                 .collect();
-            let row_w: Vec<f32> = (0..hidden)
-                .map(|d| bf16_to_f32(weight[d]))
-                .collect();
+            let row_w: Vec<f32> = (0..hidden).map(|d| bf16_to_f32(weight[d])).collect();
             let expected = rmsnorm_f64_ref(&row_in, &row_w, eps);
             let actual: Vec<f32> = (0..hidden)
                 .map(|d| bf16_to_f32(output[row * hidden + d]))
@@ -1020,7 +1271,16 @@ mod tests {
         let n = batch * hidden;
         let mut norm_out = vec![0u16; n];
         let mut res_out = vec![0u16; n];
-        fused_add_rmsnorm_bf16_oop(&input, &residual, &mut norm_out, &mut res_out, &weight, batch, hidden, eps as f32);
+        fused_add_rmsnorm_bf16_oop(
+            &input,
+            &residual,
+            &mut norm_out,
+            &mut res_out,
+            &weight,
+            batch,
+            hidden,
+            eps as f32,
+        );
 
         // Verify res_out = h + res (SGLang tolerance)
         for row in 0..batch {
@@ -1046,9 +1306,7 @@ mod tests {
             let row_res: Vec<f32> = (0..hidden)
                 .map(|d| bf16_to_f32(res_out[row * hidden + d]))
                 .collect();
-            let row_w: Vec<f32> = (0..hidden)
-                .map(|d| bf16_to_f32(weight[d]))
-                .collect();
+            let row_w: Vec<f32> = (0..hidden).map(|d| bf16_to_f32(weight[d])).collect();
             let expected = rmsnorm_f64_ref(&row_res, &row_w, eps);
             let actual: Vec<f32> = (0..hidden)
                 .map(|d| bf16_to_f32(norm_out[row * hidden + d]))
@@ -1073,45 +1331,74 @@ mod tests {
 
     /// Test cpu_fused_add_rmsnorm Tensor API across BF16, F16, and F32 dtypes.
     /// All three should produce consistent results against the F64 reference.
-    fn verify_fused_tensor_api(hidden: usize, batch: usize, dtype: prelude_core::tensor::DType, label: &str) {
+    fn verify_fused_tensor_api(
+        hidden: usize,
+        batch: usize,
+        dtype: prelude_core::tensor::DType,
+        label: &str,
+    ) {
         let eps = 1e-6;
         let device = prelude_core::tensor::Device::Cpu;
         let n = batch * hidden;
 
         let h_f32: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.013) - 0.3).cos()).collect();
         let res_f32: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.007) + 0.1).sin()).collect();
-        let w_f32: Vec<f32> = (0..hidden).map(|i| 0.9 + (i as f32 * 0.002).sin() * 0.3).collect();
+        let w_f32: Vec<f32> = (0..hidden)
+            .map(|i| 0.9 + (i as f32 * 0.002).sin() * 0.3)
+            .collect();
 
-        let h_t = prelude_core::tensor::Tensor::from_vec(h_f32.clone(), (batch, hidden), &device).unwrap()
-            .to_dtype(dtype).unwrap();
-        let r_t = prelude_core::tensor::Tensor::from_vec(res_f32.clone(), (batch, hidden), &device).unwrap()
-            .to_dtype(dtype).unwrap();
-        let w_t = prelude_core::tensor::Tensor::from_vec(w_f32.clone(), (hidden,), &device).unwrap()
-            .to_dtype(dtype).unwrap();
+        let h_t = prelude_core::tensor::Tensor::from_vec(h_f32.clone(), (batch, hidden), &device)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let r_t = prelude_core::tensor::Tensor::from_vec(res_f32.clone(), (batch, hidden), &device)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let w_t = prelude_core::tensor::Tensor::from_vec(w_f32.clone(), (hidden,), &device)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
 
         let (res_out, norm_out) = super::cpu_fused_add_rmsnorm(&h_t, &r_t, &w_t, eps).unwrap();
         assert_eq!(res_out.dtype(), dtype);
         assert_eq!(norm_out.dtype(), dtype);
 
-        let res_out_f32 = res_out.to_dtype(prelude_core::tensor::DType::F32).unwrap()
-            .flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let norm_out_f32 = norm_out.to_dtype(prelude_core::tensor::DType::F32).unwrap()
-            .flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let res_out_f32 = res_out
+            .to_dtype(prelude_core::tensor::DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let norm_out_f32 = norm_out
+            .to_dtype(prelude_core::tensor::DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
 
         for row in 0..batch {
             // Check residual = input + residual
-            let actual_res: Vec<f32> = res_out_f32[row*hidden..(row+1)*hidden].to_vec();
-            let expected_res: Vec<f32> = (0..hidden).map(|d| h_f32[row*hidden+d] + res_f32[row*hidden+d]).collect();
+            let actual_res: Vec<f32> = res_out_f32[row * hidden..(row + 1) * hidden].to_vec();
+            let expected_res: Vec<f32> = (0..hidden)
+                .map(|d| h_f32[row * hidden + d] + res_f32[row * hidden + d])
+                .collect();
             let violation = max_sglang_violation(&actual_res, &expected_res);
-            assert!(violation <= 0.0,
-                "{label} residual row={row} violation={violation:.6}");
+            assert!(
+                violation <= 0.0,
+                "{label} residual row={row} violation={violation:.6}"
+            );
 
             // Check norm = rmsnorm(residual_out, weight)
             let expected_norm = rmsnorm_f64_ref(&actual_res, &w_f32, eps);
-            let actual_norm: Vec<f32> = norm_out_f32[row*hidden..(row+1)*hidden].to_vec();
+            let actual_norm: Vec<f32> = norm_out_f32[row * hidden..(row + 1) * hidden].to_vec();
             let violation = max_sglang_violation(&actual_norm, &expected_norm);
-            assert!(violation <= 0.0,
-                "{label} norm row={row} violation={violation:.6}");
+            assert!(
+                violation <= 0.0,
+                "{label} norm row={row} violation={violation:.6}"
+            );
         }
     }
 
@@ -1146,19 +1433,39 @@ mod tests {
             // Scalar reference
             let mut norm_s = vec![0f32; n];
             let mut res_s = vec![0f32; n];
-            fused_add_rmsnorm_generic_oop(&inp, &res, &mut norm_s, &mut res_s, &w, batch, hidden, 1e-6);
+            fused_add_rmsnorm_generic_oop(
+                &inp,
+                &res,
+                &mut norm_s,
+                &mut res_s,
+                &w,
+                batch,
+                hidden,
+                1e-6,
+            );
 
             // AVX-512 path
             let mut norm_d = vec![0f32; n];
             let mut res_d = vec![0f32; n];
-            fused_add_rmsnorm_f32_oop_impl(&inp, &res, &mut norm_d, &mut res_d, &w, batch, hidden, 1e-6);
+            fused_add_rmsnorm_f32_oop_impl(
+                &inp,
+                &res,
+                &mut norm_d,
+                &mut res_d,
+                &w,
+                batch,
+                hidden,
+                1e-6,
+            );
 
             // res_out = input + residual is exact (no reordering)
             assert_eq!(res_s, res_d, "F32 res mismatch at {batch}x{hidden}");
             // norm_out has rounding diff from sum_sq reduction order
             let violation = max_sglang_violation(&norm_d, &norm_s);
-            assert!(violation <= 0.0,
-                "F32 norm mismatch at {batch}x{hidden}: violation={violation:.6}");
+            assert!(
+                violation <= 0.0,
+                "F32 norm mismatch at {batch}x{hidden}: violation={violation:.6}"
+            );
         }
     }
 
@@ -1175,7 +1482,16 @@ mod tests {
         // Serial
         let mut norm_s = vec![0f32; n];
         let mut res_s = vec![0f32; n];
-        fused_add_rmsnorm_f32_oop_impl(&inp, &res, &mut norm_s, &mut res_s, &w, batch, hidden, 1e-6);
+        fused_add_rmsnorm_f32_oop_impl(
+            &inp,
+            &res,
+            &mut norm_s,
+            &mut res_s,
+            &w,
+            batch,
+            hidden,
+            1e-6,
+        );
 
         // Parallel (via dispatch wrapper)
         let mut norm_p = vec![0f32; n];

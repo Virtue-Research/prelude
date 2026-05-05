@@ -6,8 +6,11 @@
 
 mod common;
 
-use prelude_core::tensor::{DType, Device, Result, Tensor, TensorExt, D};
-use prelude_core::ops::{self, traits::{Ops, VarlenParams, MaskType}};
+use prelude_core::ops::{
+    self,
+    traits::{MaskType, VarlenParams},
+};
+use prelude_core::tensor::{D, DType, Device, Result, Tensor, TensorExt};
 
 /// Register device ops once, then return the test device.
 fn dev() -> &'static Device {
@@ -25,24 +28,11 @@ fn dev() -> &'static Device {
 /// Dtype configs to test for matmul-based tests. Candle CPU matmul is F32-only,
 /// so BF16/F16 are skipped unless the test device is CUDA.
 fn matmul_dtypes() -> &'static [&'static common::DTypeConfig] {
-    if dev().is_cuda() { common::ALL_DTYPES } else { &[&common::F32_CONFIG] }
-}
-
-/// Run a test body on ALL test devices (CPU + GPU if enabled).
-macro_rules! for_each_device {
-    ($body:expr) => {{
-        for __dev in common::test_devices().iter() {
-            (|| -> Result<()> {
-                let dev: &Device = __dev;
-                let _ = dev;
-                $body
-            })()
-            .map_err(|e| prelude_core::tensor::Error::Msg(
-                format!("[device {:?}] {e}", __dev).into()
-            ))?;
-        }
-        Ok(())
-    }};
+    if dev().is_cuda() {
+        common::ALL_DTYPES
+    } else {
+        &[&common::F32_CONFIG]
+    }
 }
 
 // == Tensor creation ==
@@ -249,7 +239,8 @@ fn matmul_vs_pytorch() -> Result<()> {
     for cfg in matmul_dtypes() {
         let reference = require_pytorch_ref!(
             &[("a", &a_data), ("b", &b_data)],
-            &format!(r#"
+            &format!(
+                r#"
 a = read_input("a", {py}).reshape({m}, {k})
 b = read_input("b", {py}).reshape({k}, {n})
 y = (a @ b).float()
@@ -285,7 +276,8 @@ fn matmul_tall_skinny_vs_pytorch() -> Result<()> {
     for cfg in matmul_dtypes() {
         let reference = require_pytorch_ref!(
             &[("a", &a_data), ("b", &b_data)],
-            &format!(r#"
+            &format!(
+                r#"
 a = read_input("a", {py}).reshape({m}, {k})
 b = read_input("b", {py}).reshape({k}, {n})
 y = (a @ b).float()
@@ -314,7 +306,7 @@ write_output(y)
 /// SM90 skips (n=7 < 64), SM80 bf16_c1 handles it.
 #[test]
 fn matmul_gemma4_double_wide_mlp_vs_pytorch() -> Result<()> {
-    let m = 7;    // seq_len (prefill)
+    let m = 7; // seq_len (prefill)
     let k = 1536; // hidden_size
     let n = 12288; // 2× intermediate_size
     let a_data = common::pseudo_random(m * k, 7.0);
@@ -323,7 +315,8 @@ fn matmul_gemma4_double_wide_mlp_vs_pytorch() -> Result<()> {
     for cfg in matmul_dtypes() {
         let reference = require_pytorch_ref!(
             &[("a", &a_data), ("b", &b_data)],
-            &format!(r#"
+            &format!(
+                r#"
 a = read_input("a", {py}).reshape({m}, {k})
 b = read_input("b", {py}).reshape({k}, {n})
 y = (a @ b).float()
@@ -341,7 +334,10 @@ write_output(y)
             &ours,
             &reference,
             cfg.atol_matmul,
-            &format!("matmul_gemma4_double_wide {:?} [{m},{k}]×[{k},{n}]", cfg.dtype),
+            &format!(
+                "matmul_gemma4_double_wide {:?} [{m},{k}]×[{k},{n}]",
+                cfg.dtype
+            ),
         );
     }
     Ok(())
@@ -356,14 +352,15 @@ fn matmul_gemma4_attn_score_vs_pytorch() -> Result<()> {
     }
     let m = 7;
     let k = 512; // head_dim=512
-    let n = 7;   // seq_len
+    let n = 7; // seq_len
     let a_data = common::pseudo_random(m * k, 9.0);
     let b_data = common::pseudo_random(k * n, 10.0);
 
     for cfg in [&common::BF16_CONFIG] {
         let reference = require_pytorch_ref!(
             &[("a", &a_data), ("b", &b_data)],
-            &format!(r#"
+            &format!(
+                r#"
 a = read_input("a", {py}).reshape({m}, {k})
 b = read_input("b", {py}).reshape({k}, {n})
 y = (a @ b).float()
@@ -381,7 +378,10 @@ write_output(y)
             &ours,
             &reference,
             cfg.atol_matmul,
-            &format!("matmul_gemma4_attn_score {:?} [{m},{k}]×[{k},{n}]", cfg.dtype),
+            &format!(
+                "matmul_gemma4_attn_score {:?} [{m},{k}]×[{k},{n}]",
+                cfg.dtype
+            ),
         );
     }
     Ok(())
@@ -406,7 +406,8 @@ fn matmul_chained_14_layers_vs_pytorch() -> Result<()> {
     for cfg in [&common::BF16_CONFIG] {
         let reference = require_pytorch_ref!(
             &[("x", &x_data), ("gate", &gate_data), ("down", &down_data)],
-            &format!(r#"
+            &format!(
+                r#"
 import torch
 x = read_input("x", {py}).reshape({seq}, {hidden})
 gate_w = read_input("gate", {py}).reshape({inter}, {hidden})
@@ -424,8 +425,10 @@ write_output(x)
         );
 
         let x = Tensor::from_vec(x_data.clone(), (seq, hidden), dev())?.to_dtype(cfg.dtype)?;
-        let gate_w = Tensor::from_vec(gate_data.clone(), (inter, hidden), dev())?.to_dtype(cfg.dtype)?;
-        let down_w = Tensor::from_vec(down_data.clone(), (hidden, inter), dev())?.to_dtype(cfg.dtype)?;
+        let gate_w =
+            Tensor::from_vec(gate_data.clone(), (inter, hidden), dev())?.to_dtype(cfg.dtype)?;
+        let down_w =
+            Tensor::from_vec(down_data.clone(), (hidden, inter), dev())?.to_dtype(cfg.dtype)?;
 
         let mut x_cur = x;
         for _ in 0..14 {
@@ -520,7 +523,8 @@ fn sum_vs_pytorch() -> Result<()> {
     for cfg in common::ALL_DTYPES {
         let reference = require_pytorch_ref!(
             &[("x", &data)],
-            &format!(r#"
+            &format!(
+                r#"
 x = read_input("x", {py})
 write_output(x.float().sum().reshape(1))
 "#,
@@ -550,7 +554,8 @@ fn mean_vs_pytorch() -> Result<()> {
     for cfg in common::ALL_DTYPES {
         let reference = require_pytorch_ref!(
             &[("x", &data)],
-            &format!(r#"
+            &format!(
+                r#"
 x = read_input("x", {py}).reshape({rows}, {cols})
 y = x.float().mean(dim=1)
 write_output(y)
@@ -609,11 +614,7 @@ fn comparisons() -> Result<()> {
 
 #[test]
 fn where_cond() -> Result<()> {
-    let cond = Tensor::from_vec(
-        vec![0u8, 1, 0, 1, 0, 1, 1, 1, 0, 0],
-        (2, 5),
-        dev(),
-    )?;
+    let cond = Tensor::from_vec(vec![0u8, 1, 0, 1, 0, 1, 1, 1, 0, 0], (2, 5), dev())?;
     let a = Tensor::from_vec(
         vec![0f32, 1., 2., 3., 4., 5., 6., 7., 8., 9.],
         (2, 5),
@@ -677,11 +678,7 @@ fn gather() -> Result<()> {
 #[test]
 fn scatter_add() -> Result<()> {
     let init = Tensor::ones((4, 5), DType::F32, dev())?;
-    let ids = Tensor::from_vec(
-        vec![0u32, 1, 2, 3, 4, 0, 3, 3, 1, 2, 0, 4],
-        (4, 3),
-        dev(),
-    )?;
+    let ids = Tensor::from_vec(vec![0u32, 1, 2, 3, 4, 0, 3, 3, 1, 2, 0, 4], (4, 3), dev())?;
     let src = Tensor::from_vec(
         vec![0f32, 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11.],
         (4, 3),
@@ -772,7 +769,8 @@ fn softmax_vs_pytorch() -> Result<()> {
     for cfg in common::ALL_DTYPES {
         let reference = require_pytorch_ref!(
             &[("x", &data)],
-            &format!(r#"
+            &format!(
+                r#"
 x = read_input("x", {py}).reshape(1, {len})
 y = torch.nn.functional.softmax(x, dim=-1).float()
 write_output(y)
@@ -871,16 +869,8 @@ fn cat_dim1() -> Result<()> {
 
 #[test]
 fn transpose_matmul() -> Result<()> {
-    let a = Tensor::from_vec(
-        (0..12).map(|i| i as f32).collect::<Vec<_>>(),
-        (3, 4),
-        dev(),
-    )?;
-    let b = Tensor::from_vec(
-        (0..8).map(|i| i as f32).collect::<Vec<_>>(),
-        (4, 2),
-        dev(),
-    )?;
+    let a = Tensor::from_vec((0..12).map(|i| i as f32).collect::<Vec<_>>(), (3, 4), dev())?;
+    let b = Tensor::from_vec((0..8).map(|i| i as f32).collect::<Vec<_>>(), (4, 2), dev())?;
     let c = a.matmul(&b)?;
     assert_eq!(c.dims(), &[3, 2]);
     assert_eq!(
@@ -890,11 +880,7 @@ fn transpose_matmul() -> Result<()> {
 
     let at = a.t()?; // (4, 3)
     assert!(!at.is_contiguous());
-    let b2 = Tensor::from_vec(
-        (0..6).map(|i| i as f32).collect::<Vec<_>>(),
-        (3, 2),
-        dev(),
-    )?;
+    let b2 = Tensor::from_vec((0..6).map(|i| i as f32).collect::<Vec<_>>(), (3, 2), dev())?;
     let c2 = at.matmul(&b2)?;
     assert_eq!(c2.dims(), &[4, 2]);
     assert_eq!(c2.to_vec2::<f32>()?[0], vec![40., 52.]);
@@ -903,11 +889,7 @@ fn transpose_matmul() -> Result<()> {
 
 #[test]
 fn narrow_then_ops() -> Result<()> {
-    let t = Tensor::from_vec(
-        (0..20).map(|i| i as f32).collect::<Vec<_>>(),
-        (4, 5),
-        dev(),
-    )?;
+    let t = Tensor::from_vec((0..20).map(|i| i as f32).collect::<Vec<_>>(), (4, 5), dev())?;
     let n = t.narrow(1, 1, 3)?; // cols 1..4, shape (4, 3)
     assert_eq!(n.dims(), &[4, 3]);
 
@@ -923,11 +905,7 @@ fn narrow_then_ops() -> Result<()> {
 
 #[test]
 fn non_contiguous_reduction() -> Result<()> {
-    let t = Tensor::from_vec(
-        (0..12).map(|i| i as f32).collect::<Vec<_>>(),
-        (3, 4),
-        dev(),
-    )?;
+    let t = Tensor::from_vec((0..12).map(|i| i as f32).collect::<Vec<_>>(), (3, 4), dev())?;
     let tt = t.t()?; // (4, 3), non-contiguous
     let s0 = tt.sum_keepdim(0)?;
     assert_eq!(s0.dims(), &[1, 3]);
@@ -984,11 +962,7 @@ fn squeeze_unsqueeze() -> Result<()> {
 
 #[test]
 fn reshape_non_contiguous() -> Result<()> {
-    let t = Tensor::from_vec(
-        (0..6).map(|i| i as f32).collect::<Vec<_>>(),
-        (2, 3),
-        dev(),
-    )?;
+    let t = Tensor::from_vec((0..6).map(|i| i as f32).collect::<Vec<_>>(), (2, 3), dev())?;
     let tt = t.t()?; // (3, 2), non-contiguous
     let r = tt.reshape((6,))?;
     assert_eq!(r.to_vec1::<f32>()?, vec![0., 3., 1., 4., 2., 5.]);
@@ -1040,11 +1014,7 @@ fn comparison_ops() -> Result<()> {
 
 #[test]
 fn gather_2d_indices() -> Result<()> {
-    let t = Tensor::from_vec(
-        (0..12).map(|i| i as f32).collect::<Vec<_>>(),
-        (4, 3),
-        dev(),
-    )?;
+    let t = Tensor::from_vec((0..12).map(|i| i as f32).collect::<Vec<_>>(), (4, 3), dev())?;
     let ids = Tensor::from_vec(vec![0u32, 0, 2, 0, 1, 1, 0, 2], (4, 2), dev())?;
     let r = t.gather(&ids, 1)?;
     assert_eq!(r.dims(), &[4, 2]);
@@ -1075,7 +1045,12 @@ fn sum_large_reduction() -> Result<()> {
     let t = Tensor::from_vec(data.clone(), n, dev())?;
     let s = t.sum_all()?.to_scalar::<f32>()?;
     let expected: f32 = data.iter().sum();
-    assert!((s - expected).abs() < 0.1, "sum diff: {} vs {}", s, expected);
+    assert!(
+        (s - expected).abs() < 0.1,
+        "sum diff: {} vs {}",
+        s,
+        expected
+    );
     Ok(())
 }
 
@@ -1083,11 +1058,7 @@ fn sum_large_reduction() -> Result<()> {
 
 #[test]
 fn chunk() -> Result<()> {
-    let t = Tensor::from_vec(
-        (0..12).map(|i| i as f32).collect::<Vec<_>>(),
-        (4, 3),
-        dev(),
-    )?;
+    let t = Tensor::from_vec((0..12).map(|i| i as f32).collect::<Vec<_>>(), (4, 3), dev())?;
     let chunks = t.chunk(2, 0)?;
     assert_eq!(chunks.len(), 2);
     assert_eq!(chunks[0].dims(), &[2, 3]);
@@ -1253,7 +1224,8 @@ fn gelu_erf_vs_pytorch() -> Result<()> {
     for cfg in common::ALL_DTYPES {
         let reference = require_pytorch_ref!(
             &[("x", &data)],
-            &format!(r#"
+            &format!(
+                r#"
 x = read_input("x", {py})
 y = torch.nn.functional.gelu(x, approximate='none').float()
 write_output(y)
@@ -1562,7 +1534,12 @@ write_output(y)
     let x = Tensor::from_vec(data, (2, 3), dev())?;
     let y = x.pad_with_zeros(0, 1, 2)?;
     assert_eq!(y.dims(), &[5, 3]);
-    common::assert_close_2d(&y.to_vec2::<f32>()?, &reference, 1e-6, "pad_with_zeros_dim0");
+    common::assert_close_2d(
+        &y.to_vec2::<f32>()?,
+        &reference,
+        1e-6,
+        "pad_with_zeros_dim0",
+    );
     Ok(())
 }
 
@@ -1641,8 +1618,13 @@ write_outputs(vals=vals, idxs=idxs)
 "#
     );
     let ref_vals = common::unflatten(&result["vals"], 6);
-    let ref_idxs: Vec<Vec<u32>> = result["idxs"].iter().map(|&v| v as u32).collect::<Vec<u32>>()
-        .chunks(6).map(|c| c.to_vec()).collect();
+    let ref_idxs: Vec<Vec<u32>> = result["idxs"]
+        .iter()
+        .map(|&v| v as u32)
+        .collect::<Vec<u32>>()
+        .chunks(6)
+        .map(|c| c.to_vec())
+        .collect();
 
     let x = Tensor::from_vec(data, (2, 6), dev())?;
     let (vals, idxs) = x.sort_last_dim(true)?;
@@ -1665,8 +1647,13 @@ write_outputs(vals=vals, idxs=idxs)
 "#
     );
     let ref_vals = common::unflatten(&result["vals"], 6);
-    let ref_idxs: Vec<Vec<u32>> = result["idxs"].iter().map(|&v| v as u32).collect::<Vec<u32>>()
-        .chunks(6).map(|c| c.to_vec()).collect();
+    let ref_idxs: Vec<Vec<u32>> = result["idxs"]
+        .iter()
+        .map(|&v| v as u32)
+        .collect::<Vec<u32>>()
+        .chunks(6)
+        .map(|c| c.to_vec())
+        .collect();
 
     let x = Tensor::from_vec(data, (2, 6), dev())?;
     let (vals, idxs) = x.sort_last_dim(false)?;
@@ -1692,7 +1679,8 @@ fn rope_thd_vs_pytorch() -> Result<()> {
 
     let reference = require_pytorch_ref!(
         &[("x", &x_data), ("cos", &cos_data), ("sin", &sin_data)],
-        &format!(r#"
+        &format!(
+            r#"
 x = read_input("x").reshape({b}, {l}, {h}, {d})
 cos = read_input("cos").reshape({l}, {half_d})
 sin = read_input("sin").reshape({l}, {half_d})
@@ -1973,7 +1961,8 @@ fn rmsnorm_vs_pytorch() -> Result<()> {
     for cfg in common::ALL_DTYPES {
         let reference = require_pytorch_ref!(
             &[("x", &x_data), ("w", &w_data)],
-            &format!(r#"
+            &format!(
+                r#"
 x = read_input("x", {py}).reshape({batch}, {hidden})
 w = read_input("w", {py})
 y = torch.nn.functional.rms_norm(x.float(), ({hidden},), w.float(), {eps}).to({py}).float()
@@ -1983,8 +1972,7 @@ write_output(y)
             )
         );
 
-        let x =
-            Tensor::from_vec(x_data.clone(), (batch, hidden), dev())?.to_dtype(cfg.dtype)?;
+        let x = Tensor::from_vec(x_data.clone(), (batch, hidden), dev())?.to_dtype(cfg.dtype)?;
         let w = Tensor::from_vec(w_data.clone(), (hidden,), dev())?.to_dtype(cfg.dtype)?;
 
         let norm = prelude_core::models::commons::linear::RmsNorm::from_weight(w, eps);
@@ -2013,7 +2001,8 @@ fn linear_vs_pytorch() -> Result<()> {
     for cfg in matmul_dtypes() {
         let reference = require_pytorch_ref!(
             &[("x", &x_data), ("w", &w_data)],
-            &format!(r#"
+            &format!(
+                r#"
 x = read_input("x", {py}).reshape({batch}, {in_dim})
 w = read_input("w", {py}).reshape({out_dim}, {in_dim})
 y = (x @ w.T).float()
@@ -2023,10 +2012,8 @@ write_output(y)
             )
         );
 
-        let x = Tensor::from_vec(x_data.clone(), (batch, in_dim), dev())?
-            .to_dtype(cfg.dtype)?;
-        let w = Tensor::from_vec(w_data.clone(), (out_dim, in_dim), dev())?
-            .to_dtype(cfg.dtype)?;
+        let x = Tensor::from_vec(x_data.clone(), (batch, in_dim), dev())?.to_dtype(cfg.dtype)?;
+        let w = Tensor::from_vec(w_data.clone(), (out_dim, in_dim), dev())?.to_dtype(cfg.dtype)?;
         let linear = prelude_core::models::commons::linear::Linear::from_weight(w, None)?;
         let y = linear
             .forward(
@@ -2061,8 +2048,14 @@ fn chained_norm_linear_silu_vs_pytorch() -> Result<()> {
 
     for cfg in matmul_dtypes() {
         let reference = require_pytorch_ref!(
-            &[("x", &x_data), ("nw", &norm_w), ("gw", &gate_w), ("uw", &up_w)],
-            &format!(r#"
+            &[
+                ("x", &x_data),
+                ("nw", &norm_w),
+                ("gw", &gate_w),
+                ("uw", &up_w)
+            ],
+            &format!(
+                r#"
 x = read_input("x", {py}).reshape({batch}, {hidden})
 nw = read_input("nw", {py})
 gw = read_input("gw", {py}).reshape({inter}, {hidden})
@@ -2077,18 +2070,14 @@ write_output(y)
             )
         );
 
-        let x = Tensor::from_vec(x_data.clone(), (batch, hidden), dev())?
-            .to_dtype(cfg.dtype)?;
-        let nw =
-            Tensor::from_vec(norm_w.clone(), (hidden,), dev())?.to_dtype(cfg.dtype)?;
-        let norm = prelude_core::models::commons::linear::RmsNorm::from_weight(nw.clone(), eps);
+        let x = Tensor::from_vec(x_data.clone(), (batch, hidden), dev())?.to_dtype(cfg.dtype)?;
+        let nw = Tensor::from_vec(norm_w.clone(), (hidden,), dev())?.to_dtype(cfg.dtype)?;
+        let _norm = prelude_core::models::commons::linear::RmsNorm::from_weight(nw.clone(), eps);
         let ops = prelude_core::ops::select_ops(dev());
 
         let h = ops.rms_norm(&x, &nw, eps as f32)?;
-        let gw = Tensor::from_vec(gate_w.clone(), (inter, hidden), dev())?
-            .to_dtype(cfg.dtype)?;
-        let uw = Tensor::from_vec(up_w.clone(), (inter, hidden), dev())?
-            .to_dtype(cfg.dtype)?;
+        let gw = Tensor::from_vec(gate_w.clone(), (inter, hidden), dev())?.to_dtype(cfg.dtype)?;
+        let uw = Tensor::from_vec(up_w.clone(), (inter, hidden), dev())?.to_dtype(cfg.dtype)?;
         let gate = h.matmul(&gw.t()?)?;
         let up = h.matmul(&uw.t()?)?;
         let y = ops.silu_mul(&gate, &up)?.to_dtype(DType::F32)?;
@@ -2116,14 +2105,16 @@ fn add_rmsnorm_vs_pytorch() -> Result<()> {
 
     let result = require_pytorch_ref_multi!(
         &[("x", &x_data), ("h", &h_data), ("w", &w_data)],
-        &format!(r#"
+        &format!(
+            r#"
 x = read_input("x").reshape({batch}, {hidden})
 h = read_input("h").reshape({batch}, {hidden})
 w = read_input("w")
 residual = x + h
 normed = torch.nn.functional.rms_norm(residual, ({hidden},), w, {eps})
 write_outputs(residual=residual, normed=normed)
-"#)
+"#
+        )
     );
     let ref_residual = &result["residual"];
     let ref_normed = &result["normed"];
@@ -2131,11 +2122,10 @@ write_outputs(residual=residual, normed=normed)
     let x = Tensor::from_vec(x_data, (batch, hidden), dev())?;
     let h = Tensor::from_vec(h_data, (batch, hidden), dev())?;
     let w = Tensor::from_vec(w_data.clone(), (hidden,), dev())?;
-    let norm = prelude_core::models::commons::linear::RmsNorm::from_weight(w.clone(), eps);
+    let _norm = prelude_core::models::commons::linear::RmsNorm::from_weight(w.clone(), eps);
     let ops = prelude_core::ops::select_ops(dev());
 
-    let (residual, normed) =
-        ops.add_rmsnorm(&x, &h, &w, eps as f32)?;
+    let (residual, normed) = ops.add_rmsnorm(&x, &h, &w, eps as f32)?;
     let our_res: Vec<f32> = residual.flatten_all()?.to_vec1()?;
     let our_normed: Vec<f32> = normed.flatten_all()?.to_vec1()?;
     common::assert_close(&our_res, ref_residual, 1e-5, "add_rmsnorm residual");
@@ -2228,7 +2218,10 @@ fn where_cond_u32_condition() -> Result<()> {
     let on_true = Tensor::from_vec(vec![10f32, 20.0, 30.0, 40.0], (2, 2), dev())?;
     let on_false = Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (2, 2), dev())?;
     let result = cond.where_cond(&on_true, &on_false)?;
-    assert_eq!(result.to_vec2::<f32>()?, vec![vec![1.0, 20.0], vec![3.0, 40.0]]);
+    assert_eq!(
+        result.to_vec2::<f32>()?,
+        vec![vec![1.0, 20.0], vec![3.0, 40.0]]
+    );
     Ok(())
 }
 
@@ -2239,9 +2232,16 @@ fn where_cond_u32_condition() -> Result<()> {
 /// Helper: build varlen inputs and run attention through the Ops trait.
 /// Uses file-based I/O via `require_pytorch_ref!` for data exchange.
 fn run_varlen_attention_vs_pytorch(
-    seq_lens_q: &[usize], seq_lens_k: &[usize],
-    num_heads_q: usize, num_heads_k: usize, head_dim: usize,
-    causal: bool, py_dtype: &str, dtype: DType, atol: f32, context: &str,
+    seq_lens_q: &[usize],
+    seq_lens_k: &[usize],
+    num_heads_q: usize,
+    num_heads_k: usize,
+    head_dim: usize,
+    causal: bool,
+    py_dtype: &str,
+    dtype: DType,
+    atol: f32,
+    context: &str,
 ) -> Result<()> {
     // Candle CPU matmul is F32-only; varlen_attention tests all use BF16.
     if !dev().is_cuda() && dtype != DType::F32 {
@@ -2269,7 +2269,8 @@ fn run_varlen_attention_vs_pytorch(
 
     let reference = require_pytorch_ref!(
         &[("q", &q_data), ("k", &k_data), ("v", &v_data)],
-        &format!(r#"
+        &format!(
+            r#"
 seq_lens_q = {seq_lens_q:?}
 seq_lens_k = {seq_lens_k:?}
 nq, nk, hd = {num_heads_q}, {num_heads_k}, {head_dim}
@@ -2317,10 +2318,19 @@ write_output(out)
     let cu_seqlens_k = Tensor::from_vec(cu_k, (batch + 1,), d)?;
 
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let mask = if causal { MaskType::Causal } else { MaskType::Bidirectional };
+    let mask = if causal {
+        MaskType::Causal
+    } else {
+        MaskType::Bidirectional
+    };
     let params = VarlenParams {
-        cu_seqlens_q: &cu_seqlens_q, cu_seqlens_k: &cu_seqlens_k,
-        max_seqlen_q, max_seqlen_k, scale, mask, softcap: None,
+        cu_seqlens_q: &cu_seqlens_q,
+        cu_seqlens_k: &cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        scale,
+        mask,
+        softcap: None,
     };
 
     let ops = ops::ops_for(d);
@@ -2334,40 +2344,80 @@ write_output(out)
 #[test]
 fn varlen_attention_causal_vs_pytorch() -> Result<()> {
     run_varlen_attention_vs_pytorch(
-        &[32], &[32], 8, 8, 64, true,
-        "torch.bfloat16", DType::BF16, 2e-2, "varlen causal bf16",
+        &[32],
+        &[32],
+        8,
+        8,
+        64,
+        true,
+        "torch.bfloat16",
+        DType::BF16,
+        2e-2,
+        "varlen causal bf16",
     )
 }
 
 #[test]
 fn varlen_attention_bidirectional_vs_pytorch() -> Result<()> {
     run_varlen_attention_vs_pytorch(
-        &[16], &[16], 8, 8, 64, false,
-        "torch.bfloat16", DType::BF16, 2e-2, "varlen bidirectional bf16",
+        &[16],
+        &[16],
+        8,
+        8,
+        64,
+        false,
+        "torch.bfloat16",
+        DType::BF16,
+        2e-2,
+        "varlen bidirectional bf16",
     )
 }
 
 #[test]
 fn varlen_attention_gqa4_vs_pytorch() -> Result<()> {
     run_varlen_attention_vs_pytorch(
-        &[32], &[32], 32, 8, 128, true,
-        "torch.bfloat16", DType::BF16, 2e-2, "varlen gqa4 bf16",
+        &[32],
+        &[32],
+        32,
+        8,
+        128,
+        true,
+        "torch.bfloat16",
+        DType::BF16,
+        2e-2,
+        "varlen gqa4 bf16",
     )
 }
 
 #[test]
 fn varlen_attention_gqa8_vs_pytorch() -> Result<()> {
     run_varlen_attention_vs_pytorch(
-        &[32], &[32], 64, 8, 128, true,
-        "torch.bfloat16", DType::BF16, 2e-2, "varlen gqa8 bf16",
+        &[32],
+        &[32],
+        64,
+        8,
+        128,
+        true,
+        "torch.bfloat16",
+        DType::BF16,
+        2e-2,
+        "varlen gqa8 bf16",
     )
 }
 
 #[test]
 fn varlen_attention_multi_seq_vs_pytorch() -> Result<()> {
     run_varlen_attention_vs_pytorch(
-        &[16, 32, 8], &[16, 32, 8], 8, 8, 128, true,
-        "torch.bfloat16", DType::BF16, 2e-2, "varlen multi-seq bf16",
+        &[16, 32, 8],
+        &[16, 32, 8],
+        8,
+        8,
+        128,
+        true,
+        "torch.bfloat16",
+        DType::BF16,
+        2e-2,
+        "varlen multi-seq bf16",
     )
 }
 
@@ -2375,32 +2425,64 @@ fn varlen_attention_multi_seq_vs_pytorch() -> Result<()> {
 fn varlen_attention_prefill_decode_vs_pytorch() -> Result<()> {
     // Mixed: seq0 is prefill (32 tokens), seq1 is decode (1 token with 64 KV)
     run_varlen_attention_vs_pytorch(
-        &[32, 1], &[32, 64], 8, 8, 128, true,
-        "torch.bfloat16", DType::BF16, 2e-2, "varlen prefill+decode bf16",
+        &[32, 1],
+        &[32, 64],
+        8,
+        8,
+        128,
+        true,
+        "torch.bfloat16",
+        DType::BF16,
+        2e-2,
+        "varlen prefill+decode bf16",
     )
 }
 
 #[test]
 fn varlen_attention_hdim256_vs_pytorch() -> Result<()> {
     run_varlen_attention_vs_pytorch(
-        &[16], &[16], 8, 8, 256, true,
-        "torch.bfloat16", DType::BF16, 2e-2, "varlen hdim256 bf16",
+        &[16],
+        &[16],
+        8,
+        8,
+        256,
+        true,
+        "torch.bfloat16",
+        DType::BF16,
+        2e-2,
+        "varlen hdim256 bf16",
     )
 }
 
 #[test]
 fn varlen_attention_gqa32_vs_pytorch() -> Result<()> {
     run_varlen_attention_vs_pytorch(
-        &[32], &[32], 256, 8, 128, true,
-        "torch.bfloat16", DType::BF16, 2e-2, "varlen gqa32 bf16",
+        &[32],
+        &[32],
+        256,
+        8,
+        128,
+        true,
+        "torch.bfloat16",
+        DType::BF16,
+        2e-2,
+        "varlen gqa32 bf16",
     )
 }
 
 #[test]
 fn varlen_attention_long_seq_vs_pytorch() -> Result<()> {
     run_varlen_attention_vs_pytorch(
-        &[256], &[256], 8, 8, 128, true,
-        "torch.bfloat16", DType::BF16, 5e-2, "varlen long-seq bf16",
+        &[256],
+        &[256],
+        8,
+        8,
+        128,
+        true,
+        "torch.bfloat16",
+        DType::BF16,
+        5e-2,
+        "varlen long-seq bf16",
     )
 }
 
@@ -2408,8 +2490,16 @@ fn varlen_attention_long_seq_vs_pytorch() -> Result<()> {
 fn varlen_attention_hdim512_vs_pytorch() -> Result<()> {
     // Gemma4 full_attention layers use head_dim=512 with GQA 8:1
     run_varlen_attention_vs_pytorch(
-        &[16], &[16], 8, 1, 512, true,
-        "torch.bfloat16", DType::BF16, 5e-2, "varlen hdim512 gqa8 bf16",
+        &[16],
+        &[16],
+        8,
+        1,
+        512,
+        true,
+        "torch.bfloat16",
+        DType::BF16,
+        5e-2,
+        "varlen hdim512 gqa8 bf16",
     )
 }
 
@@ -2417,8 +2507,15 @@ fn varlen_attention_hdim512_vs_pytorch() -> Result<()> {
 fn varlen_attention_hdim512_short_vs_pytorch() -> Result<()> {
     // Short seq (7 tokens) — tests CUTLASS small-matrix fallback
     run_varlen_attention_vs_pytorch(
-        &[7], &[7], 8, 1, 512, true,
-        "torch.bfloat16", DType::BF16, 5e-2, "varlen hdim512 short bf16",
+        &[7],
+        &[7],
+        8,
+        1,
+        512,
+        true,
+        "torch.bfloat16",
+        DType::BF16,
+        5e-2,
+        "varlen hdim512 short bf16",
     )
 }
-

@@ -70,13 +70,19 @@ impl CpuFloat for half::f16 {
     const DTYPE: DType = DType::F16;
 
     #[inline(always)]
-    fn to_f32(self) -> f32 { half::f16::to_f32(self) }
+    fn to_f32(self) -> f32 {
+        half::f16::to_f32(self)
+    }
 
     #[inline(always)]
-    fn from_f32(v: f32) -> Self { half::f16::from_f32(v) }
+    fn from_f32(v: f32) -> Self {
+        half::f16::from_f32(v)
+    }
 
     #[inline(always)]
-    fn zero() -> Self { half::f16::ZERO }
+    fn zero() -> Self {
+        half::f16::ZERO
+    }
 
     fn tensor_to_vec(tensor: &Tensor) -> Result<Vec<Self>> {
         let n = tensor.elem_count();
@@ -97,13 +103,19 @@ impl CpuFloat for f32 {
     const DTYPE: DType = DType::F32;
 
     #[inline(always)]
-    fn to_f32(self) -> f32 { self }
+    fn to_f32(self) -> f32 {
+        self
+    }
 
     #[inline(always)]
-    fn from_f32(v: f32) -> Self { v }
+    fn from_f32(v: f32) -> Self {
+        v
+    }
 
     #[inline(always)]
-    fn zero() -> Self { 0.0 }
+    fn zero() -> Self {
+        0.0
+    }
 
     fn tensor_to_vec(tensor: &Tensor) -> Result<Vec<Self>> {
         let n = tensor.elem_count();

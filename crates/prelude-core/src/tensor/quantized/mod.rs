@@ -54,12 +54,20 @@ impl GgmlDType {
 
     pub fn to_u32(self) -> u32 {
         match self {
-            Self::F32 => 0, Self::F16 => 1,
-            Self::Q4_0 => 2, Self::Q4_1 => 3,
-            Self::Q5_0 => 6, Self::Q5_1 => 7,
-            Self::Q8_0 => 8, Self::Q8_1 => 9,
-            Self::Q2K => 10, Self::Q3K => 11, Self::Q4K => 12,
-            Self::Q5K => 13, Self::Q6K => 14, Self::Q8K => 15,
+            Self::F32 => 0,
+            Self::F16 => 1,
+            Self::Q4_0 => 2,
+            Self::Q4_1 => 3,
+            Self::Q5_0 => 6,
+            Self::Q5_1 => 7,
+            Self::Q8_0 => 8,
+            Self::Q8_1 => 9,
+            Self::Q2K => 10,
+            Self::Q3K => 11,
+            Self::Q4K => 12,
+            Self::Q5K => 13,
+            Self::Q6K => 14,
+            Self::Q8K => 15,
             Self::BF16 => 30,
         }
     }
@@ -68,10 +76,8 @@ impl GgmlDType {
     pub fn block_size(self) -> usize {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => 1,
-            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1
-            | Self::Q8_0 | Self::Q8_1 => 32,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K
-            | Self::Q6K | Self::Q8K => 256,
+            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
         }
     }
 
@@ -80,18 +86,18 @@ impl GgmlDType {
         match self {
             Self::F32 => 4,
             Self::F16 | Self::BF16 => 2,
-            Self::Q4_0 => 18,   // 2 + 16
-            Self::Q4_1 => 20,   // 2 + 2 + 16
-            Self::Q5_0 => 22,   // 2 + 4 + 16
-            Self::Q5_1 => 24,   // 2 + 2 + 4 + 16
-            Self::Q8_0 => 34,   // 2 + 32
-            Self::Q8_1 => 36,   // 2 + 2 + 32
-            Self::Q2K => 84,    // 16 + 64 + 2 + 2
-            Self::Q3K => 110,   // 32 + 64 + 12 + 2
-            Self::Q4K => 144,   // 2 + 2 + 12 + 128
-            Self::Q5K => 176,   // 2 + 2 + 12 + 32 + 128
-            Self::Q6K => 210,   // 128 + 64 + 16 + 2
-            Self::Q8K => 292,   // 4 + 256 + 32
+            Self::Q4_0 => 18, // 2 + 16
+            Self::Q4_1 => 20, // 2 + 2 + 16
+            Self::Q5_0 => 22, // 2 + 4 + 16
+            Self::Q5_1 => 24, // 2 + 2 + 4 + 16
+            Self::Q8_0 => 34, // 2 + 32
+            Self::Q8_1 => 36, // 2 + 2 + 32
+            Self::Q2K => 84,  // 16 + 64 + 2 + 2
+            Self::Q3K => 110, // 32 + 64 + 12 + 2
+            Self::Q4K => 144, // 2 + 2 + 12 + 128
+            Self::Q5K => 176, // 2 + 2 + 12 + 32 + 128
+            Self::Q6K => 210, // 128 + 64 + 16 + 2
+            Self::Q8K => 292, // 4 + 256 + 32
         }
     }
 
@@ -103,14 +109,27 @@ impl GgmlDType {
 
 impl std::fmt::Display for GgmlDType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", match self {
-            Self::F32 => "F32", Self::F16 => "F16", Self::BF16 => "BF16",
-            Self::Q4_0 => "Q4_0", Self::Q4_1 => "Q4_1",
-            Self::Q5_0 => "Q5_0", Self::Q5_1 => "Q5_1",
-            Self::Q8_0 => "Q8_0", Self::Q8_1 => "Q8_1",
-            Self::Q2K => "Q2K", Self::Q3K => "Q3K", Self::Q4K => "Q4K",
-            Self::Q5K => "Q5K", Self::Q6K => "Q6K", Self::Q8K => "Q8K",
-        })
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::F32 => "F32",
+                Self::F16 => "F16",
+                Self::BF16 => "BF16",
+                Self::Q4_0 => "Q4_0",
+                Self::Q4_1 => "Q4_1",
+                Self::Q5_0 => "Q5_0",
+                Self::Q5_1 => "Q5_1",
+                Self::Q8_0 => "Q8_0",
+                Self::Q8_1 => "Q8_1",
+                Self::Q2K => "Q2K",
+                Self::Q3K => "Q3K",
+                Self::Q4K => "Q4K",
+                Self::Q5K => "Q5K",
+                Self::Q6K => "Q6K",
+                Self::Q8K => "Q8K",
+            }
+        )
     }
 }
 

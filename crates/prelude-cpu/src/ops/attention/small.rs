@@ -66,8 +66,10 @@ pub(super) fn prefill_attention_bf16_small(
             let start = tid * items_per_thread;
             let end = (start + items_per_thread).min(total_work);
 
-            let offsets = std::slice::from_raw_parts(ctx.offsets_ptr as *const usize, ctx.num_reqs + 1);
-            let seq_lens = std::slice::from_raw_parts(ctx.seq_lens_ptr as *const usize, ctx.num_reqs);
+            let offsets =
+                std::slice::from_raw_parts(ctx.offsets_ptr as *const usize, ctx.num_reqs + 1);
+            let seq_lens =
+                std::slice::from_raw_parts(ctx.seq_lens_ptr as *const usize, ctx.num_reqs);
             let q = ctx.q_ptr as *const u16;
             let k = ctx.k_ptr as *const u16;
             let v = ctx.v_ptr as *const u16;
@@ -81,9 +83,17 @@ pub(super) fn prefill_attention_bf16_small(
                 let kv_head = head_idx / ctx.gqa_ratio;
 
                 prefill_one_head_small(
-                    output, q, k, v,
-                    req_start, slen, head_idx, kv_head,
-                    ctx.num_heads, ctx.num_kv_heads, ctx.head_dim,
+                    output,
+                    q,
+                    k,
+                    v,
+                    req_start,
+                    slen,
+                    head_idx,
+                    kv_head,
+                    ctx.num_heads,
+                    ctx.num_kv_heads,
+                    ctx.head_dim,
                     ctx.sm_scale,
                 );
             }

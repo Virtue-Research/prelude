@@ -5,18 +5,6 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 use crate::{MOD_RMSNORM, PTX_RMSNORM, PTX_RMSNORM_GATED};
 
-/// Extract candle CUDA storage from a tensor, or bail.
-macro_rules! cuda_storage {
-    ($tensor:expr, $ctx:expr) => {{
-        let (storage, layout) = $tensor.storage_and_layout();
-        let cuda = match &*storage {
-            candle_core::Storage::Cuda(s) => s,
-            _ => candle_core::bail!("{}: requires CUDA", $ctx),
-        };
-        (storage, layout, cuda)
-    }};
-}
-
 /// Fast standalone RMSNorm with register caching and vectorized loads.
 /// Replaces naive rmsnorm_bf16 which runs at ~13% of bandwidth.
 pub fn fast_rmsnorm(input: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
@@ -105,12 +93,25 @@ pub fn fast_rmsnorm_gated(x: &Tensor, gate: &Tensor, weight: &Tensor, eps: f64) 
     let (g_storage, g_layout) = gate.storage_and_layout();
     let (w_storage, w_layout) = weight.storage_and_layout();
 
-    let x_cuda = match &*x_storage { candle_core::Storage::Cuda(s) => s, _ => candle_core::bail!("rmsnorm_gated: requires CUDA") };
-    let g_cuda = match &*g_storage { candle_core::Storage::Cuda(s) => s, _ => candle_core::bail!("rmsnorm_gated: requires CUDA") };
-    let w_cuda = match &*w_storage { candle_core::Storage::Cuda(s) => s, _ => candle_core::bail!("rmsnorm_gated: requires CUDA") };
+    let x_cuda = match &*x_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("rmsnorm_gated: requires CUDA"),
+    };
+    let g_cuda = match &*g_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("rmsnorm_gated: requires CUDA"),
+    };
+    let w_cuda = match &*w_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("rmsnorm_gated: requires CUDA"),
+    };
 
-    if x_cuda.dtype() != DType::BF16 { candle_core::bail!("rmsnorm_gated: x must be BF16"); }
-    if w_cuda.dtype() != DType::F32 { candle_core::bail!("rmsnorm_gated: weight must be F32"); }
+    if x_cuda.dtype() != DType::BF16 {
+        candle_core::bail!("rmsnorm_gated: x must be BF16");
+    }
+    if w_cuda.dtype() != DType::F32 {
+        candle_core::bail!("rmsnorm_gated: weight must be F32");
+    }
 
     let shape = x_layout.shape();
     let dims = shape.dims();
@@ -120,9 +121,15 @@ pub fn fast_rmsnorm_gated(x: &Tensor, gate: &Tensor, weight: &Tensor, eps: f64) 
 
     let dev = x_cuda.device().clone();
 
-    let x_slice = x_cuda.as_cuda_slice::<half::bf16>()?.slice(x_layout.start_offset()..);
-    let g_slice = g_cuda.as_cuda_slice::<half::bf16>()?.slice(g_layout.start_offset()..);
-    let w_slice = w_cuda.as_cuda_slice::<f32>()?.slice(w_layout.start_offset()..);
+    let x_slice = x_cuda
+        .as_cuda_slice::<half::bf16>()?
+        .slice(x_layout.start_offset()..);
+    let g_slice = g_cuda
+        .as_cuda_slice::<half::bf16>()?
+        .slice(g_layout.start_offset()..);
+    let w_slice = w_cuda
+        .as_cuda_slice::<f32>()?
+        .slice(w_layout.start_offset()..);
 
     let out = unsafe { dev.alloc::<half::bf16>(n) }?;
 
@@ -137,8 +144,13 @@ pub fn fast_rmsnorm_gated(x: &Tensor, gate: &Tensor, weight: &Tensor, eps: f64) 
         (block, n_rows as u32, num_warps * 4)
     };
 
-    let func = dev.get_or_load_custom_func("rmsnorm_gated_bf16", "rmsnorm_gated", PTX_RMSNORM_GATED)?;
-    let cfg = LaunchConfig { grid_dim: (grid_size, 1, 1), block_dim: (block_size, 1, 1), shared_mem_bytes: shared_mem };
+    let func =
+        dev.get_or_load_custom_func("rmsnorm_gated_bf16", "rmsnorm_gated", PTX_RMSNORM_GATED)?;
+    let cfg = LaunchConfig {
+        grid_dim: (grid_size, 1, 1),
+        block_dim: (block_size, 1, 1),
+        shared_mem_bytes: shared_mem,
+    };
     let mut builder = func.builder();
     builder.arg(&x_slice);
     builder.arg(&g_slice);
@@ -152,8 +164,15 @@ pub fn fast_rmsnorm_gated(x: &Tensor, gate: &Tensor, weight: &Tensor, eps: f64) 
     builder.arg(&eps_val);
     unsafe { builder.launch(cfg) }.w()?;
 
-    drop(x_storage); drop(g_storage); drop(w_storage);
+    drop(x_storage);
+    drop(g_storage);
+    drop(w_storage);
 
     let out_storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
-    Ok(Tensor::from_storage(candle_core::Storage::Cuda(out_storage), shape.clone(), candle_core::op::BackpropOp::none(), false))
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(out_storage),
+        shape.clone(),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
 }

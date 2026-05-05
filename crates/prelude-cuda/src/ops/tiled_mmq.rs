@@ -6,9 +6,8 @@
 //! Use this for M > 1 (prefill). For M = 1 (decode), use `mmvq` instead.
 
 use candle_core::backend::BackendStorage;
-use candle_core::cuda_backend::WrapErr;
 use cudarc::driver::DevicePtr;
-use prelude_core::tensor::{bail, DType, Result, Tensor};
+use prelude_core::tensor::{DType, Result, Tensor, bail};
 use std::ffi::c_void;
 
 /// Perform tiled quantized matrix multiplication on GPU.
@@ -40,14 +39,17 @@ pub fn tiled_mmq(
     };
 
     if a_cuda.dtype() != DType::BF16 {
-        bail!("tiled_mmq: activations must be BF16, got {:?}", a_cuda.dtype());
+        bail!(
+            "tiled_mmq: activations must be BF16, got {:?}",
+            a_cuda.dtype()
+        );
     }
 
     let dev = a_cuda.device().clone();
     let stream = dev.cuda_stream();
 
     // Get raw CUDA stream
-    let raw_stream = unsafe { stream.cu_stream() } as *const c_void;
+    let raw_stream = stream.cu_stream() as *const c_void;
 
     // Allocate Q8_1_MMQ buffer
     // llama.cpp: nrows * GGML_PAD(K, 512) * 36/32 + mmq_x_max * sizeof(block_q8_1_mmq)
@@ -57,7 +59,9 @@ pub fn tiled_mmq(
     let q8_buffer = unsafe { dev.alloc::<u8>(q8_buf_size) }?;
 
     // Get raw device pointers (use device stream for all)
-    let w_slice = w_cuda.as_cuda_slice::<u8>()?.slice(w_layout.start_offset()..);
+    let w_slice = w_cuda
+        .as_cuda_slice::<u8>()?
+        .slice(w_layout.start_offset()..);
     let a_slice = a_cuda.as_cuda_slice::<half::bf16>()?;
     let output = unsafe { dev.alloc::<f32>(m * n) }?;
 
@@ -68,19 +72,18 @@ pub fn tiled_mmq(
 
     // Step 1: Quantize activations BF16 → Q8_1_MMQ
     unsafe {
-        quant_gemm::quantize_q8_1(
-            a_ptr, q8_ptr,
-            m as i64, k as i64,
-            weight_type,
-            raw_stream,
-        );
+        quant_gemm::quantize_q8_1(a_ptr, q8_ptr, m as i64, k as i64, weight_type, raw_stream);
     }
 
     // Step 2: Tiled MMQ (compute_cap=0 → auto-detect in C++ side)
     unsafe {
         quant_gemm::mul_mat_q(
-            w_ptr, q8_ptr as *const c_void, out_ptr,
-            m as i64, n as i64, k as i64,
+            w_ptr,
+            q8_ptr as *const c_void,
+            out_ptr,
+            m as i64,
+            n as i64,
+            k as i64,
             weight_type,
             0, // auto-detect compute capability
             raw_stream,

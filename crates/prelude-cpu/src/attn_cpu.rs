@@ -8,8 +8,11 @@ use prelude_core::tensor::{Result, Tensor};
 /// BF16: optimized tiled kernel (when Q and K have equal lengths).
 /// F32 or cross-attention: matmul SDPA.
 pub fn varlen_causal(
-    q: &Tensor, k: &Tensor, v: &Tensor,
-    cu_seqlens_q: &Tensor, cu_seqlens_k: &Tensor,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    cu_seqlens_q: &Tensor,
+    cu_seqlens_k: &Tensor,
     softmax_scale: f32,
 ) -> Result<Tensor> {
     let cu_q: Vec<u32> = cu_seqlens_q.to_vec1()?;
@@ -26,7 +29,14 @@ pub fn varlen_causal(
     // (the tiled kernel assumes Q and K share the same seq_lens).
     if q.dtype() == prelude_core::tensor::DType::BF16 && same_lengths {
         return crate::ops::cpu_prefill_attention(
-            q, k, v, &seq_lens_q, num_heads, num_kv_heads, head_dim, softmax_scale as f64,
+            q,
+            k,
+            v,
+            &seq_lens_q,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            softmax_scale as f64,
         );
     }
 
@@ -35,14 +45,26 @@ pub fn varlen_causal(
     let q_f32 = q.to_dtype(prelude_core::tensor::DType::F32)?;
     let k_f32 = k.to_dtype(prelude_core::tensor::DType::F32)?;
     let v_f32 = v.to_dtype(prelude_core::tensor::DType::F32)?;
-    let out = matmul_sdpa_cross(&q_f32, &k_f32, &v_f32, &seq_lens_q, &seq_lens_k,
-        num_heads, num_kv_heads, head_dim, softmax_scale, true)?;
+    let out = matmul_sdpa_cross(
+        &q_f32,
+        &k_f32,
+        &v_f32,
+        &seq_lens_q,
+        &seq_lens_k,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        softmax_scale,
+        true,
+    )?;
     out.to_dtype(q.dtype())
 }
 
 /// Non-causal (bidirectional) varlen attention on CPU.
 pub fn varlen_bidirectional(
-    q: &Tensor, k: &Tensor, v: &Tensor,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
     cu_seqlens_q: &Tensor,
     softmax_scale: f32,
 ) -> Result<Tensor> {
@@ -56,29 +78,60 @@ pub fn varlen_bidirectional(
     let q_f32 = q.to_dtype(prelude_core::tensor::DType::F32)?;
     let k_f32 = k.to_dtype(prelude_core::tensor::DType::F32)?;
     let v_f32 = v.to_dtype(prelude_core::tensor::DType::F32)?;
-    let out = matmul_sdpa(&q_f32, &k_f32, &v_f32, &seq_lens, num_heads, num_kv_heads, head_dim, softmax_scale, false)?;
+    let out = matmul_sdpa(
+        &q_f32,
+        &k_f32,
+        &v_f32,
+        &seq_lens,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        softmax_scale,
+        false,
+    )?;
     out.to_dtype(q.dtype())
 }
 
 /// Dispatch: oneDNN path (when available) or naive fallback.
 #[allow(clippy::too_many_arguments)]
 fn matmul_sdpa(
-    q: &Tensor, k: &Tensor, v: &Tensor,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
     seq_lens: &[usize],
-    num_heads: usize, num_kv_heads: usize, head_dim: usize,
-    softmax_scale: f32, causal: bool,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    softmax_scale: f32,
+    causal: bool,
 ) -> Result<Tensor> {
-    matmul_sdpa_onednn(q, k, v, seq_lens, num_heads, num_kv_heads, head_dim, softmax_scale, causal)
+    matmul_sdpa_onednn(
+        q,
+        k,
+        v,
+        seq_lens,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        softmax_scale,
+        causal,
+    )
 }
 
 /// Dispatch for cross-attention: Q and K may have different per-sequence lengths.
 /// Falls back to per-sequence cross_attention_f32_onednn.
 #[allow(clippy::too_many_arguments)]
 fn matmul_sdpa_cross(
-    q: &Tensor, k: &Tensor, v: &Tensor,
-    seq_lens_q: &[usize], seq_lens_k: &[usize],
-    num_heads: usize, num_kv_heads: usize, head_dim: usize,
-    softmax_scale: f32, causal: bool,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    seq_lens_q: &[usize],
+    seq_lens_k: &[usize],
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    softmax_scale: f32,
+    causal: bool,
 ) -> Result<Tensor> {
     let batch = seq_lens_q.len();
     let mut outputs = Vec::with_capacity(batch);
@@ -94,9 +147,17 @@ fn matmul_sdpa_cross(
 
         let position_offset = sk.saturating_sub(sq); // causal offset for cross-attention
         let out = cross_attention_f32_onednn(
-            &q_seq, &k_seq, &v_seq,
-            sq, sk, num_heads, num_kv_heads, head_dim,
-            softmax_scale, causal, position_offset,
+            &q_seq,
+            &k_seq,
+            &v_seq,
+            sq,
+            sk,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            softmax_scale,
+            causal,
+            position_offset,
         )?;
         outputs.push(out);
         q_offset += sq;
@@ -116,13 +177,18 @@ fn matmul_sdpa_cross(
 /// parallelized across heads with rayon. No tensor overhead in the hot path.
 #[allow(clippy::too_many_arguments)]
 fn matmul_sdpa_onednn(
-    q: &Tensor, k: &Tensor, v: &Tensor,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
     seq_lens: &[usize],
-    num_heads: usize, num_kv_heads: usize, head_dim: usize,
-    softmax_scale: f32, causal: bool,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    softmax_scale: f32,
+    causal: bool,
 ) -> Result<Tensor> {
-    use rayon::prelude::*;
     use crate::ops::buf_tensor::CpuTensorF32;
+    use rayon::prelude::*;
 
     crate::onednn::init();
 
@@ -178,43 +244,56 @@ fn matmul_sdpa_onednn(
 
         let head_scores = slen * slen;
 
-        scores_buf.par_chunks_mut(head_scores)
+        scores_buf
+            .par_chunks_mut(head_scores)
             .zip(head_out.par_chunks_mut(head_block))
             .enumerate()
             .for_each(|(h, (s_h, o_h))| {
-            let q_h = &q_heads[h * head_block..(h + 1) * head_block];
-            let k_h = &k_heads[h * head_block..(h + 1) * head_block];
-            let v_h = &v_heads[h * head_block..(h + 1) * head_block];
+                let q_h = &q_heads[h * head_block..(h + 1) * head_block];
+                let k_h = &k_heads[h * head_block..(h + 1) * head_block];
+                let v_h = &v_heads[h * head_block..(h + 1) * head_block];
 
-            // QK^T: [slen, head_dim] @ [slen, head_dim]^T → [slen, slen]
-            unsafe {
-                crate::onednn::ffi::onednn_f32_linear(
-                    q_h.as_ptr() as *const _, k_h.as_ptr() as *const _,
-                    s_h.as_mut_ptr() as *mut _,
-                    slen as i64, head_dim as i64, slen as i64,
-                );
-            }
-
-            if causal {
-                for i in 0..slen {
-                    for j in 0..=i { s_h[i * slen + j] *= softmax_scale; }
-                    for j in (i + 1)..slen { s_h[i * slen + j] = f32::NEG_INFINITY; }
+                // QK^T: [slen, head_dim] @ [slen, head_dim]^T → [slen, slen]
+                unsafe {
+                    crate::onednn::ffi::onednn_f32_linear(
+                        q_h.as_ptr() as *const _,
+                        k_h.as_ptr() as *const _,
+                        s_h.as_mut_ptr() as *mut _,
+                        slen as i64,
+                        head_dim as i64,
+                        slen as i64,
+                    );
                 }
-            } else {
-                for v in s_h.iter_mut() { *v *= softmax_scale; }
-            }
 
-            crate::ops::softmax::softmax_f32_inplace(s_h, slen, slen);
+                if causal {
+                    for i in 0..slen {
+                        for j in 0..=i {
+                            s_h[i * slen + j] *= softmax_scale;
+                        }
+                        for j in (i + 1)..slen {
+                            s_h[i * slen + j] = f32::NEG_INFINITY;
+                        }
+                    }
+                } else {
+                    for v in s_h.iter_mut() {
+                        *v *= softmax_scale;
+                    }
+                }
 
-            // score @ V: [slen, slen] @ [slen, head_dim] → [slen, head_dim]
-            unsafe {
-                crate::onednn::ffi::onednn_f32_matmul(
-                    s_h.as_ptr() as *const _, v_h.as_ptr() as *const _,
-                    o_h.as_mut_ptr() as *mut _,
-                    slen as i64, slen as i64, head_dim as i64,
-                );
-            }
-        });
+                crate::ops::softmax::softmax_f32_inplace(s_h, slen, slen);
+
+                // score @ V: [slen, slen] @ [slen, head_dim] → [slen, head_dim]
+                unsafe {
+                    crate::onednn::ffi::onednn_f32_matmul(
+                        s_h.as_ptr() as *const _,
+                        v_h.as_ptr() as *const _,
+                        o_h.as_mut_ptr() as *mut _,
+                        slen as i64,
+                        slen as i64,
+                        head_dim as i64,
+                    );
+                }
+            });
 
         // Scatter back: [num_heads, slen, head_dim] → [slen, num_heads, head_dim]
         let out_seq = unsafe {
@@ -247,13 +326,20 @@ fn matmul_sdpa_onednn(
 /// Returns: [seq_q, num_heads, head_dim]
 #[allow(clippy::too_many_arguments)]
 pub fn cross_attention_f32_onednn(
-    q: &Tensor, k: &Tensor, v: &Tensor,
-    seq_q: usize, seq_kv: usize,
-    num_heads: usize, num_kv_heads: usize, head_dim: usize,
-    softmax_scale: f32, causal: bool, position_offset: usize,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    seq_q: usize,
+    seq_kv: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    softmax_scale: f32,
+    causal: bool,
+    position_offset: usize,
 ) -> Result<Tensor> {
-    use rayon::prelude::*;
     use crate::ops::buf_tensor::CpuTensorF32;
+    use rayon::prelude::*;
 
     crate::onednn::init();
 
@@ -299,46 +385,55 @@ pub fn cross_attention_f32_onednn(
     let mut scores_buf = vec![0.0f32; num_heads * head_scores];
     let mut head_out = vec![0.0f32; num_heads * head_q_block];
 
-    scores_buf.par_chunks_mut(head_scores)
+    scores_buf
+        .par_chunks_mut(head_scores)
         .zip(head_out.par_chunks_mut(head_q_block))
         .enumerate()
         .for_each(|(h, (s_h, o_h))| {
-        let q_h = &q_heads[h * head_q_block..(h + 1) * head_q_block];
-        let k_h = &k_heads[h * head_kv_block..(h + 1) * head_kv_block];
-        let v_h = &v_heads[h * head_kv_block..(h + 1) * head_kv_block];
+            let q_h = &q_heads[h * head_q_block..(h + 1) * head_q_block];
+            let k_h = &k_heads[h * head_kv_block..(h + 1) * head_kv_block];
+            let v_h = &v_heads[h * head_kv_block..(h + 1) * head_kv_block];
 
-        unsafe {
-            crate::onednn::ffi::onednn_f32_linear(
-                q_h.as_ptr() as *const _, k_h.as_ptr() as *const _,
-                s_h.as_mut_ptr() as *mut _,
-                seq_q as i64, head_dim as i64, seq_kv as i64,
-            );
-        }
+            unsafe {
+                crate::onednn::ffi::onednn_f32_linear(
+                    q_h.as_ptr() as *const _,
+                    k_h.as_ptr() as *const _,
+                    s_h.as_mut_ptr() as *mut _,
+                    seq_q as i64,
+                    head_dim as i64,
+                    seq_kv as i64,
+                );
+            }
 
-        if causal {
-            for i in 0..seq_q {
-                for j in 0..seq_kv {
-                    if j <= position_offset + i {
-                        s_h[i * seq_kv + j] *= softmax_scale;
-                    } else {
-                        s_h[i * seq_kv + j] = f32::NEG_INFINITY;
+            if causal {
+                for i in 0..seq_q {
+                    for j in 0..seq_kv {
+                        if j <= position_offset + i {
+                            s_h[i * seq_kv + j] *= softmax_scale;
+                        } else {
+                            s_h[i * seq_kv + j] = f32::NEG_INFINITY;
+                        }
                     }
                 }
+            } else {
+                for val in s_h.iter_mut() {
+                    *val *= softmax_scale;
+                }
             }
-        } else {
-            for val in s_h.iter_mut() { *val *= softmax_scale; }
-        }
 
-        crate::ops::softmax::softmax_f32_inplace(s_h, seq_q, seq_kv);
+            crate::ops::softmax::softmax_f32_inplace(s_h, seq_q, seq_kv);
 
-        unsafe {
-            crate::onednn::ffi::onednn_f32_matmul(
-                s_h.as_ptr() as *const _, v_h.as_ptr() as *const _,
-                o_h.as_mut_ptr() as *mut _,
-                seq_q as i64, seq_kv as i64, head_dim as i64,
-            );
-        }
-    });
+            unsafe {
+                crate::onednn::ffi::onednn_f32_matmul(
+                    s_h.as_ptr() as *const _,
+                    v_h.as_ptr() as *const _,
+                    o_h.as_mut_ptr() as *mut _,
+                    seq_q as i64,
+                    seq_kv as i64,
+                    head_dim as i64,
+                );
+            }
+        });
 
     let mut out_flat = vec![0.0f32; seq_q * num_heads * head_dim];
     for h in 0..num_heads {
@@ -358,10 +453,15 @@ pub fn cross_attention_f32_onednn(
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn matmul_sdpa_reference(
-    q: &Tensor, k: &Tensor, v: &Tensor,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
     seq_lens: &[usize],
-    num_heads: usize, num_kv_heads: usize, head_dim: usize,
-    softmax_scale: f32, causal: bool,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    softmax_scale: f32,
+    causal: bool,
 ) -> Result<Tensor> {
     let gqa_ratio = num_heads / num_kv_heads;
     let mut outputs = Vec::with_capacity(seq_lens.len());
@@ -373,13 +473,17 @@ fn matmul_sdpa_reference(
         let v_seq = v.narrow(0, offset, slen)?;
 
         let k_exp = if gqa_ratio > 1 {
-            k_seq.unsqueeze(2)?.expand((slen, num_kv_heads, gqa_ratio, head_dim))?
+            k_seq
+                .unsqueeze(2)?
+                .expand((slen, num_kv_heads, gqa_ratio, head_dim))?
                 .reshape((slen, num_heads, head_dim))?
         } else {
             k_seq.clone()
         };
         let v_exp = if gqa_ratio > 1 {
-            v_seq.unsqueeze(2)?.expand((slen, num_kv_heads, gqa_ratio, head_dim))?
+            v_seq
+                .unsqueeze(2)?
+                .expand((slen, num_kv_heads, gqa_ratio, head_dim))?
                 .reshape((slen, num_heads, head_dim))?
         } else {
             v_seq.clone()
@@ -400,8 +504,8 @@ fn matmul_sdpa_reference(
                     mask_data[i * slen + j] = f32::NEG_INFINITY;
                 }
             }
-            let causal_mask = Tensor::from_vec(mask_data, (slen, slen), q.device())?
-                .to_dtype(scores.dtype())?;
+            let causal_mask =
+                Tensor::from_vec(mask_data, (slen, slen), q.device())?.to_dtype(scores.dtype())?;
             scores.broadcast_add(&causal_mask)?
         } else {
             scores
@@ -446,22 +550,45 @@ mod tests {
         let v = deterministic_f32_tensor(&[seq_len, num_kv_heads, head_dim], 3);
 
         let ref_out = matmul_sdpa_reference(
-            &q, &k, &v, &[seq_len], num_heads, num_kv_heads, head_dim, scale, true,
-        ).unwrap();
+            &q,
+            &k,
+            &v,
+            &[seq_len],
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            true,
+        )
+        .unwrap();
 
         {
             let onednn_out = matmul_sdpa_onednn(
-                &q, &k, &v, &[seq_len], num_heads, num_kv_heads, head_dim, scale, true,
-            ).unwrap();
+                &q,
+                &k,
+                &v,
+                &[seq_len],
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+                true,
+            )
+            .unwrap();
 
             let c: Vec<f32> = ref_out.flatten_all().unwrap().to_vec1().unwrap();
             let o: Vec<f32> = onednn_out.flatten_all().unwrap().to_vec1().unwrap();
             assert_eq!(c.len(), o.len());
 
-            let max_diff = c.iter().zip(o.iter())
+            let max_diff = c
+                .iter()
+                .zip(o.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
-            eprintln!("correctness: max_diff = {max_diff:.2e} ({} elements)", c.len());
+            eprintln!(
+                "correctness: max_diff = {max_diff:.2e} ({} elements)",
+                c.len()
+            );
             assert!(max_diff < 1e-4, "max diff {max_diff} exceeds tolerance");
         }
     }
@@ -480,17 +607,37 @@ mod tests {
         let v = deterministic_f32_tensor(&[total, num_kv_heads, head_dim], 30);
 
         let ref_out = matmul_sdpa_reference(
-            &q, &k, &v, &seq_lens, num_heads, num_kv_heads, head_dim, scale, true,
-        ).unwrap();
+            &q,
+            &k,
+            &v,
+            &seq_lens,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            true,
+        )
+        .unwrap();
 
         {
             let onednn_out = matmul_sdpa_onednn(
-                &q, &k, &v, &seq_lens, num_heads, num_kv_heads, head_dim, scale, true,
-            ).unwrap();
+                &q,
+                &k,
+                &v,
+                &seq_lens,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+                true,
+            )
+            .unwrap();
 
             let c: Vec<f32> = ref_out.flatten_all().unwrap().to_vec1().unwrap();
             let o: Vec<f32> = onednn_out.flatten_all().unwrap().to_vec1().unwrap();
-            let max_diff = c.iter().zip(o.iter())
+            let max_diff = c
+                .iter()
+                .zip(o.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
             eprintln!("varlen correctness: max_diff = {max_diff:.2e}");
@@ -514,13 +661,29 @@ mod tests {
 
         for _ in 0..warmup {
             let _ = matmul_sdpa_reference(
-                &q, &k, &v, &[seq_len], num_heads, num_kv_heads, head_dim, scale, true,
+                &q,
+                &k,
+                &v,
+                &[seq_len],
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+                true,
             );
         }
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
             let _ = matmul_sdpa_reference(
-                &q, &k, &v, &[seq_len], num_heads, num_kv_heads, head_dim, scale, true,
+                &q,
+                &k,
+                &v,
+                &[seq_len],
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+                true,
             );
         }
         let ref_us = t0.elapsed().as_micros() / iters as u128;
@@ -528,19 +691,37 @@ mod tests {
         {
             for _ in 0..warmup {
                 let _ = matmul_sdpa_onednn(
-                    &q, &k, &v, &[seq_len], num_heads, num_kv_heads, head_dim, scale, true,
+                    &q,
+                    &k,
+                    &v,
+                    &[seq_len],
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    scale,
+                    true,
                 );
             }
             let t0 = std::time::Instant::now();
             for _ in 0..iters {
                 let _ = matmul_sdpa_onednn(
-                    &q, &k, &v, &[seq_len], num_heads, num_kv_heads, head_dim, scale, true,
+                    &q,
+                    &k,
+                    &v,
+                    &[seq_len],
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    scale,
+                    true,
                 );
             }
             let onednn_us = t0.elapsed().as_micros() / iters as u128;
 
             eprintln!();
-            eprintln!("=== F32 SDPA Benchmark (seq={seq_len}, H={num_heads}, Hkv={num_kv_heads}, D={head_dim}) ===");
+            eprintln!(
+                "=== F32 SDPA Benchmark (seq={seq_len}, H={num_heads}, Hkv={num_kv_heads}, D={head_dim}) ==="
+            );
             eprintln!("reference: {ref_us} us/iter");
             eprintln!("oneDNN:  {onednn_us} us/iter");
             if onednn_us > 0 {
@@ -548,6 +729,5 @@ mod tests {
                 eprintln!("speedup: {speedup:.2}x");
             }
         }
-
     }
 }

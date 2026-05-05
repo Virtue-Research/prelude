@@ -1,8 +1,8 @@
-use prelude_core::tensor::{DType, Device, Module, Result, Tensor};
 use half::bf16;
+use prelude_core::tensor::{DType, Device, Module, Result, Tensor};
 use std::time::Instant;
 
-use super::{print_result, BenchResult};
+use super::{BenchResult, print_result};
 
 pub fn bench(hidden: usize, batch: usize, warmup: usize, repeats: usize) -> Result<()> {
     let device = Device::Cpu;
@@ -41,7 +41,16 @@ pub fn bench(hidden: usize, batch: usize, warmup: usize, repeats: usize) -> Resu
 
     let sgl_us: Option<f64> = None;
 
-    print_result("rmsnorm  ", hidden, batch, &BenchResult { cpu_ops_us, naive_us, sgl_us });
+    print_result(
+        "rmsnorm  ",
+        hidden,
+        batch,
+        &BenchResult {
+            cpu_ops_us,
+            naive_us,
+            sgl_us,
+        },
+    );
     Ok(())
 }
 
@@ -52,14 +61,14 @@ pub fn bench_dtypes(hidden: usize, batch: usize, warmup: usize, repeats: usize) 
     let input_f32: Vec<f32> = (0..batch * hidden)
         .map(|i| ((i as f32 * 0.007) - 0.5).sin())
         .collect();
-    let weight_f32: Vec<f32> = (0..hidden)
-        .map(|i| 0.8 + i as f32 * 0.001)
-        .collect();
+    let weight_f32: Vec<f32> = (0..hidden).map(|i| 0.8 + i as f32 * 0.001).collect();
     let weight_f32_t = Tensor::from_vec(weight_f32, (hidden,), &device)?;
-    let candle_norm = prelude_core::models::commons::linear::RmsNorm::from_weight(weight_f32_t.clone(), 1e-6);
+    let candle_norm =
+        prelude_core::models::commons::linear::RmsNorm::from_weight(weight_f32_t.clone(), 1e-6);
 
     for &(dtype, label) in &[(DType::F16, "rms_f16 "), (DType::F32, "rms_f32 ")] {
-        let input = Tensor::from_vec(input_f32.clone(), (batch, hidden), &device)?.to_dtype(dtype)?;
+        let input =
+            Tensor::from_vec(input_f32.clone(), (batch, hidden), &device)?.to_dtype(dtype)?;
         let weight = weight_f32_t.to_dtype(dtype)?;
 
         for _ in 0..warmup {
@@ -81,7 +90,16 @@ pub fn bench_dtypes(hidden: usize, batch: usize, warmup: usize, repeats: usize) 
         }
         let naive_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 
-        print_result(label, hidden, batch, &BenchResult { cpu_ops_us, naive_us, sgl_us: None });
+        print_result(
+            label,
+            hidden,
+            batch,
+            &BenchResult {
+                cpu_ops_us,
+                naive_us,
+                sgl_us: None,
+            },
+        );
     }
     Ok(())
 }
@@ -90,9 +108,15 @@ pub fn bench_fused(hidden: usize, batch: usize, warmup: usize, repeats: usize) -
     let device = Device::Cpu;
     let n = batch * hidden;
 
-    let h_data: Vec<bf16> = (0..n).map(|i| bf16::from_f32(((i as f32 * 0.013) - 0.3).cos())).collect();
-    let res_data: Vec<bf16> = (0..n).map(|i| bf16::from_f32(((i as f32 * 0.007) + 0.1).sin())).collect();
-    let weight_data: Vec<bf16> = (0..hidden).map(|i| bf16::from_f32(0.9 + i as f32 * 0.002)).collect();
+    let h_data: Vec<bf16> = (0..n)
+        .map(|i| bf16::from_f32(((i as f32 * 0.013) - 0.3).cos()))
+        .collect();
+    let res_data: Vec<bf16> = (0..n)
+        .map(|i| bf16::from_f32(((i as f32 * 0.007) + 0.1).sin()))
+        .collect();
+    let weight_data: Vec<bf16> = (0..hidden)
+        .map(|i| bf16::from_f32(0.9 + i as f32 * 0.002))
+        .collect();
     let weight = Tensor::from_vec(weight_data, (hidden,), &device)?;
 
     // cpu_ops — inputs are immutable (&Tensor), no need to clone per iteration
@@ -123,12 +147,26 @@ pub fn bench_fused(hidden: usize, batch: usize, warmup: usize, repeats: usize) -
 
     let sgl_us: Option<f64> = None;
 
-    print_result("fused_rms", hidden, batch, &BenchResult { cpu_ops_us, naive_us, sgl_us });
+    print_result(
+        "fused_rms",
+        hidden,
+        batch,
+        &BenchResult {
+            cpu_ops_us,
+            naive_us,
+            sgl_us,
+        },
+    );
     Ok(())
 }
 
 /// Fused Add+RMSNorm benchmark for F16 and F32 dtypes.
-pub fn bench_fused_dtypes(hidden: usize, batch: usize, warmup: usize, repeats: usize) -> Result<()> {
+pub fn bench_fused_dtypes(
+    hidden: usize,
+    batch: usize,
+    warmup: usize,
+    repeats: usize,
+) -> Result<()> {
     let device = Device::Cpu;
     let n = batch * hidden;
 
@@ -165,7 +203,16 @@ pub fn bench_fused_dtypes(hidden: usize, batch: usize, warmup: usize, repeats: u
         }
         let naive_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 
-        print_result(label, hidden, batch, &BenchResult { cpu_ops_us, naive_us, sgl_us: None });
+        print_result(
+            label,
+            hidden,
+            batch,
+            &BenchResult {
+                cpu_ops_us,
+                naive_us,
+                sgl_us: None,
+            },
+        );
     }
     Ok(())
 }

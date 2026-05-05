@@ -54,7 +54,6 @@ pub struct EngineConfig {
     pub cache: CacheConfig,
     pub sampling: SamplingDefaults,
     pub runtime: RuntimeConfig,
-    pub adaptive: AdaptiveConfig,
 }
 
 impl EngineConfig {
@@ -65,7 +64,6 @@ impl EngineConfig {
             cache: CacheConfig::from_env(),
             sampling: SamplingDefaults::from_env(),
             runtime: RuntimeConfig::from_env()?,
-            adaptive: AdaptiveConfig::from_env(),
         };
         config.validate()?;
         Ok(config)
@@ -78,18 +76,6 @@ impl EngineConfig {
         }
         if self.cache.prefix_block_size == 0 {
             return Err("PRELUDE_PREFIX_BLOCK_SIZE must be > 0".into());
-        }
-        if self.adaptive.arrival_alpha <= 0.0 || self.adaptive.arrival_alpha > 1.0 {
-            return Err(format!(
-                "adaptive arrival_alpha must be in (0, 1], got {}",
-                self.adaptive.arrival_alpha
-            ));
-        }
-        if self.adaptive.gpu_alpha <= 0.0 || self.adaptive.gpu_alpha > 1.0 {
-            return Err(format!(
-                "adaptive gpu_alpha must be in (0, 1], got {}",
-                self.adaptive.gpu_alpha
-            ));
         }
         Ok(())
     }
@@ -160,10 +146,6 @@ impl SamplingDefaults {
 pub struct RuntimeConfig {
     /// Device selection string: "auto", "cpu", "cuda", "cuda:N".
     pub device: String,
-    /// Enable CUDA sync timing for profiling.
-    pub sync_timing: bool,
-    /// Force variable-length prefill path even when all sequences are same length.
-    pub force_varlen_prefill: bool,
     /// Enable fused K-Norm + RoPE + KV cache write kernel.
     pub fused_kv_cache_write: bool,
     /// CPU IDs for NUMA-aware thread binding.
@@ -227,8 +209,6 @@ impl RuntimeConfig {
     fn from_env() -> Result<Self, String> {
         Ok(Self {
             device: "auto".to_string(),
-            sync_timing: parse_env_bool("PRELUDE_SYNC_TIMING"),
-            force_varlen_prefill: parse_env_bool("PRELUDE_FORCE_VARLEN_PREFILL"),
             fused_kv_cache_write: parse_env_bool_eq1("PRELUDE_FUSED_KV_CACHE_WRITE"),
             cpu_thread_bind: std::env::var("SGLANG_CPU_OMP_THREADS_BIND")
                 .ok()
@@ -242,32 +222,6 @@ impl RuntimeConfig {
             ),
             profile_tokens: parse_env_usize("PRELUDE_PROFILE_TOKENS", DEFAULT_PROFILE_TOKENS),
         })
-    }
-}
-
-// ── Adaptive batch config ────────────────────────────────────────────────
-
-/// EWMA parameters for the adaptive batch scheduler.
-#[derive(Debug, Clone)]
-pub struct AdaptiveConfig {
-    /// EWMA smoothing factor for arrival rate (higher = more responsive).
-    pub arrival_alpha: f64,
-    /// EWMA smoothing factor for GPU time (lower = more stable).
-    pub gpu_alpha: f64,
-    /// Initial arrival rate assumption (req/s) for cold start.
-    pub initial_lambda: f64,
-    /// Maximum instantaneous rate before clamping.
-    pub max_instant_rate: f64,
-}
-
-impl AdaptiveConfig {
-    fn from_env() -> Self {
-        Self {
-            arrival_alpha: parse_env_f64("PRELUDE_ADAPTIVE_ARRIVAL_ALPHA", 0.5),
-            gpu_alpha: parse_env_f64("PRELUDE_ADAPTIVE_GPU_ALPHA", 0.4),
-            initial_lambda: parse_env_f64("PRELUDE_ADAPTIVE_INITIAL_LAMBDA", 1000.0),
-            max_instant_rate: parse_env_f64("PRELUDE_ADAPTIVE_MAX_RATE", 10000.0),
-        }
     }
 }
 
@@ -292,21 +246,6 @@ fn parse_env_f32(name: &str, default: f32) -> f32 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
-}
-
-fn parse_env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-/// Parse a boolean env var: matches "1", "true", "yes", "on" (case-insensitive).
-fn parse_env_bool(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
 }
 
 /// Parse a boolean env var: matches only "1" exactly.

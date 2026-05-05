@@ -41,9 +41,9 @@ struct DecodeGraphBuffers {
     max_blocks: usize,
     max_seqlen_k: usize,
     // FlashInfer metadata buffers — pre-allocated with fixed GPU addresses.
-    fi_indptr: Tensor,         // (bs+1,) I32
-    fi_indices: Tensor,        // (bs * max_blocks,) I32
-    fi_last_page_len: Tensor,  // (bs,) I32
+    fi_indptr: Tensor,        // (bs+1,) I32
+    fi_indices: Tensor,       // (bs * max_blocks,) I32
+    fi_last_page_len: Tensor, // (bs,) I32
     // DeltaNet slot IDs — pre-allocated for hybrid models.
     deltanet_slots: Option<Tensor>, // (bs,) U32
 }
@@ -73,10 +73,12 @@ impl DecodeGraphBuffers {
             batch_size,
             packed_input: Tensor::zeros((batch_size,), DType::U32, device).map_err(tensor_err)?,
             cu_seqlens_q: Tensor::from_vec(cu_q, (batch_size + 1,), device).map_err(tensor_err)?,
-            cu_seqlens_k: Tensor::zeros((batch_size + 1,), DType::U32, device).map_err(tensor_err)?,
+            cu_seqlens_k: Tensor::zeros((batch_size + 1,), DType::U32, device)
+                .map_err(tensor_err)?,
             position_ids: Tensor::zeros((batch_size,), DType::U32, device).map_err(tensor_err)?,
             slot_mapping: Tensor::zeros((batch_size,), DType::I64, device).map_err(tensor_err)?,
-            block_tables: Tensor::zeros((batch_size, max_blocks), DType::U32, device).map_err(tensor_err)?,
+            block_tables: Tensor::zeros((batch_size, max_blocks), DType::U32, device)
+                .map_err(tensor_err)?,
             q_seq_lens: vec![1usize; batch_size],
             max_blocks,
             max_seqlen_k,
@@ -100,7 +102,8 @@ unsafe fn update_tensor<T: GpuDType + candle_core::cuda_backend::CudaDType>(
     debug_assert!(
         data.len() <= tensor.elem_count(),
         "update_tensor: data len {} exceeds tensor elem_count {}",
-        data.len(), tensor.elem_count(),
+        data.len(),
+        tensor.elem_count(),
     );
     // Safety: single GPU worker thread, no concurrent access to these graph-owned buffers.
     // Use raw CUDA memcpy with the device pointer from the tensor's CudaSlice.
@@ -112,10 +115,16 @@ unsafe fn update_tensor<T: GpuDType + candle_core::cuda_backend::CudaDType>(
                 .map_err(|e| EngineError::Internal(format!("as_cuda_slice: {e}")))?;
             let (dev_ptr, _g) = slice.device_ptr(stream);
             let raw_stream = stream.cu_stream();
-            cudarc::driver::result::memcpy_htod_async(dev_ptr, data, raw_stream)
-                .map_err(|e| EngineError::Internal(format!("memcpy_htod: {e}")))?;
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async(dev_ptr, data, raw_stream)
+                    .map_err(|e| EngineError::Internal(format!("memcpy_htod: {e}")))?;
+            }
         }
-        _ => return Err(EngineError::Internal("update_tensor: expected CUDA storage".into())),
+        _ => {
+            return Err(EngineError::Internal(
+                "update_tensor: expected CUDA storage".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -209,8 +218,7 @@ impl DecodeGraphCache {
         has_deltanet: bool,
         model_supports_graph: bool,
     ) -> Self {
-        let enabled =
-            config.runtime.cuda_graph && !has_deltanet && model_supports_graph;
+        let enabled = config.runtime.cuda_graph && !has_deltanet && model_supports_graph;
         let max_bs = config.runtime.cuda_graph_max_bs;
 
         if enabled {
@@ -245,8 +253,11 @@ impl DecodeGraphCache {
             match self.capture(engine, bs, 8192) {
                 Ok(()) => {
                     captured += 1;
-                    tracing::debug!(batch_size = bs, progress = format!("{captured}/{total}"),
-                        "CUDA graph captured");
+                    tracing::debug!(
+                        batch_size = bs,
+                        progress = format!("{captured}/{total}"),
+                        "CUDA graph captured"
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(batch_size = bs, error = %e, "CUDA graph warmup failed");
@@ -315,7 +326,9 @@ impl DecodeGraphCache {
                 &captured.buffers.fi_indptr,
                 &captured.buffers.fi_indices,
                 &captured.buffers.fi_last_page_len,
-            ).map_err(tensor_err) {
+            )
+            .map_err(tensor_err)
+            {
                 return Some(Err(e));
             }
         }
@@ -344,7 +357,13 @@ impl DecodeGraphCache {
 
         let has_deltanet = engine.cache.deltanet_pool.is_some();
         let max_blocks = (seqlen_budget + self.block_size - 1) / self.block_size;
-        let buffers = DecodeGraphBuffers::allocate(batch_size, max_blocks, seqlen_budget, has_deltanet, device)?;
+        let buffers = DecodeGraphBuffers::allocate(
+            batch_size,
+            max_blocks,
+            seqlen_budget,
+            has_deltanet,
+            device,
+        )?;
 
         let mut model = engine
             .executor
@@ -366,10 +385,15 @@ impl DecodeGraphCache {
                     cu_seqlens_k: &buffers.cu_seqlens_k,
                     max_seqlen_k: buffers.max_seqlen_k,
                 };
-                let mut dn_pool_guard = engine.cache.deltanet_pool.as_ref().map(|m| m.lock().unwrap());
+                let mut dn_pool_guard = engine
+                    .cache
+                    .deltanet_pool
+                    .as_ref()
+                    .map(|m| m.lock().unwrap());
                 let dn_pool_ref = dn_pool_guard.as_deref_mut();
                 let dn_slots_vec: Option<Vec<u32>> = buffers.deltanet_slots.as_ref().map(|t| {
-                    t.to_vec1::<u32>().unwrap_or_else(|_| vec![0u32; batch_size])
+                    t.to_vec1::<u32>()
+                        .unwrap_or_else(|_| vec![0u32; batch_size])
                 });
                 let dn_slots_ref = dn_slots_vec.as_deref();
                 let mut ctx = BatchAttnContext {
@@ -383,11 +407,15 @@ impl DecodeGraphCache {
                     deltanet_slots: dn_slots_ref,
                     deltanet_slots_gpu: buffers.deltanet_slots.as_ref(),
                 };
-                if $manage { engine.executor.ops.begin_forward(); }
+                if $manage {
+                    engine.executor.ops.begin_forward();
+                }
                 let result = $model
                     .forward(&buffers.packed_input, &mut ctx)
                     .map_err(tensor_err);
-                if $manage { engine.executor.ops.end_forward(); }
+                if $manage {
+                    engine.executor.ops.end_forward();
+                }
                 result
             }};
         }
@@ -412,7 +440,8 @@ impl DecodeGraphCache {
                 &buffers.fi_indptr,
                 &buffers.fi_indices,
                 &buffers.fi_last_page_len,
-            ).map_err(tensor_err)?;
+            )
+            .map_err(tensor_err)?;
         }
 
         // Capture
@@ -424,7 +453,10 @@ impl DecodeGraphCache {
             .map_err(|e| EngineError::Internal(format!("begin_capture: {e}")))?;
 
         // Plan is pre-populated — skip begin/end_forward during capture
-        tracing::debug!(batch_size, "CUDA graph: running model.forward inside capture");
+        tracing::debug!(
+            batch_size,
+            "CUDA graph: running model.forward inside capture"
+        );
         let output = decode_forward!(model, manage_fi_cache = false)?;
         let output = output.squeeze(1).map_err(tensor_err)?;
 
@@ -438,7 +470,14 @@ impl DecodeGraphCache {
 
         drop(model);
 
-        self.graphs.insert(batch_size, CapturedGraph { graph, buffers, output });
+        self.graphs.insert(
+            batch_size,
+            CapturedGraph {
+                graph,
+                buffers,
+                output,
+            },
+        );
         Ok(())
     }
 

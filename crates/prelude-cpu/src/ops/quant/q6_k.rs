@@ -36,11 +36,13 @@ pub fn vec_dot_q6k_q8k_scalar(x: &[BlockQ6K], y: &[BlockQ8K]) -> f32 {
                 aux8[a_idx + l] =
                     ((xb.ql[ql_idx + l] & 0xF) | (((xb.qh[qh_idx + l] >> 0) & 3) << 4)) as i8 - 32;
                 aux8[a_idx + l + 32] =
-                    ((xb.ql[ql_idx + l + 32] & 0xF) | (((xb.qh[qh_idx + l] >> 2) & 3) << 4)) as i8 - 32;
+                    ((xb.ql[ql_idx + l + 32] & 0xF) | (((xb.qh[qh_idx + l] >> 2) & 3) << 4)) as i8
+                        - 32;
                 aux8[a_idx + l + 64] =
                     ((xb.ql[ql_idx + l] >> 4) | (((xb.qh[qh_idx + l] >> 4) & 3) << 4)) as i8 - 32;
                 aux8[a_idx + l + 96] =
-                    ((xb.ql[ql_idx + l + 32] >> 4) | (((xb.qh[qh_idx + l] >> 6) & 3) << 4)) as i8 - 32;
+                    ((xb.ql[ql_idx + l + 32] >> 4) | (((xb.qh[qh_idx + l] >> 6) & 3) << 4)) as i8
+                        - 32;
             }
             a_idx += 128;
             ql_idx += 64;
@@ -90,14 +92,20 @@ mod avx2 {
     /// and scale 2*i+1 to last 8 bytes of a 128-bit register.
     /// 8 entries × 16 bytes = 128 bytes, matching llama.cpp's `get_scale_shuffle`.
     static SCALE_SHUFFLE_Q6K: [[u8; 16]; 8] = [
-        [ 0, 0, 0, 0, 0, 0, 0, 0,  1, 1, 1, 1, 1, 1, 1, 1],
-        [ 2, 2, 2, 2, 2, 2, 2, 2,  3, 3, 3, 3, 3, 3, 3, 3],
-        [ 4, 4, 4, 4, 4, 4, 4, 4,  5, 5, 5, 5, 5, 5, 5, 5],
-        [ 6, 6, 6, 6, 6, 6, 6, 6,  7, 7, 7, 7, 7, 7, 7, 7],
-        [ 8, 8, 8, 8, 8, 8, 8, 8,  9, 9, 9, 9, 9, 9, 9, 9],
-        [10,10,10,10,10,10,10,10, 11,11,11,11,11,11,11,11],
-        [12,12,12,12,12,12,12,12, 13,13,13,13,13,13,13,13],
-        [14,14,14,14,14,14,14,14, 15,15,15,15,15,15,15,15],
+        [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1],
+        [2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3],
+        [4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5],
+        [6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7],
+        [8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9],
+        [
+            10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11,
+        ],
+        [
+            12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13,
+        ],
+        [
+            14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15,
+        ],
     ];
 
     #[inline(always)]
@@ -160,29 +168,19 @@ mod avx2 {
 
                     // Combine low 4 bits with high 2 bits
                     let q4h_0 = _mm256_slli_epi16(_mm256_and_si256(q4bits_h, m2), 4);
-                    let q4h_1 = _mm256_slli_epi16(
-                        _mm256_and_si256(_mm256_srli_epi16(q4bits_h, 2), m2),
-                        4,
-                    );
-                    let q4h_2 = _mm256_slli_epi16(
-                        _mm256_and_si256(_mm256_srli_epi16(q4bits_h, 4), m2),
-                        4,
-                    );
-                    let q4h_3 = _mm256_slli_epi16(
-                        _mm256_and_si256(_mm256_srli_epi16(q4bits_h, 6), m2),
-                        4,
-                    );
+                    let q4h_1 =
+                        _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(q4bits_h, 2), m2), 4);
+                    let q4h_2 =
+                        _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(q4bits_h, 4), m2), 4);
+                    let q4h_3 =
+                        _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(q4bits_h, 6), m2), 4);
 
                     let q4_0 = _mm256_or_si256(_mm256_and_si256(q4bits1, m4), q4h_0);
                     let q4_1 = _mm256_or_si256(_mm256_and_si256(q4bits2, m4), q4h_1);
-                    let q4_2 = _mm256_or_si256(
-                        _mm256_and_si256(_mm256_srli_epi16(q4bits1, 4), m4),
-                        q4h_2,
-                    );
-                    let q4_3 = _mm256_or_si256(
-                        _mm256_and_si256(_mm256_srli_epi16(q4bits2, 4), m4),
-                        q4h_3,
-                    );
+                    let q4_2 =
+                        _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits1, 4), m4), q4h_2);
+                    let q4_3 =
+                        _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits2, 4), m4), q4h_3);
 
                     let q8_0 = _mm256_loadu_si256(q8 as *const __m256i);
                     q8 = q8.add(32);
@@ -268,8 +266,8 @@ pub fn quantized_matmul_q6k(
     assert_eq!(w.len(), n * nb);
     assert_eq!(out.len(), m * n);
 
-    use rayon::prelude::*;
     use super::quantize::quantize_row_q8k;
+    use rayon::prelude::*;
 
     out.par_chunks_mut(n).enumerate().for_each(|(i, out_row)| {
         let x_row = &x[i * k..(i + 1) * k];
@@ -298,7 +296,10 @@ mod tests {
         let q6 = make_test_q6k_blocks(&values);
         let q8 = super::super::quantize::quantize_row_q8k_scalar(&values);
         let result = vec_dot_q6k_q8k_scalar(&q6, &q8);
-        assert!(result > 0.0, "self dot product should be positive, got {result}");
+        assert!(
+            result > 0.0,
+            "self dot product should be positive, got {result}"
+        );
     }
 
     #[test]
@@ -320,8 +321,14 @@ mod tests {
         let q8 = super::super::quantize::quantize_row_q8k_scalar(&x_vals);
         let our_dot = vec_dot_q6k_q8k_scalar(&q6, &q8);
 
-        assert!(our_dot.is_finite(), "dot product should be finite, got {our_dot}");
-        assert!(our_dot.abs() > 1e-6, "dot product should be non-zero for non-trivial inputs");
+        assert!(
+            our_dot.is_finite(),
+            "dot product should be finite, got {our_dot}"
+        );
+        assert!(
+            our_dot.abs() > 1e-6,
+            "dot product should be non-zero for non-trivial inputs"
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -330,7 +337,9 @@ mod tests {
         if !is_x86_feature_detected!("avx2") {
             return;
         }
-        let values: Vec<f32> = (0..QK_K * 4).map(|i| ((i as f32) * 0.007).sin() * 2.0).collect();
+        let values: Vec<f32> = (0..QK_K * 4)
+            .map(|i| ((i as f32) * 0.007).sin() * 2.0)
+            .collect();
         let x_vals: Vec<f32> = (0..QK_K * 4).map(|i| ((i as f32) * 0.013).cos()).collect();
 
         let q6 = make_test_q6k_blocks(&values);
@@ -340,7 +349,10 @@ mod tests {
         let avx2 = unsafe { avx2::vec_dot_q6k_q8k_avx2(&q6, &q8) };
 
         let rel_err = (scalar - avx2).abs() / scalar.abs().max(1e-6);
-        assert!(rel_err < 1e-5, "AVX2 vs scalar: scalar={scalar}, avx2={avx2}, rel_err={rel_err}");
+        assert!(
+            rel_err < 1e-5,
+            "AVX2 vs scalar: scalar={scalar}, avx2={avx2}, rel_err={rel_err}"
+        );
     }
 
     #[test]
@@ -358,6 +370,9 @@ mod tests {
 
         let mut out = vec![0.0f32; m * n];
         quantized_matmul_q6k(&x_data, &w_blocks, &mut out, m, n, k);
-        assert!(out.iter().all(|v| v.is_finite()), "non-finite output: {out:?}");
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "non-finite output: {out:?}"
+        );
     }
 }

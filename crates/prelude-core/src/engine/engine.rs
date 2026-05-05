@@ -95,20 +95,6 @@ impl Engine {
         self.executor.config.max_position_embeddings
     }
 
-    #[inline]
-    pub(crate) fn sync_timing_enabled(&self) -> bool {
-        self.engine_config.runtime.sync_timing
-    }
-
-    #[inline]
-    pub fn maybe_sync_device(&self) {
-        if self.sync_timing_enabled() && self.executor.device.is_cuda() {
-            if let Err(error) = self.executor.device.synchronize() {
-                tracing::warn!(error = %error, "CUDA sync timing failed");
-            }
-        }
-    }
-
     /// Access the engine configuration.
     pub fn engine_config(&self) -> &crate::config::EngineConfig {
         &self.engine_config

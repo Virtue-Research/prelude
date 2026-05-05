@@ -5,5 +5,5 @@
 
 pub mod grammar;
 mod logits_processor;
-pub use logits_processor::{LogitsProcessor, Sampling};
 pub use grammar::{ConstraintSpec, GrammarBackend, GrammarMatcher};
+pub use logits_processor::{LogitsProcessor, Sampling};

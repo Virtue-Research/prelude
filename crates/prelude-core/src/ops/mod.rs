@@ -5,8 +5,8 @@
 //! - Basic tensor ops (matmul, unary, binary, etc.) go through candle-core natively.
 //!   The Ops trait only covers fused/inference-specific ops.
 
-pub mod traits;
 mod hook_bridge;
+pub mod traits;
 
 pub use traits::*;
 
@@ -18,8 +18,8 @@ pub fn hook_bridge_ref() -> &'static dyn candle_core::TensorHook {
 
 // ── Device ops registry ────────────────────────────────────────────
 
-use std::sync::{Mutex, OnceLock};
 use crate::tensor::Device;
+use std::sync::{Mutex, OnceLock};
 
 /// A registered ops backend with priority-based selection.
 pub struct OpsBackend {
@@ -63,7 +63,12 @@ fn resolve_for(device: &Device) -> &'static dyn Ops {
     let backends = OPS_REGISTRY.lock().unwrap();
     match pick_best(&backends, device) {
         Some(b) => {
-            tracing::info!("ops backend for {:?}: {} (priority {})", device, b.name, b.priority);
+            tracing::info!(
+                "ops backend for {:?}: {} (priority {})",
+                device,
+                b.name,
+                b.priority
+            );
             (b.create_ops)()
         }
         None => {
@@ -74,7 +79,11 @@ fn resolve_for(device: &Device) -> &'static dyn Ops {
 }
 
 pub fn select_ops(device: &Device) -> &'static dyn Ops {
-    let lock = if device.is_cuda() { &RESOLVED_GPU } else { &RESOLVED_CPU };
+    let lock = if device.is_cuda() {
+        &RESOLVED_GPU
+    } else {
+        &RESOLVED_CPU
+    };
     *lock.get_or_init(|| resolve_for(device))
 }
 
@@ -108,7 +117,9 @@ pub fn bare_ops() -> &'static dyn Ops {
 /// Basic tensor ops (matmul, add, etc.) are handled by candle-core natively.
 struct BareOps;
 impl Ops for BareOps {
-    fn default_impl(&self) -> &dyn Ops { self }
+    fn default_impl(&self) -> &dyn Ops {
+        self
+    }
 }
 
 pub fn with_ops<R>(ops: &'static dyn Ops, f: impl FnOnce() -> R) -> R {
@@ -203,9 +214,7 @@ mod tests {
 
     #[test]
     fn device_mismatch_skipped() {
-        let backends = vec![
-            gpu_backend("cuda", 100, true),
-        ];
+        let backends = vec![gpu_backend("cuda", 100, true)];
         assert!(pick_best(&backends, &Device::Cpu).is_none());
     }
 
@@ -217,10 +226,7 @@ mod tests {
 
     #[test]
     fn all_probes_fail_returns_none() {
-        let backends = vec![
-            cpu_backend("a", 100, false),
-            cpu_backend("b", 50, false),
-        ];
+        let backends = vec![cpu_backend("a", 100, false), cpu_backend("b", 50, false)];
         assert!(pick_best(&backends, &Device::Cpu).is_none());
     }
 

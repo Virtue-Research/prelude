@@ -1,6 +1,6 @@
-use crate::types::{ClassifyRequest, EmbedRequest, GenerateRequest, TokenLogprobInfo};
-use crate::tensor::Tensor;
 use crate::engine::sampling::LogitsProcessor;
+use crate::tensor::Tensor;
+use crate::types::{ClassifyRequest, EmbedRequest, GenerateRequest, TokenLogprobInfo};
 
 // ── Model dispatch ──────────────────────────────────────────────────────
 
@@ -175,9 +175,7 @@ pub(crate) struct PrefixReuseCandidate {
 pub(crate) struct PrefillPlan {
     pub(crate) execution_kind: ExecutionKind,
     pub(crate) seq_lens: Vec<usize>,
-    pub(crate) all_same_len: bool,
     pub(crate) all_greedy: bool,
-    pub(crate) force_varlen: bool,
     pub(crate) prefix_reuse: Option<PrefixReuseCandidate>,
     /// Per-request: tokens already in KV cache from previous chunks.
     /// Empty = standard full prefill (no chunking).
@@ -223,15 +221,15 @@ pub(crate) struct DecodePlan {
 
 /// A prepared generation batch plan produced before execution.
 #[derive(Clone, Debug)]
-pub enum GenerateBatchPlan {
+pub(crate) enum GenerateBatchPlan {
     Prefill(PrefillPlan),
     Decode(DecodePlan),
 }
 
 /// A prepared generation batch plus its queue-side logical plan.
-pub struct PreparedGenerateBatch {
-    pub plan: GenerateBatchPlan,
-    pub items: Vec<PreparedGenerateRequest>,
+pub(crate) struct PreparedGenerateBatch {
+    pub(crate) plan: GenerateBatchPlan,
+    pub(crate) items: Vec<PreparedGenerateRequest>,
 }
 
 // ── Batch item types ────────────────────────────────────────────────────
@@ -298,8 +296,6 @@ impl OwnedBatchDecodeSeq {
 // ── Paged KV pool ───────────────────────────────────────────────────────
 
 pub struct PagedKvPool {
-    pub(crate) key_caches: Vec<Tensor>,
-    pub(crate) value_caches: Vec<Tensor>,
     pub(crate) key_caches_flash: Vec<Tensor>,
     pub(crate) value_caches_flash: Vec<Tensor>,
     pub block_size: usize,

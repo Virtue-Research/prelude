@@ -1,5 +1,5 @@
-use prelude_core::tensor::{DType, Device, Result, Tensor};
 use half::bf16;
+use prelude_core::tensor::{DType, Device, Result, Tensor};
 use std::time::Instant;
 
 /// Benchmark prefill (extend) attention.
@@ -37,30 +37,49 @@ pub fn bench_extend(
     let mut out_cpu = vec![0u16; total_tokens * num_heads * head_dim];
     for _ in 0..warmup {
         prelude_cpu::ops::attention::prefill_attention_bf16(
-            &mut out_cpu, &q_u16_cpu, &k_u16_cpu, &v_u16_cpu, &seq_lens,
-            num_heads, num_kv_heads, head_dim, sm_scale as f32,
+            &mut out_cpu,
+            &q_u16_cpu,
+            &k_u16_cpu,
+            &v_u16_cpu,
+            &seq_lens,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            sm_scale as f32,
         );
     }
     let start = Instant::now();
     for _ in 0..repeats {
         prelude_cpu::ops::attention::prefill_attention_bf16(
-            &mut out_cpu, &q_u16_cpu, &k_u16_cpu, &v_u16_cpu, &seq_lens,
-            num_heads, num_kv_heads, head_dim, sm_scale as f32,
+            &mut out_cpu,
+            &q_u16_cpu,
+            &k_u16_cpu,
+            &v_u16_cpu,
+            &seq_lens,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            sm_scale as f32,
         );
     }
     let cpu_ops_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 
     // -- naive F32 baseline (matmul-based) -- skip for large sequences (too slow) --
     let naive_us: Option<f64> = if seq_len <= 1024 {
-        let q_f32 =
-            Tensor::from_vec(q_data.clone(), (total_tokens, num_heads, head_dim), &device)?
-                .to_dtype(DType::F32)?;
-        let k_f32 =
-            Tensor::from_vec(k_data.clone(), (total_tokens, num_kv_heads, head_dim), &device)?
-                .to_dtype(DType::F32)?;
-        let v_f32 =
-            Tensor::from_vec(v_data.clone(), (total_tokens, num_kv_heads, head_dim), &device)?
-                .to_dtype(DType::F32)?;
+        let q_f32 = Tensor::from_vec(q_data.clone(), (total_tokens, num_heads, head_dim), &device)?
+            .to_dtype(DType::F32)?;
+        let k_f32 = Tensor::from_vec(
+            k_data.clone(),
+            (total_tokens, num_kv_heads, head_dim),
+            &device,
+        )?
+        .to_dtype(DType::F32)?;
+        let v_f32 = Tensor::from_vec(
+            v_data.clone(),
+            (total_tokens, num_kv_heads, head_dim),
+            &device,
+        )?
+        .to_dtype(DType::F32)?;
 
         let slen = seq_lens[0];
         let gqa_ratio = num_heads / num_kv_heads;
@@ -68,42 +87,22 @@ pub fn bench_extend(
         for _ in 0..warmup {
             for h in 0..num_heads {
                 let kv_h = h / gqa_ratio;
-                let q_h = q_f32
-                    .narrow(0, 0, slen)?
-                    .narrow(1, h, 1)?
-                    .squeeze(1)?;
-                let k_h = k_f32
-                    .narrow(0, 0, slen)?
-                    .narrow(1, kv_h, 1)?
-                    .squeeze(1)?;
-                let v_h = v_f32
-                    .narrow(0, 0, slen)?
-                    .narrow(1, kv_h, 1)?
-                    .squeeze(1)?;
+                let q_h = q_f32.narrow(0, 0, slen)?.narrow(1, h, 1)?.squeeze(1)?;
+                let k_h = k_f32.narrow(0, 0, slen)?.narrow(1, kv_h, 1)?.squeeze(1)?;
+                let v_h = v_f32.narrow(0, 0, slen)?.narrow(1, kv_h, 1)?.squeeze(1)?;
                 let scores = q_h.matmul(&k_h.t()?)?;
-                let _ = prelude_core::tensor::softmax(&(scores * sm_scale)?, 1)?
-                    .matmul(&v_h)?;
+                let _ = prelude_core::tensor::softmax(&(scores * sm_scale)?, 1)?.matmul(&v_h)?;
             }
         }
         let start = Instant::now();
         for _ in 0..repeats {
             for h in 0..num_heads {
                 let kv_h = h / gqa_ratio;
-                let q_h = q_f32
-                    .narrow(0, 0, slen)?
-                    .narrow(1, h, 1)?
-                    .squeeze(1)?;
-                let k_h = k_f32
-                    .narrow(0, 0, slen)?
-                    .narrow(1, kv_h, 1)?
-                    .squeeze(1)?;
-                let v_h = v_f32
-                    .narrow(0, 0, slen)?
-                    .narrow(1, kv_h, 1)?
-                    .squeeze(1)?;
+                let q_h = q_f32.narrow(0, 0, slen)?.narrow(1, h, 1)?.squeeze(1)?;
+                let k_h = k_f32.narrow(0, 0, slen)?.narrow(1, kv_h, 1)?.squeeze(1)?;
+                let v_h = v_f32.narrow(0, 0, slen)?.narrow(1, kv_h, 1)?.squeeze(1)?;
                 let scores = q_h.matmul(&k_h.t()?)?;
-                let _ = prelude_core::tensor::softmax(&(scores * sm_scale)?, 1)?
-                    .matmul(&v_h)?;
+                let _ = prelude_core::tensor::softmax(&(scores * sm_scale)?, 1)?.matmul(&v_h)?;
             }
         }
         Some(start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0)
@@ -112,9 +111,7 @@ pub fn bench_extend(
     };
 
     // Print
-    let label = format!(
-        "[{num_seqs}x{seq_len} H={num_heads}/{num_kv_heads} D={head_dim}]"
-    );
+    let label = format!("[{num_seqs}x{seq_len} H={num_heads}/{num_kv_heads} D={head_dim}]");
     print!("  extend {label:<40} cpu_ops={cpu_ops_us:>10.1}us");
     if let Some(naive) = naive_us {
         print!("  naive_f32={naive:>10.1}us  ({:.2}x)", naive / cpu_ops_us);
@@ -198,9 +195,8 @@ pub fn bench_decode(
     }
     let cpu_ops_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 
-    let label = format!(
-        "[{num_seqs}req ctx={cache_len} H={num_heads}/{num_kv_heads} D={head_dim}]"
-    );
+    let label =
+        format!("[{num_seqs}req ctx={cache_len} H={num_heads}/{num_kv_heads} D={head_dim}]");
     print!("  decode {label:<40} cpu_ops={cpu_ops_us:>10.1}us");
     println!();
     Ok(())

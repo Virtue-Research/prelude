@@ -1,14 +1,18 @@
 #![allow(dead_code)]
 
-use prelude_core::tensor::{Device, DType, Result, Tensor};
+use prelude_core::tensor::{DType, Device, Result, Tensor};
 
 // -- Test device selection --
 
 /// Devices to test. CPU always; others added via features.
 pub fn test_devices() -> Vec<Device> {
-    let mut devs = vec![Device::Cpu];
+    let devs = vec![Device::Cpu];
     #[cfg(feature = "test-cuda")]
-    devs.push(Device::Cuda(0));
+    {
+        let mut devs = devs;
+        devs.push(Device::Cuda(0));
+        return devs;
+    }
     // planned:
     // #[cfg(feature = "test-amd")]   devs.push(Device::Amd(0));
     // #[cfg(feature = "test-metal")] devs.push(Device::Metal(0));
@@ -28,7 +32,12 @@ pub fn pytorch_eval(script: &str) -> Option<String> {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .ok()?;
-    child.stdin.take().unwrap().write_all(script.as_bytes()).ok()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .ok()?;
     let output = child.wait_with_output().ok()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -37,12 +46,7 @@ pub fn pytorch_eval(script: &str) -> Option<String> {
         }
         panic!("PyTorch script failed:\n{stderr}\nScript:\n{script}");
     }
-    Some(
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .trim()
-            .to_string(),
-    )
+    Some(String::from_utf8(output.stdout).unwrap().trim().to_string())
 }
 
 pub fn parse_f32_list(json: &str) -> Vec<f32> {
@@ -107,9 +111,9 @@ pub const F32_CONFIG: DTypeConfig = DTypeConfig {
     dtype: DType::F32,
     py_dtype: "torch.float32",
     atol_default: 1e-5,
-    atol_matmul: 5e-2,      // TF32 on SM90 has ~10-bit mantissa → relative error ~1e-3
+    atol_matmul: 5e-2, // TF32 on SM90 has ~10-bit mantissa → relative error ~1e-3
     atol_reduction: 1e-5,
-    atol_chained: 5e1,  // TF32 matmul + chained ops → large outputs (~100K) have absolute error ~10-50
+    atol_chained: 5e1, // TF32 matmul + chained ops → large outputs (~100K) have absolute error ~10-50
 };
 
 pub const BF16_CONFIG: DTypeConfig = DTypeConfig {
@@ -125,9 +129,9 @@ pub const F16_CONFIG: DTypeConfig = DTypeConfig {
     dtype: DType::F16,
     py_dtype: "torch.float16",
     atol_default: 1e-2,
-    atol_matmul: 2e0,     // F16 has 10-bit mantissa; large outputs (~1000) have ULP ~1
+    atol_matmul: 2e0, // F16 has 10-bit mantissa; large outputs (~1000) have ULP ~1
     atol_reduction: 1e-3,
-    atol_chained: 1e1,    // chained ops amplify errors
+    atol_chained: 1e1, // chained ops amplify errors
 };
 
 pub const ALL_DTYPES: &[&DTypeConfig] = &[&F32_CONFIG, &BF16_CONFIG, &F16_CONFIG];
@@ -136,7 +140,7 @@ pub const ALL_DTYPES: &[&DTypeConfig] = &[&F32_CONFIG, &BF16_CONFIG, &F16_CONFIG
 
 pub fn pseudo_random(n: usize, seed: f32) -> Vec<f32> {
     (0..n)
-        .map(|i| ((i as f32 * 0.017 + seed).sin() * 2.0))
+        .map(|i| (i as f32 * 0.017 + seed).sin() * 2.0)
         .collect()
 }
 
@@ -191,7 +195,9 @@ pub fn pytorch_ref(inputs: &[(&str, &[f32])], script: &str) -> Option<Vec<f32>> 
 
     let id = std::process::id();
     let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let dir = std::env::temp_dir();
     let input_path = dir.join(format!("prelude_ref_{id}_{ts}_in.bin"));
     let output_path = dir.join(format!("prelude_ref_{id}_{ts}_out.bin"));
@@ -256,7 +262,12 @@ def write_outputs(**kwargs):
         .stderr(std::process::Stdio::piped())
         .spawn()
         .ok()?;
-    child.stdin.take().unwrap().write_all(full_script.as_bytes()).ok()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(full_script.as_bytes())
+        .ok()?;
     let output = child.wait_with_output().ok()?;
 
     // Cleanup temp files
@@ -279,12 +290,17 @@ def write_outputs(**kwargs):
 }
 
 /// Like `pytorch_ref` but returns named outputs as a map.
-pub fn pytorch_ref_multi(inputs: &[(&str, &[f32])], script: &str) -> Option<std::collections::HashMap<String, Vec<f32>>> {
+pub fn pytorch_ref_multi(
+    inputs: &[(&str, &[f32])],
+    script: &str,
+) -> Option<std::collections::HashMap<String, Vec<f32>>> {
     use std::io::Write;
 
     let id = std::process::id();
     let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let dir = std::env::temp_dir();
     let input_path = dir.join(format!("prelude_ref_{id}_{ts}_in.bin"));
     let output_path = dir.join(format!("prelude_ref_{id}_{ts}_out.json"));
@@ -340,7 +356,12 @@ def write_outputs(**kwargs):
         .stderr(std::process::Stdio::piped())
         .spawn()
         .ok()?;
-    child.stdin.take().unwrap().write_all(full_script.as_bytes()).ok()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(full_script.as_bytes())
+        .ok()?;
     let output = child.wait_with_output().ok()?;
 
     let _ = std::fs::remove_file(&input_path);
@@ -358,7 +379,11 @@ def write_outputs(**kwargs):
     let json_str = std::fs::read_to_string(&output_path).unwrap();
     let _ = std::fs::remove_file(&output_path);
     let map: std::collections::HashMap<String, Vec<f64>> = serde_json::from_str(&json_str).unwrap();
-    Some(map.into_iter().map(|(k, v)| (k, v.into_iter().map(|x| x as f32).collect())).collect())
+    Some(
+        map.into_iter()
+            .map(|(k, v)| (k, v.into_iter().map(|x| x as f32).collect()))
+            .collect(),
+    )
 }
 
 use std::io::Seek;

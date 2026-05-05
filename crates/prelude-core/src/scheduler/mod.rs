@@ -2,12 +2,10 @@
 //!
 //! Per-paradigm schedulers decide what to run each step:
 //! - AR (autoregressive LLM): continuous batching with prefill/decode separation
-//! - DLLM (diffusion LLM): iterative demasking
-//! - Diffusion (image/video): denoising loop
-//! - TTS: multi-stage pipeline
-//! - OneShot: embed, classify, prefill-only
 //!
-//! The current implementation covers the AR scheduler. Other paradigms are stubs.
+//! The current implementation covers the AR scheduler. One-shot tasks
+//! (classification/embedding) are batched through the executor rather than a
+//! separate scheduler.
 //!
 //! AR scheduler inspired by SGLang:
 //! - Scheduler: <https://github.com/sgl-project/sglang/blob/78ddf05a/python/sglang/srt/managers/scheduler.py>
@@ -18,13 +16,6 @@
 mod admission;
 mod preemption;
 mod state;
-pub(crate) mod adaptive;
-
-// ── Paradigm scheduler stubs ──
-mod dllm;
-mod diffusion;
-mod tts;
-mod oneshot;
 
 pub mod components;
 

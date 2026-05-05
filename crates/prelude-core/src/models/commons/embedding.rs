@@ -11,11 +11,18 @@ pub struct Embedding {
 
 impl Embedding {
     pub fn new(embeddings: Tensor, hidden_size: usize) -> Self {
-        Self { embeddings, hidden_size }
+        Self {
+            embeddings,
+            hidden_size,
+        }
     }
 
-    pub fn embeddings(&self) -> &Tensor { &self.embeddings }
-    pub fn hidden_size(&self) -> usize { self.hidden_size }
+    pub fn embeddings(&self) -> &Tensor {
+        &self.embeddings
+    }
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
 }
 
 impl Module for Embedding {

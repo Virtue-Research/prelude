@@ -96,13 +96,16 @@ pub struct BatchAttnContext<'a> {
 }
 
 // Re-exports for convenient use.
-pub(crate) use linear::{Linear, RmsNorm};
 pub(crate) use attn_utils::RotaryEmbedding;
+pub(crate) use linear::{Linear, RmsNorm};
 
 // ── Utility functions ───────────────────────────────────────────────────
 
 /// Extract the last token per sequence from a packed `[total_tokens, ...]` tensor.
-pub(crate) fn last_token_select(hidden: &Tensor, seq_lens: &[usize]) -> crate::tensor::Result<Tensor> {
+pub(crate) fn last_token_select(
+    hidden: &Tensor,
+    seq_lens: &[usize],
+) -> crate::tensor::Result<Tensor> {
     if seq_lens.iter().all(|&l| l == 1) {
         return Ok(hidden.clone());
     }
@@ -118,7 +121,10 @@ pub(crate) fn last_token_select(hidden: &Tensor, seq_lens: &[usize]) -> crate::t
 }
 
 /// Extract the first token per sequence from a packed `[total_tokens, ...]` tensor.
-pub(crate) fn first_token_select(hidden: &Tensor, seq_lens: &[usize]) -> crate::tensor::Result<Tensor> {
+pub(crate) fn first_token_select(
+    hidden: &Tensor,
+    seq_lens: &[usize],
+) -> crate::tensor::Result<Tensor> {
     let batch_size = seq_lens.len();
     let mut first_indices = Vec::with_capacity(batch_size);
     let mut off = 0usize;

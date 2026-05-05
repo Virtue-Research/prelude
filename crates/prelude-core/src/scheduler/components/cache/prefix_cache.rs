@@ -13,8 +13,8 @@
 
 use std::collections::HashMap;
 
-use crate::tensor::{Result, Tensor};
 use crate::cache::prefix_index::PrefixMatchIndex;
+use crate::tensor::{Result, Tensor};
 
 // ---------------------------------------------------------------------------
 // Data structures

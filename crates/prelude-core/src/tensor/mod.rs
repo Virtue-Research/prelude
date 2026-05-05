@@ -8,16 +8,14 @@
 // ── Re-exports from candle-core ─────────────────────────────────
 
 pub use candle_core::{
-    bail, DType, Device, Error, IndexOp, Layout, Module, Result, Shape, Tensor,
-    WithDType, FloatDType, IntDType,
-    CpuStorage, Storage,
-    D,
+    CpuStorage, D, DType, Device, Error, FloatDType, IndexOp, IntDType, Layout, Module, Result,
+    Shape, Storage, Tensor, WithDType, bail,
 };
 
 pub use candle_core::error::Context;
 
 // Re-export candle-nn ops used across models
-pub use candle_nn::ops::{softmax, softmax_last_dim, sigmoid};
+pub use candle_nn::ops::{sigmoid, softmax, softmax_last_dim};
 pub use candle_nn::rotary_emb::rope_thd;
 
 #[cfg(feature = "cuda")]
@@ -65,15 +63,21 @@ impl Dim for D {
         let rank = shape.rank();
         match self {
             D::Minus1 => {
-                if rank == 0 { bail!("{op}: cannot use Minus1 on rank-0 tensor") }
+                if rank == 0 {
+                    bail!("{op}: cannot use Minus1 on rank-0 tensor")
+                }
                 Ok(rank - 1)
             }
             D::Minus2 => {
-                if rank < 2 { bail!("{op}: cannot use Minus2 on rank-{rank} tensor") }
+                if rank < 2 {
+                    bail!("{op}: cannot use Minus2 on rank-{rank} tensor")
+                }
                 Ok(rank - 2)
             }
             D::Minus(n) => {
-                if *n > rank || *n == 0 { bail!("{op}: Minus({n}) out of range for rank {rank}") }
+                if *n > rank || *n == 0 {
+                    bail!("{op}: Minus({n}) out of range for rank {rank}")
+                }
                 Ok(rank - n)
             }
         }
@@ -83,11 +87,15 @@ impl Dim for D {
         match self {
             D::Minus1 => Ok(rank),
             D::Minus2 => {
-                if rank == 0 { bail!("{op}: cannot use Minus2 on rank-0 tensor") }
+                if rank == 0 {
+                    bail!("{op}: cannot use Minus2 on rank-0 tensor")
+                }
                 Ok(rank - 1)
             }
             D::Minus(n) => {
-                if *n > rank + 1 || *n == 0 { bail!("{op}: Minus({n}) out of range for rank+1 {}", rank + 1) }
+                if *n > rank + 1 || *n == 0 {
+                    bail!("{op}: Minus({n}) out of range for rank+1 {}", rank + 1)
+                }
                 Ok(rank + 1 - n)
             }
         }
@@ -102,35 +110,51 @@ pub trait ShapeWithOneHole {
 }
 
 impl ShapeWithOneHole for Shape {
-    fn into_shape(self, _: usize) -> Result<Shape> { Ok(self) }
+    fn into_shape(self, _: usize) -> Result<Shape> {
+        Ok(self)
+    }
 }
 
 impl ShapeWithOneHole for &[usize] {
-    fn into_shape(self, _: usize) -> Result<Shape> { Ok(Shape::from(self.to_vec())) }
+    fn into_shape(self, _: usize) -> Result<Shape> {
+        Ok(Shape::from(self.to_vec()))
+    }
 }
 
 impl ShapeWithOneHole for Vec<usize> {
-    fn into_shape(self, _: usize) -> Result<Shape> { Ok(Shape::from(self)) }
+    fn into_shape(self, _: usize) -> Result<Shape> {
+        Ok(Shape::from(self))
+    }
 }
 
 impl ShapeWithOneHole for usize {
-    fn into_shape(self, _: usize) -> Result<Shape> { Ok(Shape::from(vec![self])) }
+    fn into_shape(self, _: usize) -> Result<Shape> {
+        Ok(Shape::from(vec![self]))
+    }
 }
 
 impl ShapeWithOneHole for (usize,) {
-    fn into_shape(self, _: usize) -> Result<Shape> { Ok(Shape::from(vec![self.0])) }
+    fn into_shape(self, _: usize) -> Result<Shape> {
+        Ok(Shape::from(vec![self.0]))
+    }
 }
 
 impl ShapeWithOneHole for (usize, usize) {
-    fn into_shape(self, _: usize) -> Result<Shape> { Ok(Shape::from(vec![self.0, self.1])) }
+    fn into_shape(self, _: usize) -> Result<Shape> {
+        Ok(Shape::from(vec![self.0, self.1]))
+    }
 }
 
 impl ShapeWithOneHole for (usize, usize, usize) {
-    fn into_shape(self, _: usize) -> Result<Shape> { Ok(Shape::from(vec![self.0, self.1, self.2])) }
+    fn into_shape(self, _: usize) -> Result<Shape> {
+        Ok(Shape::from(vec![self.0, self.1, self.2]))
+    }
 }
 
 impl ShapeWithOneHole for (usize, usize, usize, usize) {
-    fn into_shape(self, _: usize) -> Result<Shape> { Ok(Shape::from(vec![self.0, self.1, self.2, self.3])) }
+    fn into_shape(self, _: usize) -> Result<Shape> {
+        Ok(Shape::from(vec![self.0, self.1, self.2, self.3]))
+    }
 }
 
 // ── Compatibility: extension methods on candle Tensor ───────────
@@ -173,12 +197,24 @@ impl TensorExt for Tensor {
         self.storage_and_layout().0
     }
 
-    fn eq_t(&self, other: &Tensor) -> Result<Tensor> { self.eq(other) }
-    fn ne_t(&self, other: &Tensor) -> Result<Tensor> { self.ne(other) }
-    fn lt_t(&self, other: &Tensor) -> Result<Tensor> { self.lt(other) }
-    fn gt_t(&self, other: &Tensor) -> Result<Tensor> { self.gt(other) }
-    fn le_t(&self, other: &Tensor) -> Result<Tensor> { self.le(other) }
-    fn ge_t(&self, other: &Tensor) -> Result<Tensor> { self.ge(other) }
+    fn eq_t(&self, other: &Tensor) -> Result<Tensor> {
+        self.eq(other)
+    }
+    fn ne_t(&self, other: &Tensor) -> Result<Tensor> {
+        self.ne(other)
+    }
+    fn lt_t(&self, other: &Tensor) -> Result<Tensor> {
+        self.lt(other)
+    }
+    fn gt_t(&self, other: &Tensor) -> Result<Tensor> {
+        self.gt(other)
+    }
+    fn le_t(&self, other: &Tensor) -> Result<Tensor> {
+        self.le(other)
+    }
+    fn ge_t(&self, other: &Tensor) -> Result<Tensor> {
+        self.ge(other)
+    }
 
     fn eq_scalar<T: candle_core::scalar::TensorOrScalar>(&self, rhs: T) -> Result<Tensor> {
         self.eq(rhs)

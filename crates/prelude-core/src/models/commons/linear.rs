@@ -14,7 +14,7 @@
 // RmsNorm: AVX-512 on CPU, fused CUDA kernel on GPU via `Ops`.
 
 use crate::loading::var_builder::VarBuilder;
-use crate::tensor::{DType, Module, Result, Tensor, D};
+use crate::tensor::{D, DType, Module, Result, Tensor};
 use std::any::Any;
 use std::sync::Arc;
 
@@ -37,8 +37,12 @@ impl DenseLinear {
         Self { weight, bias }
     }
 
-    pub fn weight(&self) -> &Tensor { &self.weight }
-    pub fn bias(&self) -> Option<&Tensor> { self.bias.as_ref() }
+    pub fn weight(&self) -> &Tensor {
+        &self.weight
+    }
+    pub fn bias(&self) -> Option<&Tensor> {
+        self.bias.as_ref()
+    }
 }
 
 impl Module for DenseLinear {
@@ -47,7 +51,9 @@ impl Module for DenseLinear {
             [b1, b2, m, k] => {
                 if x.is_contiguous() {
                     let w = self.weight.t()?;
-                    x.reshape((b1 * b2 * m, k))?.matmul(&w)?.reshape((b1, b2, m, ()))?
+                    x.reshape((b1 * b2 * m, k))?
+                        .matmul(&w)?
+                        .reshape((b1, b2, m, ()))?
                 } else {
                     let w = self.weight.broadcast_left((b1, b2))?.t()?;
                     x.matmul(&w)?
@@ -56,7 +62,9 @@ impl Module for DenseLinear {
             [bsize, m, k] => {
                 if x.is_contiguous() {
                     let w = self.weight.t()?;
-                    x.reshape((bsize * m, k))?.matmul(&w)?.reshape((bsize, m, ()))?
+                    x.reshape((bsize * m, k))?
+                        .matmul(&w)?
+                        .reshape((bsize, m, ()))?
                 } else {
                     let w = self.weight.broadcast_left(bsize)?.t()?;
                     x.matmul(&w)?
@@ -75,10 +83,18 @@ impl Module for DenseLinear {
 }
 
 impl LinearBackend for DenseLinear {
-    fn name(&self) -> &str { "dense" }
-    fn weight(&self) -> Option<&Tensor> { Some(&self.weight) }
-    fn clone_box(&self) -> Box<dyn LinearBackend> { Box::new(self.clone()) }
-    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str {
+        "dense"
+    }
+    fn weight(&self) -> Option<&Tensor> {
+        Some(&self.weight)
+    }
+    fn clone_box(&self) -> Box<dyn LinearBackend> {
+        Box::new(self.clone())
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ── LinearBackend trait ───────────────────────────────────────────────────
@@ -134,7 +150,10 @@ impl Clone for Box<dyn LinearBackend> {
 pub trait QuantFormat: Send + Sync {
     fn name(&self) -> &str;
     fn can_handle(&self, dtype: crate::tensor::quantized::GgmlDType) -> bool;
-    fn load(&self, qtensor: Arc<crate::tensor::quantized::QTensor>) -> Result<Box<dyn LinearBackend>>;
+    fn load(
+        &self,
+        qtensor: Arc<crate::tensor::quantized::QTensor>,
+    ) -> Result<Box<dyn LinearBackend>>;
 }
 
 /// Wrapper for `inventory` auto-registration.
@@ -268,7 +287,12 @@ impl Linear {
     /// `ctx` carries per-batch LoRA adapter routing. `ops` provides device kernels.
     /// Currently LoRA and TP are not yet implemented — `ctx` and `ops` are accepted
     /// for API stability and will be used when those features land.
-    pub fn forward(&self, x: &Tensor, _ctx: &super::BatchState, _ops: &dyn crate::ops::Ops) -> Result<Tensor> {
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        _ctx: &super::BatchState,
+        _ops: &dyn crate::ops::Ops,
+    ) -> Result<Tensor> {
         self.inner.forward(x)
     }
 }
@@ -328,7 +352,8 @@ impl RmsNorm {
     ) -> Result<(Tensor, Tensor)> {
         match residual {
             Some(res) => {
-                let (new_res, normed) = ops.add_rmsnorm(res, hidden, &self.weight, self.eps as f32)?;
+                let (new_res, normed) =
+                    ops.add_rmsnorm(res, hidden, &self.weight, self.eps as f32)?;
                 Ok((new_res, normed))
             }
             None => {

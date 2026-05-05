@@ -11,7 +11,10 @@ use core::arch::aarch64::*;
 /// Requires aarch64 target (NEON is baseline).
 #[inline]
 pub unsafe fn quantize_row_q8_0_neon(x: &[f32]) -> Vec<BlockQ8_0> {
-    debug_assert!(x.len() % QK8_0 == 0, "input length must be multiple of {QK8_0}");
+    debug_assert!(
+        x.len() % QK8_0 == 0,
+        "input length must be multiple of {QK8_0}"
+    );
     let nb = x.len() / QK8_0;
     let mut output = Vec::with_capacity(nb);
 
@@ -91,7 +94,10 @@ pub unsafe fn quantize_row_q8_0_neon(x: &[f32]) -> Vec<BlockQ8_0> {
 /// Requires aarch64 target (NEON is baseline).
 #[inline]
 pub unsafe fn quantize_row_q8k_neon(x: &[f32]) -> Vec<BlockQ8K> {
-    debug_assert!(x.len() % QK_K == 0, "input length must be multiple of {QK_K}");
+    debug_assert!(
+        x.len() % QK_K == 0,
+        "input length must be multiple of {QK_K}"
+    );
     let nb = x.len() / QK_K;
     let mut output = Vec::with_capacity(nb);
 

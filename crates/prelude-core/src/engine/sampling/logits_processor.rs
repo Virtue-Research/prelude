@@ -3,8 +3,8 @@
 //! `LogitsProcessor` converts a raw logits tensor into a sampled token ID.
 //! Supports greedy (argmax), top-k, top-p, and temperature-scaled sampling.
 
-use crate::tensor::{DType, Error, Result, Tensor, D};
-use rand::{distr::Distribution, SeedableRng};
+use crate::tensor::{D, DType, Error, Result, Tensor};
+use rand::{SeedableRng, distr::Distribution};
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Sampling {
@@ -27,8 +27,7 @@ impl LogitsProcessor {
     }
 
     pub fn new(seed: u64, temperature: Option<f64>, top_p: Option<f64>) -> Self {
-        let temperature =
-            temperature.and_then(|v| if v < 1e-7 { None } else { Some(v) });
+        let temperature = temperature.and_then(|v| if v < 1e-7 { None } else { Some(v) });
         let sampling = match temperature {
             None => Sampling::ArgMax,
             Some(temperature) => match top_p {
@@ -44,8 +43,7 @@ impl LogitsProcessor {
     }
 
     fn sample_multinomial(&mut self, prs: &Vec<f32>) -> Result<u32> {
-        let distr =
-            rand::distr::weighted::WeightedIndex::new(prs).map_err(Error::wrap)?;
+        let distr = rand::distr::weighted::WeightedIndex::new(prs).map_err(Error::wrap)?;
         let next_token = distr.sample(&mut self.rng) as u32;
         Ok(next_token)
     }
@@ -69,26 +67,21 @@ impl LogitsProcessor {
             self.sample_multinomial(prs)
         } else {
             let mut argsort_indices = (0..prs.len()).collect::<Vec<_>>();
-            let (indices, _, _) = argsort_indices
-                .select_nth_unstable_by(top_k, |&i, &j| prs[j].total_cmp(&prs[i]));
+            let (indices, _, _) =
+                argsort_indices.select_nth_unstable_by(top_k, |&i, &j| prs[j].total_cmp(&prs[i]));
             let prs = indices.iter().map(|&i| prs[i]).collect::<Vec<_>>();
             let index = self.sample_multinomial(&prs)?;
             Ok(indices[index as usize] as u32)
         }
     }
 
-    fn sample_topk_topp(
-        &mut self,
-        prs: &mut Vec<f32>,
-        top_k: usize,
-        top_p: f32,
-    ) -> Result<u32> {
+    fn sample_topk_topp(&mut self, prs: &mut Vec<f32>, top_k: usize, top_p: f32) -> Result<u32> {
         if top_k >= prs.len() {
             self.sample_topp(prs, top_p)
         } else {
             let mut argsort_indices = (0..prs.len()).collect::<Vec<_>>();
-            let (indices, _, _) = argsort_indices
-                .select_nth_unstable_by(top_k, |&i, &j| prs[j].total_cmp(&prs[i]));
+            let (indices, _, _) =
+                argsort_indices.select_nth_unstable_by(top_k, |&i, &j| prs[j].total_cmp(&prs[i]));
             let mut prs = indices.iter().map(|&i| prs[i]).collect::<Vec<_>>();
             let sum_p = prs.iter().sum::<f32>();
             let index = if top_p <= 0.0 || top_p >= sum_p {
@@ -104,11 +97,7 @@ impl LogitsProcessor {
         self.sample_f(logits, |_| {})
     }
 
-    pub fn sample_f(
-        &mut self,
-        logits: &Tensor,
-        f: impl FnOnce(&mut [f32]),
-    ) -> Result<u32> {
+    pub fn sample_f(&mut self, logits: &Tensor, f: impl FnOnce(&mut [f32])) -> Result<u32> {
         let logits = logits.to_dtype(DType::F32)?;
         let prs = |temperature: f64| -> Result<Vec<f32>> {
             let logits = (&logits / temperature)?;
@@ -154,27 +143,21 @@ mod tests {
     #[test]
     fn argmax_selects_highest() {
         let mut proc = LogitsProcessor::from_sampling(42, Sampling::ArgMax);
-        let logits = Tensor::from_vec(
-            vec![0.1f32, 0.2, 0.9, 0.3],
-            (4,),
-            &Device::Cpu,
-        ).unwrap();
+        let logits = Tensor::from_vec(vec![0.1f32, 0.2, 0.9, 0.3], (4,), &Device::Cpu).unwrap();
         let token = proc.sample(&logits).unwrap();
         assert_eq!(token, 2);
     }
 
     #[test]
     fn argmax_deterministic() {
-        let logits = Tensor::from_vec(
-            vec![0.5f32, 0.1, 0.8, 0.3],
-            (4,),
-            &Device::Cpu,
-        ).unwrap();
+        let logits = Tensor::from_vec(vec![0.5f32, 0.1, 0.8, 0.3], (4,), &Device::Cpu).unwrap();
 
         let t1 = LogitsProcessor::from_sampling(1, Sampling::ArgMax)
-            .sample(&logits).unwrap();
+            .sample(&logits)
+            .unwrap();
         let t2 = LogitsProcessor::from_sampling(99, Sampling::ArgMax)
-            .sample(&logits).unwrap();
+            .sample(&logits)
+            .unwrap();
         assert_eq!(t1, t2); // argmax is seed-independent
     }
 
@@ -187,7 +170,13 @@ mod tests {
         assert_eq!(proc2.sampling, Sampling::All { temperature: 0.8 });
 
         let proc3 = LogitsProcessor::new(42, Some(0.8), Some(0.9));
-        assert_eq!(proc3.sampling, Sampling::TopP { p: 0.9, temperature: 0.8 });
+        assert_eq!(
+            proc3.sampling,
+            Sampling::TopP {
+                p: 0.9,
+                temperature: 0.8
+            }
+        );
 
         // near-zero temperature → argmax
         let proc4 = LogitsProcessor::new(42, Some(1e-10), None);
@@ -196,18 +185,21 @@ mod tests {
 
     #[test]
     fn topk_stays_in_range() {
-        let mut proc = LogitsProcessor::from_sampling(42, Sampling::TopK {
-            k: 2, temperature: 1.0,
-        });
-        let logits = Tensor::from_vec(
-            vec![1.0f32, 0.5, 0.1, 0.01],
-            (4,),
-            &Device::Cpu,
-        ).unwrap();
+        let mut proc = LogitsProcessor::from_sampling(
+            42,
+            Sampling::TopK {
+                k: 2,
+                temperature: 1.0,
+            },
+        );
+        let logits = Tensor::from_vec(vec![1.0f32, 0.5, 0.1, 0.01], (4,), &Device::Cpu).unwrap();
         // Sample many times — result should always be 0 or 1 (top-2)
         for _ in 0..20 {
             let token = proc.sample(&logits).unwrap();
-            assert!(token <= 1, "top-2 should only select token 0 or 1, got {token}");
+            assert!(
+                token <= 1,
+                "top-2 should only select token 0 or 1, got {token}"
+            );
         }
     }
 }

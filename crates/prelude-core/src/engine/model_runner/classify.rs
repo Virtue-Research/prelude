@@ -1,6 +1,6 @@
-use super::prefill_output::materialize_prefill_output_rows;
-use super::prefill::PrefillForwardResult;
 use super::super::*;
+use super::prefill::PrefillForwardResult;
+use super::prefill_output::materialize_prefill_output_rows;
 
 /// Raw GPU output for classify batches (before CPU post-processing).
 ///
@@ -59,7 +59,8 @@ impl Engine {
             .model
             .lock()
             .map_err(|e| EngineError::Internal(format!("model lock poisoned: {e}")))?;
-        let classifier = model.as_classifier()
+        let classifier = model
+            .as_classifier()
             .expect("classify called on model without ClassifierModel");
         let num_labels = classifier.num_labels();
         let label_map = (0..num_labels).map(|i| classifier.get_label(i)).collect();

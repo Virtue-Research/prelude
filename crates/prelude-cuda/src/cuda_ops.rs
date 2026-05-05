@@ -271,7 +271,7 @@ impl Ops for CudaOps {
         if let Some(r) = try_flashinfer_paged(q, key_cache, value_cache, params) {
             return r;
         }
-        prelude_core::ops::traits::attention::paged_attention(q, key_cache, value_cache, params)
+        prelude_core::bail!("paged_attention: no CUDA backend accepted this shape")
     }
 
     fn paged_block_size_hint(&self, head_dim: usize) -> usize {

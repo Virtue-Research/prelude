@@ -69,9 +69,7 @@ mod avx2 {
     /// Load the IQ4_NL lookup table into a 128-bit register.
     #[inline(always)]
     unsafe fn load_iq4nl_table() -> __m128i {
-        unsafe {
-            _mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i)
-        }
+        unsafe { _mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i) }
     }
 
     /// Look up 32 nibble indices from qs[16] using the IQ4_NL table.
@@ -96,10 +94,7 @@ mod avx2 {
 
     /// AVX2 IQ4_NL · Q8_0 dot product.
     #[target_feature(enable = "avx2,fma,f16c,ssse3")]
-    pub(super) unsafe fn vec_dot_iq4_nl_q8_0_avx2(
-        x: &[BlockIQ4NL],
-        y: &[BlockQ8_0],
-    ) -> f32 {
+    pub(super) unsafe fn vec_dot_iq4_nl_q8_0_avx2(x: &[BlockIQ4NL], y: &[BlockQ8_0]) -> f32 {
         unsafe {
             let nb = x.len();
             let mut acc = _mm256_setzero_ps();
@@ -178,10 +173,7 @@ mod tests {
 
         let result = vec_dot_iq4_nl_q8_0_scalar(&x, &y);
         // dot: 32 × (1 × 1) × 1.0 = 32.0
-        assert!(
-            (result - 32.0).abs() < 0.1,
-            "expected ~32.0, got {result}"
-        );
+        assert!((result - 32.0).abs() < 0.1, "expected ~32.0, got {result}");
     }
 
     #[test]
@@ -189,8 +181,8 @@ mod tests {
         // Verify that lookup table values are used correctly
         // Index 0 → -127, index 15 → 113
         let mut indices = [0u8; 32];
-        indices[0] = 0;   // KVALUES_IQ4NL[0] = -127
-        indices[16] = 15;  // KVALUES_IQ4NL[15] = 113
+        indices[0] = 0; // KVALUES_IQ4NL[0] = -127
+        indices[16] = 15; // KVALUES_IQ4NL[15] = 113
 
         let x = [make_iq4_nl(1.0, &indices)];
         let mut q8_vals = [0i8; 32];

@@ -142,15 +142,11 @@ impl GemmPool {
         }
 
         // Write work description (Relaxed — will be made visible by Release on gen bump)
-        self.shared
-            .dispatch_fn
-            .store(f as usize, Ordering::Relaxed);
+        self.shared.dispatch_fn.store(f as usize, Ordering::Relaxed);
         self.shared
             .dispatch_ctx
             .store(ctx as usize, Ordering::Relaxed);
-        self.shared
-            .dispatch_n
-            .store(n as u32, Ordering::Relaxed);
+        self.shared.dispatch_n.store(n as u32, Ordering::Relaxed);
         self.shared.done_count.store(0, Ordering::Relaxed);
 
         // Release fence + bump generation → makes all writes above visible to workers
@@ -357,7 +353,9 @@ mod tests {
 
         // First dispatch — threads are fresh
         COUNTER.store(0, Ordering::SeqCst);
-        unsafe { pool.dispatch(work, std::ptr::null(), 4); }
+        unsafe {
+            pool.dispatch(work, std::ptr::null(), 4);
+        }
         assert_eq!(COUNTER.load(Ordering::SeqCst), 4);
 
         // Wait for threads to spin out and park (1ms spin + yield + park)
@@ -365,18 +363,24 @@ mod tests {
 
         // Second dispatch — threads must wake from park
         COUNTER.store(0, Ordering::SeqCst);
-        unsafe { pool.dispatch(work, std::ptr::null(), 4); }
+        unsafe {
+            pool.dispatch(work, std::ptr::null(), 4);
+        }
         assert_eq!(COUNTER.load(Ordering::SeqCst), 4);
 
         // Third dispatch immediately after — threads should still be spinning
         COUNTER.store(0, Ordering::SeqCst);
-        unsafe { pool.dispatch(work, std::ptr::null(), 4); }
+        unsafe {
+            pool.dispatch(work, std::ptr::null(), 4);
+        }
         assert_eq!(COUNTER.load(Ordering::SeqCst), 4);
 
         // Wait again, dispatch with partial threads
         std::thread::sleep(std::time::Duration::from_millis(50));
         COUNTER.store(0, Ordering::SeqCst);
-        unsafe { pool.dispatch(work, std::ptr::null(), 2); }
+        unsafe {
+            pool.dispatch(work, std::ptr::null(), 2);
+        }
         assert_eq!(COUNTER.load(Ordering::SeqCst), 2);
     }
 
@@ -393,8 +397,14 @@ mod tests {
         for round in 0..10 {
             COUNTER.store(0, Ordering::SeqCst);
             let n = (round % 8) + 1;
-            unsafe { pool.dispatch(work, std::ptr::null(), n); }
-            assert_eq!(COUNTER.load(Ordering::SeqCst), n as u64, "round {round} n={n}");
+            unsafe {
+                pool.dispatch(work, std::ptr::null(), n);
+            }
+            assert_eq!(
+                COUNTER.load(Ordering::SeqCst),
+                n as u64,
+                "round {round} n={n}"
+            );
 
             // Every 3rd round, sleep to trigger park
             if round % 3 == 0 {
