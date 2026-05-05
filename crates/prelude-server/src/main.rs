@@ -93,6 +93,14 @@ struct Cli {
 
     #[arg(
         long,
+        help = "Max concurrent DeltaNet recurrent-state slots for hybrid models. \
+                Defaults to PRELUDE_DELTANET_POOL_SLOTS when set, otherwise \
+                --max-running-requests. Use 0 to disable the DeltaNet pool."
+    )]
+    deltanet_pool_slots: Option<u32>,
+
+    #[arg(
+        long,
         default_value_t = true,
         action = ArgAction::SetTrue,
         help = "Enable chunked prefill: interleave prefill with decode steps for lower TPOT"
@@ -275,6 +283,7 @@ async fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
     }
     engine_config.cache.gpu_memory_utilization = cli.gpu_memory_utilization;
     engine_config.runtime.cuda_graph = cli.cuda_graph && !cli.no_cuda_graph;
+    engine_config.cache.deltanet_pool_slots = resolve_deltanet_pool_slots(cli, &engine_config);
     // Activation profiler probes at this token count so the resulting
     // peak_activation_bytes matches the largest forward the scheduler
     // will dispatch. Keeping these in lockstep avoids KV cache being
@@ -342,6 +351,16 @@ async fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
     );
     let scheduled = ScheduledEngine::new(base_engine, scheduler_config);
     Ok(Arc::new(scheduled))
+}
+
+fn resolve_deltanet_pool_slots(cli: &Cli, engine_config: &EngineConfig) -> u32 {
+    if let Some(slots) = cli.deltanet_pool_slots {
+        return slots;
+    }
+    if std::env::var_os("PRELUDE_DELTANET_POOL_SLOTS").is_some() {
+        return engine_config.cache.deltanet_pool_slots;
+    }
+    cli.max_running_requests.min(u32::MAX as usize) as u32
 }
 
 /// Try loading chat template from HF Hub, with fallback for GGUF repos.

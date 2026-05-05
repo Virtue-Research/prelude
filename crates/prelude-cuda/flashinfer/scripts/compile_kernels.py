@@ -1268,6 +1268,8 @@ _BLACKWELL_CUTLASS_MOE_QUANT_FLAGS = {
 _BLACKWELL_CUTLASS_MOE_COMMON_SOURCES = {
     "moe_gemm_tma_warp_specialized_input.cu",
     "moe_gemm_kernels_bf16_bf16.cu",
+    "moe_gemm_mixed_utils.cu",
+    "fp8_blockscale_gemm.cu",
     "cutlass_heuristic.cpp",
     "lora.cpp",
     "flashinfer_cutlass_fused_moe_binding.cu",
@@ -1296,10 +1298,81 @@ def _should_compile_cutlass_moe_blackwell_source(src: Path, archs: List[int]) ->
         return False
     if any(a >= 103 and a < 120 for a in archs):
         # The BF16 dispatcher still references upstream Sm100 launcher
-        # instantiations for some tile/cluster choices, while the SM103
-        # generated files cover Blackwell-specific grouped kernels.
-        return "_sm103_" in name or "_sm100_" in name
+        # instantiations for some tile/cluster choices. It also keeps a small
+        # Ampere fallback dispatch table, so link those launcher objects too.
+        return "_sm103_" in name or "_sm100_" in name or "_sm80_" in name
     return "_sm100_" in name
+
+
+def _prepare_blackwell_cutlass_moe_bf16_dir(fi_src: Path, gen_dir: Path) -> Path:
+    out_dir = gen_dir / "fi_cutlass_moe_blackwell_bf16"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    kernels_cuh = fi_src / "csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh"
+    (out_dir / "cutlass_fused_moe_kernels.cuh").write_text(kernels_cuh.read_text())
+    moe_header = (
+        fi_src
+        / "csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+    )
+    moe_text = moe_header.read_text()
+    old = (
+        "#else\n"
+        "  static constexpr bool use_fp8 = false;\n"
+        "  static constexpr bool use_w4afp8 = false;\n"
+        "#endif\n"
+    )
+    new = (
+        "#else\n"
+        "  static constexpr bool use_fp8 = false;\n"
+        "  static constexpr bool use_w4afp8 = false;\n"
+        "  static constexpr bool use_fp8_input = false;\n"
+        "#endif\n"
+    )
+    if old not in moe_text:
+        raise RuntimeError("unexpected moe_kernels.h layout")
+    (out_dir / "moe_kernels.h").write_text(moe_text.replace(old, new, 1))
+    return out_dir
+
+
+def _write_blackwell_cutlass_moe_bf16_instantiation(fi_src: Path, gen_dir: Path) -> Path:
+    out_dir = _prepare_blackwell_cutlass_moe_bf16_dir(fi_src, gen_dir)
+    out = out_dir / "cutlass_fused_moe_instantiation_bf16.cu"
+    out.write_text(r'''
+#include "cutlass_fused_moe_kernels.cuh"
+#include "moe_kernels.h"
+
+namespace tensorrt_llm::kernels::cutlass_kernels {
+#ifdef ENABLE_BF16
+template class CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16>;
+INSTANTIATE_FINALIZE_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, __nv_bfloat16);
+#endif
+}  // namespace tensorrt_llm::kernels::cutlass_kernels
+'''.lstrip())
+    return out
+
+
+def _write_blackwell_cutlass_moe_bf16_binding(fi_src: Path, gen_dir: Path) -> Path:
+    out_dir = _prepare_blackwell_cutlass_moe_bf16_dir(fi_src, gen_dir)
+    binding = fi_src / "csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu"
+    text = binding.read_text()
+    start = text.find("    // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp")
+    end = text.find("    if (!mKernelRunner) {", start)
+    if start < 0 or end < 0:
+        raise RuntimeError("unexpected CUTLASS MoE binding constructor layout")
+    constructor_dispatch = text[start:end]
+    replacement = (
+        "    // Prelude's Blackwell AOT archive is dense BF16-only.\n"
+        "#if defined(PRELUDE_FLASHINFER_BLACKWELL_BF16_ONLY)\n"
+        "    if (mActivationDtype == dl_bfloat16 && mWeightDtype == dl_bfloat16) {\n"
+        "      mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16>>();\n"
+        "    }\n"
+        "#else\n"
+        f"{constructor_dispatch}"
+        "#endif\n"
+    )
+    out = out_dir / "flashinfer_cutlass_fused_moe_binding_bf16.cu"
+    out.write_text(text[:start] + replacement + text[end:])
+    return out
 
 
 def _add_cutlass_fused_moe_from_jit_spec(compile_jobs, fi_src: Path, gen_dir: Path,
@@ -1330,6 +1403,10 @@ def _add_cutlass_fused_moe_from_jit_spec(compile_jobs, fi_src: Path, gen_dir: Pa
         if not _should_compile_cutlass_moe_blackwell_source(src, archs):
             skipped += 1
             continue
+        if src.name == "cutlass_fused_moe_instantiation.cu":
+            src = _write_blackwell_cutlass_moe_bf16_instantiation(fi_src, gen_dir)
+        elif src.name == "flashinfer_cutlass_fused_moe_binding.cu":
+            src = _write_blackwell_cutlass_moe_bf16_binding(fi_src, gen_dir)
         compile_jobs.append((src, [], flags, vinfo))
         compiled += 1
     if skipped:
@@ -1369,6 +1446,311 @@ def blackwell_arch_flags(archs: List[int]) -> List[str]:
             suffix = f"{arch}a"
             flags += ["-gencode", f"arch=compute_{suffix},code=sm_{suffix}"]
     return flags or ["-gencode", "arch=compute_100a,code=sm_100a"]
+
+
+def gdn_prefill_arch_flags(archs: List[int]) -> List[str]:
+    """Architectures for the FlashInfer GDN prefill kernel.
+
+    The implementation lives under FlashInfer's Hopper path and uses WGMMA,
+    so it is SM90-only. Blackwell does not assemble these WGMMA instructions
+    for sm_10x targets; Prelude's CUDA backend provides its own fallback there.
+    """
+    flags = []
+    unique_archs = sorted(set(archs))
+    if 90 in unique_archs:
+        flags += ["-gencode", "arch=compute_90a,code=sm_90a"]
+    return flags
+
+
+GDN_BLACKWELL_HEAD_PAIRS = [
+    (16, 16),  # Qwen3.5 dense 0.8B/2B
+    (16, 32),  # Qwen3.5 dense 4B, Qwen3.5/3.6 MoE, Qwen3-Next
+    (16, 48),  # Qwen3.5 27B class
+    (16, 64),  # Qwen3.5 large class without TP
+    (32, 32),
+    (64, 64),
+]
+
+
+def verify_exported_tvm_symbol(obj_path: Path, name: str) -> None:
+    symbol = f"__tvm_ffi_{name}"
+    result = subprocess.run(
+        ["nm", "-g", str(obj_path)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"nm failed for {obj_path}: {result.stderr.strip()}")
+    if symbol not in result.stdout:
+        raise RuntimeError(f"{obj_path} does not export {symbol}")
+
+
+def compile_gdn_blackwell_variant(
+    obj_path: Path,
+    hq: int,
+    hv: int,
+    dtype: str,
+) -> bool:
+    """AOT-export FlashInfer's SM100 CuTe DSL GDN prefill kernel.
+
+    The exported TVM-FFI function takes the same runtime args as
+    ``GatedDeltaNetChunkedKernel.__call__``:
+
+      q, k, v, gate, beta, output, cu_seqlens, initial_state, output_state,
+      output_checkpoints, cu_checkpoints, checkpoint_every_n_tokens, scale,
+      workspace, stream
+
+    We specialize only on IO dtype and head counts. Token count, batch size and
+    pool size stay dynamic, matching upstream's Python cache key.
+    """
+    if obj_path.exists():
+        print(f"  {obj_path.name}: already exists, skipping")
+        return True
+
+    try:
+        import cutlass
+        import cutlass.cute as cute
+        import cuda.bindings.driver as cuda_drv
+        import torch
+        from cutlass.cute.runtime import from_dlpack
+        from flashinfer.gdn_kernels.blackwell.gated_delta_net_chunked import (
+            GatedDeltaNetChunkedKernel,
+        )
+        from flashinfer.cute_dsl.utils import get_num_sm
+    except Exception as e:
+        print(f"  Blackwell GDN import failed: {e}")
+        return False
+
+    if dtype == "bf16":
+        torch_dtype = torch.bfloat16
+        cutlass_dtype = cutlass.BFloat16
+    elif dtype == "fp16":
+        torch_dtype = torch.float16
+        cutlass_dtype = cutlass.Float16
+    else:
+        return False
+
+    try:
+        device = torch.device("cuda")
+        num_sm = get_num_sm(device)
+        max_active_clusters = num_sm
+        seq_len = 64
+        batch = 1
+        head_dim = 128
+
+        q = torch.zeros((seq_len, hq, head_dim), dtype=torch_dtype, device=device)
+        k = torch.zeros((seq_len, hq, head_dim), dtype=torch_dtype, device=device)
+        v = torch.zeros((seq_len, hv, head_dim), dtype=torch_dtype, device=device)
+        gate = torch.zeros((seq_len, max(hq, hv)), dtype=torch.float32, device=device)
+        beta = torch.zeros_like(gate)
+        output = torch.zeros((seq_len, max(hq, hv), head_dim), dtype=torch_dtype, device=device)
+        cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+        initial_state = torch.zeros(
+            (batch, max(hq, hv), head_dim, head_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+        output_state = torch.zeros_like(initial_state)
+        workspace = torch.empty(
+            GatedDeltaNetChunkedKernel.get_workspace_size(
+                num_sm, batch, hq, hv, True
+            ),
+            dtype=torch.int8,
+            device=device,
+        )
+
+        gdn = GatedDeltaNetChunkedKernel(
+            io_dtype=cutlass_dtype,
+            acc_dtype=cutlass.Float32,
+            state_dtype=cutlass.Float32,
+            mma_tiler_qk=(64, 64, 128),
+            mma_tiler_qs=(128, 64, 128),
+            mma_tiler_qkv=(128, 64, 64),
+            mma_tiler_kv=(128, 128, 64),
+            max_active_clusters=max_active_clusters,
+            num_sm=num_sm,
+            is_GQA=hq >= hv,
+            use_initial_state=True,
+            store_final_state=True,
+            enable_checkpoints=False,
+            is_persistent=True,
+        )
+
+        def dyn(t, mode, stride_order, assumed_align=16, divisibility=1):
+            cute_t = from_dlpack(t, assumed_align=assumed_align)
+            cute_t.mark_compact_shape_dynamic(
+                mode=mode, stride_order=stride_order, divisibility=divisibility
+            )
+            return cute_t
+
+        q_t = dyn(q, 0, (0, 1, 2))
+        k_t = dyn(k, 0, (0, 1, 2))
+        v_t = dyn(v, 0, (0, 1, 2))
+        gate_t = dyn(gate, 0, (0, 1))
+        beta_t = dyn(beta, 0, (0, 1))
+        output_t = dyn(output, 0, (0, 1, 2))
+        cu_t = from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic()
+        init_t = (
+            from_dlpack(initial_state, assumed_align=16)
+            .mark_layout_dynamic()
+            .mark_compact_shape_dynamic(
+                mode=3, stride_order=(0, 1, 2, 3), divisibility=head_dim
+            )
+        )
+        state_t = (
+            from_dlpack(output_state, assumed_align=16)
+            .mark_layout_dynamic()
+            .mark_compact_shape_dynamic(
+                mode=3, stride_order=(0, 1, 2, 3), divisibility=head_dim
+            )
+        )
+        workspace_t = from_dlpack(workspace, assumed_align=16)
+        stream = cuda_drv.CUstream(torch.cuda.current_stream(device=device).cuda_stream)
+
+        compiled = cute.compile(
+            gdn,
+            q_t,
+            k_t,
+            v_t,
+            gate_t,
+            beta_t,
+            output_t,
+            cu_t,
+            init_t,
+            state_t,
+            None,
+            None,
+            0,
+            head_dim ** -0.5,
+            workspace_t,
+            stream,
+            options="--enable-tvm-ffi --opt-level 2",
+        )
+        obj_path.parent.mkdir(parents=True, exist_ok=True)
+        compiled.export_to_c(
+            object_file_path=str(obj_path),
+            function_name=f"gdn_prefill_sm100_{dtype}_h{hq}_hv{hv}",
+        )
+        print(f"  Exported {obj_path.name} ({obj_path.stat().st_size // 1024}KB)")
+        verify_exported_tvm_symbol(obj_path, f"gdn_prefill_sm100_{dtype}_h{hq}_hv{hv}")
+        return True
+    except Exception as e:
+        print(f"  ERROR compiling Blackwell GDN h{hq}/hv{hv}/{dtype}: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return False
+
+
+def guard_gdn_outer_dispatch_instantiations(source: str) -> str:
+    """Gate GDN outer dispatch instantiations by selected AOT dtypes.
+
+    FlashInfer's dispatcher source explicitly instantiates both fp16 and bf16
+    wrappers. Prelude production builds usually pass PRELUDE_FLASHINFER_DTYPES
+    to compile only the dtype used by the loaded model, so keep the copied
+    dispatcher source consistent with the generated inner instantiation files.
+    """
+    fp16_marker = (
+        "template void launch_delta_rule_prefill_kernel"
+        "<cutlass::arch::Sm90, half, half, float>("
+    )
+    bf16_marker = (
+        "template void\n"
+        "launch_delta_rule_prefill_kernel"
+        "<cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, float>("
+    )
+    namespace_end = "\n\n}  // namespace flat"
+
+    fp16_start = source.find(fp16_marker)
+    bf16_start = source.find(bf16_marker)
+    end = source.find(namespace_end)
+    if fp16_start < 0 or bf16_start < 0 or end < 0:
+        raise RuntimeError("unexpected GDN dispatcher source layout")
+
+    fp16_block = source[fp16_start:bf16_start]
+    bf16_block = source[bf16_start:end]
+    return (
+        source[:fp16_start]
+        + "#if defined(PRELUDE_GDN_ENABLE_FP16)\n"
+        + fp16_block.rstrip()
+        + "\n#endif\n\n"
+        + "#if defined(PRELUDE_GDN_ENABLE_BF16)\n"
+        + bf16_block.rstrip()
+        + "\n#endif"
+        + source[end:]
+    )
+
+
+def guard_gdn_launcher_dispatch(source: str) -> str:
+    """Gate GDN launcher dtype dispatch by selected AOT dtypes."""
+    start_marker = "  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(dtype, DType, [&] {\n"
+    end_marker = "  });\n}"
+    start = source.find(start_marker)
+    end = source.find(end_marker, start)
+    if start < 0 or end < 0:
+        raise RuntimeError("unexpected GDN launcher source layout")
+    end += len("  });\n")
+
+    replacement = r'''  int dev_id;
+  cudaGetDevice(&dev_id);
+  int device_major;
+  cudaDeviceGetAttribute(&device_major, cudaDevAttrComputeCapabilityMajor, dev_id);
+
+#if defined(FLAT_SM90A_ENABLED)
+  if (device_major != 9 && device_major != 10) {
+    std::ostringstream err_msg;
+    err_msg << "delta rule kernel supports SM90/SM10x only; got device major version "
+            << device_major;
+    FLASHINFER_ERROR(err_msg.str());
+    return;
+  }
+#else
+  FLASHINFER_ERROR("SM90/SM10x GDN prefill is not enabled, delta rule kernel is not built");
+  return;
+#endif
+
+#define PRELUDE_GDN_LAUNCH(DType)                                                        \
+  do {                                                                                    \
+    flat::launch_delta_rule_prefill_kernel<cutlass::arch::Sm90, DType, DType, float>(     \
+        stream, static_cast<DType*>(output), static_cast<float*>(output_state),           \
+        static_cast<DType const*>(q), static_cast<DType const*>(k),                       \
+        static_cast<DType const*>(v), static_cast<float const*>(input_state),             \
+        static_cast<float const*>(alpha), static_cast<float const*>(beta), cu_seqlens,    \
+        workspace_buffer, num_seqs, num_q_heads, num_k_heads, num_v_heads, num_o_heads,   \
+        head_size, packed_seq, scale, sm_count, static_cast<float*>(state_checkpoints),   \
+        checkpoint_cu_starts, static_cast<int32_t>(checkpoint_every_n_tokens));           \
+    return;                                                                               \
+  } while (false)
+
+  if (dtype == dl_bfloat16) {
+#if defined(PRELUDE_GDN_ENABLE_BF16)
+    PRELUDE_GDN_LAUNCH(nv_bfloat16);
+#else
+    FLASHINFER_ERROR("bf16 GDN prefill was not AOT-compiled");
+    return;
+#endif
+  }
+
+  if (dtype == dl_float16) {
+#if defined(PRELUDE_GDN_ENABLE_FP16)
+    PRELUDE_GDN_LAUNCH(half);
+#else
+    FLASHINFER_ERROR("fp16 GDN prefill was not AOT-compiled");
+    return;
+#endif
+  }
+
+#undef PRELUDE_GDN_LAUNCH
+
+  std::ostringstream err_msg;
+  err_msg << "unsupported GDN prefill dtype code=" << static_cast<int>(dtype.code)
+          << " bits=" << static_cast<int>(dtype.bits);
+  FLASHINFER_ERROR(err_msg.str());
+  return;
+'''
+
+    return source[:start] + replacement + source[end:]
 
 
 def build_variant_matrix(
@@ -1660,6 +2042,97 @@ def main():
     # ── SM90 modules (matching upstream aot.py has_sm90 blocks) ────────
     has_sm90 = 90 in archs
     sm90_flags = ["-gencode", "arch=compute_90a,code=sm_90a"]
+
+    gdn_flags = gdn_prefill_arch_flags(archs)
+    gdn_dtypes = []
+    if "fp16" in dtypes:
+        gdn_dtypes.append("half")
+    if "bf16" in dtypes:
+        gdn_dtypes.append("nv_bfloat16")
+    if gdn_flags and gdn_dtypes:
+        import jinja2
+
+        csrc = fi_src / "csrc"
+        mod_out = gen_dir / "fi_gdn"
+        mod_out.mkdir(parents=True, exist_ok=True)
+        sources = []
+        gdn_extra_flags = ["-DFLAT_SM90A_ENABLED"]
+        if "half" in gdn_dtypes:
+            gdn_extra_flags.append("-DPRELUDE_GDN_ENABLE_FP16")
+        if "nv_bfloat16" in gdn_dtypes:
+            gdn_extra_flags.append("-DPRELUDE_GDN_ENABLE_BF16")
+
+        with open(csrc / "gdn_prefill_sm90_kernel_inst.jinja") as f:
+            templ = jinja2.Template(f.read())
+
+        # gen_gdn_prefill module: 64 kernel instantiations via jinja
+        # NOTE: upstream a1166dc added a 6th template bool `enable_checkpointing`
+        # (commit 08ab45d, state checkpointing in chunk_gated_delta_rule). We
+        # compile both variants so the runtime dispatcher in
+        # `prefill_kernel_delta_rule_sm90.cu::launch_delta_rule_prefill_kernel`
+        # can pick based on `checkpoint_every_n_tokens > 0`. Compiling only
+        # one side produces a link error when the other branch of the
+        # `DISPATCH_GBAI` macro references an un-instantiated template.
+        for dtype in gdn_dtypes:
+            for is_gva in ["false", "true"]:
+                for needs_beta in ["false", "true"]:
+                    for needs_alpha in ["false", "true"]:
+                        for init_state in ["false", "true"]:
+                            for enable_checkpointing in ["false", "true"]:
+                                params = dict(dtype=dtype, is_gva=is_gva,
+                                              needs_beta=needs_beta,
+                                              needs_alpha=needs_alpha,
+                                              init_state=init_state,
+                                              enable_checkpointing=enable_checkpointing)
+                                ckpt_tag = "c1" if enable_checkpointing == "true" else "c0"
+                                fname = (f"gdn_prefill_kernel_{dtype}_g{is_gva}"
+                                         f"b{needs_beta}a{needs_alpha}i{init_state}"
+                                         f"{ckpt_tag}.cu")
+                                fpath = mod_out / fname
+                                fpath.write_text(templ.render(**params))
+                                sources.append(fpath)
+
+        for sf in ["gdn_prefill_launcher.cu", "prefill_kernel_delta_rule_sm90.cu"]:
+            sp = csrc / sf
+            if sp.exists():
+                dst = mod_out / Path(sf).name
+                if sf == "gdn_prefill_launcher.cu":
+                    launcher = guard_gdn_launcher_dispatch(sp.read_text())
+                    dst.write_text(launcher)
+                elif sf == "prefill_kernel_delta_rule_sm90.cu":
+                    dispatcher = guard_gdn_outer_dispatch_instantiations(sp.read_text())
+                    dst.write_text(dispatcher)
+                else:
+                    shutil.copy2(sp, dst)
+                sources.append(dst)
+
+        vinfo_gdn = {
+            "vid": "fi_gdn",
+            "kind": "gdn",
+            "symbols": {"gdn_prefill": "__tvm_ffi_gdn_prefill"},
+        }
+        for src in sources:
+            compile_jobs.append((src, gdn_flags, gdn_extra_flags, vinfo_gdn))
+        utility_variants.append(([], [], vinfo_gdn))
+        print(f"  GDN prefill: {len(sources)} sources ({','.join(gdn_dtypes)}, SM90/SM10x)")
+
+    gdn_blackwell_vinfo = None
+    if has_sm100 and "bf16" in dtypes:
+        symbols = {
+            f"gdn_prefill_sm100_bf16_h{hq}_hv{hv}":
+                f"__tvm_ffi_gdn_prefill_sm100_bf16_h{hq}_hv{hv}"
+            for hq, hv in GDN_BLACKWELL_HEAD_PAIRS
+        }
+        gdn_blackwell_vinfo = {
+            "vid": "fi_gdn_blackwell",
+            "kind": "gdn",
+            "symbols": symbols,
+        }
+        print(
+            "  Blackwell GDN prefill: "
+            f"{len(GDN_BLACKWELL_HEAD_PAIRS)} BF16 CuTe DSL variants"
+        )
+
     if has_sm90:
         import jinja2
         sm90_modules = []
@@ -1695,40 +2168,6 @@ def main():
                 compile_jobs.append((src, sm90_flags, ef, vinfo))
             sm90_modules.append(vinfo)
             return len(sources)
-
-        # gen_gdn_prefill_sm90_module: 64 kernel instantiations via jinja
-        # NOTE: upstream a1166dc added a 6th template bool `enable_checkpointing`
-        # (commit 08ab45d, state checkpointing in chunk_gated_delta_rule). We
-        # compile both variants so the runtime dispatcher in
-        # `prefill_kernel_delta_rule_sm90.cu::launch_delta_rule_prefill_kernel`
-        # can pick based on `checkpoint_every_n_tokens > 0`. Compiling only
-        # one side produces a link error when the other branch of the
-        # `DISPATCH_GBAI` macro references an un-instantiated template.
-        gdn_instances = []
-        for dtype in ["half", "nv_bfloat16"]:
-            for is_gva in ["false", "true"]:
-                for needs_beta in ["false", "true"]:
-                    for needs_alpha in ["false", "true"]:
-                        for init_state in ["false", "true"]:
-                            for enable_checkpointing in ["false", "true"]:
-                                params = dict(dtype=dtype, is_gva=is_gva,
-                                              needs_beta=needs_beta,
-                                              needs_alpha=needs_alpha,
-                                              init_state=init_state,
-                                              enable_checkpointing=enable_checkpointing)
-                                ckpt_tag = "c1" if enable_checkpointing == "true" else "c0"
-                                fname = (f"gdn_prefill_kernel_{dtype}_g{is_gva}"
-                                         f"b{needs_beta}a{needs_alpha}i{init_state}"
-                                         f"{ckpt_tag}.cu")
-                                gdn_instances.append((params, fname))
-        n = _add_sm90_jinja(
-            "fi_gdn", "gdn", "gdn_prefill_sm90_kernel_inst.jinja",
-            gdn_instances,
-            ["gdn_prefill_launcher.cu", "prefill_kernel_delta_rule_sm90.cu"],
-            None, ["gdn_prefill"],
-            ["-DFLAT_SM90A_ENABLED"],
-        )
-        print(f"  SM90 GDN: {n} sources (64 jinja instantiations)")
 
         # gen_gemm_sm90_module: 6 dtype pair instantiations via jinja
         cutlass_dtype_map = {
@@ -1786,6 +2225,7 @@ def main():
             nv_moe / "moe_gemm_kernels_fp8_fp4.cu",
             nv_moe / "moe_gemm_kernels_fp4_fp4.cu",
             nv_moe / "moe_gemm_kernels_fp32_fp32.cu",
+            nv_moe / "moe_gemm_mixed_utils.cu",
             csrc / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/"
                    "fp8_blockscale_gemm/fp8_blockscale_gemm.cu",
             csrc / "fused_moe/cutlass_backend/deepgemm_jit_setup.cu",
@@ -2097,6 +2537,22 @@ def main():
         if moe_generated:
             print(f"\n  Skipped {len(moe_generated)} non-critical CUTLASS MoE tile variants")
 
+    if gdn_blackwell_vinfo is not None:
+        gdn_bw_dir = obj_dir / "fi_gdn_blackwell"
+        gdn_bw_ok = []
+        for hq, hv in GDN_BLACKWELL_HEAD_PAIRS:
+            name = f"gdn_prefill_sm100_bf16_h{hq}_hv{hv}"
+            obj_path = gdn_bw_dir / f"{name}.o"
+            if compile_gdn_blackwell_variant(obj_path, hq, hv, "bf16"):
+                obj_files.append(str(obj_path))
+                gdn_bw_ok.append(name)
+        missing = sorted(set(gdn_blackwell_vinfo["symbols"].keys()) - set(gdn_bw_ok))
+        if missing:
+            print("\nFAILED to compile Blackwell GDN variants:", file=sys.stderr)
+            for name in missing:
+                print(f"  {name}", file=sys.stderr)
+            sys.exit(1)
+
     # Phase 3: Write manifest
     manifest = {"variants": [], "objects": obj_files}
     for v in variants:
@@ -2146,6 +2602,13 @@ def main():
             "vid": sm100_vinfo["vid"],
             "kind": sm100_vinfo["kind"],
             "symbols": sm100_vinfo["symbols"],
+        })
+
+    if gdn_blackwell_vinfo is not None:
+        manifest["variants"].append({
+            "vid": gdn_blackwell_vinfo["vid"],
+            "kind": gdn_blackwell_vinfo["kind"],
+            "symbols": gdn_blackwell_vinfo["symbols"],
         })
 
     manifest_path = out_dir / "manifest.json"

@@ -95,7 +95,7 @@ fn kernel_name(variant: &str, h: usize, hv: usize, v: usize, arch: u32) -> Strin
 /// produce repeated tokens at decode.
 pub(crate) fn supported_on_current_arch() -> bool {
     let arch = registry().arch();
-    arch == 90 || arch == 100
+    arch == 90 || (100..110).contains(&arch)
 }
 
 /// Try to run the fused cuLA `kda_decode` kernel over a decode batch.
@@ -141,9 +141,10 @@ pub(crate) fn try_decode(
     let reg = registry();
     let arch = reg.arch();
 
-    // Our AOT build only covers Hopper (SM90) and Blackwell (SM100) for
-    // kda_decode today. Everything else falls through to the composed path.
-    if arch != 90 && arch != 100 {
+    // Our AOT build covers Hopper (SM90) and Blackwell/Blackwell-Ultra
+    // (SM10x) for kda_decode today. Everything else falls through to the
+    // composed path.
+    if arch != 90 && !(100..110).contains(&arch) {
         return Ok(None);
     }
 

@@ -49,6 +49,7 @@ fn main() {
         ("kvcache", "knorm_rope_kv_write.cu", "knorm_rope_kv_write"),
         ("kvcache", "scatter_kv_cache.cu", "scatter_kv_cache"),
         ("gdn", "post_conv.cu", "gdn_post_conv"),
+        ("gdn", "prefill_recurrent.cu", "gdn_prefill_recurrent"),
         ("logprobs", "gather_log_softmax.cu", "gather_log_softmax"),
     ];
 

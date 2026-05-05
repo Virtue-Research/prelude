@@ -440,16 +440,10 @@ fn new_utility_kernel_lookup() {
 #[test]
 fn sm90_module_lookup() {
     let reg = KernelRegistry::new();
-    if reg.arch() < 90 {
-        println!("SM{} < SM90, skipping SM90 module lookup", reg.arch());
+    if reg.arch() != 90 {
+        println!("SM{} != SM90, skipping SM90-only module lookup", reg.arch());
         return;
     }
-
-    // add_misc: gen_gdn_prefill_sm90_module
-    assert!(
-        reg.get_utility("gdn_prefill").is_some(),
-        "gdn_prefill not found (SM90 required)"
-    );
 
     // add_moe: gen_gemm_sm90_module
     assert!(
@@ -492,6 +486,21 @@ fn sm100_module_lookup() {
             }
         );
     }
+}
+
+#[test]
+fn gdn_module_lookup() {
+    let reg = KernelRegistry::new();
+    let arch = reg.arch();
+    if arch != 90 {
+        println!("SM{arch} does not support GDN prefill AOT, skipping lookup");
+        return;
+    }
+
+    assert!(
+        reg.get_utility("gdn_prefill").is_some(),
+        "gdn_prefill not found (SM90 required)"
+    );
 }
 
 // ── TopK correctness ────────────────────────────────────────────────
@@ -803,9 +812,10 @@ fn comm_module_lookup() {
 #[test]
 fn gdn_prefill_smoke() {
     let reg = KernelRegistry::new();
-    // GDN prefill kernel is sm_90 only; skip on Ampere and Blackwell.
-    if reg.arch() != 90 {
-        println!("SM{} ≠ 90, skipping GDN test", reg.arch());
+    // FlashInfer's GDN prefill kernel is Hopper WGMMA and therefore SM90-only.
+    let arch = reg.arch();
+    if arch != 90 {
+        println!("SM{arch} does not support GDN test, skipping");
         return;
     }
     let gdn = match reg.get_utility("gdn_prefill") {
@@ -3953,9 +3963,9 @@ fn fused_add_rmsnorm_correctness() {
         let eps = 1e-6f64;
 
         // Generate random input data
-        let x_f32: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.01).sin() * 0.5)).collect();
+        let x_f32: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin() * 0.5).collect();
         let r_f32: Vec<f32> = (0..n)
-            .map(|i| ((i as f32 * 0.007 + 1.0).cos() * 0.3))
+            .map(|i| (i as f32 * 0.007 + 1.0).cos() * 0.3)
             .collect();
         let w_f32: Vec<f32> = (0..hidden)
             .map(|i| 0.8 + (i as f32 * 0.003).sin() * 0.2)
@@ -3983,9 +3993,7 @@ fn fused_add_rmsnorm_correctness() {
         let dl_r = gpu_dl(r_gpu, BF16_DT, &in_s, &in_st);
         let dl_w = gpu_dl(w_gpu, BF16_DT, &w_s, &w_st);
 
-        unsafe {
-            reg.set_stream(0, std::ptr::null_mut());
-        }
+        reg.set_stream(0, std::ptr::null_mut());
 
         // FlashInfer fused_add_rmsnorm is in-place:
         // after call, x_gpu = rmsnorm(x+residual), r_gpu = x+residual

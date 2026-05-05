@@ -469,21 +469,21 @@ def build_variant_matrix(arch: int, prototype: bool = False):
                             H=H, K=D, V=D, chunk_size=cs, scale=1.0,
                             is_varlen=varlen, persistent=persistent,
                         ))
-        # KDA decode: one kernel per (H, HV, K=128, V=128) × 4 variants.
-        # Kernel launcher reads runtime batch size / pool size from tensors,
-        # so we only specialize on head counts + variant.
-        for variant in ("small_dense", "small_varlen", "large_dense", "large_varlen"):
-            # MHA: H == HV
-            kda_decode_specs.append(KdaDecodeSpec(
-                H=H, HV=H, K=128, V=128, variant=variant, use_qk_l2norm=True,
-            ))
-
-    # GQA variants we care about. Add as new models land.
-    # Qwen3.5-35B-A3B: linear_num_key_heads=16, linear_num_value_heads=32
+    # KDA decode: one kernel per (H, HV, K=128, V=128) × 4 variants.
+    # Kernel launcher reads runtime batch size / pool size from tensors,
+    # so we only specialize on head counts + variant. Keep this matrix
+    # aligned with Qwen3.5/Qwen3-Next DeltaNet configs we support.
+    kda_decode_head_pairs = [
+        (16, 16),  # Qwen3.5 dense 0.8B/2B
+        (16, 32),  # Qwen3.5 dense 4B and 35B-A3B
+        (32, 32),
+        (64, 64),
+    ]
     for variant in ("small_dense", "small_varlen", "large_dense", "large_varlen"):
-        kda_decode_specs.append(KdaDecodeSpec(
-            H=16, HV=32, K=128, V=128, variant=variant, use_qk_l2norm=True,
-        ))
+        for H, HV in kda_decode_head_pairs:
+            kda_decode_specs.append(KdaDecodeSpec(
+                H=H, HV=HV, K=128, V=128, variant=variant, use_qk_l2norm=True,
+            ))
 
     # KDA decode works on Hopper+ (the CuTe DSL kernel targets SM90+).
     result = {"kda_decode": kda_decode_specs}
