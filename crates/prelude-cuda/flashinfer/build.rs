@@ -35,7 +35,7 @@ use std::process::Command;
 use prelude_kernelbuild::archive::{self, ArMode};
 use prelude_kernelbuild::build_log;
 use prelude_kernelbuild::dispatch;
-use prelude_kernelbuild::nvcc::track_submodule;
+use prelude_kernelbuild::nvcc::{find_cuda, link_cuda_runtime_static, track_submodule};
 
 // ── Manifest schema ─────────────────────────────────────────────────
 //
@@ -92,6 +92,10 @@ fn main() -> Result<()> {
     let has_kernels =
         archive::archive_and_whole_link(&objects, &out_dir, "flashinfer_kernels", ArMode::Append)
             .map_err(anyhow::Error::msg)?;
+    if has_kernels {
+        link_cutlass_dsl_runtime_if_available()?;
+        link_cuda_runtime_static(&find_cuda());
+    }
 
     generate_dispatch(&kernels_dir, &out_dir, has_kernels)?;
 
@@ -209,6 +213,12 @@ fn find_python() -> Result<PathBuf> {
         }
     }
     anyhow::bail!("Python 3 not found")
+}
+
+fn link_cutlass_dsl_runtime_if_available() -> Result<()> {
+    let python = find_python()?;
+    prelude_kernelbuild::venv::link_cutlass_dsl_runtime(&python);
+    Ok(())
 }
 
 // ── Dispatch codegen ─────────────────────────────────────────────────
