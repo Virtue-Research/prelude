@@ -36,7 +36,7 @@ use prelude_kernelbuild::dispatch;
 use prelude_kernelbuild::dsl::{self, CULA_BOOTSTRAP, DslCompile};
 use prelude_kernelbuild::nvcc::{
     ObjCompile, compile_cu_to_obj, find_cuda, link_cuda_runtime_static, locate_source, nvcc_path,
-    nvcc_supports_sm100, track_submodule,
+    nvcc_supports_sm100, nvcc_supports_sm103, track_submodule,
 };
 use prelude_kernelbuild::venv::{InstallOpts, PythonVenv, detect_torch_cuda_index};
 
@@ -75,6 +75,7 @@ fn main() {
     let cuda_path = find_cuda();
     let nvcc = nvcc_path(&cuda_path);
     let sm100 = nvcc_supports_sm100(&nvcc);
+    let sm103 = nvcc_supports_sm103(&nvcc);
 
     // ── Phase 1 + Phase 2 run in parallel ──────────────────────────
     //   Phase 1: nvcc compiles C++ CUTLASS kernels (uses GPU compiler)
@@ -84,10 +85,13 @@ fn main() {
     let dsl_enabled = env::var("CARGO_FEATURE_DSL").is_ok();
     let kernels_dir = out_dir.join("dsl_kernels");
 
-    // Target arch list: SM90 always, SM100 if nvcc supports it.
+    // Target arch list: SM90 always, Blackwell variants when nvcc supports them.
     let mut dsl_archs = vec!["sm_90".to_string()];
     if sm100 {
         dsl_archs.push("sm_100".to_string());
+    }
+    if sm103 {
+        dsl_archs.push("sm_103".to_string());
     }
 
     // Spawn Phase 2 in a background thread; venv setup can take
@@ -119,6 +123,7 @@ fn main() {
         &out_dir,
         &manifest_dir,
         sm100,
+        sm103,
     );
 
     // Archive the C++ objects via nvcc --lib so any fatbin sections
@@ -181,6 +186,7 @@ fn compile_cpp_kernels(
     out_dir: &Path,
     manifest_dir: &Path,
     sm100: bool,
+    sm103: bool,
 ) -> Vec<PathBuf> {
     let include_dirs: Vec<PathBuf> = vec![
         cutlass_dir.join("include"),
@@ -241,6 +247,24 @@ fn compile_cpp_kernels(
         });
     } else {
         build_log!("SM100 not supported by nvcc, skipping Blackwell kernels");
+    }
+
+    if sm103 {
+        build_log!("compiling SM103 KDA kernels");
+        tasks.push(CompileTask {
+            src: cula_dir.join("csrc/kda/sm100/kda_fwd_sm100.cu"),
+            obj: out_dir.join("kda_fwd_sm103.o"),
+            gencodes: vec!["-gencode=arch=compute_103a,code=sm_103a".into()],
+            defines: vec![],
+        });
+        tasks.push(CompileTask {
+            src: wrapper_src.clone(),
+            obj: out_dir.join("cula_wrapper_sm103.o"),
+            gencodes: vec!["-gencode=arch=compute_103a,code=sm_103a".into()],
+            defines: vec!["-DCULA_SM100_ENABLED".into()],
+        });
+    } else {
+        build_log!("SM103 not supported by nvcc, skipping Blackwell-Ultra kernels");
     }
 
     // Parallel compile via threads. Each thread calls into the shared

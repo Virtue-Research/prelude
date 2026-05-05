@@ -14,9 +14,31 @@ unsafe extern "C" {
 }
 
 const CUDA_MEMCPY_H2D: i32 = 1;
-const BF16_DT: DLDataType = DLDataType { code: KDLBFLOAT, bits: 16, lanes: 1 };
-const I32_DT: DLDataType = DLDataType { code: KDLINT, bits: 32, lanes: 1 };
-const U8_DT: DLDataType = DLDataType { code: KDLUINT, bits: 8, lanes: 1 };
+const BF16_DT: DLDataType = DLDataType {
+    code: KDLBFLOAT,
+    bits: 16,
+    lanes: 1,
+};
+const F32_DT: DLDataType = DLDataType {
+    code: KDLFLOAT,
+    bits: 32,
+    lanes: 1,
+};
+const I8_DT: DLDataType = DLDataType {
+    code: KDLINT,
+    bits: 8,
+    lanes: 1,
+};
+const I32_DT: DLDataType = DLDataType {
+    code: KDLINT,
+    bits: 32,
+    lanes: 1,
+};
+const U8_DT: DLDataType = DLDataType {
+    code: KDLUINT,
+    bits: 8,
+    lanes: 1,
+};
 
 /// Compute row-major contiguous strides for a given shape.
 fn contiguous_strides(shape: &[i64]) -> Vec<i64> {
@@ -30,7 +52,10 @@ fn contiguous_strides(shape: &[i64]) -> Vec<i64> {
 fn gpu_dl(data: *mut c_void, dtype: DLDataType, shape: &[i64], strides: &[i64]) -> DLTensor {
     DLTensor {
         data,
-        device: DLDevice { device_type: KDLCUDA, device_id: 0 },
+        device: DLDevice {
+            device_type: KDLCUDA,
+            device_id: 0,
+        },
         ndim: shape.len() as i32,
         dtype,
         shape: shape.as_ptr(),
@@ -42,7 +67,10 @@ fn gpu_dl(data: *mut c_void, dtype: DLDataType, shape: &[i64], strides: &[i64]) 
 fn cpu_dl(data: *mut c_void, dtype: DLDataType, shape: &[i64], strides: &[i64]) -> DLTensor {
     DLTensor {
         data,
-        device: DLDevice { device_type: KDLCPU, device_id: 0 },
+        device: DLDevice {
+            device_type: KDLCPU,
+            device_id: 0,
+        },
         ndim: shape.len() as i32,
         dtype,
         shape: shape.as_ptr(),
@@ -56,6 +84,10 @@ fn main() {
 
     let reg = KernelRegistry::new();
     println!("GPU arch: SM{}", reg.arch());
+    if std::env::var_os("PRELUDE_TEST_GDN_SM100").is_some() {
+        test_gdn_sm100(&reg);
+        return;
+    }
 
     let key = PrefillKey {
         dtype: KernelDtype::BF16,
@@ -65,9 +97,13 @@ fn main() {
         logits_soft_cap: false,
         backend: Backend::FA2,
     };
-    let variant = reg.get_prefill(&key).expect("FA2 prefill variant not found");
-    println!("Found variant: plan={:p} ragged_run={:p}",
-        variant.plan as *const (), variant.ragged_run as *const ());
+    let variant = reg
+        .get_prefill(&key)
+        .expect("FA2 prefill variant not found");
+    println!(
+        "Found variant: plan={:p} ragged_run={:p}",
+        variant.plan as *const (), variant.ragged_run as *const ()
+    );
 
     unsafe {
         // ── Workspace buffers ──
@@ -122,8 +158,18 @@ fn main() {
         let indptr_gpu_size = ((batch_size + 1) * 4) as usize;
         assert_eq!(cudaMalloc(&mut cu_q_gpu, indptr_gpu_size), 0);
         assert_eq!(cudaMalloc(&mut cu_k_gpu, indptr_gpu_size), 0);
-        cudaMemcpy(cu_q_gpu, cu_q_data.as_ptr() as *const c_void, indptr_gpu_size, CUDA_MEMCPY_H2D);
-        cudaMemcpy(cu_k_gpu, cu_k_data.as_ptr() as *const c_void, indptr_gpu_size, CUDA_MEMCPY_H2D);
+        cudaMemcpy(
+            cu_q_gpu,
+            cu_q_data.as_ptr() as *const c_void,
+            indptr_gpu_size,
+            CUDA_MEMCPY_H2D,
+        );
+        cudaMemcpy(
+            cu_k_gpu,
+            cu_k_data.as_ptr() as *const c_void,
+            indptr_gpu_size,
+            CUDA_MEMCPY_H2D,
+        );
 
         println!("Tensors allocated");
 
@@ -162,25 +208,25 @@ fn main() {
         // ── Plan (19 args for FA2) ──
         println!("\nCalling prefill plan...");
         let plan_args = [
-            TVMFFIAny::dltensor(&dl_fws),   // float_workspace (GPU)
-            TVMFFIAny::dltensor(&dl_iws),   // int_workspace (GPU)
-            TVMFFIAny::dltensor(&dl_pws),   // pinned_workspace (CPU)
+            TVMFFIAny::dltensor(&dl_fws),     // float_workspace (GPU)
+            TVMFFIAny::dltensor(&dl_iws),     // int_workspace (GPU)
+            TVMFFIAny::dltensor(&dl_pws),     // pinned_workspace (CPU)
             TVMFFIAny::dltensor(&dl_cuq_cpu), // qo_indptr (CPU!)
             TVMFFIAny::dltensor(&dl_cuk_cpu), // kv_indptr (CPU!)
-            TVMFFIAny::dltensor(&dl_kvl),   // kv_len_arr (CPU!)
-            TVMFFIAny::int64(total_tokens), // total_num_rows
+            TVMFFIAny::dltensor(&dl_kvl),     // kv_len_arr (CPU!)
+            TVMFFIAny::int64(total_tokens),   // total_num_rows
             TVMFFIAny::int64(batch_size),
             TVMFFIAny::int64(num_qo_heads),
             TVMFFIAny::int64(num_kv_heads),
-            TVMFFIAny::int64(1),            // page_size (ragged=1)
-            TVMFFIAny::bool_val(false),     // enable_cuda_graph
-            TVMFFIAny::int64(head_dim),     // head_dim_qk
-            TVMFFIAny::int64(head_dim),     // head_dim_vo
-            TVMFFIAny::bool_val(true),      // causal
-            TVMFFIAny::int64(-1),           // window_left
-            TVMFFIAny::int64(-1),           // fixed_split_size
-            TVMFFIAny::bool_val(false),     // disable_split_kv
-            TVMFFIAny::int64(0),            // num_colocated_ctas
+            TVMFFIAny::int64(1),        // page_size (ragged=1)
+            TVMFFIAny::bool_val(false), // enable_cuda_graph
+            TVMFFIAny::int64(head_dim), // head_dim_qk
+            TVMFFIAny::int64(head_dim), // head_dim_vo
+            TVMFFIAny::bool_val(true),  // causal
+            TVMFFIAny::int64(-1),       // window_left
+            TVMFFIAny::int64(-1),       // fixed_split_size
+            TVMFFIAny::bool_val(false), // disable_split_kv
+            TVMFFIAny::int64(0),        // num_colocated_ctas
         ];
         let plan_info = match reg.call(variant.plan, &plan_args) {
             Ok(info) => {
@@ -197,32 +243,32 @@ fn main() {
         let sm_scale = 1.0f64 / (head_dim as f64).sqrt();
         println!("\nCalling ragged_run...");
         let run_args = [
-            TVMFFIAny::dltensor(&dl_fws),         // float_workspace
-            TVMFFIAny::dltensor(&dl_iws),         // int_workspace
-            plan_info,                             // plan_info (opaque Array<int64_t>)
-            TVMFFIAny::dltensor(&dl_q),           // q
-            TVMFFIAny::dltensor(&dl_k),           // k
-            TVMFFIAny::dltensor(&dl_v),           // v
-            TVMFFIAny::dltensor(&dl_cuq_gpu),     // qo_indptr (GPU)
-            TVMFFIAny::dltensor(&dl_cuk_gpu),     // kv_indptr (GPU)
-            TVMFFIAny::dltensor(&dl_o),           // output
-            TVMFFIAny::none(),                    // maybe_lse
-            TVMFFIAny::int64(1),                  // mask_mode = Causal
-            TVMFFIAny::int64(0),                  // layout = NHD
-            TVMFFIAny::int64(-1),                 // window_left
-            TVMFFIAny::bool_val(false),           // enable_pdl
+            TVMFFIAny::dltensor(&dl_fws),     // float_workspace
+            TVMFFIAny::dltensor(&dl_iws),     // int_workspace
+            plan_info,                        // plan_info (opaque Array<int64_t>)
+            TVMFFIAny::dltensor(&dl_q),       // q
+            TVMFFIAny::dltensor(&dl_k),       // k
+            TVMFFIAny::dltensor(&dl_v),       // v
+            TVMFFIAny::dltensor(&dl_cuq_gpu), // qo_indptr (GPU)
+            TVMFFIAny::dltensor(&dl_cuk_gpu), // kv_indptr (GPU)
+            TVMFFIAny::dltensor(&dl_o),       // output
+            TVMFFIAny::none(),                // maybe_lse
+            TVMFFIAny::int64(1),              // mask_mode = Causal
+            TVMFFIAny::int64(0),              // layout = NHD
+            TVMFFIAny::int64(-1),             // window_left
+            TVMFFIAny::bool_val(false),       // enable_pdl
             // FA2 additional params:
-            TVMFFIAny::none(),                    // maybe_custom_mask
-            TVMFFIAny::none(),                    // maybe_mask_indptr
-            TVMFFIAny::none(),                    // maybe_alibi_slopes
-            TVMFFIAny::none(),                    // maybe_prefix_len_ptr
-            TVMFFIAny::none(),                    // maybe_token_pos_in_items_ptr
-            TVMFFIAny::none(),                    // maybe_max_item_len_ptr
-            TVMFFIAny::float64(0.0),              // logits_soft_cap
-            TVMFFIAny::float64(sm_scale),         // sm_scale
-            TVMFFIAny::float64(1.0),              // rope_rcp_scale (Python default=1.0)
-            TVMFFIAny::float64(1e4),              // rope_rcp_theta (Python default=1e4)
-            TVMFFIAny::int64(0),                  // token_pos_in_items_len
+            TVMFFIAny::none(),            // maybe_custom_mask
+            TVMFFIAny::none(),            // maybe_mask_indptr
+            TVMFFIAny::none(),            // maybe_alibi_slopes
+            TVMFFIAny::none(),            // maybe_prefix_len_ptr
+            TVMFFIAny::none(),            // maybe_token_pos_in_items_ptr
+            TVMFFIAny::none(),            // maybe_max_item_len_ptr
+            TVMFFIAny::float64(0.0),      // logits_soft_cap
+            TVMFFIAny::float64(sm_scale), // sm_scale
+            TVMFFIAny::float64(1.0),      // rope_rcp_scale (Python default=1.0)
+            TVMFFIAny::float64(1e4),      // rope_rcp_theta (Python default=1e4)
+            TVMFFIAny::int64(0),          // token_pos_in_items_len
         ];
         match reg.call(variant.ragged_run, &run_args) {
             Ok(_) => {
@@ -261,10 +307,10 @@ fn main() {
                 TVMFFIAny::int64(1),                 // batch_size
                 TVMFFIAny::int64(num_qo_heads),
                 TVMFFIAny::int64(num_kv_heads),
-                TVMFFIAny::int64(16),                // page_size
-                TVMFFIAny::bool_val(false),          // cuda_graph
-                TVMFFIAny::int64(-1),                // window_left
-                TVMFFIAny::float64(0.0),             // logits_soft_cap
+                TVMFFIAny::int64(16),       // page_size
+                TVMFFIAny::bool_val(false), // cuda_graph
+                TVMFFIAny::int64(-1),       // window_left
+                TVMFFIAny::float64(0.0),    // logits_soft_cap
                 TVMFFIAny::int64(head_dim),
                 TVMFFIAny::int64(head_dim),
                 TVMFFIAny::dltensor(&dl_eq),
@@ -277,9 +323,146 @@ fn main() {
         }
 
         // Cleanup
-        cudaFree(q_ptr); cudaFree(k_ptr); cudaFree(v_ptr); cudaFree(o_ptr);
-        cudaFree(cu_q_gpu); cudaFree(cu_k_gpu);
-        cudaFree(float_ws); cudaFree(int_ws);
+        cudaFree(q_ptr);
+        cudaFree(k_ptr);
+        cudaFree(v_ptr);
+        cudaFree(o_ptr);
+        cudaFree(cu_q_gpu);
+        cudaFree(cu_k_gpu);
+        cudaFree(float_ws);
+        cudaFree(int_ws);
         println!("\nDone!");
+    }
+}
+
+fn test_gdn_sm100(reg: &KernelRegistry) {
+    println!("=== GDN SM100 AOT FFI smoke ===");
+    let Some(kernel) = reg.get_utility("gdn_prefill_sm100_bf16_h16_hv16") else {
+        println!("gdn_prefill_sm100_bf16_h16_hv16 not compiled");
+        return;
+    };
+
+    unsafe {
+        let total_tokens = 512i64;
+        let batch = 1i64;
+        let heads = 16i64;
+        let head_dim = 128i64;
+        let bytes_bf16 = (total_tokens * heads * head_dim * 2) as usize;
+        let bytes_gate = (total_tokens * heads * 4) as usize;
+        let bytes_state = (batch * heads * head_dim * head_dim * 4) as usize;
+        let bytes_cu = ((batch + 1) * 4) as usize;
+        let bytes_workspace = 148usize * 4 * 128;
+
+        let mut q: *mut c_void = std::ptr::null_mut();
+        let mut k: *mut c_void = std::ptr::null_mut();
+        let mut v: *mut c_void = std::ptr::null_mut();
+        let mut alpha: *mut c_void = std::ptr::null_mut();
+        let mut beta: *mut c_void = std::ptr::null_mut();
+        let mut out: *mut c_void = std::ptr::null_mut();
+        let mut init: *mut c_void = std::ptr::null_mut();
+        let mut state: *mut c_void = std::ptr::null_mut();
+        let mut cu: *mut c_void = std::ptr::null_mut();
+        let mut workspace: *mut c_void = std::ptr::null_mut();
+
+        assert_eq!(cudaMalloc(&mut q, bytes_bf16), 0);
+        assert_eq!(cudaMalloc(&mut k, bytes_bf16), 0);
+        assert_eq!(cudaMalloc(&mut v, bytes_bf16), 0);
+        assert_eq!(cudaMalloc(&mut alpha, bytes_gate), 0);
+        assert_eq!(cudaMalloc(&mut beta, bytes_gate), 0);
+        assert_eq!(cudaMalloc(&mut out, bytes_bf16), 0);
+        assert_eq!(cudaMalloc(&mut init, bytes_state), 0);
+        assert_eq!(cudaMalloc(&mut state, bytes_state), 0);
+        assert_eq!(cudaMalloc(&mut cu, bytes_cu), 0);
+        assert_eq!(cudaMalloc(&mut workspace, bytes_workspace), 0);
+
+        cudaMemset(q, 0, bytes_bf16);
+        cudaMemset(k, 0, bytes_bf16);
+        cudaMemset(v, 0, bytes_bf16);
+        cudaMemset(out, 0, bytes_bf16);
+        cudaMemset(init, 0, bytes_state);
+        cudaMemset(state, 0, bytes_state);
+        cudaMemset(workspace, 0, bytes_workspace);
+
+        let gate_host = vec![0.5f32; (total_tokens * heads) as usize];
+        let cu_host = [0i32, total_tokens as i32];
+        cudaMemcpy(
+            alpha,
+            gate_host.as_ptr() as *const c_void,
+            bytes_gate,
+            CUDA_MEMCPY_H2D,
+        );
+        cudaMemcpy(
+            beta,
+            gate_host.as_ptr() as *const c_void,
+            bytes_gate,
+            CUDA_MEMCPY_H2D,
+        );
+        cudaMemcpy(
+            cu,
+            cu_host.as_ptr() as *const c_void,
+            bytes_cu,
+            CUDA_MEMCPY_H2D,
+        );
+
+        let q_s = [total_tokens, heads, head_dim];
+        let q_st = contiguous_strides(&q_s);
+        let gate_s = [total_tokens, heads];
+        let gate_st = contiguous_strides(&gate_s);
+        let state_s = [batch, heads, head_dim, head_dim];
+        let state_st = contiguous_strides(&state_s);
+        let cu_s = [batch + 1];
+        let cu_st = [1i64];
+        let ws_s = [bytes_workspace as i64];
+        let ws_st = [1i64];
+
+        let dl_q = gpu_dl(q, BF16_DT, &q_s, &q_st);
+        let dl_k = gpu_dl(k, BF16_DT, &q_s, &q_st);
+        let dl_v = gpu_dl(v, BF16_DT, &q_s, &q_st);
+        let dl_alpha = gpu_dl(alpha, F32_DT, &gate_s, &gate_st);
+        let dl_beta = gpu_dl(beta, F32_DT, &gate_s, &gate_st);
+        let dl_out = gpu_dl(out, BF16_DT, &q_s, &q_st);
+        let dl_cu = gpu_dl(cu, I32_DT, &cu_s, &cu_st);
+        let dl_init = gpu_dl(init, F32_DT, &state_s, &state_st);
+        let dl_state = gpu_dl(state, F32_DT, &state_s, &state_st);
+        let dl_ws = gpu_dl(workspace, I8_DT, &ws_s, &ws_st);
+
+        reg.set_stream(0, std::ptr::null_mut());
+        let args = [
+            TVMFFIAny::dltensor(&dl_q),
+            TVMFFIAny::dltensor(&dl_k),
+            TVMFFIAny::dltensor(&dl_v),
+            TVMFFIAny::dltensor(&dl_alpha),
+            TVMFFIAny::dltensor(&dl_beta),
+            TVMFFIAny::dltensor(&dl_out),
+            TVMFFIAny::dltensor(&dl_cu),
+            TVMFFIAny::dltensor(&dl_init),
+            TVMFFIAny::dltensor(&dl_state),
+            TVMFFIAny::none(),
+            TVMFFIAny::none(),
+            TVMFFIAny::int32(0),
+            TVMFFIAny::float64((head_dim as f64).powf(-0.5)),
+            TVMFFIAny::dltensor(&dl_ws),
+            TVMFFIAny::opaque_ptr(std::ptr::null_mut()),
+        ];
+
+        println!("calling gdn_prefill_sm100_bf16_h16_hv16...");
+        match reg.call(kernel, &args) {
+            Ok(_) => {
+                let rc = cudaDeviceSynchronize();
+                println!("GDN SM100 call OK, cudaDeviceSynchronize={rc}");
+            }
+            Err(e) => println!("GDN SM100 call failed: {e}"),
+        }
+
+        cudaFree(q);
+        cudaFree(k);
+        cudaFree(v);
+        cudaFree(alpha);
+        cudaFree(beta);
+        cudaFree(out);
+        cudaFree(init);
+        cudaFree(state);
+        cudaFree(cu);
+        cudaFree(workspace);
     }
 }

@@ -1,10 +1,10 @@
-//! FlashInfer fused Gated DeltaNet (GDN) prefill.
+//! Gated DeltaNet (GDN) prefill.
 //!
-//! This is the kernel Qwen3.5 / Qwen3-next family actually targets (FLA's
-//! `chunk_gated_delta_rule`, not cuLA's per-element KDA). The launcher
-//! uses two architecture-specific paths: Hopper/SM90 calls FlashInfer's C++
-//! `gdn_prefill` launcher, while Blackwell/SM100+ calls the CuTe DSL export
-//! from `flashinfer.gdn_kernels.blackwell`.
+//! SM90 uses FlashInfer's Hopper WGMMA `gdn_prefill` utility. SM10x uses
+//! Prelude's in-tree recurrent BF16 kernel with the same linear-space
+//! DeltaNet semantics. An experimental FlashInfer CuTe DSL Blackwell AOT path
+//! is compiled when available, but stays behind `PRELUDE_GDN_SM100_AOT=1`
+//! until its TVM FFI launch path is fully validated.
 //!
 //! ## Semantics
 //!
@@ -29,16 +29,21 @@
 //! - `output`: `[packed_seq, num_sab_heads, head_dim]` BF16
 //! - `output_state`: `[num_seqs, num_sab_heads, head_dim, head_dim]` F32
 
+use candle_core::Shape;
 use candle_core::backend::BackendStorage;
+use candle_core::cuda_backend::WrapErr;
 use cudarc::driver::DevicePtr;
-use flashinfer::types::{
-    DLDataType, DLDevice, DLTensor, TVMFFIAny, KDLBFLOAT, KDLCUDA, KDLFLOAT, KDLINT, KDLUINT,
-};
+use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use flashinfer::KernelRegistry;
+use flashinfer::types::{
+    DLDataType, DLDevice, DLTensor, KDLBFLOAT, KDLCUDA, KDLFLOAT, KDLINT, KDLUINT, TVMFFIAny,
+};
 use half::bf16;
-use prelude_core::tensor::{bail, DType, DeviceExt, Result, Tensor};
+use prelude_core::tensor::{DType, DeviceExt, Result, Tensor, bail};
 use std::ffi::c_void;
 use std::sync::OnceLock;
+
+use crate::{MOD_GDN_PREFILL_RECURRENT, PTX_GDN_PREFILL_RECURRENT};
 
 const BF16_DT: DLDataType = DLDataType {
     code: KDLBFLOAT,
@@ -50,14 +55,14 @@ const F32_DT: DLDataType = DLDataType {
     bits: 32,
     lanes: 1,
 };
-const I32_DT: DLDataType = DLDataType {
-    code: KDLINT,
-    bits: 32,
-    lanes: 1,
-};
 const I8_DT: DLDataType = DLDataType {
     code: KDLINT,
     bits: 8,
+    lanes: 1,
+};
+const I32_DT: DLDataType = DLDataType {
+    code: KDLINT,
+    bits: 32,
     lanes: 1,
 };
 const I64_DT: DLDataType = DLDataType {
@@ -108,8 +113,8 @@ fn gpu_dl(
 /// Drive the FlashInfer `gdn_prefill` utility.
 ///
 /// Returns `Ok(Some((o, final_state)))` on success, `Ok(None)` if the
-/// registry doesn't have a kernel for the current architecture/build,
-/// `Err` for shape/dtype/CUDA errors.
+/// registry doesn't have the kernel (unsupported arch or build-time
+/// unavailable), `Err` for shape/dtype/CUDA errors.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_prefill(
     q: &Tensor,
@@ -122,7 +127,12 @@ pub(crate) fn try_prefill(
     scale: f32,
 ) -> Result<Option<(Tensor, Tensor)>> {
     let reg = registry();
-    if reg.arch() < 90 {
+    // FlashInfer's AOT GDN module is SM90-only; Blackwell is served by the
+    // custom recurrent kernel below. Avoid calling the TVM FFI entrypoint on
+    // other architectures because FlashInfer launcher errors can terminate the
+    // process before Rust can recover.
+    let arch = reg.arch();
+    if !(arch == 90 || (100..110).contains(&arch)) {
         return Ok(None);
     }
 
@@ -212,9 +222,25 @@ pub(crate) fn try_prefill(
         }
     }
 
-    if reg.arch() >= 100 {
-        return try_prefill_blackwell(
-            reg,
+    if (100..110).contains(&arch) {
+        if sm100_aot_enabled() {
+            if let Some(result) = try_prefill_blackwell_aot(
+                reg,
+                q,
+                k,
+                v,
+                alpha,
+                beta,
+                cu_seqlens,
+                initial_state,
+                scale,
+                num_seqs,
+                num_sab_heads,
+            )? {
+                return Ok(Some(result));
+            }
+        }
+        return try_prefill_recurrent_blackwell(
             q,
             k,
             v,
@@ -223,19 +249,11 @@ pub(crate) fn try_prefill(
             cu_seqlens,
             initial_state,
             scale,
-            t,
-            hq,
-            hk,
-            hv,
-            d,
-            num_sab_heads,
             num_seqs,
+            num_sab_heads,
         );
     }
 
-    if reg.arch() != 90 {
-        return Ok(None);
-    }
     let Some(gdn_fn) = reg.get_utility("gdn_prefill") else {
         return Ok(None);
     };
@@ -386,8 +404,17 @@ pub(crate) fn try_prefill(
     Ok(Some((out, final_state)))
 }
 
+fn sm100_aot_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("PRELUDE_GDN_SM100_AOT")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
-fn try_prefill_blackwell(
+fn try_prefill_blackwell_aot(
     reg: &KernelRegistry,
     q: &Tensor,
     k: &Tensor,
@@ -397,21 +424,36 @@ fn try_prefill_blackwell(
     cu_seqlens: &Tensor,
     initial_state: Option<&Tensor>,
     scale: f32,
-    t: usize,
-    hq: usize,
-    hk: usize,
-    hv: usize,
-    d: usize,
-    num_sab_heads: usize,
     num_seqs: usize,
+    num_sab_heads: usize,
 ) -> Result<Option<(Tensor, Tensor)>> {
-    let init = usize::from(initial_state.is_some());
-    let name = format!("gdn_prefill_bw_h{hq}_hv{hv}_init{init}_sm{}", reg.arch());
-    let Some(gdn_fn) = reg.get_utility(&name) else {
+    let (t, hq, d) = q.dims3()?;
+    let (_, hk, _) = k.dims3()?;
+    let (_, hv, _) = v.dims3()?;
+    if d != 128 {
+        return Ok(None);
+    }
+    if hq >= hv {
+        if hk != hv || hq % hv != 0 || num_sab_heads != hq {
+            return Ok(None);
+        }
+    } else if hk != hq || hv % hq != 0 || num_sab_heads != hv {
+        return Ok(None);
+    }
+
+    let name = format!("gdn_prefill_sm100_bf16_h{hq}_hv{hv}");
+    let Some(kernel) = reg.get_utility(&name) else {
         return Ok(None);
     };
 
     let device = q.device();
+    let cuda_dev = match device {
+        prelude_core::tensor::Device::Cuda(d) => d.clone(),
+        _ => return Ok(None),
+    };
+    let dev_id = device.ordinal() as i32;
+    let stream = cuda_dev.cuda_stream();
+
     let q_c = q.contiguous()?;
     let k_c = k.contiguous()?;
     let v_c = v.contiguous()?;
@@ -419,33 +461,21 @@ fn try_prefill_blackwell(
     let beta_c = beta.contiguous()?;
     let cu_i32 = cu_seqlens.to_dtype(DType::U32)?.contiguous()?;
     let init_c = match initial_state {
-        Some(s) => Some(s.contiguous()?),
-        None => None,
+        Some(s) => s.contiguous()?,
+        None => Tensor::zeros((num_seqs, num_sab_heads, d, d), DType::F32, device)?,
     };
 
     let out = Tensor::zeros((t, num_sab_heads, d), DType::BF16, device)?;
     let final_state = Tensor::zeros((num_seqs, num_sab_heads, d, d), DType::F32, device)?;
-
-    // FlashInfer's Blackwell CuTe DSL kernel uses one TMA descriptor bundle
-    // per SM in persistent mode: 4 tensormaps * 128 bytes.
-    let workspace_bytes = (detect_sm_count() as usize) * 512;
+    let workspace_bytes = detect_sm_count() as usize * 4 * 128; // q/k/v/o TMA descriptors per persistent CTA.
     let workspace = Tensor::zeros((workspace_bytes,), DType::U8, device)?;
-
-    let (out_storage, _) = out.storage_and_layout();
-    let cuda_dev = match &*out_storage {
-        candle_core::Storage::Cuda(s) => s.device().clone(),
-        _ => bail!("gdn_prefill_bw: output allocated on non-CUDA device"),
-    };
-    drop(out_storage);
-    let stream = cuda_dev.cuda_stream();
-    let dev_id = device.ordinal() as i32;
 
     macro_rules! cuda_ptr {
         ($t:expr, $ty:ty) => {{
             let (storage, layout) = $t.storage_and_layout();
             let cuda = match &*storage {
                 candle_core::Storage::Cuda(s) => s,
-                _ => bail!("gdn_prefill_bw: tensor not on CUDA"),
+                _ => bail!("gdn_prefill_sm100: tensor not on CUDA"),
             };
             let slice = cuda.as_cuda_slice::<$ty>()?.slice(layout.start_offset()..);
             let (ptr, _guard) = slice.device_ptr(&stream);
@@ -459,22 +489,10 @@ fn try_prefill_blackwell(
     let alpha_ptr = cuda_ptr!(alpha_c, f32);
     let beta_ptr = cuda_ptr!(beta_c, f32);
     let cu_ptr = cuda_ptr!(cu_i32, u32);
+    let init_ptr = cuda_ptr!(init_c, f32);
     let out_ptr = cuda_ptr!(out, bf16);
     let state_ptr = cuda_ptr!(final_state, f32);
     let ws_ptr = cuda_ptr!(workspace, u8);
-    let init_ptr = init_c.as_ref().map(|s| {
-        let (storage, layout) = s.storage_and_layout();
-        let cuda = match &*storage {
-            candle_core::Storage::Cuda(c) => c,
-            _ => panic!("gdn_prefill_bw: init state not on CUDA"),
-        };
-        let slice = cuda
-            .as_cuda_slice::<f32>()
-            .expect("gdn_prefill_bw: init state slice")
-            .slice(layout.start_offset()..);
-        let (ptr, _guard) = slice.device_ptr(&stream);
-        ptr as u64 as *mut c_void
-    });
 
     let q_shape = [t as i64, hq as i64, d as i64];
     let q_strides = contiguous_strides(&q_shape);
@@ -500,16 +518,12 @@ fn try_prefill_blackwell(
     let dl_beta = gpu_dl(beta_ptr, dev_id, F32_DT, &ab_shape, &ab_strides);
     let dl_o = gpu_dl(out_ptr, dev_id, BF16_DT, &o_shape, &o_strides);
     let dl_cu = gpu_dl(cu_ptr, dev_id, I32_DT, &cu_shape, &cu_strides);
+    let dl_init = gpu_dl(init_ptr, dev_id, F32_DT, &state_shape, &state_strides);
     let dl_state = gpu_dl(state_ptr, dev_id, F32_DT, &state_shape, &state_strides);
-    // The Blackwell CuTe DSL export was compiled with a torch.int8
-    // workspace. The backing allocation is byte-addressed either way, but
-    // TVM validates DLPack dtype metadata before launching the kernel.
     let dl_ws = gpu_dl(ws_ptr, dev_id, I8_DT, &ws_shape, &ws_strides);
-    let dl_init = init_ptr.map(|ptr| gpu_dl(ptr, dev_id, F32_DT, &state_shape, &state_strides));
 
     let raw_stream = unsafe { stream.cu_stream() } as *mut c_void;
     reg.set_stream(dev_id, raw_stream);
-
     let args = [
         TVMFFIAny::dltensor(&dl_q),
         TVMFFIAny::dltensor(&dl_k),
@@ -518,13 +532,10 @@ fn try_prefill_blackwell(
         TVMFFIAny::dltensor(&dl_beta),
         TVMFFIAny::dltensor(&dl_o),
         TVMFFIAny::dltensor(&dl_cu),
-        match dl_init.as_ref() {
-            Some(dl) => TVMFFIAny::dltensor(dl),
-            None => TVMFFIAny::none(),
-        },
+        TVMFFIAny::dltensor(&dl_init),
         TVMFFIAny::dltensor(&dl_state),
-        TVMFFIAny::none(),
-        TVMFFIAny::none(),
+        TVMFFIAny::none(), // output_checkpoints
+        TVMFFIAny::none(), // cu_checkpoints
         TVMFFIAny::int32(0),
         TVMFFIAny::float64(scale as f64),
         TVMFFIAny::dltensor(&dl_ws),
@@ -532,8 +543,8 @@ fn try_prefill_blackwell(
     ];
 
     unsafe {
-        reg.call(gdn_fn, &args)
-            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer gdn_prefill_bw: {e}")))?;
+        reg.call(kernel, &args)
+            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer GDN SM100: {e}")))?;
     }
 
     drop(q_c);
@@ -546,6 +557,156 @@ fn try_prefill_blackwell(
     drop(workspace);
 
     Ok(Some((out, final_state)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_prefill_recurrent_blackwell(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    alpha: &Tensor,
+    beta: &Tensor,
+    cu_seqlens: &Tensor,
+    initial_state: Option<&Tensor>,
+    scale: f32,
+    num_seqs: usize,
+    num_sab_heads: usize,
+) -> Result<Option<(Tensor, Tensor)>> {
+    let (t, hq, d) = q.dims3()?;
+    let (_, hk, _) = k.dims3()?;
+    let (_, hv, _) = v.dims3()?;
+    if hq != hk || hv < hq || hv % hq != 0 || num_sab_heads != hv || d != 128 {
+        return Ok(None);
+    }
+
+    let device = q.device();
+    let cuda_dev = match device {
+        prelude_core::tensor::Device::Cuda(d) => d.clone(),
+        _ => return Ok(None),
+    };
+
+    let q_c = q.contiguous()?;
+    let k_c = k.contiguous()?;
+    let v_c = v.contiguous()?;
+    let alpha_c = alpha.contiguous()?;
+    let beta_c = beta.contiguous()?;
+    let cu_c = cu_seqlens.contiguous()?;
+    let init_c = match initial_state {
+        Some(s) => s.contiguous()?,
+        None => Tensor::zeros((1,), DType::F32, device)?,
+    };
+
+    let (q_storage, q_layout) = q_c.storage_and_layout();
+    let (k_storage, k_layout) = k_c.storage_and_layout();
+    let (v_storage, v_layout) = v_c.storage_and_layout();
+    let (alpha_storage, alpha_layout) = alpha_c.storage_and_layout();
+    let (beta_storage, beta_layout) = beta_c.storage_and_layout();
+    let (cu_storage, cu_layout) = cu_c.storage_and_layout();
+    let (init_storage, init_layout) = init_c.storage_and_layout();
+
+    macro_rules! cuda_slice {
+        ($storage:expr, $layout:expr, $ty:ty, $name:literal) => {{
+            let cuda = match &*$storage {
+                candle_core::Storage::Cuda(s) => s,
+                _ => bail!("gdn_prefill_recurrent: {} not on CUDA", $name),
+            };
+            cuda.as_cuda_slice::<$ty>()?.slice($layout.start_offset()..)
+        }};
+    }
+
+    let q_slice = cuda_slice!(q_storage, q_layout, bf16, "q");
+    let k_slice = cuda_slice!(k_storage, k_layout, bf16, "k");
+    let v_slice = cuda_slice!(v_storage, v_layout, bf16, "v");
+    let alpha_slice = cuda_slice!(alpha_storage, alpha_layout, f32, "alpha");
+    let beta_slice = cuda_slice!(beta_storage, beta_layout, f32, "beta");
+    let cu_slice = cuda_slice!(cu_storage, cu_layout, i64, "cu_seqlens");
+    let init_slice = cuda_slice!(init_storage, init_layout, f32, "initial_state");
+
+    let mut out_buf = unsafe { cuda_dev.alloc::<bf16>(t * hv * d) }?;
+    let mut state_buf = unsafe { cuda_dev.alloc::<f32>(num_seqs * hv * d * d) }?;
+
+    let func = cuda_dev.get_or_load_custom_func(
+        "gdn_prefill_recurrent_bf16",
+        MOD_GDN_PREFILL_RECURRENT,
+        PTX_GDN_PREFILL_RECURRENT,
+    )?;
+    let cfg = LaunchConfig {
+        grid_dim: (hv as u32, d as u32, num_seqs as u32),
+        block_dim: (d as u32, 1, 1),
+        shared_mem_bytes: ((d + 31) / 32 * std::mem::size_of::<f32>()) as u32,
+    };
+
+    let num_seqs_i = num_seqs as i32;
+    let hq_i = hq as i32;
+    let hv_i = hv as i32;
+    let d_i = d as i32;
+    let has_initial = if initial_state.is_some() { 1i32 } else { 0i32 };
+
+    let mut builder = func.builder();
+    builder.arg(&q_slice);
+    builder.arg(&k_slice);
+    builder.arg(&v_slice);
+    builder.arg(&alpha_slice);
+    builder.arg(&beta_slice);
+    builder.arg(&cu_slice);
+    builder.arg(&init_slice);
+    builder.arg(&mut out_buf);
+    builder.arg(&mut state_buf);
+    builder.arg(&num_seqs_i);
+    builder.arg(&hq_i);
+    builder.arg(&hv_i);
+    builder.arg(&d_i);
+    builder.arg(&scale);
+    builder.arg(&has_initial);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(q_storage);
+    drop(k_storage);
+    drop(v_storage);
+    drop(alpha_storage);
+    drop(beta_storage);
+    drop(cu_storage);
+    drop(init_storage);
+
+    let out = tensor_from_bf16(out_buf, device, (t, hv, d))?;
+    let final_state = tensor_from_f32(state_buf, device, (num_seqs, hv, d, d))?;
+    Ok(Some((out, final_state)))
+}
+
+fn tensor_from_bf16(
+    slice: CudaSlice<bf16>,
+    dev: &prelude_core::tensor::Device,
+    shape: impl Into<Shape>,
+) -> Result<Tensor> {
+    let cuda_dev = match dev {
+        prelude_core::tensor::Device::Cuda(d) => d.clone(),
+        _ => bail!("gdn_prefill_recurrent: output not on CUDA"),
+    };
+    let storage = candle_core::CudaStorage::wrap_cuda_slice(slice, cuda_dev);
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(storage),
+        shape.into(),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+fn tensor_from_f32(
+    slice: CudaSlice<f32>,
+    dev: &prelude_core::tensor::Device,
+    shape: impl Into<Shape>,
+) -> Result<Tensor> {
+    let cuda_dev = match dev {
+        prelude_core::tensor::Device::Cuda(d) => d.clone(),
+        _ => bail!("gdn_prefill_recurrent: output not on CUDA"),
+    };
+    let storage = candle_core::CudaStorage::wrap_cuda_slice(slice, cuda_dev);
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(storage),
+        shape.into(),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -568,10 +729,6 @@ fn detect_sm_count() -> i32 {
         if cudaDeviceGetAttribute(&mut count, CUDA_DEV_ATTR_MULTIPROCESSOR_COUNT, dev) != 0 {
             return 132;
         }
-        if count > 0 {
-            count
-        } else {
-            132
-        }
+        if count > 0 { count } else { 132 }
     })
 }
