@@ -58,9 +58,8 @@ pub(crate) fn build_generate_request(
 }
 
 pub(crate) fn sse_json_event<T: Serialize>(value: &T) -> Result<Event, Infallible> {
-    Ok(Event::default().data(
-        serde_json::to_string(value).expect("SSE payload serialization should not fail"),
-    ))
+    Ok(Event::default()
+        .data(serde_json::to_string(value).expect("SSE payload serialization should not fail")))
 }
 
 pub(crate) fn sse_done_event() -> Result<Event, Infallible> {

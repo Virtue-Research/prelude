@@ -356,12 +356,7 @@ async fn completion_rejects_unsupported_fields() {
     let (status, body) = send_json(&app, request).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["type"], "invalid_request_error");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("n=2")
-    );
+    assert!(body["error"]["message"].as_str().unwrap().contains("n=2"));
 }
 
 #[tokio::test]
@@ -668,10 +663,10 @@ async fn embeddings_reject_unsupported_options() {
             .as_str()
             .unwrap()
             .contains("dimensions")
-                || body["error"]["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("encoding_format")
+            || body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("encoding_format")
     );
 }
 

@@ -84,10 +84,23 @@ pub unsafe fn gemm_dispatch(
 ) -> Result<(), String> {
     let ret = unsafe {
         cutlass_gemm_dispatch(
-            a, b, d, m, n, k, batch, lda, ldb, ldd,
-            stride_a, stride_b, stride_d,
-            transa as i32, transb as i32,
-            dtype, stream,
+            a,
+            b,
+            d,
+            m,
+            n,
+            k,
+            batch,
+            lda,
+            ldb,
+            ldd,
+            stride_a,
+            stride_b,
+            stride_d,
+            transa as i32,
+            transb as i32,
+            dtype,
+            stream,
         )
     };
     match ret {
@@ -143,8 +156,18 @@ pub unsafe fn grouped_moe_sm100(
 ) -> Result<(), String> {
     let ret = unsafe {
         moe_grouped_gemm_sm100(
-            input, weights, sorted_token_ids, expert_offsets, output,
-            m_total, n, k, num_experts, topk, data_type, stream,
+            input,
+            weights,
+            sorted_token_ids,
+            expert_offsets,
+            output,
+            m_total,
+            n,
+            k,
+            num_experts,
+            topk,
+            data_type,
+            stream,
         )
     };
     match ret {

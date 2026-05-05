@@ -19,7 +19,9 @@ unsafe extern "C" {
     ) -> i32;
 
     fn deepgemm_query_config(
-        M: i32, N: i32, K: i32,
+        M: i32,
+        N: i32,
+        K: i32,
         out_block_m: *mut i32,
         out_block_n: *mut i32,
         out_stages: *mut i32,
@@ -39,7 +41,9 @@ unsafe extern "C" {
     ) -> i32;
 
     fn deepgemm_query_fp8_config(
-        M: i32, N: i32, K: i32,
+        M: i32,
+        N: i32,
+        K: i32,
         out_block_m: *mut i32,
         out_block_n: *mut i32,
         out_stages: *mut i32,
@@ -73,7 +77,9 @@ unsafe extern "C" {
     ) -> i32;
 
     fn deepgemm_query_grouped_config(
-        M: i32, N: i32, K: i32,
+        M: i32,
+        N: i32,
+        K: i32,
         out_block_m: *mut i32,
         out_block_n: *mut i32,
         out_stages: *mut i32,
@@ -92,9 +98,14 @@ unsafe extern "C" {
     ) -> i32;
 
     fn deepgemm_fp8_gemm_1d1d(
-        A: *mut c_void, B: *mut c_void, D: *mut c_void,
-        scale_a: *mut c_void, scale_b: *mut c_void,
-        M: i32, N: i32, K: i32,
+        A: *mut c_void,
+        B: *mut c_void,
+        D: *mut c_void,
+        scale_a: *mut c_void,
+        scale_b: *mut c_void,
+        M: i32,
+        N: i32,
+        K: i32,
         stream: *mut c_void,
     ) -> i32;
 
@@ -129,38 +140,61 @@ unsafe extern "C" {
     // ── Attention kernels ───────────────────────────────────────────
 
     fn deepgemm_fp8_mqa_logits(
-        q: *mut c_void, kv: *mut c_void,
-        kv_scales: *mut c_void, weights: *mut c_void,
-        cu_seq_len_k_start: *mut c_void, cu_seq_len_k_end: *mut c_void,
+        q: *mut c_void,
+        kv: *mut c_void,
+        kv_scales: *mut c_void,
+        weights: *mut c_void,
+        cu_seq_len_k_start: *mut c_void,
+        cu_seq_len_k_end: *mut c_void,
         logits: *mut c_void,
-        seq_len: i32, seq_len_kv: i32, max_seqlen_k: i32,
-        num_heads: i32, head_dim: i32, stride_logits: i32,
+        seq_len: i32,
+        seq_len_kv: i32,
+        max_seqlen_k: i32,
+        num_heads: i32,
+        head_dim: i32,
+        stride_logits: i32,
         stream: *mut c_void,
     ) -> i32;
 
     fn deepgemm_fp8_paged_mqa_logits(
-        q: *mut c_void, kv_cache: *mut c_void,
-        kv_scales: *mut c_void, weights: *mut c_void,
-        context_lens: *mut c_void, logits: *mut c_void,
-        block_table: *mut c_void, schedule_meta: *mut c_void,
-        batch_size: i32, num_heads: i32, head_dim: i32,
-        num_kv_blocks: i32, block_kv: i32,
+        q: *mut c_void,
+        kv_cache: *mut c_void,
+        kv_scales: *mut c_void,
+        weights: *mut c_void,
+        context_lens: *mut c_void,
+        logits: *mut c_void,
+        block_table: *mut c_void,
+        schedule_meta: *mut c_void,
+        batch_size: i32,
+        num_heads: i32,
+        head_dim: i32,
+        num_kv_blocks: i32,
+        block_kv: i32,
         is_context_lens_2d: i32,
-        kv_cache_stride_bytes: i32, logits_stride: i32, block_table_stride: i32,
+        kv_cache_stride_bytes: i32,
+        logits_stride: i32,
+        block_table_stride: i32,
         stream: *mut c_void,
     ) -> i32;
 
     fn deepgemm_paged_mqa_metadata(
-        context_lens: *mut c_void, schedule_metadata: *mut c_void,
-        batch_size: i32, next_n: i32, is_context_lens_2d: i32,
-        split_kv: i32, num_sms: i32,
+        context_lens: *mut c_void,
+        schedule_metadata: *mut c_void,
+        batch_size: i32,
+        next_n: i32,
+        is_context_lens_2d: i32,
+        split_kv: i32,
+        num_sms: i32,
         stream: *mut c_void,
     ) -> i32;
 
     fn deepgemm_clean_logits(
-        cu_seq_len_k_start: *mut c_void, cu_seq_len_k_end: *mut c_void,
+        cu_seq_len_k_start: *mut c_void,
+        cu_seq_len_k_end: *mut c_void,
         logits: *mut c_void,
-        seq_len: i32, seq_len_kv: i32, stride_logits: i32,
+        seq_len: i32,
+        seq_len_kv: i32,
+        stride_logits: i32,
         next_n: i32,
         stream: *mut c_void,
     ) -> i32;
@@ -168,20 +202,31 @@ unsafe extern "C" {
     // ── Layout utilities ────────────────────────────────────────────
 
     fn deepgemm_transform_sf_transpose(
-        sf_in: *mut c_void, sf_out: *mut c_void,
-        mn: i32, sf_k: i32, num_groups: i32,
+        sf_in: *mut c_void,
+        sf_out: *mut c_void,
+        mn: i32,
+        sf_k: i32,
+        num_groups: i32,
         stream: *mut c_void,
     ) -> i32;
 
     fn deepgemm_transform_sf_pack_ue8m0(
-        sf_in: *mut c_void, sf_out: *mut c_void,
-        mn: i32, sf_k: i32, num_groups: i32,
+        sf_in: *mut c_void,
+        sf_out: *mut c_void,
+        mn: i32,
+        sf_k: i32,
+        num_groups: i32,
         stream: *mut c_void,
     ) -> i32;
 
     fn deepgemm_einsum(
-        A: *mut c_void, B: *mut c_void, D: *mut c_void,
-        shape_m: i32, shape_n: i32, shape_k: i32, shape_s: i32,
+        A: *mut c_void,
+        B: *mut c_void,
+        D: *mut c_void,
+        shape_m: i32,
+        shape_n: i32,
+        shape_k: i32,
+        shape_s: i32,
         stream: *mut c_void,
     ) -> i32;
 
@@ -211,7 +256,9 @@ pub unsafe fn bf16_gemm(
     match ret {
         0 => Ok(()),
         -1 => Err(format!("DeepGEMM: no kernel variant for M={m} N={n} K={k}")),
-        code => Err(format!("DeepGEMM: launch failed (code {code}) for M={m} N={n} K={k}")),
+        code => Err(format!(
+            "DeepGEMM: launch failed (code {code}) for M={m} N={n} K={k}"
+        )),
     }
 }
 
@@ -239,8 +286,12 @@ pub unsafe fn fp8_gemm(
     let ret = unsafe { deepgemm_fp8_gemm(a, b, d, scale_a, scale_b, m, n, k, stream) };
     match ret {
         0 => Ok(()),
-        -1 => Err(format!("DeepGEMM FP8: no kernel variant for M={m} N={n} K={k}")),
-        code => Err(format!("DeepGEMM FP8: launch failed (code {code}) for M={m} N={n} K={k}")),
+        -1 => Err(format!(
+            "DeepGEMM FP8: no kernel variant for M={m} N={n} K={k}"
+        )),
+        code => Err(format!(
+            "DeepGEMM FP8: launch failed (code {code}) for M={m} N={n} K={k}"
+        )),
     }
 }
 
@@ -282,12 +333,28 @@ pub unsafe fn m_grouped_fp8_gemm(
     stream: *mut c_void,
 ) -> Result<(), String> {
     let ret = unsafe {
-        deepgemm_m_grouped_fp8_gemm(a, b, d, scale_a, scale_b, grouped_layout, m, n, k, num_groups, stream)
+        deepgemm_m_grouped_fp8_gemm(
+            a,
+            b,
+            d,
+            scale_a,
+            scale_b,
+            grouped_layout,
+            m,
+            n,
+            k,
+            num_groups,
+            stream,
+        )
     };
     match ret {
         0 => Ok(()),
-        -1 => Err(format!("DeepGEMM grouped FP8: no kernel variant for M={m} N={n} K={k}")),
-        code => Err(format!("DeepGEMM grouped FP8: launch failed (code {code}) for M={m} N={n} K={k}")),
+        -1 => Err(format!(
+            "DeepGEMM grouped FP8: no kernel variant for M={m} N={n} K={k}"
+        )),
+        code => Err(format!(
+            "DeepGEMM grouped FP8: launch failed (code {code}) for M={m} N={n} K={k}"
+        )),
     }
 }
 
@@ -318,8 +385,12 @@ pub unsafe fn m_grouped_bf16_gemm(
     };
     match ret {
         0 => Ok(()),
-        -1 => Err(format!("DeepGEMM grouped: no kernel variant for M={m} N={n} K={k}")),
-        code => Err(format!("DeepGEMM grouped: launch failed (code {code}) for M={m} N={n} K={k}")),
+        -1 => Err(format!(
+            "DeepGEMM grouped: no kernel variant for M={m} N={n} K={k}"
+        )),
+        code => Err(format!(
+            "DeepGEMM grouped: launch failed (code {code}) for M={m} N={n} K={k}"
+        )),
     }
 }
 
@@ -374,8 +445,12 @@ pub unsafe fn fp8_gemm_1d1d(
     let ret = unsafe { deepgemm_fp8_gemm_1d1d(a, b, d, scale_a, scale_b, m, n, k, stream) };
     match ret {
         0 => Ok(()),
-        -1 => Err(format!("DeepGEMM FP8 1D1D: no kernel variant for M={m} N={n} K={k}")),
-        code => Err(format!("DeepGEMM FP8 1D1D: launch failed (code {code}) for M={m} N={n} K={k}")),
+        -1 => Err(format!(
+            "DeepGEMM FP8 1D1D: no kernel variant for M={m} N={n} K={k}"
+        )),
+        code => Err(format!(
+            "DeepGEMM FP8 1D1D: launch failed (code {code}) for M={m} N={n} K={k}"
+        )),
     }
 }
 
@@ -404,8 +479,12 @@ pub unsafe fn bf16_gemm_acc(
     let ret = unsafe { deepgemm_bf16_gemm_acc(a, b, c, d, m, n, k, stream) };
     match ret {
         0 => Ok(()),
-        -1 => Err(format!("DeepGEMM acc: no kernel variant for M={m} N={n} K={k}")),
-        code => Err(format!("DeepGEMM acc: launch failed (code {code}) for M={m} N={n} K={k}")),
+        -1 => Err(format!(
+            "DeepGEMM acc: no kernel variant for M={m} N={n} K={k}"
+        )),
+        code => Err(format!(
+            "DeepGEMM acc: launch failed (code {code}) for M={m} N={n} K={k}"
+        )),
     }
 }
 
@@ -434,12 +513,18 @@ pub unsafe fn m_grouped_masked_bf16_gemm(
     stream: *mut c_void,
 ) -> Result<(), String> {
     let ret = unsafe {
-        deepgemm_m_grouped_masked_bf16_gemm(a, b, d, masked_m, m, n, k, num_groups, expected_m, stream)
+        deepgemm_m_grouped_masked_bf16_gemm(
+            a, b, d, masked_m, m, n, k, num_groups, expected_m, stream,
+        )
     };
     match ret {
         0 => Ok(()),
-        -1 => Err(format!("DeepGEMM masked: no kernel variant for M={m} N={n} K={k} G={num_groups}")),
-        code => Err(format!("DeepGEMM masked: launch failed (code {code}) for M={m} N={n} K={k}")),
+        -1 => Err(format!(
+            "DeepGEMM masked: no kernel variant for M={m} N={n} K={k} G={num_groups}"
+        )),
+        code => Err(format!(
+            "DeepGEMM masked: launch failed (code {code}) for M={m} N={n} K={k}"
+        )),
     }
 }
 
@@ -470,13 +555,18 @@ pub unsafe fn m_grouped_masked_fp8_gemm(
     stream: *mut c_void,
 ) -> Result<(), String> {
     let ret = unsafe {
-        deepgemm_m_grouped_masked_fp8_gemm(a, b, d, scale_a, scale_b, masked_m,
-                                            m, n, k, num_groups, expected_m, stream)
+        deepgemm_m_grouped_masked_fp8_gemm(
+            a, b, d, scale_a, scale_b, masked_m, m, n, k, num_groups, expected_m, stream,
+        )
     };
     match ret {
         0 => Ok(()),
-        -1 => Err(format!("DeepGEMM masked FP8: no kernel variant for M={m} N={n} K={k} G={num_groups}")),
-        code => Err(format!("DeepGEMM masked FP8: launch failed (code {code}) for M={m} N={n} K={k}")),
+        -1 => Err(format!(
+            "DeepGEMM masked FP8: no kernel variant for M={m} N={n} K={k} G={num_groups}"
+        )),
+        code => Err(format!(
+            "DeepGEMM masked FP8: launch failed (code {code}) for M={m} N={n} K={k}"
+        )),
     }
 }
 
@@ -514,14 +604,28 @@ pub unsafe fn fp8_mqa_logits(
     stream: *mut c_void,
 ) -> Result<(), String> {
     let ret = unsafe {
-        deepgemm_fp8_mqa_logits(q, kv, kv_scales, weights,
-            cu_seq_len_k_start, cu_seq_len_k_end, logits,
-            seq_len, seq_len_kv, max_seqlen_k,
-            num_heads, head_dim, stride_logits, stream)
+        deepgemm_fp8_mqa_logits(
+            q,
+            kv,
+            kv_scales,
+            weights,
+            cu_seq_len_k_start,
+            cu_seq_len_k_end,
+            logits,
+            seq_len,
+            seq_len_kv,
+            max_seqlen_k,
+            num_heads,
+            head_dim,
+            stride_logits,
+            stream,
+        )
     };
     match ret {
         0 => Ok(()),
-        -1 => Err(format!("DeepGEMM MQA: no kernel for heads={num_heads} dim={head_dim}")),
+        -1 => Err(format!(
+            "DeepGEMM MQA: no kernel for heads={num_heads} dim={head_dim}"
+        )),
         code => Err(format!("DeepGEMM MQA: launch failed (code {code})")),
     }
 }
@@ -562,15 +666,32 @@ pub unsafe fn fp8_paged_mqa_logits(
     stream: *mut c_void,
 ) -> Result<(), String> {
     let ret = unsafe {
-        deepgemm_fp8_paged_mqa_logits(q, kv_cache, kv_scales, weights,
-            context_lens, logits, block_table, schedule_meta,
-            batch_size, num_heads, head_dim, num_kv_blocks, block_kv,
+        deepgemm_fp8_paged_mqa_logits(
+            q,
+            kv_cache,
+            kv_scales,
+            weights,
+            context_lens,
+            logits,
+            block_table,
+            schedule_meta,
+            batch_size,
+            num_heads,
+            head_dim,
+            num_kv_blocks,
+            block_kv,
             is_context_lens_2d as i32,
-            kv_cache_stride_bytes, logits_stride, block_table_stride, stream)
+            kv_cache_stride_bytes,
+            logits_stride,
+            block_table_stride,
+            stream,
+        )
     };
     match ret {
         0 => Ok(()),
-        -1 => Err(format!("DeepGEMM paged MQA: no kernel for heads={num_heads} dim={head_dim}")),
+        -1 => Err(format!(
+            "DeepGEMM paged MQA: no kernel for heads={num_heads} dim={head_dim}"
+        )),
         code => Err(format!("DeepGEMM paged MQA: launch failed (code {code})")),
     }
 }
@@ -594,9 +715,16 @@ pub unsafe fn paged_mqa_metadata(
     stream: *mut c_void,
 ) -> Result<(), String> {
     let ret = unsafe {
-        deepgemm_paged_mqa_metadata(context_lens, schedule_metadata,
-            batch_size, next_n, is_context_lens_2d as i32,
-            split_kv, num_sms, stream)
+        deepgemm_paged_mqa_metadata(
+            context_lens,
+            schedule_metadata,
+            batch_size,
+            next_n,
+            is_context_lens_2d as i32,
+            split_kv,
+            num_sms,
+            stream,
+        )
     };
     match ret {
         0 => Ok(()),
@@ -619,13 +747,25 @@ pub unsafe fn clean_logits(
     stream: *mut c_void,
 ) -> Result<(), String> {
     let ret = unsafe {
-        deepgemm_clean_logits(cu_seq_len_k_start, cu_seq_len_k_end, logits,
-            seq_len, seq_len_kv, stride_logits, next_n, stream)
+        deepgemm_clean_logits(
+            cu_seq_len_k_start,
+            cu_seq_len_k_end,
+            logits,
+            seq_len,
+            seq_len_kv,
+            stride_logits,
+            next_n,
+            stream,
+        )
     };
     match ret {
         0 => Ok(()),
-        -1 => Err(format!("DeepGEMM clean_logits: unsupported next_n={next_n}")),
-        code => Err(format!("DeepGEMM clean_logits: launch failed (code {code})")),
+        -1 => Err(format!(
+            "DeepGEMM clean_logits: unsupported next_n={next_n}"
+        )),
+        code => Err(format!(
+            "DeepGEMM clean_logits: launch failed (code {code})"
+        )),
     }
 }
 
@@ -656,12 +796,12 @@ pub unsafe fn einsum(
     shape_s: i32,
     stream: *mut c_void,
 ) -> Result<(), String> {
-    let ret = unsafe {
-        deepgemm_einsum(a, b, d, shape_m, shape_n, shape_k, shape_s, stream)
-    };
+    let ret = unsafe { deepgemm_einsum(a, b, d, shape_m, shape_n, shape_k, shape_s, stream) };
     match ret {
         0 => Ok(()),
-        -1 => Err(format!("DeepGEMM einsum: no kernel for M={shape_m} N={shape_n} K={shape_k}")),
+        -1 => Err(format!(
+            "DeepGEMM einsum: no kernel for M={shape_m} N={shape_n} K={shape_k}"
+        )),
         code => Err(format!("DeepGEMM einsum: launch failed (code {code})")),
     }
 }
@@ -681,12 +821,13 @@ pub unsafe fn transform_sf_transpose(
     num_groups: i32,
     stream: *mut c_void,
 ) -> Result<(), String> {
-    let ret = unsafe {
-        deepgemm_transform_sf_transpose(sf_in, sf_out, mn, sf_k, num_groups, stream)
-    };
+    let ret =
+        unsafe { deepgemm_transform_sf_transpose(sf_in, sf_out, mn, sf_k, num_groups, stream) };
     match ret {
         0 => Ok(()),
-        code => Err(format!("DeepGEMM SF transpose: launch failed (code {code})")),
+        code => Err(format!(
+            "DeepGEMM SF transpose: launch failed (code {code})"
+        )),
     }
 }
 
@@ -702,12 +843,13 @@ pub unsafe fn transform_sf_pack_ue8m0(
     num_groups: i32,
     stream: *mut c_void,
 ) -> Result<(), String> {
-    let ret = unsafe {
-        deepgemm_transform_sf_pack_ue8m0(sf_in, sf_out, mn, sf_k, num_groups, stream)
-    };
+    let ret =
+        unsafe { deepgemm_transform_sf_pack_ue8m0(sf_in, sf_out, mn, sf_k, num_groups, stream) };
     match ret {
         0 => Ok(()),
-        code => Err(format!("DeepGEMM SF UE8M0 pack: launch failed (code {code})")),
+        code => Err(format!(
+            "DeepGEMM SF UE8M0 pack: launch failed (code {code})"
+        )),
     }
 }
 

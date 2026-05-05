@@ -4,7 +4,7 @@
 //! Methods not overridden inherit defaults from `trait Ops`.
 
 use prelude_core::ops::traits::*;
-use prelude_core::tensor::{DType, DeviceExt, Result, Tensor, bail};
+use prelude_core::tensor::{DType, DeviceExt, Result, Tensor};
 
 pub struct CudaOps;
 
@@ -271,7 +271,7 @@ impl Ops for CudaOps {
         if let Some(r) = try_flashinfer_paged(q, key_cache, value_cache, params) {
             return r;
         }
-        bail!("paged_attention: no kernel available for this configuration")
+        prelude_core::ops::traits::attention::paged_attention(q, key_cache, value_cache, params)
     }
 
     fn paged_block_size_hint(&self, head_dim: usize) -> usize {
@@ -747,7 +747,10 @@ fn try_flashinfer_varlen(
     p: &VarlenParams,
 ) -> Option<Result<Tensor>> {
     use crate::attn::flashinfer;
-    // FlashInfer supports BF16/FP16 on SM80+; head_dim up to 256 (FA2/FA3 limit)
+    // FlashInfer supports BF16/FP16 on SM80+. The vendored FA2 ragged
+    // prefill kernels are not reliable for head_dim > 256 on SM10x
+    // (hdim512 can abort inside FlashInfer's scheduler). Let the composed
+    // fallback handle those shapes.
     if !matches!(q.dtype(), DType::BF16 | DType::F16) {
         return None;
     }
@@ -776,23 +779,36 @@ fn try_flashinfer_varlen(
             p.max_seqlen_k,
             p.scale,
         ),
-        MaskType::SlidingWindow { left, right } => flashinfer::varlen_windowed(
-            q,
-            k,
-            v,
-            p.cu_seqlens_q,
-            p.cu_seqlens_k,
-            p.max_seqlen_q,
-            p.max_seqlen_k,
-            p.scale,
-            Some(*left),
-            Some(*right),
-        ),
+        MaskType::SlidingWindow { left, right } => {
+            // FlashInfer's ragged windowed path is causal-left-window only in
+            // this binding. Bidirectional sliding attention (EmbeddingGemma)
+            // needs both sides of the window; let the composed SDPA fallback
+            // handle it unless FA4 already took the request above.
+            if *right != 0 {
+                return None;
+            }
+            flashinfer::varlen_windowed(
+                q,
+                k,
+                v,
+                p.cu_seqlens_q,
+                p.cu_seqlens_k,
+                p.max_seqlen_q,
+                p.max_seqlen_k,
+                p.scale,
+                Some(*left),
+                Some(*right),
+            )
+        }
         MaskType::Custom(_) => return None,
     };
     // If FlashInfer fails due to missing kernel variant, return None to fall through to SDPA
     match &result {
-        Err(e) if e.to_string().contains("no FA3") || e.to_string().contains("no variant") => {
+        Err(e)
+            if e.to_string().contains("no FA3")
+                || e.to_string().contains("no variant")
+                || e.to_string().contains("no prefill variant") =>
+        {
             tracing::debug!("FlashInfer fallback: {e}");
             None
         }
@@ -808,6 +824,10 @@ fn try_flashinfer_paged(
     p: &PagedParams,
 ) -> Option<Result<Tensor>> {
     if !matches!(q.dtype(), DType::BF16 | DType::F16) {
+        return None;
+    }
+    let head_dim = q.dims().last().copied().unwrap_or(0);
+    if head_dim > 256 {
         return None;
     }
     Some(crate::attn::flashinfer::varlen_paged(

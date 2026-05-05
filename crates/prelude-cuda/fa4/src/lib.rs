@@ -16,23 +16,43 @@ pub use loader::{KernelDtype, KernelKey, KernelRegistry, TVMSafeCallFn};
 
 fn half_dl_dtype(dtype: KernelDtype) -> DLDataType {
     match dtype {
-        KernelDtype::BF16 => DLDataType { code: KDLBFLOAT, bits: 16, lanes: 1 },
-        KernelDtype::FP16 => DLDataType { code: KDLFLOAT, bits: 16, lanes: 1 },
+        KernelDtype::BF16 => DLDataType {
+            code: KDLBFLOAT,
+            bits: 16,
+            lanes: 1,
+        },
+        KernelDtype::FP16 => DLDataType {
+            code: KDLFLOAT,
+            bits: 16,
+            lanes: 1,
+        },
     }
 }
 
 fn make_aux_dtypes() -> (DLDataType, DLDataType) {
-    let f32_dt = DLDataType { code: KDLFLOAT, bits: 32, lanes: 1 };
-    let i32_dt = DLDataType { code: KDLINT, bits: 32, lanes: 1 };
+    let f32_dt = DLDataType {
+        code: KDLFLOAT,
+        bits: 32,
+        lanes: 1,
+    };
+    let i32_dt = DLDataType {
+        code: KDLINT,
+        bits: 32,
+        lanes: 1,
+    };
     (f32_dt, i32_dt)
 }
 
 fn make_dltensor(
-    data: *mut c_void, device: DLDevice, dtype: DLDataType,
-    shape: &[i64], strides: &[i64],
+    data: *mut c_void,
+    device: DLDevice,
+    dtype: DLDataType,
+    shape: &[i64],
+    strides: &[i64],
 ) -> DLTensor {
     DLTensor {
-        data, device,
+        data,
+        device,
         ndim: shape.len() as i32,
         dtype,
         shape: shape.as_ptr(),
@@ -111,13 +131,28 @@ pub unsafe fn fa4_varlen_fwd(
     seqused_k_ptr: Option<*mut c_void>,
     dtype: KernelDtype,
 ) -> Result<(), String> {
-    let device = DLDevice { device_type: KDLCUDA, device_id };
+    let device = DLDevice {
+        device_type: KDLCUDA,
+        device_id,
+    };
     let half_dt = half_dl_dtype(dtype);
     let (f32_dtype, i32_dtype) = make_aux_dtypes();
 
-    debug_assert_eq!(q_strides.last().copied(), Some(1), "FA4 requires Q stride(-1) == 1");
-    debug_assert_eq!(k_strides.last().copied(), Some(1), "FA4 requires K stride(-1) == 1");
-    debug_assert_eq!(v_strides.last().copied(), Some(1), "FA4 requires V stride(-1) == 1");
+    debug_assert_eq!(
+        q_strides.last().copied(),
+        Some(1),
+        "FA4 requires Q stride(-1) == 1"
+    );
+    debug_assert_eq!(
+        k_strides.last().copied(),
+        Some(1),
+        "FA4 requires K stride(-1) == 1"
+    );
+    debug_assert_eq!(
+        v_strides.last().copied(),
+        Some(1),
+        "FA4 requires V stride(-1) == 1"
+    );
 
     let dl_q = make_dltensor(q_ptr, device, half_dt, q_shape, q_strides);
     let dl_k = make_dltensor(k_ptr, device, half_dt, k_shape, k_strides);
@@ -130,53 +165,70 @@ pub unsafe fn fa4_varlen_fwd(
     let dl_lse = make_dltensor(lse_ptr, device, f32_dtype, lse_shape, &lse_strides);
 
     let cu_q_strides = contiguous_strides(cu_seqlens_shape);
-    let dl_cu_q = make_dltensor(cu_seqlens_q_ptr, device, i32_dtype, cu_seqlens_shape, &cu_q_strides);
-    let dl_cu_k = make_dltensor(cu_seqlens_k_ptr, device, i32_dtype, cu_seqlens_shape, &cu_q_strides);
+    let dl_cu_q = make_dltensor(
+        cu_seqlens_q_ptr,
+        device,
+        i32_dtype,
+        cu_seqlens_shape,
+        &cu_q_strides,
+    );
+    let dl_cu_k = make_dltensor(
+        cu_seqlens_k_ptr,
+        device,
+        i32_dtype,
+        cu_seqlens_shape,
+        &cu_q_strides,
+    );
 
     let batch_size = cu_seqlens_shape[0] - 1;
     let seqused_shape: [i64; 1] = [batch_size];
     let seqused_strides: [i64; 1] = [1];
 
-    let dl_seqused_q = seqused_q_ptr.map(|ptr|
-        make_dltensor(ptr, device, i32_dtype, &seqused_shape, &seqused_strides));
-    let dl_seqused_k = seqused_k_ptr.map(|ptr|
-        make_dltensor(ptr, device, i32_dtype, &seqused_shape, &seqused_strides));
+    let dl_seqused_q = seqused_q_ptr
+        .map(|ptr| make_dltensor(ptr, device, i32_dtype, &seqused_shape, &seqused_strides));
+    let dl_seqused_k = seqused_k_ptr
+        .map(|ptr| make_dltensor(ptr, device, i32_dtype, &seqused_shape, &seqused_strides));
 
     registry.set_stream(device_id, stream);
 
     let mut args: [TVMFFIAny; 16] = [
-        TVMFFIAny::dltensor(&dl_q),              // 0: mQ
-        TVMFFIAny::dltensor(&dl_k),              // 1: mK
-        TVMFFIAny::dltensor(&dl_v),              // 2: mV
-        TVMFFIAny::dltensor(&dl_o),              // 3: mO
-        if lse_ptr.is_null() {                    // 4: mLSE
+        TVMFFIAny::dltensor(&dl_q), // 0: mQ
+        TVMFFIAny::dltensor(&dl_k), // 1: mK
+        TVMFFIAny::dltensor(&dl_v), // 2: mV
+        TVMFFIAny::dltensor(&dl_o), // 3: mO
+        if lse_ptr.is_null() {
+            // 4: mLSE
             TVMFFIAny::none()
         } else {
             TVMFFIAny::dltensor(&dl_lse)
         },
-        TVMFFIAny::float32(softmax_scale),        // 5: softmax_scale
-        TVMFFIAny::dltensor(&dl_cu_q),            // 6: mCuSeqlensQ
-        TVMFFIAny::dltensor(&dl_cu_k),            // 7: mCuSeqlensK
-        match &dl_seqused_q {                     // 8: mSeqUsedQ
+        TVMFFIAny::float32(softmax_scale), // 5: softmax_scale
+        TVMFFIAny::dltensor(&dl_cu_q),     // 6: mCuSeqlensQ
+        TVMFFIAny::dltensor(&dl_cu_k),     // 7: mCuSeqlensK
+        match &dl_seqused_q {
+            // 8: mSeqUsedQ
             Some(t) => TVMFFIAny::dltensor(t),
             None => TVMFFIAny::none(),
         },
-        match &dl_seqused_k {                     // 9: mSeqUsedK
+        match &dl_seqused_k {
+            // 9: mSeqUsedK
             Some(t) => TVMFFIAny::dltensor(t),
             None => TVMFFIAny::none(),
         },
-        TVMFFIAny::none(),                        // 10: mPageTable
-        match window_size_left {                  // 11: window_size_left
+        TVMFFIAny::none(), // 10: mPageTable
+        match window_size_left {
+            // 11: window_size_left
             Some(v) => TVMFFIAny::int32(v),
             None => TVMFFIAny::none(),
         },
-        match window_size_right {                 // 12: window_size_right
+        match window_size_right {
+            // 12: window_size_right
             Some(v) => TVMFFIAny::int32(v),
             None => TVMFFIAny::none(),
         },
-        TVMFFIAny::none(),                        // 13: learnable_sink
-        TVMFFIAny::none(),                        // 14: blocksparse_tensors
-        TVMFFIAny::none(),                        // 15: aux_tensors
+        TVMFFIAny::none(), // 13: learnable_sink
+        TVMFFIAny::none(), // 14: blocksparse_tensors
+        TVMFFIAny::none(), // 15: aux_tensors
     ];
 
     unsafe { registry.call_kernel(func, &mut args) }
@@ -219,11 +271,18 @@ pub unsafe fn fa4_varlen_paged_fwd(
     window_size_right: Option<i32>,
     dtype: KernelDtype,
 ) -> Result<(), String> {
-    let device = DLDevice { device_type: KDLCUDA, device_id };
+    let device = DLDevice {
+        device_type: KDLCUDA,
+        device_id,
+    };
     let half_dt = half_dl_dtype(dtype);
     let (f32_dtype, i32_dtype) = make_aux_dtypes();
 
-    debug_assert_eq!(q_strides.last().copied(), Some(1), "FA4 requires Q stride(-1) == 1");
+    debug_assert_eq!(
+        q_strides.last().copied(),
+        Some(1),
+        "FA4 requires Q stride(-1) == 1"
+    );
 
     let dl_q = make_dltensor(q_ptr, device, half_dt, q_shape, q_strides);
 
@@ -240,45 +299,66 @@ pub unsafe fn fa4_varlen_paged_fwd(
     let dl_lse = make_dltensor(lse_ptr, device, f32_dtype, lse_shape, &lse_strides);
 
     let cu_q_strides = contiguous_strides(cu_seqlens_q_shape);
-    let dl_cu_q = make_dltensor(cu_seqlens_q_ptr, device, i32_dtype, cu_seqlens_q_shape, &cu_q_strides);
+    let dl_cu_q = make_dltensor(
+        cu_seqlens_q_ptr,
+        device,
+        i32_dtype,
+        cu_seqlens_q_shape,
+        &cu_q_strides,
+    );
 
     let seqused_k_strides = contiguous_strides(seqused_k_shape);
-    let dl_seqused_k = make_dltensor(seqused_k_ptr, device, i32_dtype, seqused_k_shape, &seqused_k_strides);
+    let dl_seqused_k = make_dltensor(
+        seqused_k_ptr,
+        device,
+        i32_dtype,
+        seqused_k_shape,
+        &seqused_k_strides,
+    );
 
     let pt_strides = contiguous_strides(page_table_shape);
-    let dl_page_table = make_dltensor(page_table_ptr, device, i32_dtype, page_table_shape, &pt_strides);
+    let dl_page_table = make_dltensor(
+        page_table_ptr,
+        device,
+        i32_dtype,
+        page_table_shape,
+        &pt_strides,
+    );
 
     registry.set_stream(device_id, stream);
 
     // Same 16-slot layout as non-paged, but different slots filled:
     // cu_seqlens_k=None (paged), seqused_k=filled, page_table=filled
     let mut args: [TVMFFIAny; 16] = [
-        TVMFFIAny::dltensor(&dl_q),              // 0: mQ
-        TVMFFIAny::dltensor(&dl_k),              // 1: mK (paged 4D)
-        TVMFFIAny::dltensor(&dl_v),              // 2: mV (paged 4D)
-        TVMFFIAny::dltensor(&dl_o),              // 3: mO
-        if lse_ptr.is_null() {                    // 4: mLSE
+        TVMFFIAny::dltensor(&dl_q), // 0: mQ
+        TVMFFIAny::dltensor(&dl_k), // 1: mK (paged 4D)
+        TVMFFIAny::dltensor(&dl_v), // 2: mV (paged 4D)
+        TVMFFIAny::dltensor(&dl_o), // 3: mO
+        if lse_ptr.is_null() {
+            // 4: mLSE
             TVMFFIAny::none()
         } else {
             TVMFFIAny::dltensor(&dl_lse)
         },
-        TVMFFIAny::float32(softmax_scale),        // 5: softmax_scale
-        TVMFFIAny::dltensor(&dl_cu_q),            // 6: mCuSeqlensQ (varlen Q)
-        TVMFFIAny::none(),                        // 7: mCuSeqlensK (None — paged)
-        TVMFFIAny::none(),                        // 8: mSeqUsedQ
-        TVMFFIAny::dltensor(&dl_seqused_k),       // 9: mSeqUsedK
-        TVMFFIAny::dltensor(&dl_page_table),      // 10: mPageTable
-        match window_size_left {                  // 11: window_size_left
+        TVMFFIAny::float32(softmax_scale),   // 5: softmax_scale
+        TVMFFIAny::dltensor(&dl_cu_q),       // 6: mCuSeqlensQ (varlen Q)
+        TVMFFIAny::none(),                   // 7: mCuSeqlensK (None — paged)
+        TVMFFIAny::none(),                   // 8: mSeqUsedQ
+        TVMFFIAny::dltensor(&dl_seqused_k),  // 9: mSeqUsedK
+        TVMFFIAny::dltensor(&dl_page_table), // 10: mPageTable
+        match window_size_left {
+            // 11: window_size_left
             Some(v) => TVMFFIAny::int32(v),
             None => TVMFFIAny::none(),
         },
-        match window_size_right {                 // 12: window_size_right
+        match window_size_right {
+            // 12: window_size_right
             Some(v) => TVMFFIAny::int32(v),
             None => TVMFFIAny::none(),
         },
-        TVMFFIAny::none(),                        // 13: learnable_sink
-        TVMFFIAny::none(),                        // 14: blocksparse_tensors
-        TVMFFIAny::none(),                        // 15: aux_tensors
+        TVMFFIAny::none(), // 13: learnable_sink
+        TVMFFIAny::none(), // 14: blocksparse_tensors
+        TVMFFIAny::none(), // 15: aux_tensors
     ];
 
     unsafe { registry.call_kernel(func, &mut args) }

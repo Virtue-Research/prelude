@@ -43,13 +43,29 @@ type FnCreate = unsafe extern "C" fn(*mut cublasHandle_t) -> i32;
 type FnDestroy = unsafe extern "C" fn(cublasHandle_t) -> i32;
 #[allow(clippy::too_many_arguments)]
 type FnGemmStridedBatchedEx = unsafe extern "C" fn(
-    cublasHandle_t, i32, i32, i32, i32, i32,
+    cublasHandle_t,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
     *const c_void,
-    *const c_void, i32, i32, i64,
-    *const c_void, i32, i32, i64,
     *const c_void,
-    *mut c_void, i32, i32, i64,
-    i32, i32, i32,
+    i32,
+    i32,
+    i64,
+    *const c_void,
+    i32,
+    i32,
+    i64,
+    *const c_void,
+    *mut c_void,
+    i32,
+    i32,
+    i64,
+    i32,
+    i32,
+    i32,
 ) -> i32;
 
 struct CuBlas {
@@ -67,13 +83,25 @@ unsafe extern "C" {
 impl CuBlas {
     fn load() -> Option<Self> {
         unsafe {
-            let lib = dlopen(b"libcublas.so\0".as_ptr() as _, 0x101 /*RTLD_LAZY|RTLD_GLOBAL*/);
-            if lib.is_null() { return None; }
-            let create: FnCreate = std::mem::transmute(dlsym(lib, b"cublasCreate_v2\0".as_ptr() as _));
-            let destroy: FnDestroy = std::mem::transmute(dlsym(lib, b"cublasDestroy_v2\0".as_ptr() as _));
-            let gemm: FnGemmStridedBatchedEx = std::mem::transmute(
-                dlsym(lib, b"cublasGemmStridedBatchedEx\0".as_ptr() as _));
-            Some(Self { _lib: lib, create, destroy, gemm })
+            let lib = dlopen(
+                b"libcublas.so\0".as_ptr() as _,
+                0x101, /*RTLD_LAZY|RTLD_GLOBAL*/
+            );
+            if lib.is_null() {
+                return None;
+            }
+            let create: FnCreate =
+                std::mem::transmute(dlsym(lib, b"cublasCreate_v2\0".as_ptr() as _));
+            let destroy: FnDestroy =
+                std::mem::transmute(dlsym(lib, b"cublasDestroy_v2\0".as_ptr() as _));
+            let gemm: FnGemmStridedBatchedEx =
+                std::mem::transmute(dlsym(lib, b"cublasGemmStridedBatchedEx\0".as_ptr() as _));
+            Some(Self {
+                _lib: lib,
+                create,
+                destroy,
+                gemm,
+            })
         }
     }
 }
@@ -96,7 +124,9 @@ fn gpu_alloc(bytes: usize) -> *mut c_void {
 
 /// Measure kernel time in ms using CUDA events.
 fn cuda_bench<F: FnMut()>(warmup: usize, iters: usize, mut f: F) -> f32 {
-    for _ in 0..warmup { f(); }
+    for _ in 0..warmup {
+        f();
+    }
     cuda_check(unsafe { cudaDeviceSynchronize() }, "sync warmup");
 
     let mut start: *mut c_void = std::ptr::null_mut();
@@ -106,7 +136,9 @@ fn cuda_bench<F: FnMut()>(warmup: usize, iters: usize, mut f: F) -> f32 {
         cudaEventCreate(&mut end);
         cudaEventRecord(start, std::ptr::null_mut());
     }
-    for _ in 0..iters { f(); }
+    for _ in 0..iters {
+        f();
+    }
     unsafe {
         cudaEventRecord(end, std::ptr::null_mut());
         cudaEventSynchronize(end);
@@ -120,10 +152,16 @@ fn cuda_bench<F: FnMut()>(warmup: usize, iters: usize, mut f: F) -> f32 {
 
 /// Naive attention via cuBLAS: S = Q @ K^T, O = S @ V (no softmax, no causal mask).
 fn cublas_naive_attention(
-    cublas: &CuBlas, handle: cublasHandle_t,
-    q: *const c_void, k: *const c_void, v: *const c_void,
-    s: *mut c_void, o: *mut c_void,
-    seq: i32, dim: i32, heads: i32,
+    cublas: &CuBlas,
+    handle: cublasHandle_t,
+    q: *const c_void,
+    k: *const c_void,
+    v: *const c_void,
+    s: *mut c_void,
+    o: *mut c_void,
+    seq: i32,
+    dim: i32,
+    heads: i32,
 ) {
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
@@ -134,29 +172,55 @@ fn cublas_naive_attention(
         // S[heads, seq, seq] = Q[heads, seq, dim] @ K[heads, seq, dim]^T
         (cublas.gemm)(
             handle,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            seq, seq, dim,
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            seq,
+            seq,
+            dim,
             ap,
-            q, CUDA_R_16BF, dim, (seq * dim) as i64,
-            k, CUDA_R_16BF, dim, (seq * dim) as i64,
+            q,
+            CUDA_R_16BF,
+            dim,
+            (seq * dim) as i64,
+            k,
+            CUDA_R_16BF,
+            dim,
+            (seq * dim) as i64,
             bp,
-            s, CUDA_R_16BF, seq, (seq * seq) as i64,
+            s,
+            CUDA_R_16BF,
+            seq,
+            (seq * seq) as i64,
             heads,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT,
         );
 
         // O[heads, seq, dim] = S[heads, seq, seq] @ V[heads, seq, dim]
         (cublas.gemm)(
             handle,
-            CUBLAS_OP_N, CUBLAS_OP_T,
-            dim, seq, seq,
+            CUBLAS_OP_N,
+            CUBLAS_OP_T,
+            dim,
+            seq,
+            seq,
             ap,
-            v, CUDA_R_16BF, dim, (seq * dim) as i64,
-            s, CUDA_R_16BF, seq, (seq * seq) as i64,
+            v,
+            CUDA_R_16BF,
+            dim,
+            (seq * dim) as i64,
+            s,
+            CUDA_R_16BF,
+            seq,
+            (seq * seq) as i64,
             bp,
-            o, CUDA_R_16BF, dim, (seq * dim) as i64,
+            o,
+            CUDA_R_16BF,
+            dim,
+            (seq * dim) as i64,
             heads,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT,
         );
     }
 }
@@ -177,16 +241,43 @@ const ITERS: usize = 20;
 
 fn bench_varlen(registry: &KernelRegistry, cublas: &CuBlas, cublas_handle: cublasHandle_t) {
     println!("\n{:=<80}", "= FA4 Varlen (causal, BF16) vs cuBLAS ");
-    println!("{:<14} {:>8} {:>10} {:>10} {:>10} {:>8}",
-        "Config", "SeqLen", "FA4(ms)", "cuBLAS*", "TFLOPS", "speedup");
+    println!(
+        "{:<14} {:>8} {:>10} {:>10} {:>10} {:>8}",
+        "Config", "SeqLen", "FA4(ms)", "cuBLAS*", "TFLOPS", "speedup"
+    );
     println!("{}", "-".repeat(66));
 
     let configs = [
-        BenchConfig { name: "MHA-h128",   head_dim: 128, num_heads_q: 8,  num_heads_k: 8 },
-        BenchConfig { name: "MHA-h64",    head_dim: 64,  num_heads_q: 8,  num_heads_k: 8 },
-        BenchConfig { name: "Qwen3-0.6B", head_dim: 128, num_heads_q: 16, num_heads_k: 8 },
-        BenchConfig { name: "Qwen3-4B",   head_dim: 128, num_heads_q: 32, num_heads_k: 8 },
-        BenchConfig { name: "Qwen3-32B",  head_dim: 128, num_heads_q: 64, num_heads_k: 8 },
+        BenchConfig {
+            name: "MHA-h128",
+            head_dim: 128,
+            num_heads_q: 8,
+            num_heads_k: 8,
+        },
+        BenchConfig {
+            name: "MHA-h64",
+            head_dim: 64,
+            num_heads_q: 8,
+            num_heads_k: 8,
+        },
+        BenchConfig {
+            name: "Qwen3-0.6B",
+            head_dim: 128,
+            num_heads_q: 16,
+            num_heads_k: 8,
+        },
+        BenchConfig {
+            name: "Qwen3-4B",
+            head_dim: 128,
+            num_heads_q: 32,
+            num_heads_k: 8,
+        },
+        BenchConfig {
+            name: "Qwen3-32B",
+            head_dim: 128,
+            num_heads_q: 64,
+            num_heads_k: 8,
+        },
     ];
 
     let seq_lens: &[usize] = &[128, 256, 512, 1024, 2048, 4096, 8192];
@@ -230,29 +321,41 @@ fn bench_varlen(registry: &KernelRegistry, cublas: &CuBlas, cublas_handle: cubla
             let softmax_scale = 1.0 / (cfg.head_dim as f32).sqrt();
 
             // FA4 kernel
-            let fa4_ms = cuda_bench(WARMUP, ITERS, || {
-                unsafe {
-                    flash_attn_v4::fa4_varlen_fwd(
-                        registry, func,
-                        q_gpu, k_gpu, v_gpu, o_gpu,
-                        std::ptr::null_mut(),
-                        softmax_scale,
-                        std::ptr::null_mut(),
-                        cu_gpu, cu_gpu,
-                        &q_shape, &q_strides,
-                        &k_shape, &k_strides,
-                        &v_shape, &v_strides,
-                        &o_shape, &lse_shape, &cu_shape,
-                        0, None, None, None, None,
-                        KernelDtype::BF16,
-                    )
-                    .expect("kernel failed");
-                }
+            let fa4_ms = cuda_bench(WARMUP, ITERS, || unsafe {
+                flash_attn_v4::fa4_varlen_fwd(
+                    registry,
+                    func,
+                    q_gpu,
+                    k_gpu,
+                    v_gpu,
+                    o_gpu,
+                    std::ptr::null_mut(),
+                    softmax_scale,
+                    std::ptr::null_mut(),
+                    cu_gpu,
+                    cu_gpu,
+                    &q_shape,
+                    &q_strides,
+                    &k_shape,
+                    &k_strides,
+                    &v_shape,
+                    &v_strides,
+                    &o_shape,
+                    &lse_shape,
+                    &cu_shape,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    KernelDtype::BF16,
+                )
+                .expect("kernel failed");
             });
 
             // cuBLAS baseline: expand K/V heads to match Q heads for GQA
             let gqa_ratio = cfg.num_heads_q / cfg.num_heads_k;
-            let k_exp = gpu_alloc(q_elems * 2);  // expanded to num_heads_q
+            let k_exp = gpu_alloc(q_elems * 2); // expanded to num_heads_q
             let v_exp = gpu_alloc(q_elems * 2);
             if gqa_ratio > 1 {
                 // Repeat each KV head gqa_ratio times: [seq, num_heads_k, dim] -> [seq, num_heads_q, dim]
@@ -266,12 +369,14 @@ fn bench_varlen(registry: &KernelRegistry, cublas: &CuBlas, cublas_handle: cubla
                         cudaMemcpy(
                             (k_exp as *mut u8).add(dst_off) as *mut c_void,
                             (k_gpu as *mut u8).add(src_off) as *const c_void,
-                            nbytes, 3, // cudaMemcpyDeviceToDevice
+                            nbytes,
+                            3, // cudaMemcpyDeviceToDevice
                         );
                         cudaMemcpy(
                             (v_exp as *mut u8).add(dst_off) as *mut c_void,
                             (v_gpu as *mut u8).add(src_off) as *const c_void,
-                            nbytes, 3,
+                            nbytes,
+                            3,
                         );
                     }
                 }
@@ -288,14 +393,22 @@ fn bench_varlen(registry: &KernelRegistry, cublas: &CuBlas, cublas_handle: cubla
             let o_cub = gpu_alloc(q_elems * 2);
             let cub_ms = cuda_bench(WARMUP, ITERS, || {
                 cublas_naive_attention(
-                    cublas, cublas_handle,
-                    q_gpu, k_exp, v_exp, s_buf, o_cub,
-                    seq_len as i32, cfg.head_dim as i32, cfg.num_heads_q as i32,
+                    cublas,
+                    cublas_handle,
+                    q_gpu,
+                    k_exp,
+                    v_exp,
+                    s_buf,
+                    o_cub,
+                    seq_len as i32,
+                    cfg.head_dim as i32,
+                    cfg.num_heads_q as i32,
                 );
             });
 
             // TFLOPS: 2 * seq^2 * num_heads_q * head_dim / latency (forward attention)
-            let flops = 2.0 * (seq_len as f64).powi(2) * cfg.num_heads_q as f64 * cfg.head_dim as f64;
+            let flops =
+                2.0 * (seq_len as f64).powi(2) * cfg.num_heads_q as f64 * cfg.head_dim as f64;
             let tflops = flops / (fa4_ms as f64 / 1e3) / 1e12;
             let speedup = cub_ms / fa4_ms;
             println!(
@@ -304,10 +417,15 @@ fn bench_varlen(registry: &KernelRegistry, cublas: &CuBlas, cublas_handle: cubla
             );
 
             unsafe {
-                cudaFree(q_gpu); cudaFree(k_gpu); cudaFree(v_gpu);
-                cudaFree(o_gpu); cudaFree(cu_gpu);
-                cudaFree(k_exp); cudaFree(v_exp);
-                cudaFree(s_buf); cudaFree(o_cub);
+                cudaFree(q_gpu);
+                cudaFree(k_gpu);
+                cudaFree(v_gpu);
+                cudaFree(o_gpu);
+                cudaFree(cu_gpu);
+                cudaFree(k_exp);
+                cudaFree(v_exp);
+                cudaFree(s_buf);
+                cudaFree(o_cub);
             }
         }
         println!();
@@ -318,24 +436,40 @@ fn bench_varlen(registry: &KernelRegistry, cublas: &CuBlas, cublas_handle: cubla
 
 fn bench_paged(registry: &KernelRegistry) {
     println!("\n{:=<80}", "= FA4 Paged KV (causal, BF16) ");
-    println!("{:<14} {:>8} {:>8} {:>10} {:>10}",
-        "Config", "Q-len", "KV-len", "FA4(ms)", "TFLOPS");
+    println!(
+        "{:<14} {:>8} {:>8} {:>10} {:>10}",
+        "Config", "Q-len", "KV-len", "FA4(ms)", "TFLOPS"
+    );
     println!("{}", "-".repeat(56));
 
     let configs = [
-        BenchConfig { name: "Qwen3-4B",  head_dim: 128, num_heads_q: 32, num_heads_k: 8 },
-        BenchConfig { name: "Qwen3-32B", head_dim: 128, num_heads_q: 64, num_heads_k: 8 },
+        BenchConfig {
+            name: "Qwen3-4B",
+            head_dim: 128,
+            num_heads_q: 32,
+            num_heads_k: 8,
+        },
+        BenchConfig {
+            name: "Qwen3-32B",
+            head_dim: 128,
+            num_heads_q: 64,
+            num_heads_k: 8,
+        },
     ];
 
     // Prefill: Q tokens > 1, paged KV cache
     let prefill_cases: &[(usize, usize)] = &[
-        (128, 512), (128, 2048), (256, 2048), (256, 4096), (512, 4096),
+        (128, 512),
+        (128, 2048),
+        (256, 2048),
+        (256, 4096),
+        (512, 4096),
     ];
 
     for cfg in &configs {
         let gqa_ratio = cfg.num_heads_q / cfg.num_heads_k;
-        let key = KernelKey::new(cfg.head_dim as u32, gqa_ratio as u32, true, false)
-            .with_paged(true);
+        let key =
+            KernelKey::new(cfg.head_dim as u32, gqa_ratio as u32, true, false).with_paged(true);
         let func = match registry.get(&key) {
             Some(f) => f,
             None => {
@@ -373,7 +507,12 @@ fn bench_paged(registry: &KernelRegistry) {
             }
 
             let q_shape: [i64; 3] = [q_len as _, cfg.num_heads_q as _, cfg.head_dim as _];
-            let k_shape: [i64; 4] = [num_blocks as _, block_size as _, cfg.num_heads_k as _, cfg.head_dim as _];
+            let k_shape: [i64; 4] = [
+                num_blocks as _,
+                block_size as _,
+                cfg.num_heads_k as _,
+                cfg.head_dim as _,
+            ];
             let v_shape = k_shape;
             let o_shape: [i64; 3] = q_shape;
             let lse_shape: [i64; 2] = [cfg.num_heads_q as _, q_len as _];
@@ -385,26 +524,40 @@ fn bench_paged(registry: &KernelRegistry) {
 
             registry.set_stream(0, std::ptr::null_mut());
 
-            let fa4_ms = cuda_bench(WARMUP, ITERS, || {
-                unsafe {
-                    flash_attn_v4::fa4_varlen_paged_fwd(
-                        registry, func,
-                        q_gpu, k_gpu, v_gpu, o_gpu,
-                        std::ptr::null_mut(),
-                        softmax_scale,
-                        std::ptr::null_mut(),
-                        cu_q_gpu, sk_gpu, pt_gpu,
-                        &q_shape, &q_strides, &k_shape, &v_shape, &o_shape, &lse_shape,
-                        &cu_q_shape, &sk_shape, &pt_shape,
-                        0, None, None,
-                        KernelDtype::BF16,
-                    )
-                    .expect("paged kernel failed");
-                }
+            let fa4_ms = cuda_bench(WARMUP, ITERS, || unsafe {
+                flash_attn_v4::fa4_varlen_paged_fwd(
+                    registry,
+                    func,
+                    q_gpu,
+                    k_gpu,
+                    v_gpu,
+                    o_gpu,
+                    std::ptr::null_mut(),
+                    softmax_scale,
+                    std::ptr::null_mut(),
+                    cu_q_gpu,
+                    sk_gpu,
+                    pt_gpu,
+                    &q_shape,
+                    &q_strides,
+                    &k_shape,
+                    &v_shape,
+                    &o_shape,
+                    &lse_shape,
+                    &cu_q_shape,
+                    &sk_shape,
+                    &pt_shape,
+                    0,
+                    None,
+                    None,
+                    KernelDtype::BF16,
+                )
+                .expect("paged kernel failed");
             });
 
             // TFLOPS: 2 * q_len * kv_len * num_heads_q * head_dim / latency
-            let flops = 2.0 * q_len as f64 * kv_len as f64 * cfg.num_heads_q as f64 * cfg.head_dim as f64;
+            let flops =
+                2.0 * q_len as f64 * kv_len as f64 * cfg.num_heads_q as f64 * cfg.head_dim as f64;
             let tflops = flops / (fa4_ms as f64 / 1e3) / 1e12;
 
             println!(
@@ -413,8 +566,13 @@ fn bench_paged(registry: &KernelRegistry) {
             );
 
             unsafe {
-                cudaFree(q_gpu); cudaFree(k_gpu); cudaFree(v_gpu);
-                cudaFree(o_gpu); cudaFree(cu_q_gpu); cudaFree(sk_gpu); cudaFree(pt_gpu);
+                cudaFree(q_gpu);
+                cudaFree(k_gpu);
+                cudaFree(v_gpu);
+                cudaFree(o_gpu);
+                cudaFree(cu_q_gpu);
+                cudaFree(sk_gpu);
+                cudaFree(pt_gpu);
             }
         }
         println!();
@@ -425,14 +583,26 @@ fn bench_paged(registry: &KernelRegistry) {
 
 fn main() {
     let registry = KernelRegistry::new();
-    println!("{:=<80}", format!("= FA4 Benchmark — SM{} ", registry.arch()));
+    println!(
+        "{:=<80}",
+        format!("= FA4 Benchmark — SM{} ", registry.arch())
+    );
 
-    let cublas = CuBlas::load().expect("failed to dlopen libcublas.so — is CUDA toolkit installed?");
+    let cublas =
+        CuBlas::load().expect("failed to dlopen libcublas.so — is CUDA toolkit installed?");
     let mut cublas_handle: cublasHandle_t = std::ptr::null_mut();
-    unsafe { assert_eq!((cublas.create)(&mut cublas_handle), 0, "cublasCreate failed"); }
+    unsafe {
+        assert_eq!(
+            (cublas.create)(&mut cublas_handle),
+            0,
+            "cublasCreate failed"
+        );
+    }
 
     bench_varlen(&registry, &cublas, cublas_handle);
     bench_paged(&registry);
 
-    unsafe { (cublas.destroy)(cublas_handle); }
+    unsafe {
+        (cublas.destroy)(cublas_handle);
+    }
 }

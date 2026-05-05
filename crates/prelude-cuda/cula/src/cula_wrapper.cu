@@ -8,6 +8,7 @@
 
 // ── SM90: Fused KDA prefill ──────────────────────────────────────────
 
+#ifdef CULA_SM90A_ENABLED
 #include "kda/sm90/prefill_kernel.hpp"
 
 extern "C" int cula_kda_fwd_prefill_sm90(
@@ -55,6 +56,32 @@ extern "C" int cula_kda_fwd_prefill_sm90(
 
     return 0;
 }
+#endif // CULA_SM90A_ENABLED
+
+#ifdef CULA_SM90_STUBS
+extern "C" int cula_kda_fwd_prefill_sm90(
+    cudaStream_t,
+    void*,
+    float*,
+    const void*,
+    const void*,
+    const void*,
+    const float*,
+    const float*,
+    const float*,
+    const int32_t*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int,
+    int32_t)
+{
+    return -1;
+}
+#endif // CULA_SM90_STUBS
 
 // ── SM100: Chunked intra-attention ───────────────────────────────────
 
@@ -161,3 +188,53 @@ extern "C" int cula_chunk_kda_fwd_recomp_wu_sm100(
 
 #endif // CULA_SM100_ENABLED
 #endif // SM100 guard
+
+#ifdef CULA_SM100_STUBS
+extern "C" int cula_chunk_kda_fwd_intra_sm100(
+    cudaStream_t,
+    const void*,
+    const void*,
+    const void*,
+    const void*,
+    const int32_t*,
+    const int32_t*,
+    void*,
+    void*,
+    int*,
+    float,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int)
+{
+    return -1;
+}
+
+extern "C" int cula_chunk_kda_fwd_recomp_wu_sm100(
+    cudaStream_t,
+    const void*,
+    const void*,
+    const void*,
+    const void*,
+    const void*,
+    const int32_t*,
+    const int32_t*,
+    void*,
+    void*,
+    void*,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int)
+{
+    return -1;
+}
+#endif // CULA_SM100_STUBS

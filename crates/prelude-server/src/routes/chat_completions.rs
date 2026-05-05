@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use prelude_core::{
     ChatCompletionChoice, ChatCompletionLogprobs, ChatCompletionRequest, ChatCompletionResponse,
     ChatMessageOut, GenerateRequest, InferenceEngine, PromptInput, StreamEvent,
@@ -13,19 +13,19 @@ use tracing::info;
 use super::generation_common::{
     DEFAULT_MAX_NEW_TOKENS, ResponseMeta, build_generate_request, sse_done_event, sse_json_event,
 };
+use crate::Server;
 use crate::error::ApiError;
 use crate::logprobs::{to_chat_logprob_content, to_chat_logprobs};
 use crate::sse::stream_sse;
 use crate::utils::log_generation_metrics;
-use crate::Server;
 
 pub async fn chat_completions(
     State(server): State<Server>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    request
-        .validate_public_request()
-        .map_err(|message| ApiError::new(StatusCode::BAD_REQUEST, message, "invalid_request_error"))?;
+    request.validate_public_request().map_err(|message| {
+        ApiError::new(StatusCode::BAD_REQUEST, message, "invalid_request_error")
+    })?;
 
     let is_streaming = request.stream.unwrap_or(false);
     let include_usage = request
@@ -46,7 +46,12 @@ pub async fn chat_completions(
     );
 
     if is_streaming {
-        chat_stream(server.engine, engine_request, include_usage, thinking_in_prompt)
+        chat_stream(
+            server.engine,
+            engine_request,
+            include_usage,
+            thinking_in_prompt,
+        )
     } else {
         chat_batch(server.engine, engine_request, thinking_in_prompt).await
     }

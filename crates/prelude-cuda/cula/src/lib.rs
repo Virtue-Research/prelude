@@ -129,14 +129,21 @@ pub unsafe fn kda_fwd_prefill_sm90(
             stream,
             output,
             output_state,
-            q, k, v,
+            q,
+            k,
+            v,
             input_state.unwrap_or(std::ptr::null()),
             alpha.unwrap_or(std::ptr::null()),
             beta.unwrap_or(std::ptr::null()),
             cu_seqlens,
             workspace,
-            num_seqs, num_heads, head_size, total_seqlen,
-            scale, safe_gate as i32, sm_count,
+            num_seqs,
+            num_heads,
+            head_size,
+            total_seqlen,
+            scale,
+            safe_gate as i32,
+            sm_count,
         )
     };
     match ret {
@@ -174,12 +181,26 @@ pub unsafe fn chunk_kda_fwd_intra_sm100(
 ) -> Result<(), String> {
     let ret = unsafe {
         cula_chunk_kda_fwd_intra_sm100(
-            stream, q, k, g, beta,
-            cu_seqlens, chunk_indices,
-            aqk_out, akk_out, tile_counter,
-            scale, chunk_size, total_q_len,
-            b, h, d, num_tiles,
-            use_tf32_inverse as i32, unified_gref as i32, num_sm,
+            stream,
+            q,
+            k,
+            g,
+            beta,
+            cu_seqlens,
+            chunk_indices,
+            aqk_out,
+            akk_out,
+            tile_counter,
+            scale,
+            chunk_size,
+            total_q_len,
+            b,
+            h,
+            d,
+            num_tiles,
+            use_tf32_inverse as i32,
+            unified_gref as i32,
+            num_sm,
         )
     };
     match ret {
@@ -215,11 +236,24 @@ pub unsafe fn chunk_kda_fwd_recomp_wu_sm100(
 ) -> Result<(), String> {
     let ret = unsafe {
         cula_chunk_kda_fwd_recomp_wu_sm100(
-            stream, k, v, beta, a, g,
-            cu_seqlens, chunk_indices,
-            w_out, u_out, kg_out,
-            chunk_size, total_len,
-            b, h, d, num_tiles, num_sm,
+            stream,
+            k,
+            v,
+            beta,
+            a,
+            g,
+            cu_seqlens,
+            chunk_indices,
+            w_out,
+            u_out,
+            kg_out,
+            chunk_size,
+            total_len,
+            b,
+            h,
+            d,
+            num_tiles,
+            num_sm,
         )
     };
     match ret {

@@ -12,6 +12,11 @@ path = "src/lib.rs"
 
 [features]
 default = []
+# GGUF quantized linear kernels (llama.cpp MMQ/MMVQ). Kept opt-in because
+# safetensors BF16/FP16 models do not use them and the CUDA templates are
+# expensive to compile.
+gguf-quant = ["dep:quant-gemm"]
+quant-gemm = ["dep:quant-gemm"]
 
 [build-dependencies]
 prelude-kernelbuild = { workspace = true }
@@ -33,7 +38,7 @@ flash-attn-v4  = { workspace = true }
 flashinfer     = { workspace = true }
 deepgemm       = { workspace = true }
 cutlass-gemm   = { workspace = true }
-quant-gemm     = { workspace = true }
+quant-gemm     = { workspace = true, optional = true }
 cula           = { workspace = true, features = ["dsl"] }
 causal-conv1d  = { workspace = true }
 tvm-static-ffi = { workspace = true }

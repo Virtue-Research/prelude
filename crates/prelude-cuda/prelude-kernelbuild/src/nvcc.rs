@@ -37,6 +37,8 @@ use std::process::Command;
 
 use crate::build_log;
 
+pub const PRELUDE_CUDA_ARCHS_ENV: &str = "PRELUDE_CUDA_ARCHS";
+
 // ─────────────────────────────────────────────────────────────────────
 // CUDA toolkit discovery
 // ─────────────────────────────────────────────────────────────────────
@@ -113,23 +115,153 @@ pub fn nvcc_path(cuda_root: &Path) -> PathBuf {
     nvcc
 }
 
+/// Parse an architecture list such as `sm_90,sm_103`, `90;103`, or
+/// `8.9 9.0`. Returns normalized compute capabilities (`90`, `103`, ...).
+pub fn parse_cuda_arch_list(value: &str) -> Vec<u32> {
+    let mut archs: Vec<u32> = value
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .filter_map(parse_cuda_arch)
+        .collect();
+    archs.sort_unstable();
+    archs.dedup();
+    archs
+}
+
+fn parse_cuda_arch(raw: &str) -> Option<u32> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    let s = s
+        .strip_prefix("sm_")
+        .or_else(|| s.strip_prefix("sm"))
+        .or_else(|| s.strip_prefix("compute_"))
+        .or_else(|| s.strip_prefix("compute"))
+        .unwrap_or(&s);
+    let s = s.strip_suffix('a').unwrap_or(s);
+    if let Some((major, minor)) = s.split_once('.') {
+        let major = major.parse::<u32>().ok()?;
+        let minor = minor.parse::<u32>().ok()?;
+        return Some(major * 10 + minor);
+    }
+    s.parse::<u32>().ok()
+}
+
+pub fn cuda_archs_from_env(env_name: &str) -> Option<Vec<u32>> {
+    let value = env::var(env_name).ok()?;
+    if value.trim().is_empty() {
+        return None;
+    }
+    let archs = parse_cuda_arch_list(&value);
+    if archs.is_empty() {
+        panic!(
+            "{env_name}={value:?} did not contain any CUDA archs. \
+             Use values like sm_90,sm_103 or 90;103."
+        );
+    }
+    Some(archs)
+}
+
+/// Return the user-requested CUDA arch list, if present. Prelude's
+/// workspace-wide override takes priority over CUDA_ARCH_LIST because it is
+/// meant to control AOT fatbin size, not just the single local GPU probe.
+pub fn requested_cuda_archs() -> Option<Vec<u32>> {
+    cuda_archs_from_env(PRELUDE_CUDA_ARCHS_ENV).or_else(|| cuda_archs_from_env("CUDA_ARCH_LIST"))
+}
+
+pub fn requested_cuda_archs_or(default: &[u32]) -> Vec<u32> {
+    requested_cuda_archs().unwrap_or_else(|| default.to_vec())
+}
+
+/// Same as [`requested_cuda_archs_or`], but lets a crate-specific env var
+/// win over the workspace-wide setting.
+pub fn requested_cuda_archs_or_with(crate_env: &str, default: &[u32]) -> Vec<u32> {
+    cuda_archs_from_env(crate_env)
+        .or_else(requested_cuda_archs)
+        .unwrap_or_else(|| default.to_vec())
+}
+
+pub fn supported_cuda_archs(nvcc: &Path, default: &[u32]) -> Vec<u32> {
+    let requested = requested_cuda_archs();
+    supported_cuda_archs_inner(nvcc, requested, default)
+}
+
+pub fn supported_cuda_archs_with(nvcc: &Path, crate_env: &str, default: &[u32]) -> Vec<u32> {
+    let requested = cuda_archs_from_env(crate_env).or_else(requested_cuda_archs);
+    supported_cuda_archs_inner(nvcc, requested, default)
+}
+
+fn supported_cuda_archs_inner(
+    nvcc: &Path,
+    requested: Option<Vec<u32>>,
+    default: &[u32],
+) -> Vec<u32> {
+    let user_requested = requested.is_some();
+    let mut archs = requested.unwrap_or_else(|| default.to_vec());
+    archs.sort_unstable();
+    archs.dedup();
+
+    let unsupported: Vec<u32> = archs
+        .iter()
+        .copied()
+        .filter(|arch| !nvcc_supports_arch(nvcc, *arch))
+        .collect();
+
+    if user_requested && !unsupported.is_empty() {
+        panic!(
+            "Requested CUDA arch(s) {unsupported:?}, but {} does not support them",
+            nvcc.display()
+        );
+    }
+
+    archs.retain(|arch| nvcc_supports_arch(nvcc, *arch));
+    if archs.is_empty() {
+        panic!(
+            "No supported CUDA archs remain. Requested/default arch list: {default:?}; nvcc: {}",
+            nvcc.display()
+        );
+    }
+    archs
+}
+
+pub fn cuda_arch_list_string(archs: &[u32]) -> String {
+    archs
+        .iter()
+        .map(|arch| format!("sm_{arch}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+pub fn cutlass_gencode(arch: u32) -> String {
+    let suffix = if matches!(arch, 90 | 100 | 103) {
+        "a"
+    } else {
+        ""
+    };
+    format!("-gencode=arch=compute_{arch}{suffix},code=sm_{arch}{suffix}")
+}
+
+pub fn plain_gencode(arch: u32) -> String {
+    format!("-gencode=arch=compute_{arch},code=sm_{arch}")
+}
+
+pub fn nvcc_supports_arch(nvcc: &Path, arch: u32) -> bool {
+    let needle = format!("compute_{arch}");
+    Command::new(nvcc)
+        .arg("--list-gpu-arch")
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains(&needle))
+        .unwrap_or(false)
+}
+
 /// Probe the local GPU's compute capability as an integer (e.g. `90` for
-/// Hopper SM90). Honors `CUDA_ARCH_LIST=8.0,9.0` override. Returns `None`
-/// if no GPU is present and the env var is unset — callers should fall
-/// back to a sensible default like 80 (Ampere) for cross-compiles on
-/// CPU-only build hosts.
+/// Hopper SM90). Honors `PRELUDE_CUDA_ARCHS` and `CUDA_ARCH_LIST`
+/// overrides. Returns `None` if no GPU is present and the env vars are
+/// unset — callers should fall back to a sensible default like 80 (Ampere)
+/// for cross-compiles on CPU-only build hosts.
 pub fn detect_compute_cap() -> Option<u32> {
-    if let Ok(arch_list) = env::var("CUDA_ARCH_LIST") {
-        if let Some(cap) = arch_list
-            .split(',')
-            .filter_map(|s| {
-                let s = s.trim().replace('.', "");
-                s.parse::<u32>().ok()
-            })
-            .max()
-        {
-            return Some(cap);
-        }
+    if let Some(cap) = requested_cuda_archs().and_then(|archs| archs.into_iter().max()) {
+        return Some(cap);
     }
 
     // nvidia-smi is in PATH on Linux; on Windows it lives in the
@@ -168,11 +300,7 @@ pub fn detect_gpu_arch_str(default: &str) -> String {
 /// Check whether the given nvcc supports Blackwell (`compute_100`) codegen.
 /// Used to gate SM100 kernel compilation on older toolchains.
 pub fn nvcc_supports_sm100(nvcc: &Path) -> bool {
-    Command::new(nvcc)
-        .arg("--list-gpu-arch")
-        .output()
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("compute_100"))
-        .unwrap_or(false)
+    nvcc_supports_arch(nvcc, 100)
 }
 
 /// Check whether the given nvcc supports Blackwell-Ultra (`compute_103`).
@@ -180,11 +308,7 @@ pub fn nvcc_supports_sm100(nvcc: &Path) -> bool {
 /// a native sm_103a cubin every B300 launch hits "no kernel image
 /// available" or returns -2 from the dispatch.
 pub fn nvcc_supports_sm103(nvcc: &Path) -> bool {
-    Command::new(nvcc)
-        .arg("--list-gpu-arch")
-        .output()
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("compute_103"))
-        .unwrap_or(false)
+    nvcc_supports_arch(nvcc, 103)
 }
 
 // ─────────────────────────────────────────────────────────────────────

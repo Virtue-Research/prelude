@@ -58,9 +58,13 @@ fn main() {
         let stream_ptr = stream.cu_stream() as *mut c_void;
         unsafe {
             deepgemm::m_grouped_bf16_gemm(
-                ap as *mut c_void, bp as *mut c_void, dp as *mut c_void,
+                ap as *mut c_void,
+                bp as *mut c_void,
+                dp as *mut c_void,
                 lp as *mut c_void,
-                total_m as i32, n as i32, k as i32,
+                total_m as i32,
+                n as i32,
+                k as i32,
                 num_groups as i32,
                 stream_ptr,
             )
@@ -68,7 +72,10 @@ fn main() {
     };
     match result {
         Ok(()) => eprintln!("kernel launch returned Ok"),
-        Err(e) => { eprintln!("kernel launch returned Err: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("kernel launch returned Err: {e}");
+            std::process::exit(1);
+        }
     }
 
     eprintln!("syncing stream ...");

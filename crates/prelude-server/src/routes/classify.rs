@@ -1,13 +1,15 @@
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::Json;
 use chrono::Utc;
-use prelude_core::{ClassificationRequest, ClassificationResponse, ClassificationUsage, ClassifyRequest};
+use prelude_core::{
+    ClassificationRequest, ClassificationResponse, ClassificationUsage, ClassifyRequest,
+};
 use tracing::info;
 use uuid::Uuid;
 
-use crate::error::ApiError;
 use crate::Server;
+use crate::error::ApiError;
 
 pub async fn classify(
     State(server): State<Server>,

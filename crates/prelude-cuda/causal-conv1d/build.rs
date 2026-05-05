@@ -36,7 +36,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 macro_rules! build_log {
     ($($arg:tt)*) => {{
@@ -54,6 +54,8 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=csrc/c10_compat/c10/cuda/CUDAException.h");
     println!("cargo:rerun-if-env-changed=CAUSAL_CONV1D_ROOT");
     println!("cargo:rerun-if-env-changed=CAUSAL_CONV1D_ARCH_LIST");
+    println!("cargo:rerun-if-env-changed=PRELUDE_CUDA_ARCHS");
+    println!("cargo:rerun-if-env-changed=CUDA_ARCH_LIST");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     track_submodule("causal-conv1d");
 
@@ -76,6 +78,9 @@ fn main() -> Result<()> {
 
     // Compile the three .cu files with shared nvcc flags.
     let arch_list = env::var("CAUSAL_CONV1D_ARCH_LIST").unwrap_or_else(|_| {
+        if let Some(arch_list) = requested_arch_list() {
+            return arch_list;
+        }
         // SM80 Ampere, SM89 Ada, SM90 Hopper, SM100 Blackwell.
         //
         // We deliberately skip an explicit sm_103 cubin even though
@@ -96,7 +101,9 @@ fn main() -> Result<()> {
             continue;
         }
         let suffix = if a == "90" { "a" } else { "" };
-        arch_flags.push(format!("-gencode=arch=compute_{a}{suffix},code=sm_{a}{suffix}"));
+        arch_flags.push(format!(
+            "-gencode=arch=compute_{a}{suffix},code=sm_{a}{suffix}"
+        ));
     }
 
     let shim_src = manifest_dir.join("csrc/causal_conv1d_shim.cu");
@@ -173,8 +180,7 @@ fn main() -> Result<()> {
         std::fs::remove_file(&lib)?;
     }
     let mut cmd = Command::new(&nvcc);
-    cmd.arg("--lib")
-        .args(["-o", lib.to_str().unwrap()]);
+    cmd.arg("--lib").args(["-o", lib.to_str().unwrap()]);
     for obj in &obj_files {
         cmd.arg(obj);
     }
@@ -185,12 +191,61 @@ fn main() -> Result<()> {
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=causal_conv1d");
-    println!("cargo:rustc-link-search=native={}/lib64", cuda_path.display());
+    println!(
+        "cargo:rustc-link-search=native={}/lib64",
+        cuda_path.display()
+    );
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=stdc++");
 
     build_log!("linked libcausal_conv1d.a ({} objects)", obj_files.len());
     Ok(())
+}
+
+fn requested_arch_list() -> Option<String> {
+    for env_name in ["PRELUDE_CUDA_ARCHS", "CUDA_ARCH_LIST"] {
+        let Ok(value) = env::var(env_name) else {
+            continue;
+        };
+        if value.trim().is_empty() {
+            continue;
+        }
+        let mut archs: Vec<u32> = value
+            .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+            .filter_map(parse_arch)
+            .map(|arch| if arch == 103 { 100 } else { arch })
+            .collect();
+        archs.sort_unstable();
+        archs.dedup();
+        if !archs.is_empty() {
+            return Some(
+                archs
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(";"),
+            );
+        }
+    }
+    None
+}
+
+fn parse_arch(raw: &str) -> Option<u32> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    let s = s
+        .strip_prefix("sm_")
+        .or_else(|| s.strip_prefix("sm"))
+        .or_else(|| s.strip_prefix("compute_"))
+        .or_else(|| s.strip_prefix("compute"))
+        .unwrap_or(&s);
+    let s = s.strip_suffix('a').unwrap_or(s);
+    if let Some((major, minor)) = s.split_once('.') {
+        return Some(major.parse::<u32>().ok()? * 10 + minor.parse::<u32>().ok()?);
+    }
+    s.parse::<u32>().ok()
 }
 
 // ─────────────────────────────────────────────────────────────────────

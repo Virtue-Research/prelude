@@ -52,8 +52,7 @@ use std::ffi::c_void;
 // `prelude_cutedsl::TVMFFIAny`).
 
 pub use tvm_static_ffi::{
-    DLDataType, DLDevice, DLTensor, TVMFFIAny, TVMSafeCallFn, KDLBFLOAT, KDLCUDA, KDLFLOAT,
-    KDLINT,
+    DLDataType, DLDevice, DLTensor, KDLBFLOAT, KDLCUDA, KDLFLOAT, KDLINT, TVMFFIAny, TVMSafeCallFn,
 };
 
 // ── Extern: TVM FFI runtime + CUDA driver bits ──────────────────────
@@ -93,12 +92,10 @@ pub fn detect_gpu_arch() -> u32 {
         }
         let mut major = 0i32;
         let mut minor = 0i32;
-        if cudaDeviceGetAttribute(&mut major, CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MAJOR, device) != 0
-        {
+        if cudaDeviceGetAttribute(&mut major, CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MAJOR, device) != 0 {
             return 0;
         }
-        if cudaDeviceGetAttribute(&mut minor, CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MINOR, device) != 0
-        {
+        if cudaDeviceGetAttribute(&mut minor, CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MINOR, device) != 0 {
             return 0;
         }
         (major * 10 + minor) as u32

@@ -18,8 +18,9 @@ use std::process::Command;
 
 use prelude_kernelbuild::build_log;
 use prelude_kernelbuild::nvcc::{
-    compile_cu_to_obj, find_cuda, link_cuda_runtime_static, locate_source, nvcc_path,
-    nvcc_supports_sm100, nvcc_supports_sm103, track_submodule, ObjCompile,
+    ObjCompile, compile_cu_to_obj, cuda_arch_list_string, cutlass_gencode, find_cuda,
+    link_cuda_runtime_static, locate_source, nvcc_path, nvcc_supports_sm100, nvcc_supports_sm103,
+    supported_cuda_archs, track_submodule,
 };
 
 fn main() {
@@ -27,6 +28,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/naive_gemm.cu");
     println!("cargo:rerun-if-changed=src/grouped_moe_sm100.cu");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=PRELUDE_CUDA_ARCHS");
+    println!("cargo:rerun-if-env-changed=CUDA_ARCH_LIST");
     track_submodule("cutlass");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -46,25 +49,17 @@ fn main() {
     let sm100 = nvcc_supports_sm100(&nvcc);
     let sm103 = nvcc_supports_sm103(&nvcc);
 
-    match (sm100, sm103) {
-        (true, true) => build_log!("compiling 3.x for SM80 + SM90a + SM100a + SM103a (fat binary)"),
-        (true, false) => build_log!("compiling 3.x for SM80 + SM90a + SM100a (fat binary)"),
-        _ => build_log!("compiling 3.x for SM80 + SM90a"),
+    let mut default_archs = vec![80, 90];
+    if sm100 {
+        default_archs.push(100);
     }
+    if sm103 {
+        default_archs.push(103);
+    }
+    let archs = supported_cuda_archs(&nvcc, &default_archs);
+    build_log!("compiling 3.x for {}", cuda_arch_list_string(&archs));
 
-    let common_gencodes: Vec<String> = {
-        let mut v = vec![
-            "-gencode=arch=compute_80,code=sm_80".into(),
-            "-gencode=arch=compute_90a,code=sm_90a".into(),
-        ];
-        if sm100 {
-            v.push("-gencode=arch=compute_100a,code=sm_100a".into());
-        }
-        if sm103 {
-            v.push("-gencode=arch=compute_103a,code=sm_103a".into());
-        }
-        v
-    };
+    let common_gencodes: Vec<String> = archs.iter().map(|&arch| cutlass_gencode(arch)).collect();
 
     // ── TU 1: CUTLASS template wrapper ──────────────────────────────
     let wrapper_src = manifest_dir.join("src/cutlass_wrapper.cu");
@@ -91,7 +86,12 @@ fn main() {
     compile_cu_to_obj(&nvcc, &naive_opts);
 
     // ── TU 3: SM100 grouped GEMM for MoE (Blackwell only) ──────────
-    let grouped_obj = if sm100 {
+    let blackwell_archs: Vec<u32> = archs
+        .iter()
+        .copied()
+        .filter(|arch| matches!(arch, 100 | 103))
+        .collect();
+    let grouped_obj = if !blackwell_archs.is_empty() {
         let grouped_src = manifest_dir.join("src/grouped_moe_sm100.cu");
         let grouped_obj = out_dir.join("grouped_moe_sm100.o");
         let mut grouped_opts = ObjCompile::new(&grouped_src, &grouped_obj)
@@ -101,9 +101,8 @@ fn main() {
             .cpp_std("-std=c++17");
         // Only emit SM100/SM103 cubins — the kernel uses tcgen05/UMMA
         // and won't compile against earlier arches.
-        grouped_opts = grouped_opts.gencode("-gencode=arch=compute_100a,code=sm_100a");
-        if sm103 {
-            grouped_opts = grouped_opts.gencode("-gencode=arch=compute_103a,code=sm_103a");
+        for arch in &blackwell_archs {
+            grouped_opts = grouped_opts.gencode(cutlass_gencode(*arch));
         }
         compile_cu_to_obj(&nvcc, &grouped_opts);
         Some(grouped_obj)
@@ -114,7 +113,8 @@ fn main() {
     // ── Archive objects into libcutlass_gemm.a ─────────────────────
     let lib = out_dir.join("libcutlass_gemm.a");
     let mut nvcc_lib = Command::new(&nvcc);
-    nvcc_lib.arg("--lib")
+    nvcc_lib
+        .arg("--lib")
         .args(["-o", lib.to_str().unwrap()])
         .arg(&wrapper_obj)
         .arg(&naive_obj);

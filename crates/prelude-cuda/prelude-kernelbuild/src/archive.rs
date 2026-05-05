@@ -82,7 +82,10 @@ pub fn archive_and_whole_link(
         return Ok(false);
     }
 
-    build_log!("archiving {} kernel .o files → lib{lib_name}.a", objects.len());
+    build_log!(
+        "archiving {} kernel .o files → lib{lib_name}.a",
+        objects.len()
+    );
 
     let archive_path = out_dir.join(format!("lib{lib_name}.a"));
 
@@ -105,9 +108,7 @@ pub fn archive_and_whole_link(
         for obj in objects {
             cmd.arg(obj);
         }
-        let status = cmd
-            .status()
-            .map_err(|e| format!("ar spawn failed: {e}"))?;
+        let status = cmd.status().map_err(|e| format!("ar spawn failed: {e}"))?;
         if !status.success() {
             return Err(format!("ar failed to create lib{lib_name}.a"));
         }
@@ -129,7 +130,10 @@ pub fn archive_and_whole_link(
             .status()
             .map_err(|e| format!("lib.exe spawn failed: {e}"))?;
         if !status.success() {
-            return Err(format!("lib.exe failed to create {}", archive_path.display()));
+            return Err(format!(
+                "lib.exe failed to create {}",
+                archive_path.display()
+            ));
         }
     }
 

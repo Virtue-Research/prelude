@@ -222,6 +222,41 @@ fn test_chunked_prefill_defers_duplicate_uncached_prefix_key() {
     );
 }
 
+#[test]
+fn test_running_prefill_defers_waiting_duplicate_prefix_key() {
+    let config = SchedulerConfig {
+        chunked_prefill: true,
+        max_running_requests: 4,
+        max_num_batched_tokens: 150,
+        max_total_tokens: 65536,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    sched.add_request(make_seq_with_prefix_key("r1", 200, 1, 42));
+
+    let first = sched.schedule_step().unwrap();
+    assert_eq!(first.prefill_request_ids, vec!["r1"]);
+    assert_eq!(first.prefill_chunk_lens, vec![150]);
+    assert_eq!(sched.running[0].status, SequenceStatus::Prefilling);
+
+    sched.add_request(make_seq_with_prefix_key("r2", 20, 1, 42));
+    sched.add_request(make_seq_with_prefix_key("r3", 20, 1, 7));
+
+    let second = sched.schedule_step().unwrap();
+    assert_eq!(second.forward_mode, ForwardMode::Prefill);
+    assert_eq!(second.prefill_request_ids, vec!["r1", "r3"]);
+    assert_eq!(second.prefill_chunk_lens, vec![50, 20]);
+    assert_eq!(sched.num_waiting(), 1);
+    assert_eq!(
+        sched
+            .waiting_queue
+            .front()
+            .map(|seq| seq.request_id.as_str()),
+        Some("r2")
+    );
+}
+
 // ── Chunked prefill specific tests ───────────────────────────────
 
 #[test]

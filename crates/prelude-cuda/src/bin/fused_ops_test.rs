@@ -5,7 +5,7 @@ static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
 // Usage: cargo run --bin fused_ops_test -p prelude-cuda --release
 
 use prelude_core::ops::traits::Ops;
-use prelude_core::tensor::{bail, DType, Device, Module, Result, Tensor};
+use prelude_core::tensor::{DType, Device, Module, Result, Tensor, bail};
 
 /// Helper: call a fused op that returns Option<Result<T>>, bail if None.
 fn must_fuse<T>(opt: Option<Result<T>>, name: &str) -> Result<T> {
@@ -17,7 +17,9 @@ fn must_fuse<T>(opt: Option<Result<T>>, name: &str) -> Result<T> {
 
 /// Generate random BF16 tensor on GPU (via CPU, since curand is removed).
 fn rand_gpu(shape: impl Into<prelude_core::tensor::Shape>, dev: &Device) -> Result<Tensor> {
-    Tensor::randn(0f64, 1.0, shape, &Device::Cpu)?.to_dtype(DType::BF16)?.to_device(dev)
+    Tensor::randn(0f64, 1.0, shape, &Device::Cpu)?
+        .to_dtype(DType::BF16)?
+        .to_device(dev)
 }
 
 fn main() -> Result<()> {
@@ -148,16 +150,18 @@ fn main() -> Result<()> {
     // copy first, so we measure that full pipeline too.
 
     println!("\n= silu_mul_concat vs fused_silu_mul (model decode shapes) =");
-    println!("{:<12} {:<8} {:>12} {:>12} {:>12} {:>8}",
-        "model", "tokens", "concat(us)", "split(us)", "split+cp(us)", "concat/split");
+    println!(
+        "{:<12} {:<8} {:>12} {:>12} {:>12} {:>8}",
+        "model", "tokens", "concat(us)", "split(us)", "split+cp(us)", "concat/split"
+    );
 
     // (label, tokens, intermediate_size)
     let shapes = [
-        ("Qwen3-0.6B", 1,  3072),
-        ("Qwen3-0.6B", 4,  3072),
-        ("Qwen3-8B",   1,  12288),
-        ("Qwen3-8B",   4,  12288),
-        ("Qwen3-8B",   128, 12288),
+        ("Qwen3-0.6B", 1, 3072),
+        ("Qwen3-0.6B", 4, 3072),
+        ("Qwen3-8B", 1, 12288),
+        ("Qwen3-8B", 4, 12288),
+        ("Qwen3-8B", 128, 12288),
     ];
 
     let warmup = 10;
@@ -197,32 +201,37 @@ fn main() -> Result<()> {
         // Bench narrow+contiguous+fused_silu_mul (actual path without silu_mul_concat)
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
-            let g = gate_up.narrow(1, 0, intermediate)?.reshape((tokens, intermediate))?;
-            let u = gate_up.narrow(1, intermediate, intermediate)?.reshape((tokens, intermediate))?;
+            let g = gate_up
+                .narrow(1, 0, intermediate)?
+                .reshape((tokens, intermediate))?;
+            let u = gate_up
+                .narrow(1, intermediate, intermediate)?
+                .reshape((tokens, intermediate))?;
             let _ = must_fuse(ops.fused_silu_mul(&g, &u), "fused_silu_mul")?;
         }
         prelude_cuda::device::synchronize(&dev)?;
         let split_copy_us = t0.elapsed().as_nanos() as f64 / iters as f64 / 1000.0;
 
         let ratio = concat_us / split_us;
-        println!("{:<12} {:<8} {:>11.1} {:>11.1} {:>11.1} {:>7.2}x",
-            label, tokens, concat_us, split_us, split_copy_us, ratio);
+        println!(
+            "{:<12} {:<8} {:>11.1} {:>11.1} {:>11.1} {:>7.2}x",
+            label, tokens, concat_us, split_us, split_copy_us, ratio
+        );
     }
 
     // ── fused_add_rmsnorm (FlashInfer in-place) ────────────────
 
     println!("\n= fused_add_rmsnorm via FlashInfer (decode shapes) =");
-    println!("{:<12} {:<8} {:>12}",
-        "model", "tokens", "time(us)");
+    println!("{:<12} {:<8} {:>12}", "model", "tokens", "time(us)");
 
     let norm_shapes = [
-        ("Qwen3-0.6B", 1,  1536),
-        ("Qwen3-0.6B", 4,  1536),
-        ("Qwen3-8B",   1,  4096),
-        ("Qwen3-8B",   4,  4096),
-        ("Qwen3-8B",   128, 4096),
-        ("Qwen3-32B",  1,  5120),
-        ("Qwen3-32B",  4,  5120),
+        ("Qwen3-0.6B", 1, 1536),
+        ("Qwen3-0.6B", 4, 1536),
+        ("Qwen3-8B", 1, 4096),
+        ("Qwen3-8B", 4, 4096),
+        ("Qwen3-8B", 128, 4096),
+        ("Qwen3-32B", 1, 5120),
+        ("Qwen3-32B", 4, 5120),
     ];
 
     let warmup = 10;
@@ -241,7 +250,10 @@ fn main() -> Result<()> {
 
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
-            let _ = must_fuse(ops.fused_add_rmsnorm(&residual, &x, &weight, eps), "fused_add_rmsnorm")?;
+            let _ = must_fuse(
+                ops.fused_add_rmsnorm(&residual, &x, &weight, eps),
+                "fused_add_rmsnorm",
+            )?;
         }
         prelude_cuda::device::synchronize(&dev)?;
         let us = t0.elapsed().as_nanos() as f64 / iters as f64 / 1000.0;
@@ -276,7 +288,8 @@ fn main() -> Result<()> {
             .to_device(&dev)?;
 
         // ── Reference via candle ops (mirrors delta_rule_prefill_gdn) ─
-        let qkv_ref = mixed_qkv.narrow(prelude_core::tensor::D::Minus1, 0, hk * d)?
+        let qkv_ref = mixed_qkv
+            .narrow(prelude_core::tensor::D::Minus1, 0, hk * d)?
             .reshape((l, hk, d))?;
         let k_slice_ref = mixed_qkv
             .narrow(prelude_core::tensor::D::Minus1, hk * d, hk * d)?
@@ -314,7 +327,9 @@ fn main() -> Result<()> {
 
         // ── Fused kernel ───────────────────────────────────────────
         let (q_fused, k_fused, v_fused, alpha_fused, beta_fused) = must_fuse(
-            ops.gdn_post_conv(&mixed_qkv, &a_raw_in, &b_raw_in, &a_log, &dt_bias, hk, hv, d),
+            ops.gdn_post_conv(
+                &mixed_qkv, &a_raw_in, &b_raw_in, &a_log, &dt_bias, hk, hv, d,
+            ),
             "gdn_post_conv",
         )?;
 
@@ -357,7 +372,9 @@ fn main() -> Result<()> {
         // ── Perf ───────────────────────────────────────────────────
         for _ in 0..10 {
             let _ = must_fuse(
-                ops.gdn_post_conv(&mixed_qkv, &a_raw_in, &b_raw_in, &a_log, &dt_bias, hk, hv, d),
+                ops.gdn_post_conv(
+                    &mixed_qkv, &a_raw_in, &b_raw_in, &a_log, &dt_bias, hk, hv, d,
+                ),
                 "gdn_post_conv",
             )?;
         }
@@ -366,7 +383,9 @@ fn main() -> Result<()> {
         let t0 = std::time::Instant::now();
         for _ in 0..iters_pc {
             let _ = must_fuse(
-                ops.gdn_post_conv(&mixed_qkv, &a_raw_in, &b_raw_in, &a_log, &dt_bias, hk, hv, d),
+                ops.gdn_post_conv(
+                    &mixed_qkv, &a_raw_in, &b_raw_in, &a_log, &dt_bias, hk, hv, d,
+                ),
                 "gdn_post_conv",
             )?;
         }
@@ -397,10 +416,14 @@ fn main() -> Result<()> {
             let _beta = ops.sigmoid(&b_raw_in.to_dtype(DType::F32)?)?.contiguous()?;
             Ok(())
         };
-        for _ in 0..10 { bench_ref()?; }
+        for _ in 0..10 {
+            bench_ref()?;
+        }
         prelude_cuda::device::synchronize(&dev)?;
         let t0 = std::time::Instant::now();
-        for _ in 0..iters_pc { bench_ref()?; }
+        for _ in 0..iters_pc {
+            bench_ref()?;
+        }
         prelude_cuda::device::synchronize(&dev)?;
         let ref_us = t0.elapsed().as_nanos() as f64 / iters_pc as f64 / 1000.0;
 
@@ -474,8 +497,7 @@ fn main() -> Result<()> {
                 .zip(fused_lp.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0, f32::max);
-            let mean_abs: f32 =
-                ref_lp.iter().map(|x| x.abs()).sum::<f32>() / ref_lp.len() as f32;
+            let mean_abs: f32 = ref_lp.iter().map(|x| x.abs()).sum::<f32>() / ref_lp.len() as f32;
             println!(
                 "  {label}: max_diff={max_diff:.6e} mean_abs={mean_abs:.4} relative={:.6e}",
                 max_diff / mean_abs.max(1e-8)

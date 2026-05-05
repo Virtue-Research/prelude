@@ -10,7 +10,7 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use causal_conv1d::{causal_conv1d_fwd, causal_conv1d_update, Dtype};
+use causal_conv1d::{Dtype, causal_conv1d_fwd, causal_conv1d_update};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 
 // ─── CPU reference ──────────────────────────────────────────────────
@@ -136,7 +136,10 @@ impl Gpu {
         self.stream.clone_dtoh(slice).unwrap()
     }
     fn alloc_bf16(&self, data: &[f64]) -> CudaSlice<half::bf16> {
-        let bf: Vec<half::bf16> = data.iter().map(|&x| half::bf16::from_f32(x as f32)).collect();
+        let bf: Vec<half::bf16> = data
+            .iter()
+            .map(|&x| half::bf16::from_f32(x as f32))
+            .collect();
         self.upload(&bf)
     }
     fn sync(&self) {
@@ -166,7 +169,9 @@ fn rand_vec(n: usize, seed: u64) -> Vec<f64> {
     let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u = ((s >> 11) as f64) / ((1u64 << 53) as f64);
             u - 0.5
         })
@@ -179,7 +184,13 @@ fn rand_vec(n: usize, seed: u64) -> Vec<f64> {
 /// initial_states. Tests basic conv + L2 tail, no SiLU.
 #[test]
 fn fwd_bf16_width4_no_init() {
-    let gpu = match Gpu::new() { Some(g) => g, None => { eprintln!("no GPU, skipping"); return; } };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => {
+            eprintln!("no GPU, skipping");
+            return;
+        }
+    };
     let (b, d, l, k) = (1usize, 64usize, 32usize, 4usize);
 
     let x_f64 = rand_vec(b * d * l, 1);
@@ -198,15 +209,23 @@ fn fwd_bf16_width4_no_init() {
             None,
             None,
             ptr_mut(&mut o_gpu, &gpu.stream),
-            b as i32, d as i32, l as i32, k as i32,
+            b as i32,
+            d as i32,
+            l as i32,
+            k as i32,
             false,
-            Dtype::BF16, Dtype::BF16,
+            Dtype::BF16,
+            Dtype::BF16,
         )
         .unwrap();
     }
     gpu.sync();
 
-    let got: Vec<f64> = gpu.download(&o_gpu).iter().map(|x| x.to_f32() as f64).collect();
+    let got: Vec<f64> = gpu
+        .download(&o_gpu)
+        .iter()
+        .map(|x| x.to_f32() as f64)
+        .collect();
     let err = max_abs(&ref_out, &got);
     eprintln!("fwd_bf16_width4_no_init: max_abs_err={err:.6e}");
     assert!(err < 5e-2, "causal_conv1d_fwd max_abs_err={err}");
@@ -226,7 +245,10 @@ fn fwd_bf16_width4_no_init() {
 /// channel-last layout before the call or add a separate kernel path.
 #[test]
 fn fwd_bf16_silu_no_init() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     let (b, d, l, k) = (1usize, 128usize, 64usize, 4usize);
 
     let x_f64 = rand_vec(b * d * l, 3);
@@ -245,15 +267,23 @@ fn fwd_bf16_silu_no_init() {
             None,
             None,
             ptr_mut(&mut o_gpu, &gpu.stream),
-            b as i32, d as i32, l as i32, k as i32,
+            b as i32,
+            d as i32,
+            l as i32,
+            k as i32,
             true,
-            Dtype::BF16, Dtype::BF16,
+            Dtype::BF16,
+            Dtype::BF16,
         )
         .unwrap();
     }
     gpu.sync();
 
-    let got: Vec<f64> = gpu.download(&o_gpu).iter().map(|x| x.to_f32() as f64).collect();
+    let got: Vec<f64> = gpu
+        .download(&o_gpu)
+        .iter()
+        .map(|x| x.to_f32() as f64)
+        .collect();
     let err = max_abs(&ref_out, &got);
     eprintln!("fwd_bf16_silu_no_init: max_abs_err={err:.6e}");
     assert!(err < 5e-2, "causal_conv1d_fwd(silu) max_abs_err={err}");
@@ -269,7 +299,10 @@ fn fwd_bf16_silu_no_init() {
 /// output through this code path.
 #[test]
 fn fwd_bf16_initial_states_silently_ignored_in_channel_first() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     let (b, d, l, k) = (1usize, 64usize, 32usize, 4usize);
 
     let x_f64 = rand_vec(b * d * l, 10);
@@ -292,15 +325,23 @@ fn fwd_bf16_initial_states_silently_ignored_in_channel_first() {
             Some(ptr(&init_gpu, &gpu.stream)),
             None,
             ptr_mut(&mut o_gpu, &gpu.stream),
-            b as i32, d as i32, l as i32, k as i32,
+            b as i32,
+            d as i32,
+            l as i32,
+            k as i32,
             false,
-            Dtype::BF16, Dtype::BF16,
+            Dtype::BF16,
+            Dtype::BF16,
         )
         .unwrap();
     }
     gpu.sync();
 
-    let got: Vec<f64> = gpu.download(&o_gpu).iter().map(|x| x.to_f32() as f64).collect();
+    let got: Vec<f64> = gpu
+        .download(&o_gpu)
+        .iter()
+        .map(|x| x.to_f32() as f64)
+        .collect();
     let err = max_abs(&ref_no_init, &got);
     eprintln!("init_ignored: max_abs_err_vs_no_init={err:.6e}");
     // Kernel output should equal the no-init reference within BF16 noise
@@ -316,7 +357,10 @@ fn fwd_bf16_initial_states_silently_ignored_in_channel_first() {
 /// the in-place conv_state mutation.
 #[test]
 fn update_bf16_width4() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     let (b, d, k) = (2usize, 128usize, 4usize);
 
     let x_f64 = rand_vec(b * d, 6);
@@ -338,17 +382,28 @@ fn update_bf16_width4() {
             None,
             ptr_mut(&mut o_gpu, &gpu.stream),
             None,
-            b as i32, d as i32, k as i32,
+            b as i32,
+            d as i32,
+            k as i32,
             (k - 1) as i32,
             false,
-            Dtype::BF16, Dtype::BF16,
+            Dtype::BF16,
+            Dtype::BF16,
         )
         .unwrap();
     }
     gpu.sync();
 
-    let got_out: Vec<f64> = gpu.download(&o_gpu).iter().map(|x| x.to_f32() as f64).collect();
-    let got_state: Vec<f64> = gpu.download(&state_gpu).iter().map(|x| x.to_f32() as f64).collect();
+    let got_out: Vec<f64> = gpu
+        .download(&o_gpu)
+        .iter()
+        .map(|x| x.to_f32() as f64)
+        .collect();
+    let got_state: Vec<f64> = gpu
+        .download(&state_gpu)
+        .iter()
+        .map(|x| x.to_f32() as f64)
+        .collect();
     let out_err = max_abs(&ref_out, &got_out);
     let state_err = max_abs(&ref_new_state, &got_state);
     eprintln!("update_bf16_width4: out_err={out_err:.6e} state_err={state_err:.6e}");
