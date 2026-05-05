@@ -51,6 +51,13 @@ fn main() -> Result<()> {
             tvm_ffi_dir.display(),
         );
     }
+    if !dlpack_include.join("dlpack/dlpack.h").exists() {
+        anyhow::bail!(
+            "dlpack headers not found under {}. Run: git submodule update \
+             --init --recursive third_party/tvm-ffi",
+            tvm_ffi_dir.display(),
+        );
+    }
 
     // ── Phase 1: Compile TVM FFI C++ source ────────────────────────
     let cc_files: Vec<PathBuf> = walkdir(&tvm_src, "cc")
@@ -144,7 +151,7 @@ fn main() -> Result<()> {
 /// Compile libbacktrace from third_party/tvm-ffi/3rdparty/libbacktrace.
 fn compile_libbacktrace(tvm_ffi_dir: &Path) -> Result<()> {
     let bt_dir = tvm_ffi_dir.join("3rdparty/libbacktrace");
-    if !bt_dir.exists() {
+    if !bt_dir.join("backtrace.c").exists() {
         anyhow::bail!(
             "libbacktrace not found. Run: git submodule update --init --recursive third_party/tvm-ffi"
         );
@@ -228,6 +235,12 @@ fn compile_libbacktrace(tvm_ffi_dir: &Path) -> Result<()> {
     let fmt = bt_dir.join(format_file);
     if fmt.exists() {
         build.file(&fmt);
+    }
+    if !fmt.exists() || !bt_dir.join("backtrace.c").exists() {
+        anyhow::bail!(
+            "libbacktrace source is incomplete at {}. Run: git submodule update --init --recursive third_party/tvm-ffi",
+            bt_dir.display(),
+        );
     }
 
     build
