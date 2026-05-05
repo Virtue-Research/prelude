@@ -316,19 +316,21 @@ pub(crate) fn try_prefill(
     let out_ptr = cuda_ptr!(out, bf16);
     let state_ptr = cuda_ptr!(final_state, f32);
     let ws_ptr = cuda_ptr!(workspace, u8);
-    let init_ptr = init_c.as_ref().map(|s| {
+    let init_ptr = if let Some(s) = init_c.as_ref() {
         let (storage, layout) = s.storage_and_layout();
         let cuda = match &*storage {
             candle_core::Storage::Cuda(c) => c,
-            _ => panic!("gdn_prefill: init state not on CUDA"),
+            _ => bail!("gdn_prefill: init state not on CUDA"),
         };
         let slice = cuda
             .as_cuda_slice::<f32>()
-            .expect("gdn_prefill: init state slice")
+            .map_err(|e| candle_core::Error::Msg(format!("gdn_prefill: init state slice: {e}")))?
             .slice(layout.start_offset()..);
         let (ptr, _guard) = slice.device_ptr(&stream);
-        ptr as u64 as *mut c_void
-    });
+        Some(ptr as u64 as *mut c_void)
+    } else {
+        None
+    };
 
     // ── Build DLTensors ─────────────────────────────────────────────
     let q_shape = [t as i64, hq as i64, d as i64];
