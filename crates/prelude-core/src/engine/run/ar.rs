@@ -641,31 +641,17 @@ async fn wait_for_initial_prefill_batch(
             _ = &mut wait => break,
         }
     }
-    if *pending_prepares > 1 || scheduler.num_waiting() > 1 {
-        while *pending_prepares > 0 && scheduler.num_waiting() < scheduler.config().max_batch_size {
-            match prepare_rx.recv().await {
-                Some(msg) => {
-                    handle_prepared_message(
-                        engine,
-                        msg,
-                        scheduler,
-                        states,
-                        deltanet_pool,
-                        pending_prepares,
-                    );
-                    drain_ready_prepared_messages(
-                        engine,
-                        prepare_rx,
-                        scheduler,
-                        states,
-                        deltanet_pool,
-                        pending_prepares,
-                    );
-                }
-                None => break,
-            }
-        }
-    }
+    // The wait window is the latency budget. Once it expires, use whatever
+    // prepare work has completed and let slower tokenization join a later
+    // scheduler step instead of blocking ready requests indefinitely.
+    drain_ready_prepared_messages(
+        engine,
+        prepare_rx,
+        scheduler,
+        states,
+        deltanet_pool,
+        pending_prepares,
+    );
     true
 }
 
