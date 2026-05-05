@@ -1,6 +1,6 @@
-use super::prefill_output::materialize_prefill_output_rows;
-use super::prefill::PrefillForwardResult;
 use super::super::*;
+use super::prefill::PrefillForwardResult;
+use super::prefill_output::materialize_prefill_output_rows;
 
 fn apply_embedding_postprocess(normalization: EmbeddingNormalization, values: &mut [f32]) {
     match normalization {
@@ -68,9 +68,7 @@ impl Engine {
             .model
             .lock()
             .map_err(|e| EngineError::Internal(format!("model lock poisoned: {e}")))?;
-        let dimensions = model.as_embedding()
-            .map(|e| e.embedding_dim())
-            .unwrap_or(0);
+        let dimensions = model.as_embedding().map(|e| e.embedding_dim()).unwrap_or(0);
         drop(model);
 
         Ok(RawEmbedOutput {

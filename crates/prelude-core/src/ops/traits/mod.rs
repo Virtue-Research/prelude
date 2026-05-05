@@ -1,6 +1,6 @@
-mod ops;
-pub mod norm;
-mod conv;
 pub mod attention;
+mod conv;
+pub mod norm;
+mod ops;
 
 pub use ops::*;

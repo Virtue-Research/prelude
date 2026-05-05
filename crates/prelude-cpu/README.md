@@ -15,7 +15,7 @@ Rust wrappers around upstream CUDA libraries, `prelude-cpu`:
   an *implementation* of a prelude-core interface, not a general-purpose
   kernel library.
 - **Contains prelude-specific attention, linear, and quant code**
-  (`attn_cpu.rs`, `linear_backends.rs`, `quant_backends.rs`, `raw_cpu.rs`)
+  (`attn_cpu.rs`, `linear_backends.rs`, `ops/quant`, and oneDNN wrappers)
   — all of which assume the prelude model graph / dispatch conventions.
 
 Publishing this crate on its own wouldn't give external users anything
@@ -43,8 +43,7 @@ prelude-cpu/
     ├── executor.rs            # prelude_core::engine::Executor impl
     ├── attn_cpu.rs            # SDPA + paged attention on CPU
     ├── linear_backends.rs     # BF16 / quant Linear backends (routed through oneDNN)
-    ├── quant_backends.rs      # GGUF quant formats on CPU
-    ├── raw_cpu.rs             # Raw tensor math (elementwise, reductions, ...)
+    ├── ops/                   # BF16 attention, GEMM, RMSNorm, RoPE, quant kernels
     └── onednn/
         ├── mod.rs             # re-exports `onednn-ffi` as `ffi`, pulls in `ops`
         └── ops.rs             # safe Rust wrappers using `prelude_core::Tensor`

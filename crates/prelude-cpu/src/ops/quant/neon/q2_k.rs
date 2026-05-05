@@ -21,8 +21,7 @@ unsafe fn multiply_accum_with_scale(
 ) -> i32 {
     let p1 = vdotq_s32(q2bytes.0, q8bytes.0);
     let p2 = vdotq_s32(q2bytes.1, q8bytes.1);
-    vaddvq_s32(p1) * aux[is + index] as i32
-        + vaddvq_s32(p2) * aux[is + 1 + index] as i32
+    vaddvq_s32(p1) * aux[is + index] as i32 + vaddvq_s32(p2) * aux[is + 1 + index] as i32
 }
 
 /// NEON Q2_K x Q8_K dot product.

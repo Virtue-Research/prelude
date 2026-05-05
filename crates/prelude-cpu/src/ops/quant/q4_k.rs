@@ -98,14 +98,38 @@ pub(super) mod avx2 {
     // Scale shuffle lookup table: broadcasts scale pairs across 16-byte lanes.
     // Entry i broadcasts bytes (2*i, 2*i+1) to all positions.
     pub(in super::super) static SCALE_SHUFFLE_K4: [[u8; 32]; 8] = [
-        [ 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1],
-        [ 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3],
-        [ 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5],
-        [ 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7],
-        [ 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9],
-        [10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11],
-        [12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13],
-        [14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15],
+        [
+            0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
+            1, 0, 1,
+        ],
+        [
+            2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2,
+            3, 2, 3,
+        ],
+        [
+            4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4,
+            5, 4, 5,
+        ],
+        [
+            6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6,
+            7, 6, 7,
+        ],
+        [
+            8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8,
+            9, 8, 9,
+        ],
+        [
+            10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11,
+            10, 11, 10, 11, 10, 11, 10, 11, 10, 11,
+        ],
+        [
+            12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13,
+            12, 13, 12, 13, 12, 13, 12, 13, 12, 13,
+        ],
+        [
+            14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15,
+            14, 15, 14, 15, 14, 15, 14, 15, 14, 15,
+        ],
     ];
 
     #[inline(always)]
@@ -152,9 +176,12 @@ pub(super) mod avx2 {
                 let dmin = -yb.d * fp16_to_f32(xb.dmin);
 
                 // Unpack scales/mins from 12-byte packed format
-                utmp[0] = u32::from_le_bytes([xb.scales[0], xb.scales[1], xb.scales[2], xb.scales[3]]);
-                utmp[1] = u32::from_le_bytes([xb.scales[4], xb.scales[5], xb.scales[6], xb.scales[7]]);
-                utmp[2] = u32::from_le_bytes([xb.scales[8], xb.scales[9], xb.scales[10], xb.scales[11]]);
+                utmp[0] =
+                    u32::from_le_bytes([xb.scales[0], xb.scales[1], xb.scales[2], xb.scales[3]]);
+                utmp[1] =
+                    u32::from_le_bytes([xb.scales[4], xb.scales[5], xb.scales[6], xb.scales[7]]);
+                utmp[2] =
+                    u32::from_le_bytes([xb.scales[8], xb.scales[9], xb.scales[10], xb.scales[11]]);
 
                 utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
                 let uaux = utmp[1] & KMASK1;
@@ -164,7 +191,10 @@ pub(super) mod avx2 {
 
                 // Load scales+mins as 16-bit: lower 128 = scales, upper 128 = mins
                 let mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(
-                    utmp[3] as i32, utmp[2] as i32, utmp[1] as i32, utmp[0] as i32,
+                    utmp[3] as i32,
+                    utmp[2] as i32,
+                    utmp[1] as i32,
+                    utmp[0] as i32,
                 ));
 
                 // SIMD mins contribution: hadd bsums pairs, madd with mins, FMA accumulate
@@ -265,9 +295,12 @@ mod avx512 {
                 let dmin = -yb.d * fp16_to_f32(xb.dmin);
 
                 // Unpack scales/mins (same as AVX2)
-                utmp[0] = u32::from_le_bytes([xb.scales[0], xb.scales[1], xb.scales[2], xb.scales[3]]);
-                utmp[1] = u32::from_le_bytes([xb.scales[4], xb.scales[5], xb.scales[6], xb.scales[7]]);
-                utmp[2] = u32::from_le_bytes([xb.scales[8], xb.scales[9], xb.scales[10], xb.scales[11]]);
+                utmp[0] =
+                    u32::from_le_bytes([xb.scales[0], xb.scales[1], xb.scales[2], xb.scales[3]]);
+                utmp[1] =
+                    u32::from_le_bytes([xb.scales[4], xb.scales[5], xb.scales[6], xb.scales[7]]);
+                utmp[2] =
+                    u32::from_le_bytes([xb.scales[8], xb.scales[9], xb.scales[10], xb.scales[11]]);
 
                 utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
                 let uaux = utmp[1] & KMASK1;
@@ -277,7 +310,10 @@ mod avx512 {
 
                 // Min contribution (same as AVX2 — uses 256-bit)
                 let mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(
-                    utmp[3] as i32, utmp[2] as i32, utmp[1] as i32, utmp[0] as i32,
+                    utmp[3] as i32,
+                    utmp[2] as i32,
+                    utmp[1] as i32,
+                    utmp[0] as i32,
                 ));
                 let q8sums = _mm256_loadu_si256(yb.bsums.as_ptr() as *const __m256i);
                 let q8s = _mm_hadd_epi16(
@@ -305,7 +341,8 @@ mod avx512 {
                 for j in 0..(QK_K / 64) {
                     let q4bits = _mm256_loadu_si256(q4.add(j * 32) as *const __m256i);
                     let q4l = _mm256_and_si256(q4bits, _mm256_set1_epi8(0x0F));
-                    let q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), _mm256_set1_epi8(0x0F));
+                    let q4h =
+                        _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), _mm256_set1_epi8(0x0F));
 
                     // Concat [q4l | q4h] into 512-bit
                     let q4_512 = _mm512_inserti64x4(_mm512_castsi256_si512(q4l), q4h, 1);
@@ -387,8 +424,8 @@ pub fn quantized_matmul_q4k(
     assert_eq!(w.len(), n * nb);
     assert_eq!(out.len(), m * n);
 
-    use rayon::prelude::*;
     use super::quantize::quantize_row_q8k;
+    use rayon::prelude::*;
 
     out.par_chunks_mut(n).enumerate().for_each(|(i, out_row)| {
         let x_row = &x[i * k..(i + 1) * k];
@@ -417,7 +454,10 @@ mod tests {
         let q4 = make_test_q4k_blocks(&values);
         let q8 = super::super::quantize::quantize_row_q8k_scalar(&values);
         let result = vec_dot_q4k_q8k_scalar(&q4, &q8);
-        assert!(result > 0.0, "self dot product should be positive, got {result}");
+        assert!(
+            result > 0.0,
+            "self dot product should be positive, got {result}"
+        );
     }
 
     #[test]
@@ -439,8 +479,14 @@ mod tests {
         let q8 = super::super::quantize::quantize_row_q8k_scalar(&x_vals);
         let our_dot = vec_dot_q4k_q8k_scalar(&q4, &q8);
 
-        assert!(our_dot.is_finite(), "dot product should be finite, got {our_dot}");
-        assert!(our_dot.abs() > 1e-6, "dot product should be non-zero for non-trivial inputs");
+        assert!(
+            our_dot.is_finite(),
+            "dot product should be finite, got {our_dot}"
+        );
+        assert!(
+            our_dot.abs() > 1e-6,
+            "dot product should be non-zero for non-trivial inputs"
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -453,9 +499,7 @@ mod tests {
         let values: Vec<f32> = (0..QK_K * 4)
             .map(|i| ((i as f32) * 0.007).sin() * 2.0)
             .collect();
-        let x_vals: Vec<f32> = (0..QK_K * 4)
-            .map(|i| ((i as f32) * 0.013).cos())
-            .collect();
+        let x_vals: Vec<f32> = (0..QK_K * 4).map(|i| ((i as f32) * 0.013).cos()).collect();
 
         let q4 = make_test_q4k_blocks(&values);
         let q8 = super::super::quantize::quantize_row_q8k_scalar(&x_vals);
@@ -476,7 +520,9 @@ mod tests {
         if !is_x86_feature_detected!("avx512bw") {
             return;
         }
-        let values: Vec<f32> = (0..QK_K * 4).map(|i| ((i as f32) * 0.007).sin() * 2.0).collect();
+        let values: Vec<f32> = (0..QK_K * 4)
+            .map(|i| ((i as f32) * 0.007).sin() * 2.0)
+            .collect();
         let x_vals: Vec<f32> = (0..QK_K * 4).map(|i| ((i as f32) * 0.013).cos()).collect();
 
         let q4 = make_test_q4k_blocks(&values);
@@ -509,6 +555,9 @@ mod tests {
         let mut out = vec![0.0f32; m * n];
         quantized_matmul_q4k(&x_data, &w_blocks, &mut out, m, n, k);
 
-        assert!(out.iter().all(|v| v.is_finite()), "non-finite output: {out:?}");
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "non-finite output: {out:?}"
+        );
     }
 }

@@ -81,7 +81,8 @@ fn linear_multi_dtype_vs_pytorch() -> Result<()> {
     for cfg in dtypes {
         let reference = require_pytorch_ref!(
             &[("x", &x_data), ("w", &w_data)],
-            &format!(r#"
+            &format!(
+                r#"
 x = read_input("x", {py}).reshape({batch}, {in_dim})
 w = read_input("w", {py}).reshape({out_dim}, {in_dim})
 y = (x @ w.T).float()
@@ -91,8 +92,8 @@ write_output(y)
             )
         );
 
-        let x = Tensor::from_vec(x_data.clone(), (batch, in_dim), &Device::Cpu)?
-            .to_dtype(cfg.dtype)?;
+        let x =
+            Tensor::from_vec(x_data.clone(), (batch, in_dim), &Device::Cpu)?.to_dtype(cfg.dtype)?;
         let w = Tensor::from_vec(w_data.clone(), (out_dim, in_dim), &Device::Cpu)?
             .to_dtype(cfg.dtype)?;
         let linear = prelude_core::models::commons::linear::Linear::from_weight(w, None)?;
@@ -179,7 +180,8 @@ fn rmsnorm_multi_dtype_vs_pytorch() -> Result<()> {
     for cfg in common::ALL_DTYPES {
         let reference = require_pytorch_ref!(
             &[("x", &x_data), ("w", &w_data)],
-            &format!(r#"
+            &format!(
+                r#"
 x = read_input("x", {py}).reshape({batch}, {hidden})
 w = read_input("w", {py})
 y = torch.nn.functional.rms_norm(x.float(), ({hidden},), w.float(), {eps}).to({py}).float()
@@ -189,10 +191,9 @@ write_output(y)
             )
         );
 
-        let x = Tensor::from_vec(x_data.clone(), (batch, hidden), &Device::Cpu)?
-            .to_dtype(cfg.dtype)?;
-        let w =
-            Tensor::from_vec(w_data.clone(), (hidden,), &Device::Cpu)?.to_dtype(cfg.dtype)?;
+        let x =
+            Tensor::from_vec(x_data.clone(), (batch, hidden), &Device::Cpu)?.to_dtype(cfg.dtype)?;
+        let w = Tensor::from_vec(w_data.clone(), (hidden,), &Device::Cpu)?.to_dtype(cfg.dtype)?;
         let norm = prelude_core::models::commons::linear::RmsNorm::from_weight(w, eps);
         let y = norm.forward(&x)?.to_dtype(DType::F32)?;
         let ours: Vec<f32> = y.flatten_all()?.to_vec1()?;
@@ -260,11 +261,10 @@ write_outputs(residual=residual, normed=normed)
     let x = Tensor::from_vec(x_data, (1, 4), &Device::Cpu)?;
     let h = Tensor::from_vec(h_data, (1, 4), &Device::Cpu)?;
     let w = Tensor::from_vec(w_data.clone(), (4,), &Device::Cpu)?;
-    let norm = prelude_core::models::commons::linear::RmsNorm::from_weight(w.clone(), 1e-6);
+    let _norm = prelude_core::models::commons::linear::RmsNorm::from_weight(w.clone(), 1e-6);
     let ops = prelude_core::ops::select_ops(&Device::Cpu);
 
-    let (residual, normed) =
-        ops.add_rmsnorm(&x, &h, &w, 1e-6 as f32)?;
+    let (residual, normed) = ops.add_rmsnorm(&x, &h, &w, 1e-6 as f32)?;
 
     common::assert_close(
         &residual.to_vec2::<f32>()?[0],
@@ -325,7 +325,7 @@ write_output(y)
 
     let x = Tensor::from_vec(x_data, (1, 2), &Device::Cpu)?;
     let w = Tensor::from_vec(w_data, (2,), &Device::Cpu)?;
-    let norm = prelude_core::models::commons::linear::RmsNorm::from_weight(w.clone(), 1e-6);
+    let _norm = prelude_core::models::commons::linear::RmsNorm::from_weight(w.clone(), 1e-6);
     let ops = prelude_core::ops::select_ops(&Device::Cpu);
 
     let y = ops.rms_norm(&x, &w, 1e-6 as f32)?;

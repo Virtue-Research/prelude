@@ -74,9 +74,13 @@ mod tests {
     struct AllowAll;
     impl GrammarMatcher for AllowAll {
         fn fill_bitmask(&self, _bitmask: &mut Tensor, _batch_index: usize) {}
-        fn accept_token(&mut self, _token_id: u32) -> bool { true }
+        fn accept_token(&mut self, _token_id: u32) -> bool {
+            true
+        }
         fn rollback(&mut self, _k: usize) {}
-        fn is_terminated(&self) -> bool { false }
+        fn is_terminated(&self) -> bool {
+            false
+        }
         fn reset(&mut self) {}
     }
 

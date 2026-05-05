@@ -95,14 +95,7 @@ pub trait Backend: Send + Sync {
 
 pub trait SimpleBackend: Send + Sync {
     /// Retrieve a tensor based on a target name and shape.
-    fn get(
-        &self,
-        s: Shape,
-        name: &str,
-        h: Init,
-        dtype: DType,
-        dev: &Device,
-    ) -> Result<Tensor>;
+    fn get(&self, s: Shape, name: &str, h: Init, dtype: DType, dev: &Device) -> Result<Tensor>;
 
     /// Retrieve a tensor based on the name.
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor>;
@@ -305,14 +298,7 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
 struct Zeros;
 
 impl SimpleBackend for Zeros {
-    fn get(
-        &self,
-        s: Shape,
-        _: &str,
-        _: Init,
-        dtype: DType,
-        dev: &Device,
-    ) -> Result<Tensor> {
+    fn get(&self, s: Shape, _: &str, _: Init, dtype: DType, dev: &Device) -> Result<Tensor> {
         Tensor::zeros(s, dtype, dev)
     }
 
@@ -328,14 +314,7 @@ impl SimpleBackend for Zeros {
 }
 
 impl SimpleBackend for HashMap<String, Tensor> {
-    fn get(
-        &self,
-        s: Shape,
-        name: &str,
-        _: Init,
-        dtype: DType,
-        dev: &Device,
-    ) -> Result<Tensor> {
+    fn get(&self, s: Shape, name: &str, _: Init, dtype: DType, dev: &Device) -> Result<Tensor> {
         let tensor = self
             .get(name)
             .ok_or_else(|| {
@@ -375,14 +354,7 @@ impl SimpleBackend for HashMap<String, Tensor> {
 }
 
 impl SimpleBackend for crate::tensor::safetensors::MmapedSafetensors {
-    fn get(
-        &self,
-        s: Shape,
-        name: &str,
-        _: Init,
-        dtype: DType,
-        dev: &Device,
-    ) -> Result<Tensor> {
+    fn get(&self, s: Shape, name: &str, _: Init, dtype: DType, dev: &Device) -> Result<Tensor> {
         let tensor = self.load(name, dev)?.to_dtype(dtype)?;
         if tensor.shape() != &s {
             Err(crate::tensor::Error::UnexpectedShape {
@@ -405,14 +377,7 @@ impl SimpleBackend for crate::tensor::safetensors::MmapedSafetensors {
 }
 
 impl SimpleBackend for crate::tensor::safetensors::BufferedSafetensors {
-    fn get(
-        &self,
-        s: Shape,
-        name: &str,
-        _: Init,
-        dtype: DType,
-        dev: &Device,
-    ) -> Result<Tensor> {
+    fn get(&self, s: Shape, name: &str, _: Init, dtype: DType, dev: &Device) -> Result<Tensor> {
         let tensor = self.load(name, dev)?.to_dtype(dtype)?;
         if tensor.shape() != &s {
             Err(crate::tensor::Error::UnexpectedShape {
@@ -539,14 +504,7 @@ pub struct Rename<'a, R: Renamer> {
 }
 
 impl<R: Renamer + Sync + Send> SimpleBackend for Rename<'_, R> {
-    fn get(
-        &self,
-        s: Shape,
-        name: &str,
-        h: Init,
-        dtype: DType,
-        dev: &Device,
-    ) -> Result<Tensor> {
+    fn get(&self, s: Shape, name: &str, h: Init, dtype: DType, dev: &Device) -> Result<Tensor> {
         let name = self.renamer.rename(name);
         self.inner
             .get_with_hints_dtype(s, &name, h, dtype)?
@@ -575,4 +533,3 @@ impl Renamer for Box<dyn Fn(&str) -> String + Sync + Send> {
         std::borrow::Cow::Owned(self(v))
     }
 }
-

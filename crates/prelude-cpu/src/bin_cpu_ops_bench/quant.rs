@@ -318,9 +318,7 @@ pub fn bench_matmul(m: usize, k: usize, n: usize, warmup: usize, repeats: usize)
     }
 
     let w_mb = (n * k * 4) as f64 / 1e6;
-    print!(
-        "  M={m:>4} K={k:>5} N={n:>5}  F32={f32_us:>8.0}us({w_mb:.1}MB)  Q4_0={q4_0_us:>8.0}us"
-    );
+    print!("  M={m:>4} K={k:>5} N={n:>5}  F32={f32_us:>8.0}us({w_mb:.1}MB)  Q4_0={q4_0_us:>8.0}us");
     for (name, us) in &kquant_results {
         print!("  {name}={us:>8.0}us");
     }
@@ -336,8 +334,13 @@ pub fn bench_matmul(m: usize, k: usize, n: usize, warmup: usize, repeats: usize)
 /// K-quant matmul benchmark helpers — one per dtype to avoid generics + GgmlDType.
 
 fn bench_matmul_kquant_q2k(
-    x_data: &[f32], w_data: &[f32], m: usize, n: usize, k: usize,
-    warmup: usize, repeats: usize,
+    x_data: &[f32],
+    w_data: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    warmup: usize,
+    repeats: usize,
 ) -> f64 {
     let mut w_blocks = Vec::new();
     for j in 0..n {
@@ -358,8 +361,13 @@ fn bench_matmul_kquant_q2k(
 }
 
 fn bench_matmul_kquant_q3k(
-    x_data: &[f32], w_data: &[f32], m: usize, n: usize, k: usize,
-    warmup: usize, repeats: usize,
+    x_data: &[f32],
+    w_data: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    warmup: usize,
+    repeats: usize,
 ) -> f64 {
     let mut w_blocks = Vec::new();
     for j in 0..n {
@@ -380,8 +388,13 @@ fn bench_matmul_kquant_q3k(
 }
 
 fn bench_matmul_kquant_q4k(
-    x_data: &[f32], w_data: &[f32], m: usize, n: usize, k: usize,
-    warmup: usize, repeats: usize,
+    x_data: &[f32],
+    w_data: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    warmup: usize,
+    repeats: usize,
 ) -> f64 {
     let mut w_blocks = Vec::new();
     for j in 0..n {
@@ -402,8 +415,13 @@ fn bench_matmul_kquant_q4k(
 }
 
 fn bench_matmul_kquant_q5k(
-    x_data: &[f32], w_data: &[f32], m: usize, n: usize, k: usize,
-    warmup: usize, repeats: usize,
+    x_data: &[f32],
+    w_data: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    warmup: usize,
+    repeats: usize,
 ) -> f64 {
     let mut w_blocks = Vec::new();
     for j in 0..n {
@@ -424,8 +442,13 @@ fn bench_matmul_kquant_q5k(
 }
 
 fn bench_matmul_kquant_q6k(
-    x_data: &[f32], w_data: &[f32], m: usize, n: usize, k: usize,
-    warmup: usize, repeats: usize,
+    x_data: &[f32],
+    w_data: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    warmup: usize,
+    repeats: usize,
 ) -> f64 {
     let mut w_blocks = Vec::new();
     for j in 0..n {

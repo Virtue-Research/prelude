@@ -1,5 +1,5 @@
-use crate::tensor::Device;
 use crate::loading::var_builder::VarBuilder;
+use crate::tensor::Device;
 use serde::de::DeserializeOwned;
 
 use crate::cache::deltanet_pool::DeltaNetPoolConfig;
@@ -63,7 +63,8 @@ pub(crate) trait ArchSpec: Sync {
         _device: &Device,
     ) -> Result<GgufLoadResult, EngineError> {
         Err(EngineError::Unavailable(format!(
-            "GGUF loading not supported for architecture '{}'", self.name()
+            "GGUF loading not supported for architecture '{}'",
+            self.name()
         )))
     }
 }
@@ -209,7 +210,10 @@ mod tests {
         // architecture" error instead of the clearer "unsupported GGUF
         // architecture" from the registry-not-found path.
         let spec = find_arch_spec_by_gguf_arch("qwen3");
-        assert!(spec.is_none(), "qwen3 GGUF must not be registered until a loader exists");
+        assert!(
+            spec.is_none(),
+            "qwen3 GGUF must not be registered until a loader exists"
+        );
     }
 
     #[test]
@@ -222,7 +226,10 @@ mod tests {
     #[test]
     fn find_gguf_arch_qwen35moe() {
         let spec = find_arch_spec_by_gguf_arch("qwen35moe");
-        assert!(spec.is_some(), "qwen35moe should be registered as a GGUF arch");
+        assert!(
+            spec.is_some(),
+            "qwen35moe should be registered as a GGUF arch"
+        );
         assert_eq!(spec.unwrap().name(), "qwen3_5");
     }
 

@@ -1,8 +1,8 @@
-use prelude_core::tensor::{DType, Device, Result, Tensor};
 use half::bf16;
+use prelude_core::tensor::{DType, Device, Result, Tensor};
 use std::time::Instant;
 
-use super::{print_result, BenchResult};
+use super::{BenchResult, print_result};
 
 pub fn bench(dim: usize, batch: usize, warmup: usize, repeats: usize) -> Result<()> {
     let device = Device::Cpu;
@@ -38,6 +38,15 @@ pub fn bench(dim: usize, batch: usize, warmup: usize, repeats: usize) -> Result<
 
     let sgl_us: Option<f64> = None;
 
-    print_result("silu_mul ", dim, batch, &BenchResult { cpu_ops_us, naive_us, sgl_us });
+    print_result(
+        "silu_mul ",
+        dim,
+        batch,
+        &BenchResult {
+            cpu_ops_us,
+            naive_us,
+            sgl_us,
+        },
+    );
     Ok(())
 }

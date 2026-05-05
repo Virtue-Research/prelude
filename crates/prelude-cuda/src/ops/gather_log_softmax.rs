@@ -11,7 +11,6 @@
 //! `crates/prelude-cuda/src/kernels/kernels_src/logprobs/gather_log_softmax.cu`
 //! for the kernel.
 
-use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::WrapErr;
 use candle_core::{DType, Device, Result, Shape, Tensor};
 use cudarc::driver::{LaunchConfig, PushKernelArg};

@@ -3,7 +3,10 @@ use super::*;
 /// Verify prefill attention precision against naive F32 reference (strict SGLang tolerance).
 /// Uses sequential path to isolate precision from GemmPool scheduling.
 fn verify_prefill_precision(
-    num_heads: usize, num_kv_heads: usize, head_dim: usize, seq_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
     label: &str,
 ) {
     let sm_scale = 1.0 / (head_dim as f32).sqrt();
@@ -13,14 +16,27 @@ fn verify_prefill_precision(
     let mut k_data = vec![0u16; seq_len * num_kv_heads * head_dim];
     let mut v_data = vec![0u16; seq_len * num_kv_heads * head_dim];
 
-    for i in 0..q_data.len() { q_data[i] = to_bf16(((i as f32 * 0.007) - 0.5).sin()); }
-    for i in 0..k_data.len() { k_data[i] = to_bf16(((i as f32 * 0.013) + 0.2).cos()); }
-    for i in 0..v_data.len() { v_data[i] = to_bf16(((i as f32 * 0.017) - 0.3).sin()); }
+    for i in 0..q_data.len() {
+        q_data[i] = to_bf16(((i as f32 * 0.007) - 0.5).sin());
+    }
+    for i in 0..k_data.len() {
+        k_data[i] = to_bf16(((i as f32 * 0.013) + 0.2).cos());
+    }
+    for i in 0..v_data.len() {
+        v_data[i] = to_bf16(((i as f32 * 0.017) - 0.3).sin());
+    }
 
     let mut output = vec![0u16; seq_len * num_heads * head_dim];
     prefill_sequential(
-        &mut output, &q_data, &k_data, &v_data,
-        &[seq_len], num_heads, num_kv_heads, head_dim, sm_scale,
+        &mut output,
+        &q_data,
+        &k_data,
+        &v_data,
+        &[seq_len],
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        sm_scale,
     );
 
     let t = seq_len - 1;
@@ -32,24 +48,33 @@ fn verify_prefill_precision(
         let ks: Vec<Vec<f32>> = (0..seq_len)
             .map(|j| {
                 (0..head_dim)
-                    .map(|d| from_bf16(k_data[j * num_kv_heads * head_dim + kv_head * head_dim + d]))
+                    .map(|d| {
+                        from_bf16(k_data[j * num_kv_heads * head_dim + kv_head * head_dim + d])
+                    })
                     .collect()
             })
             .collect();
         let vs: Vec<Vec<f32>> = (0..seq_len)
             .map(|j| {
                 (0..head_dim)
-                    .map(|d| from_bf16(v_data[j * num_kv_heads * head_dim + kv_head * head_dim + d]))
+                    .map(|d| {
+                        from_bf16(v_data[j * num_kv_heads * head_dim + kv_head * head_dim + d])
+                    })
                     .collect()
             })
             .collect();
 
         let expected = naive_attention(&q_f32, &ks, &vs, sm_scale);
         let o_off = t * num_heads * head_dim + head * head_dim;
-        let actual: Vec<f32> = (0..head_dim).map(|d| from_bf16(output[o_off + d])).collect();
+        let actual: Vec<f32> = (0..head_dim)
+            .map(|d| from_bf16(output[o_off + d]))
+            .collect();
 
         for (d, &val) in actual.iter().enumerate() {
-            assert!(val.is_finite(), "{label} head={head} output[{d}] not finite: {val}");
+            assert!(
+                val.is_finite(),
+                "{label} head={head} output[{d}] not finite: {val}"
+            );
         }
         let violation = max_sglang_violation(&actual, &expected);
         assert!(
@@ -61,7 +86,10 @@ fn verify_prefill_precision(
 
 /// Verify decode attention against naive F32 reference.
 fn verify_decode_config_strict(
-    num_heads: usize, num_kv_heads: usize, head_dim: usize, cache_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    cache_len: usize,
     label: &str,
 ) {
     let sm_scale = 1.0 / (head_dim as f32).sqrt();
@@ -84,9 +112,18 @@ fn verify_decode_config_strict(
     let mut output = vec![0u16; num_seqs * num_heads * head_dim];
 
     decode_sequential(
-        &mut output, &q_data, &k_cache, &v_cache,
-        &req_to_token, &seq_lens, num_seqs, max_context_len,
-        num_heads, num_kv_heads, head_dim, sm_scale,
+        &mut output,
+        &q_data,
+        &k_cache,
+        &v_cache,
+        &req_to_token,
+        &seq_lens,
+        num_seqs,
+        max_context_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        sm_scale,
     );
 
     for head in [0, num_heads / 2, num_heads - 1] {
@@ -97,24 +134,33 @@ fn verify_decode_config_strict(
         let ks: Vec<Vec<f32>> = (0..cache_len)
             .map(|j| {
                 (0..head_dim)
-                    .map(|d| from_bf16(k_cache[j * num_kv_heads * head_dim + kv_head * head_dim + d]))
+                    .map(|d| {
+                        from_bf16(k_cache[j * num_kv_heads * head_dim + kv_head * head_dim + d])
+                    })
                     .collect()
             })
             .collect();
         let vs: Vec<Vec<f32>> = (0..cache_len)
             .map(|j| {
                 (0..head_dim)
-                    .map(|d| from_bf16(v_cache[j * num_kv_heads * head_dim + kv_head * head_dim + d]))
+                    .map(|d| {
+                        from_bf16(v_cache[j * num_kv_heads * head_dim + kv_head * head_dim + d])
+                    })
                     .collect()
             })
             .collect();
 
         let expected = naive_attention(&q_f32, &ks, &vs, sm_scale);
         let o_off = head * head_dim;
-        let actual: Vec<f32> = (0..head_dim).map(|d| from_bf16(output[o_off + d])).collect();
+        let actual: Vec<f32> = (0..head_dim)
+            .map(|d| from_bf16(output[o_off + d]))
+            .collect();
 
         for (d, &val) in actual.iter().enumerate() {
-            assert!(val.is_finite(), "{label} head={head} output[{d}] not finite: {val}");
+            assert!(
+                val.is_finite(),
+                "{label} head={head} output[{d}] not finite: {val}"
+            );
         }
         let violation = max_sglang_violation(&actual, &expected);
         assert!(
@@ -151,22 +197,42 @@ fn test_prefill_gemmpool_vs_sequential() {
     let mut q_data = vec![0u16; seq_len * num_heads * head_dim];
     let mut k_data = vec![0u16; seq_len * num_kv_heads * head_dim];
     let mut v_data = vec![0u16; seq_len * num_kv_heads * head_dim];
-    for i in 0..q_data.len() { q_data[i] = to_bf16(((i as f32 * 0.007) - 0.5).sin()); }
-    for i in 0..k_data.len() { k_data[i] = to_bf16(((i as f32 * 0.013) + 0.2).cos()); }
-    for i in 0..v_data.len() { v_data[i] = to_bf16(((i as f32 * 0.017) - 0.3).sin()); }
+    for i in 0..q_data.len() {
+        q_data[i] = to_bf16(((i as f32 * 0.007) - 0.5).sin());
+    }
+    for i in 0..k_data.len() {
+        k_data[i] = to_bf16(((i as f32 * 0.013) + 0.2).cos());
+    }
+    for i in 0..v_data.len() {
+        v_data[i] = to_bf16(((i as f32 * 0.017) - 0.3).sin());
+    }
 
     // GemmPool path (public API)
     let mut output_pool = vec![0u16; seq_len * num_heads * head_dim];
     prefill_attention_bf16(
-        &mut output_pool, &q_data, &k_data, &v_data,
-        &[seq_len], num_heads, num_kv_heads, head_dim, sm_scale,
+        &mut output_pool,
+        &q_data,
+        &k_data,
+        &v_data,
+        &[seq_len],
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        sm_scale,
     );
 
     // Sequential path (same auto-detected caps)
     let mut output_seq = vec![0u16; seq_len * num_heads * head_dim];
     prefill_sequential(
-        &mut output_seq, &q_data, &k_data, &v_data,
-        &[seq_len], num_heads, num_kv_heads, head_dim, sm_scale,
+        &mut output_seq,
+        &q_data,
+        &k_data,
+        &v_data,
+        &[seq_len],
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        sm_scale,
     );
 
     // These MUST be identical (same backend, same data, same algorithm)
@@ -182,28 +248,48 @@ fn test_prefill_gemmpool_vs_sequential() {
         .map(|d| from_bf16(q_data[t * num_heads * head_dim + head * head_dim + d]))
         .collect();
     let ks: Vec<Vec<f32>> = (0..seq_len)
-        .map(|j| (0..head_dim)
-            .map(|d| from_bf16(k_data[j * num_kv_heads * head_dim + kv_head * head_dim + d]))
-            .collect())
+        .map(|j| {
+            (0..head_dim)
+                .map(|d| from_bf16(k_data[j * num_kv_heads * head_dim + kv_head * head_dim + d]))
+                .collect()
+        })
         .collect();
     let vs: Vec<Vec<f32>> = (0..seq_len)
-        .map(|j| (0..head_dim)
-            .map(|d| from_bf16(v_data[j * num_kv_heads * head_dim + kv_head * head_dim + d]))
-            .collect())
+        .map(|j| {
+            (0..head_dim)
+                .map(|d| from_bf16(v_data[j * num_kv_heads * head_dim + kv_head * head_dim + d]))
+                .collect()
+        })
         .collect();
     let expected = naive_attention(&q_f32, &ks, &vs, sm_scale);
     let o_off = t * num_heads * head_dim + head * head_dim;
 
-    let pool_head0: Vec<f32> = (0..head_dim).map(|d| from_bf16(output_pool[o_off + d])).collect();
-    let seq_head0: Vec<f32> = (0..head_dim).map(|d| from_bf16(output_seq[o_off + d])).collect();
+    let pool_head0: Vec<f32> = (0..head_dim)
+        .map(|d| from_bf16(output_pool[o_off + d]))
+        .collect();
+    let seq_head0: Vec<f32> = (0..head_dim)
+        .map(|d| from_bf16(output_seq[o_off + d]))
+        .collect();
     let pool_vs_naive = max_sglang_violation(&pool_head0, &expected);
     let seq_vs_naive = max_sglang_violation(&seq_head0, &expected);
 
-    eprintln!("[debug] amx={} pool_vs_seq={pool_vs_seq:.6} pool_vs_naive={pool_vs_naive:.6} seq_vs_naive={seq_vs_naive:.6}", CAPS.amx);
+    eprintln!(
+        "[debug] amx={} pool_vs_seq={pool_vs_seq:.6} pool_vs_naive={pool_vs_naive:.6} seq_vs_naive={seq_vs_naive:.6}",
+        CAPS.amx
+    );
 
-    assert!(pool_vs_seq <= 0.0, "GemmPool vs sequential: {pool_vs_seq:.6}");
-    assert!(pool_vs_naive <= 0.0, "GemmPool vs naive: {pool_vs_naive:.6}");
-    assert!(seq_vs_naive <= 0.0, "Sequential vs naive: {seq_vs_naive:.6}");
+    assert!(
+        pool_vs_seq <= 0.0,
+        "GemmPool vs sequential: {pool_vs_seq:.6}"
+    );
+    assert!(
+        pool_vs_naive <= 0.0,
+        "GemmPool vs naive: {pool_vs_naive:.6}"
+    );
+    assert!(
+        seq_vs_naive <= 0.0,
+        "Sequential vs naive: {seq_vs_naive:.6}"
+    );
 }
 
 /// AMX precision: only runs when oneDNN AMX is available.
@@ -211,6 +297,8 @@ fn test_prefill_gemmpool_vs_sequential() {
 /// auto-detected path on AMX-capable machines.
 #[test]
 fn test_prefill_amx_precision() {
-    if !CAPS.amx { return; }
+    if !CAPS.amx {
+        return;
+    }
     verify_prefill_precision(16, 8, 128, 32, "amx D=128 slen=32");
 }

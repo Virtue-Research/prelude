@@ -21,21 +21,9 @@ pub const PTX_KNORM_ROPE_KV_WRITE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/knorm_rope_kv_write.ptx"));
 pub const PTX_SCATTER_KV_CACHE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/scatter_kv_cache.ptx"));
-pub const PTX_GDN_POST_CONV: &str =
-    include_str!(concat!(env!("OUT_DIR"), "/gdn_post_conv.ptx"));
+pub const PTX_GDN_POST_CONV: &str = include_str!(concat!(env!("OUT_DIR"), "/gdn_post_conv.ptx"));
 pub const PTX_GATHER_LOG_SOFTMAX: &str =
     include_str!(concat!(env!("OUT_DIR"), "/gather_log_softmax.ptx"));
-
-// ── General-purpose PTX kernels (ported from candle-kernels) ────
-pub const PTX_UNARY: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_unary.ptx"));
-pub const PTX_BINARY: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_binary.ptx"));
-pub const PTX_CAST: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_cast.ptx"));
-pub const PTX_REDUCE: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_reduce.ptx"));
-pub const PTX_INDEXING: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_indexing.ptx"));
-pub const PTX_TERNARY: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_ternary.ptx"));
-pub const PTX_AFFINE: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_affine.ptx"));
-pub const PTX_FILL: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_fill.ptx"));
-pub const PTX_SORT: &str = include_str!(concat!(env!("OUT_DIR"), "/candle_sort.ptx"));
 
 // ── Module names for cudarc caching ─────────────────────────────────
 
@@ -51,17 +39,6 @@ pub const MOD_KNORM_ROPE_KV_WRITE: &str = "kvcache_knorm_rope_kv_write";
 pub const MOD_SCATTER_KV_CACHE: &str = "kvcache_scatter_kv_cache";
 pub const MOD_GDN_POST_CONV: &str = "gdn_post_conv";
 pub const MOD_GATHER_LOG_SOFTMAX: &str = "logprobs_gather_log_softmax";
-
-// ── General-purpose module names ────────────────────────────────
-pub const MOD_UNARY: &str = "candle_unary";
-pub const MOD_BINARY: &str = "candle_binary";
-pub const MOD_CAST: &str = "candle_cast";
-pub const MOD_REDUCE: &str = "candle_reduce";
-pub const MOD_INDEXING: &str = "candle_indexing";
-pub const MOD_TERNARY: &str = "candle_ternary";
-pub const MOD_AFFINE: &str = "candle_affine";
-pub const MOD_FILL: &str = "candle_fill";
-pub const MOD_SORT: &str = "candle_sort";
 
 /// Probe whether CUDA is usable on this machine.
 /// Creates a context for device 0; the context is cached for later use.
@@ -98,20 +75,20 @@ pub fn register() {
 // ── Own CUDA storage ─────────────────
 
 pub mod device;
-pub(crate) mod tensor_ops_kernels;
 
 // ── GPU kernel modules ──────────────────────────────────────────────
 
-pub(crate) mod ops;
 pub(crate) mod attn;
-pub(crate) mod moe_ffi;
-mod cuda_ops;
 mod cuda_graph;
-mod quant_backends;
+mod cuda_ops;
 pub mod executor;
+pub(crate) mod moe_ffi;
+pub(crate) mod ops;
+#[cfg(feature = "quant-gemm")]
+mod quant_backends;
 
-pub use cuda_ops::cuda_ops;
 pub use attn::flashinfer::fi_fused_add_rmsnorm;
+pub use cuda_ops::cuda_ops;
 
 // ── Sub-crate re-exports ────────────────────────────────────────────
 
@@ -120,4 +97,5 @@ pub use cutlass_gemm;
 pub use deepgemm;
 pub use flash_attn_v4;
 pub use flashinfer;
+#[cfg(feature = "quant-gemm")]
 pub use quant_gemm;

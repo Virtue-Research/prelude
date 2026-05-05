@@ -46,9 +46,9 @@ fn dot_bf16_bf16_dpbf16ps(a: *const u16, b: *const u16, len: usize) -> f32 {
 /// into the original tensor layout.
 #[target_feature(enable = "avx512f,avx512bf16")]
 pub(super) fn micro_gemm_qk_bf16(
-    q: *const u16,       // [m_size rows, each `q_stride` elements apart]
-    k: *const u16,       // [n_size rows, each `k_stride` elements apart]
-    scores: *mut f32,    // output: [m_size * score_stride]
+    q: *const u16,    // [m_size rows, each `q_stride` elements apart]
+    k: *const u16,    // [n_size rows, each `k_stride` elements apart]
+    scores: *mut f32, // output: [m_size * score_stride]
     m_size: usize,
     n_size: usize,
     dim: usize,
@@ -74,7 +74,8 @@ pub(super) fn micro_gemm_qk_bf16(
                 let q2 = unsafe { _mm512_loadu_si512(q.add((i + 2) * q_stride + off) as *const _) };
                 let q3 = unsafe { _mm512_loadu_si512(q.add((i + 3) * q_stride + off) as *const _) };
                 for kk in 0..4 {
-                    let kv = unsafe { _mm512_loadu_si512(k.add((j + kk) * k_stride + off) as *const _) };
+                    let kv =
+                        unsafe { _mm512_loadu_si512(k.add((j + kk) * k_stride + off) as *const _) };
                     let kb = kv.as_bf16();
                     acc[0][kk] = _mm512_dpbf16_ps(acc[0][kk], q0.as_bf16(), kb);
                     acc[1][kk] = _mm512_dpbf16_ps(acc[1][kk], q1.as_bf16(), kb);
@@ -87,8 +88,10 @@ pub(super) fn micro_gemm_qk_bf16(
                 for kk in 0..4 {
                     let mut sum = _mm512_reduce_add_ps(acc[qi][kk]);
                     for r in (chunks * 32)..dim {
-                        sum += unsafe { bf16_to_f32(*q.add((i + qi) * q_stride + r))
-                            * bf16_to_f32(*k.add((j + kk) * k_stride + r)) };
+                        sum += unsafe {
+                            bf16_to_f32(*q.add((i + qi) * q_stride + r))
+                                * bf16_to_f32(*k.add((j + kk) * k_stride + r))
+                        };
                     }
                     unsafe { *scores.add((i + qi) * score_stride + j + kk) = sum * sm_scale };
                 }
@@ -101,14 +104,17 @@ pub(super) fn micro_gemm_qk_bf16(
                 let mut acc = _mm512_setzero_ps();
                 for c in 0..chunks {
                     let off = c * 32;
-                    let qv = unsafe { _mm512_loadu_si512(q.add((i + qi) * q_stride + off) as *const _) };
+                    let qv =
+                        unsafe { _mm512_loadu_si512(q.add((i + qi) * q_stride + off) as *const _) };
                     let kv = unsafe { _mm512_loadu_si512(k.add(j * k_stride + off) as *const _) };
                     acc = _mm512_dpbf16_ps(acc, qv.as_bf16(), kv.as_bf16());
                 }
                 let mut sum = _mm512_reduce_add_ps(acc);
                 for r in (chunks * 32)..dim {
-                    sum += unsafe { bf16_to_f32(*q.add((i + qi) * q_stride + r))
-                        * bf16_to_f32(*k.add(j * k_stride + r)) };
+                    sum += unsafe {
+                        bf16_to_f32(*q.add((i + qi) * q_stride + r))
+                            * bf16_to_f32(*k.add(j * k_stride + r))
+                    };
                 }
                 unsafe { *scores.add((i + qi) * score_stride + j) = sum * sm_scale };
             }
@@ -128,8 +134,9 @@ pub(super) fn micro_gemm_qk_bf16(
             }
             let mut sum = _mm512_reduce_add_ps(acc);
             for r in (chunks * 32)..dim {
-                sum += unsafe { bf16_to_f32(*q.add(i * q_stride + r))
-                    * bf16_to_f32(*k.add(j * k_stride + r)) };
+                sum += unsafe {
+                    bf16_to_f32(*q.add(i * q_stride + r)) * bf16_to_f32(*k.add(j * k_stride + r))
+                };
             }
             unsafe { *scores.add(i * score_stride + j) = sum * sm_scale };
         }
@@ -146,41 +153,5 @@ impl AsBf16 for core::arch::x86_64::__m512i {
     #[inline(always)]
     fn as_bf16(self) -> core::arch::x86_64::__m512bh {
         unsafe { std::mem::transmute(self) }
-    }
-}
-
-/// acc[d] += w * src_bf16[d] — weighted accumulation from BF16 source into F32 accumulator.
-/// Uses dpbf16ps when available: broadcasts w as BF16 pair, multiplies with src.
-#[inline]
-pub(super) fn fma_bf16_f32_native(acc: &mut [f32], src: &[u16], w: f32, len: usize) {
-    if is_x86_feature_detected!("avx512bf16") {
-        unsafe {
-            fma_bf16_f32_dpbf16ps(acc.as_mut_ptr(), src.as_ptr(), w, len);
-        }
-        return;
-    }
-    // Fallback: convert + fma
-    for d in 0..len {
-        acc[d] += w * bf16_to_f32(src[d]);
-    }
-}
-
-/// AVX-512 BF16: acc[d] += w * src_bf16[d] using dpbf16ps.
-/// We can't directly use dpbf16ps for scalar×vector, so we convert src to f32 and use fmadd.
-/// But we still benefit from the faster bf16 load path (32 elements at a time via bf16x16_load_as_f32).
-#[target_feature(enable = "avx512f,avx512bw")]
-fn fma_bf16_f32_dpbf16ps(acc: *mut f32, src: *const u16, w: f32, len: usize) {
-    use core::arch::x86_64::*;
-    let vw = _mm512_set1_ps(w);
-    let chunks = len / 16;
-    for i in 0..chunks {
-        let off = i * 16;
-        let v_src = super::common::bf16x16_load_as_f32(unsafe { src.add(off) });
-        let v_acc = unsafe { _mm512_loadu_ps(acc.add(off)) };
-        let v_res = _mm512_fmadd_ps(vw, v_src, v_acc);
-        unsafe { _mm512_storeu_ps(acc.add(off), v_res) };
-    }
-    for d in (chunks * 16)..len {
-        unsafe { *acc.add(d) += w * bf16_to_f32(*src.add(d)) };
     }
 }

@@ -1,5 +1,5 @@
-use prelude_core::tensor::{Device, Result, Tensor};
 use half::bf16;
+use prelude_core::tensor::{Device, Result, Tensor};
 use std::time::Instant;
 
 fn build_cos_sin_cache(max_pos: usize, rotary_dim: usize) -> Vec<bf16> {
@@ -11,7 +11,11 @@ fn build_cos_sin_cache(max_pos: usize, rotary_dim: usize) -> Vec<bf16> {
             let i = if j < embed_dim { j } else { j - embed_dim };
             let freq = 1.0 / (1_000_000.0f64).powf(2.0 * i as f64 / rotary_dim as f64);
             let theta = pos as f64 * freq;
-            let val = if j < embed_dim { theta.cos() } else { theta.sin() };
+            let val = if j < embed_dim {
+                theta.cos()
+            } else {
+                theta.sin()
+            };
             bf16::from_f64(val)
         })
         .collect()
@@ -45,15 +49,45 @@ pub fn bench(
 
     // cpu_ops
     for _ in 0..warmup {
-        let q = Tensor::from_vec(q_data.clone(), (batch, seq_len, num_heads, head_dim), &device)?;
-        let k = Tensor::from_vec(k_data.clone(), (batch, seq_len, num_kv_heads, head_dim), &device)?;
-        let _ = prelude_cpu::ops::cpu_rotary_embedding(&q, &k, &cos_sin_cache, offset, num_heads, num_kv_heads)?;
+        let q = Tensor::from_vec(
+            q_data.clone(),
+            (batch, seq_len, num_heads, head_dim),
+            &device,
+        )?;
+        let k = Tensor::from_vec(
+            k_data.clone(),
+            (batch, seq_len, num_kv_heads, head_dim),
+            &device,
+        )?;
+        let _ = prelude_cpu::ops::cpu_rotary_embedding(
+            &q,
+            &k,
+            &cos_sin_cache,
+            offset,
+            num_heads,
+            num_kv_heads,
+        )?;
     }
     let start = Instant::now();
     for _ in 0..repeats {
-        let q = Tensor::from_vec(q_data.clone(), (batch, seq_len, num_heads, head_dim), &device)?;
-        let k = Tensor::from_vec(k_data.clone(), (batch, seq_len, num_kv_heads, head_dim), &device)?;
-        let _ = prelude_cpu::ops::cpu_rotary_embedding(&q, &k, &cos_sin_cache, offset, num_heads, num_kv_heads)?;
+        let q = Tensor::from_vec(
+            q_data.clone(),
+            (batch, seq_len, num_heads, head_dim),
+            &device,
+        )?;
+        let k = Tensor::from_vec(
+            k_data.clone(),
+            (batch, seq_len, num_kv_heads, head_dim),
+            &device,
+        )?;
+        let _ = prelude_cpu::ops::cpu_rotary_embedding(
+            &q,
+            &k,
+            &cos_sin_cache,
+            offset,
+            num_heads,
+            num_kv_heads,
+        )?;
     }
     let cpu_ops_us = start.elapsed().as_nanos() as f64 / repeats as f64 / 1000.0;
 

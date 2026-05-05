@@ -38,7 +38,14 @@ impl CacheManager {
         };
 
         let (paged_pool, block_manager) = if runtime_caps.supports_paged_attn {
-            Self::init_paged_pool(model_config, dtype, device, cache_config, kv_sharing, peak_activation_bytes)?
+            Self::init_paged_pool(
+                model_config,
+                dtype,
+                device,
+                cache_config,
+                kv_sharing,
+                peak_activation_bytes,
+            )?
         } else {
             (None, None)
         };
@@ -68,7 +75,9 @@ impl CacheManager {
     }
 
     /// Get a shared reference to the block manager (for giving to the Scheduler).
-    pub fn block_manager_arc(&self) -> Option<Arc<Mutex<crate::cache::block_manager::BlockManager>>> {
+    pub fn block_manager_arc(
+        &self,
+    ) -> Option<Arc<Mutex<crate::cache::block_manager::BlockManager>>> {
         self.block_manager.clone()
     }
 
@@ -133,13 +142,15 @@ impl CacheManager {
             if paged_block_size != hint {
                 let old = paged_block_size;
                 paged_block_size = hint;
-                info!(old_block_size = old, new_block_size = paged_block_size, head_dim,
-                    "auto-adjusted paged_block_size per device backend hint");
+                info!(
+                    old_block_size = old,
+                    new_block_size = paged_block_size,
+                    head_dim,
+                    "auto-adjusted paged_block_size per device backend hint"
+                );
             }
         }
         let num_layers = config.num_hidden_layers;
-        let x = 16 / dtype.size_in_bytes(); // vectorization factor (8 for BF16, 16 for F16)
-
         // KV sharing: count only layers that need independent cache allocations.
         let num_shared = kv_sharing.iter().filter(|s| s.is_some()).count();
         let num_physical_kv_layers = num_layers - num_shared;
@@ -159,13 +170,8 @@ impl CacheManager {
         let paged_blocks = if cache_config.paged_attn_blocks > 0 {
             cache_config.paged_attn_blocks
         } else {
-            let bytes_per_block_per_layer = {
-                let v1 = 2 * num_kv_heads * head_dim * paged_block_size * dtype.size_in_bytes();
-                let flash = if device.is_cuda() {
-                    2 * num_kv_heads * head_dim * paged_block_size * dtype.size_in_bytes()
-                } else { 0 };
-                v1 + flash
-            };
+            let bytes_per_block_per_layer =
+                { 2 * num_kv_heads * head_dim * paged_block_size * dtype.size_in_bytes() };
             let total_bytes_per_block = bytes_per_block_per_layer * num_physical_kv_layers;
 
             let ops = crate::ops::select_ops(device);
@@ -202,63 +208,59 @@ impl CacheManager {
             auto_blocks
         };
 
-        let tensor_err = |e: crate::tensor::Error| EngineError::Internal(format!("tensor error: {e}"));
+        let tensor_err =
+            |e: crate::tensor::Error| EngineError::Internal(format!("tensor error: {e}"));
 
         // Allocate cache tensors. Shared layers alias their source layer's tensor.
-        let mut key_caches: Vec<Tensor> = Vec::with_capacity(num_layers);
-        let mut value_caches: Vec<Tensor> = Vec::with_capacity(num_layers);
         let mut key_caches_flash: Vec<Tensor> = Vec::with_capacity(num_layers);
         let mut value_caches_flash: Vec<Tensor> = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
-            let source = if i < kv_sharing.len() { kv_sharing[i] } else { None };
+            let source = if i < kv_sharing.len() {
+                kv_sharing[i]
+            } else {
+                None
+            };
             if let Some(src) = source {
                 // Shared layer: alias source layer's cache (Tensor is Arc — clone is pointer copy).
-                key_caches.push(key_caches[src].clone());
-                value_caches.push(value_caches[src].clone());
                 key_caches_flash.push(key_caches_flash[src].clone());
                 value_caches_flash.push(value_caches_flash[src].clone());
             } else {
                 // Independent layer: allocate new cache tensors.
-                key_caches.push(
-                    Tensor::zeros(
-                        (paged_blocks, num_kv_heads, head_dim / x, paged_block_size, x),
-                        dtype, device,
-                    ).map_err(tensor_err)?,
-                );
-                value_caches.push(
-                    Tensor::zeros(
-                        (paged_blocks, num_kv_heads, head_dim, paged_block_size),
-                        dtype, device,
-                    ).map_err(tensor_err)?,
-                );
                 key_caches_flash.push(
                     Tensor::zeros(
                         (paged_blocks, paged_block_size, num_kv_heads, head_dim),
-                        dtype, device,
-                    ).map_err(tensor_err)?,
+                        dtype,
+                        device,
+                    )
+                    .map_err(tensor_err)?,
                 );
                 value_caches_flash.push(
                     Tensor::zeros(
                         (paged_blocks, paged_block_size, num_kv_heads, head_dim),
-                        dtype, device,
-                    ).map_err(tensor_err)?,
+                        dtype,
+                        device,
+                    )
+                    .map_err(tensor_err)?,
                 );
             }
         }
 
         if num_shared > 0 {
-            info!(num_shared, num_physical_kv_layers, "KV cache sharing enabled");
+            info!(
+                num_shared,
+                num_physical_kv_layers, "KV cache sharing enabled"
+            );
         }
         info!(
             num_blocks = paged_blocks,
             block_size = paged_block_size,
-            num_layers, num_kv_heads, head_dim,
+            num_layers,
+            num_kv_heads,
+            head_dim,
             "paged KV cache pool allocated"
         );
 
         let pool = PagedKvPool {
-            key_caches,
-            value_caches,
             key_caches_flash,
             value_caches_flash,
             block_size: paged_block_size,
@@ -296,23 +298,4 @@ impl CacheManager {
 
         Ok(Some(Mutex::new(pool)))
     }
-
-    /// Empty CacheManager — all caches None. For tests that exercise
-    /// build_forward_batch or similar helpers that only need the cache
-    /// references to exist but never allocate against a real pool.
-    #[cfg(test)]
-    pub(crate) fn empty_for_test() -> Self {
-        Self {
-            prefix_cache: None,
-            paged_pool: None,
-            block_manager: None,
-            deltanet_pool: None,
-        }
-    }
-}
-
-/// Query free GPU memory via the registered ops session.
-fn cuda_free_memory(device: &Device) -> Option<usize> {
-    let ops = crate::ops::select_ops(device);
-    ops.gpu_free_memory()
 }

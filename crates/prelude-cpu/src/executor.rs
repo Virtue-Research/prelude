@@ -10,7 +10,9 @@ use prelude_core::engine::{Engine, EngineError};
 
 struct CpuWork {
     batch: ForwardBatch,
-    result_tx: tokio::sync::oneshot::Sender<Result<prelude_core::engine::executor::ModelOutput, EngineError>>,
+    result_tx: tokio::sync::oneshot::Sender<
+        Result<prelude_core::engine::executor::ModelOutput, EngineError>,
+    >,
 }
 
 pub struct CpuExecutor {
@@ -36,15 +38,15 @@ impl CpuExecutor {
                 });
             })
             .expect("spawn CPU executor worker thread");
-        Self { work_tx, _worker: worker }
+        Self {
+            work_tx,
+            _worker: worker,
+        }
     }
 }
 
 impl Executor for CpuExecutor {
-    fn submit(
-        &self,
-        batch: ForwardBatch,
-    ) -> Result<ExecutionHandle, EngineError> {
+    fn submit(&self, batch: ForwardBatch) -> Result<ExecutionHandle, EngineError> {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         self.work_tx
             .send(CpuWork { batch, result_tx })

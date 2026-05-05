@@ -28,7 +28,9 @@ fn main() -> Result<()> {
         None
     };
     let run = |name: &str| -> bool {
-        filter.as_ref().map_or(true, |f| f.iter().any(|&k| name.contains(k)))
+        filter
+            .as_ref()
+            .map_or(true, |f| f.iter().any(|&k| name.contains(k)))
     };
 
     let warmup = 50;
@@ -49,9 +51,21 @@ fn main() -> Result<()> {
     {
         println!(
             "  AVX-512F: {}  AVX-512BW: {}  AVX-512BF16: {}",
-            if is_x86_feature_detected!("avx512f") { "yes" } else { "NO" },
-            if is_x86_feature_detected!("avx512bw") { "yes" } else { "NO" },
-            if is_x86_feature_detected!("avx512bf16") { "yes" } else { "NO" },
+            if is_x86_feature_detected!("avx512f") {
+                "yes"
+            } else {
+                "NO"
+            },
+            if is_x86_feature_detected!("avx512bw") {
+                "yes"
+            } else {
+                "NO"
+            },
+            if is_x86_feature_detected!("avx512bf16") {
+                "yes"
+            } else {
+                "NO"
+            },
         );
     }
 
@@ -69,9 +83,9 @@ fn main() -> Result<()> {
         (16, 8, 128, 2, 1),
         (16, 8, 128, 4, 1),
         (16, 8, 128, 8, 1),
-        (16, 8, 128, 16, 1),   // boundary: small path threshold (old)
+        (16, 8, 128, 16, 1), // boundary: small path threshold (old)
         (16, 8, 128, 32, 1),
-        (16, 8, 128, 64, 1),   // boundary: small path threshold (new)
+        (16, 8, 128, 64, 1), // boundary: small path threshold (new)
         (16, 8, 128, 128, 1),
         (16, 8, 128, 512, 1),
         (16, 8, 128, 1024, 1),
@@ -79,7 +93,7 @@ fn main() -> Result<()> {
         (16, 8, 128, 4096, 1),
         (16, 8, 128, 8192, 1),
         (16, 8, 128, 32, 4),
-        (16, 8, 128, 8, 8),    // batch of short seqs: 8 requests x 8 tokens
+        (16, 8, 128, 8, 8), // batch of short seqs: 8 requests x 8 tokens
         // Qwen3-1.7B: 16 heads, 4 KV heads, 128 dim
         (16, 4, 128, 128, 1),
         (16, 4, 128, 2048, 1),
@@ -111,14 +125,14 @@ fn main() -> Result<()> {
         (16, 896, 4864),
         (32, 896, 4864),
         (64, 896, 4864),
-        (128, 896, 4864),   // boundary: brgemm vs oneDNN packed (new threshold)
+        (128, 896, 4864), // boundary: brgemm vs oneDNN packed (new threshold)
         (256, 896, 4864),
-        (512, 896, 4864),   // well above threshold: should stay on oneDNN packed
+        (512, 896, 4864), // well above threshold: should stay on oneDNN packed
         // 1.7B: hidden=1536, intermediate=8960
         (1, 1536, 8960),
         (16, 1536, 8960),
         (64, 1536, 8960),
-        (128, 1536, 8960),  // boundary: brgemm vs oneDNN packed
+        (128, 1536, 8960), // boundary: brgemm vs oneDNN packed
         // 8B: hidden=3584, intermediate=18944
         (1, 3584, 18944),
         (16, 3584, 18944),
@@ -195,13 +209,25 @@ fn main() -> Result<()> {
         println!("=== Attention (extend/prefill) ===");
         for &(nh, nkv, hd, slen, nseq) in attn_extend_configs {
             // Adaptive repeats: fewer for long sequences (O(n^2) cost)
-            let attn_repeats = if slen >= 4096 { 10 } else if slen >= 1024 { 50 } else { 200 };
+            let attn_repeats = if slen >= 4096 {
+                10
+            } else if slen >= 1024 {
+                50
+            } else {
+                200
+            };
             attention::bench_extend(nh, nkv, hd, slen, nseq, 5, attn_repeats)?;
         }
         println!();
         println!("=== Attention (decode) ===");
         for &(nh, nkv, hd, ctx_len, nseq) in attn_decode_configs {
-            let attn_repeats = if ctx_len >= 4096 { 20 } else if ctx_len >= 1024 { 50 } else { 200 };
+            let attn_repeats = if ctx_len >= 4096 {
+                20
+            } else if ctx_len >= 1024 {
+                50
+            } else {
+                200
+            };
             attention::bench_decode(nh, nkv, hd, ctx_len, nseq, 5, attn_repeats)?;
         }
     }
@@ -226,8 +252,11 @@ fn main() -> Result<()> {
 
         println!("\n=== GEMM post-ops variants (plain / bias / gelu / relu / bias+gelu) ===");
         let postops_configs: &[(usize, usize, usize)] = &[
-            (1, 896, 4864), (16, 896, 4864), (64, 896, 4864),
-            (1, 3584, 18944), (16, 3584, 18944),
+            (1, 896, 4864),
+            (16, 896, 4864),
+            (64, 896, 4864),
+            (1, 3584, 18944),
+            (16, 3584, 18944),
         ];
         for &(m, k, n) in postops_configs {
             gemm::bench_postops_variants(m, k, n, 5, gemm_repeats)?;
@@ -303,7 +332,12 @@ pub(crate) struct AccuracyResult {
 }
 
 /// Compare two tensors using SGLang-style tolerance: |a - b| <= atol + rtol * max(|a|, |b|).
-pub(crate) fn compare_tensors(a: &Tensor, b: &Tensor, atol: f32, rtol: f32) -> Result<AccuracyResult> {
+pub(crate) fn compare_tensors(
+    a: &Tensor,
+    b: &Tensor,
+    atol: f32,
+    rtol: f32,
+) -> Result<AccuracyResult> {
     let a_f32 = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
     let b_f32 = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
     let mut max_abs_err = 0.0f32;
@@ -320,10 +354,22 @@ pub(crate) fn compare_tensors(a: &Tensor, b: &Tensor, atol: f32, rtol: f32) -> R
             fail_count += 1;
         }
     }
-    Ok(AccuracyResult { max_abs_err, max_rel_err, fail_count, total: a_f32.len() })
+    Ok(AccuracyResult {
+        max_abs_err,
+        max_rel_err,
+        fail_count,
+        total: a_f32.len(),
+    })
 }
 
-pub(crate) fn print_accuracy(label: &str, hidden: usize, batch: usize, r: &AccuracyResult, atol: f32, rtol: f32) {
+pub(crate) fn print_accuracy(
+    label: &str,
+    hidden: usize,
+    batch: usize,
+    r: &AccuracyResult,
+    atol: f32,
+    rtol: f32,
+) {
     let status = if r.fail_count == 0 { "PASS" } else { "FAIL" };
     println!(
         "  {label} [{batch:>3}x{hidden:>4}] {status}: max_abs={:.6}, max_rel={:.6}, fail={}/{} (atol={atol}, rtol={rtol})",

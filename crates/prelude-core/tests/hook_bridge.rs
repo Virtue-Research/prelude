@@ -12,7 +12,7 @@ use prelude_core::ops::{
     self,
     traits::{BinaryOp, Ops, UnaryOp},
 };
-use prelude_core::tensor::{DType, Device, Result, Tensor};
+use prelude_core::tensor::{Device, Result, Tensor};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ── Test Ops that counts hook invocations ────────────────────────

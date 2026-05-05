@@ -45,9 +45,11 @@ macro_rules! nvtx_pop {
     () => {
         #[cfg(feature = "nvtx")]
         #[allow(unused_unsafe)]
-        unsafe { $crate::profiling::ffi::nvtxRangePop() };
+        unsafe {
+            $crate::profiling::ffi::nvtxRangePop()
+        };
     };
 }
 
-pub(crate) use nvtx_push;
 pub(crate) use nvtx_pop;
+pub(crate) use nvtx_push;

@@ -484,7 +484,7 @@ pub fn try_grouped_gemm_deepgemm(
     }
 
     // Output is the only allocation that escapes this call.
-    let output = unsafe { dev.alloc_zeros::<half::bf16>(n_real * size_n) }?;
+    let output = dev.alloc_zeros::<half::bf16>(n_real * size_n)?;
 
     // Step 1: gather A into padded layout.
     unsafe {
@@ -752,7 +752,7 @@ pub fn swap_gate_up_inplace(w1: &Tensor, inter: usize) -> Result<()> {
     let dims = w1.dims();
     let num_experts = dims[0] as i32;
     let hidden = dims[2] as i32;
-    let cu_stream = unsafe { stream.cu_stream() } as i64;
+    let cu_stream = stream.cu_stream() as i64;
     unsafe {
         ffi::moe_swap_gate_up_inplace(data_ptr, num_experts, inter as i32, hidden, cu_stream);
     }
@@ -908,7 +908,7 @@ pub fn cutlass_fused_moe_forward(
     let cuda_storage = as_candle_cuda(&storage, "cutlass_fused_moe_stream")?;
     let dev = cuda_storage.device().clone();
     let stream = dev.cuda_stream();
-    let raw_stream = unsafe { stream.cu_stream() } as *mut std::ffi::c_void;
+    let raw_stream = stream.cu_stream() as *mut std::ffi::c_void;
     registry.set_stream(device_id, raw_stream);
     drop(storage);
 

@@ -1,24 +1,37 @@
 //! Tests for GGUF parsing and quantized tensor dequantization.
 
-use prelude_core::tensor::{DType, Device, Result};
-use prelude_core::tensor::quantized::{GgmlDType, QTensor};
 use prelude_core::tensor::quantized::gguf_file;
+use prelude_core::tensor::quantized::{GgmlDType, QTensor};
+use prelude_core::tensor::{Device, Result};
 
 // ── GgmlDType ────────────────────────────────────────────────────
 
 #[test]
 fn ggml_dtype_roundtrip() {
     let dtypes = [
-        (GgmlDType::F32, 0), (GgmlDType::F16, 1), (GgmlDType::Q4_0, 2),
-        (GgmlDType::Q4_1, 3), (GgmlDType::Q5_0, 6), (GgmlDType::Q5_1, 7),
-        (GgmlDType::Q8_0, 8), (GgmlDType::Q8_1, 9),
-        (GgmlDType::Q2K, 10), (GgmlDType::Q3K, 11), (GgmlDType::Q4K, 12),
-        (GgmlDType::Q5K, 13), (GgmlDType::Q6K, 14), (GgmlDType::Q8K, 15),
+        (GgmlDType::F32, 0),
+        (GgmlDType::F16, 1),
+        (GgmlDType::Q4_0, 2),
+        (GgmlDType::Q4_1, 3),
+        (GgmlDType::Q5_0, 6),
+        (GgmlDType::Q5_1, 7),
+        (GgmlDType::Q8_0, 8),
+        (GgmlDType::Q8_1, 9),
+        (GgmlDType::Q2K, 10),
+        (GgmlDType::Q3K, 11),
+        (GgmlDType::Q4K, 12),
+        (GgmlDType::Q5K, 13),
+        (GgmlDType::Q6K, 14),
+        (GgmlDType::Q8K, 15),
         (GgmlDType::BF16, 30),
     ];
     for (dt, expected_u32) in dtypes {
         assert_eq!(dt.to_u32(), expected_u32, "to_u32 failed for {dt}");
-        assert_eq!(GgmlDType::from_u32(expected_u32).unwrap(), dt, "from_u32 failed for {expected_u32}");
+        assert_eq!(
+            GgmlDType::from_u32(expected_u32).unwrap(),
+            dt,
+            "from_u32 failed for {expected_u32}"
+        );
     }
 }
 
@@ -41,7 +54,11 @@ fn dequant_q4_0() -> Result<()> {
     // qs[0] = 0x9A means: low = 0xA (10-8=2), high = 0x9 (9-8=1)
     block[2] = 0x9A; // first pair: values 2 and 1
 
-    let qt = QTensor::new(block, GgmlDType::Q4_0, prelude_core::tensor::Shape::from(vec![32]));
+    let qt = QTensor::new(
+        block,
+        GgmlDType::Q4_0,
+        prelude_core::tensor::Shape::from(vec![32]),
+    );
     let t = qt.dequantize(&Device::Cpu)?;
     let v: Vec<f32> = t.to_vec1()?;
     assert_eq!(v.len(), 32);
@@ -62,16 +79,20 @@ fn dequant_q8_0() -> Result<()> {
     block[0] = scale_bytes[0];
     block[1] = scale_bytes[1];
     // Set quantized values: 2, -3, 4, ...
-    block[2] = 2u8;   // i8 = 2
+    block[2] = 2u8; // i8 = 2
     block[3] = (-3i8) as u8; // i8 = -3
-    block[4] = 4u8;   // i8 = 4
+    block[4] = 4u8; // i8 = 4
 
-    let qt = QTensor::new(block, GgmlDType::Q8_0, prelude_core::tensor::Shape::from(vec![32]));
+    let qt = QTensor::new(
+        block,
+        GgmlDType::Q8_0,
+        prelude_core::tensor::Shape::from(vec![32]),
+    );
     let t = qt.dequantize(&Device::Cpu)?;
     let v: Vec<f32> = t.to_vec1()?;
-    assert_eq!(v[0], 1.0);   // 2 * 0.5
-    assert_eq!(v[1], -1.5);  // -3 * 0.5
-    assert_eq!(v[2], 2.0);   // 4 * 0.5
+    assert_eq!(v[0], 1.0); // 2 * 0.5
+    assert_eq!(v[1], -1.5); // -3 * 0.5
+    assert_eq!(v[2], 2.0); // 4 * 0.5
     Ok(())
 }
 
@@ -81,7 +102,11 @@ fn dequant_q8_0() -> Result<()> {
 fn dequant_f32() -> Result<()> {
     let values = vec![1.0f32, 2.0, 3.0, 4.0];
     let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let qt = QTensor::new(bytes, GgmlDType::F32, prelude_core::tensor::Shape::from(vec![4]));
+    let qt = QTensor::new(
+        bytes,
+        GgmlDType::F32,
+        prelude_core::tensor::Shape::from(vec![4]),
+    );
     let t = qt.dequantize(&Device::Cpu)?;
     assert_eq!(t.to_vec1::<f32>()?, vec![1.0, 2.0, 3.0, 4.0]);
     Ok(())
@@ -92,10 +117,15 @@ fn dequant_f32() -> Result<()> {
 #[test]
 fn dequant_f16() -> Result<()> {
     let values = [1.0f32, -2.5, 3.0, 0.0];
-    let bytes: Vec<u8> = values.iter()
+    let bytes: Vec<u8> = values
+        .iter()
         .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
         .collect();
-    let qt = QTensor::new(bytes, GgmlDType::F16, prelude_core::tensor::Shape::from(vec![4]));
+    let qt = QTensor::new(
+        bytes,
+        GgmlDType::F16,
+        prelude_core::tensor::Shape::from(vec![4]),
+    );
     let t = qt.dequantize(&Device::Cpu)?;
     let v: Vec<f32> = t.to_vec1()?;
     assert_eq!(v, vec![1.0, -2.5, 3.0, 0.0]);

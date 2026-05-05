@@ -390,10 +390,7 @@ impl Engine {
 /// Pack token groups into varlen format, skipping the first `offset` tokens
 /// from each sequence (used when prefix cache provides the leading tokens).
 /// Position IDs account for the offset so the model sees correct positions.
-fn pack_varlen_tokens(
-    token_groups: &[&[Vec<u32>]],
-    offset: usize,
-) -> PackedSequenceBatch {
+fn pack_varlen_tokens(token_groups: &[&[Vec<u32>]], offset: usize) -> PackedSequenceBatch {
     let mut flat_tokens: Vec<u32> = Vec::new();
     let mut cu_seqlens = vec![0u32];
     let mut seq_lens: Vec<usize> = Vec::new();

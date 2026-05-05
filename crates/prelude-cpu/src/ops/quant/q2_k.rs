@@ -74,10 +74,22 @@ mod avx2 {
 
     // Same scale shuffle as Q3_K: broadcasts scale pairs.
     static SCALE_SHUFFLE_Q3K: [[u8; 32]; 4] = [
-        [ 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,  2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3],
-        [ 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5,  6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7],
-        [ 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11],
-        [12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13, 14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15],
+        [
+            0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2,
+            3, 2, 3,
+        ],
+        [
+            4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6,
+            7, 6, 7,
+        ],
+        [
+            8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11,
+            10, 11, 10, 11, 10, 11,
+        ],
+        [
+            12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 14, 15, 14, 15, 14, 15,
+            14, 15, 14, 15, 14, 15, 14, 15, 14, 15,
+        ],
     ];
 
     #[inline(always)]
@@ -128,11 +140,7 @@ mod avx2 {
                     _mm256_loadu_si256(yb.bsums.as_ptr() as *const __m256i),
                 );
 
-                acc = _mm256_fmadd_ps(
-                    _mm256_broadcast_ss(&dmin),
-                    _mm256_cvtepi32_ps(prod),
-                    acc,
-                );
+                acc = _mm256_fmadd_ps(_mm256_broadcast_ss(&dmin), _mm256_cvtepi32_ps(prod), acc);
 
                 let all_scales = _mm256_cvtepi8_epi16(scales8);
                 let l_scales = _mm256_extracti128_si256(all_scales, 0);
@@ -190,11 +198,7 @@ mod avx2 {
                     sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p0, p2));
                 }
 
-                acc = _mm256_fmadd_ps(
-                    _mm256_broadcast_ss(&d),
-                    _mm256_cvtepi32_ps(sumi),
-                    acc,
-                );
+                acc = _mm256_fmadd_ps(_mm256_broadcast_ss(&d), _mm256_cvtepi32_ps(sumi), acc);
             }
 
             hsum_float_8(acc)
@@ -241,8 +245,8 @@ pub fn quantized_matmul_q2k(
     assert_eq!(w.len(), n * nb);
     assert_eq!(out.len(), m * n);
 
-    use rayon::prelude::*;
     use super::quantize::quantize_row_q8k;
+    use rayon::prelude::*;
 
     out.par_chunks_mut(n).enumerate().for_each(|(i, out_row)| {
         let x_row = &x[i * k..(i + 1) * k];
@@ -271,7 +275,10 @@ mod tests {
         let q2 = make_test_q2k_blocks(&values);
         let q8 = super::super::quantize::quantize_row_q8k_scalar(&values);
         let result = vec_dot_q2k_q8k_scalar(&q2, &q8);
-        assert!(result > 0.0, "self dot product should be positive, got {result}");
+        assert!(
+            result > 0.0,
+            "self dot product should be positive, got {result}"
+        );
     }
 
     #[test]
@@ -285,8 +292,14 @@ mod tests {
         let our_dot = vec_dot_q2k_q8k_scalar(&q2, &q8);
 
         // Result should be finite and non-zero for non-trivial inputs
-        assert!(our_dot.is_finite(), "dot product should be finite, got {our_dot}");
-        assert!(our_dot.abs() > 1e-6, "dot product should be non-zero for non-trivial inputs");
+        assert!(
+            our_dot.is_finite(),
+            "dot product should be finite, got {our_dot}"
+        );
+        assert!(
+            our_dot.abs() > 1e-6,
+            "dot product should be non-zero for non-trivial inputs"
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -295,7 +308,9 @@ mod tests {
         if !is_x86_feature_detected!("avx2") {
             return;
         }
-        let values: Vec<f32> = (0..QK_K * 4).map(|i| ((i as f32) * 0.007).sin() * 2.0).collect();
+        let values: Vec<f32> = (0..QK_K * 4)
+            .map(|i| ((i as f32) * 0.007).sin() * 2.0)
+            .collect();
         let x_vals: Vec<f32> = (0..QK_K * 4).map(|i| ((i as f32) * 0.013).cos()).collect();
 
         let q2 = make_test_q2k_blocks(&values);
@@ -305,7 +320,10 @@ mod tests {
         let avx2 = unsafe { avx2::vec_dot_q2k_q8k_avx2(&q2, &q8) };
 
         let rel_err = (scalar - avx2).abs() / scalar.abs().max(1e-6);
-        assert!(rel_err < 1e-5, "AVX2 vs scalar: scalar={scalar}, avx2={avx2}, rel_err={rel_err}");
+        assert!(
+            rel_err < 1e-5,
+            "AVX2 vs scalar: scalar={scalar}, avx2={avx2}, rel_err={rel_err}"
+        );
     }
 
     #[test]
@@ -323,6 +341,9 @@ mod tests {
 
         let mut out = vec![0.0f32; m * n];
         quantized_matmul_q2k(&x_data, &w_blocks, &mut out, m, n, k);
-        assert!(out.iter().all(|v| v.is_finite()), "non-finite output: {out:?}");
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "non-finite output: {out:?}"
+        );
     }
 }

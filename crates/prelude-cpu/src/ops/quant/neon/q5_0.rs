@@ -34,8 +34,8 @@ pub unsafe fn vec_dot_q5_0_q8_0_neon(x: &[BlockQ5_0], y: &[BlockQ8_0]) -> f32 {
 
         // Load 16 bytes of packed nibbles (low 4 bits)
         let v0 = vld1q_u8(xb.qs.as_ptr());
-        let v0l = vandq_u8(v0, m4b);   // low nibble: elements 0..15
-        let v0h = vshrq_n_u8(v0, 4);    // high nibble: elements 16..31
+        let v0l = vandq_u8(v0, m4b); // low nibble: elements 0..15
+        let v0h = vshrq_n_u8(v0, 4); // high nibble: elements 16..31
 
         // Extract high bits and combine with low 4 bits
         // For elements 0..15, high bit is bit j of qh

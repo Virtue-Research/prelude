@@ -1,15 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::tensor::{DType, Device, Module, Result, Tensor};
+use crate::loading::var_builder::VarBuilder;
 use crate::models::commons::activation::Activation;
 use crate::models::commons::embedding::Embedding;
-use crate::loading::var_builder::VarBuilder;
+use crate::tensor::{DType, Device, Module, Result, Tensor};
 use serde::Deserialize;
 
-use crate::models::commons::{
-    BatchAttnContext, BatchState, LayerAttnContext, Linear, RmsNorm,
-};
+use crate::models::commons::{BatchAttnContext, BatchState, LayerAttnContext, Linear, RmsNorm};
 use crate::ops::{MaskType, PagedParams, VarlenParams};
 
 use crate::engine::{EmbeddingActivation, EmbeddingSemantics};
@@ -197,7 +195,8 @@ impl Gemma3Mlp {
         let bs = BatchState::no_lora();
         let gate = self.gate_proj.forward(x, &bs, ops)?;
         let up = self.up_proj.forward(x, &bs, ops)?;
-        self.down_proj.forward(&(gate.apply(&self.act_fn)? * up)?, &bs, ops)
+        self.down_proj
+            .forward(&(gate.apply(&self.act_fn)? * up)?, &bs, ops)
     }
 }
 
@@ -213,7 +212,6 @@ struct Gemma3Attention {
     k_norm: RmsNorm,
     num_heads: usize,
     num_kv_heads: usize,
-    num_kv_groups: usize,
     head_dim: usize,
     rotary_emb: Arc<Gemma3RotaryEmbedding>,
     softmax_scale: f32,
@@ -230,15 +228,34 @@ impl Gemma3Attention {
         let head_dim = cfg.head_dim;
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
-        let num_kv_groups = num_heads / num_kv_heads;
         // Gemma3 uses query_pre_attn_scalar for scaling
         let softmax_scale = 1.0 / (cfg.query_pre_attn_scalar as f32).sqrt();
 
         Ok(Self {
-            q_proj: Linear::load(vb.pp("q_proj"), cfg.hidden_size, num_heads * head_dim, cfg.attention_bias)?,
-            k_proj: Linear::load(vb.pp("k_proj"), cfg.hidden_size, num_kv_heads * head_dim, cfg.attention_bias)?,
-            v_proj: Linear::load(vb.pp("v_proj"), cfg.hidden_size, num_kv_heads * head_dim, cfg.attention_bias)?,
-            o_proj: Linear::load(vb.pp("o_proj"), num_heads * head_dim, cfg.hidden_size, cfg.attention_bias)?,
+            q_proj: Linear::load(
+                vb.pp("q_proj"),
+                cfg.hidden_size,
+                num_heads * head_dim,
+                cfg.attention_bias,
+            )?,
+            k_proj: Linear::load(
+                vb.pp("k_proj"),
+                cfg.hidden_size,
+                num_kv_heads * head_dim,
+                cfg.attention_bias,
+            )?,
+            v_proj: Linear::load(
+                vb.pp("v_proj"),
+                cfg.hidden_size,
+                num_kv_heads * head_dim,
+                cfg.attention_bias,
+            )?,
+            o_proj: Linear::load(
+                vb.pp("o_proj"),
+                num_heads * head_dim,
+                cfg.hidden_size,
+                cfg.attention_bias,
+            )?,
             q_norm: {
                 let weight = vb.pp("q_norm").get(head_dim, "weight")?;
                 let weight = (&weight + 1.0)?;
@@ -251,7 +268,6 @@ impl Gemma3Attention {
             },
             num_heads,
             num_kv_heads,
-            num_kv_groups,
             head_dim,
             rotary_emb,
             softmax_scale,
@@ -280,10 +296,12 @@ impl Gemma3Attention {
             Gemma3AttentionMode::FullCausal => MaskType::Causal,
             Gemma3AttentionMode::FullBidirectional => MaskType::Bidirectional,
             Gemma3AttentionMode::SlidingCausal { window_size } => MaskType::SlidingWindow {
-                left: window_size.saturating_sub(1), right: 0,
+                left: window_size.saturating_sub(1),
+                right: 0,
             },
             Gemma3AttentionMode::SlidingBidirectional { window_size } => MaskType::SlidingWindow {
-                left: window_size.saturating_sub(1), right: window_size.saturating_sub(1),
+                left: window_size.saturating_sub(1),
+                right: window_size.saturating_sub(1),
             },
         };
 
@@ -294,26 +312,41 @@ impl Gemma3Attention {
         // no cache is plumbed (one-shot embed / classify).
         let attn_out = if let Some(kv) = ctx.paged_kv {
             ops.reshape_and_cache(&k, &v, kv.key_cache, kv.value_cache, kv.slot_mapping)?;
-            ops.paged_attention(&q, kv.key_cache, kv.value_cache, &PagedParams {
-                block_tables: kv.block_tables,
-                cu_seqlens_q: ctx.cu_seqlens_q,
-                cu_seqlens_k: kv.cu_seqlens_k,
-                max_seqlen_q: ctx.max_seqlen_q,
-                max_seqlen_k: kv.max_seqlen_k,
-                scale: self.softmax_scale,
-                mask,
-                softcap: None,
-            })?
+            ops.paged_attention(
+                &q,
+                kv.key_cache,
+                kv.value_cache,
+                &PagedParams {
+                    block_tables: kv.block_tables,
+                    cu_seqlens_q: ctx.cu_seqlens_q,
+                    cu_seqlens_k: kv.cu_seqlens_k,
+                    max_seqlen_q: ctx.max_seqlen_q,
+                    max_seqlen_k: kv.max_seqlen_k,
+                    scale: self.softmax_scale,
+                    mask,
+                    softcap: None,
+                },
+            )?
         } else {
-            ops.varlen_attention(&q, &k, &v, &VarlenParams {
-                cu_seqlens_q: ctx.cu_seqlens_q, cu_seqlens_k: ctx.cu_seqlens_q,
-                max_seqlen_q: ctx.max_seqlen_q, max_seqlen_k: ctx.max_seqlen_q,
-                scale: self.softmax_scale, mask, softcap: None,
-            })?
+            ops.varlen_attention(
+                &q,
+                &k,
+                &v,
+                &VarlenParams {
+                    cu_seqlens_q: ctx.cu_seqlens_q,
+                    cu_seqlens_k: ctx.cu_seqlens_q,
+                    max_seqlen_q: ctx.max_seqlen_q,
+                    max_seqlen_k: ctx.max_seqlen_q,
+                    scale: self.softmax_scale,
+                    mask,
+                    softcap: None,
+                },
+            )?
         };
 
         let attn_dim = self.num_heads * self.head_dim;
-        self.o_proj.forward(&attn_out.reshape((total_tokens, attn_dim))?, &bs, ops)
+        self.o_proj
+            .forward(&attn_out.reshape((total_tokens, attn_dim))?, &bs, ops)
     }
 
     fn clear_kv_cache(&mut self) {}
@@ -364,7 +397,10 @@ impl Gemma3DecoderLayer {
             input_layernorm: RmsNorm::from_weight(input_ln_adjusted, cfg.rms_norm_eps),
             post_attention_layernorm: RmsNorm::from_weight(post_attn_ln_adjusted, cfg.rms_norm_eps),
             pre_feedforward_layernorm: RmsNorm::from_weight(pre_ffn_ln_adjusted, cfg.rms_norm_eps),
-            post_feedforward_layernorm: RmsNorm::from_weight(post_ffn_ln_adjusted, cfg.rms_norm_eps),
+            post_feedforward_layernorm: RmsNorm::from_weight(
+                post_ffn_ln_adjusted,
+                cfg.rms_norm_eps,
+            ),
         })
     }
 
@@ -519,7 +555,12 @@ impl Gemma3ForCausalLM {
                 .get((cfg.vocab_size, cfg.hidden_size), "weight")?;
             Linear::from_weight(embed_weight, None)?
         } else {
-            Linear::load(head_vb.pp("lm_head"), cfg.hidden_size, cfg.vocab_size, false)?
+            Linear::load(
+                head_vb.pp("lm_head"),
+                cfg.hidden_size,
+                cfg.vocab_size,
+                false,
+            )?
         };
 
         Ok(Self {
@@ -538,7 +579,9 @@ impl Gemma3ForCausalLM {
         let last_hidden =
             crate::models::commons::last_token_select(&hidden, ctx.seq_lens)?.contiguous()?;
 
-        let logits = self.lm_head.forward(&last_hidden.unsqueeze(1)?, &BatchState::no_lora(), ctx.ops)?;
+        let logits =
+            self.lm_head
+                .forward(&last_hidden.unsqueeze(1)?, &BatchState::no_lora(), ctx.ops)?;
 
         if let Some(cap) = self.final_logit_softcapping {
             let scaled = (&logits / cap)?;
@@ -564,7 +607,11 @@ impl crate::models::LogitsSplitModel for Gemma3ForCausalLM {
     }
 
     fn compute_logits(&self, hidden: &Tensor) -> crate::tensor::Result<Tensor> {
-        let logits = self.lm_head.forward(hidden, &BatchState::no_lora(), crate::ops::select_ops(hidden.device()))?;
+        let logits = self.lm_head.forward(
+            hidden,
+            &BatchState::no_lora(),
+            crate::ops::select_ops(hidden.device()),
+        )?;
         if let Some(cap) = self.final_logit_softcapping {
             let scaled = (&logits / cap)?;
             let tanh = scaled.tanh()?;
@@ -619,8 +666,12 @@ impl Gemma3ForSequenceClassification {
         head_vb: VarBuilder,
     ) -> Result<Self> {
         let base = Gemma3Model::new(&cfg.base, model_vb)?;
-        let score =
-            Linear::load(head_vb.pp("score"), cfg.base.hidden_size, cfg.num_labels, false)?;
+        let score = Linear::load(
+            head_vb.pp("score"),
+            cfg.base.hidden_size,
+            cfg.num_labels,
+            false,
+        )?;
 
         // Convert id2label from String keys to usize keys
         let id2label = cfg.id2label.as_ref().map(|m| {
@@ -644,7 +695,8 @@ impl Gemma3ForSequenceClassification {
     ) -> Result<Tensor> {
         let hidden_states = self.base.forward(packed_input, ctx)?;
         let last_hidden = crate::models::commons::last_token_select(&hidden_states, ctx.seq_lens)?;
-        self.score.forward(&last_hidden, &BatchState::no_lora(), ctx.ops)
+        self.score
+            .forward(&last_hidden, &BatchState::no_lora(), ctx.ops)
     }
 
     pub fn get_label(&self, class_idx: usize) -> Option<String> {
@@ -672,13 +724,22 @@ struct Gemma3EmbeddingDenseLayer {
 impl Gemma3EmbeddingDenseLayer {
     fn new(spec: &crate::engine::EmbeddingDenseLayerSpec, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            linear: Linear::load(vb.pp("linear"), spec.in_features, spec.out_features, spec.bias)?,
+            linear: Linear::load(
+                vb.pp("linear"),
+                spec.in_features,
+                spec.out_features,
+                spec.bias,
+            )?,
             activation: spec.activation,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.linear.forward(x, &BatchState::no_lora(), crate::ops::select_ops(x.device()))?;
+        let x = self.linear.forward(
+            x,
+            &BatchState::no_lora(),
+            crate::ops::select_ops(x.device()),
+        )?;
         match self.activation {
             EmbeddingActivation::Identity => Ok(x),
         }
@@ -802,9 +863,11 @@ pub(crate) mod meta {
         Gemma3ClassifierConfig, Gemma3Config, Gemma3EmbeddingDenseLayer, Gemma3ForCausalLM,
         Gemma3ForEmbedding, Gemma3ForSequenceClassification,
     };
-    use crate::loading::var_builder::VarBuilder;
     use crate::engine::EngineError;
-    use crate::engine::{CommonModelConfig, EmbeddingSemantics, RuntimeCaps, TaskKind, WeightsBackend};
+    use crate::engine::{
+        CommonModelConfig, EmbeddingSemantics, RuntimeCaps, TaskKind, WeightsBackend,
+    };
+    use crate::loading::var_builder::VarBuilder;
     use crate::models::registry::{
         ArchSpec, AuxiliaryVarBuilder, ParsedModelConfig, candle_model_err,
         inject_num_labels_if_missing, parse_value,
@@ -914,7 +977,9 @@ pub(crate) mod meta {
     ) -> Result<Box<dyn crate::models::ModelForward>, EngineError> {
         let cfg = arch_config
             .downcast_ref::<Gemma3ArchConfig>()
-            .ok_or_else(|| EngineError::Internal("unexpected arch config type for Gemma3".into()))?;
+            .ok_or_else(|| {
+                EngineError::Internal("unexpected arch config type for Gemma3".into())
+            })?;
 
         let backbone_vb = |layout| match layout {
             Gemma3WeightLayout::FlatText => ctx.main_vb.clone().pp("model"),
@@ -964,7 +1029,9 @@ pub(crate) mod meta {
     pub(crate) struct Gemma3ArchSpec;
 
     pub(crate) static GEMMA3_ARCH_SPEC: Gemma3ArchSpec = Gemma3ArchSpec;
-    inventory::submit!(crate::models::registry::ArchSpecEntry::new(&GEMMA3_ARCH_SPEC));
+    inventory::submit!(crate::models::registry::ArchSpecEntry::new(
+        &GEMMA3_ARCH_SPEC
+    ));
 
     impl ArchSpec for Gemma3ArchSpec {
         fn name(&self) -> &'static str {
@@ -1075,11 +1142,11 @@ pub(crate) mod meta {
 
     #[cfg(test)]
     mod tests {
+        use super::Gemma3ModelBuildContext;
         use super::embedding_semantics_or_default;
         use crate::engine::{
             EmbeddingDenseLayerSpec, EmbeddingNormalization, EmbeddingPooling, EmbeddingSemantics,
         };
-        use super::Gemma3ModelBuildContext;
         use crate::loading::var_builder::VarBuilder;
 
         #[test]

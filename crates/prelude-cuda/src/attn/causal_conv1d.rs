@@ -11,7 +11,7 @@ use candle_core::backend::BackendStorage;
 use causal_conv1d::{self as ffi, Dtype};
 use cudarc::driver::DevicePtr;
 use half::{bf16, f16};
-use prelude_core::tensor::{bail, DType, DeviceExt, Result, Tensor};
+use prelude_core::tensor::{DType, Result, Tensor, bail};
 use std::ffi::c_void;
 
 /// Map a candle DType to the causal-conv1d shim's tag.
@@ -112,9 +112,7 @@ pub(crate) fn try_fwd(
                 candle_core::Storage::Cuda(s) => s,
                 _ => bail!("causal_conv1d_fwd: tensor not on CUDA"),
             };
-            let slice = cuda
-                .as_cuda_slice::<$ty>()?
-                .slice(layout.start_offset()..);
+            let slice = cuda.as_cuda_slice::<$ty>()?.slice(layout.start_offset()..);
             let (ptr, _guard) = slice.device_ptr(&stream);
             ptr as u64 as *mut c_void
         }};
@@ -284,9 +282,7 @@ pub(crate) fn try_update(
                 candle_core::Storage::Cuda(s) => s,
                 _ => bail!("causal_conv1d_update: tensor not on CUDA"),
             };
-            let slice = cuda
-                .as_cuda_slice::<$ty>()?
-                .slice(layout.start_offset()..);
+            let slice = cuda.as_cuda_slice::<$ty>()?.slice(layout.start_offset()..);
             let (ptr, _guard) = slice.device_ptr(&stream);
             ptr as u64 as *mut c_void
         }};
@@ -341,7 +337,9 @@ pub(crate) fn try_update(
             };
             let ptr = match idx_tensor.dtype() {
                 DType::U32 => {
-                    let idx_slice = idx_cuda.as_cuda_slice::<u32>()?.slice(idx_layout.start_offset()..);
+                    let idx_slice = idx_cuda
+                        .as_cuda_slice::<u32>()?
+                        .slice(idx_layout.start_offset()..);
                     let (p, _guard) = idx_slice.device_ptr(&stream);
                     p as u64 as *const i32 // safe: u32 and i32 same size, values < 2^31
                 }
@@ -349,7 +347,10 @@ pub(crate) fn try_update(
                     bail!("causal_conv1d_update: conv_state_indices must be U32 or I32, got I64");
                 }
                 _ => {
-                    bail!("causal_conv1d_update: conv_state_indices must be U32, got {:?}", idx_tensor.dtype());
+                    bail!(
+                        "causal_conv1d_update: conv_state_indices must be U32, got {:?}",
+                        idx_tensor.dtype()
+                    );
                 }
             };
             Some(ptr)
@@ -402,7 +403,5 @@ pub(crate) fn try_update(
     drop(state_c);
 
     // Output is [B, D, 1] — squeeze the trailing 1 for the caller.
-    out.squeeze(2)
-        .map(Some)
-        .map_err(candle_core::Error::from)
+    out.squeeze(2).map(Some).map_err(candle_core::Error::from)
 }

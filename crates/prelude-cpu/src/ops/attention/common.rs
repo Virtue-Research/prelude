@@ -242,11 +242,12 @@ pub(super) fn exp_ps_avx512(x: core::arch::x86_64::__m512) -> core::arch::x86_64
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub(super) fn online_softmax_avx512(
-    scores: *mut f32,     // [block_n], raw Q@K^T (unscaled), modified in-place to exp weights
+    scores: *mut f32, // [block_n], raw Q@K^T (unscaled), modified in-place to exp weights
     n_size: usize,
-    m_prime: f32,         // previous max (already scaled)
-    sm_scale: f32,        // softmax scale (1/sqrt(head_dim)), fused to avoid separate pass
-) -> (f32, f32, f32) {   // (new_max, block_sum, rescale_factor)
+    m_prime: f32,  // previous max (already scaled)
+    sm_scale: f32, // softmax scale (1/sqrt(head_dim)), fused to avoid separate pass
+) -> (f32, f32, f32) {
+    // (new_max, block_sum, rescale_factor)
     use core::arch::x86_64::*;
 
     let chunks16 = n_size / 16;
@@ -261,7 +262,9 @@ pub(super) fn online_softmax_avx512(
     let mut m_i = _mm512_reduce_max_ps(max_vec);
     for j in (chunks16 * 16)..n_size {
         let v = unsafe { *scores.add(j) } * sm_scale;
-        if v > m_i { m_i = v; }
+        if v > m_i {
+            m_i = v;
+        }
     }
     m_i = m_i.max(m_prime);
 
@@ -288,11 +291,18 @@ pub(super) fn online_softmax_avx512(
 }
 
 /// Scalar fallback for online softmax with fused sm_scale.
-pub(super) fn softmax_scalar(scores: &mut [f32], n_size: usize, m_prime: f32, sm_scale: f32) -> (f32, f32, f32) {
+pub(super) fn softmax_scalar(
+    scores: &mut [f32],
+    n_size: usize,
+    m_prime: f32,
+    sm_scale: f32,
+) -> (f32, f32, f32) {
     let mut m_i = f32::NEG_INFINITY;
     for j in 0..n_size {
         let v = scores[j] * sm_scale;
-        if v > m_i { m_i = v; }
+        if v > m_i {
+            m_i = v;
+        }
     }
     m_i = m_i.max(m_prime);
     let rescale = (m_prime - m_i).exp();
@@ -329,6 +339,7 @@ pub(super) fn select_blocks(slen: usize) -> (usize, usize) {
 // ── BF16 dot product ────────────────────────────────────────────────────
 
 /// Dot product of two BF16 vectors, accumulated in F32.
+#[cfg(test)]
 #[inline]
 pub(super) fn dot_bf16_f32(a: &[u16], b: &[u16], len: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
@@ -352,7 +363,7 @@ pub(super) fn dot_bf16_f32_scalar(a: &[u16], b: &[u16], len: usize) -> f32 {
 }
 
 /// AVX-512 BF16 dot product: loads 16 BF16 pairs at a time, FMA in F32.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(test, target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f,avx512bw")]
 fn dot_bf16_f32_avx512(a: *const u16, b: *const u16, len: usize) -> f32 {
     use core::arch::x86_64::*;

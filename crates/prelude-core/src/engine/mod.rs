@@ -10,8 +10,8 @@ pub(crate) use crate::types::{
 pub(crate) use std::path::Path;
 pub(crate) use std::time::Instant;
 
-pub(crate) use crate::tensor::{DType, Device, Tensor};
 pub(crate) use self::sampling::{LogitsProcessor, Sampling};
+pub(crate) use crate::tensor::{DType, Device, Tensor};
 pub(crate) use fastokens::Tokenizer;
 pub(crate) use tracing::info;
 
@@ -25,30 +25,28 @@ pub(crate) mod loading;
 pub(crate) mod model_runner;
 pub mod run;
 pub mod sampling;
-mod speculative;
 pub mod weight_loader;
 pub mod weights;
 
-mod types;
 pub(crate) mod planner;
 mod pseudo;
 pub mod scheduled;
 mod tokenizer;
-
+mod types;
 
 // ── Re-exports: plan types + engine struct ──
-pub use self::engine::{Engine, ModelExecutor};
 pub(crate) use self::engine::ModelVariant;
+pub use self::engine::{Engine, ModelExecutor};
 pub use self::types::OwnedBatchDecodeSeq;
 pub use self::types::PagedKvPool;
 pub use self::types::TaskOverride;
 pub(crate) use self::types::{
     BatchDecodeSeq, BatchPrefillResult, CacheAllocationPlan, CacheAllocationPlanEntry,
     CommonModelConfig, DecodePlan, EmbeddingActivation, EmbeddingDenseLayerSpec,
-    EmbeddingNormalization, EmbeddingPooling, EmbeddingSemantics, ExecutionKind,
+    EmbeddingNormalization, EmbeddingPooling, EmbeddingSemantics, ExecutionKind, GenerateBatchPlan,
     ModelDescriptor, PreTokenizedClassifyItem, PreTokenizedEmbedItem, PrefillPlan,
-    PrefixReuseCandidate, PreparedGenerateBatch, GenerateBatchPlan,
-    PreparedGenerateRequest, ResolvedPrefixReuse, RuntimeCaps, TaskKind, WeightsBackend,
+    PrefixReuseCandidate, PreparedGenerateBatch, PreparedGenerateRequest, ResolvedPrefixReuse,
+    RuntimeCaps, TaskKind, WeightsBackend,
 };
 
 // ── Re-exports: forward (task-specific execution + postprocessing) ──

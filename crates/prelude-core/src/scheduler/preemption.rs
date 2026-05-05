@@ -33,10 +33,6 @@ impl Scheduler {
         Some((freed, victim))
     }
 
-    pub(crate) fn ensure_decode_capacity(&mut self) {
-        self.ensure_decode_capacity_tracked();
-    }
-
     /// Like `ensure_decode_capacity` but returns whether any preemption occurred.
     /// Used by `get_mixed_batch` to skip waiting admission after preemption
     /// (like vLLM V1's `if not preempted_reqs` guard).

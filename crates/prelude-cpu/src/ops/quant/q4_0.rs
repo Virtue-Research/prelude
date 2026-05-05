@@ -101,10 +101,7 @@ mod avx2 {
 
     /// AVX2 Q4_0 · Q8_0 dot product.
     #[target_feature(enable = "avx2,fma,f16c")]
-    pub(super) unsafe fn vec_dot_q4_0_q8_0_avx2(
-        x: &[BlockQ4_0],
-        y: &[BlockQ8_0],
-    ) -> f32 {
+    pub(super) unsafe fn vec_dot_q4_0_q8_0_avx2(x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
         unsafe {
             let nb = x.len();
             let mut acc = _mm256_setzero_ps();
@@ -126,10 +123,7 @@ mod avx2 {
 
     /// AVX-VNNI Q4_0 · Q8_0 dot product — dpbusd replaces maddubs+madd.
     #[target_feature(enable = "avx2,fma,f16c,avxvnni")]
-    pub(super) unsafe fn vec_dot_q4_0_q8_0_vnni(
-        x: &[BlockQ4_0],
-        y: &[BlockQ8_0],
-    ) -> f32 {
+    pub(super) unsafe fn vec_dot_q4_0_q8_0_vnni(x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
         unsafe {
             let nb = x.len();
             let mut acc = _mm256_setzero_ps();
@@ -247,14 +241,8 @@ mod tests {
 
     #[test]
     fn scalar_multi_block() {
-        let x = [
-            make_q4_0(2.0, &[1i8; 32]),
-            make_q4_0(0.5, &[-2i8; 32]),
-        ];
-        let y = [
-            make_q8_0(1.0, &[3i8; 32]),
-            make_q8_0(1.0, &[4i8; 32]),
-        ];
+        let x = [make_q4_0(2.0, &[1i8; 32]), make_q4_0(0.5, &[-2i8; 32])];
+        let y = [make_q8_0(1.0, &[3i8; 32]), make_q8_0(1.0, &[4i8; 32])];
         let result = vec_dot_q4_0_q8_0_scalar(&x, &y);
         // Block 0: 32 × 1 × 3 × (2.0 × 1.0) = 192.0
         // Block 1: 32 × (-2) × 4 × (0.5 × 1.0) = -128.0
@@ -270,7 +258,9 @@ mod tests {
             // Simple LCG for reproducible pseudo-random data
             let mut state = seed;
             let mut next = || -> u64 {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 state
             };
 

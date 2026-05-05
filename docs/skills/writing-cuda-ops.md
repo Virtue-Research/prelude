@@ -23,7 +23,6 @@ crates/prelude-cuda/src/
     kv_cache.rs              -- fused_knorm_rope_kv_cache_write_varlen
     moe.rs                   -- MoE routing ops
     gemm.rs                  -- GEMM wrappers
-    quant.rs                 -- quantization ops
     tiled_mmq.rs             -- tiled MMQ kernels
   kernels/kernels_src/       -- .cu source files (organized by subdirectory)
     elementwise/
@@ -218,12 +217,11 @@ Fused kernels can introduce numerical drift. To debug, use an environment variab
 
 ```rust
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::config::parse_env_bool;
 
 static MY_KERNEL_ENABLED: AtomicBool = AtomicBool::new(true);
 
 pub fn init() {
-    if parse_env_bool("PRELUDE_NO_MY_KERNEL") {
+    if std::env::var("PRELUDE_NO_MY_KERNEL").as_deref() == Ok("1") {
         MY_KERNEL_ENABLED.store(false, Ordering::Relaxed);
     }
 }
@@ -243,9 +241,6 @@ This way users can run `PRELUDE_NO_MY_KERNEL=1` to fall back to the unfused path
 ```bash
 # Profile with nsys
 nsys profile --trace=cuda ./target/release/prelude-server --model Qwen/Qwen3-4B
-
-# Enable sync timing to get accurate per-kernel times
-PRELUDE_SYNC_TIMING=1 ./target/release/prelude-server --model Qwen/Qwen3-4B
 ```
 
 ## Common Pitfalls

@@ -290,7 +290,6 @@ impl Engine {
         self.executor.ops.end_forward();
         drop(dn_pool_guard);
         drop(model);
-        self.maybe_sync_device();
 
         let forward_ms = forward_start.elapsed().as_secs_f32() * 1000.0;
 

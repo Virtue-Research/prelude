@@ -20,7 +20,7 @@ struct GpuWork {
 
 /// CUDA execution strategy: dedicated GPU worker thread with graph cache.
 pub struct CudaExecutor {
-    engine: Arc<Engine>,
+    _engine: Arc<Engine>,
     work_tx: tokio::sync::mpsc::UnboundedSender<GpuWork>,
     _worker: std::thread::JoinHandle<()>,
 }
@@ -69,7 +69,7 @@ impl CudaExecutor {
             })
             .expect("spawn GPU executor worker thread");
         Self {
-            engine,
+            _engine: engine,
             work_tx,
             _worker: worker,
         }
@@ -124,7 +124,6 @@ fn execute_work(
                 } else {
                     None
                 };
-                engine.maybe_sync_device();
                 let elapsed_us = t0.elapsed().as_micros();
                 tracing::debug!(
                     bs,
@@ -153,7 +152,6 @@ fn execute_work(
                 if sample_greedy {
                     output.sampled_tokens = greedy_argmax_tokens(&output.logits);
                 }
-                engine.maybe_sync_device();
             }
             let elapsed_us = t0.elapsed().as_micros();
             tracing::debug!(bs, elapsed_us, sample_greedy, path = "eager", "decode step");
@@ -172,7 +170,6 @@ fn execute_work(
                 if sample_greedy {
                     output.sampled_tokens = greedy_argmax_tokens(&output.logits);
                 }
-                engine.maybe_sync_device();
             }
             let elapsed_us = t0.elapsed().as_micros();
             tracing::debug!(elapsed_us, sample_greedy, path = "mixed", "forward step");
@@ -181,9 +178,6 @@ fn execute_work(
         other => {
             let t0 = Instant::now();
             let result = engine.forward_batch(other);
-            if result.is_ok() {
-                engine.maybe_sync_device();
-            }
             let elapsed_us = t0.elapsed().as_micros();
             tracing::debug!(elapsed_us, path = "mixed", "forward step");
             result

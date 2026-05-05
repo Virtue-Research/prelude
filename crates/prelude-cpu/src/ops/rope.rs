@@ -43,17 +43,29 @@ pub fn rope_neox_bf16(
     if !super::should_parallelize(total_elems, total_tokens, MIN_ELEMS_PER_THREAD) {
         for t in 0..total_tokens {
             let pos = positions[t];
-            if pos < 0 { continue; }
+            if pos < 0 {
+                continue;
+            }
             let cache_off = pos as usize * rotary_dim;
             let q_base = t * q_token_stride;
             let k_base = t * k_token_stride;
             for h in 0..num_heads {
                 let off = q_base + h * head_dim;
-                rope_neox_row(&mut q[off..off + head_dim], cos_sin_cache, cache_off, embed_dim);
+                rope_neox_row(
+                    &mut q[off..off + head_dim],
+                    cos_sin_cache,
+                    cache_off,
+                    embed_dim,
+                );
             }
             for h in 0..num_kv_heads {
                 let off = k_base + h * head_dim;
-                rope_neox_row(&mut k[off..off + head_dim], cos_sin_cache, cache_off, embed_dim);
+                rope_neox_row(
+                    &mut k[off..off + head_dim],
+                    cos_sin_cache,
+                    cache_off,
+                    embed_dim,
+                );
             }
         }
         return;
@@ -62,10 +74,18 @@ pub fn rope_neox_bf16(
     // Use GemmPool (spinning threads) instead of rayon to avoid contention
     #[repr(C)]
     struct RopeCtx {
-        q_ptr: usize, k_ptr: usize, cache_ptr: usize, pos_ptr: usize,
-        total_tokens: usize, q_stride: usize, k_stride: usize,
-        num_heads: usize, num_kv_heads: usize, head_dim: usize,
-        embed_dim: usize, rotary_dim: usize,
+        q_ptr: usize,
+        k_ptr: usize,
+        cache_ptr: usize,
+        pos_ptr: usize,
+        total_tokens: usize,
+        q_stride: usize,
+        k_stride: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        embed_dim: usize,
+        rotary_dim: usize,
     }
     unsafe fn work(tid: usize, n_threads: usize, ctx_raw: *const u8) {
         unsafe {
@@ -73,16 +93,22 @@ pub fn rope_neox_bf16(
             let rows_per = (c.total_tokens + n_threads - 1) / n_threads;
             let start = tid * rows_per;
             let end = (start + rows_per).min(c.total_tokens);
-            if start >= end { return; }
+            if start >= end {
+                return;
+            }
             let positions = std::slice::from_raw_parts(c.pos_ptr as *const i64, c.total_tokens);
             let q = c.q_ptr as *mut u16;
             let k = c.k_ptr as *mut u16;
             for t in start..end {
                 let pos = positions[t];
-                if pos < 0 { continue; }
+                if pos < 0 {
+                    continue;
+                }
                 let cache_off = pos as usize * c.rotary_dim;
                 let cache = std::slice::from_raw_parts(
-                    c.cache_ptr as *const u16, (pos as usize + 1) * c.rotary_dim);
+                    c.cache_ptr as *const u16,
+                    (pos as usize + 1) * c.rotary_dim,
+                );
                 let q_base = t * c.q_stride;
                 let k_base = t * c.k_stride;
                 for h in 0..c.num_heads {
@@ -99,14 +125,24 @@ pub fn rope_neox_bf16(
         }
     }
     let ctx = RopeCtx {
-        q_ptr: q.as_mut_ptr() as usize, k_ptr: k.as_mut_ptr() as usize,
-        cache_ptr: cos_sin_cache.as_ptr() as usize, pos_ptr: positions.as_ptr() as usize,
-        total_tokens, q_stride: q_token_stride, k_stride: k_token_stride,
-        num_heads, num_kv_heads, head_dim, embed_dim, rotary_dim,
+        q_ptr: q.as_mut_ptr() as usize,
+        k_ptr: k.as_mut_ptr() as usize,
+        cache_ptr: cos_sin_cache.as_ptr() as usize,
+        pos_ptr: positions.as_ptr() as usize,
+        total_tokens,
+        q_stride: q_token_stride,
+        k_stride: k_token_stride,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        embed_dim,
+        rotary_dim,
     };
     let pool = super::gemm_pool::gemm_pool();
     let n = pool.num_threads().min(total_tokens);
-    unsafe { pool.dispatch(work, &ctx as *const RopeCtx as *const u8, n); }
+    unsafe {
+        pool.dispatch(work, &ctx as *const RopeCtx as *const u8, n);
+    }
 }
 
 // ── Per-row rotation ────────────────────────────────────────────────────
@@ -116,7 +152,12 @@ pub fn rope_neox_bf16(
 /// `embed_dim` = rotary_dim / 2 = number of rotation pairs.
 ///
 /// Split-half: pairs (row[i], row[embed_dim+i]) for i in 0..embed_dim.
-pub(crate) fn rope_neox_row(row: &mut [u16], cos_sin_cache: &[u16], cache_off: usize, embed_dim: usize) {
+pub(crate) fn rope_neox_row(
+    row: &mut [u16],
+    cos_sin_cache: &[u16],
+    cache_off: usize,
+    embed_dim: usize,
+) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
@@ -219,17 +260,29 @@ pub fn rope_neox_f32(
     if !super::should_parallelize(total_elems, total_tokens, MIN_ELEMS_PER_THREAD) {
         for t in 0..total_tokens {
             let pos = positions[t];
-            if pos < 0 { continue; }
+            if pos < 0 {
+                continue;
+            }
             let cache_off = pos as usize * rotary_dim;
             let q_base = t * q_token_stride;
             let k_base = t * k_token_stride;
             for h in 0..num_heads {
                 let off = q_base + h * head_dim;
-                rope_neox_row_f32(&mut q[off..off + head_dim], cos_sin_cache, cache_off, embed_dim);
+                rope_neox_row_f32(
+                    &mut q[off..off + head_dim],
+                    cos_sin_cache,
+                    cache_off,
+                    embed_dim,
+                );
             }
             for h in 0..num_kv_heads {
                 let off = k_base + h * head_dim;
-                rope_neox_row_f32(&mut k[off..off + head_dim], cos_sin_cache, cache_off, embed_dim);
+                rope_neox_row_f32(
+                    &mut k[off..off + head_dim],
+                    cos_sin_cache,
+                    cache_off,
+                    embed_dim,
+                );
             }
         }
         return;
@@ -237,10 +290,18 @@ pub fn rope_neox_f32(
 
     #[repr(C)]
     struct RopeF32Ctx {
-        q_ptr: usize, k_ptr: usize, cache_ptr: usize, pos_ptr: usize,
-        total_tokens: usize, q_stride: usize, k_stride: usize,
-        num_heads: usize, num_kv_heads: usize, head_dim: usize,
-        embed_dim: usize, rotary_dim: usize,
+        q_ptr: usize,
+        k_ptr: usize,
+        cache_ptr: usize,
+        pos_ptr: usize,
+        total_tokens: usize,
+        q_stride: usize,
+        k_stride: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        embed_dim: usize,
+        rotary_dim: usize,
     }
     unsafe fn work(tid: usize, n_threads: usize, ctx_raw: *const u8) {
         unsafe {
@@ -248,15 +309,20 @@ pub fn rope_neox_f32(
             let rows_per = (c.total_tokens + n_threads - 1) / n_threads;
             let start = tid * rows_per;
             let end = (start + rows_per).min(c.total_tokens);
-            if start >= end { return; }
+            if start >= end {
+                return;
+            }
             let positions = std::slice::from_raw_parts(c.pos_ptr as *const i64, c.total_tokens);
             let q = c.q_ptr as *mut f32;
             let k = c.k_ptr as *mut f32;
-            let cache_len = (positions.iter().copied().max().unwrap_or(0) as usize + 1) * c.rotary_dim;
+            let cache_len =
+                (positions.iter().copied().max().unwrap_or(0) as usize + 1) * c.rotary_dim;
             let cache = std::slice::from_raw_parts(c.cache_ptr as *const f32, cache_len);
             for t in start..end {
                 let pos = positions[t];
-                if pos < 0 { continue; }
+                if pos < 0 {
+                    continue;
+                }
                 let cache_off = pos as usize * c.rotary_dim;
                 let q_base = t * c.q_stride;
                 let k_base = t * c.k_stride;
@@ -274,18 +340,33 @@ pub fn rope_neox_f32(
         }
     }
     let ctx = RopeF32Ctx {
-        q_ptr: q.as_mut_ptr() as usize, k_ptr: k.as_mut_ptr() as usize,
-        cache_ptr: cos_sin_cache.as_ptr() as usize, pos_ptr: positions.as_ptr() as usize,
-        total_tokens, q_stride: q_token_stride, k_stride: k_token_stride,
-        num_heads, num_kv_heads, head_dim, embed_dim, rotary_dim,
+        q_ptr: q.as_mut_ptr() as usize,
+        k_ptr: k.as_mut_ptr() as usize,
+        cache_ptr: cos_sin_cache.as_ptr() as usize,
+        pos_ptr: positions.as_ptr() as usize,
+        total_tokens,
+        q_stride: q_token_stride,
+        k_stride: k_token_stride,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        embed_dim,
+        rotary_dim,
     };
     let pool = super::gemm_pool::gemm_pool();
     let n = pool.num_threads().min(total_tokens);
-    unsafe { pool.dispatch(work, &ctx as *const RopeF32Ctx as *const u8, n); }
+    unsafe {
+        pool.dispatch(work, &ctx as *const RopeF32Ctx as *const u8, n);
+    }
 }
 
 /// Apply NeoX split-half RoPE to a single F32 head row in-place.
-pub(crate) fn rope_neox_row_f32(row: &mut [f32], cos_sin_cache: &[f32], cache_off: usize, embed_dim: usize) {
+pub(crate) fn rope_neox_row_f32(
+    row: &mut [f32],
+    cos_sin_cache: &[f32],
+    cache_off: usize,
+    embed_dim: usize,
+) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f") {
@@ -310,7 +391,12 @@ fn rope_neox_row_f32_scalar(row: &mut [f32], cache: &[f32], cache_off: usize, em
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-unsafe fn rope_neox_row_f32_avx512(row: &mut [f32], cache: &[f32], cache_off: usize, embed_dim: usize) {
+unsafe fn rope_neox_row_f32_avx512(
+    row: &mut [f32],
+    cache: &[f32],
+    cache_off: usize,
+    embed_dim: usize,
+) {
     use core::arch::x86_64::*;
 
     let cos_ptr = unsafe { cache.as_ptr().add(cache_off) };
@@ -349,7 +435,7 @@ unsafe fn rope_neox_row_f32_avx512(row: &mut [f32], cache: &[f32], cache_off: us
 mod tests {
     use super::*;
 
-    use super::super::bf16_utils::{make_bf16_vec, bf16_to_f32, f32_to_bf16};
+    use super::super::bf16_utils::{bf16_to_f32, f32_to_bf16, make_bf16_vec};
     use super::super::max_sglang_violation;
 
     fn make_bf16(v: f32) -> u16 {
@@ -395,17 +481,26 @@ mod tests {
         let mut k = make_bf16_vec(&k_f32);
         let positions = vec![5i64];
 
-        rope_neox_bf16(&mut q, &mut k, &cache, &positions, 1, 1, 1, 1, head_dim, rotary_dim);
+        rope_neox_bf16(
+            &mut q, &mut k, &cache, &positions, 1, 1, 1, 1, head_dim, rotary_dim,
+        );
 
         // Compare with scalar reference
         let mut q_ref: Vec<f32> = q_f32.iter().map(|&v| bf16_to_f32(f32_to_bf16(v))).collect();
-        let cos: Vec<f32> = (0..embed_dim).map(|i| bf16_to_f32(cache[5 * rotary_dim + i])).collect();
-        let sin: Vec<f32> = (0..embed_dim).map(|i| bf16_to_f32(cache[5 * rotary_dim + embed_dim + i])).collect();
+        let cos: Vec<f32> = (0..embed_dim)
+            .map(|i| bf16_to_f32(cache[5 * rotary_dim + i]))
+            .collect();
+        let sin: Vec<f32> = (0..embed_dim)
+            .map(|i| bf16_to_f32(cache[5 * rotary_dim + embed_dim + i]))
+            .collect();
         rope_ref_f32(&mut q_ref, &cos, &sin, embed_dim);
 
         let actual: Vec<f32> = q.iter().map(|&v| bf16_to_f32(v)).collect();
         let violation = max_sglang_violation(&actual, &q_ref);
-        assert!(violation <= 0.0, "rope scalar worst violation={violation:.6} (SGLang atol=1e-2, rtol=1e-2)");
+        assert!(
+            violation <= 0.0,
+            "rope scalar worst violation={violation:.6} (SGLang atol=1e-2, rtol=1e-2)"
+        );
     }
 
     #[test]
@@ -433,12 +528,26 @@ mod tests {
                 let cache_off = pos * rotary_dim;
                 let embed_dim = rotary_dim / 2;
                 for h in 0..num_heads {
-                    let off = b * seq_len * num_heads * head_dim + s * num_heads * head_dim + h * head_dim;
-                    rope_neox_row_scalar(&mut q_scalar[off..off + head_dim], &cache, cache_off, embed_dim);
+                    let off = b * seq_len * num_heads * head_dim
+                        + s * num_heads * head_dim
+                        + h * head_dim;
+                    rope_neox_row_scalar(
+                        &mut q_scalar[off..off + head_dim],
+                        &cache,
+                        cache_off,
+                        embed_dim,
+                    );
                 }
                 for h in 0..num_kv_heads {
-                    let off = b * seq_len * num_kv_heads * head_dim + s * num_kv_heads * head_dim + h * head_dim;
-                    rope_neox_row_scalar(&mut k_scalar[off..off + head_dim], &cache, cache_off, embed_dim);
+                    let off = b * seq_len * num_kv_heads * head_dim
+                        + s * num_kv_heads * head_dim
+                        + h * head_dim;
+                    rope_neox_row_scalar(
+                        &mut k_scalar[off..off + head_dim],
+                        &cache,
+                        cache_off,
+                        embed_dim,
+                    );
                 }
             }
         }
@@ -447,8 +556,16 @@ mod tests {
         let mut q_dispatch = make_bf16_vec(&q_f32);
         let mut k_dispatch = make_bf16_vec(&k_f32);
         rope_neox_bf16(
-            &mut q_dispatch, &mut k_dispatch, &cache, &positions,
-            batch_size, seq_len, num_heads, num_kv_heads, head_dim, rotary_dim,
+            &mut q_dispatch,
+            &mut k_dispatch,
+            &cache,
+            &positions,
+            batch_size,
+            seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
         );
 
         assert_eq!(q_scalar, q_dispatch, "Q dispatch should match scalar");
@@ -469,13 +586,27 @@ mod tests {
         let q_orig = q.clone();
         let positions = vec![3i64];
 
-        rope_neox_bf16(&mut q, &mut k, &cache, &positions, 1, 1, 1, 1, head_dim, rotary_dim);
+        rope_neox_bf16(
+            &mut q, &mut k, &cache, &positions, 1, 1, 1, 1, head_dim, rotary_dim,
+        );
 
         // Split-half: first half [0..embed_dim] and second half [embed_dim..rotary_dim] should be modified
-        assert_ne!(&q[..embed_dim], &q_orig[..embed_dim], "first half should change");
-        assert_ne!(&q[embed_dim..rotary_dim], &q_orig[embed_dim..rotary_dim], "second half should change");
+        assert_ne!(
+            &q[..embed_dim],
+            &q_orig[..embed_dim],
+            "first half should change"
+        );
+        assert_ne!(
+            &q[embed_dim..rotary_dim],
+            &q_orig[embed_dim..rotary_dim],
+            "second half should change"
+        );
         // Elements beyond rotary_dim should be unchanged
-        assert_eq!(&q[rotary_dim..], &q_orig[rotary_dim..], "non-rotary part should be unchanged");
+        assert_eq!(
+            &q[rotary_dim..],
+            &q_orig[rotary_dim..],
+            "non-rotary part should be unchanged"
+        );
     }
 
     /// Verify RoPE at realistic model dimensions against F32 scalar reference.
@@ -504,11 +635,21 @@ mod tests {
             let cache_off = pos * rotary_dim;
             for h in 0..num_heads {
                 let off = s * num_heads * head_dim + h * head_dim;
-                rope_neox_row_scalar(&mut q_ref[off..off + head_dim], &cache, cache_off, embed_dim);
+                rope_neox_row_scalar(
+                    &mut q_ref[off..off + head_dim],
+                    &cache,
+                    cache_off,
+                    embed_dim,
+                );
             }
             for h in 0..num_kv_heads {
                 let off = s * num_kv_heads * head_dim + h * head_dim;
-                rope_neox_row_scalar(&mut k_ref[off..off + head_dim], &cache, cache_off, embed_dim);
+                rope_neox_row_scalar(
+                    &mut k_ref[off..off + head_dim],
+                    &cache,
+                    cache_off,
+                    embed_dim,
+                );
             }
         }
 
@@ -516,8 +657,16 @@ mod tests {
         let mut q_disp = make_bf16_vec(&q_f32);
         let mut k_disp = make_bf16_vec(&k_f32);
         rope_neox_bf16(
-            &mut q_disp, &mut k_disp, &cache, &positions,
-            1, seq_len, num_heads, num_kv_heads, head_dim, rotary_dim,
+            &mut q_disp,
+            &mut k_disp,
+            &cache,
+            &positions,
+            1,
+            seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
         );
 
         // Compare element-by-element (SGLang tolerance)
@@ -580,16 +729,24 @@ mod tests {
         let mut k = k_orig.clone();
         let positions = vec![5i64];
 
-        rope_neox_f32(&mut q, &mut k, &cache, &positions, 1, 1, 1, 1, head_dim, rotary_dim);
+        rope_neox_f32(
+            &mut q, &mut k, &cache, &positions, 1, 1, 1, 1, head_dim, rotary_dim,
+        );
 
         let mut q_ref = q_orig.clone();
         let cos: Vec<f32> = (0..embed_dim).map(|i| cache[5 * rotary_dim + i]).collect();
-        let sin: Vec<f32> = (0..embed_dim).map(|i| cache[5 * rotary_dim + embed_dim + i]).collect();
+        let sin: Vec<f32> = (0..embed_dim)
+            .map(|i| cache[5 * rotary_dim + embed_dim + i])
+            .collect();
         rope_ref_f32(&mut q_ref, &cos, &sin, embed_dim);
 
         for i in 0..head_dim {
-            assert!((q[i] - q_ref[i]).abs() < 1e-6,
-                "F32 RoPE Q mismatch at {i}: got {}, expected {}", q[i], q_ref[i]);
+            assert!(
+                (q[i] - q_ref[i]).abs() < 1e-6,
+                "F32 RoPE Q mismatch at {i}: got {}, expected {}",
+                q[i],
+                q_ref[i]
+            );
         }
     }
 
@@ -617,12 +774,26 @@ mod tests {
                 let pos = positions[b * seq_len + s] as usize;
                 let cache_off = pos * rotary_dim;
                 for h in 0..num_heads {
-                    let off = b * seq_len * num_heads * head_dim + s * num_heads * head_dim + h * head_dim;
-                    rope_neox_row_f32_scalar(&mut q_scalar[off..off + head_dim], &cache, cache_off, embed_dim);
+                    let off = b * seq_len * num_heads * head_dim
+                        + s * num_heads * head_dim
+                        + h * head_dim;
+                    rope_neox_row_f32_scalar(
+                        &mut q_scalar[off..off + head_dim],
+                        &cache,
+                        cache_off,
+                        embed_dim,
+                    );
                 }
                 for h in 0..num_kv_heads {
-                    let off = b * seq_len * num_kv_heads * head_dim + s * num_kv_heads * head_dim + h * head_dim;
-                    rope_neox_row_f32_scalar(&mut k_scalar[off..off + head_dim], &cache, cache_off, embed_dim);
+                    let off = b * seq_len * num_kv_heads * head_dim
+                        + s * num_kv_heads * head_dim
+                        + h * head_dim;
+                    rope_neox_row_f32_scalar(
+                        &mut k_scalar[off..off + head_dim],
+                        &cache,
+                        cache_off,
+                        embed_dim,
+                    );
                 }
             }
         }
@@ -630,17 +801,33 @@ mod tests {
         let mut q_dispatch = q_f32.clone();
         let mut k_dispatch = k_f32.clone();
         rope_neox_f32(
-            &mut q_dispatch, &mut k_dispatch, &cache, &positions,
-            batch_size, seq_len, num_heads, num_kv_heads, head_dim, rotary_dim,
+            &mut q_dispatch,
+            &mut k_dispatch,
+            &cache,
+            &positions,
+            batch_size,
+            seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
         );
 
         for i in 0..n_q {
-            assert!((q_scalar[i] - q_dispatch[i]).abs() < 1e-6,
-                "F32 Q dispatch mismatch at {i}: scalar={}, dispatch={}", q_scalar[i], q_dispatch[i]);
+            assert!(
+                (q_scalar[i] - q_dispatch[i]).abs() < 1e-6,
+                "F32 Q dispatch mismatch at {i}: scalar={}, dispatch={}",
+                q_scalar[i],
+                q_dispatch[i]
+            );
         }
         for i in 0..n_k {
-            assert!((k_scalar[i] - k_dispatch[i]).abs() < 1e-6,
-                "F32 K dispatch mismatch at {i}: scalar={}, dispatch={}", k_scalar[i], k_dispatch[i]);
+            assert!(
+                (k_scalar[i] - k_dispatch[i]).abs() < 1e-6,
+                "F32 K dispatch mismatch at {i}: scalar={}, dispatch={}",
+                k_scalar[i],
+                k_dispatch[i]
+            );
         }
     }
 
@@ -676,28 +863,54 @@ mod tests {
             let cache_off = s * rotary_dim;
             for h in 0..num_heads {
                 let off = s * num_heads * head_dim + h * head_dim;
-                rope_neox_row_f32_scalar(&mut q_ref[off..off + head_dim], &cache, cache_off, embed_dim);
+                rope_neox_row_f32_scalar(
+                    &mut q_ref[off..off + head_dim],
+                    &cache,
+                    cache_off,
+                    embed_dim,
+                );
             }
             for h in 0..num_kv_heads {
                 let off = s * num_kv_heads * head_dim + h * head_dim;
-                rope_neox_row_f32_scalar(&mut k_ref[off..off + head_dim], &cache, cache_off, embed_dim);
+                rope_neox_row_f32_scalar(
+                    &mut k_ref[off..off + head_dim],
+                    &cache,
+                    cache_off,
+                    embed_dim,
+                );
             }
         }
 
         let mut q_disp = q_f32.clone();
         let mut k_disp = k_f32.clone();
         rope_neox_f32(
-            &mut q_disp, &mut k_disp, &cache, &positions,
-            1, seq_len, num_heads, num_kv_heads, head_dim, rotary_dim,
+            &mut q_disp,
+            &mut k_disp,
+            &cache,
+            &positions,
+            1,
+            seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
         );
 
         for i in 0..n_q {
-            assert!((q_disp[i] - q_ref[i]).abs() < 1e-5,
-                "{label} Q mismatch at {i}: dispatch={}, ref={}", q_disp[i], q_ref[i]);
+            assert!(
+                (q_disp[i] - q_ref[i]).abs() < 1e-5,
+                "{label} Q mismatch at {i}: dispatch={}, ref={}",
+                q_disp[i],
+                q_ref[i]
+            );
         }
         for i in 0..n_k {
-            assert!((k_disp[i] - k_ref[i]).abs() < 1e-5,
-                "{label} K mismatch at {i}: dispatch={}, ref={}", k_disp[i], k_ref[i]);
+            assert!(
+                (k_disp[i] - k_ref[i]).abs() < 1e-5,
+                "{label} K mismatch at {i}: dispatch={}, ref={}",
+                k_disp[i],
+                k_ref[i]
+            );
         }
     }
 }

@@ -1,5 +1,5 @@
-pub mod config;
 pub mod commons;
+pub mod config;
 mod forward;
 pub mod gemma3;
 pub mod gemma4;
@@ -8,8 +8,6 @@ pub mod qwen3_5;
 pub mod qwen3_moe;
 pub mod qwen3_next;
 pub(crate) mod registry;
-
-
 
 pub(crate) use forward::{
     ClassifierModel, EmbeddingModel, KvCacheModel, LogitsSplitModel, ModelForward,

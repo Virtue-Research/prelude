@@ -1,22 +1,20 @@
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::tensor::{DType, Module, Result, Tensor};
 use crate::loading::var_builder::VarBuilder;
 use crate::models::commons::embedding::Embedding;
 use crate::models::config::Qwen3Config;
+use crate::tensor::{DType, Module, Result, Tensor};
 use serde::Deserialize;
 
 use crate::models::commons::{BatchAttnContext, BatchState, LayerAttnContext};
-use crate::models::commons::{
-    Linear, RmsNorm, RotaryEmbedding,
-    last_token_select,
-};
-use crate::profiling::{nvtx_push, nvtx_pop};
+use crate::models::commons::{Linear, RmsNorm, RotaryEmbedding, last_token_select};
+use crate::profiling::{nvtx_pop, nvtx_push};
 
-use crate::models::{ClassifierModel, EmbeddingModel, KvCacheModel, LogitsSplitModel, ModelForward};
 use crate::cache::kv_buf::KvBuf;
+use crate::models::{
+    ClassifierModel, EmbeddingModel, KvCacheModel, LogitsSplitModel, ModelForward,
+};
 
 // ============================================================================
 // Attention
@@ -28,8 +26,6 @@ pub(crate) struct Qwen3Attention {
     k_proj: Linear,
     v_proj: Linear,
     o_proj: Linear,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
     q_norm_weight: Tensor,
     k_norm_weight: Tensor,
     rms_norm_eps: f64,
@@ -38,7 +34,6 @@ pub(crate) struct Qwen3Attention {
     head_dim: usize,
     hidden_size: usize,
     rotary_emb: Arc<RotaryEmbedding>,
-    is_cuda: bool,
     softmax_scale: f32,
     qkv_proj: Option<Linear>,
     // CPU KV cache for decode (populated by forward_with_cache)
@@ -63,11 +58,8 @@ impl Qwen3Attention {
 
         let q_norm_vb = vb.pp("q_norm");
         let q_norm_weight_raw = q_norm_vb.get(head_dim, "weight")?;
-        let q_norm = RmsNorm::from_weight(q_norm_weight_raw.clone(), cfg.rms_norm_eps);
         let k_norm_vb = vb.pp("k_norm");
         let k_norm_weight = k_norm_vb.get(head_dim, "weight")?;
-        let k_norm = RmsNorm::from_weight(k_norm_weight.clone(), cfg.rms_norm_eps);
-        let is_cuda = vb.device().is_cuda();
 
         let q_proj = Linear::load(
             vb.pp("q_proj"),
@@ -98,8 +90,7 @@ impl Qwen3Attention {
             let qw = q_proj.weight();
             let eligible = qw.device().is_cuda() || qw.dtype() == DType::BF16;
             if eligible {
-                let merged_w =
-                    Tensor::cat(&[qw, k_proj.weight(), v_proj.weight()], 0)?;
+                let merged_w = Tensor::cat(&[qw, k_proj.weight(), v_proj.weight()], 0)?;
                 match Linear::from_weight(merged_w, None) {
                     Ok(l) => Some(l),
                     Err(e) => {
@@ -124,8 +115,6 @@ impl Qwen3Attention {
                 cfg.hidden_size,
                 cfg.attention_bias,
             )?,
-            q_norm,
-            k_norm,
             q_norm_weight: q_norm_weight_raw,
             k_norm_weight,
             rms_norm_eps: cfg.rms_norm_eps,
@@ -134,7 +123,6 @@ impl Qwen3Attention {
             head_dim,
             hidden_size,
             rotary_emb,
-            is_cuda,
             softmax_scale: 1.0 / (head_dim as f32).sqrt(),
             qkv_proj,
             k_cache: KvBuf::new(),
@@ -146,13 +134,25 @@ impl Qwen3Attention {
 
     /// Project Q, K, V and reshape to `[total_tokens, H, D]` (varlen layout).
     #[inline]
-    fn fused_qkv_projection(&self, x: &Tensor, total: usize, ctx: &BatchState, ops: &dyn crate::ops::Ops) -> Result<(Tensor, Tensor, Tensor)> {
+    fn fused_qkv_projection(
+        &self,
+        x: &Tensor,
+        total: usize,
+        ctx: &BatchState,
+        ops: &dyn crate::ops::Ops,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         crate::models::commons::attn_utils::fused_qkv_projection(
             x,
-            &self.q_proj, &self.k_proj, &self.v_proj,
+            &self.q_proj,
+            &self.k_proj,
+            &self.v_proj,
             self.qkv_proj.as_ref(),
-            total, self.num_heads, self.num_kv_heads, self.head_dim,
-            ctx, ops,
+            total,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            ctx,
+            ops,
         )
     }
 
@@ -169,12 +169,19 @@ impl Qwen3Attention {
 
         // QK-norm + RoPE + optional cache write (OpsBundle picks optimal fuse path)
         nvtx_push!("attn_qknorm_rope_cache");
-        let kv_cache = ctx.paged_kv.map(|kv| (kv.key_cache, kv.value_cache, kv.slot_mapping));
+        let kv_cache = ctx
+            .paged_kv
+            .map(|kv| (kv.key_cache, kv.value_cache, kv.slot_mapping));
         let (q, k) = ops.qknorm_rope_and_cache(
-            &q, &k, &v,
-            &self.q_norm_weight, &self.k_norm_weight,
-            &self.rotary_emb.cos, &self.rotary_emb.sin,
-            ctx.position_ids, self.rms_norm_eps as f32,
+            &q,
+            &k,
+            &v,
+            &self.q_norm_weight,
+            &self.k_norm_weight,
+            &self.rotary_emb.cos,
+            &self.rotary_emb.sin,
+            ctx.position_ids,
+            self.rms_norm_eps as f32,
             kv_cache,
         )?;
         nvtx_pop!();
@@ -182,23 +189,43 @@ impl Qwen3Attention {
         // Attention
         nvtx_push!("attn_kernel");
         let attn_out = if let Some(kv) = ctx.paged_kv {
-            ops.paged_attention(&q, kv.key_cache, kv.value_cache, &crate::ops::PagedParams {
-                block_tables: kv.block_tables,
-                cu_seqlens_q: ctx.cu_seqlens_q, cu_seqlens_k: kv.cu_seqlens_k,
-                max_seqlen_q: ctx.max_seqlen_q, max_seqlen_k: kv.max_seqlen_k,
-                scale: self.softmax_scale, mask: crate::ops::MaskType::Causal, softcap: None,
-            })?
+            ops.paged_attention(
+                &q,
+                kv.key_cache,
+                kv.value_cache,
+                &crate::ops::PagedParams {
+                    block_tables: kv.block_tables,
+                    cu_seqlens_q: ctx.cu_seqlens_q,
+                    cu_seqlens_k: kv.cu_seqlens_k,
+                    max_seqlen_q: ctx.max_seqlen_q,
+                    max_seqlen_k: kv.max_seqlen_k,
+                    scale: self.softmax_scale,
+                    mask: crate::ops::MaskType::Causal,
+                    softcap: None,
+                },
+            )?
         } else {
-            ops.varlen_attention(&q, &k, &v, &crate::ops::VarlenParams {
-                cu_seqlens_q: ctx.cu_seqlens_q, cu_seqlens_k: ctx.cu_seqlens_q,
-                max_seqlen_q: ctx.max_seqlen_q, max_seqlen_k: ctx.max_seqlen_q,
-                scale: self.softmax_scale, mask: crate::ops::MaskType::Causal, softcap: None,
-            })?
+            ops.varlen_attention(
+                &q,
+                &k,
+                &v,
+                &crate::ops::VarlenParams {
+                    cu_seqlens_q: ctx.cu_seqlens_q,
+                    cu_seqlens_k: ctx.cu_seqlens_q,
+                    max_seqlen_q: ctx.max_seqlen_q,
+                    max_seqlen_k: ctx.max_seqlen_q,
+                    scale: self.softmax_scale,
+                    mask: crate::ops::MaskType::Causal,
+                    softcap: None,
+                },
+            )?
         };
         nvtx_pop!();
 
         nvtx_push!("attn_o_proj");
-        let r = self.o_proj.forward(&attn_out.reshape((total_q, self.hidden_size))?, &bs, ops);
+        let r = self
+            .o_proj
+            .forward(&attn_out.reshape((total_q, self.hidden_size))?, &bs, ops);
         nvtx_pop!();
         r
     }
@@ -216,15 +243,19 @@ impl Qwen3Attention {
         // ── Tensor-based path ──
         let ops = crate::ops::select_ops(x.device());
         let (q, k, v) = self.fused_qkv_projection(x, seq_len, &bs, ops)?;
-        let position_ids: Vec<u32> =
-            (0..seq_len).map(|i| (position_offset + i) as u32).collect();
+        let position_ids: Vec<u32> = (0..seq_len).map(|i| (position_offset + i) as u32).collect();
         let position_ids = Tensor::from_vec(position_ids, (seq_len,), x.device())?;
         let (q, k) = ops.qknorm_rope_and_cache(
-            &q, &k, &v,
-            &self.q_norm_weight, &self.k_norm_weight,
-            &self.rotary_emb.cos, &self.rotary_emb.sin,
-            &position_ids, self.rms_norm_eps as f32,
-            None,  // no paged KV cache
+            &q,
+            &k,
+            &v,
+            &self.q_norm_weight,
+            &self.k_norm_weight,
+            &self.rotary_emb.cos,
+            &self.rotary_emb.sin,
+            &position_ids,
+            self.rms_norm_eps as f32,
+            None, // no paged KV cache
         )?;
 
         self.k_cache.append(&k)?;
@@ -232,14 +263,11 @@ impl Qwen3Attention {
         let k_full = self.k_cache.view()?;
         let v_full = self.v_cache.view()?;
 
-        let attn_out = self.matmul_cross_attention(
-            &q, &k_full, &v_full, seq_len, position_offset,
-        )?;
+        let attn_out =
+            self.matmul_cross_attention(&q, &k_full, &v_full, seq_len, position_offset)?;
 
-        self.o_proj.forward(
-            &attn_out.reshape((seq_len, self.hidden_size))?,
-            &bs, ops,
-        )
+        self.o_proj
+            .forward(&attn_out.reshape((seq_len, self.hidden_size))?, &bs, ops)
     }
 
     /// Matmul-based cross-attention for decode: Q attends to full KV cache.
@@ -279,7 +307,12 @@ impl Qwen3Attention {
         // Expand K,V for GQA: [H_kv, T, D] -> [H, T, D]
         let k3 = if num_kv_groups > 1 {
             k3.unsqueeze(1)?
-                .expand((self.num_kv_heads, num_kv_groups, total_kv_len, self.head_dim))?
+                .expand((
+                    self.num_kv_heads,
+                    num_kv_groups,
+                    total_kv_len,
+                    self.head_dim,
+                ))?
                 .reshape((self.num_heads, total_kv_len, self.head_dim))?
                 .contiguous()?
         } else {
@@ -287,7 +320,12 @@ impl Qwen3Attention {
         };
         let v3 = if num_kv_groups > 1 {
             v3.unsqueeze(1)?
-                .expand((self.num_kv_heads, num_kv_groups, total_kv_len, self.head_dim))?
+                .expand((
+                    self.num_kv_heads,
+                    num_kv_groups,
+                    total_kv_len,
+                    self.head_dim,
+                ))?
                 .reshape((self.num_heads, total_kv_len, self.head_dim))?
                 .contiguous()?
         } else {
@@ -305,7 +343,11 @@ impl Qwen3Attention {
                 .flat_map(|qi| {
                     let qi_abs = position_offset + qi;
                     (0..total_kv_len).map(move |ki| {
-                        if ki <= qi_abs { 0.0f32 } else { f32::NEG_INFINITY }
+                        if ki <= qi_abs {
+                            0.0f32
+                        } else {
+                            f32::NEG_INFINITY
+                        }
                     })
                 })
                 .collect();
@@ -347,9 +389,24 @@ struct GatedMlp {
 
 impl GatedMlp {
     fn new(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = Linear::load(vb.pp("gate_proj"), cfg.hidden_size, cfg.intermediate_size, false)?;
-        let up_proj = Linear::load(vb.pp("up_proj"), cfg.hidden_size, cfg.intermediate_size, false)?;
-        let down_proj = Linear::load(vb.pp("down_proj"), cfg.intermediate_size, cfg.hidden_size, false)?;
+        let gate_proj = Linear::load(
+            vb.pp("gate_proj"),
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            false,
+        )?;
+        let up_proj = Linear::load(
+            vb.pp("up_proj"),
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            false,
+        )?;
+        let down_proj = Linear::load(
+            vb.pp("down_proj"),
+            cfg.intermediate_size,
+            cfg.hidden_size,
+            false,
+        )?;
 
         let gate_up_proj = {
             let gw = gate_proj.weight();
@@ -361,7 +418,12 @@ impl GatedMlp {
             }
         };
 
-        Ok(Self { gate_proj, up_proj, down_proj, gate_up_proj })
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+            gate_up_proj,
+        })
     }
 
     fn forward(&self, x: &Tensor, ops: &dyn crate::ops::Ops) -> Result<Tensor> {
@@ -406,24 +468,55 @@ impl DecoderLayer {
     ) -> Result<Self> {
         let self_attn = Qwen3Attention::new(cfg, rotary, vb.pp("self_attn"))?;
         let mlp = GatedMlp::new(cfg, vb.pp("mlp"))?;
-        let input_layernorm = RmsNorm::load(vb.pp("input_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let post_attention_layernorm = RmsNorm::load(vb.pp("post_attention_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        Ok(Self { self_attn, mlp, input_layernorm, post_attention_layernorm })
+        let input_layernorm =
+            RmsNorm::load(vb.pp("input_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let post_attention_layernorm = RmsNorm::load(
+            vb.pp("post_attention_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+        })
     }
 
-    fn forward(&self, hidden: &Tensor, residual: Option<&Tensor>, ctx: &LayerAttnContext) -> Result<(Tensor, Tensor)> {
+    fn forward(
+        &self,
+        hidden: &Tensor,
+        residual: Option<&Tensor>,
+        ctx: &LayerAttnContext,
+    ) -> Result<(Tensor, Tensor)> {
         let ops = ctx.ops;
-        let (residual, hidden) = self.input_layernorm.forward_residual(hidden, residual, ops)?;
+        let (residual, hidden) = self
+            .input_layernorm
+            .forward_residual(hidden, residual, ops)?;
         let hidden = self.self_attn.forward(&hidden, ctx)?;
-        let (residual, hidden) = self.post_attention_layernorm.forward_residual(&hidden, Some(&residual), ops)?;
+        let (residual, hidden) =
+            self.post_attention_layernorm
+                .forward_residual(&hidden, Some(&residual), ops)?;
         let hidden = self.mlp.forward(&hidden, ops)?;
         Ok((hidden, residual))
     }
 
-    fn forward_with_cache(&mut self, hidden: &Tensor, residual: Option<&Tensor>, ops: &dyn crate::ops::Ops, position_offset: usize) -> Result<(Tensor, Tensor)> {
-        let (residual, hidden) = self.input_layernorm.forward_residual(hidden, residual, ops)?;
-        let hidden = self.self_attn.forward_with_cache(&hidden, position_offset)?;
-        let (residual, hidden) = self.post_attention_layernorm.forward_residual(&hidden, Some(&residual), ops)?;
+    fn forward_with_cache(
+        &mut self,
+        hidden: &Tensor,
+        residual: Option<&Tensor>,
+        ops: &dyn crate::ops::Ops,
+        position_offset: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let (residual, hidden) = self
+            .input_layernorm
+            .forward_residual(hidden, residual, ops)?;
+        let hidden = self
+            .self_attn
+            .forward_with_cache(&hidden, position_offset)?;
+        let (residual, hidden) =
+            self.post_attention_layernorm
+                .forward_residual(&hidden, Some(&residual), ops)?;
         let hidden = self.mlp.forward(&hidden, ops)?;
         Ok((hidden, residual))
     }
@@ -467,12 +560,7 @@ impl Model {
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
-            layers.push(DecoderLayer::new(
-                cfg,
-                rotary.clone(),
-                layers_vb.pp(i),
-                i,
-            )?);
+            layers.push(DecoderLayer::new(cfg, rotary.clone(), layers_vb.pp(i), i)?);
         }
         let norm = RmsNorm::load(norm_vb, cfg.hidden_size, cfg.rms_norm_eps)?;
         Ok(Self {
@@ -498,12 +586,15 @@ impl Model {
         let mut residual: Option<Tensor> = None;
         for (_i, layer) in self.layers.iter_mut().enumerate() {
             nvtx_push!("layer[{}]", _i);
-            let (h, r) = layer.forward_with_cache(&hidden, residual.as_ref(), ops, position_offset)?;
+            let (h, r) =
+                layer.forward_with_cache(&hidden, residual.as_ref(), ops, position_offset)?;
             hidden = h;
             residual = Some(r);
             nvtx_pop!();
         }
-        let (_, normed) = self.norm.forward_residual(&hidden, residual.as_ref(), ops)?;
+        let (_, normed) = self
+            .norm
+            .forward_residual(&hidden, residual.as_ref(), ops)?;
         Ok(normed)
     }
 
@@ -525,7 +616,9 @@ impl Model {
             residual = Some(r);
             nvtx_pop!();
         }
-        let (_, normed) = self.norm.forward_residual(&hidden, residual.as_ref(), ctx.ops)?;
+        let (_, normed) = self
+            .norm
+            .forward_residual(&hidden, residual.as_ref(), ctx.ops)?;
         Ok(normed)
     }
 }
@@ -556,7 +649,8 @@ impl Qwen3ModelForCausalLM {
         let bs = BatchState::no_lora();
         self.lm_head.forward(
             &last_token_select(hidden, seq_lens)?.unsqueeze(1)?,
-            &bs, crate::ops::select_ops(hidden.device()),
+            &bs,
+            crate::ops::select_ops(hidden.device()),
         )
     }
 
@@ -572,7 +666,9 @@ impl Qwen3ModelForCausalLM {
         input_ids: &Tensor,
         position_offset: usize,
     ) -> Result<Tensor> {
-        let hidden = self.base.forward_with_cache(ops, input_ids, position_offset)?;
+        let hidden = self
+            .base
+            .forward_with_cache(ops, input_ids, position_offset)?;
         self.lm_head.forward(&hidden, &BatchState::no_lora(), ops)
     }
 
@@ -621,7 +717,11 @@ impl Qwen3ForSequenceClassification {
 
     pub fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> Result<Tensor> {
         let hidden_states = self.base.forward(packed_input, ctx)?;
-        self.score.forward(&last_token_select(&hidden_states, ctx.seq_lens)?, &BatchState::no_lora(), ctx.ops)
+        self.score.forward(
+            &last_token_select(&hidden_states, ctx.seq_lens)?,
+            &BatchState::no_lora(),
+            ctx.ops,
+        )
     }
 
     pub fn get_label(&self, class_idx: usize) -> Option<String> {
@@ -679,7 +779,11 @@ impl LogitsSplitModel for Qwen3ModelForCausalLM {
     }
 
     fn compute_logits(&self, hidden: &Tensor) -> crate::tensor::Result<Tensor> {
-        self.lm_head.forward(hidden, &BatchState::no_lora(), crate::ops::select_ops(hidden.device()))
+        self.lm_head.forward(
+            hidden,
+            &BatchState::no_lora(),
+            crate::ops::select_ops(hidden.device()),
+        )
     }
 }
 
@@ -689,7 +793,12 @@ impl KvCacheModel for Qwen3ModelForCausalLM {
         input_ids: &Tensor,
         position_offset: usize,
     ) -> crate::tensor::Result<Tensor> {
-        Qwen3ModelForCausalLM::forward_with_cache(self, crate::ops::select_ops(input_ids.device()), input_ids, position_offset)
+        Qwen3ModelForCausalLM::forward_with_cache(
+            self,
+            crate::ops::select_ops(input_ids.device()),
+            input_ids,
+            position_offset,
+        )
     }
 }
 
@@ -778,9 +887,9 @@ impl ModelForward for Qwen3ForEmbedding {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::Device;
     use crate::loading::var_builder::VarBuilder;
     use crate::models::commons::BatchAttnContext;
+    use crate::tensor::Device;
 
     fn tiny_config() -> Qwen3Config {
         serde_json::from_value(serde_json::json!({
@@ -817,12 +926,20 @@ mod tests {
         let seq_len = tokens.len();
         let input = Tensor::from_vec(tokens.to_vec(), (seq_len,), device).unwrap();
         let cu = Tensor::from_vec(vec![0u32, seq_len as u32], (2,), device).unwrap();
-        let pos = Tensor::from_vec((0..seq_len as u32).collect::<Vec<_>>(), (seq_len,), device).unwrap();
+        let pos =
+            Tensor::from_vec((0..seq_len as u32).collect::<Vec<_>>(), (seq_len,), device).unwrap();
         let seq_lens = vec![seq_len];
         let ops = crate::ops::select_ops(device);
         let mut ctx = BatchAttnContext {
-            ops, cu_seqlens_q: &cu, max_seqlen_q: seq_len, position_ids: &pos,
-            seq_lens: &seq_lens, paged_kv: None, deltanet_pool: None, deltanet_slots: None, deltanet_slots_gpu: None,
+            ops,
+            cu_seqlens_q: &cu,
+            max_seqlen_q: seq_len,
+            position_ids: &pos,
+            seq_lens: &seq_lens,
+            paged_kv: None,
+            deltanet_pool: None,
+            deltanet_slots: None,
+            deltanet_slots_gpu: None,
         };
         let logits = model.forward(&input, &mut ctx).unwrap();
         model.clear_kv_cache();
@@ -838,13 +955,22 @@ mod tests {
         let seq_len = tokens.len();
         let std_logits = forward_standard(&mut model, &tokens, &device);
         let input = Tensor::from_vec(tokens, (seq_len,), &device).unwrap();
-        let cached_logits = model.forward_with_cache(crate::ops::select_ops(&device), &input, 0).unwrap();
+        let cached_logits = model
+            .forward_with_cache(crate::ops::select_ops(&device), &input, 0)
+            .unwrap();
         model.clear_kv_cache();
         let std_flat: Vec<f32> = std_logits.flatten_all().unwrap().to_vec1().unwrap();
         let cached_last: Vec<f32> = cached_logits.get(seq_len - 1).unwrap().to_vec1().unwrap();
         assert_eq!(std_flat.len(), cached_last.len(), "vocab size mismatch");
-        let max_diff = std_flat.iter().zip(cached_last.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        assert!(max_diff < 1e-4, "prefill logits max diff = {max_diff} (threshold 1e-4)");
+        let max_diff = std_flat
+            .iter()
+            .zip(cached_last.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "prefill logits max diff = {max_diff} (threshold 1e-4)"
+        );
     }
 
     #[test]
@@ -857,14 +983,25 @@ mod tests {
         let ref_logits = forward_standard(&mut model, &full_seq, &device);
         let ref_flat: Vec<f32> = ref_logits.flatten_all().unwrap().to_vec1().unwrap();
         let prompt_input = Tensor::from_vec(prompt.clone(), (prompt.len(),), &device).unwrap();
-        let _prefill = model.forward_with_cache(crate::ops::select_ops(&device), &prompt_input, 0).unwrap();
+        let _prefill = model
+            .forward_with_cache(crate::ops::select_ops(&device), &prompt_input, 0)
+            .unwrap();
         let decode_input = Tensor::from_vec(vec![20u32], (1,), &device).unwrap();
-        let decode_logits = model.forward_with_cache(crate::ops::select_ops(&device), &decode_input, prompt.len()).unwrap();
+        let decode_logits = model
+            .forward_with_cache(crate::ops::select_ops(&device), &decode_input, prompt.len())
+            .unwrap();
         model.clear_kv_cache();
         let decode_flat: Vec<f32> = decode_logits.get(0).unwrap().to_vec1().unwrap();
         assert_eq!(ref_flat.len(), decode_flat.len(), "vocab size mismatch");
-        let max_diff = ref_flat.iter().zip(decode_flat.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        assert!(max_diff < 1e-4, "decode logits max diff = {max_diff} (threshold 1e-4)");
+        let max_diff = ref_flat
+            .iter()
+            .zip(decode_flat.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "decode logits max diff = {max_diff} (threshold 1e-4)"
+        );
     }
 
     #[test]
@@ -874,15 +1011,26 @@ mod tests {
         let device = Device::Cpu;
         let tokens = vec![1u32, 5, 10];
         let input = Tensor::from_vec(tokens, (3,), &device).unwrap();
-        let logits1 = model.forward_with_cache(crate::ops::select_ops(&device), &input, 0).unwrap();
+        let logits1 = model
+            .forward_with_cache(crate::ops::select_ops(&device), &input, 0)
+            .unwrap();
         model.clear_kv_cache();
-        let logits2 = model.forward_with_cache(crate::ops::select_ops(&device), &input, 0).unwrap();
+        let logits2 = model
+            .forward_with_cache(crate::ops::select_ops(&device), &input, 0)
+            .unwrap();
         model.clear_kv_cache();
         let v1: Vec<f32> = logits1.flatten_all().unwrap().to_vec1().unwrap();
         let v2: Vec<f32> = logits2.flatten_all().unwrap().to_vec1().unwrap();
         assert_eq!(v1.len(), v2.len());
-        let max_diff = v1.iter().zip(v2.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        assert!(max_diff < 1e-6, "cache clear determinism failed: max diff = {max_diff}");
+        let max_diff = v1
+            .iter()
+            .zip(v2.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-6,
+            "cache clear determinism failed: max diff = {max_diff}"
+        );
     }
 
     #[test]
@@ -892,28 +1040,54 @@ mod tests {
         let device = Device::Cpu;
         let prompt = vec![1u32, 5, 10];
         let prompt_input = Tensor::from_vec(prompt.clone(), (prompt.len(),), &device).unwrap();
-        let prefill_logits = model.forward_with_cache(crate::ops::select_ops(&device), &prompt_input, 0).unwrap();
+        let prefill_logits = model
+            .forward_with_cache(crate::ops::select_ops(&device), &prompt_input, 0)
+            .unwrap();
         let mut generated = vec![
-            prefill_logits.get(prompt.len() - 1).unwrap().argmax(0).unwrap().to_vec0::<u32>().unwrap(),
+            prefill_logits
+                .get(prompt.len() - 1)
+                .unwrap()
+                .argmax(0)
+                .unwrap()
+                .to_vec0::<u32>()
+                .unwrap(),
         ];
         for step in 0..2 {
             let offset = prompt.len() + step;
             let tok = *generated.last().unwrap();
             let input = Tensor::from_vec(vec![tok], (1,), &device).unwrap();
-            let logits = model.forward_with_cache(crate::ops::select_ops(&device), &input, offset).unwrap();
-            generated.push(logits.get(0).unwrap().argmax(0).unwrap().to_vec0::<u32>().unwrap());
+            let logits = model
+                .forward_with_cache(crate::ops::select_ops(&device), &input, offset)
+                .unwrap();
+            generated.push(
+                logits
+                    .get(0)
+                    .unwrap()
+                    .argmax(0)
+                    .unwrap()
+                    .to_vec0::<u32>()
+                    .unwrap(),
+            );
         }
         model.clear_kv_cache();
         let mut ref_generated = Vec::new();
         let mut full_seq = prompt.clone();
         for _step in 0..3 {
             let ref_logits = forward_standard(&mut model, &full_seq, &device);
-            let next = ref_logits.flatten_all().unwrap().argmax(0).unwrap().to_vec0::<u32>().unwrap();
+            let next = ref_logits
+                .flatten_all()
+                .unwrap()
+                .argmax(0)
+                .unwrap()
+                .to_vec0::<u32>()
+                .unwrap();
             ref_generated.push(next);
             full_seq.push(next);
         }
-        assert_eq!(generated, ref_generated,
-            "multi-step decode mismatch: cached={generated:?} vs reforward={ref_generated:?}");
+        assert_eq!(
+            generated, ref_generated,
+            "multi-step decode mismatch: cached={generated:?} vs reforward={ref_generated:?}"
+        );
     }
 }
 
@@ -924,7 +1098,8 @@ mod meta {
     use crate::models::config::Qwen3Config;
 
     use super::{
-        Qwen3ClassifierConfig, Qwen3ForEmbedding, Qwen3ForSequenceClassification, Qwen3ModelForCausalLM,
+        Qwen3ClassifierConfig, Qwen3ForEmbedding, Qwen3ForSequenceClassification,
+        Qwen3ModelForCausalLM,
     };
     use crate::engine::EngineError;
     use crate::engine::{CommonModelConfig, RuntimeCaps, TaskKind, WeightsBackend};
@@ -956,46 +1131,92 @@ mod meta {
 
     pub(crate) struct Qwen3ArchSpec;
     pub(crate) static QWEN3_ARCH_SPEC: Qwen3ArchSpec = Qwen3ArchSpec;
-    inventory::submit!(crate::models::registry::ArchSpecEntry::new(&QWEN3_ARCH_SPEC));
+    inventory::submit!(crate::models::registry::ArchSpecEntry::new(
+        &QWEN3_ARCH_SPEC
+    ));
 
     impl ArchSpec for Qwen3ArchSpec {
-        fn name(&self) -> &'static str { "qwen3" }
-        fn architecture_aliases(&self) -> &'static [&'static str] { ARCHITECTURE_ALIASES }
-        fn model_type_aliases(&self) -> &'static [&'static str] { MODEL_TYPE_ALIASES }
-        fn supported_tasks(&self) -> &'static [TaskKind] { SUPPORTED_TASKS }
+        fn name(&self) -> &'static str {
+            "qwen3"
+        }
+        fn architecture_aliases(&self) -> &'static [&'static str] {
+            ARCHITECTURE_ALIASES
+        }
+        fn model_type_aliases(&self) -> &'static [&'static str] {
+            MODEL_TYPE_ALIASES
+        }
+        fn supported_tasks(&self) -> &'static [TaskKind] {
+            SUPPORTED_TASKS
+        }
 
-        fn parse_config(&self, task: TaskKind, raw: &serde_json::Value, content: &str) -> Result<ParsedModelConfig, EngineError> {
+        fn parse_config(
+            &self,
+            task: TaskKind,
+            raw: &serde_json::Value,
+            content: &str,
+        ) -> Result<ParsedModelConfig, EngineError> {
             match task {
                 TaskKind::Generate => {
                     let cfg = parse_json::<Qwen3Config>(content, "Qwen3 config")?;
                     let common = common_from_qwen3(&cfg);
-                    Ok(ParsedModelConfig { common, deltanet: None, arch_config: Box::new(Qwen3ArchConfig::Dense(cfg)) })
+                    Ok(ParsedModelConfig {
+                        common,
+                        deltanet: None,
+                        arch_config: Box::new(Qwen3ArchConfig::Dense(cfg)),
+                    })
                 }
                 TaskKind::Classify => {
                     let json = inject_num_labels_if_missing(raw);
-                    let cfg = parse_value::<Qwen3ClassifierConfig>(json, "Qwen3 classifier config")?;
+                    let cfg =
+                        parse_value::<Qwen3ClassifierConfig>(json, "Qwen3 classifier config")?;
                     let common = common_from_qwen3(&cfg.base);
-                    Ok(ParsedModelConfig { common, deltanet: None, arch_config: Box::new(Qwen3ArchConfig::Classifier(cfg)) })
+                    Ok(ParsedModelConfig {
+                        common,
+                        deltanet: None,
+                        arch_config: Box::new(Qwen3ArchConfig::Classifier(cfg)),
+                    })
                 }
                 TaskKind::Embed => {
                     let cfg = parse_json::<Qwen3Config>(content, "Qwen3 embedding config")?;
                     let common = common_from_qwen3(&cfg);
-                    Ok(ParsedModelConfig { common, deltanet: None, arch_config: Box::new(Qwen3ArchConfig::Embedding(cfg)) })
+                    Ok(ParsedModelConfig {
+                        common,
+                        deltanet: None,
+                        arch_config: Box::new(Qwen3ArchConfig::Embedding(cfg)),
+                    })
                 }
             }
         }
 
-        fn build_model(&self, arch_config: &dyn std::any::Any, vb: VarBuilder<'_>) -> Result<Box<dyn crate::models::ModelForward>, EngineError> {
-            let cfg = arch_config.downcast_ref::<Qwen3ArchConfig>()
-                .ok_or_else(|| EngineError::Internal("unexpected arch config type for Qwen3".into()))?;
+        fn build_model(
+            &self,
+            arch_config: &dyn std::any::Any,
+            vb: VarBuilder<'_>,
+        ) -> Result<Box<dyn crate::models::ModelForward>, EngineError> {
+            let cfg = arch_config
+                .downcast_ref::<Qwen3ArchConfig>()
+                .ok_or_else(|| {
+                    EngineError::Internal("unexpected arch config type for Qwen3".into())
+                })?;
             match cfg {
-                Qwen3ArchConfig::Dense(c) => Ok(Box::new(Qwen3ModelForCausalLM::new(c, vb).map_err(candle_model_err)?)),
-                Qwen3ArchConfig::Classifier(c) => Ok(Box::new(Qwen3ForSequenceClassification::new(c, vb).map_err(candle_model_err)?)),
-                Qwen3ArchConfig::Embedding(c) => Ok(Box::new(Qwen3ForEmbedding::new(c, vb).map_err(candle_model_err)?)),
+                Qwen3ArchConfig::Dense(c) => Ok(Box::new(
+                    Qwen3ModelForCausalLM::new(c, vb).map_err(candle_model_err)?,
+                )),
+                Qwen3ArchConfig::Classifier(c) => Ok(Box::new(
+                    Qwen3ForSequenceClassification::new(c, vb).map_err(candle_model_err)?,
+                )),
+                Qwen3ArchConfig::Embedding(c) => Ok(Box::new(
+                    Qwen3ForEmbedding::new(c, vb).map_err(candle_model_err)?,
+                )),
             }
         }
 
-        fn runtime_caps(&self, task: TaskKind, backend: WeightsBackend, device: &crate::tensor::Device) -> RuntimeCaps {
+        fn runtime_caps(
+            &self,
+            task: TaskKind,
+            backend: WeightsBackend,
+            device: &crate::tensor::Device,
+        ) -> RuntimeCaps {
             let is_safetensors = backend == WeightsBackend::Safetensors;
             let is_cuda = device.is_cuda();
             let supports_cuda_varlen = is_cuda && is_safetensors;

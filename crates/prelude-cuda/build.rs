@@ -19,8 +19,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use prelude_kernelbuild::nvcc::{
-    compile_cu_to_obj, compile_cu_to_ptx, detect_compute_cap, find_cuda, link_cuda_runtime_dynamic,
-    nvcc_path, ObjCompile, PtxCompile,
+    ObjCompile, PtxCompile, compile_cu_to_obj, compile_cu_to_ptx, detect_compute_cap, find_cuda,
+    link_cuda_runtime_dynamic, nvcc_path,
 };
 
 fn main() {
@@ -50,16 +50,6 @@ fn main() {
         ("kvcache", "scatter_kv_cache.cu", "scatter_kv_cache"),
         ("gdn", "post_conv.cu", "gdn_post_conv"),
         ("logprobs", "gather_log_softmax.cu", "gather_log_softmax"),
-        // General-purpose kernels (ported from candle-kernels for TensorOps)
-        ("candle", "unary.cu", "candle_unary"),
-        ("candle", "binary.cu", "candle_binary"),
-        ("candle", "cast.cu", "candle_cast"),
-        ("candle", "reduce.cu", "candle_reduce"),
-        ("candle", "indexing.cu", "candle_indexing"),
-        ("candle", "ternary.cu", "candle_ternary"),
-        ("candle", "affine.cu", "candle_affine"),
-        ("candle", "fill.cu", "candle_fill"),
-        ("candle", "sort.cu", "candle_sort"),
     ];
 
     // Track common headers for rerun-if-changed
@@ -94,16 +84,8 @@ fn main() {
                 // subdir (e.g. `elementwise/add.cu` includes
                 // `common/common.cuh`). Pass the kernels root as -I so the
                 // relative include resolves.
-                let mut opts = PtxCompile::new(&src, &ptx, compute_cap)
-                    .include(kernels_dir.as_ref().clone());
-
-                // Candle-ported kernels use C++ templates (sort.cu) and need
-                // the candle/ include dir on top of the root.
-                if category == "candle" {
-                    opts = opts
-                        .include(kernels_dir.join("candle"))
-                        .extra_flag("-std=c++17");
-                }
+                let opts =
+                    PtxCompile::new(&src, &ptx, compute_cap).include(kernels_dir.as_ref().clone());
 
                 compile_cu_to_ptx(&nvcc, &opts);
             })
@@ -149,10 +131,8 @@ fn main() {
         // Archive both objects into libmoe_wmma.a so the linker
         // treats it as a normal static lib dependency.
         let moe_lib = out_dir.join("libmoe_wmma.a");
-        let mut ar_args: Vec<String> = vec![
-            "rcs".to_string(),
-            moe_lib.to_str().unwrap().to_string(),
-        ];
+        let mut ar_args: Vec<String> =
+            vec!["rcs".to_string(), moe_lib.to_str().unwrap().to_string()];
         for o in &obj_paths {
             ar_args.push(o.to_str().unwrap().to_string());
         }
@@ -187,7 +167,7 @@ fn main() {
     link_cuda_dialect_runtime(&out_dir, std::path::Path::new(&manifest_dir));
 }
 
-fn link_cuda_dialect_runtime(out_dir: &std::path::Path, manifest_dir: &std::path::Path) {
+fn link_cuda_dialect_runtime(_out_dir: &std::path::Path, manifest_dir: &std::path::Path) {
     let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
 
     // Candidate venv locations — cuLA's venv is inside its OUT_DIR,
@@ -196,9 +176,7 @@ fn link_cuda_dialect_runtime(out_dir: &std::path::Path, manifest_dir: &std::path
 
     // Also scan cuLA's OUT_DIR-based venv. We can't know the exact
     // hash Cargo picks, but we can walk the build dir.
-    let candidates: Vec<std::path::PathBuf> = vec![
-        fa4_venv,
-    ];
+    let candidates: Vec<std::path::PathBuf> = vec![fa4_venv];
 
     // Also look in cuLA build dirs
     let cula_build_dir = workspace_root.join("target");
@@ -214,7 +192,9 @@ fn link_cuda_dialect_runtime(out_dir: &std::path::Path, manifest_dir: &std::path
                         let lib = venv.join("lib/python3.12/site-packages/nvidia_cutlass_dsl/lib");
                         if lib.join("libcuda_dialect_runtime_static.a").exists() {
                             println!("cargo:rustc-link-search=native={}", lib.display());
-                            println!("cargo:rustc-link-lib=static:+whole-archive=cuda_dialect_runtime_static");
+                            println!(
+                                "cargo:rustc-link-lib=static:+whole-archive=cuda_dialect_runtime_static"
+                            );
                             return;
                         }
                     }
@@ -226,15 +206,20 @@ fn link_cuda_dialect_runtime(out_dir: &std::path::Path, manifest_dir: &std::path
     // Check FA4 venv
     for candidate in &candidates {
         if let Some(found) = find_file_recursive(candidate, "libcuda_dialect_runtime_static.a") {
-            println!("cargo:rustc-link-search=native={}", found.parent().unwrap().display());
+            println!(
+                "cargo:rustc-link-search=native={}",
+                found.parent().unwrap().display()
+            );
             println!("cargo:rustc-link-lib=static:+whole-archive=cuda_dialect_runtime_static");
             return;
         }
     }
 
     // Not found — warn but don't fail. CPU-only builds won't have it.
-    eprintln!("  [prelude-cuda] WARNING: libcuda_dialect_runtime_static.a not found; \
-               dist/LTO builds with CuTeDSL kernels may fail to link");
+    eprintln!(
+        "  [prelude-cuda] WARNING: libcuda_dialect_runtime_static.a not found; \
+               dist/LTO builds with CuTeDSL kernels may fail to link"
+    );
 }
 
 fn find_file_recursive(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {

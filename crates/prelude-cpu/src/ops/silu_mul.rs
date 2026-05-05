@@ -5,11 +5,11 @@
 //! Input layout: `[num_tokens, 2 * dim]` where first half is gate, second half is up.
 //! Output: `[num_tokens, dim]`.
 
-use prelude_core::tensor::{DType, Result, Tensor};
 use super::bf16_utils::{bf16_to_f32, f32_to_bf16};
 #[cfg(target_arch = "x86_64")]
 use super::bf16_utils::{bf16x16_load_as_f32, f32x16_store_as_bf16};
 use super::cpu_float::CpuFloat;
+use prelude_core::tensor::{DType, Result, Tensor};
 
 // ── Tensor-level API ────────────────────────────────────────────────────
 
@@ -36,9 +36,7 @@ pub fn cpu_silu_and_mul(input: &Tensor) -> Result<Tensor> {
     }
 }
 
-fn cpu_silu_and_mul_typed<T: CpuFloat>(
-    input: &Tensor, n: usize, dim: usize,
-) -> Result<Tensor> {
+fn cpu_silu_and_mul_typed<T: CpuFloat>(input: &Tensor, n: usize, dim: usize) -> Result<Tensor> {
     let input_t = input.to_dtype(T::DTYPE)?.contiguous()?;
     let in_data = T::tensor_to_vec(&input_t)?;
     let mut out_buf = vec![T::zero(); n * dim];
@@ -71,12 +69,7 @@ pub fn cpu_silu_and_mul_inplace(input: Tensor) -> Result<Tensor> {
 /// Uses the spinning GemmPool for parallelization (same threads as GEMM dispatch).
 /// This avoids rayon's futex parking overhead that dominated for small batch sizes
 /// (e.g., tokens=8 was 80µs serial vs SGLang 26µs with OpenMP threads already spinning).
-pub fn silu_and_mul_bf16(
-    output: &mut [u16],
-    input: &[u16],
-    num_tokens: usize,
-    dim: usize,
-) {
+pub fn silu_and_mul_bf16(output: &mut [u16], input: &[u16], num_tokens: usize, dim: usize) {
     debug_assert_eq!(input.len(), num_tokens * 2 * dim);
     debug_assert_eq!(output.len(), num_tokens * dim);
 
@@ -110,7 +103,9 @@ pub fn silu_and_mul_bf16(
             let rows_per_thread = (ctx.num_tokens + n_threads - 1) / n_threads;
             let start = tid * rows_per_thread;
             let end = (start + rows_per_thread).min(ctx.num_tokens);
-            if start >= end { return; }
+            if start >= end {
+                return;
+            }
 
             let chunk_tokens = end - start;
             let in_off = start * 2 * ctx.dim;
@@ -124,11 +119,7 @@ pub fn silu_and_mul_bf16(
     }
 
     unsafe {
-        pool.dispatch(
-            silu_work,
-            &ctx as *const SiluCtx as *const u8,
-            n_threads,
-        );
+        pool.dispatch(silu_work, &ctx as *const SiluCtx as *const u8, n_threads);
     }
 }
 
@@ -139,11 +130,7 @@ pub fn silu_and_mul_bf16(
 /// The up portion is untouched.
 ///
 /// Eliminates the output allocation (~3MB at M=512) by writing in-place.
-pub fn silu_and_mul_bf16_inplace(
-    data: *mut u16,
-    num_tokens: usize,
-    dim: usize,
-) {
+pub fn silu_and_mul_bf16_inplace(data: *mut u16, num_tokens: usize, dim: usize) {
     if num_tokens <= 1 {
         silu_and_mul_inplace_impl(data, num_tokens, dim);
         return;
@@ -171,7 +158,9 @@ pub fn silu_and_mul_bf16_inplace(
             let rows_per_thread = (ctx.num_tokens + n_threads - 1) / n_threads;
             let start = tid * rows_per_thread;
             let end = (start + rows_per_thread).min(ctx.num_tokens);
-            if start >= end { return; }
+            if start >= end {
+                return;
+            }
 
             let chunk_tokens = end - start;
             let ptr = (ctx.data_ptr as *mut u16).add(start * 2 * ctx.dim);
@@ -213,11 +202,7 @@ fn silu_and_mul_inplace_impl(data: *mut u16, num_tokens: usize, dim: usize) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
-fn silu_and_mul_bf16_avx512_inplace(
-    data: *mut u16,
-    num_tokens: usize,
-    dim: usize,
-) {
+fn silu_and_mul_bf16_avx512_inplace(data: *mut u16, num_tokens: usize, dim: usize) {
     use core::arch::x86_64::*;
 
     let chunks = dim / 16;
@@ -268,7 +253,12 @@ fn silu_and_mul_impl(output: &mut [u16], input: &[u16], num_tokens: usize, dim: 
 
 // ── Scalar fallback (delegates to generic kernel via CpuFloat) ──────────
 
-fn silu_and_mul_bf16_scalar_via_generic(output: &mut [u16], input: &[u16], num_tokens: usize, dim: usize) {
+fn silu_and_mul_bf16_scalar_via_generic(
+    output: &mut [u16],
+    input: &[u16],
+    num_tokens: usize,
+    dim: usize,
+) {
     let out = unsafe { &mut *(output as *mut [u16] as *mut [half::bf16]) };
     let inp = unsafe { &*(input as *const [u16] as *const [half::bf16]) };
     silu_and_mul_generic(out, inp, num_tokens, dim);
@@ -342,12 +332,7 @@ fn exp_ps_avx512(x: core::arch::x86_64::__m512) -> core::arch::x86_64::__m512 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
-fn silu_and_mul_bf16_avx512(
-    output: &mut [u16],
-    input: &[u16],
-    num_tokens: usize,
-    dim: usize,
-) {
+fn silu_and_mul_bf16_avx512(output: &mut [u16], input: &[u16], num_tokens: usize, dim: usize) {
     use core::arch::x86_64::*;
 
     let chunks = dim / 16;
@@ -388,7 +373,7 @@ fn silu_and_mul_bf16_avx512(
 mod tests {
     use super::*;
 
-    use super::super::bf16_utils::{make_bf16_vec, to_f32_vec, bf16_to_f32};
+    use super::super::bf16_utils::{bf16_to_f32, make_bf16_vec, to_f32_vec};
     use super::super::max_sglang_violation;
 
     fn silu_f32(x: f32) -> f32 {
@@ -399,7 +384,9 @@ mod tests {
     fn test_silu_and_mul_scalar_basic() {
         let dim = 64;
         // gate values around [-3, 3] (typical MLP range)
-        let gate_f32: Vec<f32> = (0..dim).map(|i| (i as f32 / dim as f32) * 6.0 - 3.0).collect();
+        let gate_f32: Vec<f32> = (0..dim)
+            .map(|i| (i as f32 / dim as f32) * 6.0 - 3.0)
+            .collect();
         let up_f32: Vec<f32> = (0..dim).map(|i| 0.5 + i as f32 * 0.01).collect();
 
         // Interleave: [gate..., up...]

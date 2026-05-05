@@ -4,7 +4,7 @@
 //! Hot path uses prelude-cpu's optimized kernels or GPU dequant via prelude-cuda.
 
 use super::GgmlDType;
-use crate::tensor::{bail, Result};
+use crate::tensor::{Result, bail};
 use half::f16;
 
 /// Dequantize raw bytes to f32 vector.
@@ -150,7 +150,7 @@ fn dequantize_q2k(data: &[u8], output: &mut [f32]) -> Result<()> {
         let dmin = f16::from_le_bytes([block[82], block[83]]).to_f32();
         for j in 0..256 {
             let is = j / 128; // which pair of scale nibbles
-            let qsi = j / 4;  // which quantized byte
+            let qsi = j / 4; // which quantized byte
             let shift = (j % 4) * 2; // bit shift within byte
             let sc_idx = (j % 128) / 16;
             let sc = scales[is * 8 + sc_idx];

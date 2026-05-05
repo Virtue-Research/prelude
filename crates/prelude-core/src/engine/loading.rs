@@ -13,12 +13,11 @@ use fastokens::Tokenizer;
 use crate::cache::manager::CacheManager;
 use crate::config::EngineConfig;
 use crate::engine::{
-    EmbeddingActivation, EmbeddingDenseLayerSpec, EmbeddingNormalization,
-    EmbeddingPooling, EmbeddingSemantics, Engine, EngineError, ModelDescriptor, ModelExecutor,
-    ModelVariant, ResolvedModelConfig, RuntimeCaps, TaskKind, TaskOverride, WeightsBackend,
-    tensor_err, has_remote_file, init_runtime, load_model_config,
-    load_safetensor_filenames, load_var_builder_from_filenames, load_weights,
-    parse_model_config_for_source, select_device,
+    EmbeddingActivation, EmbeddingDenseLayerSpec, EmbeddingNormalization, EmbeddingPooling,
+    EmbeddingSemantics, Engine, EngineError, ModelDescriptor, ModelExecutor, ModelVariant,
+    ResolvedModelConfig, RuntimeCaps, TaskKind, TaskOverride, WeightsBackend, has_remote_file,
+    init_runtime, load_model_config, load_safetensor_filenames, load_var_builder_from_filenames,
+    load_weights, parse_model_config_for_source, select_device, tensor_err,
 };
 use crate::models::gemma3::meta::{Gemma3ModelBuildContext, build_gemma3_model_with_context};
 use crate::models::registry::AuxiliaryVarBuilder;
@@ -59,7 +58,7 @@ struct SentenceTransformerDenseConfig {
     activation: Option<String>,
 }
 
-struct LoadedEmbeddingModules {
+pub(crate) struct LoadedEmbeddingModules {
     spec: EmbeddingSemantics,
     auxiliary: Vec<AuxiliaryVarBuilder>,
 }
@@ -176,7 +175,8 @@ impl Engine {
             resolved.task,
             DType::F32,
             &device,
-        ).await?;
+        )
+        .await?;
 
         let vb = load_var_builder_from_filenames(&weight_files, dtype, &device)?;
         let tokenizer = load_tokenizer_file(&tokenizer_path)?;
@@ -243,10 +243,7 @@ impl Engine {
 /// 1. If this repo has tokenizer.json, use it directly.
 /// 2. Otherwise, read GGUF metadata for `general.base_model.0.repo_url` to find the base model.
 /// 3. Fall back to stripping `-GGUF` suffix from repo_id.
-fn resolve_gguf_tokenizer_repo(
-    repo_id: &str,
-    gguf_path: &Path,
-) -> String {
+fn resolve_gguf_tokenizer_repo(repo_id: &str, gguf_path: &Path) -> String {
     // Check if tokenizer.json exists next to GGUF or in repo
     if let Some(parent) = gguf_path.parent() {
         if parent.join("tokenizer.json").exists() {
@@ -328,7 +325,8 @@ fn load_safetensor_parts(
             &common_config,
             dtype,
             engine_config.runtime.profile_tokens,
-        ).unwrap_or(0)
+        )
+        .unwrap_or(0)
     } else {
         0
     };
@@ -499,10 +497,10 @@ fn load_gguf(
     };
 
     // Look up architecture in the registry (inventory-based, no hardcoded model imports)
-    let arch_spec = crate::models::registry::find_arch_spec_by_gguf_arch(&arch)
-        .ok_or_else(|| EngineError::InvalidRequest(
-            format!("unsupported GGUF architecture '{arch}'")
-        ))?;
+    let arch_spec =
+        crate::models::registry::find_arch_spec_by_gguf_arch(&arch).ok_or_else(|| {
+            EngineError::InvalidRequest(format!("unsupported GGUF architecture '{arch}'"))
+        })?;
     let result = arch_spec.load_gguf(ct, &mut file, &device)?;
 
     let eos_token_ids = if result.eos_token_ids.is_empty() {
@@ -957,11 +955,8 @@ fn profile_peak_activation(
     // profiler measured only one token's worth of activation — the
     // result was always tiny and KV auto-sizing silently fell back to
     // the old heuristic. Verified against `qwen3.rs::Attention::forward_with_cache`.
-    let dummy_input = Tensor::zeros(
-        (profile_tokens,),
-        crate::tensor::DType::U32,
-        device,
-    ).map_err(tensor_err)?;
+    let dummy_input =
+        Tensor::zeros((profile_tokens,), crate::tensor::DType::U32, device).map_err(tensor_err)?;
 
     // forward_with_cache runs through all layers + lm_head, producing
     // [profile_tokens, vocab_size] logits — this is the peak
@@ -1048,8 +1043,8 @@ pub(crate) fn build_model_variant(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::{Device, Tensor};
     use crate::tensor::safetensors::save as save_safetensors;
+    use crate::tensor::{Device, Tensor};
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;

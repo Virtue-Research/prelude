@@ -20,11 +20,13 @@ use prelude_core::tensor::{Device, Result, Storage, Tensor};
 
 // ── Re-exports: Tensor-level kernel API ─────────────────────────────────
 
-pub use rmsnorm::{cpu_rmsnorm, cpu_fused_add_rmsnorm, CpuRmsNorm};
+pub use rmsnorm::{CpuRmsNorm, cpu_fused_add_rmsnorm, cpu_rmsnorm};
 pub use silu_mul::{cpu_silu_and_mul, cpu_silu_and_mul_inplace};
 
 // Attention: tiled kernels for BF16 and F32.
-pub use self::attention_tensor::{cpu_prefill_attention, cpu_decode_attention, cpu_decode_attention_f32};
+pub use self::attention_tensor::{
+    cpu_decode_attention, cpu_decode_attention_f32, cpu_prefill_attention,
+};
 
 // RoPE
 pub use self::rope_tensor::{cpu_rotary_embedding, cpu_rotary_embedding_with_positions};
@@ -35,15 +37,6 @@ pub use self::rope_tensor::{cpu_rotary_embedding_f32, cpu_rotary_embedding_f32_w
 /// Number of threads in the rayon pool.
 pub(crate) fn pool_size() -> usize {
     rayon::current_num_threads()
-}
-
-/// Run `f(chunk_id)` for chunk_id in [0, n) in parallel via rayon.
-pub(crate) fn parallel_for<F>(n: usize, f: &F)
-where
-    F: Fn(usize) + Sync,
-{
-    use rayon::prelude::*;
-    (0..n).into_par_iter().for_each(|i| f(i));
 }
 
 /// Adaptive parallelization check.
@@ -59,17 +52,6 @@ pub(crate) fn should_parallelize(
     let n_threads = ps.min(num_rows);
     let per_thread = total_elems / n_threads;
     per_thread >= min_elems_per_thread && total_elems >= min_elems_per_thread * ps
-}
-
-/// Returns optimal thread count for given workload.
-pub(crate) fn optimal_thread_count(
-    total_elems: usize,
-    num_rows: usize,
-    min_elems_per_thread: usize,
-) -> usize {
-    let ps = pool_size();
-    let max_useful = (total_elems / min_elems_per_thread).max(1);
-    max_useful.min(num_rows).min(ps)
 }
 
 /// SGLang-style BF16 tolerance check.
@@ -130,17 +112,32 @@ pub(crate) fn tensor_raw_ptr<T>(tensor: &Tensor) -> Result<*const T> {
 /// Pointer valid while tensor is alive. For perf-critical internal code only.
 pub(crate) fn tensor_as_u16_slice(tensor: &Tensor) -> Result<&[u16]> {
     assert!(tensor.is_contiguous());
-    unsafe { Ok(std::slice::from_raw_parts(tensor_raw_ptr::<u16>(tensor)?, tensor.elem_count())) }
+    unsafe {
+        Ok(std::slice::from_raw_parts(
+            tensor_raw_ptr::<u16>(tensor)?,
+            tensor.elem_count(),
+        ))
+    }
 }
 
 pub(crate) fn tensor_as_bf16_slice(tensor: &Tensor) -> Result<&[half::bf16]> {
     assert!(tensor.is_contiguous());
-    unsafe { Ok(std::slice::from_raw_parts(tensor_raw_ptr::<half::bf16>(tensor)?, tensor.elem_count())) }
+    unsafe {
+        Ok(std::slice::from_raw_parts(
+            tensor_raw_ptr::<half::bf16>(tensor)?,
+            tensor.elem_count(),
+        ))
+    }
 }
 
 pub(crate) fn tensor_as_f32_slice(tensor: &Tensor) -> Result<&[f32]> {
     assert!(tensor.is_contiguous());
-    unsafe { Ok(std::slice::from_raw_parts(tensor_raw_ptr::<f32>(tensor)?, tensor.elem_count())) }
+    unsafe {
+        Ok(std::slice::from_raw_parts(
+            tensor_raw_ptr::<f32>(tensor)?,
+            tensor.elem_count(),
+        ))
+    }
 }
 
 /// Get a raw mutable pointer to a contiguous CPU tensor's data, reinterpreted as `*mut T`.
@@ -150,34 +147,12 @@ pub(crate) fn tensor_data_ptr_mut<T>(tensor: &Tensor) -> Result<*mut T> {
     Ok(tensor_raw_ptr::<T>(tensor)? as *mut T)
 }
 
-// ── Safe in-place mutation helpers ──────────────────────────────────────
-
-
-/// In-place BF16 residual add: `tensor[..] += src[..]`.
-///
-/// Acquires exclusive write access to the tensor's storage.
-/// Caller must ensure no other tensor aliases this storage region.
-pub(crate) fn inplace_add_bf16(tensor: &Tensor, src: &[u16]) -> Result<()> {
-    let n = src.len();
-    unsafe {
-        let ptr = tensor_data_ptr_mut::<u16>(tensor)?;
-        crate::raw_cpu::raw_residual_add_bf16(ptr, src.as_ptr(), n);
-    }
-    Ok(())
-}
-
-/// In-place F32 residual add: `tensor[..] += src[..]`.
-pub(crate) fn inplace_add_f32(tensor: &Tensor, src: &[f32]) -> Result<()> {
-    let n = src.len();
-    unsafe {
-        let ptr = tensor_data_ptr_mut::<f32>(tensor)?;
-        crate::raw_cpu::raw_residual_add_f32(ptr, src.as_ptr(), n);
-    }
-    Ok(())
-}
-
 /// Convert a `Vec<u16>` (BF16 bit patterns) back to a BF16 tensor.
-pub(crate) fn u16_vec_to_bf16_tensor(buf: Vec<u16>, shape: &[usize], device: &Device) -> Result<Tensor> {
+pub(crate) fn u16_vec_to_bf16_tensor(
+    buf: Vec<u16>,
+    shape: &[usize],
+    device: &Device,
+) -> Result<Tensor> {
     let bf16_vec: Vec<half::bf16> = bytemuck::cast_vec(buf);
     Tensor::from_vec(bf16_vec, shape, device)
 }
@@ -190,11 +165,20 @@ mod attention_tensor {
     /// Prefill attention using optimized BF16 CPU kernels.
     /// For F32, use matmul SDPA via `cpu_varlen_attention` in layers/ops.rs.
     pub fn cpu_prefill_attention(
-        q: &Tensor, k: &Tensor, v: &Tensor,
-        seq_lens: &[usize], num_heads: usize, num_kv_heads: usize,
-        head_dim: usize, sm_scale: f64,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        seq_lens: &[usize],
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        sm_scale: f64,
     ) -> Result<Tensor> {
-        debug_assert_eq!(q.dtype(), prelude_core::tensor::DType::BF16, "cpu_prefill_attention requires BF16");
+        debug_assert_eq!(
+            q.dtype(),
+            prelude_core::tensor::DType::BF16,
+            "cpu_prefill_attention requires BF16"
+        );
         let total_tokens = q.dims()[0];
 
         let q_cont = q.contiguous()?;
@@ -206,8 +190,15 @@ mod attention_tensor {
 
         let mut out_buf = vec![0u16; total_tokens * num_heads * head_dim];
         super::attention::prefill_attention_bf16(
-            &mut out_buf, q_slice, k_slice, v_slice,
-            seq_lens, num_heads, num_kv_heads, head_dim, sm_scale as f32,
+            &mut out_buf,
+            q_slice,
+            k_slice,
+            v_slice,
+            seq_lens,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            sm_scale as f32,
         );
 
         super::u16_vec_to_bf16_tensor(out_buf, &[total_tokens, num_heads, head_dim], q.device())
@@ -218,11 +209,20 @@ mod attention_tensor {
     /// q: `[1, num_heads, head_dim]`, k/v_cache: `[context_len, num_kv_heads, head_dim]`
     /// Returns: `[1, num_heads, head_dim]`
     pub fn cpu_decode_attention(
-        q: &Tensor, k_cache: &Tensor, v_cache: &Tensor,
-        context_len: usize, num_heads: usize, num_kv_heads: usize,
-        head_dim: usize, sm_scale: f32,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        context_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        sm_scale: f32,
     ) -> Result<Tensor> {
-        debug_assert_eq!(q.dtype(), prelude_core::tensor::DType::BF16, "cpu_decode_attention requires BF16");
+        debug_assert_eq!(
+            q.dtype(),
+            prelude_core::tensor::DType::BF16,
+            "cpu_decode_attention requires BF16"
+        );
 
         let q_cont = q.contiguous()?;
         let k_cont = k_cache.contiguous()?;
@@ -237,9 +237,18 @@ mod attention_tensor {
         let seq_lens = [context_len as i64];
 
         super::attention::decode_attention_bf16(
-            &mut out_buf, q_slice, k_slice, v_slice,
-            &req_to_token, &seq_lens,
-            1, context_len, num_heads, num_kv_heads, head_dim, sm_scale,
+            &mut out_buf,
+            q_slice,
+            k_slice,
+            v_slice,
+            &req_to_token,
+            &seq_lens,
+            1,
+            context_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            sm_scale,
         );
 
         super::u16_vec_to_bf16_tensor(out_buf, &[1, num_heads, head_dim], q.device())
@@ -250,11 +259,20 @@ mod attention_tensor {
     /// q: `[1, num_heads, head_dim]`, k/v_cache: `[context_len, num_kv_heads, head_dim]`
     /// Returns: `[1, num_heads, head_dim]`
     pub fn cpu_decode_attention_f32(
-        q: &Tensor, k_cache: &Tensor, v_cache: &Tensor,
-        context_len: usize, num_heads: usize, num_kv_heads: usize,
-        head_dim: usize, sm_scale: f32,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        context_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        sm_scale: f32,
     ) -> Result<Tensor> {
-        debug_assert_eq!(q.dtype(), prelude_core::tensor::DType::F32, "cpu_decode_attention_f32 requires F32");
+        debug_assert_eq!(
+            q.dtype(),
+            prelude_core::tensor::DType::F32,
+            "cpu_decode_attention_f32 requires F32"
+        );
 
         let q_cont = q.contiguous()?;
         let k_cont = k_cache.contiguous()?;
@@ -268,9 +286,18 @@ mod attention_tensor {
         let seq_lens = [context_len as i64];
 
         super::attention::decode_attention_f32(
-            &mut out_buf, q_slice, k_slice, v_slice,
-            &req_to_token, &seq_lens,
-            1, context_len, num_heads, num_kv_heads, head_dim, sm_scale,
+            &mut out_buf,
+            q_slice,
+            k_slice,
+            v_slice,
+            &req_to_token,
+            &seq_lens,
+            1,
+            context_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            sm_scale,
         );
 
         Tensor::from_vec(out_buf, &[1, num_heads, head_dim], q.device())
@@ -284,39 +311,70 @@ mod rope_tensor {
 
     /// Apply NeoX-style RoPE in-place to Q and K tensors (BF16).
     pub fn cpu_rotary_embedding(
-        q: &Tensor, k: &Tensor, cos_sin_cache: &Tensor,
-        offset: usize, num_heads: usize, num_kv_heads: usize,
+        q: &Tensor,
+        k: &Tensor,
+        cos_sin_cache: &Tensor,
+        offset: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
     ) -> Result<(Tensor, Tensor)> {
         let q_dims = q.dims();
         let (batch_size, seq_len) = (q_dims[0], q_dims[1]);
         let positions: Vec<i64> = (0..batch_size)
             .flat_map(|_| (0..seq_len).map(|s| (offset + s) as i64))
             .collect();
-        cpu_rotary_embedding_with_positions(q, k, cos_sin_cache, &positions, num_heads, num_kv_heads)
+        cpu_rotary_embedding_with_positions(
+            q,
+            k,
+            cos_sin_cache,
+            &positions,
+            num_heads,
+            num_kv_heads,
+        )
     }
 
     /// Apply NeoX-style RoPE with explicit per-token positions (BF16).
     pub fn cpu_rotary_embedding_with_positions(
-        q: &Tensor, k: &Tensor, cos_sin_cache: &Tensor,
-        positions: &[i64], num_heads: usize, num_kv_heads: usize,
+        q: &Tensor,
+        k: &Tensor,
+        cos_sin_cache: &Tensor,
+        positions: &[i64],
+        num_heads: usize,
+        num_kv_heads: usize,
     ) -> Result<(Tensor, Tensor)> {
         let q_dims = q.dims();
         let (batch_size, seq_len, _nh, head_dim) = (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
         let rotary_dim = cos_sin_cache.dims()[1];
 
-        let q_2d = q.contiguous()?.reshape((batch_size * seq_len * num_heads * head_dim,))?;
-        let k_2d = k.contiguous()?.reshape((batch_size * seq_len * num_kv_heads * head_dim,))?;
+        let q_2d = q
+            .contiguous()?
+            .reshape((batch_size * seq_len * num_heads * head_dim,))?;
+        let k_2d = k
+            .contiguous()?
+            .reshape((batch_size * seq_len * num_kv_heads * head_dim,))?;
         let cache_slice = super::tensor_as_u16_slice(cos_sin_cache)?;
 
         {
             let q_n = batch_size * seq_len * num_heads * head_dim;
             let k_n = batch_size * seq_len * num_kv_heads * head_dim;
-            let q_slice = unsafe { std::slice::from_raw_parts_mut(super::tensor_data_ptr_mut::<u16>(&q_2d)?, q_n) };
-            let k_slice = unsafe { std::slice::from_raw_parts_mut(super::tensor_data_ptr_mut::<u16>(&k_2d)?, k_n) };
+            let q_slice = unsafe {
+                std::slice::from_raw_parts_mut(super::tensor_data_ptr_mut::<u16>(&q_2d)?, q_n)
+            };
+            let k_slice = unsafe {
+                std::slice::from_raw_parts_mut(super::tensor_data_ptr_mut::<u16>(&k_2d)?, k_n)
+            };
 
             super::rope::rope_neox_bf16(
-                q_slice, k_slice, cache_slice, positions,
-                batch_size, seq_len, num_heads, num_kv_heads, head_dim, rotary_dim,
+                q_slice,
+                k_slice,
+                cache_slice,
+                positions,
+                batch_size,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                rotary_dim,
             );
         }
 
@@ -325,39 +383,70 @@ mod rope_tensor {
 
     /// Apply NeoX-style RoPE in-place to Q and K tensors (F32).
     pub fn cpu_rotary_embedding_f32(
-        q: &Tensor, k: &Tensor, cos_sin_cache: &Tensor,
-        offset: usize, num_heads: usize, num_kv_heads: usize,
+        q: &Tensor,
+        k: &Tensor,
+        cos_sin_cache: &Tensor,
+        offset: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
     ) -> Result<(Tensor, Tensor)> {
         let q_dims = q.dims();
         let (batch_size, seq_len) = (q_dims[0], q_dims[1]);
         let positions: Vec<i64> = (0..batch_size)
             .flat_map(|_| (0..seq_len).map(|s| (offset + s) as i64))
             .collect();
-        cpu_rotary_embedding_f32_with_positions(q, k, cos_sin_cache, &positions, num_heads, num_kv_heads)
+        cpu_rotary_embedding_f32_with_positions(
+            q,
+            k,
+            cos_sin_cache,
+            &positions,
+            num_heads,
+            num_kv_heads,
+        )
     }
 
     /// Apply NeoX-style RoPE with explicit per-token positions (F32).
     pub fn cpu_rotary_embedding_f32_with_positions(
-        q: &Tensor, k: &Tensor, cos_sin_cache: &Tensor,
-        positions: &[i64], num_heads: usize, num_kv_heads: usize,
+        q: &Tensor,
+        k: &Tensor,
+        cos_sin_cache: &Tensor,
+        positions: &[i64],
+        num_heads: usize,
+        num_kv_heads: usize,
     ) -> Result<(Tensor, Tensor)> {
         let q_dims = q.dims();
         let (batch_size, seq_len, _nh, head_dim) = (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
         let rotary_dim = cos_sin_cache.dims()[1];
 
-        let q_2d = q.contiguous()?.reshape((batch_size * seq_len * num_heads * head_dim,))?;
-        let k_2d = k.contiguous()?.reshape((batch_size * seq_len * num_kv_heads * head_dim,))?;
+        let q_2d = q
+            .contiguous()?
+            .reshape((batch_size * seq_len * num_heads * head_dim,))?;
+        let k_2d = k
+            .contiguous()?
+            .reshape((batch_size * seq_len * num_kv_heads * head_dim,))?;
         let cache_slice = super::tensor_as_f32_slice(cos_sin_cache)?;
 
         {
             let q_n = batch_size * seq_len * num_heads * head_dim;
             let k_n = batch_size * seq_len * num_kv_heads * head_dim;
-            let q_slice = unsafe { std::slice::from_raw_parts_mut(super::tensor_data_ptr_mut::<f32>(&q_2d)?, q_n) };
-            let k_slice = unsafe { std::slice::from_raw_parts_mut(super::tensor_data_ptr_mut::<f32>(&k_2d)?, k_n) };
+            let q_slice = unsafe {
+                std::slice::from_raw_parts_mut(super::tensor_data_ptr_mut::<f32>(&q_2d)?, q_n)
+            };
+            let k_slice = unsafe {
+                std::slice::from_raw_parts_mut(super::tensor_data_ptr_mut::<f32>(&k_2d)?, k_n)
+            };
 
             super::rope::rope_neox_f32(
-                q_slice, k_slice, cache_slice, positions,
-                batch_size, seq_len, num_heads, num_kv_heads, head_dim, rotary_dim,
+                q_slice,
+                k_slice,
+                cache_slice,
+                positions,
+                batch_size,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                rotary_dim,
             );
         }
 

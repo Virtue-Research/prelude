@@ -2,8 +2,8 @@
 
 mod common;
 
+use prelude_core::ops::traits::{MaskType, VarlenParams};
 use prelude_core::tensor::{DType, Device, Module, Result, Tensor, TensorExt};
-use prelude_core::ops::traits::{VarlenParams, MaskType};
 
 // ── Config parsing ──────────────────────────────────────────────────────
 
@@ -128,7 +128,8 @@ fn gemma4_rope_vs_pytorch() -> Result<()> {
 
     let ref_flat = require_pytorch_ref!(
         &[("x", &x_data)],
-        &format!(r#"
+        &format!(
+            r#"
 import torch
 import math
 
@@ -166,14 +167,21 @@ out1 = x1 * cos_exp - x2 * sin_exp
 out2 = x2 * cos_exp + x1 * sin_exp
 out = torch.cat([out1, out2], dim=-1)
 write_output(out.float())
-"#)
+"#
+        )
     );
 
     // Our implementation
     let x = Tensor::from_vec(x_data.clone(), (seq_len, num_heads, head_dim), &Device::Cpu)?;
     let positions = Tensor::arange(0u32, seq_len as u32, &Device::Cpu)?;
 
-    let cos_sin = make_gemma4_cos_sin(head_dim, seq_len, rope_theta, partial_rotary_factor, &Device::Cpu)?;
+    let cos_sin = make_gemma4_cos_sin(
+        head_dim,
+        seq_len,
+        rope_theta,
+        partial_rotary_factor,
+        &Device::Cpu,
+    )?;
     let cos = &cos_sin.0;
     let sin = &cos_sin.1;
 
@@ -230,8 +238,14 @@ fn gemma4_mlp_gelu_and_mul_vs_pytorch() -> Result<()> {
     let down_w_data = common::pseudo_random(hidden * intermediate, 4.0);
 
     let ref_flat = require_pytorch_ref!(
-        &[("x", &x_data), ("gate_w", &gate_w_data), ("up_w", &up_w_data), ("down_w", &down_w_data)],
-        &format!(r#"
+        &[
+            ("x", &x_data),
+            ("gate_w", &gate_w_data),
+            ("up_w", &up_w_data),
+            ("down_w", &down_w_data)
+        ],
+        &format!(
+            r#"
 x = read_input("x").reshape({seq}, {hidden})
 gate_w = read_input("gate_w").reshape({intermediate}, {hidden})
 up_w = read_input("up_w").reshape({intermediate}, {hidden})
@@ -243,7 +257,8 @@ up = x @ up_w.T
 activated = torch.nn.functional.gelu(gate, approximate='tanh')
 out = (activated * up) @ down_w.T
 write_output(out.float())
-"#)
+"#
+        )
     );
 
     let dev = Device::Cpu;
@@ -285,8 +300,13 @@ fn gemma4_attention_qkv_norm_vs_pytorch() -> Result<()> {
     let k_norm_w = common::pseudo_random(head_dim, 12.0);
 
     let ref_flat = require_pytorch_ref!(
-        &[("x", &x_data), ("q_norm_w", &q_norm_w), ("k_norm_w", &k_norm_w)],
-        &format!(r#"
+        &[
+            ("x", &x_data),
+            ("q_norm_w", &q_norm_w),
+            ("k_norm_w", &k_norm_w)
+        ],
+        &format!(
+            r#"
 import torch
 import math
 
@@ -314,7 +334,8 @@ assert k_normed.shape == ({seq}, {num_heads}, {head_dim})
 # Output Q and K normed flat
 out = torch.cat([q_normed.reshape(-1), k_normed.reshape(-1)])
 write_output(out.float())
-"#)
+"#
+        )
     );
 
     let dev = Device::Cpu;
@@ -326,8 +347,11 @@ write_output(out.float())
     let k_norm = prelude_core::models::commons::linear::RmsNorm::from_weight(k_norm_weight, 1e-6);
 
     let q = x.reshape((seq, num_heads, head_dim))?;
-    let k = x.narrow(1, 0, head_dim)?.reshape((seq, 1, head_dim))?
-        .broadcast_as((seq, num_heads, head_dim))?.contiguous()?;
+    let k = x
+        .narrow(1, 0, head_dim)?
+        .reshape((seq, 1, head_dim))?
+        .broadcast_as((seq, num_heads, head_dim))?
+        .contiguous()?;
 
     let q_normed = q_norm.forward(&q)?;
     let k_normed = k_norm.forward(&k)?;
@@ -353,7 +377,8 @@ fn gemma4_v_norm_no_weight_vs_pytorch() -> Result<()> {
 
     let ref_flat = require_pytorch_ref!(
         &[("v", &v_data)],
-        &format!(r#"
+        &format!(
+            r#"
 import torch
 
 v = read_input("v").reshape({seq}, {num_heads}, {head_dim})
@@ -365,7 +390,8 @@ def rms_norm_no_weight(x, eps=1e-6):
 
 v_normed = rms_norm_no_weight(v)
 write_output(v_normed.float())
-"#)
+"#
+        )
     );
 
     let dev = Device::Cpu;
@@ -410,12 +436,22 @@ fn gemma4_decoder_layer_vs_pytorch() -> Result<()> {
     let ref_flat = require_pytorch_ref!(
         &[
             ("x", &x_data),
-            ("q_w", &q_w), ("k_w", &k_w), ("v_w", &v_w), ("o_w", &o_w),
-            ("q_norm_w", &q_norm_w), ("k_norm_w", &k_norm_w),
-            ("gate_w", &gate_w), ("up_w", &up_w), ("down_w", &down_w),
-            ("ln1_w", &ln1_w), ("ln2_w", &ln2_w), ("ln3_w", &ln3_w), ("ln4_w", &ln4_w),
+            ("q_w", &q_w),
+            ("k_w", &k_w),
+            ("v_w", &v_w),
+            ("o_w", &o_w),
+            ("q_norm_w", &q_norm_w),
+            ("k_norm_w", &k_norm_w),
+            ("gate_w", &gate_w),
+            ("up_w", &up_w),
+            ("down_w", &down_w),
+            ("ln1_w", &ln1_w),
+            ("ln2_w", &ln2_w),
+            ("ln3_w", &ln3_w),
+            ("ln4_w", &ln4_w),
         ],
-        &format!(r#"
+        &format!(
+            r#"
 import torch
 import math
 import torch.nn.functional as F
@@ -522,7 +558,8 @@ out = mlp_out + residual
 
 # Layer scalar = 1.0 (default)
 write_output(out.float())
-"#)
+"#
+        )
     );
 
     // Build our Gemma4 layer using raw tensors
@@ -534,36 +571,64 @@ write_output(out.float())
 
     // Create projections
     let q_proj = prelude_core::models::commons::linear::Linear::from_weight(
-        Tensor::from_vec(q_w, (num_heads * head_dim, hidden), &dev)?, None)?;
+        Tensor::from_vec(q_w, (num_heads * head_dim, hidden), &dev)?,
+        None,
+    )?;
     let k_proj = prelude_core::models::commons::linear::Linear::from_weight(
-        Tensor::from_vec(k_w, (num_kv_heads * head_dim, hidden), &dev)?, None)?;
+        Tensor::from_vec(k_w, (num_kv_heads * head_dim, hidden), &dev)?,
+        None,
+    )?;
     let v_proj = prelude_core::models::commons::linear::Linear::from_weight(
-        Tensor::from_vec(v_w, (num_kv_heads * head_dim, hidden), &dev)?, None)?;
+        Tensor::from_vec(v_w, (num_kv_heads * head_dim, hidden), &dev)?,
+        None,
+    )?;
     let o_proj = prelude_core::models::commons::linear::Linear::from_weight(
-        Tensor::from_vec(o_w, (hidden, num_heads * head_dim), &dev)?, None)?;
+        Tensor::from_vec(o_w, (hidden, num_heads * head_dim), &dev)?,
+        None,
+    )?;
 
     let q_norm = prelude_core::models::commons::linear::RmsNorm::from_weight(
-        Tensor::from_vec(q_norm_w, (head_dim,), &dev)?, 1e-6);
+        Tensor::from_vec(q_norm_w, (head_dim,), &dev)?,
+        1e-6,
+    );
     let k_norm = prelude_core::models::commons::linear::RmsNorm::from_weight(
-        Tensor::from_vec(k_norm_w, (head_dim,), &dev)?, 1e-6);
+        Tensor::from_vec(k_norm_w, (head_dim,), &dev)?,
+        1e-6,
+    );
     let v_norm = prelude_core::models::commons::linear::RmsNorm::from_weight(
-        Tensor::ones((head_dim,), DType::F32, &dev)?, 1e-6);
+        Tensor::ones((head_dim,), DType::F32, &dev)?,
+        1e-6,
+    );
 
     let gate_proj = prelude_core::models::commons::linear::Linear::from_weight(
-        Tensor::from_vec(gate_w, (intermediate, hidden), &dev)?, None)?;
+        Tensor::from_vec(gate_w, (intermediate, hidden), &dev)?,
+        None,
+    )?;
     let up_proj = prelude_core::models::commons::linear::Linear::from_weight(
-        Tensor::from_vec(up_w, (intermediate, hidden), &dev)?, None)?;
+        Tensor::from_vec(up_w, (intermediate, hidden), &dev)?,
+        None,
+    )?;
     let down_proj = prelude_core::models::commons::linear::Linear::from_weight(
-        Tensor::from_vec(down_w, (hidden, intermediate), &dev)?, None)?;
+        Tensor::from_vec(down_w, (hidden, intermediate), &dev)?,
+        None,
+    )?;
 
     let ln1 = prelude_core::models::commons::linear::RmsNorm::from_weight(
-        Tensor::from_vec(ln1_w, (hidden,), &dev)?, 1e-6);
+        Tensor::from_vec(ln1_w, (hidden,), &dev)?,
+        1e-6,
+    );
     let ln2 = prelude_core::models::commons::linear::RmsNorm::from_weight(
-        Tensor::from_vec(ln2_w, (hidden,), &dev)?, 1e-6);
+        Tensor::from_vec(ln2_w, (hidden,), &dev)?,
+        1e-6,
+    );
     let ln3 = prelude_core::models::commons::linear::RmsNorm::from_weight(
-        Tensor::from_vec(ln3_w, (hidden,), &dev)?, 1e-6);
+        Tensor::from_vec(ln3_w, (hidden,), &dev)?,
+        1e-6,
+    );
     let ln4 = prelude_core::models::commons::linear::RmsNorm::from_weight(
-        Tensor::from_vec(ln4_w, (hidden,), &dev)?, 1e-6);
+        Tensor::from_vec(ln4_w, (hidden,), &dev)?,
+        1e-6,
+    );
 
     // Build RoPE
     let (cos, sin) = make_gemma4_cos_sin(head_dim, seq, 10000.0, 1.0, &dev)?;
@@ -593,20 +658,29 @@ write_output(out.float())
     // Apply RoPE
     let q4 = q.reshape((1, seq, num_heads, head_dim))?;
     let k4 = k.reshape((1, seq, num_kv_heads, head_dim))?;
-    let q = q4.rope_thd(&cos_sel, &sin_sel)?.reshape((seq, num_heads, head_dim))?;
-    let k = k4.rope_thd(&cos_sel, &sin_sel)?.reshape((seq, num_kv_heads, head_dim))?;
+    let q = q4
+        .rope_thd(&cos_sel, &sin_sel)?
+        .reshape((seq, num_heads, head_dim))?;
+    let k = k4
+        .rope_thd(&cos_sel, &sin_sel)?
+        .reshape((seq, num_kv_heads, head_dim))?;
 
     // varlen attention with scaling=1.0
     let cu_seqlens = Tensor::from_vec(vec![0u32, seq as u32], (2,), &dev)?;
-    let attn_out = ops.varlen_attention(&q, &k, &v, &VarlenParams {
-        cu_seqlens_q: &cu_seqlens,
-        cu_seqlens_k: &cu_seqlens,
-        max_seqlen_q: seq,
-        max_seqlen_k: seq,
-        scale: 1.0,
-        mask: MaskType::Causal,
-        softcap: None,
-    })?;
+    let attn_out = ops.varlen_attention(
+        &q,
+        &k,
+        &v,
+        &VarlenParams {
+            cu_seqlens_q: &cu_seqlens,
+            cu_seqlens_k: &cu_seqlens,
+            max_seqlen_q: seq,
+            max_seqlen_k: seq,
+            scale: 1.0,
+            mask: MaskType::Causal,
+            softcap: None,
+        },
+    )?;
 
     let o = o_proj.forward(&attn_out.reshape((seq, num_heads * head_dim))?, &bs, ops)?;
 

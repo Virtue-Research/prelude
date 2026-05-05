@@ -9,18 +9,18 @@
 //!
 //! All data is BF16 (u16 bit patterns), accumulation is F32.
 
+#[cfg(target_arch = "x86_64")]
+mod avx512;
 mod buffers;
 mod common;
 #[cfg(target_arch = "x86_64")]
 mod dpbf16;
-#[cfg(target_arch = "x86_64")]
-mod avx512;
 mod small;
 
 #[cfg(target_arch = "x86_64")]
-use dpbf16::*;
-#[cfg(target_arch = "x86_64")]
 use avx512::*;
+#[cfg(target_arch = "x86_64")]
+use dpbf16::*;
 
 use buffers::{ensure_len_f32, ensure_len_u16, get_attn_bufs};
 use common::*;
@@ -38,11 +38,14 @@ struct Caps {
 }
 
 static CAPS: LazyLock<Caps> = LazyLock::new(|| {
-    let mut caps = Caps { avx512: false, avx512_bf16: false, amx: false };
+    let mut caps = Caps {
+        avx512: false,
+        avx512_bf16: false,
+        amx: false,
+    };
     #[cfg(target_arch = "x86_64")]
     {
-        caps.avx512 = is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx512bw");
+        caps.avx512 = is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw");
         caps.avx512_bf16 = is_x86_feature_detected!("avx512bf16");
     }
     {
@@ -88,15 +91,29 @@ pub fn prefill_attention_bf16(
     // Above 16, the tiled kernel's dpbf16ps vectorization outweighs its Vec alloc overhead.
     if max_slen <= 16 {
         small::prefill_attention_bf16_small(
-            output, q, k, v, seq_lens,
-            num_heads, num_kv_heads, head_dim, sm_scale,
+            output,
+            q,
+            k,
+            v,
+            seq_lens,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            sm_scale,
         );
         return;
     }
 
     prefill_attention_bf16_tiled(
-        output, q, k, v, seq_lens,
-        num_heads, num_kv_heads, head_dim, sm_scale,
+        output,
+        q,
+        k,
+        v,
+        seq_lens,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        sm_scale,
     );
 }
 
@@ -171,8 +188,10 @@ fn prefill_attention_bf16_tiled(
             let start = tid * items_per_thread;
             let end = (start + items_per_thread).min(total_work);
 
-            let offsets = std::slice::from_raw_parts(ctx.offsets_ptr as *const usize, ctx.num_reqs + 1);
-            let seq_lens = std::slice::from_raw_parts(ctx.seq_lens_ptr as *const usize, ctx.num_reqs);
+            let offsets =
+                std::slice::from_raw_parts(ctx.offsets_ptr as *const usize, ctx.num_reqs + 1);
+            let seq_lens =
+                std::slice::from_raw_parts(ctx.seq_lens_ptr as *const usize, ctx.num_reqs);
             let out_total = {
                 let last = *offsets.last().unwrap_or(&0);
                 last * ctx.num_heads * ctx.head_dim
@@ -191,8 +210,19 @@ fn prefill_attention_bf16_tiled(
                 let head_idx = rem / ctx.max_mb;
                 let mb = rem % ctx.max_mb;
                 prefill_attention_one_head(
-                    output, q, k, v, offsets, seq_lens, req_idx, head_idx,
-                    ctx.num_heads, ctx.num_kv_heads, ctx.head_dim, ctx.gqa_ratio, ctx.sm_scale,
+                    output,
+                    q,
+                    k,
+                    v,
+                    offsets,
+                    seq_lens,
+                    req_idx,
+                    head_idx,
+                    ctx.num_heads,
+                    ctx.num_kv_heads,
+                    ctx.head_dim,
+                    ctx.gqa_ratio,
+                    ctx.sm_scale,
                     mb,
                 );
             }
@@ -209,8 +239,6 @@ fn prefill_attention_bf16_tiled(
         );
     }
 }
-
-
 
 /// Tiled attention for one (request, head) pair using FlashAttention-style online softmax.
 ///
@@ -267,8 +295,10 @@ fn prefill_attention_one_head(
         ensure_len_u16(&mut bufs.v_buf, kv_len);
         for j in 0..num_keys_for_block {
             let kv_off = (req_start + j) * kv_stride + kv_head * head_dim;
-            bufs.k_buf[j * head_dim..(j + 1) * head_dim].copy_from_slice(&k[kv_off..kv_off + head_dim]);
-            bufs.v_buf[j * head_dim..(j + 1) * head_dim].copy_from_slice(&v[kv_off..kv_off + head_dim]);
+            bufs.k_buf[j * head_dim..(j + 1) * head_dim]
+                .copy_from_slice(&k[kv_off..kv_off + head_dim]);
+            bufs.v_buf[j * head_dim..(j + 1) * head_dim]
+                .copy_from_slice(&v[kv_off..kv_off + head_dim]);
         }
         if !use_avx512_bf16 {
             // F32 dot path needs K pre-converted to F32. dpbf16ps reads BF16 directly.
@@ -323,8 +353,13 @@ fn prefill_attention_one_head(
                         q.as_ptr().add(q_base + m * q_stride),
                         k.as_ptr().add(k_base + n * kv_stride),
                         bufs.s_i.as_mut_ptr(),
-                        m_size as i64, n_size as i64, head_dim as i64,
-                        q_stride as i64, kv_stride as i64, block_n as i64, sm_scale,
+                        m_size as i64,
+                        n_size as i64,
+                        head_dim as i64,
+                        q_stride as i64,
+                        kv_stride as i64,
+                        block_n as i64,
+                        sm_scale,
                     );
                 }
                 // brgemm outputs unscaled Q@K^T — apply sm_scale uniformly.
@@ -342,8 +377,12 @@ fn prefill_attention_one_head(
                     q.as_ptr().add(q_base + m * q_stride),
                     bufs.k_buf[(n * head_dim)..].as_ptr(),
                     bufs.s_i.as_mut_ptr(),
-                    m_size, n_size, head_dim,
-                    q_stride, head_dim, block_n,
+                    m_size,
+                    n_size,
+                    head_dim,
+                    q_stride,
+                    head_dim,
+                    block_n,
                     sm_scale,
                 );
             }
@@ -389,12 +428,18 @@ fn prefill_attention_one_head(
             } else {
                 softmax_scalar(
                     &mut bufs.s_i[i * block_n..i * block_n + n_size],
-                    n_size, bufs.m_prime[i], 1.0,
+                    n_size,
+                    bufs.m_prime[i],
+                    1.0,
                 )
             };
 
             bufs.s_prime[i] *= rescale;
-            scale_f32(&mut bufs.v_prime[i * head_dim..(i + 1) * head_dim], rescale, use_avx512);
+            scale_f32(
+                &mut bufs.v_prime[i * head_dim..(i + 1) * head_dim],
+                rescale,
+                use_avx512,
+            );
             bufs.s_prime[i] += block_sum;
             bufs.m_prime[i] = m_i;
         }
@@ -406,8 +451,11 @@ fn prefill_attention_one_head(
                     bufs.s_i.as_ptr(),
                     v.as_ptr().add(v_base + n * kv_stride),
                     bufs.v_prime.as_mut_ptr(),
-                    m_size as i64, n_size as i64, head_dim as i64,
-                    block_n as i64, kv_stride as i64,
+                    m_size as i64,
+                    n_size as i64,
+                    head_dim as i64,
+                    block_n as i64,
+                    kv_stride as i64,
                 );
             }
         } else if use_avx512 {
@@ -418,7 +466,9 @@ fn prefill_attention_one_head(
                         bufs.v_prime[(i * head_dim)..].as_mut_ptr(),
                         bufs.v_buf[(n * head_dim)..].as_ptr(),
                         bufs.s_i[(i * block_n)..].as_ptr(),
-                        n_size, head_dim, head_dim,
+                        n_size,
+                        head_dim,
+                        head_dim,
                     );
                 }
             }
@@ -442,12 +492,18 @@ fn prefill_attention_one_head(
 
     // ── Post-loop cleanup (brgemm only) ─────────────────────────────────
     if use_amx {
-        unsafe { crate::onednn::ffi::brgemm_attn_release(); }
+        unsafe {
+            crate::onednn::ffi::brgemm_attn_release();
+        }
     }
 
     // ── Normalize and write output (shared: avx512 vs scalar) ───────────
     for i in 0..m_size {
-        let inv_sum = if bufs.s_prime[i] > 0.0 { 1.0 / bufs.s_prime[i] } else { 0.0 };
+        let inv_sum = if bufs.s_prime[i] > 0.0 {
+            1.0 / bufs.s_prime[i]
+        } else {
+            0.0
+        };
         let o_off = (req_start + m + i) * num_heads * head_dim + head_idx * head_dim;
         if use_avx512 {
             #[cfg(target_arch = "x86_64")]
@@ -455,7 +511,8 @@ fn prefill_attention_one_head(
                 normalize_output_avx512(
                     output[o_off..].as_mut_ptr(),
                     bufs.v_prime[i * head_dim..].as_ptr(),
-                    inv_sum, head_dim,
+                    inv_sum,
+                    head_dim,
                 );
             }
         } else {
@@ -465,7 +522,6 @@ fn prefill_attention_one_head(
             }
         }
     }
-
 }
 
 // ── Decode (single-token) attention ─────────────────────────────────────
@@ -554,18 +610,35 @@ pub fn decode_attention_bf16(
 
             let output = std::slice::from_raw_parts_mut(ctx.out_ptr as *mut u16, ctx.out_len);
             let q = std::slice::from_raw_parts(ctx.q_ptr as *const u16, ctx.q_len);
-            let k_cache = std::slice::from_raw_parts(ctx.k_cache_ptr as *const u16, ctx.k_cache_len);
-            let v_cache = std::slice::from_raw_parts(ctx.v_cache_ptr as *const u16, ctx.v_cache_len);
-            let req_to_token = std::slice::from_raw_parts(ctx.req_to_token_ptr as *const i32, ctx.req_to_token_len);
-            let seq_lens = std::slice::from_raw_parts(ctx.seq_lens_ptr as *const i64, ctx.seq_lens_len);
+            let k_cache =
+                std::slice::from_raw_parts(ctx.k_cache_ptr as *const u16, ctx.k_cache_len);
+            let v_cache =
+                std::slice::from_raw_parts(ctx.v_cache_ptr as *const u16, ctx.v_cache_len);
+            let req_to_token = std::slice::from_raw_parts(
+                ctx.req_to_token_ptr as *const i32,
+                ctx.req_to_token_len,
+            );
+            let seq_lens =
+                std::slice::from_raw_parts(ctx.seq_lens_ptr as *const i64, ctx.seq_lens_len);
 
             for work_id in start..end {
                 let req_idx = work_id / ctx.num_heads;
                 let head_idx = work_id % ctx.num_heads;
                 decode_attention_one_head(
-                    output, q, k_cache, v_cache, req_to_token, seq_lens,
-                    req_idx, head_idx, ctx.max_context_len,
-                    ctx.num_heads, ctx.num_kv_heads, ctx.head_dim, ctx.gqa_ratio, ctx.sm_scale,
+                    output,
+                    q,
+                    k_cache,
+                    v_cache,
+                    req_to_token,
+                    seq_lens,
+                    req_idx,
+                    head_idx,
+                    ctx.max_context_len,
+                    ctx.num_heads,
+                    ctx.num_kv_heads,
+                    ctx.head_dim,
+                    ctx.gqa_ratio,
+                    ctx.sm_scale,
                 );
             }
         }
@@ -652,9 +725,8 @@ fn decode_attention_one_head(
         #[cfg(target_arch = "x86_64")]
         if use_avx512_bf16 {
             for j in 0..n_size {
-                scores[j] = dot_bf16_bf16_native(
-                    q_row, &k_block[j * head_dim..], head_dim,
-                ) * sm_scale;
+                scores[j] =
+                    dot_bf16_bf16_native(q_row, &k_block[j * head_dim..], head_dim) * sm_scale;
             }
         } else {
             for j in 0..n_size {
@@ -677,7 +749,9 @@ fn decode_attention_one_head(
         // ── Online softmax (shared) ─────────────────────────────────────
         let (m_i, block_sum, rescale) = if use_avx512 {
             #[cfg(target_arch = "x86_64")]
-            unsafe { online_softmax_avx512(scores.as_mut_ptr(), n_size, m_prime, 1.0) }
+            unsafe {
+                online_softmax_avx512(scores.as_mut_ptr(), n_size, m_prime, 1.0)
+            }
             #[cfg(not(target_arch = "x86_64"))]
             unreachable!()
         } else {
@@ -699,7 +773,9 @@ fn decode_attention_one_head(
                     out_f32.as_mut_ptr(),
                     v_block.as_ptr(),
                     scores.as_ptr(),
-                    n_size, head_dim, head_dim,
+                    n_size,
+                    head_dim,
+                    head_dim,
                 );
             }
         } else {
@@ -760,9 +836,20 @@ pub fn decode_attention_f32(
         let head_idx = work_id % num_heads;
         let output = unsafe { std::slice::from_raw_parts_mut(out_ptr as *mut f32, out_len) };
         decode_attention_one_head_f32(
-            output, q, k_cache, v_cache, req_to_token, seq_lens,
-            req_idx, head_idx, max_context_len,
-            num_heads, num_kv_heads, head_dim, gqa_ratio, sm_scale,
+            output,
+            q,
+            k_cache,
+            v_cache,
+            req_to_token,
+            seq_lens,
+            req_idx,
+            head_idx,
+            max_context_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            gqa_ratio,
+            sm_scale,
         );
     });
 }
@@ -831,7 +918,9 @@ fn decode_attention_one_head_f32(
         // Online softmax
         let (m_i, block_sum, rescale) = if use_avx512 {
             #[cfg(target_arch = "x86_64")]
-            unsafe { online_softmax_avx512(scores.as_mut_ptr(), n_size, m_prime, 1.0) }
+            unsafe {
+                online_softmax_avx512(scores.as_mut_ptr(), n_size, m_prime, 1.0)
+            }
             #[cfg(not(target_arch = "x86_64"))]
             unreachable!()
         } else {

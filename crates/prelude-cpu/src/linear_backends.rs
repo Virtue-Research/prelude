@@ -3,13 +3,13 @@
 //! - OnednnLinearFactory: creates OnednnLinear for CPU BF16/F32
 //! - Q4_0Linear, Q4KLinear: GGUF quantized linear backends
 
-use std::sync::Arc;
-use prelude_core::tensor::{Module, Result, Tensor};
+use prelude_core::models::commons::linear::DenseLinear;
 use prelude_core::models::commons::linear::{
     CpuLinearFactory, CpuLinearFactoryEntry, LinearBackend,
 };
-use prelude_core::models::commons::linear::DenseLinear;
+use prelude_core::tensor::{Module, Result, Tensor};
 use std::any::Any;
+use std::sync::Arc;
 
 // ── OneDNN CPU linear factory ───────────────────────────────────────
 
@@ -44,10 +44,7 @@ impl Module for Q4_0Linear {
         let m: usize = x_dims[..x_dims.len() - 1].iter().product();
         let x_k = *x_dims.last().unwrap();
         if x_k != self.k {
-            prelude_core::tensor::bail!(
-                "Q4_0 matmul: x inner dim {x_k} != weight dim {}",
-                self.k
-            );
+            prelude_core::tensor::bail!("Q4_0 matmul: x inner dim {x_k} != weight dim {}", self.k);
         }
 
         let x_cont = x.flatten_all()?.contiguous()?;
@@ -63,10 +60,18 @@ impl Module for Q4_0Linear {
 }
 
 impl LinearBackend for Q4_0Linear {
-    fn name(&self) -> &str { "cpu/q4_0" }
-    fn is_quantized(&self) -> bool { true }
-    fn clone_box(&self) -> Box<dyn LinearBackend> { Box::new(self.clone()) }
-    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str {
+        "cpu/q4_0"
+    }
+    fn is_quantized(&self) -> bool {
+        true
+    }
+    fn clone_box(&self) -> Box<dyn LinearBackend> {
+        Box::new(self.clone())
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ── Q4_K quantized linear backend ───────────────────────────────────
@@ -87,17 +92,21 @@ impl Module for Q4KLinear {
         let m: usize = x_dims[..x_dims.len() - 1].iter().product();
         let x_k = *x_dims.last().unwrap();
         if x_k != self.k {
-            prelude_core::tensor::bail!(
-                "Q4_K matmul: x inner dim {x_k} != weight dim {}",
-                self.k
-            );
+            prelude_core::tensor::bail!("Q4_K matmul: x inner dim {x_k} != weight dim {}", self.k);
         }
 
         let x_cont = x.flatten_all()?.contiguous()?;
         let x_slice = crate::ops::tensor_as_f32_slice(&x_cont)?;
 
         let mut out = vec![0.0f32; m * self.n];
-        crate::ops::quant::q4_k::quantized_matmul_q4k(x_slice, &self.blocks, &mut out, m, self.n, self.k);
+        crate::ops::quant::q4_k::quantized_matmul_q4k(
+            x_slice,
+            &self.blocks,
+            &mut out,
+            m,
+            self.n,
+            self.k,
+        );
 
         let mut out_dims = x_dims[..x_dims.len() - 1].to_vec();
         out_dims.push(self.n);
@@ -106,10 +115,18 @@ impl Module for Q4KLinear {
 }
 
 impl LinearBackend for Q4KLinear {
-    fn name(&self) -> &str { "cpu/q4_k" }
-    fn is_quantized(&self) -> bool { true }
-    fn clone_box(&self) -> Box<dyn LinearBackend> { Box::new(self.clone()) }
-    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str {
+        "cpu/q4_k"
+    }
+    fn is_quantized(&self) -> bool {
+        true
+    }
+    fn clone_box(&self) -> Box<dyn LinearBackend> {
+        Box::new(self.clone())
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ── QuantFormat registrations ───────────────────────────────────────
@@ -120,17 +137,23 @@ use prelude_core::tensor::quantized::GgmlDType;
 struct CpuQ4_0Format;
 
 impl QuantFormat for CpuQ4_0Format {
-    fn name(&self) -> &str { "cpu/q4_0" }
+    fn name(&self) -> &str {
+        "cpu/q4_0"
+    }
 
     fn can_handle(&self, dtype: GgmlDType) -> bool {
         dtype == GgmlDType::Q4_0
     }
 
-    fn load(&self, qtensor: Arc<prelude_core::tensor::quantized::QTensor>) -> Result<Box<dyn LinearBackend>> {
+    fn load(
+        &self,
+        qtensor: Arc<prelude_core::tensor::quantized::QTensor>,
+    ) -> Result<Box<dyn LinearBackend>> {
         let shape = qtensor.shape();
         let dims = shape.dims();
         let (n, k) = (dims[0], dims[1]);
-        let blocks: Vec<crate::ops::quant::BlockQ4_0> = bytemuck::cast_slice(qtensor.data()).to_vec();
+        let blocks: Vec<crate::ops::quant::BlockQ4_0> =
+            bytemuck::cast_slice(qtensor.data()).to_vec();
         Ok(Box::new(Q4_0Linear { blocks, n, k }))
     }
 }
@@ -140,17 +163,23 @@ inventory::submit!(QuantFormatEntry::new(&CpuQ4_0Format));
 struct CpuQ4KFormat;
 
 impl QuantFormat for CpuQ4KFormat {
-    fn name(&self) -> &str { "cpu/q4_k" }
+    fn name(&self) -> &str {
+        "cpu/q4_k"
+    }
 
     fn can_handle(&self, dtype: GgmlDType) -> bool {
         dtype == GgmlDType::Q4K
     }
 
-    fn load(&self, qtensor: Arc<prelude_core::tensor::quantized::QTensor>) -> Result<Box<dyn LinearBackend>> {
+    fn load(
+        &self,
+        qtensor: Arc<prelude_core::tensor::quantized::QTensor>,
+    ) -> Result<Box<dyn LinearBackend>> {
         let shape = qtensor.shape();
         let dims = shape.dims();
         let (n, k) = (dims[0], dims[1]);
-        let blocks: Vec<crate::ops::quant::BlockQ4K> = bytemuck::cast_slice(qtensor.data()).to_vec();
+        let blocks: Vec<crate::ops::quant::BlockQ4K> =
+            bytemuck::cast_slice(qtensor.data()).to_vec();
         Ok(Box::new(Q4KLinear { blocks, n, k }))
     }
 }

@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use crate::tensor::{DType, Device};
 use super::weight_loader::VarBuilder;
+use crate::tensor::{DType, Device};
 
-use crate::engine::{tensor_err, EngineError};
+use crate::engine::{EngineError, tensor_err};
 
 pub(crate) async fn has_remote_file(repo: &hf_hub::api::tokio::ApiRepo, filename: &str) -> bool {
     repo.get(filename).await.is_ok()

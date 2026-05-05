@@ -3,10 +3,10 @@
 //! Parses GGUF v2/v3 files (the standard format for quantized LLMs).
 //! Reference: https://github.com/ggerganov/ggml/blob/master/docs/gguf.md
 
+use super::{GgmlDType, QTensor};
+use crate::tensor::{Device, Result, Shape, bail};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
-use crate::tensor::{bail, Device, Result, Shape};
-use super::{GgmlDType, QTensor};
 
 const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in little-endian
 const DEFAULT_ALIGNMENT: u64 = 32;
@@ -107,8 +107,16 @@ impl Content {
         }
 
         // Counts
-        let tensor_count = if version >= 3 { read_u64(reader)? } else { read_u32(reader)? as u64 };
-        let metadata_kv_count = if version >= 3 { read_u64(reader)? } else { read_u32(reader)? as u64 };
+        let tensor_count = if version >= 3 {
+            read_u64(reader)?
+        } else {
+            read_u32(reader)? as u64
+        };
+        let metadata_kv_count = if version >= 3 {
+            read_u64(reader)?
+        } else {
+            read_u32(reader)? as u64
+        };
 
         // Parse metadata
         let mut metadata = HashMap::new();
@@ -132,20 +140,35 @@ impl Content {
             // GGUF stores dimensions in reversed order
             let mut dims = vec![0u64; n_dims];
             for d in dims.iter_mut() {
-                *d = if version >= 3 { read_u64(reader)? } else { read_u32(reader)? as u64 };
+                *d = if version >= 3 {
+                    read_u64(reader)?
+                } else {
+                    read_u32(reader)? as u64
+                };
             }
             dims.reverse();
             let shape = Shape::from(dims.iter().map(|&d| d as usize).collect::<Vec<_>>());
             let ggml_dtype = GgmlDType::from_u32(read_u32(reader)?)?;
             let offset = read_u64(reader)?;
-            tensor_infos.insert(name, TensorInfo { ggml_dtype, shape, offset });
+            tensor_infos.insert(
+                name,
+                TensorInfo {
+                    ggml_dtype,
+                    shape,
+                    offset,
+                },
+            );
         }
 
         // Tensor data starts after header, aligned
         let pos = reader.stream_position().map_err(io_err)?;
         let tensor_data_offset = align_offset(pos, alignment);
 
-        Ok(Content { metadata, tensor_infos, tensor_data_offset })
+        Ok(Content {
+            metadata,
+            tensor_infos,
+            tensor_data_offset,
+        })
     }
 
     /// Load a single tensor by name from the GGUF file.
@@ -155,8 +178,9 @@ impl Content {
         name: &str,
         _device: &Device,
     ) -> Result<QTensor> {
-        let info = self.tensor_infos.get(name)
-            .ok_or_else(|| crate::tensor::Error::Msg(format!("tensor '{name}' not found in GGUF")))?;
+        let info = self.tensor_infos.get(name).ok_or_else(|| {
+            crate::tensor::Error::Msg(format!("tensor '{name}' not found in GGUF"))
+        })?;
 
         let elem_count = info.shape.elem_count();
         let dtype = info.ggml_dtype;

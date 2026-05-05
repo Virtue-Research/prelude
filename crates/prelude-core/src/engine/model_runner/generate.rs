@@ -44,19 +44,13 @@ impl Engine {
         execution_kind: ExecutionKind,
     ) -> PrefillPlan {
         let seq_lens: Vec<usize> = items.iter().map(|item| item.prompt_tokens.len()).collect();
-        let all_same_len = seq_lens
-            .first()
-            .map(|first| seq_lens.iter().all(|len| len == first))
-            .unwrap_or(true);
         let all_greedy = items.iter().all(|item| item.is_greedy);
         let prefix_reuse = self.build_prefix_reuse_candidate(items, &seq_lens);
 
         PrefillPlan {
             execution_kind,
             seq_lens,
-            all_same_len,
             all_greedy,
-            force_varlen: self.engine_config.runtime.force_varlen_prefill,
             prefix_reuse,
             computed_lens: vec![],
             existing_block_tables: vec![],
@@ -69,10 +63,7 @@ impl Engine {
     ) -> Result<DecodePlan, EngineError> {
         self.ensure_multi_token_decode_ready()?;
         Ok(DecodePlan {
-            initial_prefill: self.build_prefill_plan(
-                items,
-                ExecutionKind::MultiTokenDecode,
-            ),
+            initial_prefill: self.build_prefill_plan(items, ExecutionKind::MultiTokenDecode),
         })
     }
 
@@ -148,7 +139,7 @@ impl Engine {
         self.generate_prepared_batch(batch)
     }
 
-    pub fn plan_generate_batch(
+    pub(crate) fn plan_generate_batch(
         &self,
         items: Vec<PreparedGenerateRequest>,
     ) -> Result<PreparedGenerateBatch, EngineError> {
@@ -174,7 +165,7 @@ impl Engine {
         Ok(PreparedGenerateBatch { plan, items })
     }
 
-    pub fn generate_prepared_batch(
+    pub(crate) fn generate_prepared_batch(
         &self,
         batch: PreparedGenerateBatch,
     ) -> Result<Vec<GenerateResult>, EngineError> {
@@ -190,9 +181,7 @@ impl Engine {
                 ExecutionKind::CudaPrefillOnly => {
                     self.execute_cuda_prefill_only_batch(items, prefill_plan)
                 }
-                ExecutionKind::CpuPrefillOnly => {
-                    self.execute_cpu_prefill_batch(items)
-                }
+                ExecutionKind::CpuPrefillOnly => self.execute_cpu_prefill_batch(items),
                 ExecutionKind::MultiTokenDecode => Err(EngineError::Internal(
                     "prefill plan cannot use multi-token decode execution kind".into(),
                 )),
@@ -220,7 +209,9 @@ impl Engine {
             .map(|item| std::slice::from_ref(&item.prompt_tokens))
             .collect();
 
-        let needs_prompt_logprobs = items.iter().any(|item| item.request.prompt_logprobs.is_some());
+        let needs_prompt_logprobs = items
+            .iter()
+            .any(|item| item.request.prompt_logprobs.is_some());
 
         let prefill_start = Instant::now();
         let mut forward_result = if needs_prompt_logprobs {
@@ -235,10 +226,14 @@ impl Engine {
         // to hidden states in chunks. This avoids materializing the full
         // (total_tokens, vocab_size) tensor and keeps GPU memory bounded.
         let prompt_logprobs_cpu = if let Some(hidden_states) = forward_result.hidden_states.take() {
-            let model = self.executor.model.lock()
+            let model = self
+                .executor
+                .model
+                .lock()
                 .map_err(|e| EngineError::Internal(format!("model lock: {e}")))?;
-            let logits_model = model.as_logits_model()
-                .ok_or_else(|| EngineError::Internal("model does not support LogitsSplitModel".into()))?;
+            let logits_model = model.as_logits_model().ok_or_else(|| {
+                EngineError::Internal("model does not support LogitsSplitModel".into())
+            })?;
             let cpu = extract_prompt_logprobs_from_hidden(
                 &hidden_states,
                 logits_model,
@@ -270,7 +265,6 @@ impl Engine {
         generate_postprocess(raw, &self.tokenizer, &self.eos_token_ids)
     }
 
-
     fn ensure_multi_token_decode_ready(&self) -> Result<(), EngineError> {
         if self.cache.paged_pool.is_none() || self.cache.block_manager.is_none() {
             return Err(EngineError::Unavailable(
@@ -296,8 +290,8 @@ impl Engine {
             .iter()
             .map(|prefill| prefill.prefill_ms)
             .collect();
-        let tx_storage: Vec<tokio::sync::mpsc::UnboundedSender<StreamEvent>> = (0
-            ..request_refs.len())
+        let tx_storage: Vec<tokio::sync::mpsc::UnboundedSender<StreamEvent>> = (0..request_refs
+            .len())
             .map(|_| {
                 let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
                 tx
@@ -305,8 +299,10 @@ impl Engine {
             .collect();
         let tx_refs: Vec<&tokio::sync::mpsc::UnboundedSender<StreamEvent>> =
             tx_storage.iter().collect();
-        let mut logits_processors: Vec<LogitsProcessor> =
-            items.into_iter().map(|item| item.logits_processor).collect();
+        let mut logits_processors: Vec<LogitsProcessor> = items
+            .into_iter()
+            .map(|item| item.logits_processor)
+            .collect();
         self.batched_stream_decode(
             &request_refs,
             prefill_results,
@@ -382,12 +378,11 @@ impl Engine {
             let seq_len = prompt_len;
             let input = Tensor::from_vec(item.prompt_tokens.clone(), (seq_len,), device)
                 .map_err(|e| EngineError::Internal(e.to_string()))?;
-            let cu_seqlens =
-                Tensor::from_vec(vec![0u32, seq_len as u32], (2,), device)
+            let cu_seqlens = Tensor::from_vec(vec![0u32, seq_len as u32], (2,), device)
+                .map_err(|e| EngineError::Internal(e.to_string()))?;
+            let position_ids =
+                Tensor::from_vec((0..seq_len as u32).collect::<Vec<_>>(), (seq_len,), device)
                     .map_err(|e| EngineError::Internal(e.to_string()))?;
-            let position_ids = Tensor::from_vec(
-                (0..seq_len as u32).collect::<Vec<_>>(), (seq_len,), device,
-            ).map_err(|e| EngineError::Internal(e.to_string()))?;
             let seq_lens_vec = vec![seq_len];
 
             let mut ctx = crate::models::commons::BatchAttnContext {
@@ -406,15 +401,20 @@ impl Engine {
 
             // When prompt logprobs requested: get hidden states, apply lm_head separately.
             let (logits_flat, prompt_token_logprobs) = if needs_prompt_logprobs {
-                let logits_model = model.as_logits_model_mut()
-                    .ok_or_else(|| EngineError::InvalidRequest(
-                        "prompt_logprobs requested but model doesn't support LogitsSplitModel".into()
-                    ))?;
-                let hidden = logits_model.forward_hidden_states(&input, &mut ctx)
+                let logits_model = model.as_logits_model_mut().ok_or_else(|| {
+                    EngineError::InvalidRequest(
+                        "prompt_logprobs requested but model doesn't support LogitsSplitModel"
+                            .into(),
+                    )
+                })?;
+                let hidden = logits_model
+                    .forward_hidden_states(&input, &mut ctx)
                     .map_err(|e| EngineError::Internal(e.to_string()))?;
-                let last_hidden = hidden.get(seq_len - 1)
+                let last_hidden = hidden
+                    .get(seq_len - 1)
                     .map_err(|e| EngineError::Internal(e.to_string()))?;
-                let last_logits = logits_model.compute_logits(&last_hidden)
+                let last_logits = logits_model
+                    .compute_logits(&last_hidden)
                     .and_then(|t| t.to_dtype(DType::F32))
                     .map_err(|e| EngineError::Internal(e.to_string()))?;
 
@@ -422,7 +422,10 @@ impl Engine {
                 let items_slice = std::slice::from_ref(item);
                 let seq_lens_slice = [seq_len];
                 let logprobs_cpu = extract_prompt_logprobs_from_hidden(
-                    &hidden, logits_model, items_slice, &seq_lens_slice,
+                    &hidden,
+                    logits_model,
+                    items_slice,
+                    &seq_lens_slice,
                 )?;
 
                 let prompt_tokens = &item.prompt_tokens;
@@ -431,7 +434,10 @@ impl Engine {
                         if pos + 1 < prompt_tokens.len() {
                             let next_token = prompt_tokens[pos + 1];
                             Some(TokenLogprobInfo {
-                                token: self.tokenizer.decode(&[next_token], false).unwrap_or_default(),
+                                token: self
+                                    .tokenizer
+                                    .decode(&[next_token], false)
+                                    .unwrap_or_default(),
                                 token_id: next_token,
                                 logprob: logprobs_cpu[pos],
                                 top_logprobs: Vec::new(),
@@ -445,17 +451,21 @@ impl Engine {
                 (last_logits, if plps.is_empty() { None } else { Some(plps) })
             } else if let Some(kv) = model.as_kv_cache_model() {
                 // GGUF and other models with internal KV cache
-                let logits = kv.forward_with_cache(&input, 0)
+                let logits = kv
+                    .forward_with_cache(&input, 0)
                     .map_err(|e| EngineError::Internal(e.to_string()))?;
                 // forward_with_cache returns [L, vocab]; take last token
-                let last_logits = logits.get(seq_len - 1)
+                let last_logits = logits
+                    .get(seq_len - 1)
                     .and_then(|t| t.to_dtype(DType::F32))
                     .map_err(|e| EngineError::Internal(e.to_string()))?;
                 (last_logits, None)
             } else {
-                let logits = model.forward(&input, &mut ctx)
+                let logits = model
+                    .forward(&input, &mut ctx)
                     .map_err(|e| EngineError::Internal(e.to_string()))?;
-                let flat = logits.flatten_all()
+                let flat = logits
+                    .flatten_all()
                     .and_then(|t| t.to_dtype(DType::F32))
                     .map_err(|e| EngineError::Internal(e.to_string()))?;
                 (flat, None)
@@ -465,13 +475,20 @@ impl Engine {
             let prefill_ms = gen_start.elapsed().as_secs_f32() * 1000.0;
 
             let _ = self.sample_and_check(
-                &logits_flat, logprobs_k, item,
-                &mut output_token_ids, &mut output_logprobs, &mut finish_reason,
+                &logits_flat,
+                logprobs_k,
+                item,
+                &mut output_token_ids,
+                &mut output_logprobs,
+                &mut finish_reason,
             )?;
 
             let total_ms = gen_start.elapsed().as_secs_f32() * 1000.0;
             let decode_ms = total_ms - prefill_ms;
-            let text = self.tokenizer.decode(&output_token_ids, true).unwrap_or_default();
+            let text = self
+                .tokenizer
+                .decode(&output_token_ids, true)
+                .unwrap_or_default();
             let text = Self::trim_stop_strings(&text, &item.request.stop.strings);
             let completion_tokens = output_token_ids.len() as u32;
 
@@ -486,9 +503,16 @@ impl Engine {
                     total_tokens: prompt_len as u32 + completion_tokens,
                 },
                 metrics: crate::types::DecodeMetrics {
-                    total_ms, prefill_ms, decode_ms, ttft_ms: prefill_ms,
+                    total_ms,
+                    prefill_ms,
+                    decode_ms,
+                    ttft_ms: prefill_ms,
                 },
-                token_logprobs: if output_logprobs.is_empty() { None } else { Some(output_logprobs) },
+                token_logprobs: if output_logprobs.is_empty() {
+                    None
+                } else {
+                    Some(output_logprobs)
+                },
                 prompt_token_logprobs,
             });
         }
@@ -514,21 +538,32 @@ impl Engine {
 
         if let Some(k) = logprobs_k {
             output_logprobs.push(Engine::extract_top_logprobs(
-                logits_flat, token_id, k, &self.tokenizer,
+                logits_flat,
+                token_id,
+                k,
+                &self.tokenizer,
             )?);
         }
 
         output_token_ids.push(token_id);
 
-        if self.eos_token_ids.contains(&token_id)
-            || item.request.stop.token_ids.contains(&token_id)
+        if self.eos_token_ids.contains(&token_id) || item.request.stop.token_ids.contains(&token_id)
         {
             *finish_reason = crate::types::FinishReason::Stop;
             return Ok(None);
         }
         if !item.request.stop.strings.is_empty() {
-            let text_so_far = self.tokenizer.decode(output_token_ids, true).unwrap_or_default();
-            if item.request.stop.strings.iter().any(|s| text_so_far.contains(s)) {
+            let text_so_far = self
+                .tokenizer
+                .decode(output_token_ids, true)
+                .unwrap_or_default();
+            if item
+                .request
+                .stop
+                .strings
+                .iter()
+                .any(|s| text_so_far.contains(s))
+            {
                 *finish_reason = crate::types::FinishReason::Stop;
                 return Ok(None);
             }
@@ -631,58 +666,6 @@ impl Engine {
     pub(crate) fn check_stop_tokens(&self, token_id: u32, stop_ids: &[u32]) -> bool {
         stop_ids.contains(&token_id)
     }
-
-    // ── CPU continuous decode helpers ─────────────────────────────────
-
-    /// CPU prefill: full prompt through KvCacheModel, returns last-token logits (F32).
-    pub(crate) fn cpu_prefill_with_cache(
-        &self,
-        prompt_tokens: &[u32],
-    ) -> Result<Tensor, EngineError> {
-        let device = &self.executor.device;
-        let seq_len = prompt_tokens.len();
-        let input = Tensor::from_vec(prompt_tokens.to_vec(), (seq_len,), device)
-            .map_err(|e| EngineError::Internal(e.to_string()))?;
-        let mut model = self.executor.model.lock().unwrap();
-        model.clear_kv_cache();
-        let kv = model.as_kv_cache_model()
-            .expect("cpu_prefill_with_cache called on model without KvCacheModel");
-        let logits = kv
-            .forward_with_cache(&input, 0)
-            .map_err(|e| EngineError::Internal(e.to_string()))?;
-        drop(model);
-        logits
-            .get(seq_len - 1)
-            .and_then(|t| t.to_dtype(DType::F32))
-            .map_err(|e| EngineError::Internal(e.to_string()))
-    }
-
-    /// CPU decode step: single token through KvCacheModel, returns logits (F32).
-    pub(crate) fn cpu_decode_step(
-        &self,
-        token: u32,
-        position_offset: usize,
-    ) -> Result<Tensor, EngineError> {
-        let device = &self.executor.device;
-        let input = Tensor::from_vec(vec![token], (1,), device)
-            .map_err(|e| EngineError::Internal(e.to_string()))?;
-        let mut model = self.executor.model.lock().unwrap();
-        let kv = model.as_kv_cache_model()
-            .expect("cpu_decode_step called on model without KvCacheModel");
-        let logits = kv
-            .forward_with_cache(&input, position_offset)
-            .map_err(|e| EngineError::Internal(e.to_string()))?;
-        drop(model);
-        logits
-            .get(0)
-            .and_then(|t| t.to_dtype(DType::F32))
-            .map_err(|e| EngineError::Internal(e.to_string()))
-    }
-
-    /// CPU: clear model's internal KV cache between requests.
-    pub(crate) fn cpu_clear_kv_cache(&self) {
-        self.executor.model.lock().unwrap().clear_kv_cache();
-    }
 }
 
 /// CPU post-processing for generation: argmax → logprob extraction → tokenizer decode → result.
@@ -717,35 +700,36 @@ pub(crate) fn generate_postprocess(
     let argmax_ms = argmax_start.elapsed().as_secs_f32() * 1000.0;
 
     // Build prompt logprobs per item from pre-extracted CPU data.
-    let prompt_logprobs_per_item: Vec<Option<Vec<TokenLogprobInfo>>> = if let Some(ref logprobs_cpu) = prompt_logprobs_cpu {
-        let mut per_item = Vec::with_capacity(batch_size);
-        let mut offset = 0usize;
-        for (i, item) in items.iter().enumerate() {
-            let q_len = fwd_seq_lens[i];
-            if item.request.prompt_logprobs.is_some() {
-                let mut plps = Vec::with_capacity(q_len.saturating_sub(1));
-                let prompt_tokens = &item.prompt_tokens;
-                for pos in 0..q_len.saturating_sub(1) {
-                    let next_token = prompt_tokens[pos + 1];
-                    let lp = logprobs_cpu[offset + pos];
-                    let token_str = tokenizer.decode(&[next_token], false).unwrap_or_default();
-                    plps.push(TokenLogprobInfo {
-                        token: token_str,
-                        token_id: next_token,
-                        logprob: lp,
-                        top_logprobs: Vec::new(),
-                    });
+    let prompt_logprobs_per_item: Vec<Option<Vec<TokenLogprobInfo>>> =
+        if let Some(ref logprobs_cpu) = prompt_logprobs_cpu {
+            let mut per_item = Vec::with_capacity(batch_size);
+            let mut offset = 0usize;
+            for (i, item) in items.iter().enumerate() {
+                let q_len = fwd_seq_lens[i];
+                if item.request.prompt_logprobs.is_some() {
+                    let mut plps = Vec::with_capacity(q_len.saturating_sub(1));
+                    let prompt_tokens = &item.prompt_tokens;
+                    for pos in 0..q_len.saturating_sub(1) {
+                        let next_token = prompt_tokens[pos + 1];
+                        let lp = logprobs_cpu[offset + pos];
+                        let token_str = tokenizer.decode(&[next_token], false).unwrap_or_default();
+                        plps.push(TokenLogprobInfo {
+                            token: token_str,
+                            token_id: next_token,
+                            logprob: lp,
+                            top_logprobs: Vec::new(),
+                        });
+                    }
+                    per_item.push(Some(plps));
+                } else {
+                    per_item.push(None);
                 }
-                per_item.push(Some(plps));
-            } else {
-                per_item.push(None);
+                offset += q_len;
             }
-            offset += q_len;
-        }
-        per_item
-    } else {
-        vec![None; batch_size]
-    };
+            per_item
+        } else {
+            vec![None; batch_size]
+        };
 
     let pack_start = Instant::now();
     let mut results: Vec<GenerateResult> = Vec::with_capacity(batch_size);
@@ -759,10 +743,7 @@ pub(crate) fn generate_postprocess(
         let token_logprobs = if let Some(k) = item.request.logprobs {
             let row = logits_2d.get(i).map_err(tensor_err)?;
             Some(vec![Engine::extract_top_logprobs(
-                &row,
-                token,
-                k,
-                tokenizer,
+                &row, token, k, tokenizer,
             )?])
         } else {
             None
@@ -876,24 +857,21 @@ pub(crate) fn extract_prompt_logprobs_from_hidden_offset(
         let end = (start + PROMPT_LOGPROBS_CHUNK_SIZE).min(total_tokens);
         let chunk_len = end - start;
 
-        let chunk_hidden = hidden_states.narrow(0, start, chunk_len).map_err(tensor_err)?;
+        let chunk_hidden = hidden_states
+            .narrow(0, start, chunk_len)
+            .map_err(tensor_err)?;
         let chunk_logits = model.compute_logits(&chunk_hidden).map_err(tensor_err)?;
 
-        let chunk_target_ids = Tensor::from_vec(
-            flat_next_tokens[start..end].to_vec(),
-            (chunk_len,),
-            &device,
-        )
-        .map_err(tensor_err)?;
+        let chunk_target_ids =
+            Tensor::from_vec(flat_next_tokens[start..end].to_vec(), (chunk_len,), &device)
+                .map_err(tensor_err)?;
 
         let chunk_logprobs_tensor = match ops.gather_log_softmax(&chunk_logits, &chunk_target_ids) {
             Some(res) => res.map_err(tensor_err)?,
             None => {
                 // Fallback: materialise the log_softmax temporary, do
                 // the on-device gather, same O(chunk_len) D2H.
-                let chunk_log_probs = ops
-                    .log_softmax(&chunk_logits, 1)
-                    .map_err(tensor_err)?;
+                let chunk_log_probs = ops.log_softmax(&chunk_logits, 1).map_err(tensor_err)?;
                 drop(chunk_logits);
                 let idx = chunk_target_ids
                     .reshape((chunk_len, 1))
@@ -908,11 +886,7 @@ pub(crate) fn extract_prompt_logprobs_from_hidden_offset(
             }
         };
 
-        logprobs_cpu.extend(
-            chunk_logprobs_tensor
-                .to_vec1::<f32>()
-                .map_err(tensor_err)?,
-        );
+        logprobs_cpu.extend(chunk_logprobs_tensor.to_vec1::<f32>().map_err(tensor_err)?);
     }
 
     Ok(logprobs_cpu)

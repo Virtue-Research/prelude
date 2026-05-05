@@ -146,9 +146,11 @@ impl PrefixMatchIndex {
 
     /// Check if all given hashes have paged block IDs.
     pub fn all_have_paged(&self, hashes: &[u64]) -> bool {
-        hashes
-            .iter()
-            .all(|h| self.entries.get(h).is_some_and(|e| e.paged_block_ids.is_some()))
+        hashes.iter().all(|h| {
+            self.entries
+                .get(h)
+                .is_some_and(|e| e.paged_block_ids.is_some())
+        })
     }
 
     /// Build a canonical paged-attn block table from matched prefix entries.

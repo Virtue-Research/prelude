@@ -40,7 +40,11 @@ mod layer_cache_spec_tests {
             sliding_window: Some(4096),
         };
         match &spec {
-            LayerCacheSpec::Attention { num_kv_heads, head_dim, sliding_window } => {
+            LayerCacheSpec::Attention {
+                num_kv_heads,
+                head_dim,
+                sliding_window,
+            } => {
                 assert_eq!(*num_kv_heads, 8);
                 assert_eq!(*head_dim, 128);
                 assert_eq!(*sliding_window, Some(4096));
@@ -56,7 +60,10 @@ mod layer_cache_spec_tests {
             state_dtypes: vec![DType::BF16, DType::BF16],
         };
         match &spec {
-            LayerCacheSpec::Recurrent { state_shapes, state_dtypes } => {
+            LayerCacheSpec::Recurrent {
+                state_shapes,
+                state_dtypes,
+            } => {
                 assert_eq!(state_shapes.len(), 2);
                 assert_eq!(state_dtypes.len(), 2);
             }
@@ -88,11 +95,17 @@ mod layer_cache_spec_tests {
         }
         assert_eq!(specs.len(), 28);
         assert_eq!(
-            specs.iter().filter(|s| matches!(s, LayerCacheSpec::Attention { .. })).count(),
+            specs
+                .iter()
+                .filter(|s| matches!(s, LayerCacheSpec::Attention { .. }))
+                .count(),
             24
         );
         assert_eq!(
-            specs.iter().filter(|s| matches!(s, LayerCacheSpec::Recurrent { .. })).count(),
+            specs
+                .iter()
+                .filter(|s| matches!(s, LayerCacheSpec::Recurrent { .. }))
+                .count(),
             4
         );
     }
