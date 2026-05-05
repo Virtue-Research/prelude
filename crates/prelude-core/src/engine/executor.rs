@@ -21,7 +21,6 @@
 //! });
 //! ```
 
-
 use crate::tensor::Tensor;
 
 use super::EngineError;
@@ -37,16 +36,20 @@ pub struct ExecutionHandle {
 }
 
 impl ExecutionHandle {
-    pub fn new(rx: tokio::sync::oneshot::Receiver<Result<ModelOutput, super::EngineError>>) -> Self {
+    pub fn new(
+        rx: tokio::sync::oneshot::Receiver<Result<ModelOutput, super::EngineError>>,
+    ) -> Self {
         Self { rx }
     }
 
     /// Await the result. Yields to tokio while the worker thread runs,
     /// allowing SSE streaming handlers to interleave naturally.
     pub async fn recv(self) -> Result<ModelOutput, super::EngineError> {
-        self.rx.await.unwrap_or_else(|_|
-            Err(super::EngineError::Internal("executor worker dropped result channel".into()))
-        )
+        self.rx.await.unwrap_or_else(|_| {
+            Err(super::EngineError::Internal(
+                "executor worker dropped result channel".into(),
+            ))
+        })
     }
 }
 
@@ -54,8 +57,9 @@ impl ExecutionHandle {
 
 /// Output from a single forward pass.
 ///
-/// Sampling and postprocessing happen in the scheduling loop (core),
-/// not in the Executor.
+/// Sampling and postprocessing normally happen in the scheduling loop (core).
+/// Device executors may optionally return greedy argmax tokens to keep the
+/// per-step hot path on the worker.
 #[derive(Debug)]
 pub struct ModelOutput {
     /// Raw logits: `[batch_size, vocab_size]` (for decode/prefill/classify)
@@ -67,6 +71,9 @@ pub struct ModelOutput {
     /// Per-request prefill metadata (block tables, prompt_len, etc.).
     /// Populated only for Prefill batches; empty for Decode/OneShot.
     pub prefill_results: Vec<super::BatchPrefillResult>,
+    /// Optional row-aligned greedy tokens.
+    /// Populated only when the executor was asked to use its greedy fast path.
+    pub sampled_tokens: Option<Vec<u32>>,
 }
 
 // ── Forward batch ──────────────────────────────────────────────────
@@ -92,6 +99,8 @@ pub struct StepRequest {
     pub deltanet_slot: Option<u32>,
     /// Whether to compute per-token prompt logprobs (for PPL / echo).
     pub prompt_logprobs: Option<u32>,
+    /// Whether this request needs paged KV cache writes for later chunks/decode.
+    pub needs_kv_cache: bool,
 }
 
 pub enum ForwardBatch {
@@ -99,6 +108,8 @@ pub enum ForwardBatch {
     /// in a single forward pass. Used by chunked-prefill scheduler.
     Mixed {
         requests: Vec<StepRequest>,
+        /// Rows that need sampling are pure greedy with no logprobs.
+        sample_greedy: bool,
     },
     /// Pure decode batch (Q=1 for all): eligible for CUDA graph replay.
     Decode {
@@ -107,6 +118,8 @@ pub enum ForwardBatch {
         block_tables: Vec<Vec<u32>>,
         /// DeltaNet pool slots for hybrid models (None = non-hybrid).
         deltanet_slots: Option<Vec<u32>>,
+        /// Pure greedy decode with no logprobs can be sampled in the executor.
+        sample_greedy: bool,
     },
     /// One-shot forward for classify/embed (no decode loop).
     /// Groups of token sequences — each group is one input item which may
@@ -135,16 +148,13 @@ pub trait Executor: Send + Sync + 'static {
     /// Both GPU and CPU executors send work to a dedicated worker thread
     /// and return an `ExecutionHandle` backed by a oneshot channel.
     /// The caller awaits the result with `handle.recv().await`.
-    fn submit(
-        &self,
-        batch: ForwardBatch,
-    ) -> Result<ExecutionHandle, EngineError>;
+    fn submit(&self, batch: ForwardBatch) -> Result<ExecutionHandle, EngineError>;
 }
 
 // ── Registration ───────────────────────────────────────────────────
 
-use std::sync::Mutex;
 use crate::tensor::Device;
+use std::sync::Mutex;
 
 /// Factory function signature: takes shared engine state, returns a device executor.
 pub type ExecutorFactory = fn(engine: std::sync::Arc<super::engine::Engine>) -> Box<dyn Executor>;
@@ -183,7 +193,12 @@ pub fn create_executor(engine: std::sync::Arc<super::engine::Engine>) -> Option<
         }
     }
     best.map(|b| {
-        tracing::info!("executor for {:?}: {} (priority {})", device, b.name, b.priority);
+        tracing::info!(
+            "executor for {:?}: {} (priority {})",
+            device,
+            b.name,
+            b.priority
+        );
         (b.create)(engine)
     })
 }
@@ -198,12 +213,9 @@ mod tests {
     }
 
     impl Executor for TestExecutor {
-        fn submit(
-            &self,
-            batch: ForwardBatch,
-        ) -> Result<ExecutionHandle, EngineError> {
+        fn submit(&self, batch: ForwardBatch) -> Result<ExecutionHandle, EngineError> {
             let (batch_size, item_seq_counts) = match &batch {
-                ForwardBatch::Mixed { requests } => (requests.len(), vec![]),
+                ForwardBatch::Mixed { requests, .. } => (requests.len(), vec![]),
                 ForwardBatch::Decode { tokens, .. } => (tokens.len(), vec![]),
                 ForwardBatch::OneShot { token_groups, .. } => {
                     let counts: Vec<usize> = token_groups.iter().map(|g| g.len()).collect();
@@ -215,24 +227,43 @@ mod tests {
                 (batch_size, self.vocab_size),
                 crate::tensor::DType::F32,
                 &crate::tensor::Device::Cpu,
-            ).map_err(|e| EngineError::Internal(format!("{e}")))?;
+            )
+            .map_err(|e| EngineError::Internal(format!("{e}")))?;
 
             let (tx, rx) = tokio::sync::oneshot::channel();
-            let _ = tx.send(Ok(ModelOutput { logits, item_seq_counts, prefill_results: vec![] }));
+            let _ = tx.send(Ok(ModelOutput {
+                logits,
+                item_seq_counts,
+                prefill_results: vec![],
+                sampled_tokens: None,
+            }));
             Ok(ExecutionHandle::new(rx))
         }
     }
 
     /// Helper: submit + recv in a blocking tokio context.
-    fn submit_recv(executor: &TestExecutor, batch: ForwardBatch) -> Result<ModelOutput, EngineError> {
+    fn submit_recv(
+        executor: &TestExecutor,
+        batch: ForwardBatch,
+    ) -> Result<ModelOutput, EngineError> {
         let handle = executor.submit(batch)?;
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(handle.recv())
     }
 
     #[test]
     fn submit_recv_prefill() {
-        let output = submit_recv(&TestExecutor { vocab_size: 100 }, ForwardBatch::Mixed { requests: vec![] }).unwrap();
+        let output = submit_recv(
+            &TestExecutor { vocab_size: 100 },
+            ForwardBatch::Mixed {
+                requests: vec![],
+                sample_greedy: false,
+            },
+        )
+        .unwrap();
         assert_eq!(output.logits.dims(), &[0, 100]);
     }
 
@@ -245,8 +276,10 @@ mod tests {
                 positions: vec![10, 20, 30],
                 block_tables: vec![vec![0, 1], vec![0, 2], vec![0, 3]],
                 deltanet_slots: None,
+                sample_greedy: false,
             },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(output.logits.dims(), &[3, 50]);
     }
 
@@ -255,13 +288,11 @@ mod tests {
         let output = submit_recv(
             &TestExecutor { vocab_size: 8 },
             ForwardBatch::OneShot {
-                token_groups: vec![
-                    vec![vec![1, 2, 3]],
-                    vec![vec![4, 5], vec![6, 7]],
-                ],
+                token_groups: vec![vec![vec![1, 2, 3]], vec![vec![4, 5], vec![6, 7]]],
                 task: crate::engine::TaskKind::Classify,
             },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(output.logits.dims(), &[3, 8]);
         assert_eq!(output.item_seq_counts, vec![1, 2]);
     }
@@ -275,8 +306,10 @@ mod tests {
                 positions: vec![5, 8],
                 block_tables: vec![vec![0], vec![1]],
                 deltanet_slots: Some(vec![0, 1]),
+                sample_greedy: false,
             },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(output.logits.dims(), &[2, 32]);
     }
 
@@ -288,7 +321,8 @@ mod tests {
                 token_groups: vec![vec![vec![1, 2, 3, 4]]],
                 task: crate::engine::TaskKind::Embed,
             },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(output.logits.dims(), &[1, 64]);
         assert_eq!(output.item_seq_counts, vec![1]);
     }
@@ -301,7 +335,8 @@ mod tests {
                 token_groups: vec![],
                 task: crate::engine::TaskKind::Classify,
             },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(output.logits.dims(), &[0, 16]);
     }
 
@@ -309,7 +344,10 @@ mod tests {
     fn dropped_sender_returns_error() {
         let (_, rx) = tokio::sync::oneshot::channel::<Result<ModelOutput, EngineError>>();
         let handle = ExecutionHandle::new(rx);
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let result = rt.block_on(handle.recv());
         assert!(result.is_err());
     }

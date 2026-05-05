@@ -24,6 +24,7 @@ impl Engine {
                 logits: Tensor::zeros((0, 0), DType::F32, &Device::Cpu).map_err(tensor_err)?,
                 item_seq_counts: vec![],
                 prefill_results: vec![],
+                sampled_tokens: None,
             });
         }
 
@@ -62,6 +63,7 @@ impl Engine {
                 block_table_len = req.block_table.len(),
                 is_prefill_final = req.is_prefill_final,
                 is_prefill_partial = req.is_prefill_partial,
+                needs_kv_cache = req.needs_kv_cache,
                 first_token = req.tokens.first().copied().unwrap_or(0),
                 last_token = req.tokens.last().copied().unwrap_or(0),
                 prompt_logprobs = ?req.prompt_logprobs,
@@ -77,41 +79,53 @@ impl Engine {
         let cu_seqlens_k_t =
             Tensor::from_vec(cu_seqlens_k, (num_requests + 1,), &self.executor.device)
                 .map_err(tensor_err)?;
-        let position_ids_t =
-            Tensor::from_vec(position_ids, (total_tokens,), &self.executor.device)
-                .map_err(tensor_err)?;
+        let position_ids_t = Tensor::from_vec(position_ids, (total_tokens,), &self.executor.device)
+            .map_err(tensor_err)?;
 
         // ── Block tables + slot mapping ───────────────────────────────
-        let max_blocks = requests.iter().map(|r| r.block_table.len()).max().unwrap_or(0);
-        let mut flat_bt: Vec<u32> = Vec::with_capacity(num_requests * max_blocks);
-        for req in requests {
-            flat_bt.extend_from_slice(&req.block_table);
-            for _ in req.block_table.len()..max_blocks {
-                flat_bt.push(0);
+        let use_paged_kv = requests.iter().any(|r| r.needs_kv_cache);
+        let block_tables_t = if use_paged_kv {
+            let max_blocks = requests
+                .iter()
+                .map(|r| r.block_table.len())
+                .max()
+                .unwrap_or(0);
+            let mut flat_bt: Vec<u32> = Vec::with_capacity(num_requests * max_blocks);
+            for req in requests {
+                flat_bt.extend_from_slice(&req.block_table);
+                for _ in req.block_table.len()..max_blocks {
+                    flat_bt.push(0);
+                }
             }
-        }
-        let block_tables_t = if max_blocks > 0 {
-            Tensor::from_vec(flat_bt, (num_requests, max_blocks), &self.executor.device)
-                .map_err(tensor_err)?
-                .to_dtype(DType::U32)
-                .map_err(tensor_err)?
+            if max_blocks > 0 {
+                Tensor::from_vec(flat_bt, (num_requests, max_blocks), &self.executor.device)
+                    .map_err(tensor_err)?
+                    .to_dtype(DType::U32)
+                    .map_err(tensor_err)?
+            } else {
+                Tensor::zeros((num_requests, 0), DType::U32, &self.executor.device)
+                    .map_err(tensor_err)?
+            }
         } else {
             Tensor::zeros((num_requests, 0), DType::U32, &self.executor.device)
                 .map_err(tensor_err)?
         };
 
-        let mut slots: Vec<i64> = Vec::with_capacity(total_tokens);
-        for req in requests {
-            for t in 0..req.tokens.len() {
-                slots.push(crate::cache::block_manager::BlockManager::slot(
-                    &req.block_table,
-                    req.position_start + t,
-                    pool.block_size,
-                ));
+        let slot_mapping_t = if use_paged_kv {
+            let mut slots: Vec<i64> = Vec::with_capacity(total_tokens);
+            for req in requests {
+                for t in 0..req.tokens.len() {
+                    slots.push(crate::cache::block_manager::BlockManager::slot(
+                        &req.block_table,
+                        req.position_start + t,
+                        pool.block_size,
+                    ));
+                }
             }
-        }
-        let slot_mapping_t =
-            Tensor::new(slots.as_slice(), &self.executor.device).map_err(tensor_err)?;
+            Tensor::new(slots.as_slice(), &self.executor.device).map_err(tensor_err)?
+        } else {
+            Tensor::zeros((0,), DType::I64, &self.executor.device).map_err(tensor_err)?
+        };
 
         // ── DeltaNet slots ────────────────────────────────────────────
         let deltanet_slots: Option<Vec<u32>> = if self.cache.deltanet_pool.is_some() {
@@ -123,6 +137,13 @@ impl Engine {
             }
         } else {
             None
+        };
+        let deltanet_slots_gpu = match deltanet_slots.as_ref() {
+            Some(slots) if self.executor.device.is_cuda() => Some(
+                Tensor::from_vec(slots.clone(), (slots.len(),), &self.executor.device)
+                    .map_err(tensor_err)?,
+            ),
+            _ => None,
         };
 
         // ── Forward ───────────────────────────────────────────────────
@@ -136,13 +157,17 @@ impl Engine {
         let mut dn_pool_guard = self.cache.deltanet_pool.as_ref().map(|m| m.lock().unwrap());
         let dn_pool_ref = dn_pool_guard.as_deref_mut();
 
-        let paged_kv = PagedKvBatchContext {
-            key_caches: &pool.active_key_caches(),
-            value_caches: &pool.active_value_caches(),
-            slot_mapping: &slot_mapping_t,
-            block_tables: &block_tables_t,
-            cu_seqlens_k: &cu_seqlens_k_t,
-            max_seqlen_k,
+        let paged_kv = if use_paged_kv {
+            Some(PagedKvBatchContext {
+                key_caches: &pool.active_key_caches(),
+                value_caches: &pool.active_value_caches(),
+                slot_mapping: &slot_mapping_t,
+                block_tables: &block_tables_t,
+                cu_seqlens_k: &cu_seqlens_k_t,
+                max_seqlen_k,
+            })
+        } else {
+            None
         };
         let mut ctx = BatchAttnContext {
             ops: self.executor.ops,
@@ -150,13 +175,10 @@ impl Engine {
             max_seqlen_q,
             position_ids: &position_ids_t,
             seq_lens: &q_seq_lens,
-            paged_kv: Some(&paged_kv),
+            paged_kv: paged_kv.as_ref(),
             deltanet_pool: dn_pool_ref,
             deltanet_slots: deltanet_slots.as_deref(),
-            deltanet_slots_gpu: {
-                // Create GPU tensor for DeltaNet slot IDs (needed for batched conv1d_update)
-                None // Eager path: deltanet_decode_batched_fused creates on-the-fly
-            },
+            deltanet_slots_gpu: deltanet_slots_gpu.as_ref(),
         };
 
         let needs_prompt_logprobs = requests.iter().any(|r| r.prompt_logprobs.is_some());
@@ -166,11 +188,14 @@ impl Engine {
         // When prompt logprobs needed: use forward_hidden_states path to get
         // all-token hidden states, then extract per-token logprobs.
         let (logits_2d, prompt_logprobs_data) = if needs_prompt_logprobs {
-            let lm = model.as_logits_model_mut()
-                .ok_or_else(|| EngineError::InvalidRequest(
-                    "prompt_logprobs requested but model doesn't support LogitsSplitModel".into()
-                ))?;
-            let hidden = lm.forward_hidden_states(&packed_input, &mut ctx).map_err(tensor_err)?;
+            let lm = model.as_logits_model_mut().ok_or_else(|| {
+                EngineError::InvalidRequest(
+                    "prompt_logprobs requested but model doesn't support LogitsSplitModel".into(),
+                )
+            })?;
+            let hidden = lm
+                .forward_hidden_states(&packed_input, &mut ctx)
+                .map_err(tensor_err)?;
             let last_hidden = crate::models::commons::last_token_select(&hidden, &q_seq_lens)
                 .map_err(tensor_err)?;
             let last_logits = lm.compute_logits(&last_hidden).map_err(tensor_err)?;
@@ -214,11 +239,9 @@ impl Engine {
 
                     // Next-token ids as a `[q_len - 1]` U32 tensor on
                     // the same device as the logits.
-                    let next_tokens: Vec<u32> =
-                        req.tokens[1..q_len].iter().copied().collect();
-                    let target_ids =
-                        Tensor::from_vec(next_tokens, (q_len - 1,), &hidden_device)
-                            .map_err(tensor_err)?;
+                    let next_tokens: Vec<u32> = req.tokens[1..q_len].iter().copied().collect();
+                    let target_ids = Tensor::from_vec(next_tokens, (q_len - 1,), &hidden_device)
+                        .map_err(tensor_err)?;
 
                     let token_logprobs_tensor = match self
                         .executor
@@ -232,17 +255,14 @@ impl Engine {
                             // Slower than the fused kernel (allocates a
                             // full `[q_len - 1, vocab] F32` temp) but
                             // still keeps D2H at O(q_len).
-                            let span_logits_f32 = span_logits
-                                .to_dtype(DType::F32)
-                                .map_err(tensor_err)?;
+                            let span_logits_f32 =
+                                span_logits.to_dtype(DType::F32).map_err(tensor_err)?;
                             let log_probs = candle_nn::ops::log_softmax(
                                 &span_logits_f32,
                                 crate::tensor::D::Minus1,
                             )
                             .map_err(tensor_err)?;
-                            let idx = target_ids
-                                .reshape((q_len - 1, 1))
-                                .map_err(tensor_err)?;
+                            let idx = target_ids.reshape((q_len - 1, 1)).map_err(tensor_err)?;
                             log_probs
                                 .gather(&idx, 1)
                                 .map_err(tensor_err)?
@@ -270,6 +290,7 @@ impl Engine {
         self.executor.ops.end_forward();
         drop(dn_pool_guard);
         drop(model);
+        self.maybe_sync_device();
 
         let forward_ms = forward_start.elapsed().as_secs_f32() * 1000.0;
 
@@ -277,30 +298,34 @@ impl Engine {
         let mut prefill_results: Vec<BatchPrefillResult> = Vec::new();
         for (i, req) in requests.iter().enumerate() {
             if req.is_prefill_final || req.is_prefill_partial {
-                let row = logits_2d.get(i).map_err(tensor_err)?;
-                let token = row
-                    .argmax(crate::tensor::D::Minus1)
-                    .map_err(tensor_err)?
-                    .to_scalar::<u32>()
-                    .map_err(tensor_err)?;
-
                 // Build prompt token logprobs if requested
                 let prompt_token_logprobs = if let Some(raw_lps) = &prompt_logprobs_data[i] {
-                    Some(raw_lps.iter().enumerate().map(|(pos, &lp)| {
-                        let next_tok = req.tokens[pos + 1];
-                        TokenLogprobInfo {
-                            token: self.tokenizer.decode(&[next_tok], false).unwrap_or_default(),
-                            token_id: next_tok,
-                            logprob: lp,
-                            top_logprobs: Vec::new(),
-                        }
-                    }).collect())
+                    Some(
+                        raw_lps
+                            .iter()
+                            .enumerate()
+                            .map(|(pos, &lp)| {
+                                let next_tok = req.tokens[pos + 1];
+                                TokenLogprobInfo {
+                                    token: self
+                                        .tokenizer
+                                        .decode(&[next_tok], false)
+                                        .unwrap_or_default(),
+                                    token_id: next_tok,
+                                    logprob: lp,
+                                    top_logprobs: Vec::new(),
+                                }
+                            })
+                            .collect(),
+                    )
                 } else {
                     None
                 };
 
                 prefill_results.push(BatchPrefillResult {
-                    first_token: token,
+                    // The AR loop samples from ModelOutput.logits. Avoid a
+                    // duplicate per-request argmax and D2H sync here.
+                    first_token: 0,
                     block_table: req.block_table.clone(),
                     prompt_len: req.position_start + req.tokens.len(),
                     prefill_ms: forward_ms,
@@ -323,6 +348,7 @@ impl Engine {
             logits: logits_2d,
             item_seq_counts: vec![],
             prefill_results,
+            sampled_tokens: None,
         })
     }
 }

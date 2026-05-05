@@ -1,19 +1,19 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use chrono::Utc;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::engine::{Engine, EngineError, InferenceEngine};
 use crate::engine::executor::{self, Executor, ForwardBatch};
 use crate::engine::run::ar::{ArMessage, ResponseChannel, ar_loop};
 use crate::engine::types::TaskKind;
+use crate::engine::{Engine, EngineError, InferenceEngine};
 use crate::scheduler::SchedulerConfig;
 use crate::types::{
     ClassifyRequest, ClassifyResult, EmbedRequest, EmbedResult, GenerateRequest, GenerateResult,
     ModelInfo, StreamEvent,
 };
-
 
 // ---------------------------------------------------------------------------
 // ScheduledEngine — Executor-based
@@ -24,7 +24,33 @@ pub struct ScheduledEngine {
     executor: Arc<dyn Executor>,
     model_info: ModelInfo,
     engine: Arc<Engine>,
+    inflight_generations: Arc<AtomicUsize>,
     _ar_loop_handle: tokio::task::JoinHandle<()>,
+}
+
+struct GenerationInflightGuard {
+    counter: Arc<AtomicUsize>,
+    count: usize,
+}
+
+impl GenerationInflightGuard {
+    fn enter(counter: &Arc<AtomicUsize>) -> Self {
+        let count = counter.fetch_add(1, Ordering::AcqRel) + 1;
+        Self {
+            counter: Arc::clone(counter),
+            count,
+        }
+    }
+
+    fn is_single(&self) -> bool {
+        self.count == 1
+    }
+}
+
+impl Drop for GenerationInflightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl ScheduledEngine {
@@ -38,11 +64,10 @@ impl ScheduledEngine {
 
         // Create the device executor (registered by device crate at startup).
         let executor: Arc<dyn Executor> = Arc::from(
-            executor::create_executor(Arc::clone(&engine))
-                .unwrap_or_else(|| {
-                    tracing::warn!("no device executor registered, using stub");
-                    Box::new(StubExecutor)
-                })
+            executor::create_executor(Arc::clone(&engine)).unwrap_or_else(|| {
+                tracing::warn!("no device executor registered, using stub");
+                Box::new(StubExecutor)
+            }),
         );
 
         // Set block_size from paged pool so the scheduler can do block-level admission.
@@ -66,6 +91,7 @@ impl ScheduledEngine {
             executor,
             model_info,
             engine,
+            inflight_generations: Arc::new(AtomicUsize::new(0)),
             _ar_loop_handle: ar_loop_handle,
         }
     }
@@ -74,13 +100,19 @@ impl ScheduledEngine {
         &self,
         request: GenerateRequest,
         response: ResponseChannel,
+        use_raw_prepare: bool,
     ) -> Result<(), EngineError> {
-        let prepared = tokio::task::block_in_place(|| {
-            self.engine.prepare_generate_request(&request, 0)
-        })?;
-        self.ar_tx
-            .send(ArMessage::NewRequest { prepared, response })
-            .map_err(|_| EngineError::Unavailable("AR loop stopped".into()))
+        if use_raw_prepare {
+            self.ar_tx
+                .send(ArMessage::RawRequest { request, response })
+                .map_err(|_| EngineError::Unavailable("AR loop stopped".into()))
+        } else {
+            let prepared =
+                tokio::task::block_in_place(|| self.engine.prepare_generate_request(&request, 0))?;
+            self.ar_tx
+                .send(ArMessage::NewRequest { prepared, response })
+                .map_err(|_| EngineError::Unavailable("AR loop stopped".into()))
+        }
     }
 }
 
@@ -89,7 +121,9 @@ struct StubExecutor;
 
 impl Executor for StubExecutor {
     fn submit(&self, _batch: ForwardBatch) -> Result<executor::ExecutionHandle, EngineError> {
-        Err(EngineError::Unavailable("no device executor registered".into()))
+        Err(EngineError::Unavailable(
+            "no device executor registered".into(),
+        ))
     }
 }
 
@@ -108,8 +142,13 @@ impl InferenceEngine for ScheduledEngine {
     }
 
     async fn generate(&self, request: GenerateRequest) -> Result<GenerateResult, EngineError> {
+        let inflight = GenerationInflightGuard::enter(&self.inflight_generations);
         let (result_tx, result_rx) = oneshot::channel();
-        self.prepare_and_enqueue(request, ResponseChannel::Complete(result_tx))?;
+        self.prepare_and_enqueue(
+            request,
+            ResponseChannel::Complete(result_tx),
+            inflight.is_single(),
+        )?;
         result_rx
             .await
             .map_err(|_| EngineError::Internal("AR loop dropped result channel".into()))?
@@ -120,7 +159,8 @@ impl InferenceEngine for ScheduledEngine {
         request: GenerateRequest,
         tx: mpsc::UnboundedSender<StreamEvent>,
     ) -> Result<(), EngineError> {
-        self.prepare_and_enqueue(request, ResponseChannel::Stream(tx))
+        let inflight = GenerationInflightGuard::enter(&self.inflight_generations);
+        self.prepare_and_enqueue(request, ResponseChannel::Stream(tx), inflight.is_single())
     }
 
     async fn cancel(&self, request_id: &str) -> Result<bool, EngineError> {
@@ -164,7 +204,8 @@ async fn classify_via_executor(
     let (num_labels, label_map) = engine.classify_metadata()?;
 
     // Postprocess: logits → per-sequence class probabilities
-    let logits_f32 = output.logits
+    let logits_f32 = output
+        .logits
         .to_dtype(DType::F32)
         .map_err(|e| EngineError::Internal(format!("classify to_dtype: {e}")))?;
     let rows: Vec<Vec<f32>> = logits_f32
@@ -173,10 +214,15 @@ async fn classify_via_executor(
 
     let mut results = Vec::with_capacity(rows.len());
     for (idx, probs) in rows.into_iter().enumerate() {
-        let (max_idx, _) = probs.iter().enumerate()
+        let (max_idx, _) = probs
+            .iter()
+            .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap_or((0, &0.0));
-        let label = label_map.get(max_idx).cloned().flatten()
+        let label = label_map
+            .get(max_idx)
+            .cloned()
+            .flatten()
             .or_else(|| Some(format!("LABEL_{}", max_idx)));
 
         results.push(ClassificationResult {
@@ -218,7 +264,8 @@ async fn embed_via_executor(
     let (dimensions, normalization) = engine.embed_metadata()?;
 
     // Postprocess: output → per-sequence embeddings with optional L2 normalization
-    let output_f32 = output.logits
+    let output_f32 = output
+        .logits
         .to_dtype(DType::F32)
         .map_err(|e| EngineError::Internal(format!("embed to_dtype: {e}")))?;
     let rows: Vec<Vec<f32>> = output_f32
@@ -230,7 +277,9 @@ async fn embed_via_executor(
         if normalization == EmbeddingNormalization::L2 {
             let norm = embedding.iter().map(|v| v * v).sum::<f32>().sqrt();
             if norm > 0.0 {
-                for v in &mut embedding { *v /= norm; }
+                for v in &mut embedding {
+                    *v /= norm;
+                }
             }
         }
         data.push(EmbeddingData {
