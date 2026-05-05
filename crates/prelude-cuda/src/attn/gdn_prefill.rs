@@ -29,17 +29,17 @@
 //! - `output`: `[packed_seq, num_sab_heads, head_dim]` BF16
 //! - `output_state`: `[num_seqs, num_sab_heads, head_dim, head_dim]` F32
 
-use candle_core::Shape;
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::WrapErr;
+use candle_core::Shape;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
-use flashinfer::KernelRegistry;
 use flashinfer::types::{
-    DLDataType, DLDevice, DLTensor, KDLBFLOAT, KDLCUDA, KDLFLOAT, KDLINT, KDLUINT, TVMFFIAny,
+    DLDataType, DLDevice, DLTensor, TVMFFIAny, KDLBFLOAT, KDLCUDA, KDLFLOAT, KDLINT, KDLUINT,
 };
+use flashinfer::KernelRegistry;
 use half::bf16;
-use prelude_core::tensor::{DType, DeviceExt, Result, Tensor, bail};
+use prelude_core::tensor::{bail, DType, DeviceExt, Result, Tensor};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
@@ -361,7 +361,7 @@ pub(crate) fn try_prefill(
     let dl_ws = gpu_dl(ws_ptr, dev_id, U8_DT, &ws_shape, &ws_strides);
     let dl_init = init_ptr.map(|ptr| gpu_dl(ptr, dev_id, F32_DT, &state_shape, &state_strides));
 
-    let raw_stream = unsafe { stream.cu_stream() } as *mut c_void;
+    let raw_stream = stream.cu_stream() as *mut c_void;
     reg.set_stream(dev_id, raw_stream);
 
     // The vendored flashinfer gdn_prefill is AOT-compiled with
@@ -524,7 +524,7 @@ fn try_prefill_blackwell_aot(
     let dl_state = gpu_dl(state_ptr, dev_id, F32_DT, &state_shape, &state_strides);
     let dl_ws = gpu_dl(ws_ptr, dev_id, I8_DT, &ws_shape, &ws_strides);
 
-    let raw_stream = unsafe { stream.cu_stream() } as *mut c_void;
+    let raw_stream = stream.cu_stream() as *mut c_void;
     reg.set_stream(dev_id, raw_stream);
     let args = [
         TVMFFIAny::dltensor(&dl_q),
@@ -731,6 +731,10 @@ fn detect_sm_count() -> i32 {
         if cudaDeviceGetAttribute(&mut count, CUDA_DEV_ATTR_MULTIPROCESSOR_COUNT, dev) != 0 {
             return 132;
         }
-        if count > 0 { count } else { 132 }
+        if count > 0 {
+            count
+        } else {
+            132
+        }
     })
 }

@@ -3963,9 +3963,9 @@ fn fused_add_rmsnorm_correctness() {
         let eps = 1e-6f64;
 
         // Generate random input data
-        let x_f32: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.01).sin() * 0.5)).collect();
+        let x_f32: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin() * 0.5).collect();
         let r_f32: Vec<f32> = (0..n)
-            .map(|i| ((i as f32 * 0.007 + 1.0).cos() * 0.3))
+            .map(|i| (i as f32 * 0.007 + 1.0).cos() * 0.3)
             .collect();
         let w_f32: Vec<f32> = (0..hidden)
             .map(|i| 0.8 + (i as f32 * 0.003).sin() * 0.2)
@@ -3993,9 +3993,7 @@ fn fused_add_rmsnorm_correctness() {
         let dl_r = gpu_dl(r_gpu, BF16_DT, &in_s, &in_st);
         let dl_w = gpu_dl(w_gpu, BF16_DT, &w_s, &w_st);
 
-        unsafe {
-            reg.set_stream(0, std::ptr::null_mut());
-        }
+        reg.set_stream(0, std::ptr::null_mut());
 
         // FlashInfer fused_add_rmsnorm is in-place:
         // after call, x_gpu = rmsnorm(x+residual), r_gpu = x+residual

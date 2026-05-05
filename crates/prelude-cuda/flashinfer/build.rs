@@ -35,7 +35,9 @@ use std::process::Command;
 use prelude_kernelbuild::archive::{self, ArMode};
 use prelude_kernelbuild::build_log;
 use prelude_kernelbuild::dispatch;
-use prelude_kernelbuild::nvcc::{find_cuda, link_cuda_runtime_static, track_submodule};
+use prelude_kernelbuild::nvcc::{
+    detect_compute_cap, find_cuda, link_cuda_runtime_static, track_submodule,
+};
 
 // ── Manifest schema ─────────────────────────────────────────────────
 //
@@ -71,6 +73,8 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=scripts/compile_kernels.py");
     println!("cargo:rerun-if-env-changed=FLASHINFER_SRC");
     println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_ARCHS");
+    println!("cargo:rerun-if-env-changed=PRELUDE_CUDA_ARCHS");
+    println!("cargo:rerun-if-env-changed=CUDA_ARCH_LIST");
     println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_HEAD_DIMS");
     println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_DTYPES");
     println!("cargo:rerun-if-env-changed=PRELUDE_FLASHINFER_WORKERS");
@@ -140,21 +144,39 @@ fn find_flashinfer_source(manifest_dir: &Path) -> Result<PathBuf> {
 fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fi_src: &Path) -> Result<()> {
     let script = manifest_dir.join("scripts/compile_kernels.py");
     let manifest = kernels_dir.join("manifest.json");
+    let config_path = kernels_dir.join("build_config.txt");
+    let archs = env::var("PRELUDE_FLASHINFER_ARCHS").unwrap_or_else(|_| default_archs());
+    let head_dims = env::var("PRELUDE_FLASHINFER_HEAD_DIMS")
+        .unwrap_or_else(|_| "64,96,128,192,256,512".to_string());
+    let dtypes = env::var("PRELUDE_FLASHINFER_DTYPES").unwrap_or_else(|_| "bf16,fp16".to_string());
+    let mla_dims = env::var("PRELUDE_FLASHINFER_MLA_DIMS").unwrap_or_else(|_| "512x64".to_string());
+    let build_config = format!(
+        "flashinfer_src={}\narchs={archs}\nhead_dims={head_dims}\ndtypes={dtypes}\nmla_dims={mla_dims}\n",
+        fi_src.display()
+    );
 
     // Script-mtime vs manifest-mtime cache check. flashinfer's compile
     // script does its own fine-grained .o mtime checks internally, so
-    // we only short-circuit at the script level — any change to the
-    // script rebuilds everything, any change to a single .cu source
-    // is handled by the script itself.
+    // short-circuit only when both the script and build configuration match.
+    // Any change to a single .cu source is handled by the script itself.
     if manifest.exists() {
         let script_mtime = script.metadata()?.modified()?;
         let manifest_mtime = manifest.metadata()?.modified()?;
-        if manifest_mtime > script_mtime {
+        let config_matches = config_path
+            .exists()
+            .then(|| std::fs::read_to_string(&config_path))
+            .transpose()?
+            .is_some_and(|current| current == build_config);
+        if manifest_mtime > script_mtime && config_matches {
             let n = archive::collect_obj_files(kernels_dir).len();
             build_log!("{n} kernel objects up-to-date");
             return Ok(());
         }
-        build_log!("compile_kernels.py changed, recompiling...");
+        if !config_matches {
+            build_log!("kernel configuration changed, recompiling...");
+        } else {
+            build_log!("compile_kernels.py changed, recompiling...");
+        }
         std::fs::remove_dir_all(kernels_dir)?;
     } else {
         build_log!("compiling kernels...");
@@ -164,11 +186,6 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fi_src: &Path) -> Res
     }
 
     let python = find_python()?;
-
-    let archs = env::var("PRELUDE_FLASHINFER_ARCHS").unwrap_or_else(|_| "sm_80,sm_90".to_string());
-    let head_dims = env::var("PRELUDE_FLASHINFER_HEAD_DIMS")
-        .unwrap_or_else(|_| "64,96,128,192,256,512".to_string());
-    let dtypes = env::var("PRELUDE_FLASHINFER_DTYPES").unwrap_or_else(|_| "bf16,fp16".to_string());
     let workers = env::var("PRELUDE_FLASHINFER_WORKERS").unwrap_or_else(|_| {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -183,6 +200,7 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fi_src: &Path) -> Res
     // dir resolution is irrelevant for our compile path; bypass.
     let status = Command::new(&python)
         .env("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+        .env("PRELUDE_FLASHINFER_MLA_DIMS", &mla_dims)
         .arg(&script)
         .arg("--flashinfer-src")
         .arg(fi_src)
@@ -203,7 +221,30 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fi_src: &Path) -> Res
         anyhow::bail!("compile_kernels.py failed");
     }
 
+    std::fs::write(config_path, build_config)?;
+
     Ok(())
+}
+
+fn default_archs() -> String {
+    if let Some(cap) = detect_compute_cap() {
+        if cap >= 100 {
+            return format!("sm_{cap}");
+        }
+    }
+
+    let mut archs = vec![80, 90];
+    if let Some(cap) = detect_compute_cap() {
+        if !archs.contains(&cap) {
+            archs.push(cap);
+        }
+    }
+    archs.sort_unstable();
+    archs
+        .into_iter()
+        .map(|cap| format!("sm_{cap}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn find_python() -> Result<PathBuf> {
@@ -284,7 +325,6 @@ fn generate_dispatch(kernels_dir: &Path, out_dir: &Path, has_kernels: bool) -> R
         code,
         "pub(crate) fn lookup_prefill(key: &crate::loader::PrefillKey) -> Option<crate::loader::PrefillVariant> {{"
     )?;
-    writeln!(code, "    use crate::loader::PrefillVariant;")?;
     writeln!(
         code,
         "    match (key.dtype as u8, key.head_dim_qk, key.head_dim_vo, key.sliding_window, key.logits_soft_cap, key.backend as u8) {{"
@@ -310,7 +350,7 @@ fn generate_dispatch(kernels_dir: &Path, out_dir: &Path, has_kernels: bool) -> R
             for cap in [false, true] {
                 writeln!(
                     code,
-                    "        ({dv}, {hqk}, {hvo}, {swa}, {cap}, {backend_val}) => Some(PrefillVariant {{ plan: {plan}, ragged_run: {ragged_run}, paged_run: {paged_run} }}),"
+                    "        ({dv}, {hqk}, {hvo}, {swa}, {cap}, {backend_val}) => Some(crate::loader::PrefillVariant {{ plan: {plan}, ragged_run: {ragged_run}, paged_run: {paged_run} }}),"
                 )?;
             }
         }
@@ -323,7 +363,6 @@ fn generate_dispatch(kernels_dir: &Path, out_dir: &Path, has_kernels: bool) -> R
         code,
         "pub(crate) fn lookup_prefill_fp8(key: &crate::loader::FP8PrefillKey) -> Option<crate::loader::PrefillVariant> {{"
     )?;
-    writeln!(code, "    use crate::loader::PrefillVariant;")?;
     writeln!(code, "    match (key.head_dim, key.sliding_window) {{")?;
     for v in &manifest.variants {
         if v.kind != "prefill_fp8" {
@@ -337,7 +376,7 @@ fn generate_dispatch(kernels_dir: &Path, out_dir: &Path, has_kernels: bool) -> R
         for swa in [false, true] {
             writeln!(
                 code,
-                "        ({hdim}, {swa}) => Some(PrefillVariant {{ plan: {plan}, ragged_run: {ragged_run}, paged_run: {paged_run} }}),"
+                "        ({hdim}, {swa}) => Some(crate::loader::PrefillVariant {{ plan: {plan}, ragged_run: {ragged_run}, paged_run: {paged_run} }}),"
             )?;
         }
     }
@@ -445,6 +484,7 @@ fn generate_dispatch(kernels_dir: &Path, out_dir: &Path, has_kernels: bool) -> R
         "pub(crate) fn lookup_utility(name: &str) -> Option<crate::loader::TVMSafeCallFn> {{"
     )?;
     writeln!(code, "    match name {{")?;
+    let mut utility_names = std::collections::BTreeSet::new();
     for v in &manifest.variants {
         if ![
             "page",
@@ -472,6 +512,9 @@ fn generate_dispatch(kernels_dir: &Path, out_dir: &Path, has_kernels: bool) -> R
             continue;
         }
         for (name, sym) in &v.symbols {
+            if !utility_names.insert(name) {
+                continue;
+            }
             writeln!(code, "        \"{name}\" => Some({sym}),")?;
         }
     }

@@ -1268,6 +1268,8 @@ _BLACKWELL_CUTLASS_MOE_QUANT_FLAGS = {
 _BLACKWELL_CUTLASS_MOE_COMMON_SOURCES = {
     "moe_gemm_tma_warp_specialized_input.cu",
     "moe_gemm_kernels_bf16_bf16.cu",
+    "moe_gemm_mixed_utils.cu",
+    "fp8_blockscale_gemm.cu",
     "cutlass_heuristic.cpp",
     "lora.cpp",
     "flashinfer_cutlass_fused_moe_binding.cu",
@@ -1296,10 +1298,81 @@ def _should_compile_cutlass_moe_blackwell_source(src: Path, archs: List[int]) ->
         return False
     if any(a >= 103 and a < 120 for a in archs):
         # The BF16 dispatcher still references upstream Sm100 launcher
-        # instantiations for some tile/cluster choices, while the SM103
-        # generated files cover Blackwell-specific grouped kernels.
-        return "_sm103_" in name or "_sm100_" in name
+        # instantiations for some tile/cluster choices. It also keeps a small
+        # Ampere fallback dispatch table, so link those launcher objects too.
+        return "_sm103_" in name or "_sm100_" in name or "_sm80_" in name
     return "_sm100_" in name
+
+
+def _prepare_blackwell_cutlass_moe_bf16_dir(fi_src: Path, gen_dir: Path) -> Path:
+    out_dir = gen_dir / "fi_cutlass_moe_blackwell_bf16"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    kernels_cuh = fi_src / "csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh"
+    (out_dir / "cutlass_fused_moe_kernels.cuh").write_text(kernels_cuh.read_text())
+    moe_header = (
+        fi_src
+        / "csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+    )
+    moe_text = moe_header.read_text()
+    old = (
+        "#else\n"
+        "  static constexpr bool use_fp8 = false;\n"
+        "  static constexpr bool use_w4afp8 = false;\n"
+        "#endif\n"
+    )
+    new = (
+        "#else\n"
+        "  static constexpr bool use_fp8 = false;\n"
+        "  static constexpr bool use_w4afp8 = false;\n"
+        "  static constexpr bool use_fp8_input = false;\n"
+        "#endif\n"
+    )
+    if old not in moe_text:
+        raise RuntimeError("unexpected moe_kernels.h layout")
+    (out_dir / "moe_kernels.h").write_text(moe_text.replace(old, new, 1))
+    return out_dir
+
+
+def _write_blackwell_cutlass_moe_bf16_instantiation(fi_src: Path, gen_dir: Path) -> Path:
+    out_dir = _prepare_blackwell_cutlass_moe_bf16_dir(fi_src, gen_dir)
+    out = out_dir / "cutlass_fused_moe_instantiation_bf16.cu"
+    out.write_text(r'''
+#include "cutlass_fused_moe_kernels.cuh"
+#include "moe_kernels.h"
+
+namespace tensorrt_llm::kernels::cutlass_kernels {
+#ifdef ENABLE_BF16
+template class CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16>;
+INSTANTIATE_FINALIZE_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, __nv_bfloat16);
+#endif
+}  // namespace tensorrt_llm::kernels::cutlass_kernels
+'''.lstrip())
+    return out
+
+
+def _write_blackwell_cutlass_moe_bf16_binding(fi_src: Path, gen_dir: Path) -> Path:
+    out_dir = _prepare_blackwell_cutlass_moe_bf16_dir(fi_src, gen_dir)
+    binding = fi_src / "csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu"
+    text = binding.read_text()
+    start = text.find("    // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp")
+    end = text.find("    if (!mKernelRunner) {", start)
+    if start < 0 or end < 0:
+        raise RuntimeError("unexpected CUTLASS MoE binding constructor layout")
+    constructor_dispatch = text[start:end]
+    replacement = (
+        "    // Prelude's Blackwell AOT archive is dense BF16-only.\n"
+        "#if defined(PRELUDE_FLASHINFER_BLACKWELL_BF16_ONLY)\n"
+        "    if (mActivationDtype == dl_bfloat16 && mWeightDtype == dl_bfloat16) {\n"
+        "      mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16>>();\n"
+        "    }\n"
+        "#else\n"
+        f"{constructor_dispatch}"
+        "#endif\n"
+    )
+    out = out_dir / "flashinfer_cutlass_fused_moe_binding_bf16.cu"
+    out.write_text(text[:start] + replacement + text[end:])
+    return out
 
 
 def _add_cutlass_fused_moe_from_jit_spec(compile_jobs, fi_src: Path, gen_dir: Path,
@@ -1330,6 +1403,10 @@ def _add_cutlass_fused_moe_from_jit_spec(compile_jobs, fi_src: Path, gen_dir: Pa
         if not _should_compile_cutlass_moe_blackwell_source(src, archs):
             skipped += 1
             continue
+        if src.name == "cutlass_fused_moe_instantiation.cu":
+            src = _write_blackwell_cutlass_moe_bf16_instantiation(fi_src, gen_dir)
+        elif src.name == "flashinfer_cutlass_fused_moe_binding.cu":
+            src = _write_blackwell_cutlass_moe_bf16_binding(fi_src, gen_dir)
         compile_jobs.append((src, [], flags, vinfo))
         compiled += 1
     if skipped:
@@ -2148,6 +2225,7 @@ def main():
             nv_moe / "moe_gemm_kernels_fp8_fp4.cu",
             nv_moe / "moe_gemm_kernels_fp4_fp4.cu",
             nv_moe / "moe_gemm_kernels_fp32_fp32.cu",
+            nv_moe / "moe_gemm_mixed_utils.cu",
             csrc / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/"
                    "fp8_blockscale_gemm/fp8_blockscale_gemm.cu",
             csrc / "fused_moe/cutlass_backend/deepgemm_jit_setup.cu",
