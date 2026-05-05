@@ -1,14 +1,10 @@
-//! FlashInfer `gdn_prefill` — fused Gated DeltaNet (GDN) prefill on SM90.
+//! FlashInfer fused Gated DeltaNet (GDN) prefill.
 //!
 //! This is the kernel Qwen3.5 / Qwen3-next family actually targets (FLA's
 //! `chunk_gated_delta_rule`, not cuLA's per-element KDA). The launcher
-//! lives in `third_party/flashinfer/csrc/gdn_prefill_launcher.cu` and is
-//! AOT-compiled into our `prelude-cuda/flashinfer` crate via 64 jinja
-//! instantiations (`(dtype, is_gva, needs_beta, needs_alpha, init_state,
-//! enable_checkpointing)`). The runtime dispatcher in
-//! `prefill_kernel_delta_rule_sm90.cu::launch_delta_rule_prefill_kernel`
-//! picks the right variant based on the runtime tensor pointers and
-//! `checkpoint_every_n_tokens`.
+//! uses two architecture-specific paths: Hopper/SM90 calls FlashInfer's C++
+//! `gdn_prefill` launcher, while Blackwell/SM100+ calls the CuTe DSL export
+//! from `flashinfer.gdn_kernels.blackwell`.
 //!
 //! ## Semantics
 //!
@@ -44,10 +40,36 @@ use prelude_core::tensor::{bail, DType, DeviceExt, Result, Tensor};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
-const BF16_DT: DLDataType = DLDataType { code: KDLBFLOAT, bits: 16, lanes: 1 };
-const F32_DT: DLDataType = DLDataType { code: KDLFLOAT, bits: 32, lanes: 1 };
-const I64_DT: DLDataType = DLDataType { code: KDLINT, bits: 64, lanes: 1 };
-const U8_DT: DLDataType = DLDataType { code: KDLUINT, bits: 8, lanes: 1 };
+const BF16_DT: DLDataType = DLDataType {
+    code: KDLBFLOAT,
+    bits: 16,
+    lanes: 1,
+};
+const F32_DT: DLDataType = DLDataType {
+    code: KDLFLOAT,
+    bits: 32,
+    lanes: 1,
+};
+const I32_DT: DLDataType = DLDataType {
+    code: KDLINT,
+    bits: 32,
+    lanes: 1,
+};
+const I8_DT: DLDataType = DLDataType {
+    code: KDLINT,
+    bits: 8,
+    lanes: 1,
+};
+const I64_DT: DLDataType = DLDataType {
+    code: KDLINT,
+    bits: 64,
+    lanes: 1,
+};
+const U8_DT: DLDataType = DLDataType {
+    code: KDLUINT,
+    bits: 8,
+    lanes: 1,
+};
 
 fn registry() -> &'static KernelRegistry {
     static REG: OnceLock<KernelRegistry> = OnceLock::new();
@@ -71,7 +93,10 @@ fn gpu_dl(
 ) -> DLTensor {
     DLTensor {
         data,
-        device: DLDevice { device_type: KDLCUDA, device_id: dev_id },
+        device: DLDevice {
+            device_type: KDLCUDA,
+            device_id: dev_id,
+        },
         ndim: shape.len() as i32,
         dtype,
         shape: shape.as_ptr(),
@@ -83,8 +108,8 @@ fn gpu_dl(
 /// Drive the FlashInfer `gdn_prefill` utility.
 ///
 /// Returns `Ok(Some((o, final_state)))` on success, `Ok(None)` if the
-/// registry doesn't have the kernel (non-SM90 or build-time
-/// unavailable), `Err` for shape/dtype/CUDA errors.
+/// registry doesn't have a kernel for the current architecture/build,
+/// `Err` for shape/dtype/CUDA errors.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_prefill(
     q: &Tensor,
@@ -97,16 +122,9 @@ pub(crate) fn try_prefill(
     scale: f32,
 ) -> Result<Option<(Tensor, Tensor)>> {
     let reg = registry();
-    // Vendored flashinfer gdn_prefill is sm_90a-only — `gdn_prefill_launcher.cu`
-    // raises `flashinfer::Error("delta rule kernel does not support this
-    // device major version: 10")` and `std::terminate`s the process if the
-    // arch isn't 90. Caller will fall through to the cuLA / pure-Rust path.
-    if reg.arch() != 90 {
+    if reg.arch() < 90 {
         return Ok(None);
     }
-    let Some(gdn_fn) = reg.get_utility("gdn_prefill") else {
-        return Ok(None);
-    };
 
     let device = q.device();
     if !device.is_cuda() {
@@ -162,7 +180,10 @@ pub(crate) fn try_prefill(
 
     // cu_seqlens must be I64 — FlashInfer's kernel enforces this.
     if cu_seqlens.dtype() != DType::I64 {
-        bail!("gdn_prefill: cu_seqlens must be I64 (got {:?})", cu_seqlens.dtype());
+        bail!(
+            "gdn_prefill: cu_seqlens must be I64 (got {:?})",
+            cu_seqlens.dtype()
+        );
     }
     let num_seqs = cu_seqlens.dim(0)? - 1;
 
@@ -190,6 +211,34 @@ pub(crate) fn try_prefill(
             );
         }
     }
+
+    if reg.arch() >= 100 {
+        return try_prefill_blackwell(
+            reg,
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            cu_seqlens,
+            initial_state,
+            scale,
+            t,
+            hq,
+            hk,
+            hv,
+            d,
+            num_sab_heads,
+            num_seqs,
+        );
+    }
+
+    if reg.arch() != 90 {
+        return Ok(None);
+    }
+    let Some(gdn_fn) = reg.get_utility("gdn_prefill") else {
+        return Ok(None);
+    };
 
     // ── Materialize contiguous inputs ───────────────────────────────
     let q_c = q.contiguous()?;
@@ -234,9 +283,7 @@ pub(crate) fn try_prefill(
                 candle_core::Storage::Cuda(s) => s,
                 _ => bail!("gdn_prefill: tensor not on CUDA"),
             };
-            let slice = cuda
-                .as_cuda_slice::<$ty>()?
-                .slice(layout.start_offset()..);
+            let slice = cuda.as_cuda_slice::<$ty>()?.slice(layout.start_offset()..);
             let (ptr, _guard) = slice.device_ptr(&stream);
             ptr as u64 as *mut c_void
         }};
@@ -339,6 +386,168 @@ pub(crate) fn try_prefill(
     Ok(Some((out, final_state)))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn try_prefill_blackwell(
+    reg: &KernelRegistry,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    alpha: &Tensor,
+    beta: &Tensor,
+    cu_seqlens: &Tensor,
+    initial_state: Option<&Tensor>,
+    scale: f32,
+    t: usize,
+    hq: usize,
+    hk: usize,
+    hv: usize,
+    d: usize,
+    num_sab_heads: usize,
+    num_seqs: usize,
+) -> Result<Option<(Tensor, Tensor)>> {
+    let init = usize::from(initial_state.is_some());
+    let name = format!("gdn_prefill_bw_h{hq}_hv{hv}_init{init}_sm{}", reg.arch());
+    let Some(gdn_fn) = reg.get_utility(&name) else {
+        return Ok(None);
+    };
+
+    let device = q.device();
+    let q_c = q.contiguous()?;
+    let k_c = k.contiguous()?;
+    let v_c = v.contiguous()?;
+    let alpha_c = alpha.contiguous()?;
+    let beta_c = beta.contiguous()?;
+    let cu_i32 = cu_seqlens.to_dtype(DType::U32)?.contiguous()?;
+    let init_c = match initial_state {
+        Some(s) => Some(s.contiguous()?),
+        None => None,
+    };
+
+    let out = Tensor::zeros((t, num_sab_heads, d), DType::BF16, device)?;
+    let final_state = Tensor::zeros((num_seqs, num_sab_heads, d, d), DType::F32, device)?;
+
+    // FlashInfer's Blackwell CuTe DSL kernel uses one TMA descriptor bundle
+    // per SM in persistent mode: 4 tensormaps * 128 bytes.
+    let workspace_bytes = (detect_sm_count() as usize) * 512;
+    let workspace = Tensor::zeros((workspace_bytes,), DType::U8, device)?;
+
+    let (out_storage, _) = out.storage_and_layout();
+    let cuda_dev = match &*out_storage {
+        candle_core::Storage::Cuda(s) => s.device().clone(),
+        _ => bail!("gdn_prefill_bw: output allocated on non-CUDA device"),
+    };
+    drop(out_storage);
+    let stream = cuda_dev.cuda_stream();
+    let dev_id = device.ordinal() as i32;
+
+    macro_rules! cuda_ptr {
+        ($t:expr, $ty:ty) => {{
+            let (storage, layout) = $t.storage_and_layout();
+            let cuda = match &*storage {
+                candle_core::Storage::Cuda(s) => s,
+                _ => bail!("gdn_prefill_bw: tensor not on CUDA"),
+            };
+            let slice = cuda.as_cuda_slice::<$ty>()?.slice(layout.start_offset()..);
+            let (ptr, _guard) = slice.device_ptr(&stream);
+            ptr as u64 as *mut c_void
+        }};
+    }
+
+    let q_ptr = cuda_ptr!(q_c, bf16);
+    let k_ptr = cuda_ptr!(k_c, bf16);
+    let v_ptr = cuda_ptr!(v_c, bf16);
+    let alpha_ptr = cuda_ptr!(alpha_c, f32);
+    let beta_ptr = cuda_ptr!(beta_c, f32);
+    let cu_ptr = cuda_ptr!(cu_i32, u32);
+    let out_ptr = cuda_ptr!(out, bf16);
+    let state_ptr = cuda_ptr!(final_state, f32);
+    let ws_ptr = cuda_ptr!(workspace, u8);
+    let init_ptr = init_c.as_ref().map(|s| {
+        let (storage, layout) = s.storage_and_layout();
+        let cuda = match &*storage {
+            candle_core::Storage::Cuda(c) => c,
+            _ => panic!("gdn_prefill_bw: init state not on CUDA"),
+        };
+        let slice = cuda
+            .as_cuda_slice::<f32>()
+            .expect("gdn_prefill_bw: init state slice")
+            .slice(layout.start_offset()..);
+        let (ptr, _guard) = slice.device_ptr(&stream);
+        ptr as u64 as *mut c_void
+    });
+
+    let q_shape = [t as i64, hq as i64, d as i64];
+    let q_strides = contiguous_strides(&q_shape);
+    let k_shape = [t as i64, hk as i64, d as i64];
+    let k_strides = contiguous_strides(&k_shape);
+    let v_shape = [t as i64, hv as i64, d as i64];
+    let v_strides = contiguous_strides(&v_shape);
+    let o_shape = [t as i64, num_sab_heads as i64, d as i64];
+    let o_strides = contiguous_strides(&o_shape);
+    let state_shape = [num_seqs as i64, num_sab_heads as i64, d as i64, d as i64];
+    let state_strides = contiguous_strides(&state_shape);
+    let ab_shape = [t as i64, num_sab_heads as i64];
+    let ab_strides = contiguous_strides(&ab_shape);
+    let cu_shape = [(num_seqs + 1) as i64];
+    let cu_strides = [1i64];
+    let ws_shape = [workspace_bytes as i64];
+    let ws_strides = [1i64];
+
+    let dl_q = gpu_dl(q_ptr, dev_id, BF16_DT, &q_shape, &q_strides);
+    let dl_k = gpu_dl(k_ptr, dev_id, BF16_DT, &k_shape, &k_strides);
+    let dl_v = gpu_dl(v_ptr, dev_id, BF16_DT, &v_shape, &v_strides);
+    let dl_alpha = gpu_dl(alpha_ptr, dev_id, F32_DT, &ab_shape, &ab_strides);
+    let dl_beta = gpu_dl(beta_ptr, dev_id, F32_DT, &ab_shape, &ab_strides);
+    let dl_o = gpu_dl(out_ptr, dev_id, BF16_DT, &o_shape, &o_strides);
+    let dl_cu = gpu_dl(cu_ptr, dev_id, I32_DT, &cu_shape, &cu_strides);
+    let dl_state = gpu_dl(state_ptr, dev_id, F32_DT, &state_shape, &state_strides);
+    // The Blackwell CuTe DSL export was compiled with a torch.int8
+    // workspace. The backing allocation is byte-addressed either way, but
+    // TVM validates DLPack dtype metadata before launching the kernel.
+    let dl_ws = gpu_dl(ws_ptr, dev_id, I8_DT, &ws_shape, &ws_strides);
+    let dl_init = init_ptr.map(|ptr| gpu_dl(ptr, dev_id, F32_DT, &state_shape, &state_strides));
+
+    let raw_stream = unsafe { stream.cu_stream() } as *mut c_void;
+    reg.set_stream(dev_id, raw_stream);
+
+    let args = [
+        TVMFFIAny::dltensor(&dl_q),
+        TVMFFIAny::dltensor(&dl_k),
+        TVMFFIAny::dltensor(&dl_v),
+        TVMFFIAny::dltensor(&dl_alpha),
+        TVMFFIAny::dltensor(&dl_beta),
+        TVMFFIAny::dltensor(&dl_o),
+        TVMFFIAny::dltensor(&dl_cu),
+        match dl_init.as_ref() {
+            Some(dl) => TVMFFIAny::dltensor(dl),
+            None => TVMFFIAny::none(),
+        },
+        TVMFFIAny::dltensor(&dl_state),
+        TVMFFIAny::none(),
+        TVMFFIAny::none(),
+        TVMFFIAny::int32(0),
+        TVMFFIAny::float64(scale as f64),
+        TVMFFIAny::dltensor(&dl_ws),
+        TVMFFIAny::opaque_ptr(raw_stream),
+    ];
+
+    unsafe {
+        reg.call(gdn_fn, &args)
+            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer gdn_prefill_bw: {e}")))?;
+    }
+
+    drop(q_c);
+    drop(k_c);
+    drop(v_c);
+    drop(alpha_c);
+    drop(beta_c);
+    drop(cu_i32);
+    drop(init_c);
+    drop(workspace);
+
+    Ok(Some((out, final_state)))
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 unsafe extern "C" {
@@ -359,6 +568,10 @@ fn detect_sm_count() -> i32 {
         if cudaDeviceGetAttribute(&mut count, CUDA_DEV_ATTR_MULTIPROCESSOR_COUNT, dev) != 0 {
             return 132;
         }
-        if count > 0 { count } else { 132 }
+        if count > 0 {
+            count
+        } else {
+            132
+        }
     })
 }

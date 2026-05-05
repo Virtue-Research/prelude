@@ -54,6 +54,17 @@ def build_chatml_prompt(messages: list[dict]) -> str:
     return "\n".join(parts) + "\n<|im_start|>assistant\n"
 
 
+def build_chat_prompt(tokenizer, messages: list[dict]) -> str:
+    """Build chat prompt using the model tokenizer template when available."""
+    if getattr(tokenizer, "chat_template", None):
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    return build_chatml_prompt(messages)
+
+
 def resolve_dtype(dtype_str: str):
     """Resolve dtype string to torch dtype."""
     import torch
@@ -83,8 +94,11 @@ def generate_golden(model_path: str, prompts: list[dict], output_path: Path,
         model_path, torch_dtype=torch_dtype
     )
     model.eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
     actual_dtype = next(model.parameters()).dtype
-    print(f"Model loaded in {time.time() - t0:.1f}s (dtype={actual_dtype})")
+    actual_device = next(model.parameters()).device
+    print(f"Model loaded in {time.time() - t0:.1f}s (dtype={actual_dtype}, device={actual_device})")
 
     results = {}
     for spec in prompts:
@@ -92,9 +106,9 @@ def generate_golden(model_path: str, prompts: list[dict], output_path: Path,
         if spec.get("type") == "completion":
             prompt_text = spec["prompt"]
         else:
-            prompt_text = build_chatml_prompt(spec["messages"])
+            prompt_text = build_chat_prompt(tokenizer, spec["messages"])
 
-        inputs = tokenizer(prompt_text, return_tensors="pt")
+        inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
         prompt_len = inputs["input_ids"].shape[1]
 
         print(f"  [{pid}] generating (prompt={prompt_len} tokens, max_new={spec['max_tokens']})...",
