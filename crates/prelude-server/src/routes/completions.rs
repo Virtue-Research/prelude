@@ -1,33 +1,33 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use chrono::Utc;
 use prelude_core::{
     CompletionChoice, CompletionPrompt, CompletionRequest, CompletionResponse, GenerateRequest,
     InferenceEngine, PromptInput, StreamEvent, Usage,
 };
-use tracing::debug;
+use tracing::info;
 
 use super::generation_common::{
     DEFAULT_MAX_NEW_TOKENS, ResponseMeta, build_generate_request, sse_done_event, sse_json_event,
 };
-use crate::Server;
 use crate::error::ApiError;
 use crate::logprobs::to_completion_logprobs;
 use crate::sse::stream_sse;
 use crate::utils::{aggregate_usage, log_generation_metrics};
+use crate::Server;
 
 pub async fn completions(
     State(server): State<Server>,
     Json(request): Json<CompletionRequest>,
 ) -> Result<Response, ApiError> {
-    request.validate_public_request().map_err(|message| {
-        ApiError::new(StatusCode::BAD_REQUEST, message, "invalid_request_error")
-    })?;
+    request
+        .validate_public_request()
+        .map_err(|message| ApiError::new(StatusCode::BAD_REQUEST, message, "invalid_request_error"))?;
 
     let is_streaming = request.stream.unwrap_or(false);
     let include_usage = request
@@ -37,7 +37,7 @@ pub async fn completions(
         .unwrap_or(false);
     let engine_requests = parse_completion_requests(&request)?;
 
-    debug!(
+    info!(
         batch_requests = engine_requests.len(),
         model = %engine_requests
             .first()
@@ -197,7 +197,7 @@ async fn completions_batch(
         })
         .collect();
 
-    debug!(
+    info!(
         batch_requests = choices.len(),
         prompt_tokens = usage.prompt_tokens,
         completion_tokens = usage.completion_tokens,

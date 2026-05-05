@@ -618,7 +618,6 @@ fn build_step_batch(
         .as_ref()
         .map(|p| p.block_size)
         .unwrap_or(16);
-    let batch_needs_paged_prefill = prefill_batch_needs_kv(scheduler, step);
 
     // ── Prefill: try to allocate blocks; if pool is exhausted, drop the
     // request from `step` AND roll back the kv_computed_len bump that
@@ -647,8 +646,7 @@ fn build_step_batch(
         let total_blocks_needed = end.div_ceil(block_size);
         let current_blocks = seq.block_table.len();
         let deltanet_slot = seq.deltanet_slot;
-        let needs_kv_cache = batch_needs_paged_prefill;
-        if needs_kv_cache && current_blocks < total_blocks_needed {
+        if current_blocks < total_blocks_needed {
             for _ in current_blocks..total_blocks_needed {
                 match scheduler.allocate_block() {
                     Some(block) => {
@@ -699,7 +697,6 @@ fn build_step_batch(
             is_prefill_partial: !is_final,
             deltanet_slot,
             prompt_logprobs,
-            needs_kv_cache,
         });
         prefill_keep.push(true);
     }
@@ -762,43 +759,11 @@ fn build_step_batch(
                 is_prefill_partial: false,
                 deltanet_slot: seq.deltanet_slot,
                 prompt_logprobs: None,
-                needs_kv_cache: true,
             });
         }
     }
 
     ForwardBatch::Mixed { requests }
-}
-
-fn prefill_batch_needs_kv(scheduler: &Scheduler, step: &SchedulerStep) -> bool {
-    if !step.decode_request_ids.is_empty() {
-        return true;
-    }
-
-    step.prefill_request_ids
-        .iter()
-        .enumerate()
-        .any(|(idx, id)| {
-            let chunk_len = step.prefill_chunk_lens.get(idx).copied().unwrap_or(0);
-            scheduler
-                .get_sequence(id)
-                .map(|seq| prefill_request_needs_kv(seq, chunk_len))
-                .unwrap_or(false)
-        })
-}
-
-fn prefill_request_needs_kv(seq: &Sequence, chunk_len: usize) -> bool {
-    let computed_before = seq.kv_computed_len.saturating_sub(chunk_len);
-    let computed_after = computed_before + chunk_len;
-    let is_final_prompt_chunk = computed_after >= seq.input_ids.len();
-
-    // A one-shot final prefill can emit the first generated token directly
-    // from prompt logits. KV cache is only needed when this request has prior
-    // cached chunks, will continue prompt prefill, or will decode after that
-    // first token. In AR mode Sequence::max_new_tokens is initialized to
-    // request.max_new - 1, so any positive remaining token budget means there
-    // will be a decode step that needs prompt KV.
-    computed_before > 0 || !is_final_prompt_chunk || seq.remaining_tokens() > 0
 }
 
 // ── Output processing (sampling + stop conditions + delivery) ──────
@@ -964,8 +929,9 @@ fn process_step_output(
             output
                 .logits
                 .narrow(0, decode_start_row, num_decode)
+                .and_then(|decode_logits| decode_logits.argmax(crate::tensor::D::Minus1))
+                .and_then(|t| t.to_vec1::<u32>())
                 .ok()
-                .and_then(|decode_logits| batched_greedy_tokens(&decode_logits))
         } else {
             None
         };
@@ -1056,14 +1022,12 @@ fn batched_prefill_argmax_tokens(
         .logits
         .narrow(0, 0, final_greedy_count)
         .ok()
-        .and_then(|logits| batched_greedy_tokens(&logits))
-}
-
-fn batched_greedy_tokens(logits: &crate::tensor::Tensor) -> Option<Vec<u32>> {
-    logits
-        .argmax(crate::tensor::D::Minus1)
-        .and_then(|tokens| tokens.to_vec1::<u32>())
-        .ok()
+        .and_then(|logits| {
+            logits
+                .argmax(crate::tensor::D::Minus1)
+                .and_then(|t| t.to_vec1::<u32>())
+                .ok()
+        })
 }
 
 /// Sample a token from a logits row using the sequence's sampling config.
@@ -1284,6 +1248,8 @@ fn seq_finish_reason(reason: &FinishReason) -> SeqFinishReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::executor::ExecutionHandle;
+    use crate::tensor::Device;
 
     fn make_prepared(request_id: &str, max_new: usize) -> PreparedGenerateRequest {
         use crate::engine::sampling::{LogitsProcessor, Sampling};
@@ -1461,34 +1427,6 @@ mod tests {
         let state = make_decode_state("s1", 42, 5);
         assert_eq!(state.pending_token, Some(42));
         assert_eq!(state.output_tokens, vec![42]);
-    }
-
-    #[test]
-    fn prefill_kv_needed_only_when_followup_work_needs_cache() {
-        let make_seq = |id: &str, max_new_after_prefill: u32, kv_computed_len: usize| {
-            let mut seq = Sequence::new(
-                id.to_string(),
-                vec![1, 2, 3],
-                SamplingParams::default(),
-                max_new_after_prefill,
-                vec![],
-                vec![],
-                None,
-            );
-            seq.kv_computed_len = kv_computed_len;
-            seq
-        };
-
-        // max_tokens=1: final one-shot prefill can sample from prompt logits
-        // and never needs paged KV.
-        assert!(!prefill_request_needs_kv(&make_seq("m1", 0, 3), 3));
-
-        // max_tokens=2: the first decode step after prefill needs prompt KV.
-        assert!(prefill_request_needs_kv(&make_seq("m2", 1, 3), 3));
-
-        // Chunked prompt work needs KV even if it will finish with one token.
-        assert!(prefill_request_needs_kv(&make_seq("partial", 0, 2), 2));
-        assert!(prefill_request_needs_kv(&make_seq("final_chunk", 0, 3), 1));
     }
 
     #[test]

@@ -17,9 +17,6 @@
 # Environment (same as bench.sh):
 #   MODEL  INPUT_TOKENS  OUTPUT_TOKENS  MAX_REQUESTS  CONCURRENCY  CUDA_VISIBLE_DEVICES
 #   WARMUP  (profile-specific, default: 5)
-#   NSYS_USE_SUDO=auto|true|false  NSYS_RUN_AS=root|<user>
-#   VLLM_MAX_MODEL_LEN  VLLM_MAX_NUM_BATCHED_TOKENS  GPU_MEMORY_UTILIZATION
-#   VLLM_USE_FLASHINFER_MOE_FP16  VLLM_FLASHINFER_MOE_BACKEND=latency|throughput|masked_gemm
 
 set -uo pipefail
 trap '' PIPE
@@ -95,8 +92,7 @@ kill_server() {
     fi
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         log "Stopping $name (pid=$pid)"
-        kill -INT "$pid" 2>/dev/null || sudo -n kill -INT "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
+        kill -INT "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
     fi
 }
 
@@ -116,23 +112,6 @@ check_engine() {
     return 0
 }
 
-profiling_restricted_to_admin() {
-    [ -r /proc/driver/nvidia/params ] &&
-        grep -q '^RmProfilingAdminOnly: 1' /proc/driver/nvidia/params
-}
-
-prelude_nsys_requires_sudo() {
-    case "${NSYS_USE_SUDO:-auto}" in
-        true|1|yes) return 0 ;;
-        false|0|no) return 1 ;;
-        auto) profiling_restricted_to_admin ;;
-        *)
-            err "Invalid NSYS_USE_SUDO=${NSYS_USE_SUDO}; expected auto, true, or false"
-            return 2
-            ;;
-    esac
-}
-
 start_engine_under_nsys() {
     local engine="$1" port="$2" output="$3"
     local hf_cache="$HOME/.cache/huggingface"
@@ -147,48 +126,14 @@ start_engine_under_nsys() {
 
     case "$engine" in
         prelude)
-            local nsys_flags=(
-                -o "$output"
-                --trace=cuda,nvtx
-                --force-overwrite=true
-                --sample=none
-                --cpuctxsw=none
-            )
+            local nsys_flags=(-o "$output" --trace=cuda,nvtx --force-overwrite=true)
             local extra_env=(RUST_LOG="${RUST_LOG:-warn}")
-            [ -n "${CUDA_VISIBLE_DEVICES:-}" ] && extra_env+=(CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES")
-            [ -n "${HF_HOME:-}" ] && extra_env+=(HF_HOME="$HF_HOME")
             [ "$NO_CUDA_GRAPH" = true ] && extra_env+=(PRELUDE_CUDA_GRAPH_MAX_BS=0)
-            local use_sudo=0
-            prelude_nsys_requires_sudo
-            case "$?" in
-                0) use_sudo=1 ;;
-                1) use_sudo=0 ;;
-                *) return 1 ;;
-            esac
-            if [ "$use_sudo" -eq 1 ]; then
-                command -v sudo >/dev/null || { err "sudo is required for nsys CUDA tracing on this host"; return 1; }
-                sudo -n true 2>/dev/null || { err "passwordless sudo is required for nsys CUDA tracing on this host"; return 1; }
-                local run_as="${NSYS_RUN_AS:-root}"
-                log "Using sudo nsys --run-as=$run_as because NVIDIA profiling is admin-only"
-                sudo -E env "${extra_env[@]}" nsys profile "${nsys_flags[@]}" --run-as="$run_as" \
-                    "$PRELUDE_BIN" --host 0.0.0.0 --port "$port" --model "$MODEL" --dtype bf16 &
-            else
-                env "${extra_env[@]}" nsys profile "${nsys_flags[@]}" \
-                    "$PRELUDE_BIN" --host 0.0.0.0 --port "$port" --model "$MODEL" --dtype bf16 &
-            fi
+            env "${extra_env[@]}" nsys profile "${nsys_flags[@]}" \
+                "$PRELUDE_BIN" --host 0.0.0.0 --port "$port" --model "$MODEL" --dtype bf16 &
             ;;
         vllm)
             # nsys runs INSIDE the container; host nsys mounted in via volume
-            local vllm_model_len="${VLLM_MAX_MODEL_LEN:-4096}"
-            local vllm_token_budget="${VLLM_MAX_NUM_BATCHED_TOKENS:-8192}"
-            local gpu_mem="${GPU_MEMORY_UTILIZATION:-0.9}"
-            local vllm_env=(-e "CUDA_VISIBLE_DEVICES=$cvd")
-            if [ -n "${VLLM_USE_FLASHINFER_MOE_FP16:-}" ]; then
-                vllm_env+=(-e "VLLM_USE_FLASHINFER_MOE_FP16=$VLLM_USE_FLASHINFER_MOE_FP16")
-            fi
-            if [ -n "${VLLM_FLASHINFER_MOE_BACKEND:-}" ]; then
-                vllm_env+=(-e "VLLM_FLASHINFER_MOE_BACKEND=$VLLM_FLASHINFER_MOE_BACKEND")
-            fi
             docker run --rm --name "$(container_name vllm)" \
                 --network=host --gpus all --ipc=host \
                 --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE \
@@ -196,15 +141,10 @@ start_engine_under_nsys() {
                 -v "$nsys_dir:$nsys_dir:ro" \
                 -v "$hf_cache:/root/.cache/huggingface" \
                 -v "$RESULTS_DIR:/profiles" \
-                "${vllm_env[@]}" \
+                -e "CUDA_VISIBLE_DEVICES=$cvd" \
                 "$img" \
                 profile -o "/profiles/$engine" --trace=cuda,nvtx --force-overwrite=true \
-                    --sample=none --cpuctxsw=none --cuda-graph-trace=graph \
-                    vllm serve "$MODEL" --port "$port" --host 0.0.0.0 \
-                    --dtype bfloat16 --max-model-len "$vllm_model_len" \
-                    --max-num-batched-tokens "$vllm_token_budget" \
-                    --gpu-memory-utilization "$gpu_mem" \
-                    --trust-remote-code --disable-uvicorn-access-log --disable-log-stats &
+                    vllm serve "$MODEL" --port "$port" --host 0.0.0.0 &
             ;;
         sglang)
             docker run --rm --name "$(container_name sglang)" \
