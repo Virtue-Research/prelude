@@ -1,5 +1,5 @@
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 use base64::Engine as _;
 use prelude_core::{
     EmbedRequest, EmbeddingObject, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage,
@@ -8,8 +8,8 @@ use prelude_core::{
 use tracing::info;
 use uuid::Uuid;
 
-use crate::error::ApiError;
 use crate::Server;
+use crate::error::ApiError;
 
 /// Encode a Vec<f32> as a base64 string of raw little-endian f32 bytes.
 /// OpenAI-compatible: each f32 → 4 bytes LE, then base64-encode the whole buffer.
@@ -24,9 +24,13 @@ pub async fn embeddings(
     State(server): State<Server>,
     Json(request): Json<EmbeddingRequest>,
 ) -> Result<Json<EmbeddingResponse>, ApiError> {
-    request
-        .validate_public_request()
-        .map_err(|message| ApiError::new(axum::http::StatusCode::BAD_REQUEST, message, "invalid_request_error"))?;
+    request.validate_public_request().map_err(|message| {
+        ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            message,
+            "invalid_request_error",
+        )
+    })?;
 
     let inputs = request.get_inputs();
     let use_base64 = request

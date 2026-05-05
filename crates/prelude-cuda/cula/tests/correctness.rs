@@ -8,7 +8,9 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, ValidAsZeroBits};
+use cudarc::driver::{
+    CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, ValidAsZeroBits,
+};
 
 // ── CPU reference: KDA gated delta rule (F64 ground truth) ──────────
 //
@@ -28,11 +30,14 @@ use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut
 /// CPU reference for KDA prefill (F64).
 /// Returns (output [total_seq, H, D], final_states [num_seqs, H, D, D]).
 fn cpu_kda_prefill_f64(
-    q: &[f64], k: &[f64], v: &[f64],
-    alpha: Option<&[f64]>,  // [total_seq, H, D] or None
-    beta: Option<&[f64]>,   // [total_seq, H] or None
+    q: &[f64],
+    k: &[f64],
+    v: &[f64],
+    alpha: Option<&[f64]>, // [total_seq, H, D] or None
+    beta: Option<&[f64]>,  // [total_seq, H] or None
     cu_seqlens: &[i32],
-    h: usize, d: usize,
+    h: usize,
+    d: usize,
     scale: f64,
 ) -> (Vec<f64>, Vec<f64>) {
     let num_seqs = cu_seqlens.len() - 1;
@@ -190,7 +195,10 @@ impl Gpu {
         self.stream.clone_dtoh(slice).unwrap()
     }
 
-    fn alloc_zeros<T: cudarc::driver::DeviceRepr + ValidAsZeroBits>(&self, len: usize) -> CudaSlice<T> {
+    fn alloc_zeros<T: cudarc::driver::DeviceRepr + ValidAsZeroBits>(
+        &self,
+        len: usize,
+    ) -> CudaSlice<T> {
         self.stream.alloc_zeros(len).unwrap()
     }
 
@@ -216,11 +224,19 @@ fn rand_f32(len: usize, scale: f32) -> Vec<f32> {
 }
 
 fn max_abs_err(reference: &[f64], result: &[f64]) -> f64 {
-    reference.iter().zip(result).map(|(r, t)| (r - t).abs()).fold(0.0f64, f64::max)
+    reference
+        .iter()
+        .zip(result)
+        .map(|(r, t)| (r - t).abs())
+        .fold(0.0f64, f64::max)
 }
 
 fn mean_abs_err(reference: &[f64], result: &[f64]) -> f64 {
-    let sum: f64 = reference.iter().zip(result).map(|(r, t)| (r - t).abs()).sum();
+    let sum: f64 = reference
+        .iter()
+        .zip(result)
+        .map(|(r, t)| (r - t).abs())
+        .sum();
     sum / reference.len() as f64
 }
 
@@ -233,7 +249,10 @@ fn mean_abs_err(reference: &[f64], result: &[f64]) -> f64 {
 ///             output_t = scale * (q_t @ state_t)
 #[test]
 fn kda_prefill_sm90_basic() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     let h = 4;
     let d = 128; // KDA kernel requires D=128 (TileShape<64,64,128>)
     let seq_len = 64; // Keep short for CPU reference tractability
@@ -245,10 +264,14 @@ fn kda_prefill_sm90_basic() {
     let v_f32 = rand_f32(total_seq * h * d, 0.1);
     // Alpha (forget gate): per [total_seq, H, D], values near 1.0 for mild decay
     let alpha_f32: Vec<f32> = rand_f32(total_seq * h * d, 0.05)
-        .iter().map(|&x| 0.95 + x.abs()).collect();
+        .iter()
+        .map(|&x| 0.95 + x.abs())
+        .collect();
     // Beta (update gate): per [total_seq, H], small positive values
     let beta_f32: Vec<f32> = rand_f32(total_seq * h, 0.1)
-        .iter().map(|x| x.abs() + 0.01).collect();
+        .iter()
+        .map(|x| x.abs() + 0.01)
+        .collect();
     let cu_seqlens: Vec<i32> = vec![0, seq_len as i32];
 
     // CPU reference
@@ -258,9 +281,15 @@ fn kda_prefill_sm90_basic() {
     let alpha_f64: Vec<f64> = alpha_f32.iter().map(|&x| x as f64).collect();
     let beta_f64: Vec<f64> = beta_f32.iter().map(|&x| x as f64).collect();
     let (ref_output, ref_state) = cpu_kda_prefill_f64(
-        &q_f64, &k_f64, &v_f64,
-        Some(&alpha_f64), Some(&beta_f64),
-        &cu_seqlens, h, d, scale as f64,
+        &q_f64,
+        &k_f64,
+        &v_f64,
+        Some(&alpha_f64),
+        Some(&beta_f64),
+        &cu_seqlens,
+        h,
+        d,
+        scale as f64,
     );
 
     // GPU: convert to BF16 (Q/K/V) and F32 (alpha/beta)
@@ -292,18 +321,25 @@ fn kda_prefill_sm90_basic() {
         unsafe {
             cula::kda_fwd_prefill_sm90(
                 gpu.stream_ptr(),
-                op, sp,
-                qp, kp, vp,
+                op,
+                sp,
+                qp,
+                kp,
+                vp,
                 None,     // no input state
                 Some(ap), // alpha (forget gate)
                 Some(bp), // beta (update gate)
-                cup, wp,
-                1,     // num_seqs
-                h as i32, d as i32,
+                cup,
+                wp,
+                1, // num_seqs
+                h as i32,
+                d as i32,
                 total_seq as i64,
-                scale, true, // safe_gate required
+                scale,
+                true, // safe_gate required
                 detect_sm_count(),
-            ).unwrap();
+            )
+            .unwrap();
         }
     }
     gpu.sync();
@@ -321,14 +357,23 @@ fn kda_prefill_sm90_basic() {
     eprintln!("KDA basic: state max_err={state_err:.6e}");
 
     // cuLA tolerance: output atol=5e-3, state atol=8e-3
-    assert!(out_err < 5e-3, "KDA output max_err={out_err:.6e} (tol=5e-3)");
-    assert!(state_err < 8e-3, "KDA state max_err={state_err:.6e} (tol=8e-3)");
+    assert!(
+        out_err < 5e-3,
+        "KDA output max_err={out_err:.6e} (tol=5e-3)"
+    );
+    assert!(
+        state_err < 8e-3,
+        "KDA state max_err={state_err:.6e} (tol=8e-3)"
+    );
 }
 
 /// Multiple sequences (varlen) test.
 #[test]
 fn kda_prefill_sm90_varlen() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     let h = 4;
     let d = 128;
     let seq_lens = [64, 128, 64]; // Must be multiples of 64 (tile size)
@@ -347,9 +392,13 @@ fn kda_prefill_sm90_varlen() {
     let k_f32 = rand_f32(total_seq * h * d, 0.1);
     let v_f32 = rand_f32(total_seq * h * d, 0.1);
     let alpha_f32: Vec<f32> = rand_f32(total_seq * h * d, 0.05)
-        .iter().map(|&x| 0.95 + x.abs()).collect();
+        .iter()
+        .map(|&x| 0.95 + x.abs())
+        .collect();
     let beta_f32: Vec<f32> = rand_f32(total_seq * h, 0.1)
-        .iter().map(|x| x.abs() + 0.01).collect();
+        .iter()
+        .map(|x| x.abs() + 0.01)
+        .collect();
 
     // CPU reference
     let q_f64: Vec<f64> = q_f32.iter().map(|&x| x as f64).collect();
@@ -358,9 +407,15 @@ fn kda_prefill_sm90_varlen() {
     let alpha_f64: Vec<f64> = alpha_f32.iter().map(|&x| x as f64).collect();
     let beta_f64: Vec<f64> = beta_f32.iter().map(|&x| x as f64).collect();
     let (ref_output, ref_state) = cpu_kda_prefill_f64(
-        &q_f64, &k_f64, &v_f64,
-        Some(&alpha_f64), Some(&beta_f64),
-        &cu_seqlens, h, d, scale as f64,
+        &q_f64,
+        &k_f64,
+        &v_f64,
+        Some(&alpha_f64),
+        Some(&beta_f64),
+        &cu_seqlens,
+        h,
+        d,
+        scale as f64,
     );
 
     // GPU
@@ -392,30 +447,49 @@ fn kda_prefill_sm90_varlen() {
         unsafe {
             cula::kda_fwd_prefill_sm90(
                 gpu.stream_ptr(),
-                op, sp,
-                qp, kp, vp,
-                None, Some(ap), Some(bp),
-                cup, wp,
+                op,
+                sp,
+                qp,
+                kp,
+                vp,
+                None,
+                Some(ap),
+                Some(bp),
+                cup,
+                wp,
                 num_seqs as i32,
-                h as i32, d as i32,
+                h as i32,
+                d as i32,
                 total_seq as i64,
-                scale, true,
+                scale,
+                true,
                 detect_sm_count(),
-            ).unwrap();
+            )
+            .unwrap();
         }
     }
     gpu.sync();
 
-    let result: Vec<f64> = gpu.download(&out_gpu).iter().map(|x| x.to_f32() as f64).collect();
+    let result: Vec<f64> = gpu
+        .download(&out_gpu)
+        .iter()
+        .map(|x| x.to_f32() as f64)
+        .collect();
     let result_state: Vec<f64> = gpu.download(&state_gpu).iter().map(|&x| x as f64).collect();
 
     let out_err = max_abs_err(&ref_output, &result);
     let state_err = max_abs_err(&ref_state, &result_state);
 
     eprintln!("KDA varlen: output max_err={out_err:.6e}, state max_err={state_err:.6e}");
-    assert!(out_err < 5e-3, "KDA varlen output max_err={out_err:.6e} (tol=5e-3)");
+    assert!(
+        out_err < 5e-3,
+        "KDA varlen output max_err={out_err:.6e} (tol=5e-3)"
+    );
     // State accumulates over longer sequences (128 tokens) → higher BF16 error
-    assert!(state_err < 2e-2, "KDA varlen state max_err={state_err:.6e} (tol=2e-2)");
+    assert!(
+        state_err < 2e-2,
+        "KDA varlen state max_err={state_err:.6e} (tol=2e-2)"
+    );
 }
 
 // ============================================================================
@@ -424,7 +498,10 @@ fn kda_prefill_sm90_varlen() {
 
 #[test]
 fn kda_prefill_sm90_perf() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     let configs = [
         // (H, D, seq_len)
         (32, 128, 512),
@@ -476,21 +553,38 @@ fn kda_prefill_sm90_perf() {
             unsafe {
                 cula::kda_fwd_prefill_sm90(
                     gpu.stream_ptr(),
-                    op, sp, qp, kp, vp,
-                    None, Some(ap), Some(bp),
-                    cup, wp,
-                    1, h as i32, d as i32, total_seq as i64,
-                    scale, true, detect_sm_count(),
-                ).unwrap();
+                    op,
+                    sp,
+                    qp,
+                    kp,
+                    vp,
+                    None,
+                    Some(ap),
+                    Some(bp),
+                    cup,
+                    wp,
+                    1,
+                    h as i32,
+                    d as i32,
+                    total_seq as i64,
+                    scale,
+                    true,
+                    detect_sm_count(),
+                )
+                .unwrap();
             }
         };
 
         // Warmup
-        for _ in 0..WARMUP { run(); }
+        for _ in 0..WARMUP {
+            run();
+        }
         gpu.sync();
 
         let start = std::time::Instant::now();
-        for _ in 0..REPEATS { run(); }
+        for _ in 0..REPEATS {
+            run();
+        }
         gpu.sync();
         let elapsed_us = start.elapsed().as_nanos() as f64 / REPEATS as f64 / 1000.0;
 

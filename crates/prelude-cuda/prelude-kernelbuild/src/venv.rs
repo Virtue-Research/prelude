@@ -115,9 +115,7 @@ impl PythonVenv {
                     .status()
                     .map_err(|e| format!("python3 -m venv spawn failed: {e}"))?;
                 if !status.success() {
-                    return Err(
-                        "python3 -m venv failed; install uv or a working python3".into(),
-                    );
+                    return Err("python3 -m venv failed; install uv or a working python3".into());
                 }
             }
             if !python.exists() {
@@ -193,7 +191,9 @@ impl PythonVenv {
             cmd.arg(pkg);
         }
 
-        let output = cmd.output().map_err(|e| format!("pip install spawn failed: {e}"))?;
+        let output = cmd
+            .output()
+            .map_err(|e| format!("pip install spawn failed: {e}"))?;
         if !output.status.success() {
             // Surface the last few stderr lines — pip tracebacks are huge
             // and build-log truncation chops off the useful part first.
@@ -247,7 +247,10 @@ impl PythonVenv {
 /// installed or the lib dir doesn't exist.
 pub fn find_cutlass_dsl_lib(python: &Path) -> Option<PathBuf> {
     let output = Command::new(python)
-        .args(["-c", "import nvidia_cutlass_dsl; print(nvidia_cutlass_dsl.__path__[0])"])
+        .args([
+            "-c",
+            "import nvidia_cutlass_dsl; print(nvidia_cutlass_dsl.__path__[0])",
+        ])
         .output()
         .ok()?;
     if !output.status.success() {

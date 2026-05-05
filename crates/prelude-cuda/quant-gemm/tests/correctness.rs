@@ -5,7 +5,9 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, ValidAsZeroBits};
+use cudarc::driver::{
+    CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, ValidAsZeroBits,
+};
 use quant_gemm::GgmlType;
 
 // ── GPU helpers ─────────────────────────────────────────────────────────
@@ -45,7 +47,10 @@ impl Gpu {
         self.stream.clone_htod(data).unwrap()
     }
 
-    fn alloc_zeros<T: cudarc::driver::DeviceRepr + ValidAsZeroBits>(&self, len: usize) -> CudaSlice<T> {
+    fn alloc_zeros<T: cudarc::driver::DeviceRepr + ValidAsZeroBits>(
+        &self,
+        len: usize,
+    ) -> CudaSlice<T> {
         self.stream.alloc_zeros(len).unwrap()
     }
 
@@ -58,31 +63,48 @@ impl Gpu {
         bf16_vec.iter().map(|v| v.to_f32()).collect()
     }
 
-    fn sync(&self) { self.stream.synchronize().unwrap(); }
+    fn sync(&self) {
+        self.stream.synchronize().unwrap();
+    }
 }
 
 // ── Block metadata ──────────────────────────────────────────────────────
 
 fn block_bytes(t: GgmlType) -> usize {
     match t {
-        GgmlType::Q4_0   => 18,  GgmlType::Q4_1   => 20,
-        GgmlType::Q5_0   => 22,  GgmlType::Q5_1   => 24,
-        GgmlType::Q8_0   => 34,  GgmlType::Q2K    => 84,
-        GgmlType::Q3K    => 110, GgmlType::Q4K    => 144,
-        GgmlType::Q5K    => 176, GgmlType::Q6K    => 210,
-        GgmlType::IQ4NL  => 18,  GgmlType::IQ4XS  => 136,
-        GgmlType::IQ3S   => 110, GgmlType::IQ3XXS => 98,
-        GgmlType::IQ2S   => 82,  GgmlType::IQ2XS  => 74,
-        GgmlType::IQ2XXS => 66,  GgmlType::IQ1S   => 50,
-        GgmlType::IQ1M   => 56,  GgmlType::MXFP4  => 17,
-        GgmlType::NVFP4  => 36,
+        GgmlType::Q4_0 => 18,
+        GgmlType::Q4_1 => 20,
+        GgmlType::Q5_0 => 22,
+        GgmlType::Q5_1 => 24,
+        GgmlType::Q8_0 => 34,
+        GgmlType::Q2K => 84,
+        GgmlType::Q3K => 110,
+        GgmlType::Q4K => 144,
+        GgmlType::Q5K => 176,
+        GgmlType::Q6K => 210,
+        GgmlType::IQ4NL => 18,
+        GgmlType::IQ4XS => 136,
+        GgmlType::IQ3S => 110,
+        GgmlType::IQ3XXS => 98,
+        GgmlType::IQ2S => 82,
+        GgmlType::IQ2XS => 74,
+        GgmlType::IQ2XXS => 66,
+        GgmlType::IQ1S => 50,
+        GgmlType::IQ1M => 56,
+        GgmlType::MXFP4 => 17,
+        GgmlType::NVFP4 => 36,
     }
 }
 
 fn block_elems(t: GgmlType) -> usize {
     match t {
-        GgmlType::IQ4NL | GgmlType::MXFP4 | GgmlType::Q4_0 | GgmlType::Q4_1
-        | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 => 32,
+        GgmlType::IQ4NL
+        | GgmlType::MXFP4
+        | GgmlType::Q4_0
+        | GgmlType::Q4_1
+        | GgmlType::Q5_0
+        | GgmlType::Q5_1
+        | GgmlType::Q8_0 => 32,
         GgmlType::NVFP4 => 64,
         _ => 256,
     }
@@ -90,10 +112,14 @@ fn block_elems(t: GgmlType) -> usize {
 
 fn random_bytes(n: usize, seed: u64) -> Vec<u8> {
     let mut state = seed;
-    (0..n).map(|_| {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (state >> 33) as u8
-    }).collect()
+    (0..n)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u8
+        })
+        .collect()
 }
 
 /// Clamp FP16 scale fields in quantized blocks to avoid inf/NaN from random data.
@@ -101,7 +127,9 @@ fn random_bytes(n: usize, seed: u64) -> Vec<u8> {
 fn sanitize_fp16_scales(data: &mut [u8], t: GgmlType) {
     let bb = block_bytes(t);
     let qk = block_elems(t);
-    if data.len() < bb { return; }
+    if data.len() < bb {
+        return;
+    }
     let num_blocks = data.len() / bb;
     // FP16 for 1.0 = 0x3C00
     let safe_scale: [u8; 2] = 0x3C00u16.to_le_bytes();
@@ -110,48 +138,53 @@ fn sanitize_fp16_scales(data: &mut [u8], t: GgmlType) {
         match t {
             // Formats with FP16 d at offset 0
             GgmlType::Q4_0 | GgmlType::Q8_0 => {
-                data[off..off+2].copy_from_slice(&safe_scale);
+                data[off..off + 2].copy_from_slice(&safe_scale);
             }
             // Formats with FP16 d + FP16 m at offset 0
             GgmlType::Q4_1 | GgmlType::Q5_1 => {
-                data[off..off+2].copy_from_slice(&safe_scale);
-                data[off+2..off+4].copy_from_slice(&safe_scale);
+                data[off..off + 2].copy_from_slice(&safe_scale);
+                data[off + 2..off + 4].copy_from_slice(&safe_scale);
             }
             // Q5_0: FP16 d at offset 0
             GgmlType::Q5_0 => {
-                data[off..off+2].copy_from_slice(&safe_scale);
+                data[off..off + 2].copy_from_slice(&safe_scale);
             }
             // Q2_K: FP16 d/dmin at end of block (offset 80,82)
             GgmlType::Q2K => {
                 let d_off = off + 16 + 64; // scales(16) + qs(64)
-                data[d_off..d_off+2].copy_from_slice(&safe_scale);
-                data[d_off+2..d_off+4].copy_from_slice(&safe_scale);
+                data[d_off..d_off + 2].copy_from_slice(&safe_scale);
+                data[d_off + 2..d_off + 4].copy_from_slice(&safe_scale);
             }
             // Q3_K: FP16 d at end of block (offset 108)
             GgmlType::Q3K => {
                 let d_off = off + 32 + 64 + 12; // hmask(32) + qs(64) + scales(12)
-                data[d_off..d_off+2].copy_from_slice(&safe_scale);
+                data[d_off..d_off + 2].copy_from_slice(&safe_scale);
             }
             // Q4_K: FP16 d + dmin at offset 0
             GgmlType::Q4K => {
-                data[off..off+2].copy_from_slice(&safe_scale);
-                data[off+2..off+4].copy_from_slice(&safe_scale);
+                data[off..off + 2].copy_from_slice(&safe_scale);
+                data[off + 2..off + 4].copy_from_slice(&safe_scale);
             }
             // Q5_K: FP16 d + dmin at offset 0
             GgmlType::Q5K => {
-                data[off..off+2].copy_from_slice(&safe_scale);
-                data[off+2..off+4].copy_from_slice(&safe_scale);
+                data[off..off + 2].copy_from_slice(&safe_scale);
+                data[off + 2..off + 4].copy_from_slice(&safe_scale);
             }
             // Q6_K: FP16 d at end (offset 208)
             GgmlType::Q6K => {
                 let d_off = off + 128 + 64 + 16; // ql(128) + qh(64) + scales(16)
-                data[d_off..d_off+2].copy_from_slice(&safe_scale);
+                data[d_off..d_off + 2].copy_from_slice(&safe_scale);
             }
             // IQ formats: FP16 d at offset 0
-            GgmlType::IQ4NL | GgmlType::IQ4XS | GgmlType::IQ3S | GgmlType::IQ3XXS
-            | GgmlType::IQ2S | GgmlType::IQ2XS | GgmlType::IQ2XXS
+            GgmlType::IQ4NL
+            | GgmlType::IQ4XS
+            | GgmlType::IQ3S
+            | GgmlType::IQ3XXS
+            | GgmlType::IQ2S
+            | GgmlType::IQ2XS
+            | GgmlType::IQ2XXS
             | GgmlType::IQ1S => {
-                data[off..off+2].copy_from_slice(&safe_scale);
+                data[off..off + 2].copy_from_slice(&safe_scale);
             }
             // IQ1M: scale is encoded in the scales array, leave as-is
             GgmlType::IQ1M => {}
@@ -221,9 +254,15 @@ fn test_mmvq(t: GgmlType, label: &str, n: usize, k: usize, gpu: &Gpu) {
     sanitize_fp16_scales(&mut raw_w, t);
     let w_f32 = cpu_dequantize(&raw_w, n * k, t);
     let x_f32: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.013).cos()).collect();
-    let ref_y: Vec<f32> = (0..n).map(|i| {
-        w_f32[i * k..(i + 1) * k].iter().zip(x_f32.iter()).map(|(w, x)| w * x).sum()
-    }).collect();
+    let ref_y: Vec<f32> = (0..n)
+        .map(|i| {
+            w_f32[i * k..(i + 1) * k]
+                .iter()
+                .zip(x_f32.iter())
+                .map(|(w, x)| w * x)
+                .sum()
+        })
+        .collect();
 
     let q8_data = quantize_f32_to_q8_1(&x_f32);
     let d_w = gpu.upload(&raw_w);
@@ -238,7 +277,10 @@ fn test_mmvq(t: GgmlType, label: &str, n: usize, k: usize, gpu: &Gpu) {
             wp as *const c_void,
             qp as *const c_void,
             yp as *mut f32,
-            n as i64, k as i64, t, gpu.stream_ptr(),
+            n as i64,
+            k as i64,
+            t,
+            gpu.stream_ptr(),
         );
     }
     gpu.sync();
@@ -248,20 +290,28 @@ fn test_mmvq(t: GgmlType, label: &str, n: usize, k: usize, gpu: &Gpu) {
     let mut max_rel: f32 = 0.0;
     let mut fail_count = 0usize;
     for (r, g) in ref_y.iter().zip(gpu_y.iter()) {
-        if !r.is_finite() || !g.is_finite() { continue; } // skip degenerate random data
+        if !r.is_finite() || !g.is_finite() {
+            continue;
+        } // skip degenerate random data
         let err = (r - g).abs();
         let denom = r.abs().max(1e-6);
         let rel = err / denom;
         max_rel = max_rel.max(rel);
-        if rel > 0.2 && err > 2.0 { fail_count += 1; }
+        if rel > 0.2 && err > 2.0 {
+            fail_count += 1;
+        }
     }
 
-    println!("  {label:>6} [{n:>4}×{k:>5}]  {}  max_rel={max_rel:.4}  fail={fail_count}/{n}",
-        if fail_count == 0 { "PASS" } else { "FAIL" });
+    println!(
+        "  {label:>6} [{n:>4}×{k:>5}]  {}  max_rel={max_rel:.4}  fail={fail_count}/{n}",
+        if fail_count == 0 { "PASS" } else { "FAIL" }
+    );
     // Allow up to 5% of outputs to differ (quantized integer vs dequant+float path).
     let max_failures = (n as f64 * 0.05).ceil() as usize;
-    assert!(fail_count <= max_failures,
-        "{label} [{n}×{k}]: {fail_count}/{n} failed (max_rel={max_rel}), limit={max_failures}");
+    assert!(
+        fail_count <= max_failures,
+        "{label} [{n}×{k}]: {fail_count}/{n} failed (max_rel={max_rel}), limit={max_failures}"
+    );
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -269,23 +319,34 @@ fn test_mmvq(t: GgmlType, label: &str, n: usize, k: usize, gpu: &Gpu) {
 #[test]
 fn dequantize_ref_smoke() {
     let formats: &[(GgmlType, &str)] = &[
-        (GgmlType::Q4_0, "Q4_0"), (GgmlType::Q4K, "Q4_K"),
-        (GgmlType::IQ4NL, "IQ4NL"), (GgmlType::IQ4XS, "IQ4XS"),
-        (GgmlType::IQ3S, "IQ3S"), (GgmlType::IQ3XXS, "IQ3XXS"),
-        (GgmlType::IQ2S, "IQ2S"), (GgmlType::IQ2XS, "IQ2XS"),
-        (GgmlType::IQ2XXS, "IQ2XXS"), (GgmlType::IQ1S, "IQ1S"),
-        (GgmlType::IQ1M, "IQ1M"), (GgmlType::MXFP4, "MXFP4"),
+        (GgmlType::Q4_0, "Q4_0"),
+        (GgmlType::Q4K, "Q4_K"),
+        (GgmlType::IQ4NL, "IQ4NL"),
+        (GgmlType::IQ4XS, "IQ4XS"),
+        (GgmlType::IQ3S, "IQ3S"),
+        (GgmlType::IQ3XXS, "IQ3XXS"),
+        (GgmlType::IQ2S, "IQ2S"),
+        (GgmlType::IQ2XS, "IQ2XS"),
+        (GgmlType::IQ2XXS, "IQ2XXS"),
+        (GgmlType::IQ1S, "IQ1S"),
+        (GgmlType::IQ1M, "IQ1M"),
+        (GgmlType::MXFP4, "MXFP4"),
         (GgmlType::NVFP4, "NVFP4"),
     ];
     for &(t, label) in formats {
         let qk = block_elems(t);
         let n = 256;
-        if n % qk != 0 { continue; }
+        if n % qk != 0 {
+            continue;
+        }
         let raw = random_bytes((n / qk) * block_bytes(t), 99 + t as u64);
         let out = cpu_dequantize(&raw, n, t);
         let finite = out.iter().filter(|v| v.is_finite()).count();
         println!("  {label:>6}: {n} elements, {finite} finite");
-        assert!(finite > n / 2, "{label}: too many non-finite ({finite}/{n})");
+        assert!(
+            finite > n / 2,
+            "{label}: too many non-finite ({finite}/{n})"
+        );
     }
 }
 
@@ -293,7 +354,10 @@ fn dequantize_ref_smoke() {
 fn mmvq_correctness() {
     let gpu = match Gpu::new() {
         Some(g) => g,
-        None => { eprintln!("No CUDA device, skipping"); return; }
+        None => {
+            eprintln!("No CUDA device, skipping");
+            return;
+        }
     };
 
     // K-family and IQ-family quant MMVQ kernels produce significant
@@ -303,29 +367,47 @@ fn mmvq_correctness() {
     let sm10x = gpu.compute_major() >= 10;
     let formats: &[(GgmlType, &str)] = if sm10x {
         &[
-            (GgmlType::Q4_0, "Q4_0"), (GgmlType::Q4_1, "Q4_1"),
-            (GgmlType::Q5_0, "Q5_0"), (GgmlType::Q5_1, "Q5_1"),
-            (GgmlType::Q8_0, "Q8_0"), (GgmlType::Q2K,  "Q2_K"),
-            (GgmlType::MXFP4, "MXFP4"), (GgmlType::NVFP4, "NVFP4"),
+            (GgmlType::Q4_0, "Q4_0"),
+            (GgmlType::Q4_1, "Q4_1"),
+            (GgmlType::Q5_0, "Q5_0"),
+            (GgmlType::Q5_1, "Q5_1"),
+            (GgmlType::Q8_0, "Q8_0"),
+            (GgmlType::Q2K, "Q2_K"),
+            (GgmlType::MXFP4, "MXFP4"),
+            (GgmlType::NVFP4, "NVFP4"),
         ]
-    } else { &[
-        (GgmlType::Q4_0,   "Q4_0"),   (GgmlType::Q4_1,   "Q4_1"),
-        (GgmlType::Q5_0,   "Q5_0"),   (GgmlType::Q5_1,   "Q5_1"),
-        (GgmlType::Q8_0,   "Q8_0"),   (GgmlType::Q2K,    "Q2_K"),
-        (GgmlType::Q3K,    "Q3_K"),   (GgmlType::Q4K,    "Q4_K"),
-        (GgmlType::Q5K,    "Q5_K"),   (GgmlType::Q6K,    "Q6_K"),
-        (GgmlType::IQ4NL,  "IQ4NL"),  (GgmlType::IQ4XS,  "IQ4XS"),
-        (GgmlType::IQ3S,   "IQ3S"),   (GgmlType::IQ3XXS, "IQ3XX"),
-        (GgmlType::IQ2S,   "IQ2S"),   (GgmlType::IQ2XS,  "IQ2XS"),
-        (GgmlType::IQ2XXS, "IQ2XX"),  (GgmlType::IQ1S,   "IQ1S"),
-        (GgmlType::IQ1M,   "IQ1M"),   (GgmlType::MXFP4,  "MXFP4"),
-        (GgmlType::NVFP4,  "NVFP4"),
-    ]};
+    } else {
+        &[
+            (GgmlType::Q4_0, "Q4_0"),
+            (GgmlType::Q4_1, "Q4_1"),
+            (GgmlType::Q5_0, "Q5_0"),
+            (GgmlType::Q5_1, "Q5_1"),
+            (GgmlType::Q8_0, "Q8_0"),
+            (GgmlType::Q2K, "Q2_K"),
+            (GgmlType::Q3K, "Q3_K"),
+            (GgmlType::Q4K, "Q4_K"),
+            (GgmlType::Q5K, "Q5_K"),
+            (GgmlType::Q6K, "Q6_K"),
+            (GgmlType::IQ4NL, "IQ4NL"),
+            (GgmlType::IQ4XS, "IQ4XS"),
+            (GgmlType::IQ3S, "IQ3S"),
+            (GgmlType::IQ3XXS, "IQ3XX"),
+            (GgmlType::IQ2S, "IQ2S"),
+            (GgmlType::IQ2XS, "IQ2XS"),
+            (GgmlType::IQ2XXS, "IQ2XX"),
+            (GgmlType::IQ1S, "IQ1S"),
+            (GgmlType::IQ1M, "IQ1M"),
+            (GgmlType::MXFP4, "MXFP4"),
+            (GgmlType::NVFP4, "NVFP4"),
+        ]
+    };
 
     println!("\n=== MMVQ Correctness (GPU vs llama.cpp CPU) ===\n");
     for &(n, k) in &[(64usize, 1024usize), (128, 4096)] {
         for &(t, label) in formats {
-            if k % block_elems(t) != 0 { continue; }
+            if k % block_elems(t) != 0 {
+                continue;
+            }
             test_mmvq(t, label, n, k, &gpu);
         }
         println!();
@@ -370,50 +452,61 @@ fn test_gpu_dequantize(t: GgmlType, label: &str, num_elements: usize, gpu: &Gpu)
         let err = (r - g).abs();
         max_abs = max_abs.max(err);
         let tol = 0.02 + 0.02 * r.abs().max(g.abs());
-        if err > tol { fail_count += 1; }
+        if err > tol {
+            fail_count += 1;
+        }
     }
 
-    println!("  {label:>6} [{num_elements:>6}]  {}  max_abs={max_abs:.4}  fail={fail_count}/{num_elements}",
-        if fail_count == 0 { "PASS" } else { "FAIL" });
-    assert_eq!(fail_count, 0,
-        "{label} [{num_elements}]: {fail_count}/{num_elements} failed (max_abs={max_abs})");
+    println!(
+        "  {label:>6} [{num_elements:>6}]  {}  max_abs={max_abs:.4}  fail={fail_count}/{num_elements}",
+        if fail_count == 0 { "PASS" } else { "FAIL" }
+    );
+    assert_eq!(
+        fail_count, 0,
+        "{label} [{num_elements}]: {fail_count}/{num_elements} failed (max_abs={max_abs})"
+    );
 }
 
 #[test]
 fn gpu_dequantize_correctness() {
     let gpu = match Gpu::new() {
         Some(g) => g,
-        None => { eprintln!("No CUDA device, skipping"); return; }
+        None => {
+            eprintln!("No CUDA device, skipping");
+            return;
+        }
     };
 
     let all_formats: &[(GgmlType, &str)] = &[
-        (GgmlType::Q4_0,   "Q4_0"),
-        (GgmlType::Q4_1,   "Q4_1"),
-        (GgmlType::Q5_0,   "Q5_0"),
-        (GgmlType::Q5_1,   "Q5_1"),
-        (GgmlType::Q8_0,   "Q8_0"),
-        (GgmlType::Q2K,    "Q2_K"),
-        (GgmlType::Q3K,    "Q3_K"),
-        (GgmlType::Q4K,    "Q4_K"),
-        (GgmlType::Q5K,    "Q5_K"),
-        (GgmlType::Q6K,    "Q6_K"),
-        (GgmlType::IQ4NL,  "IQ4NL"),
-        (GgmlType::IQ4XS,  "IQ4XS"),
-        (GgmlType::IQ3S,   "IQ3S"),
+        (GgmlType::Q4_0, "Q4_0"),
+        (GgmlType::Q4_1, "Q4_1"),
+        (GgmlType::Q5_0, "Q5_0"),
+        (GgmlType::Q5_1, "Q5_1"),
+        (GgmlType::Q8_0, "Q8_0"),
+        (GgmlType::Q2K, "Q2_K"),
+        (GgmlType::Q3K, "Q3_K"),
+        (GgmlType::Q4K, "Q4_K"),
+        (GgmlType::Q5K, "Q5_K"),
+        (GgmlType::Q6K, "Q6_K"),
+        (GgmlType::IQ4NL, "IQ4NL"),
+        (GgmlType::IQ4XS, "IQ4XS"),
+        (GgmlType::IQ3S, "IQ3S"),
         (GgmlType::IQ3XXS, "IQ3XX"),
-        (GgmlType::IQ2S,   "IQ2S"),
-        (GgmlType::IQ2XS,  "IQ2XS"),
+        (GgmlType::IQ2S, "IQ2S"),
+        (GgmlType::IQ2XS, "IQ2XS"),
         (GgmlType::IQ2XXS, "IQ2XX"),
-        (GgmlType::IQ1S,   "IQ1S"),
-        (GgmlType::IQ1M,   "IQ1M"),
-        (GgmlType::MXFP4,  "MXFP4"),
-        (GgmlType::NVFP4,  "NVFP4"),
+        (GgmlType::IQ1S, "IQ1S"),
+        (GgmlType::IQ1M, "IQ1M"),
+        (GgmlType::MXFP4, "MXFP4"),
+        (GgmlType::NVFP4, "NVFP4"),
     ];
 
     println!("\n=== GPU Dequantize Correctness (GPU BF16 vs llama.cpp CPU F32) ===\n");
     for &n in &[256usize, 1024, 4096] {
         for &(t, label) in all_formats {
-            if n % block_elems(t) != 0 { continue; }
+            if n % block_elems(t) != 0 {
+                continue;
+            }
             test_gpu_dequantize(t, label, n, &gpu);
         }
         println!();
@@ -463,13 +556,23 @@ fn test_tiled_mmq(t: GgmlType, label: &str, m: usize, n: usize, k: usize, gpu: &
         let (wp, _g3) = d_w.device_ptr(&gpu.stream);
         let (yp, _g4) = d_y.device_ptr_mut(&gpu.stream);
         quant_gemm::quantize_q8_1(
-            xp as *const c_void, qp as *mut c_void,
-            m as i64, k as i64, t, gpu.stream_ptr(),
+            xp as *const c_void,
+            qp as *mut c_void,
+            m as i64,
+            k as i64,
+            t,
+            gpu.stream_ptr(),
         );
         quant_gemm::mul_mat_q(
-            wp as *const c_void, qp as *const c_void, yp as *mut f32,
-            m as i64, n as i64, k as i64,
-            t, 0, gpu.stream_ptr(),
+            wp as *const c_void,
+            qp as *const c_void,
+            yp as *mut f32,
+            m as i64,
+            n as i64,
+            k as i64,
+            t,
+            0,
+            gpu.stream_ptr(),
         );
     }
     gpu.sync();
@@ -480,54 +583,84 @@ fn test_tiled_mmq(t: GgmlType, label: &str, m: usize, n: usize, k: usize, gpu: &
     let mut fail_count = 0usize;
     let total = m * n;
     for (r, g) in ref_y.iter().zip(gpu_y.iter()) {
-        if !r.is_finite() || !g.is_finite() { continue; } // skip degenerate random data
+        if !r.is_finite() || !g.is_finite() {
+            continue;
+        } // skip degenerate random data
         let err = (r - g).abs();
         let denom = r.abs().max(1e-6);
         let rel = err / denom;
         max_rel = max_rel.max(rel);
         // Double quantization (weight Q4 + Q8_1 activation + BF16→F32 rounding)
-        if rel > 0.3 && err > 5.0 { fail_count += 1; }
+        if rel > 0.3 && err > 5.0 {
+            fail_count += 1;
+        }
     }
 
-    println!("  {label:>5} [{m}×{n}×{k}]  {}  max_rel={max_rel:.4}  fail={fail_count}/{total}",
-        if fail_count == 0 { "PASS" } else { "FAIL" });
+    println!(
+        "  {label:>5} [{m}×{n}×{k}]  {}  max_rel={max_rel:.4}  fail={fail_count}/{total}",
+        if fail_count == 0 { "PASS" } else { "FAIL" }
+    );
     // Allow up to 1% of outputs to differ (double quantization: weight + Q8_1 + BF16).
     let max_failures = (total as f64 * 0.01).ceil() as usize;
-    assert!(fail_count <= max_failures,
-        "{label} [{m}×{n}×{k}]: {fail_count}/{total} failed (max_rel={max_rel}), limit={max_failures}");
+    assert!(
+        fail_count <= max_failures,
+        "{label} [{m}×{n}×{k}]: {fail_count}/{total} failed (max_rel={max_rel}), limit={max_failures}"
+    );
 }
 
 #[test]
 fn tiled_mmq_correctness() {
     let gpu = match Gpu::new() {
         Some(g) => g,
-        None => { eprintln!("No CUDA device, skipping"); return; }
+        None => {
+            eprintln!("No CUDA device, skipping");
+            return;
+        }
     };
 
     // Same Blackwell carve-out as mmvq_correctness — K/IQ formats break.
     let sm10x = gpu.compute_major() >= 10;
-    let formats: &[(GgmlType, &str)] = if sm10x { &[
-        (GgmlType::Q4_0, "Q4_0"), (GgmlType::Q4_1, "Q4_1"),
-        (GgmlType::Q5_0, "Q5_0"), (GgmlType::Q5_1, "Q5_1"),
-        (GgmlType::Q2K,  "Q2_K"),
-        (GgmlType::MXFP4, "MXFP4"), (GgmlType::NVFP4, "NVFP4"),
-    ]} else { &[
-        (GgmlType::Q4_0,   "Q4_0"),   (GgmlType::Q4_1,   "Q4_1"),
-        (GgmlType::Q5_0,   "Q5_0"),   (GgmlType::Q5_1,   "Q5_1"),
-        (GgmlType::Q8_0,   "Q8_0"),   (GgmlType::Q2K,    "Q2_K"),
-        (GgmlType::Q3K,    "Q3_K"),   (GgmlType::Q4K,    "Q4_K"),
-        (GgmlType::Q5K,    "Q5_K"),   (GgmlType::Q6K,    "Q6_K"),
-        (GgmlType::IQ4NL,  "IQ4NL"),  (GgmlType::IQ4XS,  "IQ4XS"),
-        (GgmlType::IQ3S,   "IQ3S"),   (GgmlType::IQ3XXS, "IQ3XX"),
-        (GgmlType::IQ2S,   "IQ2S"),   (GgmlType::IQ2XS,  "IQ2XS"),
-        (GgmlType::IQ2XXS, "IQ2XX"),  (GgmlType::IQ1S,   "IQ1S"),
-        (GgmlType::MXFP4,  "MXFP4"),  (GgmlType::NVFP4,  "NVFP4"),
-    ]};
+    let formats: &[(GgmlType, &str)] = if sm10x {
+        &[
+            (GgmlType::Q4_0, "Q4_0"),
+            (GgmlType::Q4_1, "Q4_1"),
+            (GgmlType::Q5_0, "Q5_0"),
+            (GgmlType::Q5_1, "Q5_1"),
+            (GgmlType::Q2K, "Q2_K"),
+            (GgmlType::MXFP4, "MXFP4"),
+            (GgmlType::NVFP4, "NVFP4"),
+        ]
+    } else {
+        &[
+            (GgmlType::Q4_0, "Q4_0"),
+            (GgmlType::Q4_1, "Q4_1"),
+            (GgmlType::Q5_0, "Q5_0"),
+            (GgmlType::Q5_1, "Q5_1"),
+            (GgmlType::Q8_0, "Q8_0"),
+            (GgmlType::Q2K, "Q2_K"),
+            (GgmlType::Q3K, "Q3_K"),
+            (GgmlType::Q4K, "Q4_K"),
+            (GgmlType::Q5K, "Q5_K"),
+            (GgmlType::Q6K, "Q6_K"),
+            (GgmlType::IQ4NL, "IQ4NL"),
+            (GgmlType::IQ4XS, "IQ4XS"),
+            (GgmlType::IQ3S, "IQ3S"),
+            (GgmlType::IQ3XXS, "IQ3XX"),
+            (GgmlType::IQ2S, "IQ2S"),
+            (GgmlType::IQ2XS, "IQ2XS"),
+            (GgmlType::IQ2XXS, "IQ2XX"),
+            (GgmlType::IQ1S, "IQ1S"),
+            (GgmlType::MXFP4, "MXFP4"),
+            (GgmlType::NVFP4, "NVFP4"),
+        ]
+    };
 
     println!("\n=== Tiled MMQ Correctness (GPU vs CPU dequant+matmul) ===\n");
     for &(m, n, k) in &[(32usize, 256, 1024), (64, 512, 4096)] {
         for &(t, label) in formats {
-            if k % block_elems(t) != 0 { continue; }
+            if k % block_elems(t) != 0 {
+                continue;
+            }
             test_tiled_mmq(t, label, m, n, k, &gpu);
         }
         println!();

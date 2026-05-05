@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use prelude_core::{GenerateRequest, InferenceEngine, StreamEvent};
 
 pub fn stream_sse(

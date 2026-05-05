@@ -21,8 +21,9 @@ use std::process::Command;
 
 use prelude_kernelbuild::build_log;
 use prelude_kernelbuild::nvcc::{
-    compile_cu_to_obj, find_cuda, link_cuda_runtime_static, locate_source, nvcc_path,
-    nvcc_supports_sm100, nvcc_supports_sm103, track_submodule, ObjCompile,
+    ObjCompile, compile_cu_to_obj, cuda_arch_list_string, cutlass_gencode, find_cuda,
+    link_cuda_runtime_static, locate_source, nvcc_path, nvcc_supports_sm100, nvcc_supports_sm103,
+    supported_cuda_archs, track_submodule,
 };
 
 fn main() {
@@ -40,6 +41,8 @@ fn main() {
         println!("cargo:rerun-if-changed={header}");
     }
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=PRELUDE_CUDA_ARCHS");
+    println!("cargo:rerun-if-env-changed=CUDA_ARCH_LIST");
     track_submodule("DeepGEMM");
     track_submodule("cutlass");
 
@@ -61,11 +64,21 @@ fn main() {
     let sm100 = nvcc_supports_sm100(&nvcc);
     let sm103 = nvcc_supports_sm103(&nvcc);
 
-    match (sm100, sm103) {
-        (true, true) => build_log!("compiling for SM90a + SM100a + SM103a (fat binary)"),
-        (true, false) => build_log!("compiling for SM90a + SM100a (fat binary)"),
-        _ => build_log!("compiling for SM90a only (CUDA toolkit lacks SM100 support)"),
+    let mut default_archs = vec![90];
+    if sm100 {
+        default_archs.push(100);
     }
+    if sm103 {
+        default_archs.push(103);
+    }
+    let archs: Vec<u32> = supported_cuda_archs(&nvcc, &default_archs)
+        .into_iter()
+        .filter(|arch| matches!(arch, 90 | 100 | 103))
+        .collect();
+    if archs.is_empty() {
+        panic!("DeepGEMM only supports SM90/SM100/SM103 in this build");
+    }
+    build_log!("compiling for {}", cuda_arch_list_string(&archs));
 
     // ── Compile the single TU ───────────────────────────────────────
     let src = manifest_dir.join("src/deepgemm_wrapper.cu");
@@ -74,13 +87,9 @@ fn main() {
         .include(cutlass_dir.join("include"))
         .include(deepgemm_include)
         .include(cuda_path.join("include"))
-        .include(manifest_dir.join("src"))
-        .gencode("-gencode=arch=compute_90a,code=sm_90a");
-    if sm100 {
-        opts = opts.gencode("-gencode=arch=compute_100a,code=sm_100a");
-    }
-    if sm103 {
-        opts = opts.gencode("-gencode=arch=compute_103a,code=sm_103a");
+        .include(manifest_dir.join("src"));
+    for arch in &archs {
+        opts = opts.gencode(cutlass_gencode(*arch));
     }
     compile_cu_to_obj(&nvcc, &opts);
 
@@ -110,7 +119,10 @@ fn main() {
     }
     let cuda_targets_stubs = cuda_path.join("targets/x86_64-linux/lib/stubs");
     if cuda_targets_stubs.exists() {
-        println!("cargo:rustc-link-search=native={}", cuda_targets_stubs.display());
+        println!(
+            "cargo:rustc-link-search=native={}",
+            cuda_targets_stubs.display()
+        );
     }
     println!("cargo:rustc-link-lib=dylib=cuda");
 }
@@ -154,7 +166,11 @@ fn ensure_deepgemm(out_dir: &Path, workspace_root: &Path) -> PathBuf {
         std::fs::remove_dir_all(&dg_dir).ok();
     }
     let status = Command::new("cp")
-        .args(["-r", submodule_path.to_str().unwrap(), dg_dir.to_str().unwrap()])
+        .args([
+            "-r",
+            submodule_path.to_str().unwrap(),
+            dg_dir.to_str().unwrap(),
+        ])
         .status()
         .expect("Failed to copy DeepGEMM submodule");
     if !status.success() {

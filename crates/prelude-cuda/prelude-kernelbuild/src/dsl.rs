@@ -120,23 +120,30 @@ pub struct DslCompile<'a> {
 pub fn run(spec: &DslCompile<'_>) -> Result<bool, String> {
     let kernels_dir = spec.kernels_dir;
     let script = spec.script;
+    let target_archs = normalized_archs(spec.target_archs);
+    remove_stale_arch_dirs(kernels_dir, spec.target_archs);
 
     // ── Cache hit check ─────────────────────────────────────────────
     if let Some(hash) = file_hash(script) {
         if kernels_dir.join("manifest.json").exists() && has_obj_files(kernels_dir) {
-            let manifest_str = std::fs::read_to_string(kernels_dir.join("manifest.json"))
-                .unwrap_or_default();
+            let manifest_str =
+                std::fs::read_to_string(kernels_dir.join("manifest.json")).unwrap_or_default();
             if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&manifest_str) {
                 let stored = manifest
                     .get("script_hash")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if stored == hash {
+                let manifest_archs: Vec<u64> = manifest
+                    .get("archs")
+                    .and_then(|v| v.as_array())
+                    .map(|values| values.iter().filter_map(|v| v.as_u64()).collect())
+                    .unwrap_or_default();
+                if stored == hash && manifest_archs == target_archs {
                     build_log!("[DSL] {} using cached kernels", spec.label);
                     return Ok(true);
                 }
                 build_log!(
-                    "[DSL] {} compile_kernels.py changed ({}→{}), recompiling...",
+                    "[DSL] {} compile_kernels.py or arch config changed ({}→{}), recompiling...",
                     spec.label,
                     short_hash(stored),
                     short_hash(&hash)
@@ -165,7 +172,10 @@ pub fn run(spec: &DslCompile<'_>) -> Result<bool, String> {
 
     build_log!("[DSL] {} attempting AOT compilation...", spec.label);
     if !script.exists() {
-        build_log!("[DSL] {} no compile script, skipping DSL kernels", spec.label);
+        build_log!(
+            "[DSL] {} no compile script, skipping DSL kernels",
+            spec.label
+        );
         return Ok(false);
     }
 
@@ -281,12 +291,48 @@ fn clear_obj_files(dir: &Path) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.extension().is_some_and(|x| x == "o") {
+            if p.is_dir() {
+                clear_obj_files(&p);
+            } else if p.extension().is_some_and(|x| x == "o") {
                 let _ = std::fs::remove_file(&p);
             }
         }
     }
     let _ = std::fs::remove_file(dir.join("manifest.json"));
+}
+
+fn remove_stale_arch_dirs(kernels_dir: &Path, target_archs: &[String]) {
+    let Ok(entries) = std::fs::read_dir(kernels_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with("sm_") && !target_archs.iter().any(|arch| arch == name) {
+            build_log!("[DSL] removing stale arch directory {name}");
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+fn normalized_archs(archs: &[String]) -> Vec<u64> {
+    let mut archs: Vec<u64> = archs.iter().filter_map(|arch| parse_arch(arch)).collect();
+    archs.sort_unstable();
+    archs.dedup();
+    archs
+}
+
+fn parse_arch(arch: &str) -> Option<u64> {
+    arch.trim()
+        .strip_prefix("sm_")
+        .unwrap_or(arch.trim())
+        .parse::<u64>()
+        .ok()
 }
 
 /// First 8 hex chars of a hash string, for readable `changed (XXX→YYY)` logs.

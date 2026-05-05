@@ -46,6 +46,8 @@ fn main() {
     println!("cargo:rerun-if-changed=csrc/dequantize_ffi.c");
     println!("cargo:rerun-if-changed=csrc/dequantize_gpu.cu");
     println!("cargo:rerun-if-changed=csrc/iq_tables.cuh");
+    println!("cargo:rerun-if-env-changed=PRELUDE_CUDA_ARCHS");
+    println!("cargo:rerun-if-env-changed=CUDA_ARCH_LIST");
     track_submodule("llama.cpp");
 
     // 1. Ensure llama.cpp headers (third_party/llama.cpp submodule)
@@ -70,9 +72,7 @@ fn main() {
 
     // 3. Detect GPU compute capability
     let compute_cap = detect_compute_cap().unwrap_or(80);
-    let gencode = format!(
-        "-gencode=arch=compute_{compute_cap},code=sm_{compute_cap}"
-    );
+    let gencode = format!("-gencode=arch=compute_{compute_cap},code=sm_{compute_cap}");
 
     build_log!("compiling tiled MMQ for sm_{compute_cap}");
 
@@ -88,15 +88,25 @@ fn main() {
         let h1 = s.spawn(|| {
             let status = Command::new(&nvcc)
                 .args([
-                    "-std=c++17", "-O3", "--use_fast_math",
-                    "--expt-relaxed-constexpr", "-Xcompiler", "-fPIC",
+                    "-std=c++17",
+                    "-O3",
+                    "--use_fast_math",
+                    "--expt-relaxed-constexpr",
+                    "-Xcompiler",
+                    "-fPIC",
                     &gencode,
-                    "-I", csrc.to_str().unwrap(),
-                    "-I", ggml_include.to_str().unwrap(),
-                    "-I", ggml_src.to_str().unwrap(),
-                    "-I", ggml_cuda.to_str().unwrap(),
-                    "-c", csrc.join("mmq_ffi.cu").to_str().unwrap(),
-                    "-o", obj.to_str().unwrap(),
+                    "-I",
+                    csrc.to_str().unwrap(),
+                    "-I",
+                    ggml_include.to_str().unwrap(),
+                    "-I",
+                    ggml_src.to_str().unwrap(),
+                    "-I",
+                    ggml_cuda.to_str().unwrap(),
+                    "-c",
+                    csrc.join("mmq_ffi.cu").to_str().unwrap(),
+                    "-o",
+                    obj.to_str().unwrap(),
                 ])
                 .status()
                 .expect("Failed to run nvcc");
@@ -107,32 +117,51 @@ fn main() {
         let h2 = s.spawn(|| {
             let status = Command::new(&cc_compiler)
                 .args([
-                    "-c", "-O2", "-fPIC",
-                    "-I", csrc.to_str().unwrap(),
-                    "-I", ggml_include.to_str().unwrap(),
-                    "-I", ggml_src.to_str().unwrap(),
+                    "-c",
+                    "-O2",
+                    "-fPIC",
+                    "-I",
+                    csrc.to_str().unwrap(),
+                    "-I",
+                    ggml_include.to_str().unwrap(),
+                    "-I",
+                    ggml_src.to_str().unwrap(),
                     csrc.join("dequantize_ffi.c").to_str().unwrap(),
-                    "-o", deq_obj.to_str().unwrap(),
+                    "-o",
+                    deq_obj.to_str().unwrap(),
                 ])
                 .status()
                 .expect("Failed to compile dequantize_ffi.c");
-            assert!(status.success(), "gcc compilation of dequantize_ffi.c failed");
+            assert!(
+                status.success(),
+                "gcc compilation of dequantize_ffi.c failed"
+            );
         });
 
         // dequantize_gpu.cu (CUDA)
         let h3 = s.spawn(|| {
             let status = Command::new(&nvcc)
                 .args([
-                    "-std=c++17", "-O3", "--use_fast_math",
-                    "--expt-relaxed-constexpr", "-Xcompiler", "-fPIC",
+                    "-std=c++17",
+                    "-O3",
+                    "--use_fast_math",
+                    "--expt-relaxed-constexpr",
+                    "-Xcompiler",
+                    "-fPIC",
                     &gencode,
-                    "-I", csrc.to_str().unwrap(),
-                    "-c", csrc.join("dequantize_gpu.cu").to_str().unwrap(),
-                    "-o", deq_gpu_obj.to_str().unwrap(),
+                    "-I",
+                    csrc.to_str().unwrap(),
+                    "-c",
+                    csrc.join("dequantize_gpu.cu").to_str().unwrap(),
+                    "-o",
+                    deq_gpu_obj.to_str().unwrap(),
                 ])
                 .status()
                 .expect("Failed to run nvcc for dequantize_gpu.cu");
-            assert!(status.success(), "nvcc compilation of dequantize_gpu.cu failed");
+            assert!(
+                status.success(),
+                "nvcc compilation of dequantize_gpu.cu failed"
+            );
         });
 
         h1.join().unwrap();
@@ -191,13 +220,15 @@ fn find_cuda() -> PathBuf {
 }
 
 fn detect_compute_cap() -> Option<u32> {
-    if let Ok(arch_list) = env::var("CUDA_ARCH_LIST") {
-        if let Some(cap) = arch_list
-            .split(',')
-            .filter_map(|s| s.trim().replace('.', "").parse::<u32>().ok())
-            .max()
-        {
-            return Some(cap);
+    for env_name in ["PRELUDE_CUDA_ARCHS", "CUDA_ARCH_LIST"] {
+        if let Ok(arch_list) = env::var(env_name) {
+            if let Some(cap) = arch_list
+                .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+                .filter_map(parse_arch)
+                .max()
+            {
+                return Some(cap);
+            }
         }
     }
     let output = Command::new("nvidia-smi")
@@ -214,4 +245,22 @@ fn detect_compute_cap() -> Option<u32> {
         .replace('.', "")
         .parse::<u32>()
         .ok()
+}
+
+fn parse_arch(raw: &str) -> Option<u32> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    let s = s
+        .strip_prefix("sm_")
+        .or_else(|| s.strip_prefix("sm"))
+        .or_else(|| s.strip_prefix("compute_"))
+        .or_else(|| s.strip_prefix("compute"))
+        .unwrap_or(&s);
+    let s = s.strip_suffix('a').unwrap_or(s);
+    if let Some((major, minor)) = s.split_once('.') {
+        return Some(major.parse::<u32>().ok()? * 10 + minor.parse::<u32>().ok()?);
+    }
+    s.parse::<u32>().ok()
 }

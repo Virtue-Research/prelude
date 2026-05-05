@@ -5,7 +5,9 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, ValidAsZeroBits};
+use cudarc::driver::{
+    CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, ValidAsZeroBits,
+};
 
 // ── CPU reference: f64 matmul (ground truth) ────────────────────────────
 
@@ -50,7 +52,10 @@ impl Gpu {
         self.stream.clone_dtoh(slice).unwrap()
     }
 
-    fn alloc_zeros<T: cudarc::driver::DeviceRepr + ValidAsZeroBits>(&self, len: usize) -> CudaSlice<T> {
+    fn alloc_zeros<T: cudarc::driver::DeviceRepr + ValidAsZeroBits>(
+        &self,
+        len: usize,
+    ) -> CudaSlice<T> {
         self.stream.alloc_zeros(len).unwrap()
     }
 
@@ -65,26 +70,32 @@ fn call_deepgemm(
     input_ptr: *mut c_void,
     weight_ptr: *mut c_void,
     output_ptr: *mut c_void,
-    m: usize, n: usize, k: usize,
+    m: usize,
+    n: usize,
+    k: usize,
     stream: *mut c_void,
 ) -> Result<(), String> {
     unsafe {
         deepgemm::bf16_gemm(
-            input_ptr, weight_ptr, output_ptr,
-            m as i32, n as i32, k as i32,
-            stream,
+            input_ptr, weight_ptr, output_ptr, m as i32, n as i32, k as i32, stream,
         )
     }
 }
 
 fn max_abs_err(reference: &[f64], result: &[f64]) -> f64 {
-    reference.iter().zip(result).map(|(r, t)| (r - t).abs()).fold(0.0f64, f64::max)
+    reference
+        .iter()
+        .zip(result)
+        .map(|(r, t)| (r - t).abs())
+        .fold(0.0f64, f64::max)
 }
 
 fn rand_f32(len: usize) -> Vec<f32> {
     use rand::RngExt;
     let mut rng = rand::rng();
-    (0..len).map(|_| rng.random_range(-0.5f32..0.5f32)).collect()
+    (0..len)
+        .map(|_| rng.random_range(-0.5f32..0.5f32))
+        .collect()
 }
 
 fn run_test(m: usize, n: usize, k: usize, gpu: &Gpu) {
@@ -93,7 +104,9 @@ fn run_test(m: usize, n: usize, k: usize, gpu: &Gpu) {
     let ref64 = cpu_ref_f64(
         &a_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
         &b_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
-        m, n, k,
+        m,
+        n,
+        k,
     );
 
     let a_bf16: Vec<half::bf16> = a_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
@@ -107,13 +120,23 @@ fn run_test(m: usize, n: usize, k: usize, gpu: &Gpu) {
         let (bp, _g2) = b_gpu.device_ptr(&gpu.stream);
         let (op, _g3) = out_gpu.device_ptr_mut(&gpu.stream);
         call_deepgemm(
-            ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
-            m, n, k, gpu.stream_ptr(),
-        ).unwrap();
+            ap as *mut c_void,
+            bp as *mut c_void,
+            op as *mut c_void,
+            m,
+            n,
+            k,
+            gpu.stream_ptr(),
+        )
+        .unwrap();
     }
     gpu.sync();
 
-    let result: Vec<f64> = gpu.download(&out_gpu).iter().map(|x| x.to_f32() as f64).collect();
+    let result: Vec<f64> = gpu
+        .download(&out_gpu)
+        .iter()
+        .map(|x| x.to_f32() as f64)
+        .collect();
     let err = max_abs_err(&ref64, &result);
     assert!(err < 1.0, "DeepGEMM BF16 {m}x{n}x{k}: max_err={err:.6e}");
 }
@@ -124,7 +147,10 @@ fn run_test(m: usize, n: usize, k: usize, gpu: &Gpu) {
 
 #[test]
 fn bf16_gemm_small() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     for (m, n, k) in [(1, 256, 256), (4, 64, 128), (16, 512, 1024)] {
         run_test(m, n, k, &gpu);
     }
@@ -136,7 +162,10 @@ fn bf16_gemm_small() {
 
 #[test]
 fn bf16_gemm_model_shapes() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     // Qwen3-0.6B: hidden=1024, intermediate=3072, vocab=151936
     // The (128,1024,3072) and (1,151936,1024) shapes pick an SM100 tile that
     // isn't in the compiled kernel set on Blackwell (B300); leave the
@@ -145,7 +174,12 @@ fn bf16_gemm_model_shapes() {
     let shapes: &[(usize, usize, usize)] = if arch >= 100 {
         &[(1, 1024, 1024), (32, 3072, 1024)]
     } else {
-        &[(1, 1024, 1024), (32, 3072, 1024), (128, 1024, 3072), (1, 151936, 1024)]
+        &[
+            (1, 1024, 1024),
+            (32, 3072, 1024),
+            (128, 1024, 3072),
+            (1, 151936, 1024),
+        ]
     };
     for (m, n, k) in shapes {
         run_test(*m, *n, *k, &gpu);
@@ -158,7 +192,10 @@ fn bf16_gemm_model_shapes() {
 
 #[test]
 fn bf16_gemm_decode_shapes() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     for m in [1, 4, 8, 16, 32] {
         run_test(m, 4096, 4096, &gpu);
     }
@@ -170,11 +207,17 @@ fn bf16_gemm_decode_shapes() {
 
 #[test]
 fn bf16_gemm_prefill_shapes() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     // On B300 the SM100 config selector picks tiles not in the compiled
     // variant table for large-M × 4096×4096 — skip on SM100+.
     let (_, arch) = deepgemm::query_device();
-    if arch >= 100 { eprintln!("bf16_gemm_prefill_shapes: skip (SM{arch}, missing tile variants)"); return; }
+    if arch >= 100 {
+        eprintln!("bf16_gemm_prefill_shapes: skip (SM{arch}, missing tile variants)");
+        return;
+    }
     for m in [64, 128, 256, 512] {
         run_test(m, 4096, 4096, &gpu);
     }
@@ -216,7 +259,10 @@ fn bf16_gemm_prefill_shapes() {
 // ============================================================================
 #[test]
 fn bf16_gemm_sm103_multicast2_repro() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     run_test(1408, 3072, 1024, &gpu);
 }
 
@@ -352,15 +398,24 @@ fn run_fp8_test(m: usize, n: usize, k: usize, gpu: &Gpu) {
             let (op, _g5) = out_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
                 deepgemm::fp8_gemm(
-                    ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
-                    sfap as *mut c_void, sfbp as *mut c_void,
-                    m as i32, n as i32, k as i32,
+                    ap as *mut c_void,
+                    bp as *mut c_void,
+                    op as *mut c_void,
+                    sfap as *mut c_void,
+                    sfbp as *mut c_void,
+                    m as i32,
+                    n as i32,
+                    k as i32,
                     gpu.stream_ptr(),
-                ).unwrap();
+                )
+                .unwrap();
             }
         }
         gpu.sync();
-        gpu.download(&out_gpu).iter().map(|x| x.to_f32() as f64).collect()
+        gpu.download(&out_gpu)
+            .iter()
+            .map(|x| x.to_f32() as f64)
+            .collect()
     }; // GPU slices dropped here
 
     let err = max_abs_err(&ref64, &result);
@@ -370,8 +425,13 @@ fn run_fp8_test(m: usize, n: usize, k: usize, gpu: &Gpu) {
 
 #[test]
 fn fp8_gemm_small() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
-    if fp8_sm100_skip_if_blackwell("fp8_gemm_small") { return; }
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
+    if fp8_sm100_skip_if_blackwell("fp8_gemm_small") {
+        return;
+    }
     // K must be multiple of 128
     for (m, n, k) in [(4, 128, 128), (16, 256, 256), (32, 512, 256)] {
         run_fp8_test(m, n, k, &gpu);
@@ -380,17 +440,24 @@ fn fp8_gemm_small() {
 
 #[test]
 fn fp8_gemm_model_shapes() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
-    if fp8_sm100_skip_if_blackwell("fp8_gemm_model_shapes") { return; }
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
+    if fp8_sm100_skip_if_blackwell("fp8_gemm_model_shapes") {
+        return;
+    }
     // Qwen3-0.6B/8B: K must be multiple of 128 for FP8
     for (m, n, k) in [
-        (1, 1024, 1024), (32, 3072, 1024), (128, 1024, 3072),
-        (512, 4096, 4096), (512, 11008, 4096),
+        (1, 1024, 1024),
+        (32, 3072, 1024),
+        (128, 1024, 3072),
+        (512, 4096, 4096),
+        (512, 11008, 4096),
     ] {
         run_fp8_test(m, n, k, &gpu);
     }
 }
-
 
 #[test]
 fn query_fp8_config_returns_valid() {
@@ -411,9 +478,7 @@ fn query_fp8_config_returns_valid() {
 /// CPU reference for grouped GEMM: per-group matmul.
 /// A [total_M, K], B [G, N, K] row-major, D [total_M, N].
 /// ms[g] = number of rows in group g, each aligned to 128.
-fn cpu_grouped_ref_f64(
-    a: &[f64], b: &[f64], ms: &[usize], n: usize, k: usize,
-) -> Vec<f64> {
+fn cpu_grouped_ref_f64(a: &[f64], b: &[f64], ms: &[usize], n: usize, k: usize) -> Vec<f64> {
     let total_m: usize = ms.iter().sum();
     let mut out = vec![0.0f64; total_m * n];
     let mut offset = 0;
@@ -437,7 +502,9 @@ fn run_grouped_test(ms: &[usize], n: usize, k: usize, gpu: &Gpu) {
     let ref64 = cpu_grouped_ref_f64(
         &a_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
         &b_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
-        ms, n, k,
+        ms,
+        n,
+        k,
     );
 
     // Build grouped_layout: [total_M] int32, grouped_layout[r] = group_id
@@ -466,26 +533,39 @@ fn run_grouped_test(ms: &[usize], n: usize, k: usize, gpu: &Gpu) {
             let (op, _g4) = out_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
                 deepgemm::m_grouped_bf16_gemm(
-                    ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
+                    ap as *mut c_void,
+                    bp as *mut c_void,
+                    op as *mut c_void,
                     lp as *mut c_void,
-                    total_m as i32, n as i32, k as i32,
+                    total_m as i32,
+                    n as i32,
+                    k as i32,
                     num_groups as i32,
                     gpu.stream_ptr(),
-                ).unwrap();
+                )
+                .unwrap();
             }
         }
         gpu.sync();
-        gpu.download(&out_gpu).iter().map(|x| x.to_f32() as f64).collect()
+        gpu.download(&out_gpu)
+            .iter()
+            .map(|x| x.to_f32() as f64)
+            .collect()
     };
 
     let err = max_abs_err(&ref64, &result);
-    assert!(err < 1.0,
-        "Grouped GEMM G={num_groups} M={total_m} N={n} K={k}: max_err={err:.6e}");
+    assert!(
+        err < 1.0,
+        "Grouped GEMM G={num_groups} M={total_m} N={n} K={k}: max_err={err:.6e}"
+    );
 }
 
 #[test]
 fn grouped_gemm_small() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     // SM103 grouped path is now safe under the mc=2→1 downgrade in
     // src/sm100_bf16.cuh. Don't skip on Blackwell anymore.
     // 2 groups, each 128 rows (aligned to 128)
@@ -496,7 +576,10 @@ fn grouped_gemm_small() {
 
 #[test]
 fn grouped_gemm_moe_shapes() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     // SM103 grouped path is now safe under the mc=2→1 downgrade.
     // DeepSeek-V3 MoE: 8 experts, hidden=7168, intermediate=4096
     for (ms, n, k) in [
@@ -510,7 +593,10 @@ fn grouped_gemm_moe_shapes() {
 
 #[test]
 fn grouped_gemm_unequal_groups() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     // SM103 grouped path is now safe under the mc=2→1 downgrade.
     // Unequal per-group M sizes (all aligned to 128)
     run_grouped_test(&[128, 256, 128], 1024, 1024, &gpu);
@@ -554,7 +640,9 @@ fn run_fp8_grouped_test(ms: &[usize], n: usize, k: usize, gpu: &Gpu) {
     let mut grouped_layout = vec![0i32; total_m];
     let mut offset = 0;
     for (g, &mi) in ms.iter().enumerate() {
-        for r in 0..mi { grouped_layout[offset + r] = g as i32; }
+        for r in 0..mi {
+            grouped_layout[offset + r] = g as i32;
+        }
         offset += mi;
     }
 
@@ -575,28 +663,44 @@ fn run_fp8_grouped_test(ms: &[usize], n: usize, k: usize, gpu: &Gpu) {
             let (op, _) = out_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
                 deepgemm::m_grouped_fp8_gemm(
-                    ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
-                    sfap as *mut c_void, sfbp as *mut c_void,
+                    ap as *mut c_void,
+                    bp as *mut c_void,
+                    op as *mut c_void,
+                    sfap as *mut c_void,
+                    sfbp as *mut c_void,
                     lp as *mut c_void,
-                    total_m as i32, n as i32, k as i32,
+                    total_m as i32,
+                    n as i32,
+                    k as i32,
                     num_groups as i32,
                     gpu.stream_ptr(),
-                ).unwrap();
+                )
+                .unwrap();
             }
         }
         gpu.sync();
-        gpu.download(&out_gpu).iter().map(|x| x.to_f32() as f64).collect()
+        gpu.download(&out_gpu)
+            .iter()
+            .map(|x| x.to_f32() as f64)
+            .collect()
     };
 
     let err = max_abs_err(&ref64, &result);
-    assert!(err < 1.0,
-        "Grouped FP8 G={num_groups} M={total_m} N={n} K={k}: max_err={err:.6e}");
+    assert!(
+        err < 1.0,
+        "Grouped FP8 G={num_groups} M={total_m} N={n} K={k}: max_err={err:.6e}"
+    );
 }
 
 #[test]
 fn fp8_grouped_gemm_small() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
-    if fp8_sm100_skip_if_blackwell("fp8_grouped_gemm_small") { return; }
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
+    if fp8_sm100_skip_if_blackwell("fp8_grouped_gemm_small") {
+        return;
+    }
     // K must be multiple of 128
     run_fp8_grouped_test(&[128, 128], 256, 256, &gpu);
     run_fp8_grouped_test(&[128, 128, 128, 128], 128, 128, &gpu);
@@ -604,20 +708,27 @@ fn fp8_grouped_gemm_small() {
 
 #[test]
 fn fp8_grouped_gemm_moe_shapes() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
-    if fp8_sm100_skip_if_blackwell("fp8_grouped_gemm_moe_shapes") { return; }
-    for (ms, n, k) in [
-        (vec![128; 4], 1024, 1024),
-        (vec![128; 8], 4096, 4096),
-    ] {
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
+    if fp8_sm100_skip_if_blackwell("fp8_grouped_gemm_moe_shapes") {
+        return;
+    }
+    for (ms, n, k) in [(vec![128; 4], 1024, 1024), (vec![128; 8], 4096, 4096)] {
         run_fp8_grouped_test(&ms, n, k, &gpu);
     }
 }
 
 #[test]
 fn fp8_grouped_gemm_unequal_groups() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
-    if fp8_sm100_skip_if_blackwell("fp8_grouped_gemm_unequal_groups") { return; }
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
+    if fp8_sm100_skip_if_blackwell("fp8_grouped_gemm_unequal_groups") {
+        return;
+    }
     // Varying group sizes (all aligned to 128), K must be multiple of 128
     run_fp8_grouped_test(&[128, 256, 384], 1024, 1024, &gpu);
     run_fp8_grouped_test(&[256, 128, 384, 128], 4096, 1024, &gpu);
@@ -653,11 +764,17 @@ fn run_fp8_1d1d_test(m: usize, n: usize, k: usize, gpu: &Gpu) {
             let (op, _) = out_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
                 deepgemm::fp8_gemm_1d1d(
-                    ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
-                    sfap as *mut c_void, sfbp as *mut c_void,
-                    m as i32, n as i32, k as i32,
+                    ap as *mut c_void,
+                    bp as *mut c_void,
+                    op as *mut c_void,
+                    sfap as *mut c_void,
+                    sfbp as *mut c_void,
+                    m as i32,
+                    n as i32,
+                    k as i32,
                     gpu.stream_ptr(),
-                ).unwrap();
+                )
+                .unwrap();
             }
         }
         gpu.sync();
@@ -671,7 +788,12 @@ fn run_fp8_1d1d_test(m: usize, n: usize, k: usize, gpu: &Gpu) {
 /// No SM100 1D1D FP8 implementation — wrapper returns -1 on Blackwell.
 fn fp8_1d1d_skip_if_blackwell() -> bool {
     let (_, arch) = deepgemm::query_device();
-    if arch >= 100 { eprintln!("fp8_1d1d: skip (SM{arch}, no SM100 impl)"); true } else { false }
+    if arch >= 100 {
+        eprintln!("fp8_1d1d: skip (SM{arch}, no SM100 impl)");
+        true
+    } else {
+        false
+    }
 }
 
 /// The SM100 FP8 path (regular + grouped + masked) produces numerically
@@ -679,36 +801,61 @@ fn fp8_1d1d_skip_if_blackwell() -> bool {
 /// as a known DeepGEMM upstream issue and skip on Blackwell for now.
 fn fp8_sm100_skip_if_blackwell(label: &str) -> bool {
     let (_, arch) = deepgemm::query_device();
-    if arch >= 100 { eprintln!("{label}: skip (SM{arch}, FP8 SM100 kernel broken)"); true } else { false }
+    if arch >= 100 {
+        eprintln!("{label}: skip (SM{arch}, FP8 SM100 kernel broken)");
+        true
+    } else {
+        false
+    }
 }
 
 /// SM100 grouped BF16 GEMM kernels also trigger LaunchFailed on B300 for
 /// several MoE shapes. Skip until those variants are sorted out.
 fn grouped_sm100_skip_if_blackwell(label: &str) -> bool {
     let (_, arch) = deepgemm::query_device();
-    if arch >= 100 { eprintln!("{label}: skip (SM{arch}, grouped SM100 kernel bug)"); true } else { false }
+    if arch >= 100 {
+        eprintln!("{label}: skip (SM{arch}, grouped SM100 kernel bug)");
+        true
+    } else {
+        false
+    }
 }
 
 #[test]
 fn fp8_1d1d_gemm_small() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
-    if fp8_1d1d_skip_if_blackwell() { return; }
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
+    if fp8_1d1d_skip_if_blackwell() {
+        return;
+    }
     run_fp8_1d1d_test(64, 256, 256, &gpu);
     run_fp8_1d1d_test(128, 512, 512, &gpu);
 }
 
 #[test]
 fn fp8_1d1d_gemm_model_shapes() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
-    if fp8_1d1d_skip_if_blackwell() { return; }
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
+    if fp8_1d1d_skip_if_blackwell() {
+        return;
+    }
     run_fp8_1d1d_test(64, 1024, 1024, &gpu);
     run_fp8_1d1d_test(128, 4096, 4096, &gpu);
 }
 
 #[test]
 fn fp8_1d1d_gemm_decode_shapes() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
-    if fp8_1d1d_skip_if_blackwell() { return; }
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
+    if fp8_1d1d_skip_if_blackwell() {
+        return;
+    }
     // M >= 64 required for block_m=64; K must be multiple of 128
     run_fp8_1d1d_test(64, 1024, 1024, &gpu);
     run_fp8_1d1d_test(64, 4096, 4096, &gpu);
@@ -719,7 +866,12 @@ fn fp8_1d1d_gemm_decode_shapes() {
 
 /// CPU reference for masked GEMM: per-group matmul, only first actual_m rows valid.
 fn cpu_masked_ref_f64(
-    a: &[f64], b: &[f64], padded_m: usize, actual_ms: &[usize], n: usize, k: usize,
+    a: &[f64],
+    b: &[f64],
+    padded_m: usize,
+    actual_ms: &[usize],
+    n: usize,
+    k: usize,
 ) -> Vec<f64> {
     let num_groups = actual_ms.len();
     let mut out = vec![0.0f64; num_groups * padded_m * n];
@@ -747,7 +899,10 @@ fn run_masked_test(actual_ms: &[usize], padded_m: usize, n: usize, k: usize, gpu
     let ref64 = cpu_masked_ref_f64(
         &a_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
         &b_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
-        padded_m, actual_ms, n, k,
+        padded_m,
+        actual_ms,
+        n,
+        k,
     );
 
     // masked_m[G] = actual rows per group
@@ -772,16 +927,25 @@ fn run_masked_test(actual_ms: &[usize], padded_m: usize, n: usize, k: usize, gpu
             let (op, _g4) = out_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
                 deepgemm::m_grouped_masked_bf16_gemm(
-                    ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
+                    ap as *mut c_void,
+                    bp as *mut c_void,
+                    op as *mut c_void,
                     mp as *mut c_void,
-                    padded_m as i32, n as i32, k as i32,
-                    num_groups as i32, expected_m as i32,
+                    padded_m as i32,
+                    n as i32,
+                    k as i32,
+                    num_groups as i32,
+                    expected_m as i32,
                     gpu.stream_ptr(),
-                ).unwrap();
+                )
+                .unwrap();
             }
         }
         gpu.sync();
-        gpu.download(&out_gpu).iter().map(|x| x.to_f32() as f64).collect()
+        gpu.download(&out_gpu)
+            .iter()
+            .map(|x| x.to_f32() as f64)
+            .collect()
     };
 
     // Only check valid rows (first actual_ms[g] rows of each group)
@@ -792,18 +956,27 @@ fn run_masked_test(actual_ms: &[usize], padded_m: usize, n: usize, k: usize, gpu
             for ni in 0..n {
                 let idx = g * padded_m * n + mi * n + ni;
                 let e = (ref64[idx] - result[idx]).abs();
-                if e > max_err { max_err = e; }
+                if e > max_err {
+                    max_err = e;
+                }
             }
         }
     }
-    assert!(max_err < 1.0,
-        "Masked GEMM G={num_groups} padM={padded_m} actual={actual_ms:?} N={n} K={k}: max_err={max_err:.6e}");
+    assert!(
+        max_err < 1.0,
+        "Masked GEMM G={num_groups} padM={padded_m} actual={actual_ms:?} N={n} K={k}: max_err={max_err:.6e}"
+    );
 }
 
 #[test]
 fn masked_gemm_small() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
-    if grouped_sm100_skip_if_blackwell("masked_gemm_small") { return; }
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
+    if grouped_sm100_skip_if_blackwell("masked_gemm_small") {
+        return;
+    }
     // 2 groups, padded to 128, actual 64 and 96 rows
     run_masked_test(&[64, 96], 128, 256, 256, &gpu);
     // 4 groups, padded to 256, varying actual M
@@ -812,8 +985,13 @@ fn masked_gemm_small() {
 
 #[test]
 fn masked_gemm_moe_shapes() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
-    if grouped_sm100_skip_if_blackwell("masked_gemm_moe_shapes") { return; }
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
+    if grouped_sm100_skip_if_blackwell("masked_gemm_moe_shapes") {
+        return;
+    }
     // 4 experts, padded to 256, actual ~128 each
     run_masked_test(&[128, 128, 128, 128], 256, 4096, 1024, &gpu);
     // 8 experts, padded to 128, actual varies
@@ -822,8 +1000,13 @@ fn masked_gemm_moe_shapes() {
 
 #[test]
 fn masked_gemm_varied_actual_m() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
-    if grouped_sm100_skip_if_blackwell("masked_gemm_varied_actual_m") { return; }
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
+    if grouped_sm100_skip_if_blackwell("masked_gemm_varied_actual_m") {
+        return;
+    }
     // 4 groups with varied actual_m, padded to 128
     run_masked_test(&[32, 64, 128, 96], 128, 1024, 1024, &gpu);
     // 4 groups with varied actual_m, padded to 256
@@ -870,17 +1053,27 @@ fn run_fp8_masked_test(actual_ms: &[usize], padded_m: usize, n: usize, k: usize,
             let (op, _) = out_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
                 deepgemm::m_grouped_masked_fp8_gemm(
-                    ap as *mut c_void, bp as *mut c_void, op as *mut c_void,
-                    sfap as *mut c_void, sfbp as *mut c_void,
+                    ap as *mut c_void,
+                    bp as *mut c_void,
+                    op as *mut c_void,
+                    sfap as *mut c_void,
+                    sfbp as *mut c_void,
                     mp as *mut c_void,
-                    padded_m as i32, n as i32, k as i32,
-                    num_groups as i32, expected_m as i32,
+                    padded_m as i32,
+                    n as i32,
+                    k as i32,
+                    num_groups as i32,
+                    expected_m as i32,
                     gpu.stream_ptr(),
-                ).unwrap();
+                )
+                .unwrap();
             }
         }
         gpu.sync();
-        gpu.download(&out_gpu).iter().map(|x| x.to_f32() as f64).collect()
+        gpu.download(&out_gpu)
+            .iter()
+            .map(|x| x.to_f32() as f64)
+            .collect()
     };
 
     // Only check valid rows
@@ -891,18 +1084,27 @@ fn run_fp8_masked_test(actual_ms: &[usize], padded_m: usize, n: usize, k: usize,
             for ni in 0..n {
                 let idx = g * padded_m * n + mi * n + ni;
                 let e = (ref64[idx] - result[idx]).abs();
-                if e > max_err { max_err = e; }
+                if e > max_err {
+                    max_err = e;
+                }
             }
         }
     }
-    assert!(max_err < 1.0,
-        "Masked FP8 G={num_groups} padM={padded_m} actual={actual_ms:?} N={n} K={k}: max_err={max_err:.6e}");
+    assert!(
+        max_err < 1.0,
+        "Masked FP8 G={num_groups} padM={padded_m} actual={actual_ms:?} N={n} K={k}: max_err={max_err:.6e}"
+    );
 }
 
 #[test]
 fn fp8_masked_gemm_small() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
-    if fp8_sm100_skip_if_blackwell("fp8_masked_gemm_small") { return; }
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
+    if fp8_sm100_skip_if_blackwell("fp8_masked_gemm_small") {
+        return;
+    }
     // K must be multiple of 128
     run_fp8_masked_test(&[64, 64], 128, 256, 256, &gpu);
     run_fp8_masked_test(&[64, 128, 64, 128], 128, 128, 128, &gpu);
@@ -910,10 +1112,16 @@ fn fp8_masked_gemm_small() {
 
 #[test]
 fn bf16_gemm_acc_small() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     // No SM100 implementation of bf16_gemm_acc yet.
     let (_, arch) = deepgemm::query_device();
-    if arch >= 100 { eprintln!("bf16_gemm_acc_small: skip (SM{arch}, no SM100 impl)"); return; }
+    if arch >= 100 {
+        eprintln!("bf16_gemm_acc_small: skip (SM{arch}, no SM100 impl)");
+        return;
+    }
     for (m, n, k) in [(16, 256, 256), (64, 512, 512), (128, 1024, 1024)] {
         // Reference: D = C + A @ B (all in f64)
         let a_f32 = rand_f32(m * k);
@@ -924,7 +1132,11 @@ fn bf16_gemm_acc_small() {
         let b_f64: Vec<f64> = b_f32.iter().map(|&x| x as f64).collect();
         let c_f64: Vec<f64> = c_f32.iter().map(|&x| x as f64).collect();
         let matmul = cpu_ref_f64(&a_f64, &b_f64, m, n, k);
-        let ref64: Vec<f64> = c_f64.iter().zip(matmul.iter()).map(|(&c, &m)| c + m).collect();
+        let ref64: Vec<f64> = c_f64
+            .iter()
+            .zip(matmul.iter())
+            .map(|(&c, &m)| c + m)
+            .collect();
 
         let a_bf16: Vec<half::bf16> = a_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
         let b_bf16: Vec<half::bf16> = b_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
@@ -942,11 +1154,16 @@ fn bf16_gemm_acc_small() {
                 let (dp, _) = d_gpu.device_ptr_mut(&gpu.stream);
                 unsafe {
                     deepgemm::bf16_gemm_acc(
-                        ap as *mut c_void, bp as *mut c_void,
-                        cp as *mut c_void, dp as *mut c_void,
-                        m as i32, n as i32, k as i32,
+                        ap as *mut c_void,
+                        bp as *mut c_void,
+                        cp as *mut c_void,
+                        dp as *mut c_void,
+                        m as i32,
+                        n as i32,
+                        k as i32,
                         gpu.stream_ptr(),
-                    ).unwrap();
+                    )
+                    .unwrap();
                 }
             }
             gpu.sync();
@@ -954,16 +1171,25 @@ fn bf16_gemm_acc_small() {
         };
 
         let err = max_abs_err(&ref64, &result);
-        assert!(err < 1.0, "BF16 acc GEMM M={m} N={n} K={k}: max_err={err:.6e}");
+        assert!(
+            err < 1.0,
+            "BF16 acc GEMM M={m} N={n} K={k}: max_err={err:.6e}"
+        );
     }
 }
 
 #[test]
 fn bf16_gemm_acc_model_shapes() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     // No SM100 implementation of bf16_gemm_acc yet.
     let (_, arch) = deepgemm::query_device();
-    if arch >= 100 { eprintln!("bf16_gemm_acc_model_shapes: skip (SM{arch}, no SM100 impl)"); return; }
+    if arch >= 100 {
+        eprintln!("bf16_gemm_acc_model_shapes: skip (SM{arch}, no SM100 impl)");
+        return;
+    }
     for (m, n, k) in [(64, 4096, 4096), (128, 4096, 4096)] {
         // Reference: D = C + A @ B (all in f64)
         let a_f32 = rand_f32(m * k);
@@ -974,7 +1200,11 @@ fn bf16_gemm_acc_model_shapes() {
         let b_f64: Vec<f64> = b_f32.iter().map(|&x| x as f64).collect();
         let c_f64: Vec<f64> = c_f32.iter().map(|&x| x as f64).collect();
         let matmul = cpu_ref_f64(&a_f64, &b_f64, m, n, k);
-        let ref64: Vec<f64> = c_f64.iter().zip(matmul.iter()).map(|(&c, &m)| c + m).collect();
+        let ref64: Vec<f64> = c_f64
+            .iter()
+            .zip(matmul.iter())
+            .map(|(&c, &m)| c + m)
+            .collect();
 
         let a_bf16: Vec<half::bf16> = a_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
         let b_bf16: Vec<half::bf16> = b_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
@@ -992,11 +1222,16 @@ fn bf16_gemm_acc_model_shapes() {
                 let (dp, _) = d_gpu.device_ptr_mut(&gpu.stream);
                 unsafe {
                     deepgemm::bf16_gemm_acc(
-                        ap as *mut c_void, bp as *mut c_void,
-                        cp as *mut c_void, dp as *mut c_void,
-                        m as i32, n as i32, k as i32,
+                        ap as *mut c_void,
+                        bp as *mut c_void,
+                        cp as *mut c_void,
+                        dp as *mut c_void,
+                        m as i32,
+                        n as i32,
+                        k as i32,
                         gpu.stream_ptr(),
-                    ).unwrap();
+                    )
+                    .unwrap();
                 }
             }
             gpu.sync();
@@ -1004,14 +1239,22 @@ fn bf16_gemm_acc_model_shapes() {
         };
 
         let err = max_abs_err(&ref64, &result);
-        assert!(err < 1.0, "BF16 acc GEMM M={m} N={n} K={k}: max_err={err:.6e}");
+        assert!(
+            err < 1.0,
+            "BF16 acc GEMM M={m} N={n} K={k}: max_err={err:.6e}"
+        );
     }
 }
 
 #[test]
 fn fp8_masked_gemm_moe_shapes() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
-    if fp8_sm100_skip_if_blackwell("fp8_masked_gemm_moe_shapes") { return; }
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
+    if fp8_sm100_skip_if_blackwell("fp8_masked_gemm_moe_shapes") {
+        return;
+    }
     run_fp8_masked_test(&[128, 128, 128, 128], 256, 1024, 1024, &gpu);
     run_fp8_masked_test(&[64, 128, 64, 128, 64, 128, 64, 128], 128, 4096, 4096, &gpu);
 }
@@ -1022,7 +1265,10 @@ fn fp8_masked_gemm_moe_shapes() {
 
 #[test]
 fn device_query() {
-    let _gpu = match Gpu::new() { Some(g) => g, None => return };
+    let _gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     let (num_sms, gpu_arch) = deepgemm::query_device();
     assert!(num_sms > 0, "num_sms should be positive, got {num_sms}");
     assert!(gpu_arch >= 90, "gpu_arch should be >= 90, got {gpu_arch}");
@@ -1040,8 +1286,7 @@ fn cpu_transpose_sf(sf: &[f32], g: usize, mn: usize, sf_k: usize) -> Vec<f32> {
     for gi in 0..g {
         for mi in 0..mn {
             for ki in 0..sf_k {
-                out[gi * sf_k * tma_mn + ki * tma_mn + mi] =
-                    sf[gi * mn * sf_k + mi * sf_k + ki];
+                out[gi * sf_k * tma_mn + ki * tma_mn + mi] = sf[gi * mn * sf_k + mi * sf_k + ki];
             }
         }
     }
@@ -1050,7 +1295,10 @@ fn cpu_transpose_sf(sf: &[f32], g: usize, mn: usize, sf_k: usize) -> Vec<f32> {
 
 #[test]
 fn sf_transpose_correctness() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     for (g, mn, sf_k) in [(1, 128, 8), (1, 256, 16), (2, 64, 4), (1, 1024, 56)] {
         let sf_data = rand_f32(g * mn * sf_k);
         let ref_out = cpu_transpose_sf(&sf_data, g, mn, sf_k);
@@ -1064,19 +1312,28 @@ fn sf_transpose_correctness() {
             let (op, _) = out_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
                 deepgemm::transform_sf_transpose(
-                    sp as *mut c_void, op as *mut c_void,
-                    mn as i32, sf_k as i32, g as i32,
+                    sp as *mut c_void,
+                    op as *mut c_void,
+                    mn as i32,
+                    sf_k as i32,
+                    g as i32,
                     gpu.stream_ptr(),
-                ).unwrap();
+                )
+                .unwrap();
             }
         }
         gpu.sync();
 
         let result = gpu.download(&out_gpu);
-        let err = ref_out.iter().zip(result.iter())
+        let err = ref_out
+            .iter()
+            .zip(result.iter())
             .map(|(r, t)| (r - t).abs())
             .fold(0.0f32, f32::max);
-        assert!(err == 0.0, "SF transpose G={g} MN={mn} K={sf_k}: max_err={err:.6e}");
+        assert!(
+            err == 0.0,
+            "SF transpose G={g} MN={mn} K={sf_k}: max_err={err:.6e}"
+        );
     }
 }
 
@@ -1086,7 +1343,9 @@ fn sf_transpose_correctness() {
 
 /// Simple FP8 E4M3 quantization for testing (no scaling).
 fn f32_to_fp8_e4m3_simple(val: f32) -> u8 {
-    if val == 0.0 { return 0; }
+    if val == 0.0 {
+        return 0;
+    }
     let sign = if val < 0.0 { 0x80u8 } else { 0u8 };
     let clamped = val.abs().min(448.0);
     let log2 = clamped.log2();
@@ -1098,7 +1357,10 @@ fn f32_to_fp8_e4m3_simple(val: f32) -> u8 {
 
 #[test]
 fn mqa_logits_basic() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
 
     // DeepSeek V3 config: num_heads=32, head_dim=64, block_q=4
     let seq_len = 4;
@@ -1139,22 +1401,32 @@ fn mqa_logits_basic() {
         let (lp, _) = logits_gpu.device_ptr_mut(&gpu.stream);
         unsafe {
             deepgemm::fp8_mqa_logits(
-                qp as *mut c_void, kvp as *mut c_void,
-                kvsp as *mut c_void, wp as *mut c_void,
-                ksp as *mut c_void, kep as *mut c_void,
+                qp as *mut c_void,
+                kvp as *mut c_void,
+                kvsp as *mut c_void,
+                wp as *mut c_void,
+                ksp as *mut c_void,
+                kep as *mut c_void,
                 lp as *mut c_void,
-                seq_len as i32, seq_len_kv as i32,
+                seq_len as i32,
+                seq_len_kv as i32,
                 0, // non-compressed
-                num_heads as i32, head_dim as i32, seq_len_kv as i32,
+                num_heads as i32,
+                head_dim as i32,
+                seq_len_kv as i32,
                 gpu.stream_ptr(),
-            ).unwrap();
+            )
+            .unwrap();
         }
     }
     gpu.sync();
 
     let result = gpu.download(&logits_gpu);
     // Verify kernel runs and produces finite results
-    assert!(result.iter().all(|x| x.is_finite()), "MQA logits produced non-finite values");
+    assert!(
+        result.iter().all(|x| x.is_finite()),
+        "MQA logits produced non-finite values"
+    );
     // Verify non-trivial output (not all zeros)
     let max_abs = result.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
     assert!(max_abs > 0.0, "MQA logits output is all zeros");
@@ -1167,7 +1439,10 @@ fn mqa_logits_basic() {
 
 #[test]
 fn clean_logits_basic() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
 
     let seq_len = 4;
     let seq_len_kv = 256;
@@ -1189,12 +1464,16 @@ fn clean_logits_basic() {
         let (lp, _g3) = logits_gpu.device_ptr_mut(&gpu.stream);
         unsafe {
             deepgemm::clean_logits(
-                ksp as *mut c_void, kep as *mut c_void,
+                ksp as *mut c_void,
+                kep as *mut c_void,
                 lp as *mut c_void,
-                seq_len as i32, seq_len_kv as i32, stride as i32,
+                seq_len as i32,
+                seq_len_kv as i32,
+                stride as i32,
                 1, // next_n
                 gpu.stream_ptr(),
-            ).unwrap();
+            )
+            .unwrap();
         }
     }
     gpu.sync();
@@ -1207,10 +1486,15 @@ fn clean_logits_basic() {
         for kvi in 0..seq_len_kv {
             let val = result[qi * stride + kvi];
             if kvi >= ks && kvi < ke {
-                assert!(val == 1.0, "q={qi} kv={kvi}: expected 1.0 (in range [{ks},{ke})), got {val}");
+                assert!(
+                    val == 1.0,
+                    "q={qi} kv={kvi}: expected 1.0 (in range [{ks},{ke})), got {val}"
+                );
             } else {
-                assert!(val == f32::NEG_INFINITY,
-                        "q={qi} kv={kvi}: expected -inf (outside [{ks},{ke})), got {val}");
+                assert!(
+                    val == f32::NEG_INFINITY,
+                    "q={qi} kv={kvi}: expected -inf (outside [{ks},{ke})), got {val}"
+                );
             }
         }
     }
@@ -1222,7 +1506,10 @@ fn clean_logits_basic() {
 
 #[test]
 fn paged_mqa_metadata_basic() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     let (num_sms, _) = deepgemm::query_device();
 
     let batch_size = 4;
@@ -1236,11 +1523,16 @@ fn paged_mqa_metadata_basic() {
         let (mp, _) = meta_gpu.device_ptr_mut(&gpu.stream);
         unsafe {
             deepgemm::paged_mqa_metadata(
-                cp as *mut c_void, mp as *mut c_void,
-                batch_size as i32, 1, false,
-                split_kv as i32, num_sms,
+                cp as *mut c_void,
+                mp as *mut c_void,
+                batch_size as i32,
+                1,
+                false,
+                split_kv as i32,
+                num_sms,
                 gpu.stream_ptr(),
-            ).unwrap();
+            )
+            .unwrap();
         }
     }
     gpu.sync();
@@ -1249,10 +1541,17 @@ fn paged_mqa_metadata_basic() {
     // Verify: first entry should start at q_idx=0, last entry at q_idx=batch_size
     assert_eq!(meta[0], 0, "First SM should start at q_idx=0");
     let last_q = meta[num_sms as usize * 2];
-    assert!(last_q >= batch_size as u32,
-            "Last entry should cover all batches, got q_idx={last_q}");
-    println!("Metadata: first=(q={}, kv={}), last=(q={}, kv={})",
-             meta[0], meta[1], meta[num_sms as usize * 2], meta[num_sms as usize * 2 + 1]);
+    assert!(
+        last_q >= batch_size as u32,
+        "Last entry should cover all batches, got q_idx={last_q}"
+    );
+    println!(
+        "Metadata: first=(q={}, kv={}), last=(q={}, kv={})",
+        meta[0],
+        meta[1],
+        meta[num_sms as usize * 2],
+        meta[num_sms as usize * 2 + 1]
+    );
 }
 
 // ============================================================================
@@ -1302,10 +1601,16 @@ fn run_einsum_test(m: usize, n: usize, k: usize, s: usize, gpu: &Gpu) {
             let (dp, _) = d_gpu.device_ptr_mut(&gpu.stream);
             unsafe {
                 deepgemm::einsum(
-                    ap as *mut c_void, bp as *mut c_void, dp as *mut c_void,
-                    m as i32, n as i32, k as i32, s as i32,
+                    ap as *mut c_void,
+                    bp as *mut c_void,
+                    dp as *mut c_void,
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    s as i32,
                     gpu.stream_ptr(),
-                ).unwrap();
+                )
+                .unwrap();
             }
         }
         gpu.sync();
@@ -1315,34 +1620,52 @@ fn run_einsum_test(m: usize, n: usize, k: usize, s: usize, gpu: &Gpu) {
     let err = max_abs_err(&ref64, &result);
     // BF16 with FP32 accumulation and atomicAdd — tolerance scales with S
     let tol = 1.0 * s as f64;
-    assert!(err < tol, "Einsum M={m} N={n} K={k} S={s}: max_err={err:.6e} (tol={tol})");
+    assert!(
+        err < tol,
+        "Einsum M={m} N={n} K={k} S={s}: max_err={err:.6e} (tol={tol})"
+    );
 }
 
 #[test]
 fn einsum_128x128x64() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     run_einsum_test(128, 128, 64, 4, &gpu);
     run_einsum_test(128, 128, 64, 16, &gpu);
 }
 
 #[test]
 fn einsum_128x64x64() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     // SM100 einsum kernel set is incomplete for this M/N/K/S on B300.
     let (_, arch) = deepgemm::query_device();
-    if arch >= 100 { eprintln!("einsum_128x64x64: skip (SM{arch})"); return; }
+    if arch >= 100 {
+        eprintln!("einsum_128x64x64: skip (SM{arch})");
+        return;
+    }
     run_einsum_test(128, 64, 64, 8, &gpu);
 }
 
 #[test]
 fn einsum_256x128x64() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     run_einsum_test(256, 128, 64, 4, &gpu);
 }
 
 #[test]
 fn einsum_128x128x128() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     run_einsum_test(128, 128, 128, 4, &gpu);
 }
 
@@ -1353,7 +1676,7 @@ fn einsum_128x128x128() {
 #[test]
 fn alignment_helpers() {
     assert_eq!(deepgemm::get_tma_aligned_size(100, 4), 100); // 100*4=400, already 16-aligned
-    assert_eq!(deepgemm::get_tma_aligned_size(3, 4), 4);     // 3*4=12 → 16 → 4 elems
-    assert_eq!(deepgemm::get_tma_aligned_size(7, 2), 8);     // 7*2=14 → 16 → 8 elems
+    assert_eq!(deepgemm::get_tma_aligned_size(3, 4), 4); // 3*4=12 → 16 → 4 elems
+    assert_eq!(deepgemm::get_tma_aligned_size(7, 2), 8); // 7*2=14 → 16 → 8 elems
     assert_eq!(deepgemm::get_mk_alignment(), 128);
 }

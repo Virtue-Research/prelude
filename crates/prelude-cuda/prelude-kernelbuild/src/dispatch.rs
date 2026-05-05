@@ -174,7 +174,10 @@ pub fn tvm_ffi_extern_block<'a, I: IntoIterator<Item = &'a str>>(
 /// `"pub(crate) fn lookup_dsl(_kernel_type: &str, _key: &str, _arch: u32)
 ///   -> Option<crate::dsl::TVMSafeCallFn>"`.
 pub fn stub_lookup(fn_signature: &str) -> String {
-    format!("{header}{fn_signature} {{ None }}\n", header = header_comment())
+    format!(
+        "{header}{fn_signature} {{ None }}\n",
+        header = header_comment()
+    )
 }
 
 /// Convenience: log how many variants were wired into a dispatch table

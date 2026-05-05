@@ -1,10 +1,10 @@
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::Json;
 use prelude_core::{ModelCard, ModelListResponse};
 
-use crate::error::ApiError;
 use crate::Server;
+use crate::error::ApiError;
 
 pub async fn list_models(
     State(server): State<Server>,

@@ -124,8 +124,10 @@ unsafe extern "C" {
     fn cudaGetErrorString(error: i32) -> *const std::ffi::c_char;
     fn cudaDeviceSynchronize() -> i32;
     fn TVMFFIEnvSetStream(
-        device_type: i32, device_id: i32,
-        stream: *mut c_void, out_original: *mut *mut c_void,
+        device_type: i32,
+        device_id: i32,
+        stream: *mut c_void,
+        out_original: *mut *mut c_void,
     ) -> i32;
     fn tvm_static_ffi_get_last_error(out_len: *mut usize) -> *const u8;
 }
@@ -136,11 +138,17 @@ const CUDA_DEV_ATTR_MINOR: i32 = 76;
 fn detect_gpu_arch() -> u32 {
     unsafe {
         let mut device = 0i32;
-        if cudaGetDevice(&mut device) != 0 { return 0; }
+        if cudaGetDevice(&mut device) != 0 {
+            return 0;
+        }
         let mut major = 0i32;
         let mut minor = 0i32;
-        if cudaDeviceGetAttribute(&mut major, CUDA_DEV_ATTR_MAJOR, device) != 0 { return 0; }
-        if cudaDeviceGetAttribute(&mut minor, CUDA_DEV_ATTR_MINOR, device) != 0 { return 0; }
+        if cudaDeviceGetAttribute(&mut major, CUDA_DEV_ATTR_MAJOR, device) != 0 {
+            return 0;
+        }
+        if cudaDeviceGetAttribute(&mut minor, CUDA_DEV_ATTR_MINOR, device) != 0 {
+            return 0;
+        }
         (major * 10 + minor) as u32
     }
 }
@@ -161,7 +169,9 @@ impl KernelRegistry {
         Self { arch }
     }
 
-    pub fn arch(&self) -> u32 { self.arch }
+    pub fn arch(&self) -> u32 {
+        self.arch
+    }
 
     /// Select backend based on GPU arch: FA3 for SM90 (Hopper), FA2 elsewhere.
     ///
@@ -171,7 +181,11 @@ impl KernelRegistry {
     /// valid match. FA2 has an `sm_80` PTX fallback that JIT-compiles for any
     /// higher arch, so Blackwell stays on FA2 until we ship FA3 cubins for it.
     pub fn default_backend(&self) -> Backend {
-        if self.arch == 90 { Backend::FA3 } else { Backend::FA2 }
+        if self.arch == 90 {
+            Backend::FA3
+        } else {
+            Backend::FA2
+        }
     }
 
     /// Look up a batch prefill variant.
@@ -217,11 +231,18 @@ impl KernelRegistry {
     /// # Safety
     /// All TVMFFIAny args must contain valid device pointers.
     pub unsafe fn call(
-        &self, func: TVMSafeCallFn, args: &[TVMFFIAny],
+        &self,
+        func: TVMSafeCallFn,
+        args: &[TVMFFIAny],
     ) -> Result<TVMFFIAny, String> {
         let mut result = TVMFFIAny::none();
         let ret = unsafe {
-            func(std::ptr::null_mut(), args.as_ptr(), args.len() as i32, &mut result)
+            func(
+                std::ptr::null_mut(),
+                args.as_ptr(),
+                args.len() as i32,
+                &mut result,
+            )
         };
         if ret != 0 {
             let detail = unsafe {
@@ -229,7 +250,8 @@ impl KernelRegistry {
                 let mut msg_len: usize = 0;
                 let msg_ptr = tvm_static_ffi_get_last_error(&mut msg_len);
                 let tvm_msg = if !msg_ptr.is_null() && msg_len > 0 {
-                    String::from_utf8_lossy(std::slice::from_raw_parts(msg_ptr, msg_len)).into_owned()
+                    String::from_utf8_lossy(std::slice::from_raw_parts(msg_ptr, msg_len))
+                        .into_owned()
                 } else {
                     String::new()
                 };
@@ -241,7 +263,10 @@ impl KernelRegistry {
                 } else if err != 0 {
                     let ptr = cudaGetErrorString(err);
                     if !ptr.is_null() {
-                        format!("CUDA error {err}: {}", std::ffi::CStr::from_ptr(ptr).to_string_lossy())
+                        format!(
+                            "CUDA error {err}: {}",
+                            std::ffi::CStr::from_ptr(ptr).to_string_lossy()
+                        )
                     } else {
                         format!("CUDA error {err}")
                     }
@@ -249,7 +274,9 @@ impl KernelRegistry {
                     "TVM FFI internal failure (no error message available)".to_string()
                 }
             };
-            return Err(format!("FlashInfer kernel call failed (code {ret}): {detail}"));
+            return Err(format!(
+                "FlashInfer kernel call failed (code {ret}): {detail}"
+            ));
         }
         Ok(result)
     }

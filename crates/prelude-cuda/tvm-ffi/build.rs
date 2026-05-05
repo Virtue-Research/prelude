@@ -30,9 +30,12 @@ fn main() -> Result<()> {
         Ok(p) if !p.is_empty() => PathBuf::from(p),
         _ => {
             let workspace_root = manifest_dir
-                .parent().unwrap()  // crates/prelude-cuda/
-                .parent().unwrap()  // crates/
-                .parent().unwrap(); // workspace root
+                .parent()
+                .unwrap() // crates/prelude-cuda/
+                .parent()
+                .unwrap() // crates/
+                .parent()
+                .unwrap(); // workspace root
             workspace_root.join("third_party/tvm-ffi")
         }
     };
@@ -48,6 +51,13 @@ fn main() -> Result<()> {
             tvm_ffi_dir.display(),
         );
     }
+    if !dlpack_include.join("dlpack/dlpack.h").exists() {
+        anyhow::bail!(
+            "dlpack headers not found under {}. Run: git submodule update \
+             --init --recursive third_party/tvm-ffi",
+            tvm_ffi_dir.display(),
+        );
+    }
 
     // ── Phase 1: Compile TVM FFI C++ source ────────────────────────
     let cc_files: Vec<PathBuf> = walkdir(&tvm_src, "cc")
@@ -58,7 +68,10 @@ fn main() -> Result<()> {
         })
         .collect();
 
-    eprintln!("tvm-static-ffi: compiling {} C++ source files", cc_files.len());
+    eprintln!(
+        "tvm-static-ffi: compiling {} C++ source files",
+        cc_files.len()
+    );
 
     let mut build = cc::Build::new();
     build
@@ -127,9 +140,9 @@ fn main() -> Result<()> {
         println!("cargo:rustc-link-search=native={cuda_path}/lib64");
     }
     println!("cargo:rustc-link-lib=static=cudart_static");
-    println!("cargo:rustc-link-lib=dylib=cuda");   // CUDA Driver API
-    println!("cargo:rustc-link-lib=dylib=rt");      // required by cudart_static
-    println!("cargo:rustc-link-lib=dylib=dl");      // required by cudart_static
+    println!("cargo:rustc-link-lib=dylib=cuda"); // CUDA Driver API
+    println!("cargo:rustc-link-lib=dylib=rt"); // required by cudart_static
+    println!("cargo:rustc-link-lib=dylib=dl"); // required by cudart_static
     println!("cargo:rustc-link-lib=dylib=stdc++");
 
     Ok(())
@@ -138,7 +151,7 @@ fn main() -> Result<()> {
 /// Compile libbacktrace from third_party/tvm-ffi/3rdparty/libbacktrace.
 fn compile_libbacktrace(tvm_ffi_dir: &Path) -> Result<()> {
     let bt_dir = tvm_ffi_dir.join("3rdparty/libbacktrace");
-    if !bt_dir.exists() {
+    if !bt_dir.join("backtrace.c").exists() {
         anyhow::bail!(
             "libbacktrace not found. Run: git submodule update --init --recursive third_party/tvm-ffi"
         );
@@ -186,9 +199,23 @@ fn compile_libbacktrace(tvm_ffi_dir: &Path) -> Result<()> {
     };
     std::fs::write(config_dir.join("config.h"), config_h)?;
 
-    let core_files = ["backtrace.c", "dwarf.c", "fileline.c", "posix.c",
-                      "sort.c", "state.c", "alloc.c", "read.c", "mmapio.c", "mmap.c"];
-    let format_file = if cfg!(target_os = "macos") { "macho.c" } else { "elf.c" };
+    let core_files = [
+        "backtrace.c",
+        "dwarf.c",
+        "fileline.c",
+        "posix.c",
+        "sort.c",
+        "state.c",
+        "alloc.c",
+        "read.c",
+        "mmapio.c",
+        "mmap.c",
+    ];
+    let format_file = if cfg!(target_os = "macos") {
+        "macho.c"
+    } else {
+        "elf.c"
+    };
 
     let mut build = cc::Build::new();
     build
@@ -209,8 +236,15 @@ fn compile_libbacktrace(tvm_ffi_dir: &Path) -> Result<()> {
     if fmt.exists() {
         build.file(&fmt);
     }
+    if !fmt.exists() || !bt_dir.join("backtrace.c").exists() {
+        anyhow::bail!(
+            "libbacktrace source is incomplete at {}. Run: git submodule update --init --recursive third_party/tvm-ffi",
+            bt_dir.display(),
+        );
+    }
 
-    build.try_compile("backtrace")
+    build
+        .try_compile("backtrace")
         .context("Failed to compile libbacktrace")?;
 
     Ok(())

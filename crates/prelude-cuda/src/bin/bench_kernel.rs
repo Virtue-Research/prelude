@@ -22,9 +22,21 @@ struct ModelShape {
 }
 
 const MODELS: &[ModelShape] = &[
-    ModelShape { name: "Qwen3-0.6B", hidden: 1024, intermediate: 3072 },
-    ModelShape { name: "Qwen3-8B",   hidden: 4096, intermediate: 12288 },
-    ModelShape { name: "Qwen3-32B",  hidden: 5120, intermediate: 25600 },
+    ModelShape {
+        name: "Qwen3-0.6B",
+        hidden: 1024,
+        intermediate: 3072,
+    },
+    ModelShape {
+        name: "Qwen3-8B",
+        hidden: 4096,
+        intermediate: 12288,
+    },
+    ModelShape {
+        name: "Qwen3-32B",
+        hidden: 5120,
+        intermediate: 25600,
+    },
 ];
 
 const T_VALUES: &[usize] = &[1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
@@ -53,11 +65,7 @@ fn time_us<F: FnMut() -> Result<()>>(dev: &Device, mut f: F, iters: usize) -> Re
 
 /// Fused path: 1× GEMM [T, H] × [H, 2I] + silu_and_mul → [T, I]
 /// `gate_up_w` is `[2I, H]` (row-major weight); we use `.t()` lazy view for TN GEMM.
-fn run_fused(
-    x: &Tensor,
-    gate_up_w: &Tensor,
-    ops: &dyn Ops,
-) -> Result<Tensor> {
+fn run_fused(x: &Tensor, gate_up_w: &Tensor, ops: &dyn Ops) -> Result<Tensor> {
     let gate_up = x.matmul(&gate_up_w.t()?)?; // [T, 2I]
     match ops.silu_mul_concat(&gate_up) {
         Some(r) => r,
@@ -78,13 +86,16 @@ fn run_separate(
     up_w: &Tensor,   // [I, H]
 ) -> Result<Tensor> {
     let gate = x.matmul(&gate_w.t()?)?; // [T, I]
-    let up = x.matmul(&up_w.t()?)?;     // [T, I]
+    let up = x.matmul(&up_w.t()?)?; // [T, I]
     let s = gate.apply(&prelude_core::models::commons::activation::Activation::Silu)?;
     &s * &up
 }
 
 fn bench_model(dev: &Device, ops: &dyn Ops, m: &ModelShape) -> Result<()> {
-    println!("\n═══ {} (H={}, I={}) ═══", m.name, m.hidden, m.intermediate);
+    println!(
+        "\n═══ {} (H={}, I={}) ═══",
+        m.name, m.hidden, m.intermediate
+    );
     println!(
         "{:>6} {:>14} {:>14} {:>10} {:>14} {:>14}",
         "T", "fused (us)", "separate (us)", "speedup", "fused GEMM", "fused silu"
@@ -100,30 +111,55 @@ fn bench_model(dev: &Device, ops: &dyn Ops, m: &ModelShape) -> Result<()> {
         let x = rand_bf16((t, m.hidden), dev)?;
 
         // Iterations: more for small T to reduce noise.
-        let iters = if t <= 32 { 200 } else if t <= 256 { 100 } else if t <= 1024 { 50 } else { 20 };
+        let iters = if t <= 32 {
+            200
+        } else if t <= 256 {
+            100
+        } else if t <= 1024 {
+            50
+        } else {
+            20
+        };
 
-        let fused_us = time_us(dev, || {
-            let _ = run_fused(&x, &gate_up_w, ops)?;
-            Ok(())
-        }, iters)?;
+        let fused_us = time_us(
+            dev,
+            || {
+                let _ = run_fused(&x, &gate_up_w, ops)?;
+                Ok(())
+            },
+            iters,
+        )?;
 
-        let sep_us = time_us(dev, || {
-            let _ = run_separate(&x, &gate_w, &up_w)?;
-            Ok(())
-        }, iters)?;
+        let sep_us = time_us(
+            dev,
+            || {
+                let _ = run_separate(&x, &gate_w, &up_w)?;
+                Ok(())
+            },
+            iters,
+        )?;
 
         // Component breakdown for fused path
-        let fused_gemm_us = time_us(dev, || {
-            let _ = x.matmul(&gate_up_w.t()?)?;
-            Ok(())
-        }, iters)?;
+        let fused_gemm_us = time_us(
+            dev,
+            || {
+                let _ = x.matmul(&gate_up_w.t()?)?;
+                Ok(())
+            },
+            iters,
+        )?;
 
         let gate_up = x.matmul(&gate_up_w.t()?)?;
-        let fused_silu_us = time_us(dev, || {
-            let _ = ops.silu_mul_concat(&gate_up)
-                .ok_or_else(|| candle_core::Error::Msg("silu_mul_concat not supported".into()))??;
-            Ok(())
-        }, iters)?;
+        let fused_silu_us = time_us(
+            dev,
+            || {
+                let _ = ops.silu_mul_concat(&gate_up).ok_or_else(|| {
+                    candle_core::Error::Msg("silu_mul_concat not supported".into())
+                })??;
+                Ok(())
+            },
+            iters,
+        )?;
 
         let speedup = sep_us / fused_us;
         println!(
@@ -148,11 +184,22 @@ fn main() -> Result<()> {
         // Try a real launch via Tensor::matmul + measure
         let x = rand_bf16((m as usize, k as usize), &dev)?;
         let w = rand_bf16((n as usize, k as usize), &dev)?;
-        let us = time_us(&dev, || { let _ = x.matmul(&w.t()?)?; Ok(()) }, 50)?;
+        let us = time_us(
+            &dev,
+            || {
+                let _ = x.matmul(&w.t()?)?;
+                Ok(())
+            },
+            50,
+        )?;
         // Bandwidth lower bound
         let bw_us = (n * k * 2) as f64 / (4.8 * 1e6);
         let eff = bw_us / us * 100.0;
-        let mark = if eff < 50.0 { "← SLOW (likely CUTLASS)" } else { "" };
+        let mark = if eff < 50.0 {
+            "← SLOW (likely CUTLASS)"
+        } else {
+            ""
+        };
         println!(
             "  M={:>4}  cfg={:?}  matmul={:>7.2}us  ({:>5.1}% bw)  {}",
             m, cfg, us, eff, mark
@@ -166,7 +213,14 @@ fn main() -> Result<()> {
         let cfg = deepgemm::query_config(m, n, k);
         let x = rand_bf16((m as usize, k as usize), &dev)?;
         let w = rand_bf16((n as usize, k as usize), &dev)?;
-        let us = time_us(&dev, || { let _ = x.matmul(&w.t()?)?; Ok(()) }, 50)?;
+        let us = time_us(
+            &dev,
+            || {
+                let _ = x.matmul(&w.t()?)?;
+                Ok(())
+            },
+            50,
+        )?;
         let bw_us = (n * k * 2) as f64 / (4.8 * 1e6);
         let eff = bw_us / us * 100.0;
         println!(
@@ -186,26 +240,30 @@ fn main() -> Result<()> {
         let kv = h / 4; // Qwen3 4× GQA
         let vocab = 151936;
         let layers: Vec<(&str, usize, usize)> = vec![
-            ("q_proj",        h,            h),
-            ("k_proj",        kv,           h),
-            ("v_proj",        kv,           h),
-            ("o_proj",        h,            h),
-            ("qkv_fused",     h + 2 * kv,   h),
-            ("gate_proj",     i,            h),
-            ("up_proj",       i,            h),
-            ("gate_up_fused", 2 * i,        h),
-            ("down_proj",     h,            i),
-            ("lm_head",       vocab,        h),
+            ("q_proj", h, h),
+            ("k_proj", kv, h),
+            ("v_proj", kv, h),
+            ("o_proj", h, h),
+            ("qkv_fused", h + 2 * kv, h),
+            ("gate_proj", i, h),
+            ("up_proj", i, h),
+            ("gate_up_fused", 2 * i, h),
+            ("down_proj", h, i),
+            ("lm_head", vocab, h),
         ];
         println!("─── {} ───", mdl.name);
         let m = 4usize;
         for (name, n, k) in &layers {
             let x = rand_bf16((m, *k), &dev)?;
             let w = rand_bf16((*n, *k), &dev)?;
-            let us = time_us(&dev, || {
-                let _ = x.matmul(&w.t()?)?;
-                Ok(())
-            }, 100)?;
+            let us = time_us(
+                &dev,
+                || {
+                    let _ = x.matmul(&w.t()?)?;
+                    Ok(())
+                },
+                100,
+            )?;
             // Compute pure-bandwidth lower bound (BF16, 2 bytes/elem; weight dominates)
             let bw_us = (n * k * 2) as f64 / (4.8 * 1e6); // 4.8 TB/s H200
             let efficiency = bw_us / us * 100.0;

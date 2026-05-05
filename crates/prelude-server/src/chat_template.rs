@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::Local;
 use hf_hub::api::tokio::{Api, ApiRepo};
-use minijinja::{context, Environment, Error, ErrorKind};
+use minijinja::{Environment, Error, ErrorKind, context};
 use minijinja_contrib::pycompat::unknown_method_callback;
 use prelude_core::ChatMessage;
 use serde::Deserialize;

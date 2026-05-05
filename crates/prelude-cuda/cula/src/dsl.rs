@@ -19,8 +19,8 @@ use std::sync::OnceLock;
 // Runtime re-exports from the shared crate — keeps
 // `use cula::dsl::{DslKernelRegistry, TVMFFIAny, ...}` working.
 pub use prelude_cutedsl::{
-    contiguous_strides, detect_gpu_arch, make_dltensor, DLDataType, DLDevice, DLTensor,
-    DslKernelRegistry, LookupFn, TVMFFIAny, TVMSafeCallFn, KDLBFLOAT, KDLCUDA, KDLFLOAT, KDLINT,
+    DLDataType, DLDevice, DLTensor, DslKernelRegistry, KDLBFLOAT, KDLCUDA, KDLFLOAT, KDLINT,
+    LookupFn, TVMFFIAny, TVMSafeCallFn, contiguous_strides, detect_gpu_arch, make_dltensor,
 };
 
 // Build-generated dispatch table. Defines

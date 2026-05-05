@@ -137,8 +137,10 @@ unsafe extern "C" {
     /// Set the CUDA stream for TVM FFI kernel calls.
     /// Kernels call TVMFFIEnvGetStream() internally to get the stream.
     fn TVMFFIEnvSetStream(
-        device_type: i32, device_id: i32,
-        stream: *mut c_void, out_original: *mut *mut c_void,
+        device_type: i32,
+        device_id: i32,
+        stream: *mut c_void,
+        out_original: *mut *mut c_void,
     ) -> i32;
     /// Extract error message from TVM FFI's thread-local error state.
     /// Defined in src/tvm_error_helper.cc.
@@ -153,11 +155,17 @@ const CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MINOR: i32 = 76;
 fn detect_gpu_arch() -> u32 {
     unsafe {
         let mut device = 0i32;
-        if cudaGetDevice(&mut device) != 0 { return 0; }
+        if cudaGetDevice(&mut device) != 0 {
+            return 0;
+        }
         let mut major = 0i32;
         let mut minor = 0i32;
-        if cudaDeviceGetAttribute(&mut major, CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MAJOR, device) != 0 { return 0; }
-        if cudaDeviceGetAttribute(&mut minor, CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MINOR, device) != 0 { return 0; }
+        if cudaDeviceGetAttribute(&mut major, CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MAJOR, device) != 0 {
+            return 0;
+        }
+        if cudaDeviceGetAttribute(&mut minor, CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MINOR, device) != 0 {
+            return 0;
+        }
         (major * 10 + minor) as u32
     }
 }
@@ -227,7 +235,8 @@ impl KernelRegistry {
                 let mut msg_len: usize = 0;
                 let msg_ptr = tvm_static_ffi_get_last_error(&mut msg_len);
                 let tvm_msg = if !msg_ptr.is_null() && msg_len > 0 {
-                    String::from_utf8_lossy(std::slice::from_raw_parts(msg_ptr, msg_len)).into_owned()
+                    String::from_utf8_lossy(std::slice::from_raw_parts(msg_ptr, msg_len))
+                        .into_owned()
                 } else {
                     String::new()
                 };
@@ -239,7 +248,10 @@ impl KernelRegistry {
                 } else if err != 0 {
                     let ptr = cudaGetErrorString(err);
                     if !ptr.is_null() {
-                        format!("CUDA error {err}: {}", std::ffi::CStr::from_ptr(ptr).to_string_lossy())
+                        format!(
+                            "CUDA error {err}: {}",
+                            std::ffi::CStr::from_ptr(ptr).to_string_lossy()
+                        )
                     } else {
                         format!("CUDA error {err}")
                     }

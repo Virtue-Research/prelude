@@ -55,15 +55,17 @@ tower = { version = "0.5.3", features = ["util"] }
 default = ["cpu"]
 # CPU-only inference (oneDNN matmul, AVX-512 kernels)
 cpu = []
-# CUDA inference — all GPU backends (FlashInfer, FA4, CUTLASS, DeepGEMM, quant-gemm, cuLA)
+# CUDA inference — core GPU backends (FlashInfer, FA4, CUTLASS, DeepGEMM, cuLA)
 cuda = [
     "dep:prelude-cuda",
     "prelude-core/cuda",
 ]
+# CUDA GGUF quantized linear kernels (llama.cpp MMQ/MMVQ via quant-gemm).
+cuda-gguf = ["cuda", "prelude-cuda/gguf-quant"]
 # AMD GPU inference — bare-metal KFD via t0-gpu (zero HIP/ROCm dependency).
 # Disabled until t0-gpu upstream fixes `tests/t0_original` submodule entry.
 # amd = ["dep:prelude-amd"]
 # NVTX profiling annotations (no-op without this feature).
 nvtx = ["prelude-core/nvtx"]
 # Everything
-full = ["cpu", "cuda"]
+full = ["cpu", "cuda", "cuda-gguf"]

@@ -28,13 +28,18 @@ use std::process::Command;
 use prelude_kernelbuild::archive::{self, ArMode};
 use prelude_kernelbuild::build_log;
 use prelude_kernelbuild::dispatch;
-use prelude_kernelbuild::nvcc::{file_hash, track_submodule};
-use prelude_kernelbuild::venv::{detect_torch_cuda_index, InstallOpts, PythonVenv};
+use prelude_kernelbuild::nvcc::{
+    cuda_archs_from_env, file_hash, requested_cuda_archs, track_submodule,
+};
+use prelude_kernelbuild::venv::{InstallOpts, PythonVenv, detect_torch_cuda_index};
 
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=scripts/compile_kernels.py");
     println!("cargo:rerun-if-changed=vendor/");
+    println!("cargo:rerun-if-env-changed=PRELUDE_FA4_ARCHS");
+    println!("cargo:rerun-if-env-changed=PRELUDE_CUDA_ARCHS");
+    println!("cargo:rerun-if-env-changed=CUDA_ARCH_LIST");
     track_submodule("flash-attention");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
@@ -58,13 +63,9 @@ fn main() -> Result<()> {
 
     // Phase 3: Archive the .o files and generate the dispatch table.
     let objects = archive::collect_obj_files(&kernels_dir);
-    let has_kernels = archive::archive_and_whole_link(
-        &objects,
-        &out_dir,
-        "fa4_kernels",
-        ArMode::Replace,
-    )
-    .map_err(anyhow::Error::msg)?;
+    let has_kernels =
+        archive::archive_and_whole_link(&objects, &out_dir, "fa4_kernels", ArMode::Replace)
+            .map_err(anyhow::Error::msg)?;
 
     // CuTeDSL kernel objects (libfa4_kernels.a) reference _cudaGetDevice,
     // _cudaLibraryLoadData, etc. — these are provided by
@@ -92,8 +93,7 @@ fn main() -> Result<()> {
 fn generate_dispatch_code(kernels_dir: &Path, out_dir: &Path, has_kernels: bool) -> Result<()> {
     let dispatch_path = out_dir.join("fa4_dispatch.rs");
 
-    let stub_signature =
-        "pub(crate) fn lookup(_key: &crate::loader::KernelKey, _arch: u32) \
+    let stub_signature = "pub(crate) fn lookup(_key: &crate::loader::KernelKey, _arch: u32) \
          -> Option<crate::loader::TVMSafeCallFn>";
 
     if !has_kernels {
@@ -233,8 +233,27 @@ fn ensure_kernels(
     let script = manifest_dir.join("scripts/compile_kernels.py");
     let current_hash = file_hash(&script).unwrap_or_default();
 
+    // Collect target archs. A crate-specific FA4 override wins; otherwise
+    // PRELUDE_CUDA_ARCHS narrows the AOT build. Without either env var we
+    // keep the old local-GPU fallback.
+    let mut archs: Vec<String> = cuda_archs_from_env("PRELUDE_FA4_ARCHS")
+        .or_else(requested_cuda_archs)
+        .map(|archs| archs.into_iter().map(|arch| format!("sm_{arch}")).collect())
+        .unwrap_or_else(|| {
+            detect_gpu_arch()
+                .map(|local| vec![local])
+                .unwrap_or_else(|_| vec!["sm_90".to_string()])
+        });
+    archs.sort();
+    archs.dedup();
+    let mut target_arch_nums: Vec<u64> = archs
+        .iter()
+        .filter_map(|arch| parse_sm_arch(arch))
+        .collect();
+    target_arch_nums.sort_unstable();
+
     // Cache hit: script hash hasn't changed since the last successful
-    // build.
+    // build, and the requested arch set is the same.
     if kernels_dir.join("manifest.json").exists() {
         let has_objs = std::fs::read_dir(kernels_dir)
             .ok()
@@ -253,14 +272,23 @@ fn ensure_kernels(
                     .get("script_hash")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if stored_hash == current_hash {
+                let manifest_archs: Vec<u64> = manifest
+                    .get("archs")
+                    .and_then(|v| v.as_array())
+                    .map(|values| values.iter().filter_map(|v| v.as_u64()).collect())
+                    .unwrap_or_default();
+                if stored_hash == current_hash && manifest_archs == target_arch_nums {
                     return Ok(());
                 }
                 build_log!(
-                    "compile_kernels.py changed (hash {stored_hash:.8} → {current_hash:.8}), \
+                    "compile_kernels.py or arch config changed (hash {stored_hash:.8} → {current_hash:.8}), \
                      clearing old kernels and recompiling..."
                 );
-                for entry in std::fs::read_dir(kernels_dir).into_iter().flatten().flatten() {
+                for entry in std::fs::read_dir(kernels_dir)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
                     let p = entry.path();
                     if p.extension().is_some_and(|x| x == "o") {
                         let _ = std::fs::remove_file(&p);
@@ -284,24 +312,6 @@ fn ensure_kernels(
     }
 
     let python = ensure_fa4_python_env(venv_dir)?;
-
-    // Collect target archs: local GPU + PRELUDE_FA4_ARCHS env var
-    // override. Falls back to sm_90 for headless build hosts.
-    let mut archs = Vec::new();
-    if let Ok(local) = detect_gpu_arch() {
-        archs.push(local.clone());
-    }
-    if let Ok(extra) = env::var("PRELUDE_FA4_ARCHS") {
-        for a in extra.split(',') {
-            let a = a.trim().to_string();
-            if !a.is_empty() && !archs.contains(&a) {
-                archs.push(a);
-            }
-        }
-    }
-    if archs.is_empty() {
-        archs.push("sm_90".to_string());
-    }
 
     let workers = env::var("PRELUDE_FA4_WORKERS").unwrap_or_else(|_| {
         let num_cpus = std::thread::available_parallelism()
@@ -353,6 +363,14 @@ fn ensure_kernels(
     }
 
     Ok(())
+}
+
+fn parse_sm_arch(arch: &str) -> Option<u64> {
+    arch.trim()
+        .strip_prefix("sm_")
+        .unwrap_or(arch.trim())
+        .parse::<u64>()
+        .ok()
 }
 
 /// Provision (or reuse) the FA4 venv with cutlass-dsl + quack + torch

@@ -30,7 +30,7 @@ pub struct DLDevice {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct DLDataType {
-    pub code: u8,  // kDLFloat=2, kDLBfloat=4, kDLInt=0, kDLUInt=1
+    pub code: u8, // kDLFloat=2, kDLBfloat=4, kDLInt=0, kDLUInt=1
     pub bits: u8,
     pub lanes: u16,
 }
@@ -81,36 +81,68 @@ pub type TVMSafeCallFn =
 
 impl TVMFFIAny {
     pub fn none() -> Self {
-        Self { type_index: KTVMFFI_NONE, zero_padding: 0, v_union: 0 }
+        Self {
+            type_index: KTVMFFI_NONE,
+            zero_padding: 0,
+            v_union: 0,
+        }
     }
 
     pub fn dltensor(tensor: *const DLTensor) -> Self {
-        Self { type_index: KTVMFFI_DLTENSOR_PTR, zero_padding: 0, v_union: tensor as u64 }
+        Self {
+            type_index: KTVMFFI_DLTENSOR_PTR,
+            zero_padding: 0,
+            v_union: tensor as u64,
+        }
     }
 
     pub fn float32(val: f32) -> Self {
         let f64_val = val as f64;
-        Self { type_index: KTVMFFI_FLOAT, zero_padding: 0, v_union: f64_val.to_bits() }
+        Self {
+            type_index: KTVMFFI_FLOAT,
+            zero_padding: 0,
+            v_union: f64_val.to_bits(),
+        }
     }
 
     pub fn float64(val: f64) -> Self {
-        Self { type_index: KTVMFFI_FLOAT, zero_padding: 0, v_union: val.to_bits() }
+        Self {
+            type_index: KTVMFFI_FLOAT,
+            zero_padding: 0,
+            v_union: val.to_bits(),
+        }
     }
 
     pub fn int32(val: i32) -> Self {
-        Self { type_index: KTVMFFI_INT, zero_padding: 0, v_union: val as i64 as u64 }
+        Self {
+            type_index: KTVMFFI_INT,
+            zero_padding: 0,
+            v_union: val as i64 as u64,
+        }
     }
 
     pub fn int64(val: i64) -> Self {
-        Self { type_index: KTVMFFI_INT, zero_padding: 0, v_union: val as u64 }
+        Self {
+            type_index: KTVMFFI_INT,
+            zero_padding: 0,
+            v_union: val as u64,
+        }
     }
 
     pub fn bool_val(val: bool) -> Self {
-        Self { type_index: KTVMFFI_BOOL, zero_padding: 0, v_union: val as u64 }
+        Self {
+            type_index: KTVMFFI_BOOL,
+            zero_padding: 0,
+            v_union: val as u64,
+        }
     }
 
     pub fn opaque_ptr(ptr: *mut c_void) -> Self {
-        Self { type_index: KTVMFFI_OPAQUE_PTR, zero_padding: 0, v_union: ptr as u64 }
+        Self {
+            type_index: KTVMFFI_OPAQUE_PTR,
+            zero_padding: 0,
+            v_union: ptr as u64,
+        }
     }
 
     /// Pack a DLDataType as a TVMFFIAny (for passing dtype arguments).
@@ -118,7 +150,11 @@ impl TVMFFIAny {
         // DLDataType is 4 bytes (code:u8, bits:u8, lanes:u16).
         // TVM FFI encodes it in the lower 32 bits of the int64 union.
         let encoded = (dt.code as u64) | ((dt.bits as u64) << 8) | ((dt.lanes as u64) << 16);
-        Self { type_index: KTVMFFI_DLPACK_DTYPE, zero_padding: 0, v_union: encoded }
+        Self {
+            type_index: KTVMFFI_DLPACK_DTYPE,
+            zero_padding: 0,
+            v_union: encoded,
+        }
     }
 }
 
@@ -196,8 +232,7 @@ fn get_last_error() -> String {
     };
     if !msg_ptr.is_null() && msg_len > 0 {
         unsafe {
-            std::str::from_utf8_unchecked(std::slice::from_raw_parts(msg_ptr, msg_len))
-                .to_string()
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(msg_ptr, msg_len)).to_string()
         }
     } else {
         "TVM FFI call failed".to_string()
@@ -211,15 +246,21 @@ fn get_last_error() -> String {
 /// # Safety
 /// The caller must ensure `func` is a valid TVM SafeCall function pointer and
 /// that the lifetimes of all `TVMFFIAny` contents in `args` outlive the call.
-pub unsafe fn call_tvm_ffi(
-    func: TVMSafeCallFn,
-    args: &[TVMFFIAny],
-) -> Result<(), String> {
+pub unsafe fn call_tvm_ffi(func: TVMSafeCallFn, args: &[TVMFFIAny]) -> Result<(), String> {
     let mut ret = TVMFFIAny::none();
     let rc = unsafe {
-        func(std::ptr::null_mut(), args.as_ptr(), args.len() as i32, &mut ret)
+        func(
+            std::ptr::null_mut(),
+            args.as_ptr(),
+            args.len() as i32,
+            &mut ret,
+        )
     };
-    if rc == 0 { Ok(()) } else { Err(get_last_error()) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(get_last_error())
+    }
 }
 
 /// Call a TVM FFI function and return the result as a TVMFFIAny.
@@ -232,9 +273,18 @@ pub unsafe fn call_tvm_ffi_ret(
 ) -> Result<TVMFFIAny, String> {
     let mut ret = TVMFFIAny::none();
     let rc = unsafe {
-        func(std::ptr::null_mut(), args.as_ptr(), args.len() as i32, &mut ret)
+        func(
+            std::ptr::null_mut(),
+            args.as_ptr(),
+            args.len() as i32,
+            &mut ret,
+        )
     };
-    if rc == 0 { Ok(ret) } else { Err(get_last_error()) }
+    if rc == 0 {
+        Ok(ret)
+    } else {
+        Err(get_last_error())
+    }
 }
 
 /// Call `__tvm_ffi_init` and wrap the returned Module object.

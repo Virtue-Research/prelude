@@ -92,11 +92,7 @@ pub struct BsrMask {
 ///
 /// # Returns
 /// Flattened mask of length `num_qo_tokens * num_kv_tokens`.
-pub fn bsr_to_flat_mask(
-    bsr: &BsrMask,
-    num_qo_tokens: usize,
-    num_kv_tokens: usize,
-) -> Vec<u8> {
+pub fn bsr_to_flat_mask(bsr: &BsrMask, num_qo_tokens: usize, num_kv_tokens: usize) -> Vec<u8> {
     let total = num_qo_tokens * num_kv_tokens;
     let mut mask = vec![0u8; total];
 
@@ -108,10 +104,14 @@ pub fn bsr_to_flat_mask(
             let block_col = block_col_idx as usize;
             for dr in 0..bsr.block_size {
                 let row = block_row * bsr.block_size + dr;
-                if row >= num_qo_tokens { break; }
+                if row >= num_qo_tokens {
+                    break;
+                }
                 for dc in 0..bsr.block_size {
                     let col = block_col * bsr.block_size + dc;
-                    if col >= num_kv_tokens { break; }
+                    if col >= num_kv_tokens {
+                        break;
+                    }
                     mask[row * num_kv_tokens + col] = 1;
                 }
             }
@@ -237,12 +237,15 @@ mod tests {
         let mask = bsr_to_flat_mask(&bsr, 4, 4);
         // Block (0,0): rows 0-1, cols 0-1 = attend
         // Block (1,1): rows 2-3, cols 2-3 = attend
-        assert_eq!(mask, vec![
-            1,1,0,0,  // row 0
-            1,1,0,0,  // row 1
-            0,0,1,1,  // row 2
-            0,0,1,1,  // row 3
-        ]);
+        assert_eq!(
+            mask,
+            vec![
+                1, 1, 0, 0, // row 0
+                1, 1, 0, 0, // row 1
+                0, 0, 1, 1, // row 2
+                0, 0, 1, 1, // row 3
+            ]
+        );
     }
 
     #[test]

@@ -8,7 +8,9 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, ValidAsZeroBits};
+use cudarc::driver::{
+    CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, ValidAsZeroBits,
+};
 
 // ── CPU reference: f64 matmul (ground truth) ────────────────────────────
 
@@ -29,7 +31,12 @@ fn cpu_ref_f64(a: &[f64], b: &[f64], m: usize, n: usize, k: usize) -> Vec<f64> {
 
 /// Batched CPU F64 matmul
 fn cpu_ref_f64_batched(
-    a: &[f64], b: &[f64], m: usize, n: usize, k: usize, batch: usize,
+    a: &[f64],
+    b: &[f64],
+    m: usize,
+    n: usize,
+    k: usize,
+    batch: usize,
 ) -> Vec<f64> {
     let mut out = vec![0.0f64; batch * m * n];
     for bi in 0..batch {
@@ -74,7 +81,10 @@ impl Gpu {
         self.stream.clone_dtoh(slice).unwrap()
     }
 
-    fn alloc_zeros<T: cudarc::driver::DeviceRepr + ValidAsZeroBits>(&self, len: usize) -> CudaSlice<T> {
+    fn alloc_zeros<T: cudarc::driver::DeviceRepr + ValidAsZeroBits>(
+        &self,
+        len: usize,
+    ) -> CudaSlice<T> {
         self.stream.alloc_zeros(len).unwrap()
     }
 
@@ -117,33 +127,53 @@ fn call_gemm(
     weight_ptr: *const c_void,
     input_ptr: *const c_void,
     output_ptr: *mut c_void,
-    m: usize, n: usize, k: usize,
+    m: usize,
+    n: usize,
+    k: usize,
     batch: usize,
-    stride_a: i64, stride_b: i64, stride_d: i64,
+    stride_a: i64,
+    stride_b: i64,
+    stride_d: i64,
     dtype: u32,
     stream: *const c_void,
 ) -> Result<(), String> {
     unsafe {
         cutlass_gemm::gemm_dispatch(
-            weight_ptr, input_ptr, output_ptr,
-            n as i32, m as i32, k as i32,
+            weight_ptr,
+            input_ptr,
+            output_ptr,
+            n as i32,
+            m as i32,
+            k as i32,
             batch as i32,
-            k as i32, k as i32, n as i32,
-            stride_a, stride_b, stride_d,
-            true, false,
-            dtype, stream,
+            k as i32,
+            k as i32,
+            n as i32,
+            stride_a,
+            stride_b,
+            stride_d,
+            true,
+            false,
+            dtype,
+            stream,
         )
     }
 }
 
 fn max_abs_err(reference: &[f64], result: &[f64]) -> f64 {
-    reference.iter().zip(result).map(|(r, t)| (r - t).abs()).fold(0.0f64, f64::max)
+    reference
+        .iter()
+        .zip(result)
+        .map(|(r, t)| (r - t).abs())
+        .fold(0.0f64, f64::max)
 }
 
 fn rand_f32(len: usize) -> Vec<f32> {
     use rand::RngExt;
     let mut rng = rand::rng();
-    (0..len).map(|_| rng.random_range(-0.5f32..0.5f32)).collect()
+    (0..len)
+        .map(|_| rng.random_range(-0.5f32..0.5f32))
+        .collect()
 }
 
 // ============================================================================
@@ -152,14 +182,19 @@ fn rand_f32(len: usize) -> Vec<f32> {
 
 #[test]
 fn bf16_gemm_small() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     for (m, n, k) in [(1, 256, 256), (4, 64, 128), (16, 512, 1024)] {
         let a_f32 = rand_f32(m * k);
         let b_f32 = rand_f32(n * k);
         let ref64 = cpu_ref_f64(
             &a_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
             &b_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
-            m, n, k,
+            m,
+            n,
+            k,
         );
 
         let a_bf16: Vec<half::bf16> = a_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
@@ -176,7 +211,11 @@ fn bf16_gemm_small() {
         }
         gpu.sync();
 
-        let result: Vec<f64> = gpu.download(&out_gpu).iter().map(|x| x.to_f32() as f64).collect();
+        let result: Vec<f64> = gpu
+            .download(&out_gpu)
+            .iter()
+            .map(|x| x.to_f32() as f64)
+            .collect();
         let err = max_abs_err(&ref64, &result);
         // Match gpu_ops_bench: flat 1.0 threshold for BF16
         assert!(err < 1.0, "BF16 GEMM {m}x{n}x{k}: max_err={err:.6e}");
@@ -185,15 +224,25 @@ fn bf16_gemm_small() {
 
 #[test]
 fn bf16_gemm_model_shapes() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     // Qwen3-0.6B: hidden=1024, intermediate=3072, vocab=151936
-    for (m, n, k) in [(1, 1024, 1024), (32, 3072, 1024), (128, 1024, 3072), (1, 151936, 1024)] {
+    for (m, n, k) in [
+        (1, 1024, 1024),
+        (32, 3072, 1024),
+        (128, 1024, 3072),
+        (1, 151936, 1024),
+    ] {
         let a_f32 = rand_f32(m * k);
         let b_f32 = rand_f32(n * k);
         let ref64 = cpu_ref_f64(
             &a_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
             &b_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
-            m, n, k,
+            m,
+            n,
+            k,
         );
 
         let a_bf16: Vec<half::bf16> = a_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
@@ -210,7 +259,11 @@ fn bf16_gemm_model_shapes() {
         }
         gpu.sync();
 
-        let result: Vec<f64> = gpu.download(&out_gpu).iter().map(|x| x.to_f32() as f64).collect();
+        let result: Vec<f64> = gpu
+            .download(&out_gpu)
+            .iter()
+            .map(|x| x.to_f32() as f64)
+            .collect();
         let err = max_abs_err(&ref64, &result);
         assert!(err < 1.0, "BF16 GEMM {m}x{n}x{k}: max_err={err:.6e}");
     }
@@ -222,14 +275,19 @@ fn bf16_gemm_model_shapes() {
 
 #[test]
 fn fp16_gemm_small() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     for (m, n, k) in [(1, 256, 256), (4, 64, 128), (16, 512, 1024)] {
         let a_f32 = rand_f32(m * k);
         let b_f32 = rand_f32(n * k);
         let ref64 = cpu_ref_f64(
             &a_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
             &b_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
-            m, n, k,
+            m,
+            n,
+            k,
         );
 
         let a_fp16: Vec<half::f16> = a_f32.iter().map(|&x| half::f16::from_f32(x)).collect();
@@ -246,7 +304,11 @@ fn fp16_gemm_small() {
         }
         gpu.sync();
 
-        let result: Vec<f64> = gpu.download(&out_gpu).iter().map(|x| x.to_f32() as f64).collect();
+        let result: Vec<f64> = gpu
+            .download(&out_gpu)
+            .iter()
+            .map(|x| x.to_f32() as f64)
+            .collect();
         let err = max_abs_err(&ref64, &result);
         // FP16 has ~0.1% relative error, slightly better than BF16. Use same 1.0 threshold.
         assert!(err < 1.0, "FP16 GEMM {m}x{n}x{k}: max_err={err:.6e}");
@@ -255,14 +317,19 @@ fn fp16_gemm_small() {
 
 #[test]
 fn fp16_gemm_model_shapes() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     for (m, n, k) in [(1, 1024, 1024), (32, 3072, 1024), (128, 1024, 3072)] {
         let a_f32 = rand_f32(m * k);
         let b_f32 = rand_f32(n * k);
         let ref64 = cpu_ref_f64(
             &a_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
             &b_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
-            m, n, k,
+            m,
+            n,
+            k,
         );
 
         let a_fp16: Vec<half::f16> = a_f32.iter().map(|&x| half::f16::from_f32(x)).collect();
@@ -279,7 +346,11 @@ fn fp16_gemm_model_shapes() {
         }
         gpu.sync();
 
-        let result: Vec<f64> = gpu.download(&out_gpu).iter().map(|x| x.to_f32() as f64).collect();
+        let result: Vec<f64> = gpu
+            .download(&out_gpu)
+            .iter()
+            .map(|x| x.to_f32() as f64)
+            .collect();
         let err = max_abs_err(&ref64, &result);
         assert!(err < 1.0, "FP16 GEMM {m}x{n}x{k}: max_err={err:.6e}");
     }
@@ -291,17 +362,25 @@ fn fp16_gemm_model_shapes() {
 
 #[test]
 fn f32_gemm_small() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     // SM80 SIMT F32 path produces wrong results on Blackwell; CUTLASS 3.x
     // SM90 F32 only runs on compute major == 9. Skip on 10+.
-    if gpu.compute_major() >= 10 { eprintln!("f32_gemm_small: skip (SM10+, no F32 kernel)"); return; }
+    if gpu.compute_major() >= 10 {
+        eprintln!("f32_gemm_small: skip (SM10+, no F32 kernel)");
+        return;
+    }
     for (m, n, k) in [(4, 64, 128), (1, 256, 256), (16, 512, 1024)] {
         let a = rand_f32(m * k);
         let b = rand_f32(n * k);
         let ref64 = cpu_ref_f64(
             &a.iter().map(|&x| x as f64).collect::<Vec<_>>(),
             &b.iter().map(|&x| x as f64).collect::<Vec<_>>(),
-            m, n, k,
+            m,
+            n,
+            k,
         );
 
         let a_gpu = gpu.upload(&a);
@@ -320,14 +399,23 @@ fn f32_gemm_small() {
         let result: Vec<f64> = gpu.download(&out_gpu).iter().map(|&x| x as f64).collect();
         let err = max_abs_err(&ref64, &result);
         let tol = 0.05 * k as f64 * 0.5e-3;
-        assert!(err < tol, "F32 GEMM {m}x{n}x{k}: max_err={err:.6e}, tol={tol:.6e}");
+        assert!(
+            err < tol,
+            "F32 GEMM {m}x{n}x{k}: max_err={err:.6e}, tol={tol:.6e}"
+        );
     }
 }
 
 #[test]
 fn f32_gemm_model_shapes() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
-    if gpu.compute_major() >= 10 { eprintln!("f32_gemm_model_shapes: skip (SM10+, no F32 kernel)"); return; }
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
+    if gpu.compute_major() >= 10 {
+        eprintln!("f32_gemm_model_shapes: skip (SM10+, no F32 kernel)");
+        return;
+    }
     // Qwen3-0.6B: hidden=1024, intermediate=3072
     for (m, n, k) in [(1, 1024, 1024), (32, 3072, 1024), (128, 1024, 3072)] {
         let a = rand_f32(m * k);
@@ -335,7 +423,9 @@ fn f32_gemm_model_shapes() {
         let ref64 = cpu_ref_f64(
             &a.iter().map(|&x| x as f64).collect::<Vec<_>>(),
             &b.iter().map(|&x| x as f64).collect::<Vec<_>>(),
-            m, n, k,
+            m,
+            n,
+            k,
         );
 
         let a_gpu = gpu.upload(&a);
@@ -353,7 +443,10 @@ fn f32_gemm_model_shapes() {
         let result: Vec<f64> = gpu.download(&out_gpu).iter().map(|&x| x as f64).collect();
         let err = max_abs_err(&ref64, &result);
         let tol = 0.05 * k as f64 * 0.5e-3;
-        assert!(err < tol, "F32 GEMM {m}x{n}x{k}: max_err={err:.6e}, tol={tol:.6e}");
+        assert!(
+            err < tol,
+            "F32 GEMM {m}x{n}x{k}: max_err={err:.6e}, tol={tol:.6e}"
+        );
     }
 }
 
@@ -363,14 +456,19 @@ fn f32_gemm_model_shapes() {
 
 #[test]
 fn fp8_gemm_small() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     for (m, n, k) in [(4, 64, 128), (16, 128, 256), (32, 256, 512)] {
         let a_f32 = rand_f32(m * k);
         let b_f32 = rand_f32(n * k);
 
         // Quantize to FP8 — reference uses dequantized inputs for fair comparison
-        let a_fp8: Vec<float8::F8E4M3> = a_f32.iter().map(|&x| float8::F8E4M3::from_f32(x)).collect();
-        let b_fp8: Vec<float8::F8E4M3> = b_f32.iter().map(|&x| float8::F8E4M3::from_f32(x)).collect();
+        let a_fp8: Vec<float8::F8E4M3> =
+            a_f32.iter().map(|&x| float8::F8E4M3::from_f32(x)).collect();
+        let b_fp8: Vec<float8::F8E4M3> =
+            b_f32.iter().map(|&x| float8::F8E4M3::from_f32(x)).collect();
         let a_deq: Vec<f64> = a_fp8.iter().map(|x| x.to_f32() as f64).collect();
         let b_deq: Vec<f64> = b_fp8.iter().map(|x| x.to_f32() as f64).collect();
         let ref64 = cpu_ref_f64(&a_deq, &b_deq, m, n, k);
@@ -395,26 +493,35 @@ fn fp8_gemm_small() {
         gpu.sync();
 
         let out_bytes = gpu.download(&out_gpu);
-        let result: Vec<f64> = out_bytes.iter()
+        let result: Vec<f64> = out_bytes
+            .iter()
             .map(|&b| float8::F8E4M3::from_bits(b).to_f32() as f64)
             .collect();
         let err = max_abs_err(&ref64, &result);
         // FP8 E4M3: 3 mantissa bits → ~6% relative error per element.
         // Accumulation in F32 is exact; error comes from input/output quantization.
         let tol = 1.0;
-        assert!(err < tol, "FP8 GEMM {m}x{n}x{k}: max_err={err:.6e}, tol={tol:.6e}");
+        assert!(
+            err < tol,
+            "FP8 GEMM {m}x{n}x{k}: max_err={err:.6e}, tol={tol:.6e}"
+        );
     }
 }
 
 #[test]
 fn fp8_gemm_model_shapes() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     // Smaller K for FP8 to keep outputs in representable range
     for (m, n, k) in [(1, 512, 256), (16, 1024, 512), (32, 256, 1024)] {
         let a_f32 = rand_f32(m * k);
         let b_f32 = rand_f32(n * k);
-        let a_fp8: Vec<float8::F8E4M3> = a_f32.iter().map(|&x| float8::F8E4M3::from_f32(x)).collect();
-        let b_fp8: Vec<float8::F8E4M3> = b_f32.iter().map(|&x| float8::F8E4M3::from_f32(x)).collect();
+        let a_fp8: Vec<float8::F8E4M3> =
+            a_f32.iter().map(|&x| float8::F8E4M3::from_f32(x)).collect();
+        let b_fp8: Vec<float8::F8E4M3> =
+            b_f32.iter().map(|&x| float8::F8E4M3::from_f32(x)).collect();
         let a_deq: Vec<f64> = a_fp8.iter().map(|x| x.to_f32() as f64).collect();
         let b_deq: Vec<f64> = b_fp8.iter().map(|x| x.to_f32() as f64).collect();
         let ref64 = cpu_ref_f64(&a_deq, &b_deq, m, n, k);
@@ -437,8 +544,11 @@ fn fp8_gemm_model_shapes() {
         }
         gpu.sync();
 
-        let result: Vec<f64> = gpu.download(&out_gpu).iter()
-            .map(|&b| float8::F8E4M3::from_bits(b).to_f32() as f64).collect();
+        let result: Vec<f64> = gpu
+            .download(&out_gpu)
+            .iter()
+            .map(|&b| float8::F8E4M3::from_bits(b).to_f32() as f64)
+            .collect();
         let err = max_abs_err(&ref64, &result);
         assert!(err < 1.0, "FP8 GEMM {m}x{n}x{k}: max_err={err:.6e}");
     }
@@ -450,7 +560,10 @@ fn fp8_gemm_model_shapes() {
 
 #[test]
 fn batched_fp8_gemm() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     for (batch, m, n, k) in [(2, 8, 64, 128), (4, 4, 128, 256)] {
         let total_a = batch * m * k;
         let total_b = batch * n * k;
@@ -458,8 +571,10 @@ fn batched_fp8_gemm() {
 
         let a_f32 = rand_f32(total_a);
         let b_f32 = rand_f32(total_b);
-        let a_fp8: Vec<float8::F8E4M3> = a_f32.iter().map(|&x| float8::F8E4M3::from_f32(x)).collect();
-        let b_fp8: Vec<float8::F8E4M3> = b_f32.iter().map(|&x| float8::F8E4M3::from_f32(x)).collect();
+        let a_fp8: Vec<float8::F8E4M3> =
+            a_f32.iter().map(|&x| float8::F8E4M3::from_f32(x)).collect();
+        let b_fp8: Vec<float8::F8E4M3> =
+            b_f32.iter().map(|&x| float8::F8E4M3::from_f32(x)).collect();
         let a_deq: Vec<f64> = a_fp8.iter().map(|x| x.to_f32() as f64).collect();
         let b_deq: Vec<f64> = b_fp8.iter().map(|x| x.to_f32() as f64).collect();
         let ref64 = cpu_ref_f64_batched(&a_deq, &b_deq, m, n, k, batch);
@@ -478,7 +593,20 @@ fn batched_fp8_gemm() {
             let ap = ptr(&a_gpu, &gpu.stream);
             let bp = ptr(&b_gpu, &gpu.stream);
             let op = ptr_mut(&mut out_gpu, &gpu.stream);
-            call_gemm(bp, ap, op, m, n, k, batch, stride_a, stride_b, stride_d, 3, gpu.stream_ptr())
+            call_gemm(
+                bp,
+                ap,
+                op,
+                m,
+                n,
+                k,
+                batch,
+                stride_a,
+                stride_b,
+                stride_d,
+                3,
+                gpu.stream_ptr(),
+            )
         };
         if let Err(e) = res {
             eprintln!("Batched FP8 GEMM {batch}x{m}x{n}x{k} skipped: {e}");
@@ -486,10 +614,16 @@ fn batched_fp8_gemm() {
         }
         gpu.sync();
 
-        let result: Vec<f64> = gpu.download(&out_gpu).iter()
-            .map(|&b| float8::F8E4M3::from_bits(b).to_f32() as f64).collect();
+        let result: Vec<f64> = gpu
+            .download(&out_gpu)
+            .iter()
+            .map(|&b| float8::F8E4M3::from_bits(b).to_f32() as f64)
+            .collect();
         let err = max_abs_err(&ref64, &result);
-        assert!(err < 1.0, "Batched FP8 {batch}x{m}x{n}x{k}: max_err={err:.6e}");
+        assert!(
+            err < 1.0,
+            "Batched FP8 {batch}x{m}x{n}x{k}: max_err={err:.6e}"
+        );
     }
 }
 
@@ -499,7 +633,10 @@ fn batched_fp8_gemm() {
 
 #[test]
 fn batched_bf16_gemm() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     for (batch, m, n, k) in [(2, 16, 128, 256), (4, 8, 64, 128), (8, 1, 128, 512)] {
         let total_a = batch * m * k;
         let total_b = batch * n * k;
@@ -510,7 +647,10 @@ fn batched_bf16_gemm() {
         let ref64 = cpu_ref_f64_batched(
             &a_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
             &b_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
-            m, n, k, batch,
+            m,
+            n,
+            k,
+            batch,
         );
 
         let a_bf16: Vec<half::bf16> = a_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
@@ -527,7 +667,20 @@ fn batched_bf16_gemm() {
             let ap = ptr(&a_gpu, &gpu.stream);
             let bp = ptr(&b_gpu, &gpu.stream);
             let op = ptr_mut(&mut out_gpu, &gpu.stream);
-            call_gemm(bp, ap, op, m, n, k, batch, stride_a, stride_b, stride_d, 0, gpu.stream_ptr())
+            call_gemm(
+                bp,
+                ap,
+                op,
+                m,
+                n,
+                k,
+                batch,
+                stride_a,
+                stride_b,
+                stride_d,
+                0,
+                gpu.stream_ptr(),
+            )
         };
         if let Err(e) = res {
             eprintln!("Batched BF16 GEMM {batch}x{m}x{n}x{k} skipped: {e}");
@@ -540,7 +693,10 @@ fn batched_bf16_gemm() {
         let err = max_abs_err(&ref64, &result);
         // Match gpu_ops_bench: flat 1.0 threshold for BF16 (holds up to K=30720)
         let tol = 1.0;
-        assert!(err < tol, "Batched BF16 {batch}x{m}x{n}x{k}: max_err={err:.6e}, tol={tol:.6e}");
+        assert!(
+            err < tol,
+            "Batched BF16 {batch}x{m}x{n}x{k}: max_err={err:.6e}, tol={tol:.6e}"
+        );
     }
 }
 
@@ -550,7 +706,10 @@ fn batched_bf16_gemm() {
 
 #[test]
 fn batched_fp16_gemm() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     for (batch, m, n, k) in [(2, 16, 128, 256), (4, 8, 64, 128)] {
         let total_a = batch * m * k;
         let total_b = batch * n * k;
@@ -561,7 +720,10 @@ fn batched_fp16_gemm() {
         let ref64 = cpu_ref_f64_batched(
             &a_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
             &b_f32.iter().map(|&x| x as f64).collect::<Vec<_>>(),
-            m, n, k, batch,
+            m,
+            n,
+            k,
+            batch,
         );
 
         let a_fp16: Vec<half::f16> = a_f32.iter().map(|&x| half::f16::from_f32(x)).collect();
@@ -578,7 +740,20 @@ fn batched_fp16_gemm() {
             let ap = ptr(&a_gpu, &gpu.stream);
             let bp = ptr(&b_gpu, &gpu.stream);
             let op = ptr_mut(&mut out_gpu, &gpu.stream);
-            call_gemm(bp, ap, op, m, n, k, batch, stride_a, stride_b, stride_d, 1, gpu.stream_ptr())
+            call_gemm(
+                bp,
+                ap,
+                op,
+                m,
+                n,
+                k,
+                batch,
+                stride_a,
+                stride_b,
+                stride_d,
+                1,
+                gpu.stream_ptr(),
+            )
         };
         if let Err(e) = res {
             eprintln!("Batched FP16 GEMM {batch}x{m}x{n}x{k} skipped: {e}");
@@ -590,7 +765,10 @@ fn batched_fp16_gemm() {
         let result: Vec<f64> = out_fp16.iter().map(|x| x.to_f32() as f64).collect();
         let err = max_abs_err(&ref64, &result);
         let tol = 1.0;
-        assert!(err < tol, "Batched FP16 {batch}x{m}x{n}x{k}: max_err={err:.6e}, tol={tol:.6e}");
+        assert!(
+            err < tol,
+            "Batched FP16 {batch}x{m}x{n}x{k}: max_err={err:.6e}, tol={tol:.6e}"
+        );
     }
 }
 
@@ -600,7 +778,10 @@ fn batched_fp16_gemm() {
 
 #[test]
 fn batched_f32_gemm() {
-    let gpu = match Gpu::new() { Some(g) => g, None => return };
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
     for (batch, m, n, k) in [(2, 8, 64, 128), (4, 4, 128, 256)] {
         let total_a = batch * m * k;
         let total_b = batch * n * k;
@@ -611,7 +792,10 @@ fn batched_f32_gemm() {
         let ref64 = cpu_ref_f64_batched(
             &a.iter().map(|&x| x as f64).collect::<Vec<_>>(),
             &b.iter().map(|&x| x as f64).collect::<Vec<_>>(),
-            m, n, k, batch,
+            m,
+            n,
+            k,
+            batch,
         );
 
         let a_gpu = gpu.upload(&a);
@@ -626,7 +810,20 @@ fn batched_f32_gemm() {
             let ap = ptr(&a_gpu, &gpu.stream);
             let bp = ptr(&b_gpu, &gpu.stream);
             let op = ptr_mut(&mut out_gpu, &gpu.stream);
-            call_gemm(bp, ap, op, m, n, k, batch, stride_a, stride_b, stride_d, 2, gpu.stream_ptr())
+            call_gemm(
+                bp,
+                ap,
+                op,
+                m,
+                n,
+                k,
+                batch,
+                stride_a,
+                stride_b,
+                stride_d,
+                2,
+                gpu.stream_ptr(),
+            )
         };
         if let Err(e) = res {
             eprintln!("Batched F32 GEMM {batch}x{m}x{n}x{k} skipped: {e}");
@@ -637,6 +834,9 @@ fn batched_f32_gemm() {
         let result: Vec<f64> = gpu.download(&out_gpu).iter().map(|&x| x as f64).collect();
         let err = max_abs_err(&ref64, &result);
         let tol = 0.05 * k as f64 * 0.5e-3;
-        assert!(err < tol, "Batched F32 {batch}x{m}x{n}x{k}: max_err={err:.6e}, tol={tol:.6e}");
+        assert!(
+            err < tol,
+            "Batched F32 {batch}x{m}x{n}x{k}: max_err={err:.6e}, tol={tol:.6e}"
+        );
     }
 }
