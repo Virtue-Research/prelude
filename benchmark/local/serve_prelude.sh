@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 RUNTIME_DIR="${RUNTIME_DIR:-$ROOT_DIR/bench_results/runtime}"
 PID_FILE="$RUNTIME_DIR/prelude.pid"
@@ -14,6 +14,7 @@ PORT="${PORT:-8000}"
 GPU="${GPU:-0}"
 HOST="${HOST:-0.0.0.0}"
 START_TIMEOUT_S="${START_TIMEOUT_S:-120}"
+PRELUDE_EXTRA_ARGS="${PRELUDE_EXTRA_ARGS:-}"
 
 mkdir -p "$RUNTIME_DIR"
 
@@ -38,11 +39,22 @@ echo "  host:  $HOST"
 echo "  port:  $PORT"
 echo "  gpu:   $GPU"
 
-CUDA_VISIBLE_DEVICES="$GPU" "$BIN" \
-  --model "$MODEL" \
-  --host "$HOST" \
-  --port "$PORT" \
-  >"$LOG_FILE" 2>&1 &
+cmd=(
+  "$BIN"
+  --model "$MODEL"
+  --host "$HOST"
+  --port "$PORT"
+)
+
+if [[ -n "$PRELUDE_EXTRA_ARGS" ]]; then
+  # Intentionally split on shell words for flags like:
+  # "--max-num-batched-tokens 16384 --max-batch-wait-ms 2"
+  # shellcheck disable=SC2206
+  extra_args=( $PRELUDE_EXTRA_ARGS )
+  cmd+=("${extra_args[@]}")
+fi
+
+CUDA_VISIBLE_DEVICES="$GPU" nohup "${cmd[@]}" >"$LOG_FILE" 2>&1 &
 
 pid="$!"
 echo "$pid" > "$PID_FILE"
