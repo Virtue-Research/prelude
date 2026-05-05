@@ -63,6 +63,7 @@ impl Engine {
                 block_table_len = req.block_table.len(),
                 is_prefill_final = req.is_prefill_final,
                 is_prefill_partial = req.is_prefill_partial,
+                needs_kv_cache = req.needs_kv_cache,
                 first_token = req.tokens.first().copied().unwrap_or(0),
                 last_token = req.tokens.last().copied().unwrap_or(0),
                 prompt_logprobs = ?req.prompt_logprobs,
@@ -82,40 +83,49 @@ impl Engine {
             .map_err(tensor_err)?;
 
         // ── Block tables + slot mapping ───────────────────────────────
-        let max_blocks = requests
-            .iter()
-            .map(|r| r.block_table.len())
-            .max()
-            .unwrap_or(0);
-        let mut flat_bt: Vec<u32> = Vec::with_capacity(num_requests * max_blocks);
-        for req in requests {
-            flat_bt.extend_from_slice(&req.block_table);
-            for _ in req.block_table.len()..max_blocks {
-                flat_bt.push(0);
+        let use_paged_kv = requests.iter().any(|r| r.needs_kv_cache);
+        let block_tables_t = if use_paged_kv {
+            let max_blocks = requests
+                .iter()
+                .map(|r| r.block_table.len())
+                .max()
+                .unwrap_or(0);
+            let mut flat_bt: Vec<u32> = Vec::with_capacity(num_requests * max_blocks);
+            for req in requests {
+                flat_bt.extend_from_slice(&req.block_table);
+                for _ in req.block_table.len()..max_blocks {
+                    flat_bt.push(0);
+                }
             }
-        }
-        let block_tables_t = if max_blocks > 0 {
-            Tensor::from_vec(flat_bt, (num_requests, max_blocks), &self.executor.device)
-                .map_err(tensor_err)?
-                .to_dtype(DType::U32)
-                .map_err(tensor_err)?
+            if max_blocks > 0 {
+                Tensor::from_vec(flat_bt, (num_requests, max_blocks), &self.executor.device)
+                    .map_err(tensor_err)?
+                    .to_dtype(DType::U32)
+                    .map_err(tensor_err)?
+            } else {
+                Tensor::zeros((num_requests, 0), DType::U32, &self.executor.device)
+                    .map_err(tensor_err)?
+            }
         } else {
             Tensor::zeros((num_requests, 0), DType::U32, &self.executor.device)
                 .map_err(tensor_err)?
         };
 
-        let mut slots: Vec<i64> = Vec::with_capacity(total_tokens);
-        for req in requests {
-            for t in 0..req.tokens.len() {
-                slots.push(crate::cache::block_manager::BlockManager::slot(
-                    &req.block_table,
-                    req.position_start + t,
-                    pool.block_size,
-                ));
+        let slot_mapping_t = if use_paged_kv {
+            let mut slots: Vec<i64> = Vec::with_capacity(total_tokens);
+            for req in requests {
+                for t in 0..req.tokens.len() {
+                    slots.push(crate::cache::block_manager::BlockManager::slot(
+                        &req.block_table,
+                        req.position_start + t,
+                        pool.block_size,
+                    ));
+                }
             }
-        }
-        let slot_mapping_t =
-            Tensor::new(slots.as_slice(), &self.executor.device).map_err(tensor_err)?;
+            Tensor::new(slots.as_slice(), &self.executor.device).map_err(tensor_err)?
+        } else {
+            Tensor::zeros((0,), DType::I64, &self.executor.device).map_err(tensor_err)?
+        };
 
         // ── DeltaNet slots ────────────────────────────────────────────
         let deltanet_slots: Option<Vec<u32>> = if self.cache.deltanet_pool.is_some() {
@@ -147,13 +157,17 @@ impl Engine {
         let mut dn_pool_guard = self.cache.deltanet_pool.as_ref().map(|m| m.lock().unwrap());
         let dn_pool_ref = dn_pool_guard.as_deref_mut();
 
-        let paged_kv = PagedKvBatchContext {
-            key_caches: &pool.active_key_caches(),
-            value_caches: &pool.active_value_caches(),
-            slot_mapping: &slot_mapping_t,
-            block_tables: &block_tables_t,
-            cu_seqlens_k: &cu_seqlens_k_t,
-            max_seqlen_k,
+        let paged_kv = if use_paged_kv {
+            Some(PagedKvBatchContext {
+                key_caches: &pool.active_key_caches(),
+                value_caches: &pool.active_value_caches(),
+                slot_mapping: &slot_mapping_t,
+                block_tables: &block_tables_t,
+                cu_seqlens_k: &cu_seqlens_k_t,
+                max_seqlen_k,
+            })
+        } else {
+            None
         };
         let mut ctx = BatchAttnContext {
             ops: self.executor.ops,
@@ -161,7 +175,7 @@ impl Engine {
             max_seqlen_q,
             position_ids: &position_ids_t,
             seq_lens: &q_seq_lens,
-            paged_kv: Some(&paged_kv),
+            paged_kv: paged_kv.as_ref(),
             deltanet_pool: dn_pool_ref,
             deltanet_slots: deltanet_slots.as_deref(),
             deltanet_slots_gpu: deltanet_slots_gpu.as_ref(),

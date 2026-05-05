@@ -99,6 +99,8 @@ pub struct StepRequest {
     pub deltanet_slot: Option<u32>,
     /// Whether to compute per-token prompt logprobs (for PPL / echo).
     pub prompt_logprobs: Option<u32>,
+    /// Whether this request needs paged KV cache writes for later chunks/decode.
+    pub needs_kv_cache: bool,
 }
 
 pub enum ForwardBatch {
