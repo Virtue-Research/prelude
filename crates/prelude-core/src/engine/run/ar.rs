@@ -675,11 +675,12 @@ async fn wait_for_initial_prefill_batch(
     true
 }
 
-fn attach_prefix_cache_reuse(
-    engine: &Engine,
-    seq: &mut Sequence,
-    min_cached_len: Option<usize>,
-) -> Option<DeltaNetPrefixState> {
+struct PrefixAttach {
+    deltanet_state: Option<DeltaNetPrefixState>,
+    replaced_blocks: Vec<u32>,
+}
+
+fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) -> Option<PrefixAttach> {
     if engine.cache.prefix_cache.is_none() || seq.input_ids.len() <= 1 {
         return None;
     }
@@ -714,12 +715,6 @@ fn attach_prefix_cache_reuse(
     cached_len -= cached_len % pool.block_size;
     cached_blocks.truncate(cached_len / pool.block_size);
 
-    if let Some(min_cached_len) = min_cached_len
-        && cached_len < min_cached_len
-    {
-        return None;
-    }
-
     if cached_len == 0
         || cached_len <= seq.kv_computed_len
         || cached_len >= seq.input_ids.len()
@@ -734,7 +729,7 @@ fn attach_prefix_cache_reuse(
     }
 
     seq.kv_computed_len = cached_len;
-    seq.block_table = cached_blocks;
+    let replaced_blocks = std::mem::replace(&mut seq.block_table, cached_blocks);
     tracing::debug!(
         request_id = %seq.request_id,
         cached_len,
@@ -742,7 +737,10 @@ fn attach_prefix_cache_reuse(
         suffix_len = seq.input_ids.len() - cached_len,
         "attached AR prefix-cache reuse"
     );
-    deltanet_state
+    Some(PrefixAttach {
+        deltanet_state,
+        replaced_blocks,
+    })
 }
 
 fn prefix_cache_key(engine: &Engine, tokens: &[u32]) -> Option<u64> {
@@ -777,11 +775,20 @@ fn refresh_waiting_prefix_cache(engine: &Engine, scheduler: &mut Scheduler) {
     let mut refreshed = 0usize;
     let mut blocks_to_release: Vec<Vec<u32>> = Vec::new();
     scheduler.for_each_waiting_mut(|seq| {
-        if seq.kv_computed_len != 0 || !seq.block_table.is_empty() {
+        if seq.kv_computed_len > 0
+            && seq
+                .prefix_cache_target_len
+                .is_none_or(|target_len| seq.kv_computed_len >= target_len)
+        {
             return;
         }
-        let deltanet_state = attach_prefix_cache_reuse(engine, seq, seq.prefix_cache_target_len);
-        if let Some(state) = deltanet_state {
+        let Some(attach) = attach_prefix_cache_reuse(engine, seq) else {
+            return;
+        };
+        if !attach.replaced_blocks.is_empty() {
+            blocks_to_release.push(attach.replaced_blocks);
+        }
+        if let Some(state) = attach.deltanet_state {
             let restored_slot = if let Some(slot) = seq.deltanet_slot {
                 engine.cache.deltanet_pool.as_ref().and_then(|pool_mutex| {
                     pool_mutex

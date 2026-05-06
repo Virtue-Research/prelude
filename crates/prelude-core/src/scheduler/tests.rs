@@ -368,6 +368,70 @@ fn test_shared_prefix_planner_uses_running_leader() {
 }
 
 #[test]
+fn test_shared_prefix_planner_extends_partial_waiting_hit() {
+    let config = SchedulerConfig {
+        chunked_prefill: true,
+        block_size: 4,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    let a: Vec<u32> = (0..17).collect();
+    let mut b: Vec<u32> = (0..16).collect();
+    b.push(100);
+
+    let mut r1 = make_seq_with_tokens_and_prefix_key("r1", a, 1, 1);
+    let mut r2 = make_seq_with_tokens_and_prefix_key("r2", b, 1, 2);
+    r1.kv_computed_len = 8;
+    r2.kv_computed_len = 8;
+    r1.block_table = vec![10, 11];
+    r2.block_table = vec![10, 11];
+
+    sched.add_request(r1);
+    sched.add_request(r2);
+
+    assert_eq!(sched.plan_waiting_shared_prefixes(), 2);
+    assert_eq!(sched.waiting_queue[0].prefix_cache_target_len, Some(16));
+    assert_eq!(sched.waiting_queue[1].prefix_cache_target_len, Some(16));
+}
+
+#[test]
+fn test_partial_shared_prefix_target_admits_one_leader() {
+    let config = SchedulerConfig {
+        chunked_prefill: true,
+        max_running_requests: 4,
+        max_num_batched_tokens: 64,
+        max_total_tokens: 65536,
+        block_size: 4,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    let a: Vec<u32> = (0..17).collect();
+    let mut b: Vec<u32> = (0..16).collect();
+    b.push(100);
+
+    let mut r1 = make_seq_with_tokens_and_prefix_key("r1", a, 1, 1);
+    let mut r2 = make_seq_with_tokens_and_prefix_key("r2", b, 1, 2);
+    r1.kv_computed_len = 8;
+    r2.kv_computed_len = 8;
+    r1.block_table = vec![10, 11];
+    r2.block_table = vec![10, 11];
+    r1.deltanet_slot = Some(0);
+    r2.deltanet_slot = Some(1);
+
+    sched.add_request(r1);
+    sched.add_request(r2);
+    sched.plan_waiting_shared_prefixes();
+
+    let step = sched.schedule_step().unwrap();
+    assert_eq!(step.prefill_request_ids, vec!["r1"]);
+    assert_eq!(step.prefill_chunk_lens, vec![8]);
+    assert_eq!(sched.num_waiting(), 1);
+    assert_eq!(sched.waiting_queue[0].request_id, "r2");
+}
+
+#[test]
 fn test_late_waiting_shared_prefix_updates_running_leader_key() {
     let config = SchedulerConfig {
         chunked_prefill: true,

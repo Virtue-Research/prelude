@@ -38,13 +38,10 @@ impl Scheduler {
             }
 
             for (idx, seq) in self.waiting_queue.iter().enumerate() {
-                if seq.kv_computed_len == 0
-                    && seq.block_table.is_empty()
-                    && seq.prefix_cache_key.is_some()
-                {
+                if seq.prefix_cache_key.is_some() && seq.kv_computed_len < seq.input_ids.len() {
                     prompts.push(SharedPrefixPrompt {
                         tokens: &seq.input_ids,
-                        min_boundary_tokens: 0,
+                        min_boundary_tokens: seq.kv_computed_len,
                     });
                     slots.push(SharedPrefixPlanSlot::Waiting(idx));
                 }
@@ -318,8 +315,7 @@ impl Scheduler {
             // same prefix repeatedly. Let one uncached "leader" populate the
             // cache, then the deferred peers can be refreshed to suffix-only
             // work on the next scheduler iteration.
-            if seq.kv_computed_len == 0
-                && seq.block_table.is_empty()
+            if prefix_prefill_leader_needed(seq)
                 && let Some(key) = seq.prefix_cache_key
                 && scheduled_prefill_prefixes.contains(&key)
             {
@@ -378,8 +374,7 @@ impl Scheduler {
                 .waiting_queue
                 .pop_front()
                 .expect("queue checked non-empty");
-            if seq.kv_computed_len == 0
-                && seq.block_table.is_empty()
+            if prefix_prefill_leader_needed(&seq)
                 && let Some(key) = seq.prefix_cache_key
             {
                 scheduled_prefill_prefixes.insert(key);
@@ -433,6 +428,15 @@ fn shared_prefix_target_chunk(seq: &Sequence, block_size: usize) -> Option<usize
     }
 
     Some(target_len - seq.kv_computed_len)
+}
+
+fn shared_prefix_target_pending(seq: &Sequence) -> bool {
+    seq.prefix_cache_target_len
+        .is_some_and(|target_len| seq.kv_computed_len < target_len)
+}
+
+fn prefix_prefill_leader_needed(seq: &Sequence) -> bool {
+    shared_prefix_target_pending(seq) || (seq.kv_computed_len == 0 && seq.block_table.is_empty())
 }
 
 // ── Legacy admission helpers (used by non-chunked path) ──────────────
