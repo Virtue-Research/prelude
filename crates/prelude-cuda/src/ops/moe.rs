@@ -1,7 +1,7 @@
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::WrapErr;
 use cudarc::driver::{DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg};
-use prelude_core::tensor::{DType, DeviceExt, Result, Tensor, bail};
+use prelude_core::tensor::{bail, DType, DeviceExt, Result, Tensor};
 
 use crate::moe_ffi as ffi;
 use crate::{MOD_MOE_ROUTING, MOD_SHARED_EXPERT_GATE, PTX_MOE_ROUTING, PTX_SHARED_EXPERT_GATE};
@@ -896,15 +896,29 @@ pub fn cutlass_fused_moe_forward(
     if !input.device().is_cuda() {
         bail!("cutlass_fused_moe: input must be on CUDA");
     }
+    if input.dtype() != DType::BF16 {
+        bail!("cutlass_fused_moe: requires BF16 input");
+    }
     let device_id = input.device().ordinal() as i32;
     let runner = get_cutlass_moe_runner(device_id)
         .ok_or_else(|| candle_core::Error::Msg("CUTLASS fused MoE runner not available".into()))?;
 
     let (n_tokens, hidden) = input.dims2()?;
-    let device = input.device();
 
-    // Allocate output tensor
-    let output = Tensor::zeros((n_tokens, hidden), input.dtype(), device)?;
+    let output = {
+        let (storage, _) = input.storage_and_layout();
+        let cuda_storage = as_candle_cuda(&storage, "cutlass_fused_moe_output")?;
+        let dev = cuda_storage.device().clone();
+        drop(storage);
+        let output = unsafe { dev.alloc::<half::bf16>(n_tokens * hidden) }?;
+        let storage = candle_core::CudaStorage::wrap_cuda_slice(output, dev);
+        Tensor::from_storage(
+            candle_core::Storage::Cuda(storage),
+            (n_tokens, hidden),
+            candle_core::op::BackpropOp::none(),
+            false,
+        )
+    };
 
     // Ensure contiguous layout
     let input = input.contiguous()?;

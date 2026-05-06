@@ -22,6 +22,14 @@ use std::path::{Path, PathBuf};
 fn main() -> Result<()> {
     println!("cargo:rerun-if-env-changed=TVM_FFI_ROOT");
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("src/tvm_error_helper.cc").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("src/tvm_module_helper.cc").display()
+    );
 
     // `TVM_FFI_ROOT` overrides the source directory so this crate can be
     // built outside the prelude workspace. The fallback walks up three levels
