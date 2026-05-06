@@ -337,19 +337,23 @@ fn main() {
 
 fn test_gdn_sm100(reg: &KernelRegistry) {
     println!("=== GDN SM100 AOT FFI smoke ===");
-    let Some(kernel) = reg.get_utility("gdn_prefill_sm100_bf16_h16_hv16") else {
-        println!("gdn_prefill_sm100_bf16_h16_hv16 not compiled");
+    let seq_len = env_i64("PRELUDE_TEST_GDN_SEQ", 512);
+    let batch = env_i64("PRELUDE_TEST_GDN_BATCH", 1);
+    let hq = env_i64("PRELUDE_TEST_GDN_HQ", 16);
+    let hv = env_i64("PRELUDE_TEST_GDN_HV", 16);
+    let head_dim = env_i64("PRELUDE_TEST_GDN_D", 128);
+    let total_tokens = seq_len * batch;
+    let name = format!("gdn_prefill_sm100_bf16_h{hq}_hv{hv}");
+    let Some(kernel) = reg.get_utility(&name) else {
+        println!("{name} not compiled");
         return;
     };
 
     unsafe {
-        let total_tokens = 512i64;
-        let batch = 1i64;
-        let heads = 16i64;
-        let head_dim = 128i64;
-        let bytes_bf16 = (total_tokens * heads * head_dim * 2) as usize;
-        let bytes_gate = (total_tokens * heads * 4) as usize;
-        let bytes_state = (batch * heads * head_dim * head_dim * 4) as usize;
+        let bytes_qk_bf16 = (total_tokens * hq * head_dim * 2) as usize;
+        let bytes_vo_bf16 = (total_tokens * hv * head_dim * 2) as usize;
+        let bytes_gate = (total_tokens * hv.max(hq) * 4) as usize;
+        let bytes_state = (batch * hv.max(hq) * head_dim * head_dim * 4) as usize;
         let bytes_cu = ((batch + 1) * 4) as usize;
         let bytes_workspace = 148usize * 4 * 128;
 
@@ -364,27 +368,30 @@ fn test_gdn_sm100(reg: &KernelRegistry) {
         let mut cu: *mut c_void = std::ptr::null_mut();
         let mut workspace: *mut c_void = std::ptr::null_mut();
 
-        assert_eq!(cudaMalloc(&mut q, bytes_bf16), 0);
-        assert_eq!(cudaMalloc(&mut k, bytes_bf16), 0);
-        assert_eq!(cudaMalloc(&mut v, bytes_bf16), 0);
+        assert_eq!(cudaMalloc(&mut q, bytes_qk_bf16), 0);
+        assert_eq!(cudaMalloc(&mut k, bytes_qk_bf16), 0);
+        assert_eq!(cudaMalloc(&mut v, bytes_vo_bf16), 0);
         assert_eq!(cudaMalloc(&mut alpha, bytes_gate), 0);
         assert_eq!(cudaMalloc(&mut beta, bytes_gate), 0);
-        assert_eq!(cudaMalloc(&mut out, bytes_bf16), 0);
+        assert_eq!(cudaMalloc(&mut out, bytes_vo_bf16), 0);
         assert_eq!(cudaMalloc(&mut init, bytes_state), 0);
         assert_eq!(cudaMalloc(&mut state, bytes_state), 0);
         assert_eq!(cudaMalloc(&mut cu, bytes_cu), 0);
         assert_eq!(cudaMalloc(&mut workspace, bytes_workspace), 0);
 
-        cudaMemset(q, 0, bytes_bf16);
-        cudaMemset(k, 0, bytes_bf16);
-        cudaMemset(v, 0, bytes_bf16);
-        cudaMemset(out, 0, bytes_bf16);
+        cudaMemset(q, 0, bytes_qk_bf16);
+        cudaMemset(k, 0, bytes_qk_bf16);
+        cudaMemset(v, 0, bytes_vo_bf16);
+        cudaMemset(out, 0, bytes_vo_bf16);
         cudaMemset(init, 0, bytes_state);
         cudaMemset(state, 0, bytes_state);
         cudaMemset(workspace, 0, bytes_workspace);
 
-        let gate_host = vec![0.5f32; (total_tokens * heads) as usize];
-        let cu_host = [0i32, total_tokens as i32];
+        let gate_host = vec![0.5f32; (total_tokens * hv.max(hq)) as usize];
+        let mut cu_host = Vec::with_capacity((batch + 1) as usize);
+        for i in 0..=batch {
+            cu_host.push((i * seq_len) as i32);
+        }
         cudaMemcpy(
             alpha,
             gate_host.as_ptr() as *const c_void,
@@ -404,11 +411,15 @@ fn test_gdn_sm100(reg: &KernelRegistry) {
             CUDA_MEMCPY_H2D,
         );
 
-        let q_s = [total_tokens, heads, head_dim];
+        let q_s = [total_tokens, hq, head_dim];
         let q_st = contiguous_strides(&q_s);
-        let gate_s = [total_tokens, heads];
+        let k_s = [total_tokens, hq, head_dim];
+        let k_st = contiguous_strides(&k_s);
+        let vo_s = [total_tokens, hv, head_dim];
+        let vo_st = contiguous_strides(&vo_s);
+        let gate_s = [total_tokens, hv.max(hq)];
         let gate_st = contiguous_strides(&gate_s);
-        let state_s = [batch, heads, head_dim, head_dim];
+        let state_s = [batch, hv.max(hq), head_dim, head_dim];
         let state_st = contiguous_strides(&state_s);
         let cu_s = [batch + 1];
         let cu_st = [1i64];
@@ -416,11 +427,11 @@ fn test_gdn_sm100(reg: &KernelRegistry) {
         let ws_st = [1i64];
 
         let dl_q = gpu_dl(q, BF16_DT, &q_s, &q_st);
-        let dl_k = gpu_dl(k, BF16_DT, &q_s, &q_st);
-        let dl_v = gpu_dl(v, BF16_DT, &q_s, &q_st);
+        let dl_k = gpu_dl(k, BF16_DT, &k_s, &k_st);
+        let dl_v = gpu_dl(v, BF16_DT, &vo_s, &vo_st);
         let dl_alpha = gpu_dl(alpha, F32_DT, &gate_s, &gate_st);
         let dl_beta = gpu_dl(beta, F32_DT, &gate_s, &gate_st);
-        let dl_out = gpu_dl(out, BF16_DT, &q_s, &q_st);
+        let dl_out = gpu_dl(out, BF16_DT, &vo_s, &vo_st);
         let dl_cu = gpu_dl(cu, I32_DT, &cu_s, &cu_st);
         let dl_init = gpu_dl(init, F32_DT, &state_s, &state_st);
         let dl_state = gpu_dl(state, F32_DT, &state_s, &state_st);
@@ -445,7 +456,7 @@ fn test_gdn_sm100(reg: &KernelRegistry) {
             TVMFFIAny::opaque_ptr(std::ptr::null_mut()),
         ];
 
-        println!("calling gdn_prefill_sm100_bf16_h16_hv16...");
+        println!("calling {name}: batch={batch} seq_len={seq_len} total_tokens={total_tokens}");
         match reg.call(kernel, &args) {
             Ok(_) => {
                 let rc = cudaDeviceSynchronize();
@@ -465,4 +476,11 @@ fn test_gdn_sm100(reg: &KernelRegistry) {
         cudaFree(cu);
         cudaFree(workspace);
     }
+}
+
+fn env_i64(name: &str, default: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }

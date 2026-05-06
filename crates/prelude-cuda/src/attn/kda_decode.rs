@@ -76,7 +76,7 @@ fn gpu_dl(
 
 /// Small-batch kernels process up to this many requests. Above that the
 /// large-batch kernel is a better fit (matches cuLA's own split point).
-const SMALL_BATCH_THRESHOLD: usize = 32;
+const SMALL_BATCH_THRESHOLD: usize = 1024;
 
 /// Build the DSL kernel key that matches the symbols we AOT-compiled in
 /// `compile_kernels.py::compile_kda_decode`. We only register `varlen`
@@ -86,16 +86,46 @@ fn kernel_name(variant: &str, h: usize, hv: usize, v: usize, arch: u32) -> Strin
     format!("cula_kda_decode_{variant}_h{h}_hv{hv}_v{v}_l2norm_sm{arch}")
 }
 
-/// True iff the current CUDA device has an AOT-compiled `kda_decode`
-/// kernel variant. Mirrors the arch gate in `try_decode` but is cheap
-/// enough for hot-path callers to query before they start mutating
-/// the DeltaNet pool's conv_state — running conv1d into the pool and
-/// then discovering kda is unavailable would advance conv_state twice
-/// (once in the fused fast path, once in the sequential fallback) and
-/// produce repeated tokens at decode.
-pub(crate) fn supported_on_current_arch() -> bool {
-    let arch = registry().arch();
-    arch == 90 || (100..110).contains(&arch)
+fn varlen_variant_name(
+    n: usize,
+    h: usize,
+    hv: usize,
+    key_dim: usize,
+    val_dim: usize,
+    arch: u32,
+) -> Option<String> {
+    if n == 0 || key_dim != 128 {
+        return None;
+    }
+    if arch != 90 && !(100..110).contains(&arch) {
+        return None;
+    }
+
+    let variant = if n < SMALL_BATCH_THRESHOLD {
+        "small_varlen"
+    } else {
+        "large_varlen"
+    };
+    Some(kernel_name(variant, h, hv, val_dim, arch))
+}
+
+/// True iff the current CUDA device has the exact AOT-compiled varlen
+/// `kda_decode` kernel variant this batch will use. This must be a registry
+/// lookup, not just an architecture check: the cuLA DSL build is optional, and
+/// entering the fused decode path without the KDA kernel mutates conv_state
+/// before falling back.
+pub(crate) fn variant_available(
+    n: usize,
+    h: usize,
+    hv: usize,
+    key_dim: usize,
+    val_dim: usize,
+) -> bool {
+    let reg = registry();
+    let Some(name) = varlen_variant_name(n, h, hv, key_dim, val_dim, reg.arch()) else {
+        return false;
+    };
+    reg.get("kda_decode", &name).is_some()
 }
 
 /// Try to run the fused cuLA `kda_decode` kernel over a decode batch.
@@ -171,14 +201,11 @@ pub(crate) fn try_decode(
     // AOT-compiled. The caller is responsible for only routing supported
     // combos through here (see `deltanet_decode_batched_fused`).
 
-    // Look up the variant that matches this (HV, V, arch). `small_varlen`
+    // Look up the variant that matches this (H, HV, V, arch). `small_varlen`
     // uses a tighter SMEM tile and is faster for N < 32.
-    let variant = if n < SMALL_BATCH_THRESHOLD {
-        "small_varlen"
-    } else {
-        "large_varlen"
+    let Some(name) = varlen_variant_name(n, h, hv, key_dim, val_dim, arch) else {
+        return Ok(None);
     };
-    let name = kernel_name(variant, h, hv, val_dim, arch);
     let Some(kernel) = reg.get("kda_decode", &name) else {
         return Ok(None);
     };
@@ -222,7 +249,7 @@ pub(crate) fn try_decode(
     //  v:           [N, HV, V]   ->  [1, N, HV, V]
     //  a:           [N, HV]      ->  [N, HV, K]    (broadcast across K)
     //  b:           [N, HV]      ->  [N, HV]       (no change)
-    //  dt_bias:     [HV]         ->  [HV, K] F32   (cast + broadcast across K)
+    //  dt_bias:     [HV] or [HV,K] -> [HV, K] F32  (cast + broadcast if needed)
     //  slot_ids:    [N] U32      ->  [N] I32       (cast if needed)
     //  output:      [1, N, HV, V] BF16             (allocated here)
 
@@ -239,12 +266,22 @@ pub(crate) fn try_decode(
         .contiguous()?; // [N, HV, K] BF16
     let b2 = b_raw.contiguous()?; // [N, HV] BF16
 
-    let dt_bias2 = dt_bias_raw
-        .to_dtype(DType::F32)?
-        .reshape((hv,))?
-        .unsqueeze(D::Minus1)?
-        .broadcast_as((hv, key_dim))?
-        .contiguous()?; // [HV, K] F32
+    let dt_bias2 = match dt_bias_raw.dims() {
+        [heads] if *heads == hv => dt_bias_raw
+            .to_dtype(DType::F32)?
+            .reshape((hv,))?
+            .unsqueeze(D::Minus1)?
+            .broadcast_as((hv, key_dim))?
+            .contiguous()?,
+        [heads, dim] if *heads == hv && *dim == key_dim => {
+            if dt_bias_raw.dtype() == DType::F32 {
+                dt_bias_raw.contiguous()?
+            } else {
+                dt_bias_raw.to_dtype(DType::F32)?.contiguous()?
+            }
+        }
+        shape => bail!("kda_decode: dt_bias shape {shape:?} must be [{hv}] or [{hv}, {key_dim}]"),
+    }; // [HV, K] F32
     let a_log1 = a_log.reshape((hv,))?.contiguous()?; // [HV] F32
 
     let slot_ids_i32 = if slot_ids_gpu.dtype() == DType::I64 {

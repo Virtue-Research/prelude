@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 
+use crate::cache::deltanet_pool::DeltaNetPrefixState;
 use crate::cache::prefix_index::PrefixMatchIndex;
 use crate::tensor::{Result, Tensor};
 
@@ -39,6 +40,8 @@ pub struct PrefixKvCache {
     num_layers: usize,
     /// Per-layer KV tensors for each cached block, keyed by block hash.
     kv_store: HashMap<u64, Vec<(Tensor, Tensor)>>,
+    /// Optional hybrid-model state at selected block boundaries.
+    deltanet_state_store: HashMap<u64, DeltaNetPrefixState>,
     /// Cache of pre-assembled KV tensors, keyed by the last block hash.
     assembled_cache: HashMap<u64, AssembledKvCache>,
 }
@@ -50,6 +53,7 @@ impl PrefixKvCache {
             concat_dim,
             num_layers,
             kv_store: HashMap::new(),
+            deltanet_state_store: HashMap::new(),
             assembled_cache: HashMap::new(),
         }
     }
@@ -108,6 +112,34 @@ impl PrefixKvCache {
         Ok((m.cached_len, paged_blocks))
     }
 
+    /// Match prefix for hybrid models and require a DeltaNet state snapshot at
+    /// the returned boundary.
+    pub fn match_paged_blocks_with_deltanet_state(
+        &mut self,
+        tokens: &[u32],
+    ) -> Result<(usize, Vec<u32>, Option<DeltaNetPrefixState>)> {
+        let m = self.index.match_prefix(tokens);
+        if m.matched_hashes.is_empty() {
+            return Ok((0, vec![], None));
+        }
+
+        for end in (1..=m.matched_hashes.len()).rev() {
+            let hashes = &m.matched_hashes[..end];
+            let Some(state) = self.deltanet_state_store.get(hashes.last().unwrap()) else {
+                continue;
+            };
+            if !self.index.all_have_paged(hashes) {
+                continue;
+            }
+
+            let cached_len = end * self.index.block_size();
+            let paged_blocks = self.index.collect_paged_blocks(hashes);
+            return Ok((cached_len, paged_blocks, Some(state.clone())));
+        }
+
+        Ok((0, vec![], None))
+    }
+
     // -----------------------------------------------------------------------
     // Insert
     // -----------------------------------------------------------------------
@@ -142,6 +174,33 @@ impl PrefixKvCache {
         paged_block_size: usize,
         full_block_table: &[u32],
     ) -> Vec<u32> {
+        self.insert_paged_blocks_only_inner(tokens, paged_block_size, full_block_table, None)
+    }
+
+    /// Insert paged block IDs and attach a DeltaNet state snapshot to the
+    /// block-aligned prefix boundary represented by `tokens`.
+    pub fn insert_paged_blocks_with_deltanet_state(
+        &mut self,
+        tokens: &[u32],
+        paged_block_size: usize,
+        full_block_table: &[u32],
+        deltanet_state: DeltaNetPrefixState,
+    ) -> Vec<u32> {
+        self.insert_paged_blocks_only_inner(
+            tokens,
+            paged_block_size,
+            full_block_table,
+            Some(deltanet_state),
+        )
+    }
+
+    fn insert_paged_blocks_only_inner(
+        &mut self,
+        tokens: &[u32],
+        paged_block_size: usize,
+        full_block_table: &[u32],
+        deltanet_state: Option<DeltaNetPrefixState>,
+    ) -> Vec<u32> {
         if !self.index.enabled() {
             return Vec::new();
         }
@@ -154,14 +213,34 @@ impl PrefixKvCache {
         );
         let plan = self.index.insert_blocks(tokens, Some(&paged_map));
 
+        if let Some(state) = deltanet_state
+            && tokens.len() >= self.index.block_size()
+            && tokens.len() % self.index.block_size() == 0
+        {
+            let hash = Self::last_full_block_hash(tokens, self.index.block_size());
+            self.deltanet_state_store.insert(hash, state);
+        }
+
         // No KV tensor storage needed — KV lives in the paged pool.
         // Clean up any evicted entries.
         for hash in self.index.take_evicted_hashes() {
             self.kv_store.remove(&hash);
+            self.deltanet_state_store.remove(&hash);
             self.assembled_cache.remove(&hash);
         }
 
         plan.stored_paged_blocks
+    }
+
+    fn last_full_block_hash(tokens: &[u32], block_size: usize) -> u64 {
+        let mut parent_hash = 0u64;
+        for block_tokens in tokens.chunks(block_size) {
+            if block_tokens.len() < block_size {
+                break;
+            }
+            parent_hash = PrefixMatchIndex::hash_block(parent_hash, block_tokens);
+        }
+        parent_hash
     }
 
     fn insert_blocks_inner(
@@ -196,6 +275,7 @@ impl PrefixKvCache {
         // Clean up KV data for evicted entries
         for hash in self.index.take_evicted_hashes() {
             self.kv_store.remove(&hash);
+            self.deltanet_state_store.remove(&hash);
             self.assembled_cache.remove(&hash);
         }
 

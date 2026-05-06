@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
+use crate::cache::deltanet_pool::DeltaNetPrefixState;
 use crate::engine::executor::{Executor, ForwardBatch, ModelOutput};
 use crate::engine::{
     DecodeMetrics, Engine, EngineError, PreparedGenerateRequest, TokenLogprobInfo, Usage,
@@ -430,53 +431,66 @@ fn admit_prepared_request(
         prepared.request.stop.token_ids.clone(),
         None,
     );
+    let mut matched_deltanet_state = None;
     if let Some(engine) = engine {
         seq.prefix_cache_key = prefix_cache_key(engine, &seq.input_ids);
-        attach_prefix_cache_reuse(engine, &mut seq);
+        matched_deltanet_state = attach_prefix_cache_reuse(engine, &mut seq);
     }
-    // Allocate a DeltaNet pool slot for hybrid models before queueing.
-    // `allocate` zeros the slot so a fresh request always starts from
-    // clean recurrent + conv state; `release_resources` frees it when
-    // the sequence finishes.
+    // Allocate a DeltaNet pool slot only when state has to survive across
+    // scheduler steps: multi-token decode, prefix reuse, or chunked prefill.
+    // One-shot final prefill can run from zero state without touching the
+    // pool, avoiding per-layer slot zeroing that would never be consumed.
     //
-    // Fail the request if the pool is exhausted: `build_step_batch`
+    // When a slot is required, fail the request if the pool is exhausted:
+    // `build_step_batch`
     // only forwards `deltanet_slots` when *every* sequence in the
     // batch has one, so a single slotless admission flips the whole
     // batch onto the non-pooled linear-attention path that clears
     // recurrent state every step — silently corrupting all
     // co-batched DeltaNet requests, not just the slotless one.
-    if let Some(pool_mutex) = deltanet_pool {
-        let allocated = pool_mutex.lock().ok().and_then(|mut pool| pool.allocate());
-        match allocated {
-            Some(slot) => {
-                seq.deltanet_slot = Some(slot);
+    let needs_deltanet_slot = matched_deltanet_state.is_some()
+        || deltanet_slot_needed(&prepared, &seq, scheduler.config());
+    if needs_deltanet_slot && let Some(pool_mutex) = deltanet_pool {
+        let allocated = pool_mutex.lock().ok().and_then(|mut pool| {
+            let slot = pool.allocate()?;
+            if let Some(ref state) = matched_deltanet_state
+                && let Err(error) = pool.restore_slot(slot, state)
+            {
+                tracing::warn!(request_id = %request_id, slot, error = %error, "DeltaNet prefix state restore failed");
+                pool.free(slot);
+                return None;
             }
-            None => {
-                let max_new_tokens = prepared.max_new;
-                let mut state = ArSequenceState {
-                    request_id: prepared.request.request_id.clone(),
-                    prepared: Some(prepared),
-                    response,
-                    gen_start: Instant::now(),
-                    prefill_ms: 0.0,
-                    started_sent: false,
-                    sent_text_len: 0,
-                    pending_token: None,
-                    output_tokens: Vec::new(),
-                    token_logprobs: Vec::new(),
-                    prompt_token_logprobs: None,
-                    max_new_tokens,
-                };
-                state.ensure_started();
-                fail_state(
-                    state,
-                    EngineError::Unavailable(
-                        "DeltaNet pool exhausted — increase `deltanet_pool_slots` or retry".into(),
-                    ),
-                );
-                return;
-            }
+            Some(slot)
+        });
+        if let Some(slot) = allocated {
+            seq.deltanet_slot = Some(slot);
+        } else {
+            let max_new_tokens = prepared.max_new;
+            let mut state = ArSequenceState {
+                request_id: prepared.request.request_id.clone(),
+                prepared: Some(prepared),
+                response,
+                gen_start: Instant::now(),
+                prefill_ms: 0.0,
+                started_sent: false,
+                sent_text_len: 0,
+                pending_token: None,
+                output_tokens: Vec::new(),
+                token_logprobs: Vec::new(),
+                prompt_token_logprobs: None,
+                max_new_tokens,
+            };
+            state.ensure_started();
+            fail_state(
+                state,
+                EngineError::Unavailable(
+                    "DeltaNet pool exhausted — increase `deltanet_pool_slots` or retry".into(),
+                ),
+            );
+            return;
         }
+    } else if deltanet_pool.is_some() {
+        seq.prefill_must_be_atomic = true;
     }
     scheduler.add_request(seq);
     let max_new_tokens = prepared.max_new;
@@ -497,6 +511,22 @@ fn admit_prepared_request(
             max_new_tokens,
         },
     );
+}
+
+fn deltanet_slot_needed(
+    prepared: &PreparedGenerateRequest,
+    seq: &Sequence,
+    config: &SchedulerConfig,
+) -> bool {
+    let prefill_cap = if config.long_prefill_token_threshold > 0 {
+        config.long_prefill_token_threshold
+    } else {
+        config.max_num_batched_tokens
+    };
+    prepared.max_new > 1
+        || seq.kv_computed_len > 0
+        || seq.prefix_cache_key.is_some()
+        || prepared.prompt_tokens.len() > prefill_cap
 }
 
 fn drain_ready_messages(
@@ -655,31 +685,32 @@ async fn wait_for_initial_prefill_batch(
     true
 }
 
-fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) {
+fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) -> Option<DeltaNetPrefixState> {
     if engine.cache.prefix_cache.is_none() || seq.input_ids.len() <= 1 {
-        return;
+        return None;
     }
     let Some(pool) = engine.cache.paged_pool.as_ref() else {
-        return;
+        return None;
     };
 
-    let block_ok = if engine.executor.config.head_dim == 256 {
-        pool.block_size % 64 == 0
-    } else {
-        pool.block_size % 128 == 0
-    };
-    if !block_ok {
-        return;
-    }
-
-    let (mut cached_len, mut cached_blocks) = match engine
+    let (mut cached_len, mut cached_blocks, deltanet_state) = match if engine
         .cache
-        .try_prefix_cache_match_paged_only(&seq.input_ids)
+        .deltanet_pool
+        .is_some()
     {
+        engine
+            .cache
+            .try_prefix_cache_match_paged_with_deltanet_state(&seq.input_ids)
+    } else {
+        engine
+            .cache
+            .try_prefix_cache_match_paged_only(&seq.input_ids)
+            .map(|(len, blocks)| (len, blocks, None))
+    } {
         Ok(hit) => hit,
         Err(error) => {
             tracing::warn!(request_id = %seq.request_id, error = %error, "prefix cache match failed");
-            return;
+            return None;
         }
     };
 
@@ -689,13 +720,17 @@ fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) {
     cached_len -= cached_len % pool.block_size;
     cached_blocks.truncate(cached_len / pool.block_size);
 
-    if cached_len == 0 || cached_len >= seq.input_ids.len() || cached_blocks.is_empty() {
-        return;
+    if cached_len == 0
+        || cached_len <= seq.kv_computed_len
+        || cached_len >= seq.input_ids.len()
+        || cached_blocks.is_empty()
+    {
+        return None;
     }
 
     if let Err(error) = engine.cache.retain_paged_blocks(&cached_blocks) {
         tracing::warn!(request_id = %seq.request_id, error = %error, "prefix cache block retain failed");
-        return;
+        return None;
     }
 
     seq.kv_computed_len = cached_len;
@@ -707,6 +742,7 @@ fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) {
         suffix_len = seq.input_ids.len() - cached_len,
         "attached AR prefix-cache reuse"
     );
+    deltanet_state
 }
 
 fn prefix_cache_key(engine: &Engine, tokens: &[u32]) -> Option<u64> {
@@ -734,15 +770,54 @@ fn refresh_waiting_prefix_cache(engine: &Engine, scheduler: &mut Scheduler) {
     }
 
     let mut refreshed = 0usize;
+    let mut blocks_to_release: Vec<Vec<u32>> = Vec::new();
     scheduler.for_each_waiting_mut(|seq| {
         if seq.kv_computed_len != 0 || !seq.block_table.is_empty() {
             return;
         }
-        attach_prefix_cache_reuse(engine, seq);
+        let deltanet_state = attach_prefix_cache_reuse(engine, seq);
+        if let Some(state) = deltanet_state {
+            let restored_slot = if let Some(slot) = seq.deltanet_slot {
+                engine.cache.deltanet_pool.as_ref().and_then(|pool_mutex| {
+                    pool_mutex
+                        .lock()
+                        .ok()
+                        .and_then(|pool| match pool.restore_slot(slot, &state) {
+                            Ok(()) => Some(slot),
+                            Err(error) => {
+                                tracing::warn!(request_id = %seq.request_id, slot, error = %error, "DeltaNet prefix state restore failed");
+                                None
+                            }
+                        })
+                })
+            } else {
+                engine.cache.deltanet_pool.as_ref().and_then(|pool_mutex| {
+                    pool_mutex.lock().ok().and_then(|mut pool| {
+                        let slot = pool.allocate()?;
+                        if let Err(error) = pool.restore_slot(slot, &state) {
+                            tracing::warn!(request_id = %seq.request_id, slot, error = %error, "DeltaNet prefix state restore failed");
+                            pool.free(slot);
+                            return None;
+                        }
+                        Some(slot)
+                    })
+                })
+            };
+            if let Some(slot) = restored_slot {
+                seq.deltanet_slot = Some(slot);
+            } else {
+                seq.kv_computed_len = 0;
+                blocks_to_release.push(std::mem::take(&mut seq.block_table));
+                return;
+            }
+        }
         if seq.kv_computed_len > 0 {
             refreshed += 1;
         }
     });
+    for blocks in blocks_to_release {
+        scheduler.free_blocks(&blocks);
+    }
 
     if refreshed > 0 {
         tracing::debug!(refreshed, "refreshed waiting prefix-cache reuse");
@@ -1136,32 +1211,60 @@ fn process_step_output(
             prefill_result_idx += 1;
         }
 
-        // Populate prefix cache on the final chunk of a prefill, so future
-        // requests sharing the same prompt prefix can skip the full prefill.
-        //
-        // This was previously a dead write: the `prefill.rs` non-paged path
-        // populated the cache, but the paged hot path (`paged_mixed` +
-        // `batch_prefill_paged`) never did. Every request was a cache miss.
-        //
-        // We do it here in the AR loop because this is where we have both:
-        //   (a) the full prompt tokens (from `seq.input_ids`), and
-        //   (b) the finished block table (from `result.block_table`).
-        // Inside `batch_mixed_paged` only the per-step chunk is visible.
-        //
-        // The prefix cache takes its own ref count on the blocks, so they
-        // survive the post-decode free.
-        if is_final && engine.cache.prefix_cache.is_some() {
+        // Populate prefix cache once a prefill reaches a reusable boundary.
+        // Non-hybrid models only need KV blocks and can use the completed
+        // prompt. Hybrid DeltaNet models additionally need a state snapshot
+        // at the exact block-aligned boundary being cached.
+        if engine.cache.prefix_cache.is_some() {
             if let (Some(seq), Some(pool), Some(result)) = (
                 scheduler.get_sequence(request_id),
                 engine.cache.paged_pool.as_ref(),
                 prefill_result,
             ) {
                 if !result.block_table.is_empty() && !seq.input_ids.is_empty() {
-                    if let Err(e) = engine.cache.try_prefix_cache_insert_paged_only(
-                        &seq.input_ids,
-                        &result.block_table,
-                        pool.block_size,
-                    ) {
+                    if let Some(dn_pool_mutex) = engine.cache.deltanet_pool.as_ref() {
+                        if computed > 0
+                            && computed <= seq.input_ids.len()
+                            && computed % pool.block_size == 0
+                            && let Some(slot) = seq.deltanet_slot
+                        {
+                            match dn_pool_mutex
+                                .lock()
+                                .map_err(|e| {
+                                    EngineError::Internal(format!("deltanet pool lock: {e}"))
+                                })
+                                .and_then(|pool| {
+                                    pool.snapshot_slot(slot).map_err(|e| {
+                                        EngineError::Internal(format!(
+                                            "DeltaNet prefix state snapshot failed: {e}"
+                                        ))
+                                    })
+                                }) {
+                                Ok(deltanet_state) => {
+                                    if let Err(e) = engine
+                                        .cache
+                                        .try_prefix_cache_insert_paged_with_deltanet_state(
+                                            &seq.input_ids[..computed],
+                                            &result.block_table,
+                                            pool.block_size,
+                                            deltanet_state,
+                                        )
+                                    {
+                                        tracing::warn!("hybrid prefix cache insert failed: {e}");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "hybrid prefix state snapshot failed");
+                                }
+                            }
+                        }
+                    } else if is_final
+                        && let Err(e) = engine.cache.try_prefix_cache_insert_paged_only(
+                            &seq.input_ids,
+                            &result.block_table,
+                            pool.block_size,
+                        )
+                    {
                         tracing::warn!("prefix cache insert (ar_loop) failed: {e}");
                     }
                 }
@@ -1595,8 +1698,6 @@ fn seq_finish_reason(reason: &FinishReason) -> SeqFinishReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::executor::ExecutionHandle;
-    use crate::tensor::Device;
 
     fn make_prepared(request_id: &str, max_new: usize) -> PreparedGenerateRequest {
         use crate::engine::sampling::{LogitsProcessor, Sampling};
@@ -1742,23 +1843,6 @@ mod tests {
 
     // ── build_forward_batch tests ─────────────────────────────────
 
-    fn make_prefill_state(id: &str, max_new: usize) -> ArSequenceState {
-        ArSequenceState {
-            request_id: id.to_string(),
-            prepared: Some(make_prepared(id, max_new)),
-            response: ResponseChannel::Complete(tokio::sync::oneshot::channel().0),
-            gen_start: Instant::now(),
-            prefill_ms: 0.0,
-            started_sent: false,
-            sent_text_len: 0,
-            pending_token: None,
-            output_tokens: vec![],
-            token_logprobs: vec![],
-            prompt_token_logprobs: None,
-            max_new_tokens: max_new,
-        }
-    }
-
     fn make_decode_state(id: &str, pending_token: u32, _position: usize) -> ArSequenceState {
         let max_new = 10;
         ArSequenceState {
@@ -1810,6 +1894,55 @@ mod tests {
         // Chunked prompt work needs KV even if it will finish with one token.
         assert!(prefill_request_needs_kv(&make_seq("partial", 0, 2), 2));
         assert!(prefill_request_needs_kv(&make_seq("final_chunk", 0, 3), 1));
+    }
+
+    #[test]
+    fn deltanet_slot_needed_only_for_cross_step_state() {
+        let config = SchedulerConfig {
+            max_num_batched_tokens: 8,
+            ..SchedulerConfig::default()
+        };
+        let mut prepared = make_prepared("oneshot", 1);
+        prepared.prompt_tokens = vec![1, 2, 3];
+        let seq = Sequence::new(
+            "oneshot".to_string(),
+            prepared.prompt_tokens.clone(),
+            SamplingParams::default(),
+            0,
+            vec![],
+            vec![],
+            None,
+        );
+        assert!(!deltanet_slot_needed(&prepared, &seq, &config));
+
+        let decode_prepared = make_prepared("decode", 4);
+        let decode_seq = Sequence::new(
+            "decode".to_string(),
+            decode_prepared.prompt_tokens.clone(),
+            SamplingParams::default(),
+            3,
+            vec![],
+            vec![],
+            None,
+        );
+        assert!(deltanet_slot_needed(&decode_prepared, &decode_seq, &config));
+
+        let mut long_prepared = make_prepared("long", 1);
+        long_prepared.prompt_tokens = vec![1; 16];
+        let long_seq = Sequence::new(
+            "long".to_string(),
+            long_prepared.prompt_tokens.clone(),
+            SamplingParams::default(),
+            0,
+            vec![],
+            vec![],
+            None,
+        );
+        assert!(deltanet_slot_needed(&long_prepared, &long_seq, &config));
+
+        let mut prefix_seq = seq;
+        prefix_seq.kv_computed_len = 1;
+        assert!(deltanet_slot_needed(&prepared, &prefix_seq, &config));
     }
 
     #[test]

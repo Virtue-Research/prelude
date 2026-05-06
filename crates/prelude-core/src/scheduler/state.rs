@@ -101,6 +101,9 @@ pub struct Sequence {
     /// multiple uncached copies of the same prefix in one prefill step.
     pub prefix_cache_key: Option<u64>,
     pub deltanet_slot: Option<u32>,
+    /// Some hybrid models can skip DeltaNet state allocation for max_tokens=1,
+    /// but only if the full prompt runs in one forward pass.
+    pub prefill_must_be_atomic: bool,
     pub preempt_count: u32,
 }
 
@@ -130,6 +133,7 @@ impl Sequence {
             block_table: Vec::new(),
             prefix_cache_key: None,
             deltanet_slot: None,
+            prefill_must_be_atomic: false,
             preempt_count: 0,
         }
     }

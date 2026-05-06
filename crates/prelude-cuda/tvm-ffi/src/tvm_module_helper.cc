@@ -11,11 +11,17 @@
 #include <tvm/ffi/extra/module.h>
 #include <tvm/ffi/function.h>
 #include <cuda_runtime.h>
+#include <cstring>
 
 // TVM allocator API
 #include <tvm/ffi/extra/c_env_api.h>
 
 using namespace tvm::ffi;
+
+struct CudaAllocCtx {
+    cudaStream_t stream;
+    bool async_alloc;
+};
 
 /// Call a method on a TVM Module object.
 ///
@@ -88,7 +94,17 @@ static int cuda_dlpack_alloc(
     if (nbytes == 0) nbytes = 1;
 
     void* data = nullptr;
-    cudaError_t err = cudaMalloc(&data, nbytes);
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(
+        TVMFFIEnvGetStream(prototype->device.device_type, prototype->device.device_id));
+    bool async_alloc = false;
+    cudaError_t err = cudaErrorNotSupported;
+    if (stream != nullptr) {
+        err = cudaMallocAsync(&data, nbytes, stream);
+        async_alloc = (err == cudaSuccess);
+    }
+    if (!async_alloc) {
+        err = cudaMalloc(&data, nbytes);
+    }
     if (err != cudaSuccess) {
         if (set_error) set_error(error_ctx, "CUDAError", cudaGetErrorString(err));
         return -1;
@@ -105,9 +121,18 @@ static int cuda_dlpack_alloc(
     memcpy(shape_copy, prototype->shape, prototype->ndim * sizeof(int64_t));
     managed->dl_tensor.shape = shape_copy;
     managed->dl_tensor.strides = nullptr;
-    managed->manager_ctx = nullptr;
+    managed->manager_ctx = new CudaAllocCtx{stream, async_alloc};
     managed->deleter = [](DLManagedTensorVersioned* self) {
-        cudaFree(self->dl_tensor.data);
+        auto* ctx = static_cast<CudaAllocCtx*>(self->manager_ctx);
+        if (ctx != nullptr && ctx->async_alloc && ctx->stream != nullptr) {
+            cudaError_t err = cudaFreeAsync(self->dl_tensor.data, ctx->stream);
+            if (err != cudaSuccess) {
+                cudaFree(self->dl_tensor.data);
+            }
+        } else {
+            cudaFree(self->dl_tensor.data);
+        }
+        delete ctx;
         delete[] self->dl_tensor.shape;
         delete self;
     };

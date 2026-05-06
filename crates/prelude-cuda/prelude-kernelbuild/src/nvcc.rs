@@ -421,6 +421,14 @@ pub fn link_cuda_runtime_dynamic(cuda_path: &Path) {
     println!("cargo:rustc-link-lib=dylib=cudart");
 }
 
+/// Link against cuBLAS dynamically. Callers using raw cuBLAS FFI need this
+/// even when cudarc is configured for fallback dynamic loading, because Rust's
+/// final link still has to resolve the extern symbols.
+pub fn link_cublas_dynamic(cuda_path: &Path) {
+    emit_cuda_lib_search_paths(cuda_path);
+    println!("cargo:rustc-link-lib=dylib=cublas");
+}
+
 /// Emit `cargo:rustc-link-search=native=` for the CUDA lib directories
 /// that exist on this platform.
 fn emit_cuda_lib_search_paths(cuda_path: &Path) {

@@ -252,6 +252,7 @@ impl Engine {
                                 paged_kv: Some(&paged_kv),
                                 deltanet_pool: None,
                                 deltanet_slots: None,
+                                deltanet_state_is_zero: None,
                                 deltanet_slots_gpu: None,
                             };
                             self.executor.ops.begin_forward();
@@ -284,6 +285,7 @@ impl Engine {
                         paged_kv: None,
                         deltanet_pool: None,
                         deltanet_slots: None,
+                        deltanet_state_is_zero: None,
                         deltanet_slots_gpu: None,
                     };
                     self.executor.ops.begin_forward();
@@ -355,19 +357,6 @@ impl Engine {
 
         // (flash attention implies cuda, so paged infra is always available here)
         {
-            // Block-size alignment check: paged attention kernels require
-            // block_size aligned to head_dim constraints.
-            if let Some(pool) = self.cache.paged_pool.as_ref() {
-                let block_ok = if self.executor.config.head_dim == 256 {
-                    pool.block_size % 64 == 0
-                } else {
-                    pool.block_size % 128 == 0
-                };
-                if !block_ok {
-                    return Ok((0, vec![]));
-                }
-            }
-
             let (cached_len, cached_block_ids) = self
                 .cache
                 .try_prefix_cache_match_paged_only(common_prefix)?;

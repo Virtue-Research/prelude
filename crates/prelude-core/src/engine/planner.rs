@@ -66,16 +66,7 @@ impl Engine {
         let Some(candidate) = prefill_plan.prefix_reuse.as_ref() else {
             return Ok(ResolvedPrefixReuse::default());
         };
-        let Some(pool) = self.cache.paged_pool.as_ref() else {
-            return Ok(ResolvedPrefixReuse::default());
-        };
-
-        let block_ok = if self.executor.config.head_dim == 256 {
-            pool.block_size % 64 == 0
-        } else {
-            pool.block_size % 128 == 0
-        };
-        if !block_ok {
+        if self.cache.paged_pool.is_none() {
             return Ok(ResolvedPrefixReuse::default());
         }
 

@@ -89,6 +89,11 @@ pub struct BatchAttnContext<'a> {
     pub paged_kv: Option<&'a PagedKvBatchContext<'a>>,
     pub deltanet_pool: Option<&'a mut crate::cache::deltanet_pool::DeltaNetPool>,
     pub deltanet_slots: Option<&'a [u32]>,
+    /// Per-request hint for hybrid DeltaNet models. `true` means the request's
+    /// recurrent and convolution states are known to be zero at this step, so
+    /// the model can avoid loading an all-zero row from the state pool before
+    /// prefill. Decode and continuation chunks must use `false`.
+    pub deltanet_state_is_zero: Option<&'a [bool]>,
     /// Pre-allocated GPU tensor of DeltaNet slot IDs `[bs]` U32.
     /// Used by batched conv1d_update (conv_state_indices) and kda_decode.
     /// Created outside model.forward() to be CUDA-graph compatible.

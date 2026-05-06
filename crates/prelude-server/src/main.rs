@@ -329,6 +329,13 @@ async fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
         n => n,
     };
 
+    let scheduler_block_size = base_engine
+        .cache
+        .paged_pool
+        .as_ref()
+        .map(|pool| pool.block_size)
+        .unwrap_or_else(|| SchedulerConfig::default().block_size);
+
     let scheduler_config = SchedulerConfig {
         max_batch_size: cli.max_batch_size,
         max_batch_wait_ms: cli.max_batch_wait_ms,
@@ -338,6 +345,7 @@ async fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
         max_total_tokens,
         decode_reservation_cap,
         chunked_prefill: cli.chunked_prefill && !cli.no_chunked_prefill,
+        block_size: scheduler_block_size,
         ..SchedulerConfig::default()
     };
     info!(

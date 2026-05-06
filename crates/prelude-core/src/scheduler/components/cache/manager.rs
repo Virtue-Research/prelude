@@ -31,12 +31,6 @@ impl CacheManager {
         kv_sharing: &[Option<usize>],
         peak_activation_bytes: usize,
     ) -> Result<Self, EngineError> {
-        let prefix_cache = if runtime_caps.supports_prefix_cache {
-            Self::init_prefix_cache(device, model_config.num_hidden_layers, cache_config)
-        } else {
-            None
-        };
-
         let (paged_pool, block_manager) = if runtime_caps.supports_paged_attn {
             Self::init_paged_pool(
                 model_config,
@@ -48,6 +42,17 @@ impl CacheManager {
             )?
         } else {
             (None, None)
+        };
+
+        let prefix_cache = if runtime_caps.supports_prefix_cache {
+            Self::init_prefix_cache(
+                device,
+                model_config.num_hidden_layers,
+                cache_config,
+                paged_pool.as_ref().map(|pool| pool.block_size),
+            )
+        } else {
+            None
         };
 
         let deltanet_pool = if runtime_caps.supports_deltanet {
@@ -88,12 +93,13 @@ impl CacheManager {
         device: &Device,
         num_layers: usize,
         cache_config: &CacheConfig,
+        paged_block_size: Option<usize>,
     ) -> Option<Mutex<PrefixKvCache>> {
         let max_blocks = cache_config.prefix_cache_blocks;
         if max_blocks == 0 {
             return None;
         }
-        let block_size = cache_config.prefix_block_size;
+        let block_size = paged_block_size.unwrap_or(cache_config.prefix_block_size);
         // flash layout: [B, L, H, D] → concat dim 1; standard: [B, H, L, D] → concat dim 2
         let is_flash = device.is_cuda();
         let concat_dim = if is_flash { 1 } else { 2 };

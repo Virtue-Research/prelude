@@ -15,14 +15,18 @@
 use crate::loading::var_builder::VarBuilder;
 use crate::models::commons::embedding::Embedding;
 use crate::models::commons::linear::DenseLinear;
-use crate::tensor::{DType, Device, Module, Result, Tensor, D};
+use crate::tensor::{D, DType, Device, Module, Result, Tensor};
 
 use crate::models::commons::{
-    last_token_select, BatchAttnContext, BatchState, LayerAttnContext, Linear,
+    BatchAttnContext, BatchState, LayerAttnContext, Linear, last_token_select,
 };
 use crate::models::resolve_or_warn;
 use crate::ops::{MaskType, PagedParams, VarlenParams};
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
+const MAX_GROUPED_PREFILL_BATCH: usize = 8;
+const MAX_ZERO_GROUPED_PREFILL_BATCH: usize = 16;
 
 // ── Config ──────────────────────────────────────────────────────────────
 
@@ -433,14 +437,18 @@ impl RmsNormGated {
 // ── Gated DeltaNet (Linear Attention) ────────────────────────────────────
 
 pub(super) struct Qwen3_5GatedDeltaNet {
-    // Qwen3.5 uses split projections (not fused like Qwen3-Next)
+    // Qwen3.5 keeps QKV/Z/B/A as split projections. Fusing QKV/Z forces large
+    // contiguous copies before conv/norm in this implementation, and fusing
+    // only B/A did not improve the 35B prefill path in profiling.
     pub(super) in_proj_qkv: Linear, // hidden → key_dim*2 + value_dim
     pub(super) in_proj_z: Linear,   // hidden → value_dim
     pub(super) in_proj_b: Linear,   // hidden → num_v_heads
     pub(super) in_proj_a: Linear,   // hidden → num_v_heads
     pub(super) conv_weight: Tensor, // [conv_dim, kernel_size] reshaped for dot product
-    pub(super) dt_bias: Tensor,     // [num_v_heads]
-    pub(super) a_log: Tensor,       // [num_v_heads]
+    dt_bias_f32: Tensor,
+    dt_bias_f32_expanded: Tensor,
+    a_log_f32: Tensor,
+    prefill_cu_seqlens: Option<(usize, Tensor)>,
     pub(super) norm: RmsNormGated,
     pub(super) out_proj: Linear,
     // State
@@ -463,14 +471,6 @@ impl Qwen3_5GatedDeltaNet {
         let value_dim = cfg.value_dim();
         let conv_dim = cfg.conv_dim();
 
-        // Split projections: QKV separate from Z, B, A. We intentionally
-        // do NOT fuse these four into a single matmul — the fused output
-        // dim would be `2*key_dim + value_dim + value_dim + 2*num_v_heads`
-        // (e.g. 12352 for Qwen3.5-35B-A3B) which has an awkward prime
-        // factor for GEMM tile alignment, and empirically runs ~20%
-        // slower on Hopper than the 4 separate projections whose
-        // individual output dims (8192, 4096, 32, 32) each hit clean
-        // tile boundaries for DeepGEMM / CUTLASS.
         let in_proj_qkv = Linear::load(
             vb.pp("in_proj_qkv"),
             cfg.hidden_size,
@@ -504,6 +504,16 @@ impl Qwen3_5GatedDeltaNet {
             Default::default(),
             DType::F32,
         )?;
+        let dt_bias_f32 = dt_bias.to_dtype(DType::F32)?;
+        let dt_bias_f32_expanded = dt_bias_f32
+            .reshape((cfg.linear_num_value_heads, 1))?
+            .broadcast_as((cfg.linear_num_value_heads, cfg.linear_key_head_dim))?
+            .contiguous()?;
+        let a_log_f32 = if a_log.dtype() == DType::F32 {
+            a_log.clone()
+        } else {
+            a_log.to_dtype(DType::F32)?
+        };
 
         let norm = RmsNormGated::new(
             cfg.linear_value_head_dim,
@@ -519,8 +529,10 @@ impl Qwen3_5GatedDeltaNet {
             in_proj_b,
             in_proj_a,
             conv_weight,
-            dt_bias,
-            a_log,
+            dt_bias_f32,
+            dt_bias_f32_expanded,
+            a_log_f32,
+            prefill_cu_seqlens: None,
             norm,
             out_proj,
             conv_state: None,
@@ -539,6 +551,17 @@ impl Qwen3_5GatedDeltaNet {
     fn clear_state(&mut self) {
         self.conv_state = None;
         self.recurrent_state = None;
+    }
+
+    fn single_prefill_cu_seqlens(&mut self, seq_len: usize, device: &Device) -> Result<Tensor> {
+        if let Some((cached_len, cached)) = &self.prefill_cu_seqlens {
+            if *cached_len == seq_len {
+                return Ok(cached.clone());
+            }
+        }
+        let cu = Tensor::from_vec(vec![0i64, seq_len as i64], (2,), device)?;
+        self.prefill_cu_seqlens = Some((seq_len, cu.clone()));
+        Ok(cu)
     }
 
     /// Forward pass for a single token (decode) or a sequence (prefill).
@@ -672,11 +695,9 @@ impl Qwen3_5GatedDeltaNet {
 
         // Gating: decay[t, hv] = exp(-exp(a_log[hv]) * softplus(a[t, hv] + dt_bias[hv]))
         // All shapes are [HV] scalar-per-head except `a_in` which is [T, HV].
-        let dt_bias_f32 = self.dt_bias.to_dtype(DType::F32)?;
-        let a_log_f32 = self.a_log.to_dtype(DType::F32)?;
-        let neg_a_exp = a_log_f32.exp()?.neg()?; // [HV]
+        let neg_a_exp = self.a_log_f32.exp()?.neg()?; // [HV]
         let a_f32 = a_in.to_dtype(DType::F32)?; // [T, HV]
-        let a_plus_dt = a_f32.broadcast_add(&dt_bias_f32)?; // [T, HV]
+        let a_plus_dt = a_f32.broadcast_add(&self.dt_bias_f32)?; // [T, HV]
         let softplus_val = softplus(&a_plus_dt)?;
         let g = softplus_val.broadcast_mul(&neg_a_exp)?; // [T, HV]
         let decay_all = g.exp()?; // [T, HV]
@@ -785,22 +806,14 @@ impl Qwen3_5GatedDeltaNet {
         debug_assert!(hv >= hk, "Qwen3.5 DeltaNet is GVA: num_v >= num_k");
 
         // ── Stage 1: fused post-conv1d prep ────────────────────────────
-        // `gdn_post_conv` wants dt_bias and A_log as F32. A_log is
-        // loaded in F32 natively; dt_bias comes from the checkpoint in
-        // BF16 (or F16), so we pre-cast once and cache the F32 copy on
-        // the layer. Stash it lazily.
-        let dt_bias_f32 = self.dt_bias.to_dtype(DType::F32)?;
-        let a_log_f32 = if self.a_log.dtype() == DType::F32 {
-            self.a_log.clone()
-        } else {
-            self.a_log.to_dtype(DType::F32)?
-        };
+        // `gdn_post_conv` wants dt_bias and A_log as F32. Keep cached F32
+        // copies on the layer to avoid per-request cast kernels.
         let Some(prep) = ops.gdn_post_conv(
             mixed_qkv,
             a_in,
             b_in,
-            &a_log_f32,
-            &dt_bias_f32,
+            &self.a_log_f32,
+            &self.dt_bias_f32,
             hk,
             hv,
             kdim,
@@ -813,7 +826,7 @@ impl Qwen3_5GatedDeltaNet {
 
         // ── cu_seqlens = [0, T] for a single packed sequence (I64) ───────
         // Note: flashinfer expects I64, unlike cuLA's I32.
-        let cu_seqlens = Tensor::from_vec(vec![0i64, t as i64], (2,), device)?;
+        let cu_seqlens = self.single_prefill_cu_seqlens(t, device)?;
 
         // ── Initial state: [1, HV, D, D] f32 or None ─────────────────────
         // Our own recurrent state is stored [HV, V, K]; the kernel wants a
@@ -898,9 +911,9 @@ impl Qwen3_5GatedDeltaNet {
             /*silu_activation=*/ true,
             None, // conv_state_indices — single-seq decode, not pool-indexed
         ) {
-            let out_bd = res?; // [1, conv_dim]
-                               // `state_bd` was mutated in place. Save it back to
-                               // `self.conv_state` — squeezed to our 2-D on-disk layout.
+            let out_bd = res?;
+            // `state_bd` was mutated in place. Save it back to
+            // `self.conv_state` — squeezed to our 2-D on-disk layout.
             self.conv_state = Some(state_bd.squeeze(0)?.contiguous()?);
             return out_bd.squeeze(0);
         }
@@ -909,8 +922,8 @@ impl Qwen3_5GatedDeltaNet {
         let state = self.conv_state.as_ref().unwrap();
         let x_col = x.unsqueeze(D::Minus1)?; // [conv_dim, 1]
         let full_window = Tensor::cat(&[state, &x_col], 1)?; // [conv_dim, kernel]
-        let out_raw = (full_window * &self.conv_weight)?.sum(D::Minus1)?; // [conv_dim]
-                                                                          // Manual SiLU fusion parity with the fast path.
+        let out_raw = (full_window * &self.conv_weight)?.sum(D::Minus1)?;
+        // Manual SiLU fusion parity with the fast path.
         let out = ops.silu(&out_raw)?;
 
         let new_state = if self.conv_kernel > 2 {
@@ -974,10 +987,10 @@ impl Qwen3_5GatedDeltaNet {
             None,
             /*silu_activation=*/ true,
         ) {
-            let result_padded = res?; // [1, D, pad_len+L]
-                                      // Drop the leading `pad_len` outputs: they correspond to
-                                      // timesteps in the pre-pad zone which don't belong to the
-                                      // output sequence.
+            let result_padded = res?;
+            // Drop the leading `pad_len` outputs: they correspond to
+            // timesteps in the pre-pad zone which don't belong to the
+            // output sequence.
             let result_t = result_padded.narrow(2, pad_len, seq_len)?; // [1, D, L]
             let result = result_t.transpose(1, 2)?.contiguous()?; // [1, L, conv_dim]
             debug_assert_eq!(padded_len - pad_len, seq_len);
@@ -1013,8 +1026,8 @@ impl Qwen3_5GatedDeltaNet {
 
         let mut acc: Option<Tensor> = None;
         for k_i in 0..self.conv_kernel {
-            let shifted = padded.narrow(2, k_i, seq_len)?; // [1, D, L]
-                                                           // weight[:, k_i] → [D], reshape to [1, D, 1] for broadcast.
+            let shifted = padded.narrow(2, k_i, seq_len)?;
+            // weight[:, k_i] -> [D], reshape to [1, D, 1] for broadcast.
             let w_slice = self
                 .conv_weight
                 .narrow(1, k_i, 1)?
@@ -1025,8 +1038,8 @@ impl Qwen3_5GatedDeltaNet {
                 Some(a) => (a + term)?,
             });
         }
-        let out_t = acc.unwrap(); // [1, D, L]
-                                  // Fuse SiLU here so the caller can drop its separate silu call.
+        let out_t = acc.unwrap();
+        // Fuse SiLU here so the caller can drop its separate silu call.
         let out_t = ops.silu(&out_t)?;
         let result = out_t.transpose(1, 2)?.contiguous()?; // [1, L, conv_dim]
 
@@ -1518,10 +1531,14 @@ impl Qwen3_5SparseMoeBlock {
         if let Some(ref shared) = self.shared_expert {
             let shared_out = shared.forward(ops, xs)?;
             let shared_out = if let Some(ref gate_w) = self.shared_expert_gate_weight {
-                let logits = xs
-                    .broadcast_mul(&gate_w.unsqueeze(0)?)?
-                    .sum_keepdim(D::Minus1)?;
-                shared_out.broadcast_mul(&ops.sigmoid(&logits)?)?
+                if let Some(result) = ops.shared_expert_gate(xs, &shared_out, gate_w) {
+                    result?
+                } else {
+                    let logits = xs
+                        .broadcast_mul(&gate_w.unsqueeze(0)?)?
+                        .sum_keepdim(D::Minus1)?;
+                    shared_out.broadcast_mul(&ops.sigmoid(&logits)?)?
+                }
             } else {
                 shared_out
             };
@@ -1715,6 +1732,10 @@ fn deltanet_varlen(
     seq_lens: &[usize],
     ops: &dyn crate::ops::Ops,
 ) -> Result<Tensor> {
+    if let Some(out) = deltanet_varlen_grouped_zero(gdn, packed, seq_lens, ops)? {
+        return Ok(out);
+    }
+
     let mut outputs = Vec::new();
     let mut offset = 0usize;
     for &len in seq_lens {
@@ -1726,6 +1747,202 @@ fn deltanet_varlen(
     }
     gdn.clear_state();
     Tensor::cat(&outputs, 0) // [total_tokens, D]
+}
+
+fn deltanet_varlen_grouped_zero(
+    gdn: &mut Qwen3_5GatedDeltaNet,
+    packed: &Tensor,
+    seq_lens: &[usize],
+    ops: &dyn crate::ops::Ops,
+) -> Result<Option<Tensor>> {
+    if seq_lens.len() < 2 || !packed.device().is_cuda() {
+        return Ok(None);
+    }
+    if gdn.head_k_dim != 128 || gdn.head_v_dim != 128 || gdn.head_k_dim != gdn.head_v_dim {
+        return Ok(None);
+    }
+    let mut offsets = Vec::with_capacity(seq_lens.len());
+    let mut off = 0usize;
+    for &len in seq_lens {
+        offsets.push(off);
+        off += len;
+    }
+
+    let mut prefill_by_len: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (idx, &len) in seq_lens.iter().enumerate() {
+        prefill_by_len.entry(len).or_default().push(idx);
+    }
+    if !prefill_by_len
+        .iter()
+        .any(|(&seq_len, indices)| seq_len > 1 && indices.len() > 1)
+    {
+        return Ok(None);
+    }
+
+    if prefill_by_len.len() == 1 {
+        let (&seq_len, indices) = prefill_by_len.iter().next().unwrap();
+        if seq_len > 1 && indices.len() > 1 {
+            let mut flattened = Vec::new();
+            let mut start = 0usize;
+            while start < indices.len() {
+                let remaining = indices.len() - start;
+                let take = grouped_prefill_take_with(remaining, MAX_ZERO_GROUPED_PREFILL_BATCH);
+                let chunk = &indices[start..start + take];
+                let Some(out) =
+                    deltanet_prefill_group_fused_zero(gdn, packed, &offsets, seq_len, chunk, ops)?
+                else {
+                    gdn.clear_state();
+                    return Ok(None);
+                };
+                flattened.push(flatten_grouped_prefill_output(out, take, seq_len)?);
+                start += take;
+            }
+            gdn.clear_state();
+            return Ok(Some(if flattened.len() == 1 {
+                flattened.pop().unwrap()
+            } else {
+                Tensor::cat(&flattened, 0)?
+            }));
+        }
+    }
+
+    let mut outputs: Vec<Option<Tensor>> = vec![None; seq_lens.len()];
+    for (&seq_len, indices) in prefill_by_len.iter() {
+        let mut start = 0usize;
+        while start < indices.len() {
+            let remaining = indices.len() - start;
+            let take = grouped_prefill_take_with(remaining, MAX_ZERO_GROUPED_PREFILL_BATCH);
+            if take == 1 || seq_len <= 1 {
+                let req_idx = indices[start];
+                gdn.clear_state();
+                let seq = packed.narrow(0, offsets[req_idx], seq_len)?.unsqueeze(0)?;
+                outputs[req_idx] = Some(gdn.forward(&seq, 0, ops)?.squeeze(0)?);
+                gdn.clear_state();
+                start += 1;
+                continue;
+            }
+
+            let chunk = &indices[start..start + take];
+            let Some(out) =
+                deltanet_prefill_group_fused_zero(gdn, packed, &offsets, seq_len, chunk, ops)?
+            else {
+                gdn.clear_state();
+                return Ok(None);
+            };
+            for (group_pos, &req_idx) in chunk.iter().enumerate() {
+                outputs[req_idx] = Some(out.get(group_pos)?);
+            }
+            start += take;
+        }
+    }
+
+    let mut ordered = Vec::with_capacity(seq_lens.len());
+    for item in outputs {
+        let Some(t) = item else {
+            gdn.clear_state();
+            return Ok(None);
+        };
+        ordered.push(t);
+    }
+    gdn.clear_state();
+    Ok(Some(Tensor::cat(&ordered, 0)?))
+}
+
+fn grouped_prefill_take(remaining: usize) -> usize {
+    grouped_prefill_take_with(remaining, MAX_GROUPED_PREFILL_BATCH)
+}
+
+fn grouped_prefill_take_with(remaining: usize, max_batch: usize) -> usize {
+    if remaining == 1 {
+        1
+    } else if remaining <= max_batch {
+        remaining
+    } else if remaining - max_batch == 1 {
+        max_batch - 1
+    } else {
+        max_batch
+    }
+}
+
+fn qwen35_kda_decode_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("PRELUDE_QWEN35_KDA_DECODE")
+            .map(|v| {
+                !matches!(
+                    v.as_str(),
+                    "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
+                )
+            })
+            .unwrap_or(true)
+    })
+}
+
+fn qwen35_grouped_pooled_prefill_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("PRELUDE_QWEN35_GROUPED_POOLED_PREFILL")
+            .map(|v| {
+                !matches!(
+                    v.as_str(),
+                    "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
+                )
+            })
+            .unwrap_or(true)
+    })
+}
+
+fn qwen35_varlen_pooled_prefill_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("PRELUDE_QWEN35_VARLEN_POOLED_PREFILL")
+            .map(|v| {
+                !matches!(
+                    v.as_str(),
+                    "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
+                )
+            })
+            .unwrap_or(true)
+    })
+}
+
+fn grouped_prefill_input(
+    packed: &Tensor,
+    offsets: &[usize],
+    seq_len: usize,
+    indices: &[usize],
+) -> Result<Tensor> {
+    let batch = indices.len();
+    if batch == 0 {
+        crate::tensor::bail!("grouped_prefill_input called with empty batch")
+    }
+
+    let first_idx = indices[0];
+    let first_offset = offsets[first_idx];
+    let contiguous_group = indices
+        .iter()
+        .enumerate()
+        .all(|(group_pos, &req_idx)| offsets[req_idx] == first_offset + group_pos * seq_len);
+
+    if contiguous_group && packed.is_contiguous() {
+        let (_, hidden) = packed.dims2()?;
+        return packed
+            .narrow(0, first_offset, batch * seq_len)?
+            .reshape((batch, seq_len, hidden));
+    }
+
+    let mut seqs = Vec::with_capacity(batch);
+    for &req_idx in indices {
+        seqs.push(packed.narrow(0, offsets[req_idx], seq_len)?);
+    }
+    Tensor::stack(&seqs, 0)?.contiguous()
+}
+
+fn flatten_grouped_prefill_output(out: Tensor, batch: usize, seq_len: usize) -> Result<Tensor> {
+    let (out_batch, out_seq_len, hidden) = out.dims3()?;
+    debug_assert_eq!(out_batch, batch);
+    debug_assert_eq!(out_seq_len, seq_len);
+    out.reshape((batch * seq_len, hidden))
 }
 
 /// Pooled varlen DeltaNet: for each sequence in the batch,
@@ -1746,6 +1963,7 @@ fn deltanet_varlen_pooled(
     pool: &mut crate::deltanet_pool::DeltaNetPool,
     slot_ids: &[u32],
     slot_ids_gpu: Option<&Tensor>,
+    state_is_zero: Option<&[bool]>,
     dn_layer_idx: usize,
     ops: &dyn crate::ops::Ops,
 ) -> Result<Tensor> {
@@ -1776,15 +1994,17 @@ fn deltanet_varlen_pooled(
         | (64, 64, 128, 128) // MHA H=64
         | (16, 32, 128, 128) // GQA H=16/HV=32 (Qwen3.5-35B-A3B)
     );
-    // The fast path's first step (`causal_conv1d_update` with pool indexing)
-    // mutates `pool.conv_states` in place. If we let it run and then `kda_decode_batched`
-    // returns None — for example on Blackwell/SM103 where there's no AOT cuLA cubin —
-    // the sequential fallback below will run conv1d *again* against the
-    // already-advanced state, producing degenerate decode output ("Paris Paris…").
-    // Probe `kda_decode_available()` BEFORE entering the fast path so we never
-    // touch pool state if the second stage can't run.
-    let fused_eligible =
-        all_decode && packed.device().is_cuda() && fused_supported && ops.kda_decode_available();
+    let fused_eligible = all_decode
+        && packed.device().is_cuda()
+        && fused_supported
+        && qwen35_kda_decode_enabled()
+        && ops.kda_decode_available_for(
+            slot_ids.len(),
+            gdn.num_k_heads,
+            gdn.num_v_heads,
+            gdn.head_k_dim,
+            gdn.head_v_dim,
+        );
     if fused_eligible {
         if let Some(out) = deltanet_decode_batched_fused(
             gdn,
@@ -1799,9 +2019,16 @@ fn deltanet_varlen_pooled(
         }
     }
     if packed.device().is_cuda() && fused_supported {
-        if let Some(out) =
-            deltanet_mixed_grouped_fused(gdn, packed, seq_lens, pool, slot_ids, dn_layer_idx, ops)?
-        {
+        if let Some(out) = deltanet_mixed_grouped_fused(
+            gdn,
+            packed,
+            seq_lens,
+            pool,
+            slot_ids,
+            state_is_zero,
+            dn_layer_idx,
+            ops,
+        )? {
             return Ok(out);
         }
     }
@@ -1810,16 +2037,28 @@ fn deltanet_varlen_pooled(
     let mut offset = 0usize;
     for (i, &len) in seq_lens.iter().enumerate() {
         let slot = slot_ids[i] as usize;
+        let starts_from_zero = state_is_zero
+            .and_then(|flags| flags.get(i))
+            .copied()
+            .unwrap_or(false);
 
-        // Load this request's state from the pool into the layer scratch.
-        // Force contiguous so downstream ops (matmul, slice_set on write-back)
-        // see a dense layout. `get(slot)` strips the leading max_slots dim.
-        gdn.recurrent_state = Some(
-            pool.recurrent_states[dn_layer_idx]
-                .get(slot)?
-                .contiguous()?,
-        );
-        gdn.conv_state = Some(pool.conv_states[dn_layer_idx].get(slot)?.contiguous()?);
+        if starts_from_zero {
+            // New prefill request: the pool slot was just allocated/reset, so
+            // avoid copying an all-zero recurrent row into layer scratch. The
+            // GDN and conv paths already treat `None` as zero initial state.
+            gdn.recurrent_state = None;
+            gdn.conv_state = None;
+        } else {
+            // Load this request's state from the pool into the layer scratch.
+            // Force contiguous so downstream ops (matmul, slice_set on write-back)
+            // see a dense layout. `get(slot)` strips the leading max_slots dim.
+            gdn.recurrent_state = Some(
+                pool.recurrent_states[dn_layer_idx]
+                    .get(slot)?
+                    .contiguous()?,
+            );
+            gdn.conv_state = Some(pool.conv_states[dn_layer_idx].get(slot)?.contiguous()?);
+        }
 
         let seq = packed.narrow(0, offset, len)?.unsqueeze(0)?; // [1, L, D]
         let out = gdn.forward(&seq, 0, ops)?; // [1, L, D]
@@ -1848,6 +2087,7 @@ fn deltanet_mixed_grouped_fused(
     seq_lens: &[usize],
     pool: &mut crate::deltanet_pool::DeltaNetPool,
     slot_ids: &[u32],
+    state_is_zero: Option<&[bool]>,
     dn_layer_idx: usize,
     ops: &dyn crate::ops::Ops,
 ) -> Result<Option<Tensor>> {
@@ -1875,46 +2115,135 @@ fn deltanet_mixed_grouped_fused(
         }
     }
 
-    // Only take this fast path for small same-length prefill buckets.
-    // Larger buckets make FlashInfer GDN workspace/allocator behavior
-    // spiky on Blackwell in the continuous mixed workload; the old path is
-    // slower at C16 but more stable at C64/C128.
-    const MAX_GROUPED_PREFILL_BATCH: usize = 8;
-    if prefill_by_len
-        .values()
-        .any(|indices| indices.len() < 2 || indices.len() > MAX_GROUPED_PREFILL_BATCH)
-    {
-        return Ok(None);
-    }
     if decode_indices.is_empty() && prefill_by_len.is_empty() {
         return Ok(None);
     }
-    if !decode_indices.is_empty() && !ops.kda_decode_available() {
+    if qwen35_kda_decode_enabled()
+        && !decode_indices.is_empty()
+        && !ops.kda_decode_available_for(
+            decode_indices.len(),
+            gdn.num_k_heads,
+            gdn.num_v_heads,
+            gdn.head_k_dim,
+            gdn.head_v_dim,
+        )
+    {
         return Ok(None);
     }
 
     let mut outputs: Vec<Option<Tensor>> = vec![None; seq_lens.len()];
-    for (&seq_len, indices) in prefill_by_len.iter() {
-        let out = deltanet_prefill_group_fused(
+    let mut handled_varlen_prefill = false;
+    let prefill_indices: Vec<usize> = prefill_by_len
+        .values()
+        .flat_map(|indices| indices.iter().copied())
+        .collect();
+    if qwen35_varlen_pooled_prefill_enabled() && prefill_indices.len() > 1 {
+        if let Some(prefill_outputs) = deltanet_prefill_varlen_pooled_batched(
             gdn,
             packed,
             &offsets,
-            seq_len,
-            indices,
+            seq_lens,
+            &prefill_indices,
             pool,
             slot_ids,
+            state_is_zero,
             dn_layer_idx,
             ops,
-        )?;
-        let Some(out) = out else {
-            return Ok(None);
-        };
-        for (group_pos, &req_idx) in indices.iter().enumerate() {
-            outputs[req_idx] = Some(out.get(group_pos)?);
+        )? {
+            for (req_idx, out) in prefill_outputs {
+                outputs[req_idx] = Some(out);
+            }
+            handled_varlen_prefill = true;
         }
     }
 
-    if !decode_indices.is_empty() {
+    // Larger same-length buckets are chunked so we still reduce the per-layer
+    // GDN/conv launch count without feeding an oversized grouped prefill into
+    // FlashInfer.
+    if decode_indices.is_empty() && prefill_by_len.len() == 1 {
+        let (&seq_len, indices) = prefill_by_len.iter().next().unwrap();
+        if !handled_varlen_prefill && seq_len > 1 && indices.len() > 1 {
+            let mut flattened = Vec::new();
+            let mut start = 0usize;
+            while start < indices.len() {
+                let remaining = indices.len() - start;
+                let take = grouped_prefill_take(remaining);
+                let chunk = &indices[start..start + take];
+                let out = deltanet_prefill_group_single_pooled(
+                    gdn,
+                    packed,
+                    &offsets,
+                    seq_len,
+                    chunk,
+                    pool,
+                    slot_ids,
+                    state_is_zero,
+                    dn_layer_idx,
+                    ops,
+                )?;
+                let Some(out) = out else { return Ok(None) };
+                flattened.push(flatten_grouped_prefill_output(out, take, seq_len)?);
+                start += take;
+            }
+            return Ok(Some(if flattened.len() == 1 {
+                flattened.pop().unwrap()
+            } else {
+                Tensor::cat(&flattened, 0)?
+            }));
+        }
+    }
+
+    if !handled_varlen_prefill {
+        for (&seq_len, indices) in prefill_by_len.iter() {
+            let mut start = 0usize;
+            while start < indices.len() {
+                let remaining = indices.len() - start;
+                let take = grouped_prefill_take(remaining);
+                if take == 1 {
+                    let req_idx = indices[start];
+                    let starts_from_zero = state_is_zero
+                        .and_then(|flags| flags.get(req_idx))
+                        .copied()
+                        .unwrap_or(false);
+                    outputs[req_idx] = Some(deltanet_single_pooled(
+                        gdn,
+                        packed,
+                        offsets[req_idx],
+                        seq_len,
+                        pool,
+                        slot_ids[req_idx],
+                        starts_from_zero,
+                        dn_layer_idx,
+                        ops,
+                    )?);
+                    start += 1;
+                    continue;
+                }
+                let chunk = &indices[start..start + take];
+                let out = deltanet_prefill_group_single_pooled(
+                    gdn,
+                    packed,
+                    &offsets,
+                    seq_len,
+                    chunk,
+                    pool,
+                    slot_ids,
+                    state_is_zero,
+                    dn_layer_idx,
+                    ops,
+                )?;
+                let Some(out) = out else {
+                    return Ok(None);
+                };
+                for (group_pos, &req_idx) in chunk.iter().enumerate() {
+                    outputs[req_idx] = Some(out.get(group_pos)?);
+                }
+                start += take;
+            }
+        }
+    }
+
+    if qwen35_kda_decode_enabled() && !decode_indices.is_empty() {
         let mut rows = Vec::with_capacity(decode_indices.len());
         let mut decode_slots = Vec::with_capacity(decode_indices.len());
         for &req_idx in decode_indices.iter() {
@@ -1952,15 +2281,308 @@ fn deltanet_mixed_grouped_fused(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn deltanet_prefill_group_fused(
+fn deltanet_prefill_varlen_pooled_batched(
+    gdn: &mut Qwen3_5GatedDeltaNet,
+    packed: &Tensor,
+    offsets: &[usize],
+    seq_lens: &[usize],
+    indices: &[usize],
+    pool: &mut crate::deltanet_pool::DeltaNetPool,
+    slot_ids: &[u32],
+    state_is_zero: Option<&[bool]>,
+    dn_layer_idx: usize,
+    ops: &dyn crate::ops::Ops,
+) -> Result<Option<Vec<(usize, Tensor)>>> {
+    let batch = indices.len();
+    if batch <= 1 || !packed.device().is_cuda() {
+        return Ok(None);
+    }
+    if gdn.head_k_dim != 128 || gdn.head_v_dim != 128 || gdn.head_k_dim != gdn.head_v_dim {
+        return Ok(None);
+    }
+
+    let mut lens = Vec::with_capacity(batch);
+    let mut total_tokens = 0usize;
+    let mut max_len = 0usize;
+    for &req_idx in indices {
+        let len = seq_lens[req_idx];
+        if len <= 1 {
+            return Ok(None);
+        }
+        lens.push(len);
+        total_tokens += len;
+        max_len = max_len.max(len);
+    }
+
+    let starts_from_zero: Vec<bool> = indices
+        .iter()
+        .map(|&req_idx| {
+            state_is_zero
+                .and_then(|flags| flags.get(req_idx))
+                .copied()
+                .unwrap_or(false)
+        })
+        .collect();
+    let all_zero = starts_from_zero.iter().all(|&v| v);
+
+    let x_packed = gather_packed_sequences(packed, offsets, &lens, indices)?;
+    let bst = BatchState::no_lora();
+    let qkv_packed = gdn.in_proj_qkv.forward(&x_packed, &bst, ops)?; // [T, conv_dim]
+    let z_packed = gdn.in_proj_z.forward(&x_packed, &bst, ops)?; // [T, value_dim]
+    let b_raw = gdn.in_proj_b.forward(&x_packed, &bst, ops)?; // [T, HV]
+    let a_raw = gdn.in_proj_a.forward(&x_packed, &bst, ops)?; // [T, HV]
+
+    let qkv_padded = pad_packed_sequences(&qkv_packed, &lens, max_len)?;
+    let pad_len = gdn.conv_kernel - 1;
+    let conv_initial = if all_zero {
+        None
+    } else {
+        let zero_row = Tensor::zeros(
+            (pad_len, gdn.conv_dim),
+            qkv_packed.dtype(),
+            qkv_packed.device(),
+        )?;
+        let mut rows = Vec::with_capacity(batch);
+        for (group_pos, &req_idx) in indices.iter().enumerate() {
+            if starts_from_zero[group_pos] {
+                rows.push(zero_row.clone());
+            } else {
+                let slot = slot_ids[req_idx] as usize;
+                rows.push(
+                    pool.conv_states[dn_layer_idx]
+                        .get(slot)?
+                        .transpose(0, 1)?
+                        .contiguous()?,
+                );
+            }
+        }
+        Some(Tensor::stack(&rows, 0)?.contiguous()?) // [B, W-1, conv_dim]
+    };
+
+    let Some(qkv_conv_result) = ops.causal_conv1d_fn_channellast(
+        &qkv_padded,
+        &gdn.conv_weight,
+        None,
+        conv_initial.as_ref(),
+        /*silu_activation=*/ true,
+    ) else {
+        return Ok(None);
+    };
+    let qkv_conv_padded = qkv_conv_result?;
+    let qkv_conv_packed = unpad_padded_sequences(&qkv_conv_padded, &lens)?;
+
+    let next_conv = next_conv_states_from_padded_qkv(
+        &qkv_padded,
+        conv_initial.as_ref(),
+        &lens,
+        pad_len,
+        gdn.conv_dim,
+    )?;
+
+    let Some(prep) = ops.gdn_post_conv(
+        &qkv_conv_packed,
+        &a_raw,
+        &b_raw,
+        &gdn.a_log_f32,
+        &gdn.dt_bias_f32,
+        gdn.num_k_heads,
+        gdn.num_v_heads,
+        gdn.head_k_dim,
+    ) else {
+        return Ok(None);
+    };
+    let (q_bf16, k_bf16, v_bf16, alpha, beta) = prep?;
+
+    let mut cu = Vec::with_capacity(batch + 1);
+    cu.push(0i64);
+    let mut running = 0usize;
+    for &len in &lens {
+        running += len;
+        cu.push(running as i64);
+    }
+    debug_assert_eq!(running, total_tokens);
+    let cu_seqlens = Tensor::from_vec(cu, (batch + 1,), packed.device())?;
+
+    let recurrent_initial = if all_zero {
+        None
+    } else {
+        let zero_row = Tensor::zeros(
+            (gdn.num_v_heads, gdn.head_v_dim, gdn.head_k_dim),
+            DType::F32,
+            packed.device(),
+        )?;
+        let mut rows = Vec::with_capacity(batch);
+        for (group_pos, &req_idx) in indices.iter().enumerate() {
+            if starts_from_zero[group_pos] {
+                rows.push(zero_row.clone());
+            } else {
+                let slot = slot_ids[req_idx] as usize;
+                rows.push(
+                    pool.recurrent_states[dn_layer_idx]
+                        .get(slot)?
+                        .contiguous()?,
+                );
+            }
+        }
+        Some(Tensor::stack(&rows, 0)?.contiguous()?)
+    };
+
+    let scale = (gdn.head_k_dim as f32).powf(-0.5);
+    let Some(result) = ops.gdn_prefill_varlen(
+        &q_bf16,
+        &k_bf16,
+        &v_bf16,
+        &alpha,
+        &beta,
+        &cu_seqlens,
+        recurrent_initial.as_ref(),
+        scale,
+    ) else {
+        return Ok(None);
+    };
+    let (out, final_state) = result?;
+
+    for (group_pos, &req_idx) in indices.iter().enumerate() {
+        let slot = slot_ids[req_idx] as usize;
+        let conv_row = next_conv.get(group_pos)?.unsqueeze(0)?.contiguous()?;
+        pool.conv_states[dn_layer_idx].slice_set(&conv_row, 0, slot)?;
+        let rec_row = final_state.get(group_pos)?.unsqueeze(0)?.contiguous()?;
+        pool.recurrent_states[dn_layer_idx].slice_set(&rec_row, 0, slot)?;
+    }
+
+    let out = out.reshape((total_tokens, gdn.value_dim))?;
+    let normed = gdn.norm.forward(&out, &z_packed.contiguous()?, ops)?;
+    let projected = gdn.out_proj.forward(&normed, &bst, ops)?;
+
+    let mut outputs = Vec::with_capacity(batch);
+    let mut offset = 0usize;
+    for (&req_idx, &len) in indices.iter().zip(lens.iter()) {
+        outputs.push((req_idx, projected.narrow(0, offset, len)?));
+        offset += len;
+    }
+    Ok(Some(outputs))
+}
+
+fn gather_packed_sequences(
+    packed: &Tensor,
+    offsets: &[usize],
+    lens: &[usize],
+    indices: &[usize],
+) -> Result<Tensor> {
+    if indices.is_empty() {
+        crate::tensor::bail!("gather_packed_sequences called with empty indices");
+    }
+    let mut seqs = Vec::with_capacity(indices.len());
+    for (&req_idx, &len) in indices.iter().zip(lens.iter()) {
+        seqs.push(packed.narrow(0, offsets[req_idx], len)?);
+    }
+    Tensor::cat(&seqs, 0)
+}
+
+fn pad_packed_sequences(packed: &Tensor, lens: &[usize], max_len: usize) -> Result<Tensor> {
+    let hidden = packed.dim(1)?;
+    let mut rows = Vec::with_capacity(lens.len());
+    let mut offset = 0usize;
+    for &len in lens {
+        let seq = packed.narrow(0, offset, len)?;
+        offset += len;
+        if len == max_len {
+            rows.push(seq);
+        } else {
+            let pad = Tensor::zeros((max_len - len, hidden), packed.dtype(), packed.device())?;
+            rows.push(Tensor::cat(&[&seq, &pad], 0)?);
+        }
+    }
+    Tensor::stack(&rows, 0)?.contiguous()
+}
+
+fn unpad_padded_sequences(padded: &Tensor, lens: &[usize]) -> Result<Tensor> {
+    let mut rows = Vec::with_capacity(lens.len());
+    for (idx, &len) in lens.iter().enumerate() {
+        rows.push(padded.get(idx)?.narrow(0, 0, len)?);
+    }
+    Tensor::cat(&rows, 0)
+}
+
+fn next_conv_states_from_padded_qkv(
+    qkv_padded: &Tensor,
+    conv_initial: Option<&Tensor>,
+    lens: &[usize],
+    pad_len: usize,
+    conv_dim: usize,
+) -> Result<Tensor> {
+    let batch = lens.len();
+    let device = qkv_padded.device();
+    let zero_initial;
+    let initial = match conv_initial {
+        Some(t) => t,
+        None => {
+            zero_initial = Tensor::zeros((batch, pad_len, conv_dim), qkv_padded.dtype(), device)?;
+            &zero_initial
+        }
+    };
+
+    let mut rows = Vec::with_capacity(batch);
+    for (idx, &len) in lens.iter().enumerate() {
+        let qkv_row = qkv_padded.get(idx)?;
+        let state_bt = if len >= pad_len {
+            qkv_row.narrow(0, len - pad_len, pad_len)?
+        } else {
+            let old = initial.get(idx)?.narrow(0, len, pad_len - len)?;
+            let cur = qkv_row.narrow(0, 0, len)?;
+            Tensor::cat(&[&old, &cur], 0)?
+        };
+        rows.push(state_bt.transpose(0, 1)?.contiguous()?); // [conv_dim, W-1]
+    }
+    Tensor::stack(&rows, 0)?.contiguous()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deltanet_single_pooled(
+    gdn: &mut Qwen3_5GatedDeltaNet,
+    packed: &Tensor,
+    offset: usize,
+    seq_len: usize,
+    pool: &mut crate::deltanet_pool::DeltaNetPool,
+    slot_id: u32,
+    starts_from_zero: bool,
+    dn_layer_idx: usize,
+    ops: &dyn crate::ops::Ops,
+) -> Result<Tensor> {
+    let slot = slot_id as usize;
+    if starts_from_zero {
+        gdn.recurrent_state = None;
+        gdn.conv_state = None;
+    } else {
+        gdn.recurrent_state = Some(
+            pool.recurrent_states[dn_layer_idx]
+                .get(slot)?
+                .contiguous()?,
+        );
+        gdn.conv_state = Some(pool.conv_states[dn_layer_idx].get(slot)?.contiguous()?);
+    }
+
+    let seq = packed.narrow(0, offset, seq_len)?.unsqueeze(0)?;
+    let out = gdn.forward(&seq, 0, ops)?.squeeze(0)?;
+
+    if let Some(ref state) = gdn.recurrent_state {
+        let row = state.contiguous()?.unsqueeze(0)?.contiguous()?;
+        pool.recurrent_states[dn_layer_idx].slice_set(&row, 0, slot)?;
+    }
+    if let Some(ref state) = gdn.conv_state {
+        let row = state.contiguous()?.unsqueeze(0)?.contiguous()?;
+        pool.conv_states[dn_layer_idx].slice_set(&row, 0, slot)?;
+    }
+    gdn.clear_state();
+    Ok(out)
+}
+
+fn deltanet_prefill_group_fused_zero(
     gdn: &mut Qwen3_5GatedDeltaNet,
     packed: &Tensor,
     offsets: &[usize],
     seq_len: usize,
     indices: &[usize],
-    pool: &mut crate::deltanet_pool::DeltaNetPool,
-    slot_ids: &[u32],
-    dn_layer_idx: usize,
     ops: &dyn crate::ops::Ops,
 ) -> Result<Option<Tensor>> {
     let batch = indices.len();
@@ -1969,59 +2591,46 @@ fn deltanet_prefill_group_fused(
     }
 
     let bst = BatchState::no_lora();
-    let mut seqs = Vec::with_capacity(batch);
-    for &req_idx in indices {
-        seqs.push(packed.narrow(0, offsets[req_idx], seq_len)?);
-    }
-    let x = Tensor::stack(&seqs, 0)?.contiguous()?; // [B, L, hidden]
+    let x = grouped_prefill_input(packed, offsets, seq_len, indices)?; // [B, L, hidden]
 
     let qkv = gdn.in_proj_qkv.forward(&x, &bst, ops)?; // [B, L, conv_dim]
     let z = gdn.in_proj_z.forward(&x, &bst, ops)?; // [B, L, value_dim]
     let b_raw = gdn.in_proj_b.forward(&x, &bst, ops)?; // [B, L, HV]
     let a_raw = gdn.in_proj_a.forward(&x, &bst, ops)?; // [B, L, HV]
 
-    let pad_len = gdn.conv_kernel - 1;
-    let x_t = qkv.transpose(1, 2)?.contiguous()?; // [B, conv_dim, L]
-    let pool_conv = &pool.conv_states[dn_layer_idx];
-    let mut prefixes = Vec::with_capacity(batch);
-    for &req_idx in indices {
-        prefixes.push(pool_conv.get(slot_ids[req_idx] as usize)?.contiguous()?);
-    }
-    let prefix = Tensor::stack(&prefixes, 0)?.contiguous()?; // [B, conv_dim, W-1]
-    let x_padded = Tensor::cat(&[&prefix, &x_t], 2)?.contiguous()?;
-
-    let Some(conv) = ops.causal_conv1d_fn(
-        &x_padded,
+    let qkv_conv = if let Some(conv) = ops.causal_conv1d_fn_channellast(
+        &qkv,
         &gdn.conv_weight,
         None,
         None,
         /*silu_activation=*/ true,
-    ) else {
-        return Ok(None);
+    ) {
+        conv?
+    } else {
+        let x_t = qkv.transpose(1, 2)?.contiguous()?; // [B, conv_dim, L]
+        let Some(conv) = ops.causal_conv1d_fn(
+            &x_t,
+            &gdn.conv_weight,
+            None,
+            None,
+            /*silu_activation=*/ true,
+        ) else {
+            return Ok(None);
+        };
+        conv?.transpose(1, 2)?.contiguous()? // [B, L, conv_dim]
     };
-    let conv = conv?;
-    let qkv_conv = conv
-        .narrow(2, pad_len, seq_len)?
-        .transpose(1, 2)?
-        .contiguous()?; // [B, L, conv_dim]
 
     let total_tokens = batch * seq_len;
     let mixed = qkv_conv.reshape((total_tokens, gdn.conv_dim))?;
     let a_2d = a_raw.reshape((total_tokens, gdn.num_v_heads))?;
     let b_2d = b_raw.reshape((total_tokens, gdn.num_v_heads))?;
-    let dt_bias_f32 = gdn.dt_bias.to_dtype(DType::F32)?;
-    let a_log_f32 = if gdn.a_log.dtype() == DType::F32 {
-        gdn.a_log.clone()
-    } else {
-        gdn.a_log.to_dtype(DType::F32)?
-    };
 
     let Some(prep) = ops.gdn_post_conv(
         &mixed,
         &a_2d,
         &b_2d,
-        &a_log_f32,
-        &dt_bias_f32,
+        &gdn.a_log_f32,
+        &gdn.dt_bias_f32,
         gdn.num_k_heads,
         gdn.num_v_heads,
         gdn.head_k_dim,
@@ -2036,12 +2645,245 @@ fn deltanet_prefill_group_fused(
     }
     let cu_seqlens = Tensor::from_vec(cu, (batch + 1,), packed.device())?;
 
-    let pool_state = &pool.recurrent_states[dn_layer_idx];
-    let mut states = Vec::with_capacity(batch);
-    for &req_idx in indices {
-        states.push(pool_state.get(slot_ids[req_idx] as usize)?.contiguous()?);
+    let scale = (gdn.head_k_dim as f32).powf(-0.5);
+    let Some(result) = ops.gdn_prefill_varlen(
+        &q_bf16,
+        &k_bf16,
+        &v_bf16,
+        &alpha,
+        &beta,
+        &cu_seqlens,
+        None,
+        scale,
+    ) else {
+        return Ok(None);
+    };
+    let (out, _) = result?;
+
+    let out = out.reshape((batch, seq_len, gdn.value_dim))?;
+    let normed = gdn.norm.forward(&out, &z.contiguous()?, ops)?;
+    let projected = gdn.out_proj.forward(&normed, &bst, ops)?;
+    Ok(Some(projected))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deltanet_prefill_group_single_pooled(
+    gdn: &mut Qwen3_5GatedDeltaNet,
+    packed: &Tensor,
+    offsets: &[usize],
+    seq_len: usize,
+    indices: &[usize],
+    pool: &mut crate::deltanet_pool::DeltaNetPool,
+    slot_ids: &[u32],
+    state_is_zero: Option<&[bool]>,
+    dn_layer_idx: usize,
+    ops: &dyn crate::ops::Ops,
+) -> Result<Option<Tensor>> {
+    let batch = indices.len();
+    if batch == 0 || seq_len <= 1 {
+        return Ok(None);
     }
-    let initial_state = Tensor::stack(&states, 0)?.contiguous()?;
+
+    if qwen35_grouped_pooled_prefill_enabled() && batch > 1 {
+        if let Some(out) = deltanet_prefill_group_pooled_batched(
+            gdn,
+            packed,
+            offsets,
+            seq_len,
+            indices,
+            pool,
+            slot_ids,
+            state_is_zero,
+            dn_layer_idx,
+            ops,
+        )? {
+            return Ok(Some(out));
+        }
+    }
+
+    deltanet_prefill_group_pooled_sequential(
+        gdn,
+        packed,
+        offsets,
+        seq_len,
+        indices,
+        pool,
+        slot_ids,
+        state_is_zero,
+        dn_layer_idx,
+        ops,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deltanet_prefill_group_pooled_sequential(
+    gdn: &mut Qwen3_5GatedDeltaNet,
+    packed: &Tensor,
+    offsets: &[usize],
+    seq_len: usize,
+    indices: &[usize],
+    pool: &mut crate::deltanet_pool::DeltaNetPool,
+    slot_ids: &[u32],
+    state_is_zero: Option<&[bool]>,
+    dn_layer_idx: usize,
+    ops: &dyn crate::ops::Ops,
+) -> Result<Option<Tensor>> {
+    let batch = indices.len();
+    let mut rows = Vec::with_capacity(batch);
+    for &req_idx in indices {
+        let starts_from_zero = state_is_zero
+            .and_then(|flags| flags.get(req_idx))
+            .copied()
+            .unwrap_or(false);
+        rows.push(deltanet_single_pooled(
+            gdn,
+            packed,
+            offsets[req_idx],
+            seq_len,
+            pool,
+            slot_ids[req_idx],
+            starts_from_zero,
+            dn_layer_idx,
+            ops,
+        )?);
+    }
+    Ok(Some(Tensor::stack(&rows, 0)?))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deltanet_prefill_group_pooled_batched(
+    gdn: &mut Qwen3_5GatedDeltaNet,
+    packed: &Tensor,
+    offsets: &[usize],
+    seq_len: usize,
+    indices: &[usize],
+    pool: &mut crate::deltanet_pool::DeltaNetPool,
+    slot_ids: &[u32],
+    state_is_zero: Option<&[bool]>,
+    dn_layer_idx: usize,
+    ops: &dyn crate::ops::Ops,
+) -> Result<Option<Tensor>> {
+    let batch = indices.len();
+    if batch <= 1 || seq_len <= 1 || !packed.device().is_cuda() {
+        return Ok(None);
+    }
+
+    let starts_from_zero: Vec<bool> = indices
+        .iter()
+        .map(|&req_idx| {
+            state_is_zero
+                .and_then(|flags| flags.get(req_idx))
+                .copied()
+                .unwrap_or(false)
+        })
+        .collect();
+
+    let bst = BatchState::no_lora();
+    let x = grouped_prefill_input(packed, offsets, seq_len, indices)?; // [B, L, hidden]
+
+    let qkv = gdn.in_proj_qkv.forward(&x, &bst, ops)?; // [B, L, conv_dim]
+    let z = gdn.in_proj_z.forward(&x, &bst, ops)?; // [B, L, value_dim]
+    let b_raw = gdn.in_proj_b.forward(&x, &bst, ops)?; // [B, L, HV]
+    let a_raw = gdn.in_proj_a.forward(&x, &bst, ops)?; // [B, L, HV]
+
+    let pad_len = gdn.conv_kernel - 1;
+    let all_zero = starts_from_zero.iter().all(|&v| v);
+    let conv_initial = if all_zero {
+        None
+    } else {
+        let mut rows = Vec::with_capacity(batch);
+        let zero_row = Tensor::zeros((pad_len, gdn.conv_dim), qkv.dtype(), qkv.device())?;
+        for (group_pos, &req_idx) in indices.iter().enumerate() {
+            if starts_from_zero[group_pos] {
+                rows.push(zero_row.clone());
+            } else {
+                let slot = slot_ids[req_idx] as usize;
+                rows.push(
+                    pool.conv_states[dn_layer_idx]
+                        .get(slot)?
+                        .transpose(0, 1)?
+                        .contiguous()?,
+                );
+            }
+        }
+        Some(Tensor::stack(&rows, 0)?.contiguous()?) // [B, W-1, conv_dim]
+    };
+
+    let Some(qkv_conv_result) = ops.causal_conv1d_fn_channellast(
+        &qkv,
+        &gdn.conv_weight,
+        None,
+        conv_initial.as_ref(),
+        /*silu_activation=*/ true,
+    ) else {
+        return Ok(None);
+    };
+    let qkv_conv = qkv_conv_result?; // [B, L, conv_dim]
+
+    let next_conv = if seq_len >= pad_len {
+        qkv.narrow(1, seq_len - pad_len, pad_len)?
+            .transpose(1, 2)?
+            .contiguous()? // [B, conv_dim, W-1]
+    } else {
+        let initial = match conv_initial {
+            Some(ref t) => t.clone(),
+            None => Tensor::zeros((batch, pad_len, gdn.conv_dim), qkv.dtype(), qkv.device())?,
+        };
+        let keep = initial.narrow(1, seq_len, pad_len - seq_len)?;
+        Tensor::cat(&[&keep, &qkv], 1)?
+            .transpose(1, 2)?
+            .contiguous()? // [B, conv_dim, W-1]
+    };
+
+    let total_tokens = batch * seq_len;
+    let mixed = qkv_conv.reshape((total_tokens, gdn.conv_dim))?;
+    let a_2d = a_raw.reshape((total_tokens, gdn.num_v_heads))?;
+    let b_2d = b_raw.reshape((total_tokens, gdn.num_v_heads))?;
+
+    let Some(prep) = ops.gdn_post_conv(
+        &mixed,
+        &a_2d,
+        &b_2d,
+        &gdn.a_log_f32,
+        &gdn.dt_bias_f32,
+        gdn.num_k_heads,
+        gdn.num_v_heads,
+        gdn.head_k_dim,
+    ) else {
+        return Ok(None);
+    };
+    let (q_bf16, k_bf16, v_bf16, alpha, beta) = prep?;
+
+    let mut cu = Vec::with_capacity(batch + 1);
+    for i in 0..=batch {
+        cu.push((i * seq_len) as i64);
+    }
+    let cu_seqlens = Tensor::from_vec(cu, (batch + 1,), packed.device())?;
+
+    let recurrent_initial = if all_zero {
+        None
+    } else {
+        let zero_row;
+        let mut rows = Vec::with_capacity(batch);
+        zero_row = Tensor::zeros(
+            (gdn.num_v_heads, gdn.head_v_dim, gdn.head_k_dim),
+            DType::F32,
+            packed.device(),
+        )?;
+        for (group_pos, &req_idx) in indices.iter().enumerate() {
+            if starts_from_zero[group_pos] {
+                rows.push(zero_row.clone());
+            } else {
+                let slot = slot_ids[req_idx] as usize;
+                rows.push(
+                    pool.recurrent_states[dn_layer_idx]
+                        .get(slot)?
+                        .contiguous()?,
+                );
+            }
+        }
+        Some(Tensor::stack(&rows, 0)?.contiguous()?)
+    };
 
     let scale = (gdn.head_k_dim as f32).powf(-0.5);
     let Some(result) = ops.gdn_prefill_varlen(
@@ -2051,7 +2893,7 @@ fn deltanet_prefill_group_fused(
         &alpha,
         &beta,
         &cu_seqlens,
-        Some(&initial_state),
+        recurrent_initial.as_ref(),
         scale,
     ) else {
         return Ok(None);
@@ -2059,20 +2901,14 @@ fn deltanet_prefill_group_fused(
     let (out, final_state) = result?;
 
     for (group_pos, &req_idx) in indices.iter().enumerate() {
-        let x_row = x_t.get(group_pos)?;
-        let new_conv_state = if seq_len >= pad_len {
-            x_row.narrow(1, seq_len - pad_len, pad_len)?.contiguous()?
-        } else {
-            let old = prefix
-                .get(group_pos)?
-                .narrow(1, seq_len, pad_len - seq_len)?;
-            Tensor::cat(&[&old, &x_row], 1)?.contiguous()?
-        };
-        let conv_row = new_conv_state.unsqueeze(0)?.contiguous()?;
-        pool_conv.slice_set(&conv_row, 0, slot_ids[req_idx] as usize)?;
-
+        let slot = slot_ids[req_idx] as usize;
+        let row = next_conv.get(group_pos)?.unsqueeze(0)?.contiguous()?;
+        pool.conv_states[dn_layer_idx].slice_set(&row, 0, slot)?;
+    }
+    for (group_pos, &req_idx) in indices.iter().enumerate() {
+        let slot = slot_ids[req_idx] as usize;
         let row = final_state.get(group_pos)?.unsqueeze(0)?.contiguous()?;
-        pool_state.slice_set(&row, 0, slot_ids[req_idx] as usize)?;
+        pool.recurrent_states[dn_layer_idx].slice_set(&row, 0, slot)?;
     }
 
     let out = out.reshape((batch, seq_len, gdn.value_dim))?;
@@ -2103,6 +2939,15 @@ fn deltanet_decode_batched_fused(
 
     let n = slot_ids.len();
     if n == 0 {
+        return Ok(None);
+    }
+    if !ops.kda_decode_available_for(
+        n,
+        gdn.num_k_heads,
+        gdn.num_v_heads,
+        gdn.head_k_dim,
+        gdn.head_v_dim,
+    ) {
         return Ok(None);
     }
     // `packed` is `[total_tokens, hidden]` and all seq_lens == 1, so
@@ -2137,10 +2982,11 @@ fn deltanet_decode_batched_fused(
         }
     };
     let qkv_conv = {
-        let x_bd = qkv_for_conv_2d.contiguous()?; // [N, conv_dim]
-        let pool_conv = &pool.conv_states[dn_layer_idx]; // [pool_size, conv_dim, state_len]
-                                                         // causal_conv1d_update wants x: [N, dim, 1], conv_state: [pool, dim, sl]
-                                                         // We need to check if the fused kernel path is available
+        let x_bd = qkv_for_conv_2d.contiguous()?;
+        let pool_conv = &pool.conv_states[dn_layer_idx];
+        // causal_conv1d_update wants x: [N, dim, 1], conv_state:
+        // [pool, dim, sl]. We need to check if the fused kernel path is
+        // available.
         if let Some(res) = ops.causal_conv1d_update(
             &x_bd,            // [N, conv_dim]
             pool_conv,        // [pool_size, conv_dim, state_len]
@@ -2193,8 +3039,8 @@ fn deltanet_decode_batched_fused(
         &v_nhv,
         &a_2d,
         &b_2d,
-        &gdn.a_log,
-        &gdn.dt_bias,
+        &gdn.a_log_f32,
+        &gdn.dt_bias_f32_expanded,
         &pool.recurrent_states[dn_layer_idx],
         slot_ids_gpu,
     ) {
@@ -2270,12 +3116,16 @@ impl Qwen3_5DecoderLayer {
     ) -> Result<Tensor> {
         let ops = ctx.ops;
         let h = ops.rms_norm(x, &self.ln1_weight, self.rms_norm_eps)?;
+
         let h = match &mut self.token_mixer {
             TokenMixer::FullAttention(attn) => attn.forward(&h, ctx)?,
             TokenMixer::LinearAttention(gdn) => deltanet_varlen(gdn, &h, seq_lens, ops)?,
         };
+
         let (x_res, h2) = ops.add_rmsnorm(x, &h, &self.ln2_weight, self.rms_norm_eps)?;
-        ops.add_or_fused(&x_res, &self.mlp.forward(ops, &h2)?)
+
+        let mlp = self.mlp.forward(ops, &h2)?;
+        ops.add_or_fused(&x_res, &mlp)
     }
 
     fn forward_with_paged_prefix_pooled(
@@ -2291,6 +3141,7 @@ impl Qwen3_5DecoderLayer {
         pool: &mut crate::deltanet_pool::DeltaNetPool,
         slot_ids: &[u32],
         slot_ids_gpu: Option<&Tensor>,
+        state_is_zero: Option<&[bool]>,
         dn_layer_idx: usize,
     ) -> Result<Tensor> {
         let h = ops.rms_norm(x, &self.ln1_weight, self.rms_norm_eps)?;
@@ -2302,6 +3153,7 @@ impl Qwen3_5DecoderLayer {
                 pool,
                 slot_ids,
                 slot_ids_gpu,
+                state_is_zero,
                 dn_layer_idx,
                 ops,
             )?,
@@ -2425,6 +3277,7 @@ impl Qwen3_5Model {
                                 pool,
                                 slots,
                                 ctx.deltanet_slots_gpu,
+                                ctx.deltanet_state_is_zero,
                                 dn_layer_idx,
                             )?;
                         } else {
@@ -2594,7 +3447,7 @@ pub(crate) mod meta {
     use crate::cache::deltanet_pool::DeltaNetPoolConfig;
     use crate::engine::EngineError;
     use crate::engine::{CommonModelConfig, RuntimeCaps, TaskKind, WeightsBackend};
-    use crate::models::registry::{candle_model_err, parse_json, ArchSpec, ParsedModelConfig};
+    use crate::models::registry::{ArchSpec, ParsedModelConfig, candle_model_err, parse_json};
 
     const ARCHITECTURE_ALIASES: &[&str] = &["Qwen3_5", "Qwen35", "Qwen3_5Moe", "Qwen35Moe"];
     const MODEL_TYPE_ALIASES: &[&str] =
@@ -2687,7 +3540,7 @@ pub(crate) mod meta {
 
             RuntimeCaps {
                 supports_kv_cache: false,
-                supports_prefix_cache: false,
+                supports_prefix_cache: device.is_cuda() && is_safetensors,
                 supports_paged_attn: device.is_cuda() && is_safetensors,
                 supports_varlen: device.is_cuda() && is_safetensors,
                 supports_deltanet: true,
@@ -2751,8 +3604,8 @@ pub mod gguf {
     use std::sync::Arc;
 
     use crate::constants::GGUF_INTERMEDIATE_SIZE_MULTIPLIER;
-    use crate::models::commons::embedding::Embedding;
     use crate::models::commons::Linear;
+    use crate::models::commons::embedding::Embedding;
 
     // ── Config ──────────────────────────────────────────────────────────────
 
@@ -2932,6 +3785,16 @@ pub mod gguf {
                     // GGUF stores -exp(A_log); convert back: A_log = ln(-ssm_a)
                     let ssm_a = Self::load_tensor(&ct, reader, &format!("{prefix}.ssm_a"), device)?;
                     let a_log = ssm_a.neg()?.log()?;
+                    let dt_bias_f32 = dt_bias.to_dtype(DType::F32)?;
+                    let dt_bias_f32_expanded = dt_bias_f32
+                        .reshape((config.linear_num_value_heads, 1))?
+                        .broadcast_as((config.linear_num_value_heads, config.linear_key_head_dim))?
+                        .contiguous()?;
+                    let a_log_f32 = if a_log.dtype() == DType::F32 {
+                        a_log.clone()
+                    } else {
+                        a_log.to_dtype(DType::F32)?
+                    };
 
                     // Gated RMSNorm (NO +1 for ssm_norm)
                     let norm_weight = Self::load_tensor(
@@ -2964,8 +3827,10 @@ pub mod gguf {
                         in_proj_b,
                         in_proj_a,
                         conv_weight,
-                        dt_bias,
-                        a_log,
+                        dt_bias_f32,
+                        dt_bias_f32_expanded,
+                        a_log_f32,
+                        prefill_cu_seqlens: None,
                         norm,
                         out_proj,
                         conv_state: None,

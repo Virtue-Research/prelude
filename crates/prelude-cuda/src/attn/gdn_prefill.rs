@@ -1,10 +1,8 @@
 //! Gated DeltaNet (GDN) prefill.
 //!
-//! SM90 uses FlashInfer's Hopper WGMMA `gdn_prefill` utility. SM10x uses
-//! Prelude's in-tree recurrent BF16 kernel with the same linear-space
-//! DeltaNet semantics. An experimental FlashInfer CuTe DSL Blackwell AOT path
-//! is compiled when available, but stays behind `PRELUDE_GDN_SM100_AOT=1`
-//! until its TVM FFI launch path is fully validated.
+//! SM90 uses FlashInfer's Hopper WGMMA `gdn_prefill` utility. SM10x first
+//! tries FlashInfer's CuTe DSL Blackwell AOT path when the vendored build
+//! produced it, then falls back to Prelude's in-tree recurrent BF16 kernel.
 //!
 //! ## Semantics
 //!
@@ -79,6 +77,55 @@ const U8_DT: DLDataType = DLDataType {
 fn registry() -> &'static KernelRegistry {
     static REG: OnceLock<KernelRegistry> = OnceLock::new();
     REG.get_or_init(KernelRegistry::new)
+}
+
+fn cuda_device(device: &prelude_core::tensor::Device) -> Result<candle_core::CudaDevice> {
+    match device {
+        prelude_core::tensor::Device::Cuda(d) => Ok(d.clone()),
+        _ => bail!("GDN prefill: expected CUDA device"),
+    }
+}
+
+fn uninit_bf16_3(
+    device: &prelude_core::tensor::Device,
+    shape: (usize, usize, usize),
+) -> Result<Tensor> {
+    let dev = cuda_device(device)?;
+    let data = unsafe { dev.alloc::<bf16>(shape.0 * shape.1 * shape.2) }?;
+    let storage = candle_core::CudaStorage::wrap_cuda_slice(data, dev);
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(storage),
+        shape,
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+fn uninit_f32_4(
+    device: &prelude_core::tensor::Device,
+    shape: (usize, usize, usize, usize),
+) -> Result<Tensor> {
+    let dev = cuda_device(device)?;
+    let data = unsafe { dev.alloc::<f32>(shape.0 * shape.1 * shape.2 * shape.3) }?;
+    let storage = candle_core::CudaStorage::wrap_cuda_slice(data, dev);
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(storage),
+        shape,
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+fn uninit_u8_1(device: &prelude_core::tensor::Device, len: usize) -> Result<Tensor> {
+    let dev = cuda_device(device)?;
+    let data = unsafe { dev.alloc::<u8>(len) }?;
+    let storage = candle_core::CudaStorage::wrap_cuda_slice(data, dev);
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(storage),
+        (len,),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
 }
 
 fn contiguous_strides(shape: &[i64]) -> Vec<i64> {
@@ -223,7 +270,12 @@ pub(crate) fn try_prefill(
     }
 
     if (100..110).contains(&arch) {
-        if sm100_aot_enabled() {
+        // Keep FlashInfer's SM100 persistent GDN AOT kernel opt-in for now.
+        // It is fast in smoke tests, but real activation end-to-end runs have
+        // reproduced device-side hangs in Prelude's static TVM-FFI path. The
+        // recurrent Blackwell kernel is the production default until the AOT
+        // path is proven stable.
+        if sm100_aot_enabled() && initial_state.is_none() && num_seqs == 1 {
             if let Some(result) = try_prefill_blackwell_aot(
                 reg,
                 q,
@@ -271,10 +323,10 @@ pub(crate) fn try_prefill(
     };
 
     // ── Output buffers ──────────────────────────────────────────────
-    let out = Tensor::zeros((t, num_sab_heads, d), DType::BF16, device)?;
+    let out = uninit_bf16_3(device, (t, num_sab_heads, d))?;
     // Kernel unconditionally writes final state — allocate even if the
     // caller doesn't care. Shape `[num_seqs, num_sab_heads, D, D]` F32.
-    let final_state = Tensor::zeros((num_seqs, num_sab_heads, d, d), DType::F32, device)?;
+    let final_state = uninit_f32_4(device, (num_seqs, num_sab_heads, d, d))?;
 
     // Workspace: kernel stores one TMA tensormap per SM on Hopper.
     // Upstream's Python wrapper uses `sm_count * 128` bytes; we pad to
@@ -282,7 +334,7 @@ pub(crate) fn try_prefill(
     // we'd over-provision otherwise.
     let sm_count = detect_sm_count();
     let workspace_bytes = (sm_count as usize) * 256;
-    let workspace = Tensor::zeros((workspace_bytes,), DType::U8, device)?;
+    let workspace = uninit_u8_1(device, workspace_bytes)?;
 
     // ── Extract device pointers (flashinfer-style storage_and_layout) ──
     let (out_storage, _) = out.storage_and_layout();
@@ -410,8 +462,31 @@ fn sm100_aot_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("PRELUDE_GDN_SM100_AOT")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .map(|v| {
+                matches!(
+                    v.as_str(),
+                    "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+                )
+            })
             .unwrap_or(false)
+    })
+}
+
+fn sm100_aot_sync_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        // FlashInfer's SM100 persistent GDN AOT path is not safe to leave
+        // multiple launches outstanding in Prelude's static TVM-FFI setup. Keep
+        // the boundary conservative by default; developers can disable it for
+        // profiling with PRELUDE_GDN_SM100_SYNC=0.
+        std::env::var("PRELUDE_GDN_SM100_SYNC")
+            .map(|v| {
+                !matches!(
+                    v.as_str(),
+                    "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
+                )
+            })
+            .unwrap_or(true)
     })
 }
 
@@ -467,10 +542,10 @@ fn try_prefill_blackwell_aot(
         None => Tensor::zeros((num_seqs, num_sab_heads, d, d), DType::F32, device)?,
     };
 
-    let out = Tensor::zeros((t, num_sab_heads, d), DType::BF16, device)?;
-    let final_state = Tensor::zeros((num_seqs, num_sab_heads, d, d), DType::F32, device)?;
+    let out = uninit_bf16_3(device, (t, num_sab_heads, d))?;
+    let final_state = uninit_f32_4(device, (num_seqs, num_sab_heads, d, d))?;
     let workspace_bytes = detect_sm_count() as usize * 4 * 128; // q/k/v/o TMA descriptors per persistent CTA.
-    let workspace = Tensor::zeros((workspace_bytes,), DType::U8, device)?;
+    let workspace = uninit_u8_1(device, workspace_bytes)?;
 
     macro_rules! cuda_ptr {
         ($t:expr, $ty:ty) => {{
@@ -547,6 +622,11 @@ fn try_prefill_blackwell_aot(
     unsafe {
         reg.call(kernel, &args)
             .map_err(|e| candle_core::Error::Msg(format!("FlashInfer GDN SM100: {e}")))?;
+    }
+    if sm100_aot_sync_enabled() {
+        stream
+            .synchronize()
+            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer GDN SM100 sync: {e}")))?;
     }
 
     drop(q_c);

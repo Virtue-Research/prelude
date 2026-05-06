@@ -33,6 +33,12 @@ impl Scheduler {
                 if self.config.long_prefill_token_threshold > 0 {
                     chunk = chunk.min(self.config.long_prefill_token_threshold);
                 }
+                if seq.kv_computed_len == 0
+                    && let Some(prefix_chunk) =
+                        hybrid_prefix_bootstrap_chunk(seq, self.config.block_size)
+                {
+                    chunk = chunk.min(prefix_chunk);
+                }
                 chunk = chunk.min(token_budget);
                 if chunk > 0 {
                     if let Some(key) = seq.prefix_cache_key {
@@ -246,6 +252,14 @@ impl Scheduler {
             if self.config.long_prefill_token_threshold > 0 {
                 chunk = chunk.min(self.config.long_prefill_token_threshold);
             }
+            if seq.kv_computed_len == 0
+                && let Some(prefix_chunk) = hybrid_prefix_bootstrap_chunk(seq, block_size)
+            {
+                chunk = chunk.min(prefix_chunk);
+            }
+            if seq.prefill_must_be_atomic && seq.kv_computed_len == 0 && chunk > token_budget {
+                break;
+            }
             // Per-step token budget
             chunk = chunk.min(token_budget);
 
@@ -285,6 +299,20 @@ impl Scheduler {
         while let Some(seq) = deferred_same_prefix.pop_back() {
             self.waiting_queue.push_front(seq);
         }
+    }
+}
+
+fn hybrid_prefix_bootstrap_chunk(seq: &Sequence, block_size: usize) -> Option<usize> {
+    if block_size == 0 || seq.prefix_cache_key.is_none() || seq.deltanet_slot.is_none() {
+        return None;
+    }
+
+    let key_tokens = (block_size * 8).min(seq.input_ids.len());
+    let key_tokens = key_tokens - (key_tokens % block_size);
+    if key_tokens >= block_size && key_tokens < seq.input_ids.len() {
+        Some(key_tokens)
+    } else {
+        None
     }
 }
 

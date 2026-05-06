@@ -197,6 +197,160 @@ pub(crate) fn try_fwd(
     Ok(Some(out))
 }
 
+/// Fused prefill conv1d for channel-last `[B, L, D]` input/output.
+pub(crate) fn try_fwd_channellast(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    initial_states: Option<&Tensor>,
+    silu_activation: bool,
+) -> Result<Option<Tensor>> {
+    if !x.device().is_cuda() {
+        return Ok(None);
+    }
+
+    let (batch, seqlen, dim) = x.dims3()?;
+    let (wd, width) = weight.dims2()?;
+    if wd != dim {
+        bail!("causal_conv1d_fwd_channellast: weight dim {wd} != x dim {dim}");
+    }
+    if !(2..=4).contains(&width) {
+        return Ok(None);
+    }
+
+    let Some(input_dtype) = dtype_tag(x.dtype()) else {
+        return Ok(None);
+    };
+    let Some(weight_dtype) = dtype_tag(weight.dtype()) else {
+        return Ok(None);
+    };
+
+    if let Some(init) = initial_states {
+        let init_dims = init.dims();
+        if init_dims != [batch, width - 1, dim] {
+            bail!(
+                "causal_conv1d_fwd_channellast: initial_states shape {:?} != [{batch}, {}, {dim}]",
+                init_dims,
+                width - 1
+            );
+        }
+        if init.dtype() != x.dtype() {
+            bail!(
+                "causal_conv1d_fwd_channellast: initial_states dtype {:?} != x dtype {:?}",
+                init.dtype(),
+                x.dtype()
+            );
+        }
+    }
+
+    let x_c = x.contiguous()?;
+    let weight_c = weight.contiguous()?;
+    let bias_c = match bias {
+        Some(b) => Some(b.contiguous()?),
+        None => None,
+    };
+    let init_c = match initial_states {
+        Some(s) => Some(s.contiguous()?),
+        None => None,
+    };
+    let out = Tensor::zeros((batch, seqlen, dim), x.dtype(), x.device())?;
+
+    let (out_storage, _) = out.storage_and_layout();
+    let cuda_dev = match &*out_storage {
+        candle_core::Storage::Cuda(s) => s.device().clone(),
+        _ => bail!("causal_conv1d_fwd_channellast: output not on CUDA"),
+    };
+    drop(out_storage);
+    let stream = cuda_dev.cuda_stream();
+    let stream_ptr = stream.cu_stream() as *const c_void;
+
+    macro_rules! cuda_ptr {
+        ($t:expr, $ty:ty) => {{
+            let (storage, layout) = $t.storage_and_layout();
+            let cuda = match &*storage {
+                candle_core::Storage::Cuda(s) => s,
+                _ => bail!("causal_conv1d_fwd_channellast: tensor not on CUDA"),
+            };
+            let slice = cuda.as_cuda_slice::<$ty>()?.slice(layout.start_offset()..);
+            let (ptr, _guard) = slice.device_ptr(&stream);
+            ptr as u64 as *mut c_void
+        }};
+    }
+
+    let (x_ptr, w_ptr, out_ptr, bias_ptr, init_ptr) = match x.dtype() {
+        DType::BF16 => {
+            let xp = cuda_ptr!(x_c, bf16);
+            let wp = cuda_ptr!(weight_c, bf16);
+            let op = cuda_ptr!(out, bf16);
+            let bp = match bias_c.as_ref() {
+                Some(b) => Some(cuda_ptr!(b, bf16)),
+                None => None,
+            };
+            let ip = match init_c.as_ref() {
+                Some(i) => Some(cuda_ptr!(i, bf16)),
+                None => None,
+            };
+            (xp, wp, op, bp, ip)
+        }
+        DType::F16 => {
+            let xp = cuda_ptr!(x_c, f16);
+            let wp = cuda_ptr!(weight_c, f16);
+            let op = cuda_ptr!(out, f16);
+            let bp = match bias_c.as_ref() {
+                Some(b) => Some(cuda_ptr!(b, f16)),
+                None => None,
+            };
+            let ip = match init_c.as_ref() {
+                Some(i) => Some(cuda_ptr!(i, f16)),
+                None => None,
+            };
+            (xp, wp, op, bp, ip)
+        }
+        DType::F32 => {
+            let xp = cuda_ptr!(x_c, f32);
+            let wp = cuda_ptr!(weight_c, f32);
+            let op = cuda_ptr!(out, f32);
+            let bp = match bias_c.as_ref() {
+                Some(b) => Some(cuda_ptr!(b, f32)),
+                None => None,
+            };
+            let ip = match init_c.as_ref() {
+                Some(i) => Some(cuda_ptr!(i, f32)),
+                None => None,
+            };
+            (xp, wp, op, bp, ip)
+        }
+        _ => unreachable!("dtype_tag guarded above"),
+    };
+
+    unsafe {
+        ffi::causal_conv1d_fwd_channellast(
+            stream_ptr,
+            x_ptr as *const c_void,
+            w_ptr as *const c_void,
+            bias_ptr.map(|p| p as *const c_void),
+            init_ptr.map(|p| p as *const c_void),
+            /*final_states=*/ None,
+            out_ptr,
+            batch as i32,
+            dim as i32,
+            seqlen as i32,
+            width as i32,
+            silu_activation,
+            input_dtype,
+            weight_dtype,
+        )
+        .map_err(candle_core::Error::msg)?;
+    }
+
+    drop(x_c);
+    drop(weight_c);
+    drop(bias_c);
+    drop(init_c);
+
+    Ok(Some(out))
+}
+
 /// Single-token decode step. `conv_state` is updated in place.
 ///
 /// When `conv_state_indices` is `Some(&indices)`, `conv_state` is a pool

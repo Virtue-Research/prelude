@@ -7,7 +7,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use prelude_core::engine::executor::{ExecutionHandle, Executor, ForwardBatch, ModelOutput};
+use prelude_core::engine::executor::{
+    ExecutionHandle, Executor, ForwardBatch, ModelOutput, StepRequest,
+};
 use prelude_core::engine::{Engine, EngineError, OwnedBatchDecodeSeq};
 use prelude_core::tensor::{D, Tensor};
 
@@ -28,6 +30,7 @@ pub struct CudaExecutor {
 impl CudaExecutor {
     pub fn new(engine: Arc<Engine>) -> Self {
         let (work_tx, mut work_rx) = tokio::sync::mpsc::unbounded_channel::<GpuWork>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let worker_engine = engine.clone();
         let worker = std::thread::Builder::new()
             .name("gpu-executor".into())
@@ -54,6 +57,9 @@ impl CudaExecutor {
                 if supports_graph {
                     graph_cache.warmup_all(&worker_engine);
                 }
+                warmup_mixed_prefill(&worker_engine, false);
+                warmup_mixed_prefill(&worker_engine, true);
+                let _ = ready_tx.send(());
 
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -68,6 +74,7 @@ impl CudaExecutor {
                 tracing::debug!("GPU executor worker exited");
             })
             .expect("spawn GPU executor worker thread");
+        let _ = ready_rx.recv();
         Self {
             _engine: engine,
             work_tx,
@@ -181,6 +188,127 @@ fn execute_work(
             let elapsed_us = t0.elapsed().as_micros();
             tracing::debug!(elapsed_us, path = "mixed", "forward step");
             result
+        }
+    }
+}
+
+fn warmup_mixed_prefill(engine: &Engine, needs_kv_cache: bool) {
+    let token_budget = engine.engine_config.runtime.profile_tokens.clamp(4, 8192);
+    let batch = 2usize;
+    let seq_len = (token_budget / batch).clamp(2, 4096);
+    let path = if needs_kv_cache {
+        "paged_prefill"
+    } else {
+        "ragged_prefill"
+    };
+    let t0 = Instant::now();
+
+    let mut block_tables = vec![Vec::new(); batch];
+    if needs_kv_cache {
+        let Some(bm_mutex) = engine.cache.block_manager_arc() else {
+            tracing::debug!("mixed prefill warmup skipped: block manager unavailable");
+            return;
+        };
+        let mut bm = match bm_mutex.lock() {
+            Ok(bm) => bm,
+            Err(e) => {
+                tracing::warn!(error = %e, "mixed prefill warmup skipped: block manager lock");
+                return;
+            }
+        };
+        for table in &mut block_tables {
+            let Some(allocated) = bm.allocate_for_tokens(seq_len) else {
+                tracing::warn!(
+                    seq_len,
+                    batch,
+                    "mixed prefill warmup skipped: insufficient KV blocks"
+                );
+                drop(bm);
+                free_warmup_blocks(engine, &block_tables);
+                return;
+            };
+            *table = allocated;
+        }
+    }
+
+    let mut deltanet_slots = vec![None; batch];
+    if needs_kv_cache && let Some(pool_mutex) = &engine.cache.deltanet_pool {
+        let mut pool = match pool_mutex.lock() {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::warn!(error = %e, "mixed prefill warmup skipped: DeltaNet pool lock");
+                free_warmup_blocks(engine, &block_tables);
+                return;
+            }
+        };
+        for slot in &mut deltanet_slots {
+            let Some(allocated) = pool.allocate() else {
+                tracing::warn!(
+                    seq_len,
+                    batch,
+                    "mixed prefill warmup skipped: insufficient DeltaNet slots"
+                );
+                drop(pool);
+                free_warmup_deltanet_slots(engine, &deltanet_slots);
+                free_warmup_blocks(engine, &block_tables);
+                return;
+            };
+            *slot = Some(allocated);
+        }
+    }
+
+    let requests = (0..batch)
+        .map(|i| StepRequest {
+            tokens: vec![0; seq_len],
+            context_len: seq_len,
+            position_start: 0,
+            block_table: block_tables[i].clone(),
+            is_prefill_final: true,
+            is_prefill_partial: false,
+            deltanet_slot: deltanet_slots[i],
+            prompt_logprobs: None,
+            needs_kv_cache,
+        })
+        .collect();
+
+    let result = engine.forward_batch(ForwardBatch::Mixed {
+        requests,
+        sample_greedy: true,
+    });
+
+    free_warmup_deltanet_slots(engine, &deltanet_slots);
+    free_warmup_blocks(engine, &block_tables);
+
+    match result {
+        Ok(_) => tracing::info!(
+            path,
+            batch,
+            seq_len,
+            elapsed_ms = t0.elapsed().as_millis(),
+            "mixed prefill warmup complete"
+        ),
+        Err(e) => tracing::warn!(path, batch, seq_len, error = %e, "mixed prefill warmup failed"),
+    }
+}
+
+fn free_warmup_blocks(engine: &Engine, block_tables: &[Vec<u32>]) {
+    let Some(bm_mutex) = engine.cache.block_manager_arc() else {
+        return;
+    };
+    if let Ok(mut bm) = bm_mutex.lock() {
+        for table in block_tables {
+            bm.free(table);
+        }
+    }
+}
+
+fn free_warmup_deltanet_slots(engine: &Engine, slots: &[Option<u32>]) {
+    let Some(pool_mutex) = &engine.cache.deltanet_pool else {
+        return;
+    };
+    if let Ok(mut pool) = pool_mutex.lock() {
+        for slot in slots.iter().flatten() {
+            pool.free(*slot);
         }
     }
 }

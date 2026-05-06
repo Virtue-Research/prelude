@@ -80,10 +80,10 @@ impl Ops for CudaOps {
     // ── Normalization (CUDA kernels) ──────────────────────────────
 
     fn rms_norm(&self, x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
-        // Fast kernel only supports matching BF16 weight — F32 weight falls through
-        // to the composed path, which casts weight to F32 and does the mul in F32
-        // (matches HF reference for models that carry small `+1` residual weights).
-        if x.dtype() == DType::BF16 && weight.dtype() == DType::BF16 {
+        // The fast kernel supports BF16 input with BF16 or F32 weights. The F32
+        // weight variant keeps HF parity for models with small `+1` residual
+        // norm weights while avoiding the composed multi-kernel path.
+        if x.dtype() == DType::BF16 && matches!(weight.dtype(), DType::BF16 | DType::F32) {
             return crate::ops::rmsnorm::fast_rmsnorm(x, weight, eps as f64);
         }
         prelude_core::ops::traits::norm::rms_norm(x, weight, eps)
@@ -196,6 +196,25 @@ impl Ops for CudaOps {
             topk_weights,
             w1,
             w2,
+        ))
+    }
+
+    fn shared_expert_gate(
+        &self,
+        input: &Tensor,
+        shared_out: &Tensor,
+        gate_weight: &Tensor,
+    ) -> Option<Result<Tensor>> {
+        if input.dtype() != DType::BF16
+            || shared_out.dtype() != DType::BF16
+            || gate_weight.dtype() != DType::BF16
+        {
+            return None;
+        }
+        Some(crate::ops::moe::shared_expert_gate(
+            input,
+            shared_out,
+            gate_weight,
         ))
     }
 
@@ -523,8 +542,21 @@ impl Ops for CudaOps {
         }
     }
 
-    fn kda_decode_available(&self) -> bool {
-        crate::attn::kda_decode::supported_on_current_arch()
+    fn kda_decode_available_for(
+        &self,
+        batch: usize,
+        num_k_heads: usize,
+        num_v_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+    ) -> bool {
+        crate::attn::kda_decode::variant_available(
+            batch,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+        )
     }
 
     fn causal_conv1d_fn(
@@ -537,6 +569,27 @@ impl Ops for CudaOps {
     ) -> Option<Result<Tensor>> {
         match crate::attn::causal_conv1d::try_fwd(x, weight, bias, initial_states, silu_activation)
         {
+            Ok(Some(t)) => Some(Ok(t)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    fn causal_conv1d_fn_channellast(
+        &self,
+        x: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        initial_states: Option<&Tensor>,
+        silu_activation: bool,
+    ) -> Option<Result<Tensor>> {
+        match crate::attn::causal_conv1d::try_fwd_channellast(
+            x,
+            weight,
+            bias,
+            initial_states,
+            silu_activation,
+        ) {
             Ok(Some(t)) => Some(Ok(t)),
             Ok(None) => None,
             Err(e) => Some(Err(e)),

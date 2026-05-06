@@ -22,6 +22,8 @@ which we import via the `PRELUDE_KB_SCRIPTS_DIR` env var that
 import os
 import sys
 from dataclasses import dataclass
+import importlib
+import importlib.util
 from pathlib import Path
 from typing import Optional
 
@@ -39,6 +41,17 @@ from dsl_driver import (  # noqa: E402
 def get_arch_from_env():
     arch_str = os.environ.get("CUTE_DSL_ARCH", "sm_90a")
     return int("".join(c for c in arch_str.split("_")[1] if c.isdigit()))
+
+
+def import_kda_decode_module():
+    """Import cuLA's KDA decode module across upstream layout changes."""
+    for module_name in ("cula.ops.kda_decode", "cula.kda.kda_decode"):
+        if importlib.util.find_spec(module_name) is not None:
+            return importlib.import_module(module_name)
+    raise ModuleNotFoundError(
+        "Could not find cuLA KDA decode module; tried "
+        "cula.ops.kda_decode and cula.kda.kda_decode"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -204,14 +217,12 @@ def compile_chunk_delta_h(spec: ChunkDeltaHSpec, arch: int, output_dir: Path):
 def compile_kda_decode(spec: KdaDecodeSpec, arch: int, output_dir: Path):
     """AOT-compile one kda_decode variant to a .o file.
 
-    The launcher (`run_small_batch`, `run_large_batch`, etc. in
-    `cula.kda.kda_decode`) deletes `B`, `T`, `K`, `use_initial_state`,
+    The launcher (`run_small_batch`, `run_large_batch`, etc.) deletes
+    `B`, `T`, `K`, `use_initial_state`,
     `cu_seqlens` inside the jit body, so the compiled kernel can serve any
     batch size / pool size at runtime. We only need to specialize on
     (variant, H, HV, V, use_qk_l2norm) plus the scalar constants.
     """
-    import importlib
-
     parts = [
         "cula_kda_decode",
         spec.variant,
@@ -236,7 +247,7 @@ def compile_kda_decode(spec: KdaDecodeSpec, arch: int, output_dir: Path):
         import torch
         from cutlass.cute.runtime import from_dlpack
 
-        kda_decode_mod = importlib.import_module("cula.kda.kda_decode")
+        kda_decode_mod = import_kda_decode_module()
         TILE_K = kda_decode_mod.TILE_K
         assert spec.K == TILE_K, f"kda_decode kernel requires K={TILE_K}, got K={spec.K}"
 
@@ -328,18 +339,35 @@ def compile_kda_decode(spec: KdaDecodeSpec, arch: int, output_dir: Path):
 
         stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
 
+        compile_kwargs = {
+            "softplus_beta": spec.softplus_beta,
+            "softplus_threshold": spec.softplus_threshold,
+            "scale": spec.K ** -0.5,
+            "B": 1 if is_varlen else N_placeholder,
+            "T": N_placeholder if is_varlen else 1,
+            "H": spec.H,
+            "HV": spec.HV,
+            "K": spec.K,
+            "V": spec.V,
+            "use_initial_state": True,
+            "use_qk_l2norm": spec.use_qk_l2norm,
+            "stream": stream,
+        }
+        # Newer cuLA kernels expose explicit state-layout and small-batch
+        # tuning constexprs. Our Rust state pool is VK layout:
+        # [pool, HV, V, K].
+        if hasattr(kda_decode_mod, "NUM_BLOCKS_PER_STATE_SMALL"):
+            compile_kwargs.update({
+                "state_layout_is_kv": False,
+                "precomputed_decay_beta": False,
+                "num_blocks_per_state_small": kda_decode_mod.NUM_BLOCKS_PER_STATE_SMALL,
+                "dense_small_hv_parallel": False,
+            })
+
         compiled = cute.compile(
             kernel_func,
             cu_sql_t, q_t, k_t, v_t, a_t, b_t, A_log_t, dt_bias_t, h0_src_t, h0_idx_t, o_t,
-            softplus_beta=spec.softplus_beta,
-            softplus_threshold=spec.softplus_threshold,
-            scale=spec.K ** -0.5,
-            B=1 if is_varlen else N_placeholder,
-            T=N_placeholder if is_varlen else 1,
-            H=spec.H, HV=spec.HV, K=spec.K, V=spec.V,
-            use_initial_state=True,
-            use_qk_l2norm=spec.use_qk_l2norm,
-            stream=stream,
+            **compile_kwargs,
         )
 
         # When CUTE_DSL_ENABLE_TVM_FFI=1 is set (in build.rs), `cute.compile`
@@ -421,55 +449,22 @@ def build_variant_matrix(arch: int, prototype: bool = False):
     Conservative: only compile configs needed for known model architectures.
     Expand as new models are added.
     """
-    # Common head dims for linear attention models
-    head_dims = [128]
-    num_heads_list = [32, 64]
-    chunk_sizes = [64]
-
     if prototype:
         return {
-            "lightning_prefill": [
-                LightningPrefillSpec(H=32, D=128, chunk_size=64,
-                                     has_initial_state=False, output_final_state=True),
-            ],
-            "chunk_delta_h": [
-                ChunkDeltaHSpec(H=32, K=128, V=128, chunk_size=64,
-                                is_varlen=False, persistent=False),
-            ],
-            "fwd_o": [
-                FwdOSpec(H=32, K=128, V=128, chunk_size=64, scale=1.0,
-                         is_varlen=False, persistent=False),
+            "kda_decode": [
+                KdaDecodeSpec(
+                    H=16,
+                    HV=16,
+                    K=128,
+                    V=128,
+                    variant="small_varlen",
+                    use_qk_l2norm=True,
+                ),
             ],
         }
 
-    la_prefill = []
-    delta_h = []
-    fwd_o_specs = []
     kda_decode_specs = []
-
-    for H in num_heads_list:
-        for D in head_dims:
-            for cs in chunk_sizes:
-                # Lightning Attention prefill: all state combos
-                for init_state in [False, True]:
-                    for final_state in [False, True]:
-                        la_prefill.append(LightningPrefillSpec(
-                            H=H, D=D, chunk_size=cs,
-                            has_initial_state=init_state,
-                            output_final_state=final_state,
-                        ))
-                # Chunk delta-H: varlen and non-varlen
-                for varlen in [False, True]:
-                    for persistent in [False, True]:
-                        delta_h.append(ChunkDeltaHSpec(
-                            H=H, K=D, V=D, chunk_size=cs,
-                            is_varlen=varlen, persistent=persistent,
-                        ))
-                        fwd_o_specs.append(FwdOSpec(
-                            H=H, K=D, V=D, chunk_size=cs, scale=1.0,
-                            is_varlen=varlen, persistent=persistent,
-                        ))
-    # KDA decode: one kernel per (H, HV, K=128, V=128) × 4 variants.
+    # KDA decode: one kernel per (H, HV, K=128, V=128) × varlen variants.
     # Kernel launcher reads runtime batch size / pool size from tensors,
     # so we only specialize on head counts + variant. Keep this matrix
     # aligned with Qwen3.5/Qwen3-Next DeltaNet configs we support.
@@ -479,7 +474,7 @@ def build_variant_matrix(arch: int, prototype: bool = False):
         (32, 32),
         (64, 64),
     ]
-    for variant in ("small_dense", "small_varlen", "large_dense", "large_varlen"):
+    for variant in ("small_varlen", "large_varlen"):
         for H, HV in kda_decode_head_pairs:
             kda_decode_specs.append(KdaDecodeSpec(
                 H=H, HV=HV, K=128, V=128, variant=variant, use_qk_l2norm=True,
@@ -487,16 +482,6 @@ def build_variant_matrix(arch: int, prototype: bool = False):
 
     # KDA decode works on Hopper+ (the CuTe DSL kernel targets SM90+).
     result = {"kda_decode": kda_decode_specs}
-
-    # chunk_delta_h and fwd_o use tcgen05 ops → SM100+ only.
-    # Lightning Attention prefill also requires SM100+.
-    if arch >= 100:
-        result["chunk_delta_h"] = delta_h
-        result["fwd_o"] = fwd_o_specs
-        result["lightning_prefill"] = la_prefill
-    else:
-        print(f"  Note: skipping chunk_delta_h/fwd_o/lightning_prefill "
-              f"(require SM100+, target is SM{arch})")
 
     return result
 

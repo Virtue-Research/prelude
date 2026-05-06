@@ -10,7 +10,9 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use causal_conv1d::{Dtype, causal_conv1d_fwd, causal_conv1d_update};
+use causal_conv1d::{
+    Dtype, causal_conv1d_fwd, causal_conv1d_fwd_channellast, causal_conv1d_update,
+};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 
 // ─── CPU reference ──────────────────────────────────────────────────
@@ -178,6 +180,43 @@ fn rand_vec(n: usize, seed: u64) -> Vec<f64> {
         .collect()
 }
 
+fn blc_to_bcl(x: &[f64], b: usize, l: usize, d: usize) -> Vec<f64> {
+    let mut out = vec![0.0; b * d * l];
+    for bi in 0..b {
+        for t in 0..l {
+            for c in 0..d {
+                out[bi * d * l + c * l + t] = x[bi * l * d + t * d + c];
+            }
+        }
+    }
+    out
+}
+
+fn bcl_to_blc(x: &[f64], b: usize, d: usize, l: usize) -> Vec<f64> {
+    let mut out = vec![0.0; b * l * d];
+    for bi in 0..b {
+        for c in 0..d {
+            for t in 0..l {
+                out[bi * l * d + t * d + c] = x[bi * d * l + c * l + t];
+            }
+        }
+    }
+    out
+}
+
+fn init_blc_to_bcl(init: &[f64], b: usize, k_minus_1: usize, d: usize) -> Vec<f64> {
+    let mut out = vec![0.0; b * d * k_minus_1];
+    for bi in 0..b {
+        for t in 0..k_minus_1 {
+            for c in 0..d {
+                out[bi * d * k_minus_1 + c * k_minus_1 + t] =
+                    init[bi * k_minus_1 * d + t * d + c];
+            }
+        }
+    }
+    out
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 /// BF16 forward with width=4 (Qwen3.5 DeltaNet shape) and no
@@ -229,6 +268,111 @@ fn fwd_bf16_width4_no_init() {
     let err = max_abs(&ref_out, &got);
     eprintln!("fwd_bf16_width4_no_init: max_abs_err={err:.6e}");
     assert!(err < 5e-2, "causal_conv1d_fwd max_abs_err={err}");
+}
+
+#[test]
+fn fwd_bf16_channellast_silu_no_init() {
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
+    let (b, l, d, k) = (2usize, 64usize, 128usize, 4usize);
+
+    let x_blc = rand_vec(b * l * d, 31);
+    let w_f64 = rand_vec(d * k, 32);
+    let x_bcl = blc_to_bcl(&x_blc, b, l, d);
+    let ref_bcl = cpu_ref_fwd(&x_bcl, &w_f64, None, None, b, d, l, k, true);
+    let ref_blc = bcl_to_blc(&ref_bcl, b, d, l);
+
+    let x_gpu = gpu.alloc_bf16(&x_blc);
+    let w_gpu = gpu.alloc_bf16(&w_f64);
+    let mut o_gpu = gpu.alloc_bf16(&vec![0.0f64; b * l * d]);
+    unsafe {
+        causal_conv1d_fwd_channellast(
+            gpu.stream_ptr(),
+            ptr(&x_gpu, &gpu.stream),
+            ptr(&w_gpu, &gpu.stream),
+            None,
+            None,
+            None,
+            ptr_mut(&mut o_gpu, &gpu.stream),
+            b as i32,
+            d as i32,
+            l as i32,
+            k as i32,
+            true,
+            Dtype::BF16,
+            Dtype::BF16,
+        )
+        .unwrap();
+    }
+    gpu.sync();
+
+    let got: Vec<f64> = gpu
+        .download(&o_gpu)
+        .iter()
+        .map(|x| x.to_f32() as f64)
+        .collect();
+    let err = max_abs(&ref_blc, &got);
+    eprintln!("fwd_bf16_channellast_silu_no_init: max_abs_err={err:.6e}");
+    assert!(
+        err < 5e-2,
+        "causal_conv1d_fwd_channellast(silu) max_abs_err={err}"
+    );
+}
+
+#[test]
+fn fwd_bf16_channellast_honors_initial_states() {
+    let gpu = match Gpu::new() {
+        Some(g) => g,
+        None => return,
+    };
+    let (b, l, d, k) = (1usize, 32usize, 64usize, 4usize);
+
+    let x_blc = rand_vec(b * l * d, 41);
+    let w_f64 = rand_vec(d * k, 42);
+    let init_blc = rand_vec(b * (k - 1) * d, 43);
+    let x_bcl = blc_to_bcl(&x_blc, b, l, d);
+    let init_bcl = init_blc_to_bcl(&init_blc, b, k - 1, d);
+    let ref_bcl = cpu_ref_fwd(&x_bcl, &w_f64, None, Some(&init_bcl), b, d, l, k, false);
+    let ref_blc = bcl_to_blc(&ref_bcl, b, d, l);
+
+    let x_gpu = gpu.alloc_bf16(&x_blc);
+    let w_gpu = gpu.alloc_bf16(&w_f64);
+    let init_gpu = gpu.alloc_bf16(&init_blc);
+    let mut o_gpu = gpu.alloc_bf16(&vec![0.0f64; b * l * d]);
+    unsafe {
+        causal_conv1d_fwd_channellast(
+            gpu.stream_ptr(),
+            ptr(&x_gpu, &gpu.stream),
+            ptr(&w_gpu, &gpu.stream),
+            None,
+            Some(ptr(&init_gpu, &gpu.stream)),
+            None,
+            ptr_mut(&mut o_gpu, &gpu.stream),
+            b as i32,
+            d as i32,
+            l as i32,
+            k as i32,
+            false,
+            Dtype::BF16,
+            Dtype::BF16,
+        )
+        .unwrap();
+    }
+    gpu.sync();
+
+    let got: Vec<f64> = gpu
+        .download(&o_gpu)
+        .iter()
+        .map(|x| x.to_f32() as f64)
+        .collect();
+    let err = max_abs(&ref_blc, &got);
+    eprintln!("fwd_bf16_channellast_honors_initial_states: max_abs_err={err:.6e}");
+    assert!(
+        err < 5e-2,
+        "channellast initial_states max_abs_err={err}"
+    );
 }
 
 /// BF16 forward + fused SiLU (the path Qwen3.5 uses in prefill).

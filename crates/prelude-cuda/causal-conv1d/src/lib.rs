@@ -72,6 +72,37 @@ unsafe extern "C" {
         weight_dtype: i32,
     ) -> i32;
 
+    fn cula_causal_conv1d_fwd_channellast(
+        stream: *const c_void,
+        x: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        initial_states: *const c_void,
+        final_states: *mut c_void,
+        out: *mut c_void,
+        batch: i32,
+        dim: i32,
+        seqlen: i32,
+        width: i32,
+        silu_activation: i32,
+        x_batch_stride: i64,
+        x_c_stride: i64,
+        x_l_stride: i64,
+        weight_c_stride: i64,
+        weight_width_stride: i64,
+        out_batch_stride: i64,
+        out_c_stride: i64,
+        out_l_stride: i64,
+        initial_states_batch_stride: i64,
+        initial_states_c_stride: i64,
+        initial_states_l_stride: i64,
+        final_states_batch_stride: i64,
+        final_states_c_stride: i64,
+        final_states_l_stride: i64,
+        input_dtype: i32,
+        weight_dtype: i32,
+    ) -> i32;
+
     fn cula_causal_conv1d_update(
         stream: *const c_void,
         x: *const c_void,
@@ -106,6 +137,12 @@ unsafe extern "C" {
 fn contiguous_bcl(dim: i64, seqlen: i64) -> (i64, i64, i64) {
     // C-contiguous: batch stride = dim*seqlen, c stride = seqlen, l stride = 1
     (dim * seqlen, seqlen, 1)
+}
+
+/// Contiguous strides in element counts for shape `(batch, seqlen, dim)`.
+fn contiguous_blc(dim: i64, seqlen: i64) -> (i64, i64, i64) {
+    // Channel-last: batch stride = seqlen*dim, c stride = 1, l stride = dim.
+    (dim * seqlen, 1, dim)
 }
 
 /// Contiguous strides for shape `(dim, width)`.
@@ -196,6 +233,71 @@ pub unsafe fn causal_conv1d_fwd(
     match ret {
         0 => Ok(()),
         code => Err(format!("causal_conv1d_fwd failed (code {code})")),
+    }
+}
+
+/// Channel-last prefill-side fused causal conv1d.
+///
+/// Shapes are `x/out: [B, L, D]`, `weight: [D, W]`, optional
+/// `initial_states / final_states: [B, W-1, D]`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn causal_conv1d_fwd_channellast(
+    stream: *const c_void,
+    x: *const c_void,
+    weight: *const c_void,
+    bias: Option<*const c_void>,
+    initial_states: Option<*const c_void>,
+    final_states: Option<*mut c_void>,
+    out: *mut c_void,
+    batch: i32,
+    dim: i32,
+    seqlen: i32,
+    width: i32,
+    silu_activation: bool,
+    input_dtype: Dtype,
+    weight_dtype: Dtype,
+) -> Result<(), String> {
+    let (xb, xc, xl) = contiguous_blc(dim as i64, seqlen as i64);
+    let (wc, ww) = contiguous_dw(width as i64);
+    let state_stride = contiguous_blc(dim as i64, (width - 1) as i64);
+
+    let ret = unsafe {
+        cula_causal_conv1d_fwd_channellast(
+            stream,
+            x,
+            weight,
+            bias.unwrap_or(std::ptr::null()),
+            initial_states.unwrap_or(std::ptr::null()),
+            final_states.unwrap_or(std::ptr::null_mut()),
+            out,
+            batch,
+            dim,
+            seqlen,
+            width,
+            silu_activation as i32,
+            xb,
+            xc,
+            xl,
+            wc,
+            ww,
+            xb,
+            xc,
+            xl,
+            state_stride.0,
+            state_stride.1,
+            state_stride.2,
+            state_stride.0,
+            state_stride.1,
+            state_stride.2,
+            input_dtype as i32,
+            weight_dtype as i32,
+        )
+    };
+    match ret {
+        0 => Ok(()),
+        code => Err(format!(
+            "causal_conv1d_fwd_channellast failed (code {code})"
+        )),
     }
 }
 

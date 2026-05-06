@@ -6,9 +6,9 @@
 //!   * **Phase 1 (nvcc C++)**: Compile C++ CUTLASS 3.x KDA kernels
 //!     (SM90 always, SM100 when the toolkit supports it) into
 //!     `libcula_cpp.a`. Uses [`prelude_kernelbuild::nvcc`].
-//!   * **Phase 2 (CuTe DSL Python)**: AOT compile the CuTe DSL kernels
-//!     (`kda_decode`, `lightning_prefill`, `chunk_delta_h`, `fwd_o`)
-//!     by invoking `scripts/compile_kernels.py` inside a provisioned
+//!   * **Phase 2 (CuTe DSL Python)**: AOT compile the CuTe DSL
+//!     `kda_decode` kernels by invoking `scripts/compile_kernels.py`
+//!     inside a provisioned
 //!     Python venv. Produces `.o` files under
 //!     `OUT_DIR/dsl_kernels/<arch>/` with TVM-FFI symbols. Gated behind
 //!     the `dsl` cargo feature (on by default). Runs in parallel with
@@ -369,21 +369,27 @@ fn compile_dsl_kernels(
 /// cuLA installs in three sequential pip steps:
 ///
 ///   1. **torch first** — cuLA's setup.py imports torch at build time.
-///   2. **flash-linear-attention** — provides `fla`, required by the
-///      KDA kernels. Upstream's pyproject.toml doesn't declare it, so
-///      we install it ourselves. Failure is tolerated (logged, not
-///      fatal) — if it's missing the KDA kernels are skipped but other
-///      variants still build.
+///   2. **flash-linear-attention** — optional compatibility dependency
+///      for older cuLA revisions. Failure is tolerated (logged, not
+///      fatal); current KDA decode AOT kernels do not require it.
 ///   3. **cuLA from source** with `--no-build-isolation` (torch is
 ///      already installed).
 ///
-/// We also require `cula.kda.kda_decode` importable so a stale venv
+/// We also require cuLA's KDA decode module importable so a stale venv
 /// with an older cuLA gets reinstalled from the current source tree.
 fn ensure_cula_python_env(out_dir: &Path, cula_src: &Path) -> Result<PathBuf, String> {
     let venv_dir = out_dir.join("cula-venv");
     let venv = PythonVenv::ensure(&venv_dir)?;
 
-    let check_code = "import cula; import cutlass; from cula.kda import kda_decode";
+    let check_code = r#"
+import importlib.util
+import cula
+import cutlass
+assert (
+    importlib.util.find_spec("cula.ops.kda_decode")
+    or importlib.util.find_spec("cula.kda.kda_decode")
+), "kda_decode module not found"
+"#;
     if venv.check_import(check_code) {
         return Ok(venv.python_path().to_path_buf());
     }
