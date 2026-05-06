@@ -479,6 +479,8 @@ fn admit_prepared_request(
                 return;
             }
         }
+    } else if deltanet_pool.is_some() {
+        seq.prefill_must_be_atomic = true;
     }
     scheduler.add_request(seq);
     let max_new_tokens = prepared.max_new;

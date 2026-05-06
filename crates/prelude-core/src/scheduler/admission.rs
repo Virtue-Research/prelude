@@ -246,6 +246,9 @@ impl Scheduler {
             if self.config.long_prefill_token_threshold > 0 {
                 chunk = chunk.min(self.config.long_prefill_token_threshold);
             }
+            if seq.prefill_must_be_atomic && seq.kv_computed_len == 0 && chunk > token_budget {
+                break;
+            }
             // Per-step token budget
             chunk = chunk.min(token_budget);
 

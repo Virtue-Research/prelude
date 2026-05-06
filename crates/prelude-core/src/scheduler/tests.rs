@@ -23,6 +23,12 @@ fn make_seq_with_prefix_key(
     seq
 }
 
+fn make_atomic_prefill_seq(id: &str, prompt_len: usize, max_new: u32) -> Sequence {
+    let mut seq = make_seq(id, prompt_len, max_new);
+    seq.prefill_must_be_atomic = true;
+    seq
+}
+
 #[test]
 fn test_basic_prefill_then_decode() {
     let config = SchedulerConfig {
@@ -624,6 +630,27 @@ fn test_second_waiting_request_gets_chunked() {
     let r2 = sched.running.iter().find(|s| s.request_id == "r2").unwrap();
     assert_eq!(r2.status, SequenceStatus::Prefilling);
     assert_eq!(r2.kv_computed_len, 40);
+}
+
+#[test]
+fn test_atomic_prefill_is_not_chunked_to_fill_remaining_budget() {
+    let config = SchedulerConfig {
+        chunked_prefill: true,
+        max_num_batched_tokens: 100,
+        max_total_tokens: 65536,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    sched.add_request(make_seq("r1", 60, 20));
+    sched.add_request(make_atomic_prefill_seq("r2", 80, 0));
+
+    let step = sched.schedule_step().unwrap();
+    assert_eq!(step.prefill_request_ids, vec!["r1"]);
+    assert_eq!(step.prefill_chunk_lens, vec![60]);
+    assert_eq!(sched.num_waiting(), 1);
+    assert_eq!(sched.waiting_queue[0].request_id, "r2");
+    assert_eq!(sched.waiting_queue[0].kv_computed_len, 0);
 }
 
 #[test]
