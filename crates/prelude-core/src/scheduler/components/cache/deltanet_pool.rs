@@ -49,6 +49,17 @@ pub struct DeltaNetPool {
     zero_conv_state: Tensor,
 }
 
+/// Snapshot of all DeltaNet layer states at one prefix boundary.
+///
+/// This is paired with prefix KV cache entries for hybrid models. KV blocks
+/// alone are not enough to resume a Qwen3.5/Qwen3-Next suffix because the
+/// linear-attention layers also need recurrent and convolutional state.
+#[derive(Clone)]
+pub struct DeltaNetPrefixState {
+    recurrent_states: Vec<Tensor>,
+    conv_states: Vec<Tensor>,
+}
+
 impl DeltaNetPool {
     /// Create a new DeltaNet state pool.
     ///
@@ -137,6 +148,46 @@ impl DeltaNetPool {
         }
         for cs in &self.conv_states {
             cs.slice_set(&self.zero_conv_state, 0, slot)?;
+        }
+        Ok(())
+    }
+
+    /// Copy all layer states from a live slot into independent tensors.
+    pub fn snapshot_slot(&self, slot: u32) -> Result<DeltaNetPrefixState> {
+        let slot = slot as usize;
+        let mut recurrent_states = Vec::with_capacity(self.recurrent_states.len());
+        let mut conv_states = Vec::with_capacity(self.conv_states.len());
+
+        for rs in &self.recurrent_states {
+            // `get(slot)` can be a view into the pool. `affine(1, 0)` forces
+            // a real tensor copy so later suffix updates cannot mutate the
+            // cached prefix state.
+            recurrent_states.push(rs.get(slot)?.affine(1.0, 0.0)?.contiguous()?);
+        }
+        for cs in &self.conv_states {
+            conv_states.push(cs.get(slot)?.affine(1.0, 0.0)?.contiguous()?);
+        }
+
+        Ok(DeltaNetPrefixState {
+            recurrent_states,
+            conv_states,
+        })
+    }
+
+    /// Restore a previously cached prefix state into a live slot.
+    pub fn restore_slot(&self, slot: u32, state: &DeltaNetPrefixState) -> Result<()> {
+        let slot = slot as usize;
+        if state.recurrent_states.len() != self.recurrent_states.len()
+            || state.conv_states.len() != self.conv_states.len()
+        {
+            crate::tensor::bail!("DeltaNet prefix state layer count mismatch");
+        }
+
+        for (dst, src) in self.recurrent_states.iter().zip(&state.recurrent_states) {
+            dst.slice_set(&src.unsqueeze(0)?.contiguous()?, 0, slot)?;
+        }
+        for (dst, src) in self.conv_states.iter().zip(&state.conv_states) {
+            dst.slice_set(&src.unsqueeze(0)?.contiguous()?, 0, slot)?;
         }
         Ok(())
     }

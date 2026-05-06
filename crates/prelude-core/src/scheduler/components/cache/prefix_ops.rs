@@ -1,3 +1,4 @@
+use crate::cache::deltanet_pool::DeltaNetPrefixState;
 use crate::cache::manager::CacheManager;
 use crate::engine::EngineError;
 use crate::engine::PreparedGenerateRequest;
@@ -59,6 +60,42 @@ impl CacheManager {
         Ok((cached_len, paged_ids))
     }
 
+    /// Match prefix cache for hybrid paged-attention runs. A hit is only valid
+    /// when both paged KV blocks and the corresponding DeltaNet state snapshot
+    /// are present at the same prefix boundary.
+    pub(crate) fn try_prefix_cache_match_paged_with_deltanet_state(
+        &self,
+        tokens: &[u32],
+    ) -> Result<(usize, Vec<u32>, Option<DeltaNetPrefixState>), EngineError> {
+        let Some(ref pc_mutex) = self.prefix_cache else {
+            return Ok((0, vec![], None));
+        };
+        let mut pc = pc_mutex
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("prefix cache lock poisoned: {e}")))?;
+        let (cached_len, paged_ids, state) = pc
+            .match_paged_blocks_with_deltanet_state(tokens)
+            .map_err(tensor_err)?;
+        if cached_len > 0 {
+            debug!(
+                cached_tokens = cached_len,
+                suffix_tokens = tokens.len() - cached_len,
+                paged_blocks = paged_ids.len(),
+                "prefix cache match (paged blocks + deltanet state)"
+            );
+        }
+        let evicted = pc.take_evicted_paged_blocks();
+        if !evicted.is_empty()
+            && let Some(ref bm_mutex) = self.block_manager
+        {
+            let mut bm = bm_mutex
+                .lock()
+                .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
+            bm.decrement_refs(&evicted);
+        }
+        Ok((cached_len, paged_ids, state))
+    }
+
     /// Insert only paged block IDs into prefix cache (no KV tensor extraction).
     pub(crate) fn try_prefix_cache_insert_paged_only(
         &self,
@@ -95,6 +132,53 @@ impl CacheManager {
             cached_blocks = pc.cached_blocks(),
             stored_paged_blocks = stored_paged_ids.len(),
             "prefix cache insert (paged blocks only)"
+        );
+        Ok(())
+    }
+
+    /// Insert paged block IDs plus a DeltaNet state snapshot for a hybrid
+    /// prefix boundary.
+    pub(crate) fn try_prefix_cache_insert_paged_with_deltanet_state(
+        &self,
+        tokens: &[u32],
+        block_table: &[u32],
+        paged_block_size: usize,
+        deltanet_state: DeltaNetPrefixState,
+    ) -> Result<(), EngineError> {
+        let Some(ref pc_mutex) = self.prefix_cache else {
+            return Ok(());
+        };
+        let mut pc = pc_mutex
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("prefix cache lock poisoned: {e}")))?;
+        let stored_paged_ids = pc.insert_paged_blocks_with_deltanet_state(
+            tokens,
+            paged_block_size,
+            block_table,
+            deltanet_state,
+        );
+        if !stored_paged_ids.is_empty()
+            && let Some(ref bm_mutex) = self.block_manager
+        {
+            let mut bm = bm_mutex
+                .lock()
+                .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
+            bm.increment_refs(&stored_paged_ids);
+        }
+        let evicted = pc.take_evicted_paged_blocks();
+        if !evicted.is_empty()
+            && let Some(ref bm_mutex) = self.block_manager
+        {
+            let mut bm = bm_mutex
+                .lock()
+                .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
+            bm.decrement_refs(&evicted);
+        }
+        debug!(
+            prompt_tokens = tokens.len(),
+            cached_blocks = pc.cached_blocks(),
+            stored_paged_blocks = stored_paged_ids.len(),
+            "prefix cache insert (paged blocks + deltanet state)"
         );
         Ok(())
     }
