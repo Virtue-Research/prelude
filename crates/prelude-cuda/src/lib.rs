@@ -14,6 +14,8 @@ pub const PTX_RMSNORM: &str = include_str!(concat!(env!("OUT_DIR"), "/rmsnorm.pt
 pub const PTX_RMSNORM_GATED: &str = include_str!(concat!(env!("OUT_DIR"), "/rmsnorm_gated.ptx"));
 pub const PTX_QKNORM_ROPE: &str = include_str!(concat!(env!("OUT_DIR"), "/qknorm_rope.ptx"));
 pub const PTX_MOE_ROUTING: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_routing.ptx"));
+pub const PTX_SHARED_EXPERT_GATE: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/shared_expert_gate.ptx"));
 pub const PTX_MOE_GATEUP: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_gateup.ptx"));
 pub const PTX_MOE_DOWN: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_down.ptx"));
 pub const PTX_KV_APPEND: &str = include_str!(concat!(env!("OUT_DIR"), "/kv_append.ptx"));
@@ -34,6 +36,7 @@ pub const MOD_SILU_MUL: &str = "elementwise_silu_mul";
 pub const MOD_RMSNORM: &str = "normalization_rmsnorm";
 pub const MOD_QKNORM_ROPE: &str = "rope_qknorm";
 pub const MOD_MOE_ROUTING: &str = "moe_routing";
+pub const MOD_SHARED_EXPERT_GATE: &str = "moe_shared_expert_gate";
 pub const MOD_MOE_GATEUP: &str = "moe_gateup";
 pub const MOD_MOE_DOWN: &str = "moe_down";
 pub const MOD_KV_APPEND: &str = "kvcache_kv_append";

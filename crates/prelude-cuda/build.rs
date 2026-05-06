@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use prelude_kernelbuild::nvcc::{
     ObjCompile, PtxCompile, compile_cu_to_obj, compile_cu_to_ptx, detect_compute_cap, find_cuda,
-    link_cuda_runtime_dynamic, nvcc_path,
+    link_cublas_dynamic, link_cuda_runtime_dynamic, nvcc_path,
 };
 
 fn main() {
@@ -43,6 +43,7 @@ fn main() {
         ("normalization", "rmsnorm_gated.cu", "rmsnorm_gated"),
         ("rope", "qknorm_rope.cu", "qknorm_rope"),
         ("moe", "routing.cu", "moe_routing"),
+        ("moe", "shared_expert_gate.cu", "shared_expert_gate"),
         ("moe", "gateup.cu", "moe_gateup"),
         ("moe", "down.cu", "moe_down"),
         ("kvcache", "append.cu", "kv_append"),
@@ -145,11 +146,13 @@ fn main() {
 
         println!("cargo:rustc-link-search=native={}", out_dir.display());
         println!("cargo:rustc-link-lib=static=moe_wmma");
-        // Dynamic libcudart is fine here — cudarc's dylib lookup already
-        // requires it at runtime, so we don't gain anything by statically
-        // linking cudart_static just for this one .a file.
-        link_cuda_runtime_dynamic(&cuda_root);
     }
+
+    // The Rust GEMM fallback owns raw CUDA runtime + cuBLAS FFI bindings.
+    // Dynamic links are intentional: cudarc already requires CUDA shared
+    // libraries at runtime, and this keeps the final server link explicit.
+    link_cuda_runtime_dynamic(&cuda_root);
+    link_cublas_dynamic(&cuda_root);
 
     // ── Phase 3: Link cuda_dialect_runtime_static.a ─────────────────
     //

@@ -14,10 +14,10 @@
 use crate::loading::var_builder::VarBuilder;
 use crate::models::commons::embedding::Embedding;
 use crate::models::commons::linear::DenseLinear;
-use crate::tensor::{DType, Device, Module, Result, Tensor, D};
+use crate::tensor::{D, DType, Device, Module, Result, Tensor};
 
 use crate::models::commons::{
-    last_token_select, BatchAttnContext, BatchState, LayerAttnContext, Linear,
+    BatchAttnContext, BatchState, LayerAttnContext, Linear, last_token_select,
 };
 use crate::models::model_config;
 use crate::ops::{MaskType, PagedParams, VarlenParams};
@@ -1253,6 +1253,7 @@ impl Qwen3NextDecoderLayer {
         pool: &mut crate::deltanet_pool::DeltaNetPool,
         slot_ids: &[u32],
         slot_ids_gpu: Option<&Tensor>,
+        state_is_zero: Option<&[bool]>,
         dn_layer_idx: usize,
     ) -> Result<Tensor> {
         let h = ops.rms_norm(x, &self.ln1_weight, self.rms_norm_eps)?;
@@ -1264,6 +1265,7 @@ impl Qwen3NextDecoderLayer {
                 pool,
                 slot_ids,
                 slot_ids_gpu,
+                state_is_zero,
                 dn_layer_idx,
                 ops,
             )?,
@@ -1317,6 +1319,15 @@ fn deltanet_decode_batched_fused(
     }
     let n = slot_ids.len();
     if n == 0 {
+        return Ok(None);
+    }
+    if !ops.kda_decode_available_for(
+        n,
+        gdn.num_k_heads,
+        gdn.num_v_heads,
+        gdn.head_k_dim,
+        gdn.head_v_dim,
+    ) {
         return Ok(None);
     }
 
@@ -1397,6 +1408,7 @@ fn deltanet_varlen_pooled(
     pool: &mut crate::deltanet_pool::DeltaNetPool,
     slot_ids: &[u32],
     slot_ids_gpu: Option<&Tensor>,
+    state_is_zero: Option<&[bool]>,
     dn_layer_idx: usize,
     ops: &dyn crate::ops::Ops,
 ) -> Result<Tensor> {
@@ -1410,7 +1422,17 @@ fn deltanet_varlen_pooled(
         ),
         (16, 32, 128, 128)
     );
-    if all_decode && packed.device().is_cuda() && fused_supported && ops.kda_decode_available() {
+    if all_decode
+        && packed.device().is_cuda()
+        && fused_supported
+        && ops.kda_decode_available_for(
+            slot_ids.len(),
+            gdn.num_k_heads,
+            gdn.num_v_heads,
+            gdn.head_k_dim,
+            gdn.head_v_dim,
+        )
+    {
         if let Some(out) = deltanet_decode_batched_fused(
             gdn,
             packed,
@@ -1435,12 +1457,21 @@ fn deltanet_varlen_pooled(
     let mut offset = 0usize;
     for (i, &len) in seq_lens.iter().enumerate() {
         let slot = slot_ids[i] as usize;
-        gdn.recurrent_state = Some(
-            pool.recurrent_states[dn_layer_idx]
-                .get(slot)?
-                .contiguous()?,
-        );
-        gdn.conv_state = Some(pool.conv_states[dn_layer_idx].get(slot)?.contiguous()?);
+        let starts_from_zero = state_is_zero
+            .and_then(|flags| flags.get(i))
+            .copied()
+            .unwrap_or(false);
+        if starts_from_zero {
+            gdn.recurrent_state = None;
+            gdn.conv_state = None;
+        } else {
+            gdn.recurrent_state = Some(
+                pool.recurrent_states[dn_layer_idx]
+                    .get(slot)?
+                    .contiguous()?,
+            );
+            gdn.conv_state = Some(pool.conv_states[dn_layer_idx].get(slot)?.contiguous()?);
+        }
 
         let seq = packed.narrow(0, offset, len)?.unsqueeze(0)?; // [1, L, D]
         let out = gdn.forward(&seq, 0, ops)?; // [1, L, D]
@@ -1496,7 +1527,15 @@ fn deltanet_mixed_grouped_fused(
     if decode_indices.is_empty() && prefill_by_len.is_empty() {
         return Ok(None);
     }
-    if !decode_indices.is_empty() && !ops.kda_decode_available() {
+    if !decode_indices.is_empty()
+        && !ops.kda_decode_available_for(
+            decode_indices.len(),
+            gdn.num_k_heads,
+            gdn.num_v_heads,
+            gdn.head_k_dim,
+            gdn.head_v_dim,
+        )
+    {
         return Ok(None);
     }
 
@@ -1818,6 +1857,7 @@ impl Qwen3NextModel {
                             pool,
                             slots,
                             ctx.deltanet_slots_gpu,
+                            ctx.deltanet_state_is_zero,
                             dn_layer_idx,
                         )?;
                     } else {
@@ -1920,7 +1960,7 @@ mod meta {
     use crate::cache::deltanet_pool::DeltaNetPoolConfig;
     use crate::engine::EngineError;
     use crate::engine::{CommonModelConfig, RuntimeCaps, TaskKind, WeightsBackend};
-    use crate::models::registry::{candle_model_err, parse_json, ArchSpec, ParsedModelConfig};
+    use crate::models::registry::{ArchSpec, ParsedModelConfig, candle_model_err, parse_json};
 
     const ARCHITECTURE_ALIASES: &[&str] = &["Qwen3Next"];
     const MODEL_TYPE_ALIASES: &[&str] = &["qwen3_next"];

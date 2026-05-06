@@ -1,10 +1,8 @@
 //! Gated DeltaNet (GDN) prefill.
 //!
-//! SM90 uses FlashInfer's Hopper WGMMA `gdn_prefill` utility. SM10x uses
-//! Prelude's in-tree recurrent BF16 kernel with the same linear-space
-//! DeltaNet semantics. An experimental FlashInfer CuTe DSL Blackwell AOT path
-//! is compiled when available, but stays behind `PRELUDE_GDN_SM100_AOT=1`
-//! until its TVM FFI launch path is fully validated.
+//! SM90 uses FlashInfer's Hopper WGMMA `gdn_prefill` utility. SM10x first
+//! tries FlashInfer's CuTe DSL Blackwell AOT path when the vendored build
+//! produced it, then falls back to Prelude's in-tree recurrent BF16 kernel.
 //!
 //! ## Semantics
 //!
@@ -29,17 +27,17 @@
 //! - `output`: `[packed_seq, num_sab_heads, head_dim]` BF16
 //! - `output_state`: `[num_seqs, num_sab_heads, head_dim, head_dim]` F32
 
+use candle_core::Shape;
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::WrapErr;
-use candle_core::Shape;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
-use flashinfer::types::{
-    DLDataType, DLDevice, DLTensor, TVMFFIAny, KDLBFLOAT, KDLCUDA, KDLFLOAT, KDLINT, KDLUINT,
-};
 use flashinfer::KernelRegistry;
+use flashinfer::types::{
+    DLDataType, DLDevice, DLTensor, KDLBFLOAT, KDLCUDA, KDLFLOAT, KDLINT, KDLUINT, TVMFFIAny,
+};
 use half::bf16;
-use prelude_core::tensor::{bail, DType, DeviceExt, Result, Tensor};
+use prelude_core::tensor::{DType, DeviceExt, Result, Tensor, bail};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
@@ -410,8 +408,13 @@ fn sm100_aot_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("PRELUDE_GDN_SM100_AOT")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(false)
+            .map(|v| {
+                !matches!(
+                    v.as_str(),
+                    "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
+                )
+            })
+            .unwrap_or(true)
     })
 }
 
@@ -731,10 +734,6 @@ fn detect_sm_count() -> i32 {
         if cudaDeviceGetAttribute(&mut count, CUDA_DEV_ATTR_MULTIPROCESSOR_COUNT, dev) != 0 {
             return 132;
         }
-        if count > 0 {
-            count
-        } else {
-            132
-        }
+        if count > 0 { count } else { 132 }
     })
 }

@@ -16,9 +16,11 @@
 #
 # Environment (same as bench.sh):
 #   MODEL  INPUT_TOKENS  OUTPUT_TOKENS  MAX_REQUESTS  CONCURRENCY  CUDA_VISIBLE_DEVICES
+#   PRELUDE_PORT  VLLM_PORT  SGLANG_PORT
 #   WARMUP  (profile-specific, default: 5)
-#   NSYS_USE_SUDO=auto|true|false  NSYS_RUN_AS=root|<user>
-#   VLLM_MAX_MODEL_LEN  VLLM_MAX_NUM_BATCHED_TOKENS  GPU_MEMORY_UTILIZATION
+#   PROFILE_LOAD=benchmark|curl  BENCH_TIMEOUT  NSYS_TRACE
+#   NSYS_USE_SUDO=auto|true|false
+#   VLLM_MAX_MODEL_LEN  VLLM_MAX_NUM_BATCHED_TOKENS  GPU_MEMORY_UTILIZATION  VLLM_EXTRA_ARGS
 #   VLLM_USE_FLASHINFER_MOE_FP16  VLLM_FLASHINFER_MOE_BACKEND=latency|throughput|masked_gemm
 
 set -uo pipefail
@@ -31,7 +33,10 @@ INPUT_TOKENS="${INPUT_TOKENS:-128}"
 OUTPUT_TOKENS="${OUTPUT_TOKENS:-32}"
 MAX_REQUESTS="${MAX_REQUESTS:-20}"
 CONCURRENCY="${CONCURRENCY:-1}"
-WARMUP="${WARMUP:-20}"
+WARMUP="${WARMUP:-5}"
+PROFILE_LOAD="${PROFILE_LOAD:-benchmark}"
+BENCH_TIMEOUT="${BENCH_TIMEOUT:-300}"
+NSYS_TRACE="${NSYS_TRACE:-cuda,nvtx,osrt}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PRELUDE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -51,9 +56,9 @@ RESULTS_DIR="${RESULTS_DIR:-$PRELUDE_DIR/bench_results/profile_$TIMESTAMP}"
 
 declare -A ENGINES
 ENGINES=(
-    [prelude]="prelude|Prelude|8099|no|/health|180|native"
-    [vllm]="vllm|vLLM|8003|yes|/v1/models|300|docker"
-    [sglang]="sglang|SGLang|8004|yes|/v1/models|300|docker"
+    [prelude]="prelude|Prelude|${PRELUDE_PORT:-8099}|no|/health|180|native"
+    [vllm]="vllm|vLLM|${VLLM_PORT:-8003}|yes|/v1/models|300|docker"
+    [sglang]="sglang|SGLang|${SGLANG_PORT:-8004}|yes|/v1/models|300|docker"
 )
 
 declare -A DOCKER_IMAGES
@@ -116,6 +121,12 @@ check_engine() {
     return 0
 }
 
+fix_result_permissions() {
+    if command -v sudo >/dev/null && sudo -n true 2>/dev/null; then
+        sudo chown -R "$(id -u):$(id -g)" "$RESULTS_DIR" 2>/dev/null || true
+    fi
+}
+
 profiling_restricted_to_admin() {
     [ -r /proc/driver/nvidia/params ] &&
         grep -q '^RmProfilingAdminOnly: 1' /proc/driver/nvidia/params
@@ -149,14 +160,22 @@ start_engine_under_nsys() {
         prelude)
             local nsys_flags=(
                 -o "$output"
-                --trace=cuda,nvtx
+                --trace="$NSYS_TRACE"
                 --force-overwrite=true
                 --sample=none
                 --cpuctxsw=none
             )
-            local extra_env=(RUST_LOG="${RUST_LOG:-warn}")
+            local hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
+            local hub_cache="${HUGGINGFACE_HUB_CACHE:-$hf_home/hub}"
+            local extra_env=(
+                HOME="$HOME"
+                HF_HOME="$hf_home"
+                HUGGINGFACE_HUB_CACHE="$hub_cache"
+                PATH="${PATH:-/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin}"
+                LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+                RUST_LOG="${RUST_LOG:-warn}"
+            )
             [ -n "${CUDA_VISIBLE_DEVICES:-}" ] && extra_env+=(CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES")
-            [ -n "${HF_HOME:-}" ] && extra_env+=(HF_HOME="$HF_HOME")
             [ "$NO_CUDA_GRAPH" = true ] && extra_env+=(PRELUDE_CUDA_GRAPH_MAX_BS=0)
             local use_sudo=0
             prelude_nsys_requires_sudo
@@ -168,9 +187,9 @@ start_engine_under_nsys() {
             if [ "$use_sudo" -eq 1 ]; then
                 command -v sudo >/dev/null || { err "sudo is required for nsys CUDA tracing on this host"; return 1; }
                 sudo -n true 2>/dev/null || { err "passwordless sudo is required for nsys CUDA tracing on this host"; return 1; }
-                local run_as="${NSYS_RUN_AS:-root}"
-                log "Using sudo nsys --run-as=$run_as because NVIDIA profiling is admin-only"
-                sudo -E env "${extra_env[@]}" nsys profile "${nsys_flags[@]}" --run-as="$run_as" \
+                log "Using sudo nsys because NVIDIA profiling is admin-only"
+                sudo -E env -u SUDO_UID -u SUDO_GID -u SUDO_USER "${extra_env[@]}" \
+                    nsys profile "${nsys_flags[@]}" \
                     "$PRELUDE_BIN" --host 0.0.0.0 --port "$port" --model "$MODEL" --dtype bf16 &
             else
                 env "${extra_env[@]}" nsys profile "${nsys_flags[@]}" \
@@ -182,6 +201,10 @@ start_engine_under_nsys() {
             local vllm_model_len="${VLLM_MAX_MODEL_LEN:-4096}"
             local vllm_token_budget="${VLLM_MAX_NUM_BATCHED_TOKENS:-8192}"
             local gpu_mem="${GPU_MEMORY_UTILIZATION:-0.9}"
+            local vllm_extra_args=()
+            if [ -n "${VLLM_EXTRA_ARGS:-}" ]; then
+                read -r -a vllm_extra_args <<< "$VLLM_EXTRA_ARGS"
+            fi
             local vllm_env=(-e "CUDA_VISIBLE_DEVICES=$cvd")
             if [ -n "${VLLM_USE_FLASHINFER_MOE_FP16:-}" ]; then
                 vllm_env+=(-e "VLLM_USE_FLASHINFER_MOE_FP16=$VLLM_USE_FLASHINFER_MOE_FP16")
@@ -198,13 +221,14 @@ start_engine_under_nsys() {
                 -v "$RESULTS_DIR:/profiles" \
                 "${vllm_env[@]}" \
                 "$img" \
-                profile -o "/profiles/$engine" --trace=cuda,nvtx --force-overwrite=true \
+                profile -o "/profiles/$engine" --trace="$NSYS_TRACE" --force-overwrite=true \
                     --sample=none --cpuctxsw=none --cuda-graph-trace=graph \
                     vllm serve "$MODEL" --port "$port" --host 0.0.0.0 \
                     --dtype bfloat16 --max-model-len "$vllm_model_len" \
                     --max-num-batched-tokens "$vllm_token_budget" \
                     --gpu-memory-utilization "$gpu_mem" \
-                    --trust-remote-code --disable-uvicorn-access-log --disable-log-stats &
+                    --trust-remote-code --disable-uvicorn-access-log --disable-log-stats \
+                    "${vllm_extra_args[@]}" &
             ;;
         sglang)
             docker run --rm --name "$(container_name sglang)" \
@@ -216,7 +240,7 @@ start_engine_under_nsys() {
                 -v "$RESULTS_DIR:/profiles" \
                 -e "CUDA_VISIBLE_DEVICES=$cvd" \
                 "$img" \
-                profile -o "/profiles/$engine" --trace=cuda,nvtx --force-overwrite=true \
+                profile -o "/profiles/$engine" --trace="$NSYS_TRACE" --force-overwrite=true \
                     python3 -m sglang.launch_server \
                     --model-path "$MODEL" --port "$port" --host 0.0.0.0 &
             ;;
@@ -245,6 +269,19 @@ print_stats() {
     log "GUI:    nsys-ui $report"
 }
 
+report_has_cuda_kernels() {
+    local report="$1"
+    local prefix="$RESULTS_DIR/.nsys_kernel_check_$(basename "$report" .nsys-rep)"
+    local csv="${prefix}_cuda_gpu_kern_sum.csv"
+    rm -f "$csv"
+    nsys stats --force-export=true --report cuda_gpu_kern_sum \
+        --format csv --output "$prefix" "$report" >/dev/null 2>&1 || true
+    [ -s "$csv" ] && [ "$(wc -l < "$csv")" -gt 1 ]
+    local ok=$?
+    rm -f "$csv"
+    return "$ok"
+}
+
 # ── Request sender ──
 
 send_requests() {
@@ -259,6 +296,45 @@ send_requests() {
         fi
     done
     [ ${#pids[@]} -gt 0 ] && { wait "${pids[@]}" 2>/dev/null || true; }
+}
+
+run_profile_workload() {
+    local label="$1" port="$2"
+    local bench_py="$PRELUDE_DIR/benchmark/local/benchmark.py"
+    local bench_out="$RESULTS_DIR/${label}_bench.json"
+    case "$PROFILE_LOAD" in
+        benchmark|bench)
+            [ -f "$bench_py" ] || {
+                err "benchmark.py not found; falling back to curl load"
+                log "Warmup ($WARMUP requests)..."
+                send_requests "$port" "$WARMUP"
+                log "Profiling ($MAX_REQUESTS requests, in=$INPUT_TOKENS out=$OUTPUT_TOKENS c=$CONCURRENCY)..."
+                send_requests "$port" "$MAX_REQUESTS"
+                return
+            }
+            log "Profiling with benchmark.py (warmup=$WARMUP requests=$MAX_REQUESTS in=$INPUT_TOKENS out=$OUTPUT_TOKENS c=$CONCURRENCY)..."
+            "${PYTHON:-python3}" "$bench_py" complete \
+                --url "http://127.0.0.1:${port}" \
+                --model "$MODEL" \
+                --concurrency "$CONCURRENCY" \
+                --requests "$MAX_REQUESTS" \
+                --warmup "$WARMUP" \
+                --timeout "$BENCH_TIMEOUT" \
+                --prompt-tokens "$INPUT_TOKENS" \
+                --max-tokens "$OUTPUT_TOKENS" \
+                --output "$bench_out"
+            ;;
+        curl)
+            log "Warmup ($WARMUP requests)..."
+            send_requests "$port" "$WARMUP"
+            log "Profiling ($MAX_REQUESTS requests, in=$INPUT_TOKENS out=$OUTPUT_TOKENS c=$CONCURRENCY)..."
+            send_requests "$port" "$MAX_REQUESTS"
+            ;;
+        *)
+            err "Invalid PROFILE_LOAD=${PROFILE_LOAD}; expected benchmark or curl"
+            return 1
+            ;;
+    esac
 }
 
 # ── Profile single engine ──
@@ -281,22 +357,24 @@ profile_engine() {
     local pid=$! container; container=$(container_name "$engine")
 
     if wait_for_server "http://localhost:${port}${health_path}" "$display" "$timeout" "$pid"; then
-        log "Warmup ($WARMUP requests)..."
-        send_requests "$port" "$WARMUP"
-
-        log "Profiling $display ($MAX_REQUESTS requests, in=$INPUT_TOKENS out=$OUTPUT_TOKENS c=$CONCURRENCY)..."
-        send_requests "$port" "$MAX_REQUESTS"
+        run_profile_workload "$label" "$port"
     fi
 
     kill_server "$pid" "$display" "$container"
     sleep 2
+    fix_result_permissions
 
     # Find and print report
     local report=""
     for f in "$output.nsys-rep" "$output"; do
         [ -f "$f" ] && { report="$f"; break; }
     done
-    [ -n "$report" ] && print_stats "$report" "$display"
+    if [ -n "$report" ]; then
+        if ! report_has_cuda_kernels "$report"; then
+            err "No CUDA kernel data found in $report. Increase MAX_REQUESTS/CONCURRENCY, use PROFILE_LOAD=benchmark, or try NSYS_TRACE=cuda,cuda-sw,nvtx,osrt."
+        fi
+        print_stats "$report" "$display"
+    fi
 }
 
 # ── Main ──
@@ -349,7 +427,7 @@ BODY="{\"model\":\"$MODEL\",\"prompt\":\"$PROMPT\",\"max_tokens\":$OUTPUT_TOKENS
 
 mkdir -p "$RESULTS_DIR"
 
-log "Config: model=$MODEL in=$INPUT_TOKENS out=$OUTPUT_TOKENS requests=$MAX_REQUESTS concurrency=$CONCURRENCY"
+log "Config: model=$MODEL in=$INPUT_TOKENS out=$OUTPUT_TOKENS requests=$MAX_REQUESTS concurrency=$CONCURRENCY load=$PROFILE_LOAD trace=$NSYS_TRACE"
 [ "$NO_CUDA_GRAPH" = true ] && log "CUDA graphs disabled (kernel-level visibility)"
 echo ""
 

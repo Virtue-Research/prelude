@@ -405,6 +405,7 @@ impl DecodeGraphCache {
                     paged_kv: Some(&paged_kv),
                     deltanet_pool: dn_pool_ref,
                     deltanet_slots: dn_slots_ref,
+                    deltanet_state_is_zero: None,
                     deltanet_slots_gpu: buffers.deltanet_slots.as_ref(),
                 };
                 if $manage {

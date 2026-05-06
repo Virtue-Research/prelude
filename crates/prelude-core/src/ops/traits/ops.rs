@@ -489,6 +489,24 @@ pub trait Ops: Send + Sync {
         None
     }
 
+    /// Fused shared expert gate for MoE blocks:
+    ///
+    /// ```text
+    /// gate = sigmoid(sum_i input[row, i] * gate_weight[i]))
+    /// out[row, col] = shared_out[row, col] * gate
+    /// ```
+    ///
+    /// This avoids materializing the `[tokens, hidden]` multiply temporary for
+    /// the scalar gate projection and the separate row-wise multiply.
+    fn shared_expert_gate(
+        &self,
+        _input: &Tensor,
+        _shared_out: &Tensor,
+        _gate_weight: &Tensor,
+    ) -> Option<Result<Tensor>> {
+        None
+    }
+
     /// Fused Adaptive Layer Norm (AdaLN-Zero) for diffusion transformers.
     /// Computes: normed = layer_norm(x) * (1 + scale) + shift, gated = normed * gate.
     fn fused_adaln_zero(
@@ -571,16 +589,23 @@ pub trait Ops: Send + Sync {
         None
     }
 
-    /// True iff `kda_decode_batched` would run successfully on the current
-    /// device and shape. Callers use this to gate the fused decode fast
-    /// path BEFORE they start mutating shared state (e.g. the DeltaNet
-    /// pool's `conv_states`) — running conv1d_update into the pool and
-    /// then falling through to the sequential path on the kda step would
-    /// advance conv_state twice and produce degenerate decode output.
+    /// True iff `kda_decode_batched` has an AOT kernel for the current device
+    /// and exact decode shape. Callers use this to gate the fused decode fast
+    /// path BEFORE they start mutating shared state (e.g. the DeltaNet pool's
+    /// `conv_states`) — running conv1d_update into the pool and then falling
+    /// through to the sequential path on the kda step would advance conv_state
+    /// twice and produce degenerate decode output.
     ///
     /// Default: `false` (no kda kernel — caller should pick the
     /// composed path directly).
-    fn kda_decode_available(&self) -> bool {
+    fn kda_decode_available_for(
+        &self,
+        _batch: usize,
+        _num_k_heads: usize,
+        _num_v_heads: usize,
+        _head_k_dim: usize,
+        _head_v_dim: usize,
+    ) -> bool {
         false
     }
 
@@ -615,6 +640,18 @@ pub trait Ops: Send + Sync {
     /// matrix).
     #[allow(clippy::too_many_arguments)]
     fn causal_conv1d_fn(
+        &self,
+        _x: &Tensor,
+        _weight: &Tensor,
+        _bias: Option<&Tensor>,
+        _initial_states: Option<&Tensor>,
+        _silu_activation: bool,
+    ) -> Option<Result<Tensor>> {
+        None
+    }
+
+    /// Channel-last prefill causal conv1d. Input/output shapes are `[B, L, D]`.
+    fn causal_conv1d_fn_channellast(
         &self,
         _x: &Tensor,
         _weight: &Tensor,

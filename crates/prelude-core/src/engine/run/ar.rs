@@ -434,18 +434,20 @@ fn admit_prepared_request(
         seq.prefix_cache_key = prefix_cache_key(engine, &seq.input_ids);
         attach_prefix_cache_reuse(engine, &mut seq);
     }
-    // Allocate a DeltaNet pool slot for hybrid models before queueing.
-    // `allocate` zeros the slot so a fresh request always starts from
-    // clean recurrent + conv state; `release_resources` frees it when
-    // the sequence finishes.
+    // Allocate a DeltaNet pool slot only when state has to survive across
+    // scheduler steps: multi-token decode, prefix reuse, or chunked prefill.
+    // One-shot final prefill can run from zero state without touching the
+    // pool, avoiding per-layer slot zeroing that would never be consumed.
     //
-    // Fail the request if the pool is exhausted: `build_step_batch`
+    // When a slot is required, fail the request if the pool is exhausted:
+    // `build_step_batch`
     // only forwards `deltanet_slots` when *every* sequence in the
     // batch has one, so a single slotless admission flips the whole
     // batch onto the non-pooled linear-attention path that clears
     // recurrent state every step — silently corrupting all
     // co-batched DeltaNet requests, not just the slotless one.
-    if let Some(pool_mutex) = deltanet_pool {
+    let needs_deltanet_slot = deltanet_slot_needed(&prepared, &seq, scheduler.config());
+    if needs_deltanet_slot && let Some(pool_mutex) = deltanet_pool {
         let allocated = pool_mutex.lock().ok().and_then(|mut pool| pool.allocate());
         match allocated {
             Some(slot) => {
@@ -497,6 +499,19 @@ fn admit_prepared_request(
             max_new_tokens,
         },
     );
+}
+
+fn deltanet_slot_needed(
+    prepared: &PreparedGenerateRequest,
+    seq: &Sequence,
+    config: &SchedulerConfig,
+) -> bool {
+    let prefill_cap = if config.long_prefill_token_threshold > 0 {
+        config.long_prefill_token_threshold
+    } else {
+        config.max_num_batched_tokens
+    };
+    prepared.max_new > 1 || seq.kv_computed_len > 0 || prepared.prompt_tokens.len() > prefill_cap
 }
 
 fn drain_ready_messages(
@@ -1595,8 +1610,6 @@ fn seq_finish_reason(reason: &FinishReason) -> SeqFinishReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::executor::ExecutionHandle;
-    use crate::tensor::Device;
 
     fn make_prepared(request_id: &str, max_new: usize) -> PreparedGenerateRequest {
         use crate::engine::sampling::{LogitsProcessor, Sampling};
@@ -1742,23 +1755,6 @@ mod tests {
 
     // ── build_forward_batch tests ─────────────────────────────────
 
-    fn make_prefill_state(id: &str, max_new: usize) -> ArSequenceState {
-        ArSequenceState {
-            request_id: id.to_string(),
-            prepared: Some(make_prepared(id, max_new)),
-            response: ResponseChannel::Complete(tokio::sync::oneshot::channel().0),
-            gen_start: Instant::now(),
-            prefill_ms: 0.0,
-            started_sent: false,
-            sent_text_len: 0,
-            pending_token: None,
-            output_tokens: vec![],
-            token_logprobs: vec![],
-            prompt_token_logprobs: None,
-            max_new_tokens: max_new,
-        }
-    }
-
     fn make_decode_state(id: &str, pending_token: u32, _position: usize) -> ArSequenceState {
         let max_new = 10;
         ArSequenceState {
@@ -1810,6 +1806,55 @@ mod tests {
         // Chunked prompt work needs KV even if it will finish with one token.
         assert!(prefill_request_needs_kv(&make_seq("partial", 0, 2), 2));
         assert!(prefill_request_needs_kv(&make_seq("final_chunk", 0, 3), 1));
+    }
+
+    #[test]
+    fn deltanet_slot_needed_only_for_cross_step_state() {
+        let config = SchedulerConfig {
+            max_num_batched_tokens: 8,
+            ..SchedulerConfig::default()
+        };
+        let mut prepared = make_prepared("oneshot", 1);
+        prepared.prompt_tokens = vec![1, 2, 3];
+        let seq = Sequence::new(
+            "oneshot".to_string(),
+            prepared.prompt_tokens.clone(),
+            SamplingParams::default(),
+            0,
+            vec![],
+            vec![],
+            None,
+        );
+        assert!(!deltanet_slot_needed(&prepared, &seq, &config));
+
+        let decode_prepared = make_prepared("decode", 4);
+        let decode_seq = Sequence::new(
+            "decode".to_string(),
+            decode_prepared.prompt_tokens.clone(),
+            SamplingParams::default(),
+            3,
+            vec![],
+            vec![],
+            None,
+        );
+        assert!(deltanet_slot_needed(&decode_prepared, &decode_seq, &config));
+
+        let mut long_prepared = make_prepared("long", 1);
+        long_prepared.prompt_tokens = vec![1; 16];
+        let long_seq = Sequence::new(
+            "long".to_string(),
+            long_prepared.prompt_tokens.clone(),
+            SamplingParams::default(),
+            0,
+            vec![],
+            vec![],
+            None,
+        );
+        assert!(deltanet_slot_needed(&long_prepared, &long_seq, &config));
+
+        let mut prefix_seq = seq;
+        prefix_seq.kv_computed_len = 1;
+        assert!(deltanet_slot_needed(&prepared, &prefix_seq, &config));
     }
 
     #[test]

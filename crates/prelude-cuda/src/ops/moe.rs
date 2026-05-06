@@ -4,7 +4,7 @@ use cudarc::driver::{DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg};
 use prelude_core::tensor::{DType, DeviceExt, Result, Tensor, bail};
 
 use crate::moe_ffi as ffi;
-use crate::{MOD_MOE_ROUTING, PTX_MOE_ROUTING};
+use crate::{MOD_MOE_ROUTING, MOD_SHARED_EXPERT_GATE, PTX_MOE_ROUTING, PTX_SHARED_EXPERT_GATE};
 
 use std::{
     collections::HashMap,
@@ -121,6 +121,98 @@ pub fn fused_moe_routing(
     );
 
     Ok((tw_tensor, ti_tensor, se_tensor, st_tensor))
+}
+
+/// Fused shared expert gate:
+///
+/// `output[row, col] = shared_out[row, col] * sigmoid(dot(input[row], gate_weight))`
+pub fn shared_expert_gate(
+    input: &Tensor,
+    shared_out: &Tensor,
+    gate_weight: &Tensor,
+) -> Result<Tensor> {
+    let (rows, hidden) = input.dims2()?;
+    if shared_out.dims() != input.dims() {
+        bail!(
+            "shared_expert_gate: shared_out shape {:?} != input shape {:?}",
+            shared_out.dims(),
+            input.dims()
+        );
+    }
+    if gate_weight.dims() != [hidden] {
+        bail!(
+            "shared_expert_gate: gate_weight shape {:?} != [{hidden}]",
+            gate_weight.dims()
+        );
+    }
+    if input.dtype() != DType::BF16
+        || shared_out.dtype() != DType::BF16
+        || gate_weight.dtype() != DType::BF16
+    {
+        bail!("shared_expert_gate: requires BF16 input/shared_out/gate_weight");
+    }
+    if !input.device().is_cuda() {
+        bail!("shared_expert_gate: requires CUDA");
+    }
+
+    let input = input.contiguous()?;
+    let shared_out = shared_out.contiguous()?;
+    let gate_weight = gate_weight.contiguous()?;
+
+    let (input_storage, input_layout) = input.storage_and_layout();
+    let (shared_storage, shared_layout) = shared_out.storage_and_layout();
+    let (gate_storage, gate_layout) = gate_weight.storage_and_layout();
+
+    let input_cuda = as_candle_cuda(&input_storage, "shared_expert_gate/input")?;
+    let shared_cuda = as_candle_cuda(&shared_storage, "shared_expert_gate/shared_out")?;
+    let gate_cuda = as_candle_cuda(&gate_storage, "shared_expert_gate/gate_weight")?;
+    let dev = input_cuda.device().clone();
+
+    let input_slice = input_cuda
+        .as_cuda_slice::<half::bf16>()?
+        .slice(input_layout.start_offset()..);
+    let shared_slice = shared_cuda
+        .as_cuda_slice::<half::bf16>()?
+        .slice(shared_layout.start_offset()..);
+    let gate_slice = gate_cuda
+        .as_cuda_slice::<half::bf16>()?
+        .slice(gate_layout.start_offset()..);
+
+    let out = unsafe { dev.alloc::<half::bf16>(rows * hidden) }?;
+    let threads = 256u32;
+    let func = dev.get_or_load_custom_func(
+        "shared_expert_gate_bf16",
+        MOD_SHARED_EXPERT_GATE,
+        PTX_SHARED_EXPERT_GATE,
+    )?;
+    let cfg = LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: (threads / 32) * 4,
+    };
+
+    let rows_i = rows as i32;
+    let hidden_i = hidden as i32;
+    let mut builder = func.builder();
+    builder.arg(&input_slice);
+    builder.arg(&shared_slice);
+    builder.arg(&gate_slice);
+    builder.arg(&out);
+    builder.arg(&rows_i);
+    builder.arg(&hidden_i);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(input_storage);
+    drop(shared_storage);
+    drop(gate_storage);
+
+    let out_storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(out_storage),
+        (rows, hidden),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
 }
 
 /// WMMA-based MoE GEMM kernel.

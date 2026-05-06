@@ -37,6 +37,10 @@ template <typename input_t, typename weight_t>
 void causal_conv1d_fwd_cuda(ConvParamsBase &params, cudaStream_t stream);
 
 template <typename input_t, typename weight_t>
+void causal_conv1d_channellast_fwd_cuda(ConvParamsBase &params,
+                                        cudaStream_t stream);
+
+template <typename input_t, typename weight_t>
 void causal_conv1d_update_cuda(ConvParamsBase &params, cudaStream_t stream);
 
 namespace {
@@ -86,6 +90,34 @@ static void dispatch(int input_dtype, int weight_dtype,
       break;
     default:
       dispatch_weight<float>(weight_dtype, params, stream, is_update);
+      break;
+  }
+}
+
+template <typename In>
+static void dispatch_weight_channellast(int weight_dtype, ConvParamsBase &params,
+                                        cudaStream_t stream) {
+  if (weight_dtype == DT_BF16) {
+    causal_conv1d_channellast_fwd_cuda<In, at::BFloat16>(params, stream);
+  } else if (weight_dtype == DT_F16) {
+    causal_conv1d_channellast_fwd_cuda<In, at::Half>(params, stream);
+  } else {
+    causal_conv1d_channellast_fwd_cuda<In, float>(params, stream);
+  }
+}
+
+static void dispatch_channellast(int input_dtype, int weight_dtype,
+                                 ConvParamsBase &params,
+                                 cudaStream_t stream) {
+  switch (input_dtype) {
+    case DT_BF16:
+      dispatch_weight_channellast<at::BFloat16>(weight_dtype, params, stream);
+      break;
+    case DT_F16:
+      dispatch_weight_channellast<at::Half>(weight_dtype, params, stream);
+      break;
+    default:
+      dispatch_weight_channellast<float>(weight_dtype, params, stream);
       break;
   }
 }
@@ -190,6 +222,89 @@ int cula_causal_conv1d_fwd(
       static_cast<ConvParamsBase::index_t>(final_states_c_stride);
 
   dispatch(input_dtype, weight_dtype, params, stream, /*is_update=*/false);
+  return 0;
+}
+
+// Channel-last causal conv1d forward (prefill). Layout is `[B, L, C]` with
+// channel stride 1; this avoids the transpose needed by the channel-first
+// entry point and is the only upstream prefill kernel variant that honors
+// initial/final state pointers.
+int cula_causal_conv1d_fwd_channellast(
+    cudaStream_t stream,
+    const void *x,
+    const void *weight,
+    const void *bias,
+    const void *initial_states,
+    void *final_states,
+    void *out,
+    int32_t batch,
+    int32_t dim,
+    int32_t seqlen,
+    int32_t width,
+    int32_t silu_activation,
+    int64_t x_batch_stride,
+    int64_t x_c_stride,
+    int64_t x_l_stride,
+    int64_t weight_c_stride,
+    int64_t weight_width_stride,
+    int64_t out_batch_stride,
+    int64_t out_c_stride,
+    int64_t out_l_stride,
+    int64_t initial_states_batch_stride,
+    int64_t initial_states_c_stride,
+    int64_t initial_states_l_stride,
+    int64_t final_states_batch_stride,
+    int64_t final_states_c_stride,
+    int64_t final_states_l_stride,
+    int32_t input_dtype,
+    int32_t weight_dtype
+) {
+  ConvParamsBase params{};
+  params.batch = batch;
+  params.dim = dim;
+  params.seqlen = seqlen;
+  params.width = width;
+  params.silu_activation = silu_activation != 0;
+
+  params.x_batch_stride = static_cast<ConvParamsBase::index_t>(x_batch_stride);
+  params.x_c_stride = static_cast<ConvParamsBase::index_t>(x_c_stride);
+  params.x_l_stride = static_cast<ConvParamsBase::index_t>(x_l_stride);
+  params.weight_c_stride =
+      static_cast<ConvParamsBase::index_t>(weight_c_stride);
+  params.weight_width_stride =
+      static_cast<ConvParamsBase::index_t>(weight_width_stride);
+  params.out_batch_stride =
+      static_cast<ConvParamsBase::index_t>(out_batch_stride);
+  params.out_c_stride = static_cast<ConvParamsBase::index_t>(out_c_stride);
+  params.out_l_stride = static_cast<ConvParamsBase::index_t>(out_l_stride);
+
+  params.x_ptr = const_cast<void *>(x);
+  params.weight_ptr = const_cast<void *>(weight);
+  params.bias_ptr = const_cast<void *>(bias);
+  params.out_ptr = out;
+
+  params.conv_state_ptr = nullptr;
+  params.cache_seqlens = nullptr;
+  params.conv_state_indices_ptr = nullptr;
+  params.seq_idx_ptr = nullptr;
+
+  params.initial_states_ptr = const_cast<void *>(initial_states);
+  params.initial_states_batch_stride =
+      static_cast<ConvParamsBase::index_t>(initial_states_batch_stride);
+  params.initial_states_l_stride =
+      static_cast<ConvParamsBase::index_t>(initial_states_l_stride);
+  params.initial_states_c_stride =
+      static_cast<ConvParamsBase::index_t>(initial_states_c_stride);
+
+  params.final_states_ptr = final_states;
+  params.final_states_batch_stride =
+      static_cast<ConvParamsBase::index_t>(final_states_batch_stride);
+  params.final_states_l_stride =
+      static_cast<ConvParamsBase::index_t>(final_states_l_stride);
+  params.final_states_c_stride =
+      static_cast<ConvParamsBase::index_t>(final_states_c_stride);
+
+  dispatch_channellast(input_dtype, weight_dtype, params, stream);
   return 0;
 }
 

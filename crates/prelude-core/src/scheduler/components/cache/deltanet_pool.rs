@@ -45,6 +45,8 @@ pub struct DeltaNetPool {
     free_slots: VecDeque<u32>,
     /// Total number of slots in the pool.
     pub max_slots: u32,
+    zero_recurrent_state: Tensor,
+    zero_conv_state: Tensor,
 }
 
 impl DeltaNetPool {
@@ -62,6 +64,13 @@ impl DeltaNetPool {
         let mut conv_states = Vec::with_capacity(cfg.num_deltanet_layers);
 
         let conv_state_len = cfg.conv_kernel.saturating_sub(1);
+        let zero_recurrent_state = Tensor::zeros(
+            (1, cfg.num_v_heads, cfg.head_v_dim, cfg.head_k_dim),
+            DType::F32,
+            device,
+        )?;
+        let zero_conv_state =
+            Tensor::zeros((1, cfg.conv_dim, conv_state_len), model_dtype, device)?;
 
         for _ in 0..cfg.num_deltanet_layers {
             recurrent_states.push(Tensor::zeros(
@@ -89,6 +98,8 @@ impl DeltaNetPool {
             num_layers: cfg.num_deltanet_layers,
             free_slots,
             max_slots,
+            zero_recurrent_state,
+            zero_conv_state,
         })
     }
 
@@ -122,12 +133,10 @@ impl DeltaNetPool {
     pub fn reset_slot(&self, slot: u32) -> Result<()> {
         let slot = slot as usize;
         for rs in &self.recurrent_states {
-            let zero = Tensor::zeros(&rs.dims()[1..], rs.dtype(), rs.device())?;
-            rs.slice_set(&zero.unsqueeze(0)?, 0, slot)?;
+            rs.slice_set(&self.zero_recurrent_state, 0, slot)?;
         }
         for cs in &self.conv_states {
-            let zero = Tensor::zeros(&cs.dims()[1..], cs.dtype(), cs.device())?;
-            cs.slice_set(&zero.unsqueeze(0)?, 0, slot)?;
+            cs.slice_set(&self.zero_conv_state, 0, slot)?;
         }
         Ok(())
     }

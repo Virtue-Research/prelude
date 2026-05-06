@@ -939,6 +939,7 @@ mod tests {
             paged_kv: None,
             deltanet_pool: None,
             deltanet_slots: None,
+            deltanet_state_is_zero: None,
             deltanet_slots_gpu: None,
         };
         let logits = model.forward(&input, &mut ctx).unwrap();

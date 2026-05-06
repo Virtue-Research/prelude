@@ -125,6 +125,21 @@ pub fn run(spec: &DslCompile<'_>) -> Result<bool, String> {
 
     // ── Cache hit check ─────────────────────────────────────────────
     if let Some(hash) = file_hash(script) {
+        match per_arch_cache_status(kernels_dir, spec.target_archs, &hash) {
+            Some(true) => {
+                build_log!("[DSL] {} using cached kernels", spec.label);
+                return Ok(true);
+            }
+            Some(false) => {
+                build_log!(
+                    "[DSL] {} compile_kernels.py or arch config changed, recompiling...",
+                    spec.label
+                );
+                clear_obj_files(kernels_dir);
+            }
+            None => {}
+        }
+
         if kernels_dir.join("manifest.json").exists() && has_obj_files(kernels_dir) {
             let manifest_str =
                 std::fs::read_to_string(kernels_dir.join("manifest.json")).unwrap_or_default();
@@ -318,6 +333,49 @@ fn remove_stale_arch_dirs(kernels_dir: &Path, target_archs: &[String]) {
             let _ = std::fs::remove_dir_all(&path);
         }
     }
+}
+
+fn per_arch_cache_status(kernels_dir: &Path, target_archs: &[String], hash: &str) -> Option<bool> {
+    if target_archs.is_empty() {
+        return None;
+    }
+
+    let mut saw_arch_cache = false;
+    for arch in target_archs {
+        let arch_dir = kernels_dir.join(arch);
+        let manifest_path = arch_dir.join("manifest.json");
+        if !manifest_path.exists() && !has_obj_files(&arch_dir) {
+            return None;
+        }
+        saw_arch_cache = true;
+        if !has_obj_files(&arch_dir) || !manifest_path.exists() {
+            return Some(false);
+        }
+
+        let manifest_str = std::fs::read_to_string(&manifest_path).unwrap_or_default();
+        let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&manifest_str) else {
+            return Some(false);
+        };
+        let stored = manifest
+            .get("script_hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if stored != hash {
+            return Some(false);
+        }
+
+        let expected_arch = parse_arch(arch);
+        let manifest_archs: Vec<u64> = manifest
+            .get("archs")
+            .and_then(|v| v.as_array())
+            .map(|values| values.iter().filter_map(|v| v.as_u64()).collect())
+            .unwrap_or_default();
+        if expected_arch.is_some_and(|expected| manifest_archs != vec![expected]) {
+            return Some(false);
+        }
+    }
+
+    saw_arch_cache.then_some(true)
 }
 
 fn normalized_archs(archs: &[String]) -> Vec<u64> {

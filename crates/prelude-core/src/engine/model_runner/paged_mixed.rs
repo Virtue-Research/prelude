@@ -145,6 +145,9 @@ impl Engine {
             ),
             _ => None,
         };
+        let deltanet_state_is_zero: Option<Vec<bool>> = deltanet_slots
+            .as_ref()
+            .map(|_| requests.iter().map(|req| req.position_start == 0).collect());
 
         // ── Forward ───────────────────────────────────────────────────
         let forward_start = Instant::now();
@@ -178,6 +181,7 @@ impl Engine {
             paged_kv: paged_kv.as_ref(),
             deltanet_pool: dn_pool_ref,
             deltanet_slots: deltanet_slots.as_deref(),
+            deltanet_state_is_zero: deltanet_state_is_zero.as_deref(),
             deltanet_slots_gpu: deltanet_slots_gpu.as_ref(),
         };
 

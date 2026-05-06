@@ -767,6 +767,7 @@ fn gemma4_model_forward_smoke() -> Result<()> {
         paged_kv: None,
         deltanet_pool: None,
         deltanet_slots: None,
+        deltanet_state_is_zero: None,
         deltanet_slots_gpu: None,
     };
 
@@ -841,6 +842,7 @@ fn gemma4_model_multi_seq_smoke() -> Result<()> {
         paged_kv: None,
         deltanet_pool: None,
         deltanet_slots: None,
+        deltanet_state_is_zero: None,
         deltanet_slots_gpu: None,
     };
 

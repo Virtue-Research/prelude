@@ -35,9 +35,9 @@ pub fn fast_rmsnorm(input: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor>
     let x_slice = x_cuda
         .as_cuda_slice::<half::bf16>()?
         .slice(x_layout.start_offset()..);
-    let w_slice = w_cuda
-        .as_cuda_slice::<half::bf16>()?
-        .slice(w_layout.start_offset()..);
+    if !matches!(w_cuda.dtype(), DType::BF16 | DType::F32) {
+        candle_core::bail!("fast_rmsnorm: weight must be BF16 or F32");
+    }
 
     let out = unsafe { dev.alloc::<half::bf16>(n) }?;
 
@@ -54,23 +54,49 @@ pub fn fast_rmsnorm(input: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor>
         (block, n_rows as u32, num_warps * 4)
     };
 
-    let func = dev.get_or_load_custom_func("fast_rmsnorm_bf16", MOD_RMSNORM, PTX_RMSNORM)?;
+    let func_name = match w_cuda.dtype() {
+        DType::BF16 => "fast_rmsnorm_bf16",
+        DType::F32 => "fast_rmsnorm_bf16_f32_weight",
+        _ => unreachable!("weight dtype guarded above"),
+    };
+    let func = dev.get_or_load_custom_func(func_name, MOD_RMSNORM, PTX_RMSNORM)?;
     let cfg = LaunchConfig {
         grid_dim: (grid_size, 1, 1),
         block_dim: (block_size, 1, 1),
         shared_mem_bytes: shared_mem,
     };
-    let mut builder = func.builder();
-    builder.arg(&x_slice);
-    builder.arg(&w_slice);
-    builder.arg(&out);
     let n_rows_val = n_rows as u32;
     let d_val = d as u32;
     let eps_val = eps as f32;
-    builder.arg(&n_rows_val);
-    builder.arg(&d_val);
-    builder.arg(&eps_val);
-    unsafe { builder.launch(cfg) }.w()?;
+    match w_cuda.dtype() {
+        DType::BF16 => {
+            let w_slice = w_cuda
+                .as_cuda_slice::<half::bf16>()?
+                .slice(w_layout.start_offset()..);
+            let mut builder = func.builder();
+            builder.arg(&x_slice);
+            builder.arg(&w_slice);
+            builder.arg(&out);
+            builder.arg(&n_rows_val);
+            builder.arg(&d_val);
+            builder.arg(&eps_val);
+            unsafe { builder.launch(cfg) }.w()?;
+        }
+        DType::F32 => {
+            let w_slice = w_cuda
+                .as_cuda_slice::<f32>()?
+                .slice(w_layout.start_offset()..);
+            let mut builder = func.builder();
+            builder.arg(&x_slice);
+            builder.arg(&w_slice);
+            builder.arg(&out);
+            builder.arg(&n_rows_val);
+            builder.arg(&d_val);
+            builder.arg(&eps_val);
+            unsafe { builder.launch(cfg) }.w()?;
+        }
+        _ => unreachable!("weight dtype guarded above"),
+    }
 
     drop(x_storage);
     drop(w_storage);
