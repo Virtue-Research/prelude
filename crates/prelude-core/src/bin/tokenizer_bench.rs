@@ -1,6 +1,3 @@
-#[global_allocator]
-static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
-
 //! Benchmark: HuggingFace `tokenizers` vs `fastokens` — encode/decode speed + correctness.
 //!
 //! Usage:
@@ -8,6 +5,9 @@ static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
 //!
 //! Custom model:
 //!   cargo run -p prelude-core --bin tokenizer_bench --release --features hf_tokenizer -- --model deepseek-ai/DeepSeek-V3
+
+#[global_allocator]
+static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
 
 #[cfg(not(feature = "hf_tokenizer"))]
 compile_error!("This benchmark requires the `hf_tokenizer` feature for HF comparison. Use: --features hf_tokenizer");

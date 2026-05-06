@@ -1,8 +1,101 @@
 use std::collections::{HashSet, VecDeque};
 
+use super::components::cache::prefix_plan::{SharedPrefixPlanner, SharedPrefixPrompt};
 use super::{Scheduler, SchedulerStep, SeqFinishReason, Sequence, SequenceStatus};
 
+enum SharedPrefixPlanSlot {
+    Running(usize),
+    Waiting(usize),
+}
+
 impl Scheduler {
+    /// Update running prefills and waiting requests with the deepest currently
+    /// shared block-aligned prefix boundary.
+    pub(crate) fn plan_waiting_shared_prefixes(&mut self) -> usize {
+        let block_size = self.config.block_size;
+        if block_size == 0 {
+            return 0;
+        }
+        if self.waiting_queue.is_empty() {
+            for seq in &mut self.running {
+                seq.prefix_cache_target_len = None;
+            }
+            return 0;
+        }
+
+        let (slots, assignments) = {
+            let mut prompts: Vec<SharedPrefixPrompt<'_>> = Vec::new();
+            let mut slots: Vec<SharedPrefixPlanSlot> = Vec::new();
+
+            for (idx, seq) in self.running.iter().enumerate() {
+                if seq.status == SequenceStatus::Prefilling && seq.prefix_cache_key.is_some() {
+                    prompts.push(SharedPrefixPrompt {
+                        tokens: &seq.input_ids,
+                        min_boundary_tokens: seq.kv_computed_len,
+                    });
+                    slots.push(SharedPrefixPlanSlot::Running(idx));
+                }
+            }
+
+            for (idx, seq) in self.waiting_queue.iter().enumerate() {
+                if seq.kv_computed_len == 0
+                    && seq.block_table.is_empty()
+                    && seq.prefix_cache_key.is_some()
+                {
+                    prompts.push(SharedPrefixPrompt {
+                        tokens: &seq.input_ids,
+                        min_boundary_tokens: 0,
+                    });
+                    slots.push(SharedPrefixPlanSlot::Waiting(idx));
+                }
+            }
+
+            if prompts.len() < 2 {
+                for seq in &mut self.running {
+                    seq.prefix_cache_target_len = None;
+                }
+                for seq in &mut self.waiting_queue {
+                    seq.prefix_cache_target_len = None;
+                }
+                return 0;
+            }
+
+            let planner = SharedPrefixPlanner::new(block_size);
+            (slots, planner.assign_prompts(&prompts))
+        };
+
+        let mut assigned_waiting = 0usize;
+        for (slot, assignment) in slots.into_iter().zip(assignments.into_iter()) {
+            match slot {
+                SharedPrefixPlanSlot::Running(idx) => {
+                    let Some(seq) = self.running.get_mut(idx) else {
+                        continue;
+                    };
+                    if let Some(assignment) = assignment {
+                        seq.prefix_cache_key = Some(assignment.boundary.hash);
+                        seq.prefix_cache_target_len = Some(assignment.boundary.tokens);
+                    } else {
+                        seq.prefix_cache_target_len = None;
+                    }
+                }
+                SharedPrefixPlanSlot::Waiting(idx) => {
+                    let Some(seq) = self.waiting_queue.get_mut(idx) else {
+                        continue;
+                    };
+                    if let Some(assignment) = assignment {
+                        seq.prefix_cache_key = Some(assignment.boundary.hash);
+                        seq.prefix_cache_target_len = Some(assignment.boundary.tokens);
+                        assigned_waiting += 1;
+                    } else {
+                        seq.prefix_cache_target_len = None;
+                    }
+                }
+            }
+        }
+
+        assigned_waiting
+    }
+
     /// Schedule one step using a unified per-step token budget.
     ///
     /// Like vLLM V1: running requests are scheduled first (decode = 1 token,
@@ -30,14 +123,19 @@ impl Scheduler {
             if remaining_prefill > 0 {
                 // Partially prefilled — needs more prefill tokens
                 let mut chunk = remaining_prefill;
-                if self.config.long_prefill_token_threshold > 0 {
-                    chunk = chunk.min(self.config.long_prefill_token_threshold);
-                }
-                if seq.kv_computed_len == 0
-                    && let Some(prefix_chunk) =
-                        hybrid_prefix_bootstrap_chunk(seq, self.config.block_size)
+                if let Some(prefix_chunk) = shared_prefix_target_chunk(seq, self.config.block_size)
                 {
                     chunk = chunk.min(prefix_chunk);
+                } else {
+                    if self.config.long_prefill_token_threshold > 0 {
+                        chunk = chunk.min(self.config.long_prefill_token_threshold);
+                    }
+                    if seq.kv_computed_len == 0
+                        && let Some(prefix_chunk) =
+                            hybrid_prefix_bootstrap_chunk(seq, self.config.block_size)
+                    {
+                        chunk = chunk.min(prefix_chunk);
+                    }
                 }
                 chunk = chunk.min(token_budget);
                 if chunk > 0 {
@@ -249,13 +347,17 @@ impl Scheduler {
 
             // Per-request prefill cap
             let mut chunk = seq.prefill_len();
-            if self.config.long_prefill_token_threshold > 0 {
-                chunk = chunk.min(self.config.long_prefill_token_threshold);
-            }
-            if seq.kv_computed_len == 0
-                && let Some(prefix_chunk) = hybrid_prefix_bootstrap_chunk(seq, block_size)
-            {
+            if let Some(prefix_chunk) = shared_prefix_target_chunk(seq, block_size) {
                 chunk = chunk.min(prefix_chunk);
+            } else {
+                if self.config.long_prefill_token_threshold > 0 {
+                    chunk = chunk.min(self.config.long_prefill_token_threshold);
+                }
+                if seq.kv_computed_len == 0
+                    && let Some(prefix_chunk) = hybrid_prefix_bootstrap_chunk(seq, block_size)
+                {
+                    chunk = chunk.min(prefix_chunk);
+                }
             }
             if seq.prefill_must_be_atomic && seq.kv_computed_len == 0 && chunk > token_budget {
                 break;
@@ -314,6 +416,23 @@ fn hybrid_prefix_bootstrap_chunk(seq: &Sequence, block_size: usize) -> Option<us
     } else {
         None
     }
+}
+
+fn shared_prefix_target_chunk(seq: &Sequence, block_size: usize) -> Option<usize> {
+    if block_size == 0 || seq.prefix_cache_key.is_none() || seq.deltanet_slot.is_none() {
+        return None;
+    }
+
+    let target_len = seq.prefix_cache_target_len?;
+    if target_len < block_size
+        || target_len >= seq.input_ids.len()
+        || target_len % block_size != 0
+        || seq.kv_computed_len >= target_len
+    {
+        return None;
+    }
+
+    Some(target_len - seq.kv_computed_len)
 }
 
 // ── Legacy admission helpers (used by non-chunked path) ──────────────

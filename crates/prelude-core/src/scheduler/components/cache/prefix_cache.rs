@@ -15,6 +15,7 @@ use std::collections::HashMap;
 
 use crate::cache::deltanet_pool::DeltaNetPrefixState;
 use crate::cache::prefix_index::PrefixMatchIndex;
+use crate::cache::prefix_plan::PrefixResources;
 use crate::tensor::{Result, Tensor};
 
 // ---------------------------------------------------------------------------
@@ -128,7 +129,11 @@ impl PrefixKvCache {
             let Some(state) = self.deltanet_state_store.get(hashes.last().unwrap()) else {
                 continue;
             };
-            if !self.index.all_have_paged(hashes) {
+            let resources = PrefixResources {
+                paged_kv: self.index.all_have_paged(hashes),
+                recurrent_state: true,
+            };
+            if !(resources.paged_kv && resources.recurrent_state) {
                 continue;
             }
 

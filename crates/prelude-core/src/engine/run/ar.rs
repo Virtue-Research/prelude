@@ -431,10 +431,8 @@ fn admit_prepared_request(
         prepared.request.stop.token_ids.clone(),
         None,
     );
-    let mut matched_deltanet_state = None;
     if let Some(engine) = engine {
         seq.prefix_cache_key = prefix_cache_key(engine, &seq.input_ids);
-        matched_deltanet_state = attach_prefix_cache_reuse(engine, &mut seq);
     }
     // Allocate a DeltaNet pool slot only when state has to survive across
     // scheduler steps: multi-token decode, prefix reuse, or chunked prefill.
@@ -448,18 +446,10 @@ fn admit_prepared_request(
     // batch onto the non-pooled linear-attention path that clears
     // recurrent state every step — silently corrupting all
     // co-batched DeltaNet requests, not just the slotless one.
-    let needs_deltanet_slot = matched_deltanet_state.is_some()
-        || deltanet_slot_needed(&prepared, &seq, scheduler.config());
+    let needs_deltanet_slot = deltanet_slot_needed(&prepared, &seq, scheduler.config());
     if needs_deltanet_slot && let Some(pool_mutex) = deltanet_pool {
         let allocated = pool_mutex.lock().ok().and_then(|mut pool| {
             let slot = pool.allocate()?;
-            if let Some(ref state) = matched_deltanet_state
-                && let Err(error) = pool.restore_slot(slot, state)
-            {
-                tracing::warn!(request_id = %request_id, slot, error = %error, "DeltaNet prefix state restore failed");
-                pool.free(slot);
-                return None;
-            }
             Some(slot)
         });
         if let Some(slot) = allocated {
@@ -685,7 +675,11 @@ async fn wait_for_initial_prefill_batch(
     true
 }
 
-fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) -> Option<DeltaNetPrefixState> {
+fn attach_prefix_cache_reuse(
+    engine: &Engine,
+    seq: &mut Sequence,
+    min_cached_len: Option<usize>,
+) -> Option<DeltaNetPrefixState> {
     if engine.cache.prefix_cache.is_none() || seq.input_ids.len() <= 1 {
         return None;
     }
@@ -719,6 +713,12 @@ fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) -> Option<Delt
     // cached KV that another prompt may later reuse.
     cached_len -= cached_len % pool.block_size;
     cached_blocks.truncate(cached_len / pool.block_size);
+
+    if let Some(min_cached_len) = min_cached_len
+        && cached_len < min_cached_len
+    {
+        return None;
+    }
 
     if cached_len == 0
         || cached_len <= seq.kv_computed_len
@@ -769,13 +769,18 @@ fn refresh_waiting_prefix_cache(engine: &Engine, scheduler: &mut Scheduler) {
         return;
     }
 
+    let planned = scheduler.plan_waiting_shared_prefixes();
+    if planned > 0 {
+        tracing::debug!(planned, "planned shared prefix-cache boundaries");
+    }
+
     let mut refreshed = 0usize;
     let mut blocks_to_release: Vec<Vec<u32>> = Vec::new();
     scheduler.for_each_waiting_mut(|seq| {
         if seq.kv_computed_len != 0 || !seq.block_table.is_empty() {
             return;
         }
-        let deltanet_state = attach_prefix_cache_reuse(engine, seq);
+        let deltanet_state = attach_prefix_cache_reuse(engine, seq, seq.prefix_cache_target_len);
         if let Some(state) = deltanet_state {
             let restored_slot = if let Some(slot) = seq.deltanet_slot {
                 engine.cache.deltanet_pool.as_ref().and_then(|pool_mutex| {

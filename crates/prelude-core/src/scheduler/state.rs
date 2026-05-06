@@ -97,9 +97,12 @@ pub struct Sequence {
     pub kv_computed_len: usize,
     /// Real GPU block IDs (authoritative source, managed by scheduler).
     pub block_table: Vec<u32>,
-    /// Coarse hash of the leading prompt blocks used to avoid scheduling
-    /// multiple uncached copies of the same prefix in one prefill step.
+    /// Hash key used to avoid scheduling multiple uncached copies of the same
+    /// prefix in one prefill step.
     pub prefix_cache_key: Option<u64>,
+    /// Deepest block-aligned shared boundary the scheduler wants this request
+    /// to reuse before doing suffix prefill.
+    pub prefix_cache_target_len: Option<usize>,
     pub deltanet_slot: Option<u32>,
     /// Some hybrid models can skip DeltaNet state allocation for max_tokens=1,
     /// but only if the full prompt runs in one forward pass.
@@ -132,6 +135,7 @@ impl Sequence {
             kv_computed_len: 0,
             block_table: Vec::new(),
             prefix_cache_key: None,
+            prefix_cache_target_len: None,
             deltanet_slot: None,
             prefill_must_be_atomic: false,
             preempt_count: 0,
