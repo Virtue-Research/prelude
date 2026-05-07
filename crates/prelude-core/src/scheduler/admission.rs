@@ -1,8 +1,98 @@
 use std::collections::{HashSet, VecDeque};
 
+use super::components::cache::prefix_plan::{SharedPrefixPlanner, SharedPrefixPrompt};
 use super::{Scheduler, SchedulerStep, SeqFinishReason, Sequence, SequenceStatus};
 
+enum SharedPrefixPlanSlot {
+    Running(usize),
+    Waiting(usize),
+}
+
 impl Scheduler {
+    /// Update running prefills and waiting requests with the deepest currently
+    /// shared block-aligned prefix boundary.
+    pub(crate) fn plan_waiting_shared_prefixes(&mut self) -> usize {
+        let block_size = self.config.block_size;
+        if block_size == 0 {
+            return 0;
+        }
+        if self.waiting_queue.is_empty() {
+            for seq in &mut self.running {
+                seq.prefix_cache_target_len = None;
+            }
+            return 0;
+        }
+
+        let (slots, assignments) = {
+            let mut prompts: Vec<SharedPrefixPrompt<'_>> = Vec::new();
+            let mut slots: Vec<SharedPrefixPlanSlot> = Vec::new();
+
+            for (idx, seq) in self.running.iter().enumerate() {
+                if seq.status == SequenceStatus::Prefilling && seq.prefix_cache_key.is_some() {
+                    prompts.push(SharedPrefixPrompt {
+                        tokens: &seq.input_ids,
+                        min_boundary_tokens: seq.kv_computed_len,
+                    });
+                    slots.push(SharedPrefixPlanSlot::Running(idx));
+                }
+            }
+
+            for (idx, seq) in self.waiting_queue.iter().enumerate() {
+                if seq.prefix_cache_key.is_some() && seq.kv_computed_len < seq.input_ids.len() {
+                    prompts.push(SharedPrefixPrompt {
+                        tokens: &seq.input_ids,
+                        min_boundary_tokens: seq.kv_computed_len,
+                    });
+                    slots.push(SharedPrefixPlanSlot::Waiting(idx));
+                }
+            }
+
+            if prompts.len() < 2 {
+                for seq in &mut self.running {
+                    seq.prefix_cache_target_len = None;
+                }
+                for seq in &mut self.waiting_queue {
+                    seq.prefix_cache_target_len = None;
+                }
+                return 0;
+            }
+
+            let planner = SharedPrefixPlanner::new(block_size);
+            (slots, planner.assign_prompts(&prompts))
+        };
+
+        let mut assigned_waiting = 0usize;
+        for (slot, assignment) in slots.into_iter().zip(assignments.into_iter()) {
+            match slot {
+                SharedPrefixPlanSlot::Running(idx) => {
+                    let Some(seq) = self.running.get_mut(idx) else {
+                        continue;
+                    };
+                    if let Some(assignment) = assignment {
+                        seq.prefix_cache_key = Some(assignment.boundary.hash);
+                        seq.prefix_cache_target_len = Some(assignment.boundary.tokens);
+                    } else {
+                        seq.prefix_cache_target_len = None;
+                    }
+                }
+                SharedPrefixPlanSlot::Waiting(idx) => {
+                    let Some(seq) = self.waiting_queue.get_mut(idx) else {
+                        continue;
+                    };
+                    if let Some(assignment) = assignment {
+                        seq.prefix_cache_key = Some(assignment.boundary.hash);
+                        seq.prefix_cache_target_len = Some(assignment.boundary.tokens);
+                        assigned_waiting += 1;
+                    } else {
+                        seq.prefix_cache_target_len = None;
+                    }
+                }
+            }
+        }
+
+        assigned_waiting
+    }
+
     /// Schedule one step using a unified per-step token budget.
     ///
     /// Like vLLM V1: running requests are scheduled first (decode = 1 token,
@@ -30,16 +120,22 @@ impl Scheduler {
             if remaining_prefill > 0 {
                 // Partially prefilled — needs more prefill tokens
                 let mut chunk = remaining_prefill;
-                if self.config.long_prefill_token_threshold > 0 {
-                    chunk = chunk.min(self.config.long_prefill_token_threshold);
-                }
-                if seq.kv_computed_len == 0
-                    && let Some(prefix_chunk) =
-                        hybrid_prefix_bootstrap_chunk(seq, self.config.block_size)
+                if let Some(prefix_chunk) = shared_prefix_target_chunk(seq, self.config.block_size)
                 {
                     chunk = chunk.min(prefix_chunk);
+                } else {
+                    if self.config.long_prefill_token_threshold > 0 {
+                        chunk = chunk.min(self.config.long_prefill_token_threshold);
+                    }
+                    if seq.kv_computed_len == 0
+                        && let Some(prefix_chunk) =
+                            hybrid_prefix_bootstrap_chunk(seq, self.config.block_size)
+                    {
+                        chunk = chunk.min(prefix_chunk);
+                    }
                 }
                 chunk = chunk.min(token_budget);
+                chunk = cap_hybrid_prefix_cache_chunk(seq, self.config.block_size, chunk);
                 if chunk > 0 {
                     if let Some(key) = seq.prefix_cache_key {
                         scheduled_prefill_prefixes.insert(key);
@@ -58,7 +154,10 @@ impl Scheduler {
         // ── 2. Schedule WAITING requests with remaining budget ────────
         // Like vLLM V1: skip waiting admission entirely if preemption
         // happened (system is under memory pressure).
-        if !had_preemption && token_budget > 0 {
+        if !had_preemption
+            && token_budget > 0
+            && !self.should_prioritize_short_decode_tail(&decode_ids)
+        {
             self.admit_waiting_into_mixed(
                 token_budget,
                 &mut prefill_ids,
@@ -102,6 +201,20 @@ impl Scheduler {
             prefill_chunk_lens,
             decode_request_ids: decode_ids,
             forward_mode,
+        })
+    }
+
+    fn should_prioritize_short_decode_tail(&self, decode_ids: &[String]) -> bool {
+        let threshold = self.config.decode_priority_max_remaining_tokens;
+        if threshold == 0 || decode_ids.is_empty() {
+            return false;
+        }
+
+        decode_ids.iter().all(|id| {
+            self.running
+                .iter()
+                .find(|seq| seq.request_id == *id)
+                .is_some_and(|seq| seq.remaining_tokens() as usize <= threshold)
         })
     }
 
@@ -220,8 +333,7 @@ impl Scheduler {
             // same prefix repeatedly. Let one uncached "leader" populate the
             // cache, then the deferred peers can be refreshed to suffix-only
             // work on the next scheduler iteration.
-            if seq.kv_computed_len == 0
-                && seq.block_table.is_empty()
+            if prefix_prefill_leader_needed(seq)
                 && let Some(key) = seq.prefix_cache_key
                 && scheduled_prefill_prefixes.contains(&key)
             {
@@ -249,19 +361,24 @@ impl Scheduler {
 
             // Per-request prefill cap
             let mut chunk = seq.prefill_len();
-            if self.config.long_prefill_token_threshold > 0 {
-                chunk = chunk.min(self.config.long_prefill_token_threshold);
-            }
-            if seq.kv_computed_len == 0
-                && let Some(prefix_chunk) = hybrid_prefix_bootstrap_chunk(seq, block_size)
-            {
+            if let Some(prefix_chunk) = shared_prefix_target_chunk(seq, block_size) {
                 chunk = chunk.min(prefix_chunk);
+            } else {
+                if self.config.long_prefill_token_threshold > 0 {
+                    chunk = chunk.min(self.config.long_prefill_token_threshold);
+                }
+                if seq.kv_computed_len == 0
+                    && let Some(prefix_chunk) = hybrid_prefix_bootstrap_chunk(seq, block_size)
+                {
+                    chunk = chunk.min(prefix_chunk);
+                }
             }
             if seq.prefill_must_be_atomic && seq.kv_computed_len == 0 && chunk > token_budget {
                 break;
             }
             // Per-step token budget
             chunk = chunk.min(token_budget);
+            chunk = cap_hybrid_prefix_cache_chunk(seq, block_size, chunk);
 
             // Deadlock prevention: if nothing else is scheduled and chunk would
             // be 0, force at least 1 token so the system makes progress.
@@ -276,8 +393,7 @@ impl Scheduler {
                 .waiting_queue
                 .pop_front()
                 .expect("queue checked non-empty");
-            if seq.kv_computed_len == 0
-                && seq.block_table.is_empty()
+            if prefix_prefill_leader_needed(&seq)
                 && let Some(key) = seq.prefix_cache_key
             {
                 scheduled_prefill_prefixes.insert(key);
@@ -314,6 +430,75 @@ fn hybrid_prefix_bootstrap_chunk(seq: &Sequence, block_size: usize) -> Option<us
     } else {
         None
     }
+}
+
+fn shared_prefix_target_chunk(seq: &Sequence, block_size: usize) -> Option<usize> {
+    if block_size == 0 || seq.prefix_cache_key.is_none() || seq.deltanet_slot.is_none() {
+        return None;
+    }
+
+    let target_len = seq.prefix_cache_target_len?;
+    if target_len < block_size
+        || target_len >= seq.input_ids.len()
+        || target_len % block_size != 0
+        || seq.kv_computed_len >= target_len
+    {
+        return None;
+    }
+
+    Some(target_len - seq.kv_computed_len)
+}
+
+fn cap_hybrid_prefix_cache_chunk(seq: &Sequence, block_size: usize, chunk: usize) -> usize {
+    if chunk == 0
+        || block_size == 0
+        || seq.prefix_cache_key.is_none()
+        || seq.deltanet_slot.is_none()
+    {
+        return chunk;
+    }
+
+    let computed = seq.kv_computed_len;
+    let prompt_len = seq.input_ids.len();
+    if computed >= prompt_len {
+        return chunk;
+    }
+
+    let mut chunk = chunk.min(prompt_len - computed);
+    let after = computed + chunk;
+
+    // DeltaNet prefix entries require an exact state snapshot at the cached
+    // boundary. The reusable boundary must be strictly before the full prompt:
+    // generation still needs to run at least one suffix token to produce logits
+    // for the first sampled token. For block-aligned prompts, keep the final
+    // full block as suffix instead of caching the whole prompt.
+    let mut final_reusable = prompt_len - (prompt_len % block_size);
+    if final_reusable == prompt_len {
+        final_reusable = final_reusable.saturating_sub(block_size);
+    }
+    if final_reusable > computed && after > final_reusable {
+        return final_reusable - computed;
+    }
+
+    // Keep intermediate partial chunks block-aligned when the token budget
+    // allows it, so every completed chunk can become reusable prefix cache.
+    if after < prompt_len && after % block_size != 0 {
+        let aligned_after = after - (after % block_size);
+        if aligned_after > computed {
+            chunk = aligned_after - computed;
+        }
+    }
+
+    chunk
+}
+
+fn shared_prefix_target_pending(seq: &Sequence) -> bool {
+    seq.prefix_cache_target_len
+        .is_some_and(|target_len| seq.kv_computed_len < target_len)
+}
+
+fn prefix_prefill_leader_needed(seq: &Sequence) -> bool {
+    shared_prefix_target_pending(seq) || (seq.kv_computed_len == 0 && seq.block_table.is_empty())
 }
 
 // ── Legacy admission helpers (used by non-chunked path) ──────────────

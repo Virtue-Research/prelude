@@ -37,6 +37,13 @@ pub const DEFAULT_CUDA_GRAPH_MAX_BS: usize = 32;
 /// in the default config.
 pub const DEFAULT_PROFILE_TOKENS: usize = 8192;
 pub const DEFAULT_PAGED_BLOCK_SIZE: usize = 128;
+/// Default logical prefix-cache capacity, measured in paged KV blocks.
+///
+/// The cache stores references to blocks that already live in the paged KV
+/// pool. A moderate default avoids silently disabling prefix reuse for models
+/// that advertise support, while `PRELUDE_PREFIX_CACHE_BLOCKS=0` remains the
+/// explicit opt-out.
+pub const DEFAULT_PREFIX_CACHE_BLOCKS: usize = 4096;
 pub const DEFAULT_PREFIX_BLOCK_SIZE: usize = DEFAULT_PAGED_BLOCK_SIZE;
 pub const DEFAULT_DELTANET_POOL_SLOTS: u32 = 8;
 pub const DEFAULT_TEMPERATURE: f32 = 1.0;
@@ -109,7 +116,10 @@ impl CacheConfig {
             paged_block_size,
             paged_attn_blocks: parse_env_usize("PRELUDE_PAGED_ATTN_BLOCKS", 0),
             gpu_memory_utilization: DEFAULT_GPU_MEMORY_UTILIZATION,
-            prefix_cache_blocks: parse_env_usize("PRELUDE_PREFIX_CACHE_BLOCKS", 0),
+            prefix_cache_blocks: parse_env_usize(
+                "PRELUDE_PREFIX_CACHE_BLOCKS",
+                DEFAULT_PREFIX_CACHE_BLOCKS,
+            ),
             prefix_block_size: parse_env_usize("PRELUDE_PREFIX_BLOCK_SIZE", paged_block_size),
             deltanet_pool_slots: parse_env_u32(
                 "PRELUDE_DELTANET_POOL_SLOTS",

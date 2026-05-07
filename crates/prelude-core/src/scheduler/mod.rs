@@ -24,6 +24,7 @@ mod tests;
 
 pub use components::cache::block_manager::BlockManager;
 pub use components::cache::prefix_index::{PrefixInsertPlan, PrefixMatch, PrefixMatchIndex};
+pub use components::cache::prefix_plan::{PrefixBoundary, PrefixResources, SharedPrefixPlanner};
 pub use state::{
     FinishReason, ForwardMode, SamplingParams, SchedulePolicy, Scheduler, SchedulerConfig,
     SchedulerOutput, SchedulerStep, SeqFinishReason, Sequence, SequenceStatus,

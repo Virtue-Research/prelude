@@ -431,10 +431,8 @@ fn admit_prepared_request(
         prepared.request.stop.token_ids.clone(),
         None,
     );
-    let mut matched_deltanet_state = None;
     if let Some(engine) = engine {
         seq.prefix_cache_key = prefix_cache_key(engine, &seq.input_ids);
-        matched_deltanet_state = attach_prefix_cache_reuse(engine, &mut seq);
     }
     // Allocate a DeltaNet pool slot only when state has to survive across
     // scheduler steps: multi-token decode, prefix reuse, or chunked prefill.
@@ -448,18 +446,10 @@ fn admit_prepared_request(
     // batch onto the non-pooled linear-attention path that clears
     // recurrent state every step — silently corrupting all
     // co-batched DeltaNet requests, not just the slotless one.
-    let needs_deltanet_slot = matched_deltanet_state.is_some()
-        || deltanet_slot_needed(&prepared, &seq, scheduler.config());
+    let needs_deltanet_slot = deltanet_slot_needed(&prepared, &seq, scheduler.config());
     if needs_deltanet_slot && let Some(pool_mutex) = deltanet_pool {
         let allocated = pool_mutex.lock().ok().and_then(|mut pool| {
             let slot = pool.allocate()?;
-            if let Some(ref state) = matched_deltanet_state
-                && let Err(error) = pool.restore_slot(slot, state)
-            {
-                tracing::warn!(request_id = %request_id, slot, error = %error, "DeltaNet prefix state restore failed");
-                pool.free(slot);
-                return None;
-            }
             Some(slot)
         });
         if let Some(slot) = allocated {
@@ -685,7 +675,12 @@ async fn wait_for_initial_prefill_batch(
     true
 }
 
-fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) -> Option<DeltaNetPrefixState> {
+struct PrefixAttach {
+    deltanet_state: Option<DeltaNetPrefixState>,
+    replaced_blocks: Vec<u32>,
+}
+
+fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) -> Option<PrefixAttach> {
     if engine.cache.prefix_cache.is_none() || seq.input_ids.len() <= 1 {
         return None;
     }
@@ -734,7 +729,7 @@ fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) -> Option<Delt
     }
 
     seq.kv_computed_len = cached_len;
-    seq.block_table = cached_blocks;
+    let replaced_blocks = std::mem::replace(&mut seq.block_table, cached_blocks);
     tracing::debug!(
         request_id = %seq.request_id,
         cached_len,
@@ -742,7 +737,10 @@ fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) -> Option<Delt
         suffix_len = seq.input_ids.len() - cached_len,
         "attached AR prefix-cache reuse"
     );
-    deltanet_state
+    Some(PrefixAttach {
+        deltanet_state,
+        replaced_blocks,
+    })
 }
 
 fn prefix_cache_key(engine: &Engine, tokens: &[u32]) -> Option<u64> {
@@ -769,14 +767,28 @@ fn refresh_waiting_prefix_cache(engine: &Engine, scheduler: &mut Scheduler) {
         return;
     }
 
+    let planned = scheduler.plan_waiting_shared_prefixes();
+    if planned > 0 {
+        tracing::debug!(planned, "planned shared prefix-cache boundaries");
+    }
+
     let mut refreshed = 0usize;
     let mut blocks_to_release: Vec<Vec<u32>> = Vec::new();
     scheduler.for_each_waiting_mut(|seq| {
-        if seq.kv_computed_len != 0 || !seq.block_table.is_empty() {
+        if seq.kv_computed_len > 0
+            && seq
+                .prefix_cache_target_len
+                .is_none_or(|target_len| seq.kv_computed_len >= target_len)
+        {
             return;
         }
-        let deltanet_state = attach_prefix_cache_reuse(engine, seq);
-        if let Some(state) = deltanet_state {
+        let Some(attach) = attach_prefix_cache_reuse(engine, seq) else {
+            return;
+        };
+        if !attach.replaced_blocks.is_empty() {
+            blocks_to_release.push(attach.replaced_blocks);
+        }
+        if let Some(state) = attach.deltanet_state {
             let restored_slot = if let Some(slot) = seq.deltanet_slot {
                 engine.cache.deltanet_pool.as_ref().and_then(|pool_mutex| {
                     pool_mutex

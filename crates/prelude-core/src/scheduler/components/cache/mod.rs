@@ -4,6 +4,7 @@ pub mod kv_buf;
 pub mod manager;
 pub mod prefix_cache;
 pub mod prefix_index;
+pub mod prefix_plan;
 
 pub(crate) mod prefix_ops;
 

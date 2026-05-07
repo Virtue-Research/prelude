@@ -23,6 +23,25 @@ fn make_seq_with_prefix_key(
     seq
 }
 
+fn make_seq_with_tokens_and_prefix_key(
+    id: &str,
+    tokens: Vec<u32>,
+    max_new: u32,
+    prefix_cache_key: u64,
+) -> Sequence {
+    let mut seq = Sequence::new(
+        id.to_string(),
+        tokens,
+        SamplingParams::default(),
+        max_new,
+        vec![],
+        vec![],
+        None,
+    );
+    seq.prefix_cache_key = Some(prefix_cache_key);
+    seq
+}
+
 fn make_atomic_prefill_seq(id: &str, prompt_len: usize, max_new: u32) -> Sequence {
     let mut seq = make_seq(id, prompt_len, max_new);
     seq.prefill_must_be_atomic = true;
@@ -261,6 +280,327 @@ fn test_running_prefill_defers_waiting_duplicate_prefix_key() {
             .map(|seq| seq.request_id.as_str()),
         Some("r2")
     );
+}
+
+#[test]
+fn test_shared_prefix_planner_targets_deepest_waiting_boundary() {
+    let config = SchedulerConfig {
+        chunked_prefill: true,
+        block_size: 4,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    let a: Vec<u32> = (0..17).collect();
+    let mut b: Vec<u32> = (0..16).collect();
+    b.push(100);
+
+    sched.add_request(make_seq_with_tokens_and_prefix_key("r1", a, 1, 1));
+    sched.add_request(make_seq_with_tokens_and_prefix_key("r2", b, 1, 2));
+
+    assert_eq!(sched.plan_waiting_shared_prefixes(), 2);
+    assert_eq!(sched.waiting_queue[0].prefix_cache_target_len, Some(16));
+    assert_eq!(sched.waiting_queue[1].prefix_cache_target_len, Some(16));
+    assert_eq!(
+        sched.waiting_queue[0].prefix_cache_key,
+        sched.waiting_queue[1].prefix_cache_key
+    );
+}
+
+#[test]
+fn test_shared_prefix_target_controls_hybrid_bootstrap_chunk() {
+    let config = SchedulerConfig {
+        chunked_prefill: true,
+        max_running_requests: 4,
+        max_num_batched_tokens: 64,
+        max_total_tokens: 65536,
+        block_size: 4,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    let a: Vec<u32> = (0..17).collect();
+    let mut b: Vec<u32> = (0..16).collect();
+    b.push(100);
+    let mut r1 = make_seq_with_tokens_and_prefix_key("r1", a, 1, 1);
+    let mut r2 = make_seq_with_tokens_and_prefix_key("r2", b, 1, 2);
+    r1.deltanet_slot = Some(0);
+    r2.deltanet_slot = Some(1);
+    sched.add_request(r1);
+    sched.add_request(r2);
+
+    sched.plan_waiting_shared_prefixes();
+    let step = sched.schedule_step().unwrap();
+
+    assert_eq!(step.prefill_request_ids, vec!["r1"]);
+    assert_eq!(step.prefill_chunk_lens, vec![16]);
+    assert_eq!(sched.num_waiting(), 1);
+    assert_eq!(sched.waiting_queue[0].request_id, "r2");
+}
+
+#[test]
+fn test_shared_prefix_planner_uses_running_leader() {
+    let config = SchedulerConfig {
+        chunked_prefill: true,
+        block_size: 4,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    let leader_tokens: Vec<u32> = (0..17).collect();
+    let mut follower_tokens: Vec<u32> = (0..16).collect();
+    follower_tokens.push(100);
+
+    let mut leader = make_seq_with_tokens_and_prefix_key("leader", leader_tokens, 1, 1);
+    leader.status = SequenceStatus::Prefilling;
+    leader.kv_computed_len = 4;
+    sched.running.push(leader);
+    sched.add_request(make_seq_with_tokens_and_prefix_key(
+        "follower",
+        follower_tokens,
+        1,
+        2,
+    ));
+
+    assert_eq!(sched.plan_waiting_shared_prefixes(), 1);
+    assert_eq!(sched.running[0].prefix_cache_target_len, Some(16));
+    assert_eq!(sched.waiting_queue[0].prefix_cache_target_len, Some(16));
+}
+
+#[test]
+fn test_shared_prefix_planner_extends_partial_waiting_hit() {
+    let config = SchedulerConfig {
+        chunked_prefill: true,
+        block_size: 4,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    let a: Vec<u32> = (0..17).collect();
+    let mut b: Vec<u32> = (0..16).collect();
+    b.push(100);
+
+    let mut r1 = make_seq_with_tokens_and_prefix_key("r1", a, 1, 1);
+    let mut r2 = make_seq_with_tokens_and_prefix_key("r2", b, 1, 2);
+    r1.kv_computed_len = 8;
+    r2.kv_computed_len = 8;
+    r1.block_table = vec![10, 11];
+    r2.block_table = vec![10, 11];
+
+    sched.add_request(r1);
+    sched.add_request(r2);
+
+    assert_eq!(sched.plan_waiting_shared_prefixes(), 2);
+    assert_eq!(sched.waiting_queue[0].prefix_cache_target_len, Some(16));
+    assert_eq!(sched.waiting_queue[1].prefix_cache_target_len, Some(16));
+}
+
+#[test]
+fn test_partial_shared_prefix_target_admits_one_leader() {
+    let config = SchedulerConfig {
+        chunked_prefill: true,
+        max_running_requests: 4,
+        max_num_batched_tokens: 64,
+        max_total_tokens: 65536,
+        block_size: 4,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    let a: Vec<u32> = (0..17).collect();
+    let mut b: Vec<u32> = (0..16).collect();
+    b.push(100);
+
+    let mut r1 = make_seq_with_tokens_and_prefix_key("r1", a, 1, 1);
+    let mut r2 = make_seq_with_tokens_and_prefix_key("r2", b, 1, 2);
+    r1.kv_computed_len = 8;
+    r2.kv_computed_len = 8;
+    r1.block_table = vec![10, 11];
+    r2.block_table = vec![10, 11];
+    r1.deltanet_slot = Some(0);
+    r2.deltanet_slot = Some(1);
+
+    sched.add_request(r1);
+    sched.add_request(r2);
+    sched.plan_waiting_shared_prefixes();
+
+    let step = sched.schedule_step().unwrap();
+    assert_eq!(step.prefill_request_ids, vec!["r1"]);
+    assert_eq!(step.prefill_chunk_lens, vec![8]);
+    assert_eq!(sched.num_waiting(), 1);
+    assert_eq!(sched.waiting_queue[0].request_id, "r2");
+}
+
+#[test]
+fn test_hybrid_prefix_chunk_stops_at_final_block_boundary() {
+    let config = SchedulerConfig {
+        chunked_prefill: true,
+        max_running_requests: 4,
+        max_num_batched_tokens: 4096,
+        max_total_tokens: 65536,
+        block_size: 80,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    let mut seq = make_seq_with_prefix_key("r1", 2166, 4, 1);
+    seq.status = SequenceStatus::Prefilling;
+    seq.kv_computed_len = 640;
+    seq.block_table = (0..8).collect();
+    seq.deltanet_slot = Some(0);
+    sched.running.push(seq);
+
+    let step = sched.schedule_step().unwrap();
+    assert_eq!(step.prefill_request_ids, vec!["r1"]);
+    assert_eq!(step.prefill_chunk_lens, vec![1520]);
+    assert_eq!(sched.running[0].kv_computed_len, 2160);
+    assert_eq!(sched.running[0].status, SequenceStatus::Prefilling);
+
+    let tail = sched.schedule_step().unwrap();
+    assert_eq!(tail.prefill_request_ids, vec!["r1"]);
+    assert_eq!(tail.prefill_chunk_lens, vec![6]);
+    assert_eq!(sched.running[0].kv_computed_len, 2166);
+    assert_eq!(sched.running[0].status, SequenceStatus::Decoding);
+}
+
+#[test]
+fn test_hybrid_prefix_chunk_keeps_suffix_for_block_aligned_prompt() {
+    let config = SchedulerConfig {
+        chunked_prefill: true,
+        max_running_requests: 4,
+        max_num_batched_tokens: 4096,
+        max_total_tokens: 65536,
+        block_size: 80,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    let mut seq = make_seq_with_prefix_key("r1", 2160, 4, 1);
+    seq.status = SequenceStatus::Prefilling;
+    seq.kv_computed_len = 640;
+    seq.block_table = (0..8).collect();
+    seq.deltanet_slot = Some(0);
+    sched.running.push(seq);
+
+    let step = sched.schedule_step().unwrap();
+    assert_eq!(step.prefill_request_ids, vec!["r1"]);
+    assert_eq!(step.prefill_chunk_lens, vec![1440]);
+    assert_eq!(sched.running[0].kv_computed_len, 2080);
+    assert_eq!(sched.running[0].status, SequenceStatus::Prefilling);
+
+    let tail = sched.schedule_step().unwrap();
+    assert_eq!(tail.prefill_request_ids, vec!["r1"]);
+    assert_eq!(tail.prefill_chunk_lens, vec![80]);
+    assert_eq!(sched.running[0].kv_computed_len, 2160);
+    assert_eq!(sched.running[0].status, SequenceStatus::Decoding);
+}
+
+#[test]
+fn test_short_decode_tail_defers_waiting_prefill() {
+    let config = SchedulerConfig {
+        max_running_requests: 4,
+        max_num_batched_tokens: 64,
+        max_total_tokens: 65536,
+        decode_priority_max_remaining_tokens: 4,
+        chunked_prefill: true,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    let mut running = make_seq("decode", 8, 4);
+    running.status = SequenceStatus::Decoding;
+    running.kv_computed_len = 8;
+    running.output_ids = vec![10];
+    running.block_table = vec![0];
+    sched.running.push(running);
+    sched.add_request(make_seq("waiting", 16, 4));
+
+    let step = sched.schedule_step().unwrap();
+    assert_eq!(step.forward_mode, ForwardMode::Decode);
+    assert_eq!(step.decode_request_ids, vec!["decode"]);
+    assert!(step.prefill_request_ids.is_empty());
+    assert_eq!(sched.num_waiting(), 1);
+}
+
+#[test]
+fn test_long_decode_tail_can_mix_waiting_prefill() {
+    let config = SchedulerConfig {
+        max_running_requests: 4,
+        max_num_batched_tokens: 64,
+        max_total_tokens: 65536,
+        decode_priority_max_remaining_tokens: 4,
+        chunked_prefill: true,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    let mut running = make_seq("decode", 8, 16);
+    running.status = SequenceStatus::Decoding;
+    running.kv_computed_len = 8;
+    running.output_ids = vec![10];
+    running.block_table = vec![0];
+    sched.running.push(running);
+    sched.add_request(make_seq("waiting", 16, 4));
+
+    let step = sched.schedule_step().unwrap();
+    assert_eq!(step.forward_mode, ForwardMode::Mixed);
+    assert_eq!(step.decode_request_ids, vec!["decode"]);
+    assert_eq!(step.prefill_request_ids, vec!["waiting"]);
+}
+
+#[test]
+fn test_late_waiting_shared_prefix_updates_running_leader_key() {
+    let config = SchedulerConfig {
+        chunked_prefill: true,
+        max_running_requests: 4,
+        max_num_batched_tokens: 64,
+        max_total_tokens: 65536,
+        block_size: 4,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    let leader_tokens: Vec<u32> = (0..17).collect();
+    let mut follower_tokens: Vec<u32> = (0..16).collect();
+    follower_tokens.push(100);
+
+    let mut leader = make_seq_with_tokens_and_prefix_key("leader", leader_tokens, 1, 1);
+    leader.status = SequenceStatus::Prefilling;
+    leader.kv_computed_len = 4;
+    leader.deltanet_slot = Some(0);
+    sched.running.push(leader);
+    let mut follower = make_seq_with_tokens_and_prefix_key("follower", follower_tokens, 1, 2);
+    follower.deltanet_slot = Some(1);
+    sched.add_request(follower);
+
+    sched.plan_waiting_shared_prefixes();
+    assert_eq!(
+        sched.running[0].prefix_cache_key,
+        sched.waiting_queue[0].prefix_cache_key
+    );
+
+    let step = sched.schedule_step().unwrap();
+    assert_eq!(step.prefill_request_ids, vec!["leader"]);
+    assert_eq!(step.prefill_chunk_lens, vec![12]);
+    assert_eq!(sched.num_waiting(), 1);
+}
+
+#[test]
+fn test_shared_prefix_planner_clears_stale_target() {
+    let config = SchedulerConfig {
+        chunked_prefill: true,
+        block_size: 4,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    let tokens: Vec<u32> = (0..17).collect();
+    let mut seq = make_seq_with_tokens_and_prefix_key("r1", tokens, 1, 1);
+    seq.prefix_cache_target_len = Some(16);
+    sched.add_request(seq);
+
+    assert_eq!(sched.plan_waiting_shared_prefixes(), 0);
+    assert_eq!(sched.waiting_queue[0].prefix_cache_target_len, None);
 }
 
 // ── Chunked prefill specific tests ───────────────────────────────
