@@ -93,6 +93,13 @@ struct Cli {
 
     #[arg(
         long,
+        default_value_t = 4,
+        help = "Prioritize running decode requests with at most this many tokens remaining before admitting new prefill work. 0 disables."
+    )]
+    decode_priority_max_remaining_tokens: usize,
+
+    #[arg(
+        long,
         help = "Max concurrent DeltaNet recurrent-state slots for hybrid models. \
                 Defaults to PRELUDE_DELTANET_POOL_SLOTS when set, otherwise \
                 --max-running-requests. Use 0 to disable the DeltaNet pool."
@@ -344,6 +351,7 @@ async fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
         long_prefill_token_threshold: cli.long_prefill_token_threshold,
         max_total_tokens,
         decode_reservation_cap,
+        decode_priority_max_remaining_tokens: cli.decode_priority_max_remaining_tokens,
         chunked_prefill: cli.chunked_prefill && !cli.no_chunked_prefill,
         block_size: scheduler_block_size,
         ..SchedulerConfig::default()
@@ -355,6 +363,8 @@ async fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
         max_num_batched_tokens = scheduler_config.max_num_batched_tokens,
         max_total_tokens = scheduler_config.max_total_tokens,
         decode_reservation_cap = scheduler_config.decode_reservation_cap,
+        decode_priority_max_remaining_tokens =
+            scheduler_config.decode_priority_max_remaining_tokens,
         "scheduler enabled"
     );
     let scheduled = ScheduledEngine::new(base_engine, scheduler_config);

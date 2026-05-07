@@ -432,6 +432,123 @@ fn test_partial_shared_prefix_target_admits_one_leader() {
 }
 
 #[test]
+fn test_hybrid_prefix_chunk_stops_at_final_block_boundary() {
+    let config = SchedulerConfig {
+        chunked_prefill: true,
+        max_running_requests: 4,
+        max_num_batched_tokens: 4096,
+        max_total_tokens: 65536,
+        block_size: 80,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    let mut seq = make_seq_with_prefix_key("r1", 2166, 4, 1);
+    seq.status = SequenceStatus::Prefilling;
+    seq.kv_computed_len = 640;
+    seq.block_table = (0..8).collect();
+    seq.deltanet_slot = Some(0);
+    sched.running.push(seq);
+
+    let step = sched.schedule_step().unwrap();
+    assert_eq!(step.prefill_request_ids, vec!["r1"]);
+    assert_eq!(step.prefill_chunk_lens, vec![1520]);
+    assert_eq!(sched.running[0].kv_computed_len, 2160);
+    assert_eq!(sched.running[0].status, SequenceStatus::Prefilling);
+
+    let tail = sched.schedule_step().unwrap();
+    assert_eq!(tail.prefill_request_ids, vec!["r1"]);
+    assert_eq!(tail.prefill_chunk_lens, vec![6]);
+    assert_eq!(sched.running[0].kv_computed_len, 2166);
+    assert_eq!(sched.running[0].status, SequenceStatus::Decoding);
+}
+
+#[test]
+fn test_hybrid_prefix_chunk_keeps_suffix_for_block_aligned_prompt() {
+    let config = SchedulerConfig {
+        chunked_prefill: true,
+        max_running_requests: 4,
+        max_num_batched_tokens: 4096,
+        max_total_tokens: 65536,
+        block_size: 80,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    let mut seq = make_seq_with_prefix_key("r1", 2160, 4, 1);
+    seq.status = SequenceStatus::Prefilling;
+    seq.kv_computed_len = 640;
+    seq.block_table = (0..8).collect();
+    seq.deltanet_slot = Some(0);
+    sched.running.push(seq);
+
+    let step = sched.schedule_step().unwrap();
+    assert_eq!(step.prefill_request_ids, vec!["r1"]);
+    assert_eq!(step.prefill_chunk_lens, vec![1440]);
+    assert_eq!(sched.running[0].kv_computed_len, 2080);
+    assert_eq!(sched.running[0].status, SequenceStatus::Prefilling);
+
+    let tail = sched.schedule_step().unwrap();
+    assert_eq!(tail.prefill_request_ids, vec!["r1"]);
+    assert_eq!(tail.prefill_chunk_lens, vec![80]);
+    assert_eq!(sched.running[0].kv_computed_len, 2160);
+    assert_eq!(sched.running[0].status, SequenceStatus::Decoding);
+}
+
+#[test]
+fn test_short_decode_tail_defers_waiting_prefill() {
+    let config = SchedulerConfig {
+        max_running_requests: 4,
+        max_num_batched_tokens: 64,
+        max_total_tokens: 65536,
+        decode_priority_max_remaining_tokens: 4,
+        chunked_prefill: true,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    let mut running = make_seq("decode", 8, 4);
+    running.status = SequenceStatus::Decoding;
+    running.kv_computed_len = 8;
+    running.output_ids = vec![10];
+    running.block_table = vec![0];
+    sched.running.push(running);
+    sched.add_request(make_seq("waiting", 16, 4));
+
+    let step = sched.schedule_step().unwrap();
+    assert_eq!(step.forward_mode, ForwardMode::Decode);
+    assert_eq!(step.decode_request_ids, vec!["decode"]);
+    assert!(step.prefill_request_ids.is_empty());
+    assert_eq!(sched.num_waiting(), 1);
+}
+
+#[test]
+fn test_long_decode_tail_can_mix_waiting_prefill() {
+    let config = SchedulerConfig {
+        max_running_requests: 4,
+        max_num_batched_tokens: 64,
+        max_total_tokens: 65536,
+        decode_priority_max_remaining_tokens: 4,
+        chunked_prefill: true,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    let mut running = make_seq("decode", 8, 16);
+    running.status = SequenceStatus::Decoding;
+    running.kv_computed_len = 8;
+    running.output_ids = vec![10];
+    running.block_table = vec![0];
+    sched.running.push(running);
+    sched.add_request(make_seq("waiting", 16, 4));
+
+    let step = sched.schedule_step().unwrap();
+    assert_eq!(step.forward_mode, ForwardMode::Mixed);
+    assert_eq!(step.decode_request_ids, vec!["decode"]);
+    assert_eq!(step.prefill_request_ids, vec!["waiting"]);
+}
+
+#[test]
 fn test_late_waiting_shared_prefix_updates_running_leader_key() {
     let config = SchedulerConfig {
         chunked_prefill: true,

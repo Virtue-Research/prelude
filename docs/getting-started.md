@@ -101,8 +101,8 @@ PRELUDE_DEVICE=cpu ./target/release/prelude-server \
 | `PRELUDE_DEVICE`                | `auto`  | `auto`, `cpu`, `cuda`, `cuda:N`                  |
 | `CUDA_VISIBLE_DEVICES`          | (all)   | Standard CUDA device visibility                  |
 | `PRELUDE_PAGED_BLOCK_SIZE`      | `128`*  | Paged KV block size (128 w/ FA3, 16 otherwise)   |
-| `PRELUDE_PREFIX_CACHE_BLOCKS`   | `0`     | Prefix cache capacity (0 = disabled)             |
-| `PRELUDE_PREFIX_BLOCK_SIZE`     | `64`    | Tokens per prefix cache block                    |
+| `PRELUDE_PREFIX_CACHE_BLOCKS`   | `4096`  | Prefix cache capacity in paged KV blocks (`0` disables) |
+| `PRELUDE_PREFIX_BLOCK_SIZE`     | `128`*  | Tokens per prefix cache block                    |
 | `PRELUDE_API_KEY`               | (none)  | API key (merged with `--api-key` CLI args)       |
 | `PRELUDE_MOCK`                  | `0`     | `1` to use mock engine (no model needed)         |
 | `RUST_LOG`                      | `info`  | Log level (`prelude_core=debug` for verbose)     |

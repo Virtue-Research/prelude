@@ -126,6 +126,10 @@ impl PrefixKvCache {
 
         for end in (1..=m.matched_hashes.len()).rev() {
             let hashes = &m.matched_hashes[..end];
+            let cached_len = end * self.index.block_size();
+            if cached_len >= tokens.len() {
+                continue;
+            }
             let Some(state) = self.deltanet_state_store.get(hashes.last().unwrap()) else {
                 continue;
             };
@@ -137,7 +141,6 @@ impl PrefixKvCache {
                 continue;
             }
 
-            let cached_len = end * self.index.block_size();
             let paged_blocks = self.index.collect_paged_blocks(hashes);
             return Ok((cached_len, paged_blocks, Some(state.clone())));
         }

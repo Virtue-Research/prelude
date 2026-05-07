@@ -27,19 +27,20 @@
 //! - `output`: `[packed_seq, num_sab_heads, head_dim]` BF16
 //! - `output_state`: `[num_seqs, num_sab_heads, head_dim, head_dim]` F32
 
+use candle_core::Shape;
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::WrapErr;
-use candle_core::Shape;
 use cudarc::driver::DevicePtr;
-use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
-use flashinfer::types::{
-    DLDataType, DLDevice, DLTensor, TVMFFIAny, KDLBFLOAT, KDLCUDA, KDLFLOAT, KDLINT, KDLUINT,
-};
+use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use flashinfer::KernelRegistry;
+use flashinfer::types::{
+    DLDataType, DLDevice, DLTensor, KDLBFLOAT, KDLCUDA, KDLFLOAT, KDLINT, KDLUINT, TVMFFIAny,
+};
 use half::bf16;
-use prelude_core::tensor::{bail, DType, DeviceExt, Result, Tensor};
+use prelude_core::tensor::{DType, DeviceExt, Result, Tensor, bail};
+use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use crate::{MOD_GDN_PREFILL_RECURRENT, PTX_GDN_PREFILL_RECURRENT};
 
@@ -270,13 +271,9 @@ pub(crate) fn try_prefill(
     }
 
     if (100..110).contains(&arch) {
-        // Keep FlashInfer's SM100 persistent GDN AOT kernel opt-in for now.
-        // It is fast in smoke tests, but real activation end-to-end runs have
-        // reproduced device-side hangs in Prelude's static TVM-FFI path. The
-        // recurrent Blackwell kernel is the production default until the AOT
-        // path is proven stable.
-        if sm100_aot_enabled() && initial_state.is_none() && num_seqs == 1 {
-            if let Some(result) = try_prefill_blackwell_aot(
+        let backend = sm100_backend_policy();
+        if sm100_should_try_aot(backend, hq, hv, num_seqs, t) {
+            match try_prefill_blackwell_aot(
                 reg,
                 q,
                 k,
@@ -288,8 +285,17 @@ pub(crate) fn try_prefill(
                 scale,
                 num_seqs,
                 num_sab_heads,
-            )? {
-                return Ok(Some(result));
+            ) {
+                Ok(Some(result)) => return Ok(Some(result)),
+                Ok(None) => {
+                    tracing::debug!(
+                        policy = ?backend,
+                        total_tokens = t,
+                        num_seqs,
+                        "FlashInfer GDN SM100 AOT kernel unavailable; falling back to recurrent"
+                    );
+                }
+                Err(e) => return Err(e),
             }
         }
         return try_prefill_recurrent_blackwell(
@@ -458,27 +464,86 @@ pub(crate) fn try_prefill(
     Ok(Some((out, final_state)))
 }
 
-fn sm100_aot_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PRELUDE_GDN_SM100_AOT")
-            .map(|v| {
-                matches!(
-                    v.as_str(),
-                    "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-                )
-            })
-            .unwrap_or(false)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Sm100GdnBackend {
+    Auto,
+    Aot,
+    Recurrent,
+}
+
+fn sm100_backend_policy() -> Sm100GdnBackend {
+    static POLICY: OnceLock<Sm100GdnBackend> = OnceLock::new();
+    *POLICY.get_or_init(|| {
+        let raw = std::env::var("PRELUDE_GDN_SM100_BACKEND")
+            .or_else(|_| std::env::var("PRELUDE_GDN_BACKEND"))
+            .ok();
+        match raw.as_deref().map(str::to_ascii_lowercase).as_deref() {
+            Some("recurrent") | Some("fallback") => Sm100GdnBackend::Recurrent,
+            Some("aot") | Some("flashinfer") | Some("sm100-aot") => Sm100GdnBackend::Aot,
+            Some("auto") | None => Sm100GdnBackend::Auto,
+            Some(_) => Sm100GdnBackend::Auto,
+        }
+    })
+}
+
+fn sm100_should_try_aot(
+    policy: Sm100GdnBackend,
+    hq: usize,
+    hv: usize,
+    num_seqs: usize,
+    total_tokens: usize,
+) -> bool {
+    if !sm100_aot_specialization_available(hq, hv, num_seqs) {
+        return false;
+    }
+
+    match policy {
+        Sm100GdnBackend::Aot => true,
+        Sm100GdnBackend::Recurrent => false,
+        Sm100GdnBackend::Auto => {
+            num_seqs >= sm100_aot_min_batch() && total_tokens <= sm100_aot_max_tokens()
+        }
+    }
+}
+
+fn sm100_aot_specialization_available(hq: usize, hv: usize, num_seqs: usize) -> bool {
+    match (hq, hv) {
+        // Qwen3.5 / Qwen3-next 35B/9B/4B TP1 shape. This is the only shape
+        // with batched SM100 AOT specializations in the vendored build.
+        (16, 32) => matches!(num_seqs, 1 | 2 | 4 | 8 | 16 | 32),
+        // Other supported value-head counts currently only have single-seq
+        // AOT entrypoints; batched prefill falls back to recurrent.
+        (16, 16) | (16, 48) | (16, 64) | (32, 32) | (64, 64) => num_seqs == 1,
+        _ => false,
+    }
+}
+
+fn sm100_aot_min_batch() -> usize {
+    static MIN_BATCH: OnceLock<usize> = OnceLock::new();
+    *MIN_BATCH.get_or_init(|| {
+        std::env::var("PRELUDE_GDN_SM100_AOT_MIN_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(16)
+    })
+}
+
+fn sm100_aot_max_tokens() -> usize {
+    static MAX_TOKENS: OnceLock<usize> = OnceLock::new();
+    *MAX_TOKENS.get_or_init(|| {
+        std::env::var("PRELUDE_GDN_SM100_AOT_MAX_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2048)
     })
 }
 
 fn sm100_aot_sync_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        // FlashInfer's SM100 persistent GDN AOT path is not safe to leave
-        // multiple launches outstanding in Prelude's static TVM-FFI setup. Keep
-        // the boundary conservative by default; developers can disable it for
-        // profiling with PRELUDE_GDN_SM100_SYNC=0.
+        // AOT launches are asynchronous. The default path keeps temporary
+        // tensors alive with CUDA events, so a full stream sync is only a
+        // debugging escape hatch.
         std::env::var("PRELUDE_GDN_SM100_SYNC")
             .map(|v| {
                 !matches!(
@@ -486,8 +551,58 @@ fn sm100_aot_sync_enabled() -> bool {
                     "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
                 )
             })
-            .unwrap_or(true)
+            .unwrap_or(false)
     })
+}
+
+struct PendingAotTemps {
+    event: CudaEvent,
+    _tensors: Vec<Tensor>,
+}
+
+fn sm100_aot_max_pending_calls() -> usize {
+    static MAX_PENDING: OnceLock<usize> = OnceLock::new();
+    *MAX_PENDING.get_or_init(|| {
+        std::env::var("PRELUDE_GDN_SM100_MAX_PENDING_CALLS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(128)
+    })
+}
+
+fn retain_sm100_aot_temporaries(stream: &CudaStream, tensors: Vec<Tensor>) -> Result<()> {
+    static PENDING: OnceLock<Mutex<VecDeque<PendingAotTemps>>> = OnceLock::new();
+
+    let event = stream
+        .record_event(None)
+        .map_err(|e| candle_core::Error::Msg(format!("FlashInfer GDN SM100 event record: {e}")))?;
+    let pending = PENDING.get_or_init(|| Mutex::new(VecDeque::new()));
+    let mut pending = pending
+        .lock()
+        .map_err(|e| candle_core::Error::Msg(format!("FlashInfer GDN SM100 pending lock: {e}")))?;
+
+    while pending
+        .front()
+        .is_some_and(|entry| entry.event.is_complete())
+    {
+        pending.pop_front();
+    }
+
+    let max_pending = sm100_aot_max_pending_calls();
+    while pending.len() >= max_pending {
+        if let Some(entry) = pending.pop_front() {
+            entry.event.synchronize().map_err(|e| {
+                candle_core::Error::Msg(format!("FlashInfer GDN SM100 pending sync: {e}"))
+            })?;
+        }
+    }
+
+    pending.push_back(PendingAotTemps {
+        event,
+        _tensors: tensors,
+    });
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -518,7 +633,7 @@ fn try_prefill_blackwell_aot(
         return Ok(None);
     }
 
-    let name = format!("gdn_prefill_sm100_bf16_h{hq}_hv{hv}");
+    let name = format!("gdn_prefill_sm100_bf16_h{hq}_hv{hv}_b{num_seqs}");
     let Some(kernel) = reg.get_utility(&name) else {
         return Ok(None);
     };
@@ -627,6 +742,12 @@ fn try_prefill_blackwell_aot(
         stream
             .synchronize()
             .map_err(|e| candle_core::Error::Msg(format!("FlashInfer GDN SM100 sync: {e}")))?;
+    } else {
+        retain_sm100_aot_temporaries(
+            &stream,
+            vec![q_c, k_c, v_c, alpha_c, beta_c, cu_i32, init_c, workspace],
+        )?;
+        return Ok(Some((out, final_state)));
     }
 
     drop(q_c);
@@ -811,10 +932,6 @@ fn detect_sm_count() -> i32 {
         if cudaDeviceGetAttribute(&mut count, CUDA_DEV_ATTR_MULTIPROCESSOR_COUNT, dev) != 0 {
             return 132;
         }
-        if count > 0 {
-            count
-        } else {
-            132
-        }
+        if count > 0 { count } else { 132 }
     })
 }

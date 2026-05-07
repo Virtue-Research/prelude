@@ -135,6 +135,7 @@ impl Scheduler {
                     }
                 }
                 chunk = chunk.min(token_budget);
+                chunk = cap_hybrid_prefix_cache_chunk(seq, self.config.block_size, chunk);
                 if chunk > 0 {
                     if let Some(key) = seq.prefix_cache_key {
                         scheduled_prefill_prefixes.insert(key);
@@ -153,7 +154,10 @@ impl Scheduler {
         // ── 2. Schedule WAITING requests with remaining budget ────────
         // Like vLLM V1: skip waiting admission entirely if preemption
         // happened (system is under memory pressure).
-        if !had_preemption && token_budget > 0 {
+        if !had_preemption
+            && token_budget > 0
+            && !self.should_prioritize_short_decode_tail(&decode_ids)
+        {
             self.admit_waiting_into_mixed(
                 token_budget,
                 &mut prefill_ids,
@@ -197,6 +201,20 @@ impl Scheduler {
             prefill_chunk_lens,
             decode_request_ids: decode_ids,
             forward_mode,
+        })
+    }
+
+    fn should_prioritize_short_decode_tail(&self, decode_ids: &[String]) -> bool {
+        let threshold = self.config.decode_priority_max_remaining_tokens;
+        if threshold == 0 || decode_ids.is_empty() {
+            return false;
+        }
+
+        decode_ids.iter().all(|id| {
+            self.running
+                .iter()
+                .find(|seq| seq.request_id == *id)
+                .is_some_and(|seq| seq.remaining_tokens() as usize <= threshold)
         })
     }
 
@@ -360,6 +378,7 @@ impl Scheduler {
             }
             // Per-step token budget
             chunk = chunk.min(token_budget);
+            chunk = cap_hybrid_prefix_cache_chunk(seq, block_size, chunk);
 
             // Deadlock prevention: if nothing else is scheduled and chunk would
             // be 0, force at least 1 token so the system makes progress.
@@ -428,6 +447,49 @@ fn shared_prefix_target_chunk(seq: &Sequence, block_size: usize) -> Option<usize
     }
 
     Some(target_len - seq.kv_computed_len)
+}
+
+fn cap_hybrid_prefix_cache_chunk(seq: &Sequence, block_size: usize, chunk: usize) -> usize {
+    if chunk == 0
+        || block_size == 0
+        || seq.prefix_cache_key.is_none()
+        || seq.deltanet_slot.is_none()
+    {
+        return chunk;
+    }
+
+    let computed = seq.kv_computed_len;
+    let prompt_len = seq.input_ids.len();
+    if computed >= prompt_len {
+        return chunk;
+    }
+
+    let mut chunk = chunk.min(prompt_len - computed);
+    let after = computed + chunk;
+
+    // DeltaNet prefix entries require an exact state snapshot at the cached
+    // boundary. The reusable boundary must be strictly before the full prompt:
+    // generation still needs to run at least one suffix token to produce logits
+    // for the first sampled token. For block-aligned prompts, keep the final
+    // full block as suffix instead of caching the whole prompt.
+    let mut final_reusable = prompt_len - (prompt_len % block_size);
+    if final_reusable == prompt_len {
+        final_reusable = final_reusable.saturating_sub(block_size);
+    }
+    if final_reusable > computed && after > final_reusable {
+        return final_reusable - computed;
+    }
+
+    // Keep intermediate partial chunks block-aligned when the token budget
+    // allows it, so every completed chunk can become reusable prefix cache.
+    if after < prompt_len && after % block_size != 0 {
+        let aligned_after = after - (after % block_size);
+        if aligned_after > computed {
+            chunk = aligned_after - computed;
+        }
+    }
+
+    chunk
 }
 
 fn shared_prefix_target_pending(seq: &Sequence) -> bool {

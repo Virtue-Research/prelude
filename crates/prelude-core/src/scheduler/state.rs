@@ -199,6 +199,12 @@ pub struct SchedulerConfig {
     pub long_prefill_token_threshold: usize,
     pub max_total_tokens: usize,
     pub decode_reservation_cap: usize,
+    /// When non-zero, short decode tails with at most this many tokens left
+    /// are prioritized over admitting new waiting prefill work. This protects
+    /// low-latency short-generation workloads from being blocked behind
+    /// unrelated suffix prefill while keeping long generations on the normal
+    /// mixed prefill/decode path.
+    pub decode_priority_max_remaining_tokens: usize,
     pub new_token_ratio: f32,
     pub min_new_token_ratio: f32,
     pub new_token_ratio_decay: f32,
@@ -218,6 +224,7 @@ impl Default for SchedulerConfig {
             long_prefill_token_threshold: 0,
             max_total_tokens: 32768,
             decode_reservation_cap: 4096,
+            decode_priority_max_remaining_tokens: 4,
             new_token_ratio: 0.4,
             min_new_token_ratio: 0.1,
             new_token_ratio_decay: 0.002,
