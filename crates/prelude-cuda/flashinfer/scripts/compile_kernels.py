@@ -1471,6 +1471,29 @@ GDN_BLACKWELL_HEAD_PAIRS = [
     (64, 64),
 ]
 
+GDN_BLACKWELL_BATCHES_BY_HEAD_PAIR = {
+    # The production C32 path for Qwen3.5 large-class GVA models lands here.
+    # CuTe DSL specializes `cu_seqlens.shape[0] - 1`, so these must be exact
+    # batch-size variants rather than one nominally dynamic batch=1 export.
+    (16, 32): [1, 2, 4, 8, 16, 32],
+}
+
+
+def gdn_blackwell_batches(hq: int, hv: int) -> List[int]:
+    return GDN_BLACKWELL_BATCHES_BY_HEAD_PAIR.get((hq, hv), [1])
+
+
+def gdn_blackwell_symbol(dtype: str, hq: int, hv: int, batch: int) -> str:
+    return f"gdn_prefill_sm100_{dtype}_h{hq}_hv{hv}_b{batch}"
+
+
+def gdn_blackwell_variants() -> List[Tuple[int, int, int]]:
+    return [
+        (hq, hv, batch)
+        for hq, hv in GDN_BLACKWELL_HEAD_PAIRS
+        for batch in gdn_blackwell_batches(hq, hv)
+    ]
+
 
 def verify_exported_tvm_symbol(obj_path: Path, name: str) -> None:
     symbol = f"__tvm_ffi_{name}"
@@ -1491,6 +1514,7 @@ def compile_gdn_blackwell_variant(
     hq: int,
     hv: int,
     dtype: str,
+    batch: int,
 ) -> bool:
     """AOT-export FlashInfer's SM100 CuTe DSL GDN prefill kernel.
 
@@ -1501,8 +1525,10 @@ def compile_gdn_blackwell_variant(
       output_checkpoints, cu_checkpoints, checkpoint_every_n_tokens, scale,
       workspace, stream
 
-    We specialize only on IO dtype and head counts. Token count, batch size and
-    pool size stay dynamic, matching upstream's Python cache key.
+    We specialize on IO dtype, head counts and batch size. Token count stays
+    dynamic. The CuTe DSL host entry point derives ``batch_size`` from
+    ``cu_seqlens.shape[0] - 1``; a batch=1 export is therefore not a safe
+    replacement for batched production prefill.
     """
     if obj_path.exists():
         print(f"  {obj_path.name}: already exists, skipping")
@@ -1536,16 +1562,22 @@ def compile_gdn_blackwell_variant(
         num_sm = get_num_sm(device)
         max_active_clusters = num_sm
         seq_len = 64
-        batch = 1
+        total_tokens = seq_len * batch
         head_dim = 128
 
-        q = torch.zeros((seq_len, hq, head_dim), dtype=torch_dtype, device=device)
-        k = torch.zeros((seq_len, hq, head_dim), dtype=torch_dtype, device=device)
-        v = torch.zeros((seq_len, hv, head_dim), dtype=torch_dtype, device=device)
-        gate = torch.zeros((seq_len, max(hq, hv)), dtype=torch.float32, device=device)
+        q = torch.zeros((total_tokens, hq, head_dim), dtype=torch_dtype, device=device)
+        k = torch.zeros((total_tokens, hq, head_dim), dtype=torch_dtype, device=device)
+        v = torch.zeros((total_tokens, hv, head_dim), dtype=torch_dtype, device=device)
+        gate = torch.zeros((total_tokens, max(hq, hv)), dtype=torch.float32, device=device)
         beta = torch.zeros_like(gate)
-        output = torch.zeros((seq_len, max(hq, hv), head_dim), dtype=torch_dtype, device=device)
-        cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+        output = torch.zeros((total_tokens, max(hq, hv), head_dim), dtype=torch_dtype, device=device)
+        cu_seqlens = torch.arange(
+            0,
+            total_tokens + 1,
+            seq_len,
+            dtype=torch.int32,
+            device=device,
+        )
         initial_state = torch.zeros(
             (batch, max(hq, hv), head_dim, head_dim),
             dtype=torch.float32,
@@ -1630,13 +1662,13 @@ def compile_gdn_blackwell_variant(
         obj_path.parent.mkdir(parents=True, exist_ok=True)
         compiled.export_to_c(
             object_file_path=str(obj_path),
-            function_name=f"gdn_prefill_sm100_{dtype}_h{hq}_hv{hv}",
+            function_name=gdn_blackwell_symbol(dtype, hq, hv, batch),
         )
         print(f"  Exported {obj_path.name} ({obj_path.stat().st_size // 1024}KB)")
-        verify_exported_tvm_symbol(obj_path, f"gdn_prefill_sm100_{dtype}_h{hq}_hv{hv}")
+        verify_exported_tvm_symbol(obj_path, gdn_blackwell_symbol(dtype, hq, hv, batch))
         return True
     except Exception as e:
-        print(f"  ERROR compiling Blackwell GDN h{hq}/hv{hv}/{dtype}: {e}")
+        print(f"  ERROR compiling Blackwell GDN h{hq}/hv{hv}/b{batch}/{dtype}: {e}")
         import traceback
 
         traceback.print_exc()
@@ -2119,9 +2151,9 @@ def main():
     gdn_blackwell_vinfo = None
     if has_sm100 and "bf16" in dtypes:
         symbols = {
-            f"gdn_prefill_sm100_bf16_h{hq}_hv{hv}":
-                f"__tvm_ffi_gdn_prefill_sm100_bf16_h{hq}_hv{hv}"
-            for hq, hv in GDN_BLACKWELL_HEAD_PAIRS
+            gdn_blackwell_symbol("bf16", hq, hv, batch):
+                f"__tvm_ffi_{gdn_blackwell_symbol('bf16', hq, hv, batch)}"
+            for hq, hv, batch in gdn_blackwell_variants()
         }
         gdn_blackwell_vinfo = {
             "vid": "fi_gdn_blackwell",
@@ -2130,7 +2162,7 @@ def main():
         }
         print(
             "  Blackwell GDN prefill: "
-            f"{len(GDN_BLACKWELL_HEAD_PAIRS)} BF16 CuTe DSL variants"
+            f"{len(gdn_blackwell_variants())} BF16 CuTe DSL variants"
         )
 
     if has_sm90:
@@ -2540,10 +2572,10 @@ def main():
     if gdn_blackwell_vinfo is not None:
         gdn_bw_dir = obj_dir / "fi_gdn_blackwell"
         gdn_bw_ok = []
-        for hq, hv in GDN_BLACKWELL_HEAD_PAIRS:
-            name = f"gdn_prefill_sm100_bf16_h{hq}_hv{hv}"
+        for hq, hv, batch in gdn_blackwell_variants():
+            name = gdn_blackwell_symbol("bf16", hq, hv, batch)
             obj_path = gdn_bw_dir / f"{name}.o"
-            if compile_gdn_blackwell_variant(obj_path, hq, hv, "bf16"):
+            if compile_gdn_blackwell_variant(obj_path, hq, hv, "bf16", batch):
                 obj_files.append(str(obj_path))
                 gdn_bw_ok.append(name)
         missing = sorted(set(gdn_blackwell_vinfo["symbols"].keys()) - set(gdn_bw_ok))
