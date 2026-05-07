@@ -343,7 +343,7 @@ fn test_gdn_sm100(reg: &KernelRegistry) {
     let hv = env_i64("PRELUDE_TEST_GDN_HV", 16);
     let head_dim = env_i64("PRELUDE_TEST_GDN_D", 128);
     let total_tokens = seq_len * batch;
-    let name = format!("gdn_prefill_sm100_bf16_h{hq}_hv{hv}");
+    let name = format!("gdn_prefill_sm100_bf16_h{hq}_hv{hv}_b{batch}");
     let Some(kernel) = reg.get_utility(&name) else {
         println!("{name} not compiled");
         return;
