@@ -17,211 +17,22 @@ use crate::models::commons::linear::DenseLinear;
 use crate::tensor::{D, DType, Device, Module, Result, Tensor};
 
 use crate::models::commons::{
-    BatchAttnContext, BatchState, HybridAttentionPattern, LayerAttnContext, Linear,
-    grouped_prefill_batch_take, last_token_select, packed_sequence_offsets,
+    BatchAttnContext, BatchState, LayerAttnContext, Linear, grouped_prefill_batch_take,
+    last_token_select, packed_sequence_offsets,
 };
-use crate::models::model_config;
 use crate::ops::{MaskType, PagedParams, VarlenParams};
 use std::collections::BTreeMap;
 
 const MAX_GROUPED_PREFILL_BATCH: usize = 8;
 
-// ── Config ──────────────────────────────────────────────────────────────
+mod config;
 
-model_config! {
-    pub struct Qwen3NextConfig("Qwen3Next") {
-        required {
-            vocab_size: usize,
-            hidden_size: usize,
-            intermediate_size: usize,
-            num_hidden_layers: usize,
-            num_attention_heads: usize,
-            num_key_value_heads: usize,
-            head_dim: usize,
-            max_position_embeddings: usize,
-        }
-        serde_default {
-            norm_topk_prob: bool,
-            tie_word_embeddings: bool,
-        }
-        warn_default {
-            rms_norm_eps: f64 = 1e-6,
-            rope_theta: f64 = 10_000_000.0,
-            partial_rotary_factor: f64 = 0.25,
-            full_attention_interval: usize = 4,
-            // DeltaNet
-            linear_num_key_heads: usize = 16,
-            linear_num_value_heads: usize = 32,
-            linear_key_head_dim: usize = 128,
-            linear_value_head_dim: usize = 128,
-            linear_conv_kernel_dim: usize = 4,
-            // MoE
-            num_experts: usize = 512,
-            num_experts_per_tok: usize = 10,
-            moe_intermediate_size: usize = 512,
-            shared_expert_intermediate_size: usize = 512,
-            decoder_sparse_step: usize = 1,
-        }
-    }
-}
+use self::config::LayerType;
+pub use self::config::Qwen3NextConfig;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LayerType {
-    LinearAttention,
-    FullAttention,
-}
+mod components;
 
-impl Qwen3NextConfig {
-    fn attention_pattern(&self) -> HybridAttentionPattern {
-        HybridAttentionPattern::new(self.num_hidden_layers, self.full_attention_interval)
-    }
-
-    fn layer_type(&self, idx: usize) -> LayerType {
-        if self.attention_pattern().is_full_attention_layer(idx) {
-            LayerType::FullAttention
-        } else {
-            LayerType::LinearAttention
-        }
-    }
-
-    fn key_dim(&self) -> usize {
-        self.linear_num_key_heads * self.linear_key_head_dim
-    }
-
-    fn value_dim(&self) -> usize {
-        self.linear_num_value_heads * self.linear_value_head_dim
-    }
-
-    /// Convolution dimension: Q + K + V flattened (Z is separate, not convolved).
-    fn conv_dim(&self) -> usize {
-        self.key_dim() * 2 + self.value_dim()
-    }
-
-    fn rotary_dim(&self) -> usize {
-        (self.head_dim as f64 * self.partial_rotary_factor) as usize
-    }
-}
-
-// ── RoPE with partial rotary factor ─────────────────────────────────────
-
-struct PartialRotaryEmbedding {
-    cos: Tensor,
-    sin: Tensor,
-    rotary_dim: usize,
-}
-
-impl PartialRotaryEmbedding {
-    fn new(cfg: &Qwen3NextConfig, dtype: DType, device: &Device) -> Result<Self> {
-        let rotary_dim = cfg.rotary_dim();
-        let inv_freq: Vec<f32> = (0..rotary_dim)
-            .step_by(2)
-            .map(|i| 1.0 / cfg.rope_theta.powf(i as f64 / rotary_dim as f64) as f32)
-            .collect();
-        let inv_freq = Tensor::new(inv_freq, device)?;
-        let positions = Tensor::arange(0u32, cfg.max_position_embeddings as u32, device)?
-            .to_dtype(DType::F32)?;
-        let freqs = positions.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?;
-        let cos = freqs.cos()?.to_dtype(dtype)?;
-        let sin = freqs.sin()?.to_dtype(dtype)?;
-        Ok(Self {
-            cos,
-            sin,
-            rotary_dim,
-        })
-    }
-
-    /// Apply partial RoPE with per-token position_ids for varlen paths.
-    /// q, k shape: [total_tokens, num_heads, head_dim]
-    fn apply_varlen(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        position_ids: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
-        let cos = self.cos.index_select(position_ids, 0)?.unsqueeze(1)?;
-        let sin = self.sin.index_select(position_ids, 0)?.unsqueeze(1)?;
-
-        let q_rot = q.narrow(D::Minus1, 0, self.rotary_dim)?;
-        let q_pass = q.narrow(
-            D::Minus1,
-            self.rotary_dim,
-            q.dim(D::Minus1)? - self.rotary_dim,
-        )?;
-        let q_rot = apply_rotary_emb(&q_rot, &cos, &sin)?;
-        let q = Tensor::cat(&[q_rot, q_pass], D::Minus1)?;
-
-        let k_rot = k.narrow(D::Minus1, 0, self.rotary_dim)?;
-        let k_pass = k.narrow(
-            D::Minus1,
-            self.rotary_dim,
-            k.dim(D::Minus1)? - self.rotary_dim,
-        )?;
-        let k_rot = apply_rotary_emb(&k_rot, &cos, &sin)?;
-        let k = Tensor::cat(&[k_rot, k_pass], D::Minus1)?;
-
-        Ok((q, k))
-    }
-}
-
-fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let half = x.dim(D::Minus1)? / 2;
-    let x1 = x.narrow(D::Minus1, 0, half)?;
-    let x2 = x.narrow(D::Minus1, half, half)?;
-    let rotated = Tensor::cat(
-        &[
-            (x1.broadcast_mul(cos)? - x2.broadcast_mul(sin)?)?,
-            (x2.broadcast_mul(cos)? + x1.broadcast_mul(sin)?)?,
-        ],
-        D::Minus1,
-    )?;
-    Ok(rotated)
-}
-
-// ── RMSNormGated ────────────────────────────────────────────────────────
-
-struct RmsNormGated {
-    weight: Tensor,
-    eps: f64,
-    num_heads: usize,
-    head_dim: usize,
-}
-
-impl RmsNormGated {
-    fn new(head_dim: usize, num_heads: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        let weight = vb.get(head_dim, "weight")?;
-        Ok(Self {
-            weight,
-            eps,
-            num_heads,
-            head_dim,
-        })
-    }
-
-    /// Apply per-head RMS normalization then gate with SiLU(z).
-    /// x and z: [..., num_heads * head_dim], weight: [head_dim] (broadcast over heads).
-    fn forward(&self, x: &Tensor, z: &Tensor, ops: &dyn crate::ops::Ops) -> Result<Tensor> {
-        let orig_shape = x.shape().clone();
-        let leading: Vec<usize> = orig_shape.dims()[..orig_shape.dims().len() - 1].to_vec();
-        let mut new_shape = leading.clone();
-        new_shape.push(self.num_heads);
-        new_shape.push(self.head_dim);
-
-        // Reshape to [..., num_heads, head_dim] for per-head norm
-        let x = x.reshape(new_shape.as_slice())?;
-        let z = z.reshape(new_shape.as_slice())?;
-
-        // RMS norm on last dimension (head_dim)
-        let x_f32 = x.to_dtype(DType::F32)?;
-        let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
-        let normed = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let normed = normed.to_dtype(x.dtype())?.broadcast_mul(&self.weight)?;
-        let gate = ops.silu(&z)?;
-        let result = normed.broadcast_mul(&gate)?;
-
-        // Reshape back to [..., num_heads * head_dim]
-        result.reshape(orig_shape)
-    }
-}
+use self::components::{PartialRotaryEmbedding, RmsNormGated};
 
 // ── Gated DeltaNet (Linear Attention) ────────────────────────────────────
 
