@@ -64,8 +64,11 @@ presets/
 | Flag | Description |
 |------|-------------|
 | `--data synthetic` | (default) Random text, no KV reuse |
-| `--data realworld` | HuggingFace dataset (needs `question` column) |
-| `--dataset` | Dataset name (default: `openai/gsm8k`) |
+| `--data realworld` | HuggingFace dataset (defaults to `question` column) |
+| `--dataset` | Dataset name or local JSON/JSONL path (default: `openai/gsm8k`) |
+| `--text-column` | Text column for real-world datasets (default: `question`) |
+| `--dataset-split` | Split for real-world datasets (default: `train` for GSM8K, otherwise `test` then `train`) |
+| `--dataset-config` | Optional HuggingFace dataset config |
 | `--prompt-tokens N` | Exact N tokens per prompt (needs tokenizer) |
 | `--prompt-tokens N-M` | Uniform random in [N, M] (needs tokenizer) |
 
@@ -98,6 +101,16 @@ seed        = 42
 [data]
 type          = "synthetic"
 prompt_tokens = "256-768"
+
+# Real data example:
+# type        = "realworld"
+# dataset     = "Virtue-AI-HUB/servicenow-topicguard-prompt-label"
+# split       = "test"
+# text_column = "prompt"
+#
+# Local JSONL example:
+# dataset     = "/scratch/panmz/.cache/nemo/datasets/json/training.jsonl"
+# text_column = "input"
 
 [prefix]
 enabled       = true

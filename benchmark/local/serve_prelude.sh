@@ -10,6 +10,7 @@ LOG_FILE="$RUNTIME_DIR/prelude.log"
 BIN="${PRELUDE_BIN:-$ROOT_DIR/target/release/prelude-server}"
 
 MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
+MODEL_PATH="${MODEL_PATH:-}"
 PORT="${PORT:-8000}"
 GPU="${GPU:-0}"
 HOST="${HOST:-0.0.0.0}"
@@ -35,6 +36,9 @@ fi
 echo "Starting prelude-server"
 echo "  bin:   $BIN"
 echo "  model: $MODEL"
+if [[ -n "$MODEL_PATH" ]]; then
+  echo "  path:  $MODEL_PATH"
+fi
 echo "  host:  $HOST"
 echo "  port:  $PORT"
 echo "  gpu:   $GPU"
@@ -45,6 +49,10 @@ cmd=(
   --host "$HOST"
   --port "$PORT"
 )
+
+if [[ -n "$MODEL_PATH" ]]; then
+  cmd+=(--model-path "$MODEL_PATH")
+fi
 
 if [[ -n "$PRELUDE_EXTRA_ARGS" ]]; then
   # Intentionally split on shell words for flags like:

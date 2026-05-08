@@ -1,0 +1,15 @@
+task = "complete"
+
+concurrency = [1, 4, 8, 16, 32]
+requests    = [50, 100, 200, 400, 800]
+warmup      = 20
+max_tokens  = 1              # TopicGuard classification-style prefill
+seed        = 42
+
+# output = "results/topicguard_prefill.json"
+
+[data]
+type        = "realworld"
+dataset     = "Virtue-AI-HUB/servicenow-topicguard-prompt-label"
+split       = "test"
+text_column = "prompt"
