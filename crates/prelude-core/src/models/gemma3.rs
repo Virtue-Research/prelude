@@ -907,16 +907,14 @@ pub(crate) mod meta {
     }
 
     fn common_from_gemma3(cfg: &Gemma3Config) -> CommonModelConfig {
-        CommonModelConfig {
-            vocab_size: cfg.vocab_size,
-            num_hidden_layers: cfg.num_hidden_layers,
-            max_position_embeddings: cfg.max_position_embeddings,
-            num_attention_heads: cfg.num_attention_heads,
-            num_key_value_heads: cfg.num_key_value_heads,
-            head_dim: cfg.head_dim,
-            kv_head_dims: None,
-            kv_num_heads: None,
-        }
+        CommonModelConfig::new(
+            cfg.vocab_size,
+            cfg.num_hidden_layers,
+            cfg.max_position_embeddings,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+        )
     }
 
     fn infer_weight_layout(raw: &serde_json::Value) -> Gemma3WeightLayout {

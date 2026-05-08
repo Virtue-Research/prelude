@@ -64,7 +64,6 @@ pub(crate) struct LoadedEmbeddingModules {
 }
 
 impl Engine {
-    // Cleaned -- Reviewed by Minzhou
     pub fn from_local_path_with_task(
         model_path: impl AsRef<Path>,
         model_id: impl Into<String>,

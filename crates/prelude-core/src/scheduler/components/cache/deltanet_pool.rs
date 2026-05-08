@@ -26,6 +26,31 @@ pub struct DeltaNetPoolConfig {
     pub conv_kernel: usize,
 }
 
+impl DeltaNetPoolConfig {
+    pub fn from_hybrid_attention_pattern(
+        num_hidden_layers: usize,
+        full_attention_interval: usize,
+        linear_num_key_heads: usize,
+        linear_num_value_heads: usize,
+        linear_key_head_dim: usize,
+        linear_value_head_dim: usize,
+        linear_conv_kernel_dim: usize,
+    ) -> Self {
+        let num_deltanet_layers = (0..num_hidden_layers)
+            .filter(|i| (i + 1) % full_attention_interval != 0)
+            .count();
+        Self {
+            num_deltanet_layers,
+            num_v_heads: linear_num_value_heads,
+            head_k_dim: linear_key_head_dim,
+            head_v_dim: linear_value_head_dim,
+            conv_dim: linear_num_key_heads * linear_key_head_dim * 2
+                + linear_num_value_heads * linear_value_head_dim,
+            conv_kernel: linear_conv_kernel_dim,
+        }
+    }
+}
+
 /// Pre-allocated pool for DeltaNet recurrent and convolutional state.
 ///
 /// Unlike the paged KV cache (which grows with sequence length), DeltaNet state

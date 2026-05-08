@@ -73,7 +73,6 @@ pub(crate) trait ArchSpec: Sync {
 pub(crate) struct GgufLoadResult {
     pub model: Box<dyn crate::models::ModelForward>,
     pub common: CommonModelConfig,
-    pub deltanet: Option<DeltaNetPoolConfig>,
     pub eos_token_ids: Vec<u32>,
 }
 

@@ -278,6 +278,12 @@ impl Qwen3_5Config {
         }
     }
 
+    fn full_attention_layer_count(&self) -> usize {
+        (0..self.num_hidden_layers)
+            .filter(|&i| self.layer_type(i) == LayerType::FullAttention)
+            .count()
+    }
+
     fn key_dim(&self) -> usize {
         self.linear_num_key_heads * self.linear_key_head_dim
     }
@@ -3455,54 +3461,39 @@ pub(crate) mod meta {
     const SUPPORTED_TASKS: &[TaskKind] = &[TaskKind::Generate];
 
     fn deltanet_config_from(cfg: &Qwen3_5Config) -> DeltaNetPoolConfig {
-        let num_deltanet_layers = (0..cfg.num_hidden_layers)
-            .filter(|i| (i + 1) % cfg.full_attention_interval != 0)
-            .count();
-        DeltaNetPoolConfig {
-            num_deltanet_layers,
-            num_v_heads: cfg.linear_num_value_heads,
-            head_k_dim: cfg.linear_key_head_dim,
-            head_v_dim: cfg.linear_value_head_dim,
-            conv_dim: cfg.linear_num_key_heads * cfg.linear_key_head_dim * 2
-                + cfg.linear_num_value_heads * cfg.linear_value_head_dim,
-            conv_kernel: cfg.linear_conv_kernel_dim,
-        }
-    }
-
-    fn full_attention_layers(cfg: &Qwen3_5Config) -> usize {
-        (0..cfg.num_hidden_layers)
-            .filter(|&i| cfg.layer_type(i) == super::LayerType::FullAttention)
-            .count()
+        DeltaNetPoolConfig::from_hybrid_attention_pattern(
+            cfg.num_hidden_layers,
+            cfg.full_attention_interval,
+            cfg.linear_num_key_heads,
+            cfg.linear_num_value_heads,
+            cfg.linear_key_head_dim,
+            cfg.linear_value_head_dim,
+            cfg.linear_conv_kernel_dim,
+        )
     }
 
     fn common_from_config(cfg: &Qwen3_5Config) -> CommonModelConfig {
-        let kv_layers = full_attention_layers(cfg);
-        CommonModelConfig {
-            vocab_size: cfg.vocab_size,
-            num_hidden_layers: cfg.num_hidden_layers,
-            max_position_embeddings: cfg.max_position_embeddings,
-            num_attention_heads: cfg.num_attention_heads,
-            num_key_value_heads: cfg.num_key_value_heads,
-            head_dim: cfg.head_dim,
-            kv_head_dims: Some(vec![cfg.head_dim; kv_layers]),
-            kv_num_heads: Some(vec![cfg.num_key_value_heads; kv_layers]),
-        }
+        CommonModelConfig::new(
+            cfg.vocab_size,
+            cfg.num_hidden_layers,
+            cfg.max_position_embeddings,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+        )
+        .with_uniform_physical_kv_layers(cfg.full_attention_layer_count())
     }
 
     fn common_from_gguf_config(cfg: &super::gguf::Qwen3_5GgufConfig) -> CommonModelConfig {
-        let kv_layers = (0..cfg.num_hidden_layers)
-            .filter(|i| (i + 1) % cfg.full_attention_interval == 0)
-            .count();
-        CommonModelConfig {
-            vocab_size: cfg.vocab_size,
-            num_hidden_layers: cfg.num_hidden_layers,
-            max_position_embeddings: cfg.max_position_embeddings,
-            num_attention_heads: cfg.num_attention_heads,
-            num_key_value_heads: cfg.num_key_value_heads,
-            head_dim: cfg.head_dim,
-            kv_head_dims: Some(vec![cfg.head_dim; kv_layers]),
-            kv_num_heads: Some(vec![cfg.num_key_value_heads; kv_layers]),
-        }
+        CommonModelConfig::new(
+            cfg.vocab_size,
+            cfg.num_hidden_layers,
+            cfg.max_position_embeddings,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+        )
+        .with_uniform_physical_kv_layers(cfg.full_attention_layer_count())
     }
 
     pub(crate) struct Qwen3_5ArchSpec;
@@ -3560,13 +3551,11 @@ pub(crate) mod meta {
 
         fn runtime_caps(
             &self,
-            task: TaskKind,
+            _task: TaskKind,
             backend: WeightsBackend,
             device: &crate::tensor::Device,
         ) -> RuntimeCaps {
             let is_safetensors = backend == WeightsBackend::Safetensors;
-            let _is_generate = task == TaskKind::Generate;
-
             RuntimeCaps {
                 supports_kv_cache: false,
                 supports_prefix_cache: device.is_cuda() && is_safetensors,
@@ -3590,21 +3579,9 @@ pub(crate) mod meta {
             let (model, cfg) = super::gguf::Qwen3_5GgufModel::from_gguf(ct, reader, device)
                 .map_err(candle_model_err)?;
             let common = common_from_gguf_config(&cfg);
-            let deltanet = Some(DeltaNetPoolConfig {
-                num_deltanet_layers: (0..cfg.num_hidden_layers)
-                    .filter(|i| (i + 1) % cfg.full_attention_interval != 0)
-                    .count(),
-                num_v_heads: cfg.linear_num_value_heads,
-                head_k_dim: cfg.linear_key_head_dim,
-                head_v_dim: cfg.linear_value_head_dim,
-                conv_dim: cfg.linear_num_key_heads * cfg.linear_key_head_dim * 2
-                    + cfg.linear_num_value_heads * cfg.linear_value_head_dim,
-                conv_kernel: cfg.linear_conv_kernel_dim,
-            });
             Ok(crate::models::registry::GgufLoadResult {
                 model: Box::new(model),
                 common,
-                deltanet,
                 eos_token_ids: cfg.eos_token_ids,
             })
         }
@@ -3673,6 +3650,12 @@ pub mod gguf {
 
         fn is_recurrent(&self, layer_idx: usize) -> bool {
             (layer_idx + 1) % self.full_attention_interval != 0
+        }
+
+        pub(super) fn full_attention_layer_count(&self) -> usize {
+            (0..self.num_hidden_layers)
+                .filter(|&i| !self.is_recurrent(i))
+                .count()
         }
     }
 

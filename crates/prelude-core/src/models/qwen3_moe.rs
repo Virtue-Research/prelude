@@ -797,16 +797,14 @@ mod meta {
             content: &str,
         ) -> Result<ParsedModelConfig, EngineError> {
             let cfg = parse_json::<Qwen3MoeConfig>(content, "Qwen3 MoE config")?;
-            let common = CommonModelConfig {
-                vocab_size: cfg.vocab_size,
-                num_hidden_layers: cfg.num_hidden_layers,
-                max_position_embeddings: cfg.max_position_embeddings,
-                num_attention_heads: cfg.num_attention_heads,
-                num_key_value_heads: cfg.num_key_value_heads,
-                head_dim: cfg.head_dim,
-                kv_head_dims: None,
-                kv_num_heads: None,
-            };
+            let common = CommonModelConfig::new(
+                cfg.vocab_size,
+                cfg.num_hidden_layers,
+                cfg.max_position_embeddings,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+            );
             Ok(ParsedModelConfig {
                 common,
                 deltanet: None,

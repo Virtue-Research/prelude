@@ -1967,18 +1967,15 @@ mod meta {
     const SUPPORTED_TASKS: &[TaskKind] = &[TaskKind::Generate];
 
     fn deltanet_config_from(cfg: &Qwen3NextConfig) -> DeltaNetPoolConfig {
-        let num_deltanet_layers = (0..cfg.num_hidden_layers)
-            .filter(|i| (i + 1) % cfg.full_attention_interval != 0)
-            .count();
-        DeltaNetPoolConfig {
-            num_deltanet_layers,
-            num_v_heads: cfg.linear_num_value_heads,
-            head_k_dim: cfg.linear_key_head_dim,
-            head_v_dim: cfg.linear_value_head_dim,
-            conv_dim: cfg.linear_num_key_heads * cfg.linear_key_head_dim * 2
-                + cfg.linear_num_value_heads * cfg.linear_value_head_dim,
-            conv_kernel: cfg.linear_conv_kernel_dim,
-        }
+        DeltaNetPoolConfig::from_hybrid_attention_pattern(
+            cfg.num_hidden_layers,
+            cfg.full_attention_interval,
+            cfg.linear_num_key_heads,
+            cfg.linear_num_value_heads,
+            cfg.linear_key_head_dim,
+            cfg.linear_value_head_dim,
+            cfg.linear_conv_kernel_dim,
+        )
     }
 
     pub(crate) struct Qwen3NextArchSpec;
@@ -2012,16 +2009,14 @@ mod meta {
             content: &str,
         ) -> Result<ParsedModelConfig, EngineError> {
             let cfg = parse_json::<Qwen3NextConfig>(content, "Qwen3-Next config")?;
-            let common = CommonModelConfig {
-                vocab_size: cfg.vocab_size,
-                num_hidden_layers: cfg.num_hidden_layers,
-                max_position_embeddings: cfg.max_position_embeddings,
-                num_attention_heads: cfg.num_attention_heads,
-                num_key_value_heads: cfg.num_key_value_heads,
-                head_dim: cfg.head_dim,
-                kv_head_dims: None,
-                kv_num_heads: None,
-            };
+            let common = CommonModelConfig::new(
+                cfg.vocab_size,
+                cfg.num_hidden_layers,
+                cfg.max_position_embeddings,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+            );
             let deltanet = Some(deltanet_config_from(&cfg));
             Ok(ParsedModelConfig {
                 common,
@@ -2047,13 +2042,11 @@ mod meta {
 
         fn runtime_caps(
             &self,
-            task: TaskKind,
+            _task: TaskKind,
             backend: WeightsBackend,
             device: &crate::tensor::Device,
         ) -> RuntimeCaps {
             let is_safetensors = backend == WeightsBackend::Safetensors;
-            let _is_generate = task == TaskKind::Generate;
-
             RuntimeCaps {
                 supports_kv_cache: false,
                 supports_prefix_cache: false,
