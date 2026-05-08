@@ -49,28 +49,26 @@ impl Engine {
             vec![global_cached_len; batch_size]
         };
 
+        let q_seq_lens: Vec<usize> = items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| item.prompt_tokens.len() - per_request_cached[i])
+            .collect();
+        let k_seq_lens = items.iter().map(|item| item.prompt_tokens.len());
+        let (cu_seqlens_q, max_seqlen_q) =
+            super::cumulative_lengths_u32(q_seq_lens.iter().copied())?;
+        let (cu_seqlens_k, max_seqlen_k) = super::cumulative_lengths_u32(k_seq_lens)?;
+
         // Build packed varlen input from uncached suffix tokens.
-        let mut flat_tokens: Vec<u32> = Vec::new();
-        let mut cu_seqlens_q = vec![0u32];
-        let mut cu_seqlens_k = vec![0u32];
-        let mut q_seq_lens: Vec<usize> = Vec::with_capacity(batch_size);
-        let mut max_seqlen_q = 0usize;
-        let mut max_seqlen_k = 0usize;
+        let total_tokens = *cu_seqlens_q.last().unwrap_or(&0) as usize;
+        let mut flat_tokens: Vec<u32> = Vec::with_capacity(total_tokens);
 
         for (i, item) in items.iter().enumerate() {
             let cached = per_request_cached[i];
             let suffix = &item.prompt_tokens[cached..];
-            let q_len = suffix.len();
-            let k_len = item.prompt_tokens.len();
             flat_tokens.extend_from_slice(suffix);
-            cu_seqlens_q.push(cu_seqlens_q.last().unwrap() + q_len as u32);
-            cu_seqlens_k.push(cu_seqlens_k.last().unwrap() + k_len as u32);
-            q_seq_lens.push(q_len);
-            max_seqlen_q = max_seqlen_q.max(q_len);
-            max_seqlen_k = max_seqlen_k.max(k_len);
         }
 
-        let total_tokens = flat_tokens.len();
         let packed_input = Tensor::from_vec(flat_tokens, (total_tokens,), &self.executor.device)
             .map_err(tensor_err)?;
         let cu_seqlens_q_t =
@@ -103,23 +101,10 @@ impl Engine {
             self.allocate_block_tables_from_plan(&allocation_plan, "batch_prefill_paged")?
         };
 
-        // Build block_tables tensor [batch_size, max_blocks]
-        let max_blocks = block_tables.iter().map(|bt| bt.len()).max().unwrap_or(0);
-        let mut flat_bt: Vec<u32> = Vec::with_capacity(batch_size * max_blocks);
-        for bt in &block_tables {
-            flat_bt.extend_from_slice(bt);
-            for _ in bt.len()..max_blocks {
-                flat_bt.push(0);
-            }
-        }
-        let block_tables_t = if max_blocks > 0 {
-            Tensor::from_vec(flat_bt, (batch_size, max_blocks), &self.executor.device)
-                .map_err(tensor_err)?
-                .to_dtype(DType::U32)
-                .map_err(tensor_err)?
-        } else {
-            Tensor::zeros((batch_size, 0), DType::U32, &self.executor.device).map_err(tensor_err)?
-        };
+        let block_tables_t = super::block_tables_tensor(
+            block_tables.iter().map(Vec::as_slice),
+            &self.executor.device,
+        )?;
 
         // Build slot_mapping for new tokens only (suffix tokens).
         let mut slots: Vec<i64> = Vec::with_capacity(total_tokens);
@@ -177,7 +162,7 @@ impl Engine {
             .lock()
             .map_err(|e| EngineError::Internal(format!("model lock poisoned: {e}")))?;
 
-        let mut dn_pool_guard = self.cache.deltanet_pool.as_ref().map(|m| m.lock().unwrap());
+        let mut dn_pool_guard = super::lock_deltanet_pool(self.cache.deltanet_pool.as_ref())?;
         let dn_pool_ref = dn_pool_guard.as_deref_mut();
 
         let paged_kv = PagedKvBatchContext {

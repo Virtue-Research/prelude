@@ -28,30 +28,24 @@ impl Engine {
             });
         }
 
-        // ── Build packed varlen input ──────────────────────────────────
-        let mut flat_tokens: Vec<u32> = Vec::new();
-        let mut cu_seqlens_q = vec![0u32];
-        let mut cu_seqlens_k = vec![0u32];
-        let mut q_seq_lens: Vec<usize> = Vec::with_capacity(num_requests);
-        let mut position_ids: Vec<u32> = Vec::new();
-        let mut max_seqlen_q = 0usize;
-        let mut max_seqlen_k = 0usize;
+        let q_seq_lens: Vec<usize> = requests.iter().map(|req| req.tokens.len()).collect();
+        let (cu_seqlens_q, max_seqlen_q) =
+            super::cumulative_lengths_u32(q_seq_lens.iter().copied())?;
+        let (cu_seqlens_k, max_seqlen_k) =
+            super::cumulative_lengths_u32(requests.iter().map(|req| req.context_len))?;
+        let total_tokens = *cu_seqlens_q.last().unwrap_or(&0) as usize;
 
-        for req in requests {
-            let q_len = req.tokens.len();
+        // ── Build packed varlen input ──────────────────────────────────
+        let mut flat_tokens: Vec<u32> = Vec::with_capacity(total_tokens);
+        let mut position_ids: Vec<u32> = Vec::with_capacity(total_tokens);
+
+        for (req, &q_len) in requests.iter().zip(q_seq_lens.iter()) {
             flat_tokens.extend_from_slice(&req.tokens);
-            cu_seqlens_q.push(cu_seqlens_q.last().unwrap() + q_len as u32);
-            cu_seqlens_k.push(cu_seqlens_k.last().unwrap() + req.context_len as u32);
-            q_seq_lens.push(q_len);
-            max_seqlen_q = max_seqlen_q.max(q_len);
-            max_seqlen_k = max_seqlen_k.max(req.context_len);
 
             for pos in 0..q_len {
                 position_ids.push((req.position_start + pos) as u32);
             }
         }
-
-        let total_tokens = flat_tokens.len();
 
         // Debug: log batch details for the first few steps
         for (i, req) in requests.iter().enumerate() {
@@ -85,27 +79,10 @@ impl Engine {
         // ── Block tables + slot mapping ───────────────────────────────
         let use_paged_kv = requests.iter().any(|r| r.needs_kv_cache);
         let block_tables_t = if use_paged_kv {
-            let max_blocks = requests
-                .iter()
-                .map(|r| r.block_table.len())
-                .max()
-                .unwrap_or(0);
-            let mut flat_bt: Vec<u32> = Vec::with_capacity(num_requests * max_blocks);
-            for req in requests {
-                flat_bt.extend_from_slice(&req.block_table);
-                for _ in req.block_table.len()..max_blocks {
-                    flat_bt.push(0);
-                }
-            }
-            if max_blocks > 0 {
-                Tensor::from_vec(flat_bt, (num_requests, max_blocks), &self.executor.device)
-                    .map_err(tensor_err)?
-                    .to_dtype(DType::U32)
-                    .map_err(tensor_err)?
-            } else {
-                Tensor::zeros((num_requests, 0), DType::U32, &self.executor.device)
-                    .map_err(tensor_err)?
-            }
+            super::block_tables_tensor(
+                requests.iter().map(|req| req.block_table.as_slice()),
+                &self.executor.device,
+            )?
         } else {
             Tensor::zeros((num_requests, 0), DType::U32, &self.executor.device)
                 .map_err(tensor_err)?
@@ -157,7 +134,7 @@ impl Engine {
             .lock()
             .map_err(|e| EngineError::Internal(format!("model lock poisoned: {e}")))?;
 
-        let mut dn_pool_guard = self.cache.deltanet_pool.as_ref().map(|m| m.lock().unwrap());
+        let mut dn_pool_guard = super::lock_deltanet_pool(self.cache.deltanet_pool.as_ref())?;
         let dn_pool_ref = dn_pool_guard.as_deref_mut();
 
         let paged_kv = if use_paged_kv {
