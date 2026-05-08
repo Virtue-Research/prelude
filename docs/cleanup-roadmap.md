@@ -218,6 +218,14 @@ eligibility:
   logprob helpers out of `engine/model_runner/generate.rs`.
 - Extract Qwen3-Next config parsing and shared RoPE/gated-norm components into
   sibling modules.
+- Share partial RoPE application and rotary table construction between Qwen3.5
+  and Qwen3-Next.
+- Share hybrid DeltaNet metadata construction so Qwen3.5 and Qwen3-Next expose
+  recurrent-state pool shape through the same helper.
+- Centralize API token-usage constructors, stream option handling, response ID
+  helpers, and model-card conversion.
+- Share DeltaNet slot collection/GPU tensor helpers across paged mixed and
+  decode runners.
 
 ## Current PR Progress
 
@@ -231,10 +239,16 @@ eligibility:
   config/component boundaries as Qwen3.5.
 - `engine/model_runner/generate.rs`: reduced from ~900 lines to ~575 lines by
   moving CPU postprocess and prompt-logprob extraction into a dedicated module.
+- `engine/model_runner`: paged mixed/decode paths now share DeltaNet slot
+  collection and CUDA slot tensor construction instead of repeating the same
+  all-or-none slot policy.
 - `cuda_graph.rs`: graph lifecycle remains in the main file; fixed GPU buffer
   ownership and host-to-device updates moved to `cuda_graph/buffers.rs`.
 - `engine/run/ar.rs`: prefix-cache mechanics are split from the AR loop, making
   scheduling/result emission easier to review separately.
+- `prelude-server/src/routes`: request/response helpers now own API IDs,
+  timestamps, stream usage options, and usage objects rather than repeating
+  shape details in each route.
 
 ## Validation Notes
 
@@ -258,7 +272,7 @@ eligibility:
 2. Split `engine/run/ar.rs` further around request lifecycle and result
    emission, now that prefix-cache mechanics are out.
 3. Separate scheduler prefix-boundary policy from prefix-cache storage types.
-4. Split `prelude-cuda/src/attn/flashinfer.rs` dispatch/planning from FFI
+4. Consolidate remaining server response shaping where it can be done without
+   making OpenAI-compatible response structs less explicit.
+5. Split `prelude-cuda/src/attn/flashinfer.rs` dispatch/planning from FFI
    wrappers, but only with CUDA validation available.
-5. Clean server route request/response adapters after the core runner/API
-   boundaries settle.
