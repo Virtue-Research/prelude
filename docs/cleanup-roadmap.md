@@ -191,3 +191,15 @@ review and should not alter serving behavior:
 - Share packed-varlen sequence offset calculation between hybrid models.
 - Refresh model-onboarding docs to match the current single-file inventory
   registry and shared config helpers.
+- Share paged runner block-table, cumulative-length, and DeltaNet-pool locking
+  helpers across prefill, mixed, and decode paths.
+- Tighten server request construction around one parameter object and keep CPU
+  backend registration behind the `cpu` feature.
+- Reuse cache-manager block retain/release helpers for prefix-cache ownership
+  updates.
+- Share standard safetensors runtime-cap construction across model registry
+  implementations.
+- Simplify AR sequence state construction and move AR prefix-cache insertion
+  into a focused helper.
+- Share classify/embed pretokenized batch helpers and make prefill row-count
+  mismatches return `EngineError` instead of indexing panics.
