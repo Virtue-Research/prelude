@@ -32,7 +32,7 @@ uuid.workspace = true
 hf-hub.workspace = true
 
 prelude-core = { path = "../prelude-core", default-features = false }
-prelude-cpu = { path = "../prelude-cpu" }
+prelude-cpu = { path = "../prelude-cpu", optional = true }
 prelude-cuda = { path = "../prelude-cuda", optional = true }
 # Disabled: the prelude-amd crate is excluded from the workspace (t0-gpu's
 # broken upstream submodule blocks cargo's manifest resolution). Even with
@@ -54,7 +54,7 @@ tower = { version = "0.5.3", features = ["util"] }
 [features]
 default = ["cpu"]
 # CPU-only inference (oneDNN matmul, AVX-512 kernels)
-cpu = []
+cpu = ["dep:prelude-cpu"]
 # CUDA inference — core GPU backends (FlashInfer, FA4, CUTLASS, DeepGEMM, cuLA)
 cuda = [
     "dep:prelude-cuda",

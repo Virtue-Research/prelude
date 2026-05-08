@@ -8,6 +8,18 @@ use uuid::Uuid;
 
 pub(crate) const DEFAULT_MAX_NEW_TOKENS: u32 = 4096;
 
+pub(crate) struct GenerateRequestParams {
+    pub model: String,
+    pub input: PromptInput,
+    pub max_new_tokens: u32,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub stop: Option<Vec<String>>,
+    pub seed: Option<u64>,
+    pub logprobs: Option<u32>,
+    pub prompt_logprobs: Option<u32>,
+}
+
 #[derive(Clone)]
 pub(crate) struct ResponseMeta {
     pub id: String,
@@ -25,35 +37,25 @@ impl ResponseMeta {
     }
 }
 
-pub(crate) fn build_generate_request(
-    model: String,
-    input: PromptInput,
-    max_new_tokens: u32,
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-    stop: Option<Vec<String>>,
-    seed: Option<u64>,
-    logprobs: Option<u32>,
-    prompt_logprobs: Option<u32>,
-) -> GenerateRequest {
+pub(crate) fn build_generate_request(params: GenerateRequestParams) -> GenerateRequest {
     GenerateRequest {
         request_id: format!("req-{}", Uuid::new_v4().simple()),
-        model,
-        input,
+        model: params.model,
+        input: params.input,
         sampling: SamplingParams {
-            temperature: temperature.unwrap_or(0.7),
-            top_p: top_p.unwrap_or(1.0),
+            temperature: params.temperature.unwrap_or(0.7),
+            top_p: params.top_p.unwrap_or(1.0),
             ..SamplingParams::default()
         },
-        max_new_tokens,
+        max_new_tokens: params.max_new_tokens,
         stop: StopConfig {
-            strings: stop.unwrap_or_default(),
+            strings: params.stop.unwrap_or_default(),
             token_ids: Vec::new(),
         },
-        seed,
+        seed: params.seed,
         deadline_ms: None,
-        logprobs,
-        prompt_logprobs,
+        logprobs: params.logprobs,
+        prompt_logprobs: params.prompt_logprobs,
     }
 }
 

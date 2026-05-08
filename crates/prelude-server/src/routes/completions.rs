@@ -5,7 +5,6 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use chrono::Utc;
 use prelude_core::{
     CompletionChoice, CompletionPrompt, CompletionRequest, CompletionResponse, GenerateRequest,
     InferenceEngine, PromptInput, StreamEvent, Usage,
@@ -13,7 +12,8 @@ use prelude_core::{
 use tracing::debug;
 
 use super::generation_common::{
-    DEFAULT_MAX_NEW_TOKENS, ResponseMeta, build_generate_request, sse_done_event, sse_json_event,
+    DEFAULT_MAX_NEW_TOKENS, GenerateRequestParams, ResponseMeta, build_generate_request,
+    sse_done_event, sse_json_event,
 };
 use crate::Server;
 use crate::error::ApiError;
@@ -56,11 +56,14 @@ pub async fn completions(
                 "invalid_request_error",
             ));
         }
-        completions_stream(
-            server.engine,
-            engine_requests.into_iter().next().unwrap(),
-            include_usage,
-        )
+        let engine_request = engine_requests.into_iter().next().ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "prompt batch is empty",
+                "invalid_request_error",
+            )
+        })?;
+        completions_stream(server.engine, engine_request, include_usage)
     } else {
         completions_batch(server.engine, engine_requests).await
     }
@@ -77,9 +80,12 @@ fn completions_stream(
     Ok(stream_sse(engine, request, move |event| match event {
         StreamEvent::Started => vec![],
         StreamEvent::Token { text, logprobs } => {
-            let logprobs = logprobs.as_ref().and(req_logprobs).map(|_| {
-                to_completion_logprobs(std::slice::from_ref(logprobs.as_ref().unwrap()), &text)
-            });
+            let logprobs = match (req_logprobs, logprobs.as_ref()) {
+                (Some(_), Some(info)) => {
+                    Some(to_completion_logprobs(std::slice::from_ref(info), &text))
+                }
+                _ => None,
+            };
             let chunk = CompletionResponse {
                 id: response_meta.id.clone(),
                 object: "text_completion".to_string(),
@@ -206,11 +212,12 @@ async fn completions_batch(
         "completion batch completed"
     );
 
+    let response_meta = ResponseMeta::new("cmpl", model);
     Ok(Json(CompletionResponse {
-        id: ResponseMeta::new("cmpl", model.clone()).id,
+        id: response_meta.id,
         object: "text_completion".to_string(),
-        created: Utc::now().timestamp(),
-        model,
+        created: response_meta.created,
+        model: response_meta.model,
         choices,
         usage,
         system_fingerprint: None,
@@ -243,17 +250,17 @@ fn parse_completion_requests(
             ));
         }
 
-        out.push(build_generate_request(
-            request.model.clone(),
-            PromptInput::Text(p.to_string()),
-            request.max_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS),
-            request.temperature,
-            request.top_p,
-            request.stop.clone(),
-            request.seed,
-            request.logprobs,
-            request.prompt_logprobs,
-        ));
+        out.push(build_generate_request(GenerateRequestParams {
+            model: request.model.clone(),
+            input: PromptInput::Text(p.to_string()),
+            max_new_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS),
+            temperature: request.temperature,
+            top_p: request.top_p,
+            stop: request.stop.clone(),
+            seed: request.seed,
+            logprobs: request.logprobs,
+            prompt_logprobs: request.prompt_logprobs,
+        }));
     }
 
     Ok(out)
