@@ -24,12 +24,12 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use crate::cache::deltanet_pool::DeltaNetPrefixState;
+use crate::cache::deltanet_pool::{DeltaNetPool, DeltaNetPrefixState};
 use crate::engine::executor::{Executor, ForwardBatch, ModelOutput};
 use crate::engine::{
     DecodeMetrics, Engine, EngineError, PreparedGenerateRequest, TokenLogprobInfo, Usage,
@@ -39,6 +39,8 @@ use crate::scheduler::{
     Sequence,
 };
 use crate::types::{GenerateRequest, GenerateResult, StreamEvent};
+
+type DeltaNetPoolRef<'a> = Option<&'a Mutex<DeltaNetPool>>;
 
 // ── Response channel ───────────────────────────────────────────────
 
@@ -76,6 +78,25 @@ pub struct ArSequenceState {
 }
 
 impl ArSequenceState {
+    fn new(prepared: PreparedGenerateRequest, response: ResponseChannel) -> Self {
+        let request_id = prepared.request.request_id.clone();
+        let max_new_tokens = prepared.max_new;
+        Self {
+            request_id,
+            prepared: Some(prepared),
+            response,
+            gen_start: Instant::now(),
+            prefill_ms: 0.0,
+            started_sent: false,
+            sent_text_len: 0,
+            pending_token: None,
+            output_tokens: Vec::new(),
+            token_logprobs: Vec::new(),
+            prompt_token_logprobs: None,
+            max_new_tokens,
+        }
+    }
+
     fn max_new(&self) -> usize {
         self.max_new_tokens
     }
@@ -317,7 +338,7 @@ fn handle_message(
     msg: ArMessage,
     scheduler: &mut Scheduler,
     states: &mut HashMap<String, ArSequenceState>,
-    deltanet_pool: Option<&std::sync::Mutex<crate::cache::deltanet_pool::DeltaNetPool>>,
+    deltanet_pool: DeltaNetPoolRef<'_>,
     prepare_tx: Option<&mpsc::UnboundedSender<PreparedArMessage>>,
     pending_prepares: &mut usize,
 ) {
@@ -384,7 +405,7 @@ fn handle_prepared_message(
     msg: PreparedArMessage,
     scheduler: &mut Scheduler,
     states: &mut HashMap<String, ArSequenceState>,
-    deltanet_pool: Option<&std::sync::Mutex<crate::cache::deltanet_pool::DeltaNetPool>>,
+    deltanet_pool: DeltaNetPoolRef<'_>,
     pending_prepares: &mut usize,
 ) {
     *pending_prepares = pending_prepares.saturating_sub(1);
@@ -419,7 +440,7 @@ fn admit_prepared_request(
     response: ResponseChannel,
     scheduler: &mut Scheduler,
     states: &mut HashMap<String, ArSequenceState>,
-    deltanet_pool: Option<&std::sync::Mutex<crate::cache::deltanet_pool::DeltaNetPool>>,
+    deltanet_pool: DeltaNetPoolRef<'_>,
 ) {
     let request_id = prepared.request.request_id.clone();
     let mut seq = Sequence::new(
@@ -455,21 +476,7 @@ fn admit_prepared_request(
         if let Some(slot) = allocated {
             seq.deltanet_slot = Some(slot);
         } else {
-            let max_new_tokens = prepared.max_new;
-            let mut state = ArSequenceState {
-                request_id: prepared.request.request_id.clone(),
-                prepared: Some(prepared),
-                response,
-                gen_start: Instant::now(),
-                prefill_ms: 0.0,
-                started_sent: false,
-                sent_text_len: 0,
-                pending_token: None,
-                output_tokens: Vec::new(),
-                token_logprobs: Vec::new(),
-                prompt_token_logprobs: None,
-                max_new_tokens,
-            };
+            let mut state = ArSequenceState::new(prepared, response);
             state.ensure_started();
             fail_state(
                 state,
@@ -483,24 +490,7 @@ fn admit_prepared_request(
         seq.prefill_must_be_atomic = true;
     }
     scheduler.add_request(seq);
-    let max_new_tokens = prepared.max_new;
-    states.insert(
-        request_id,
-        ArSequenceState {
-            request_id: prepared.request.request_id.clone(),
-            prepared: Some(prepared),
-            response,
-            gen_start: Instant::now(),
-            prefill_ms: 0.0,
-            started_sent: false,
-            sent_text_len: 0,
-            pending_token: None,
-            output_tokens: Vec::new(),
-            token_logprobs: Vec::new(),
-            prompt_token_logprobs: None,
-            max_new_tokens,
-        },
-    );
+    states.insert(request_id, ArSequenceState::new(prepared, response));
 }
 
 fn deltanet_slot_needed(
@@ -525,7 +515,7 @@ fn drain_ready_messages(
     rx_open: &mut bool,
     scheduler: &mut Scheduler,
     states: &mut HashMap<String, ArSequenceState>,
-    deltanet_pool: Option<&std::sync::Mutex<crate::cache::deltanet_pool::DeltaNetPool>>,
+    deltanet_pool: DeltaNetPoolRef<'_>,
     prepare_tx: Option<&mpsc::UnboundedSender<PreparedArMessage>>,
     pending_prepares: &mut usize,
 ) {
@@ -554,7 +544,7 @@ fn drain_ready_prepared_messages(
     prepare_rx: &mut mpsc::UnboundedReceiver<PreparedArMessage>,
     scheduler: &mut Scheduler,
     states: &mut HashMap<String, ArSequenceState>,
-    deltanet_pool: Option<&std::sync::Mutex<crate::cache::deltanet_pool::DeltaNetPool>>,
+    deltanet_pool: DeltaNetPoolRef<'_>,
     pending_prepares: &mut usize,
 ) {
     while let Ok(msg) = prepare_rx.try_recv() {
@@ -578,7 +568,7 @@ async fn wait_for_initial_prefill_batch(
     pending_prepares: &mut usize,
     scheduler: &mut Scheduler,
     states: &mut HashMap<String, ArSequenceState>,
-    deltanet_pool: Option<&std::sync::Mutex<crate::cache::deltanet_pool::DeltaNetPool>>,
+    deltanet_pool: DeltaNetPoolRef<'_>,
 ) -> bool {
     if scheduler.num_running() > 0 {
         return false;
@@ -1716,7 +1706,7 @@ fn fail_step(
 }
 
 fn release_resources(
-    deltanet_pool: Option<&std::sync::Mutex<crate::cache::deltanet_pool::DeltaNetPool>>,
+    deltanet_pool: DeltaNetPoolRef<'_>,
     scheduler: &mut Scheduler,
     request_id: &str,
 ) {
