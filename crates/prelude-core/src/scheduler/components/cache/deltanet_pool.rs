@@ -10,6 +10,48 @@
 use crate::tensor::{DType, Device, Result, Tensor};
 use std::collections::VecDeque;
 
+/// Layer pattern for hybrid attention models that alternate full softmax
+/// attention layers with DeltaNet/recurrent layers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HybridAttentionPattern {
+    num_hidden_layers: usize,
+    full_attention_interval: usize,
+}
+
+impl HybridAttentionPattern {
+    pub fn new(num_hidden_layers: usize, full_attention_interval: usize) -> Self {
+        assert!(
+            full_attention_interval > 0,
+            "full_attention_interval must be greater than zero"
+        );
+        Self {
+            num_hidden_layers,
+            full_attention_interval,
+        }
+    }
+
+    #[inline]
+    pub fn is_full_attention_layer(self, layer_idx: usize) -> bool {
+        (layer_idx + 1) % self.full_attention_interval == 0
+    }
+
+    #[inline]
+    pub fn is_deltanet_layer(self, layer_idx: usize) -> bool {
+        !self.is_full_attention_layer(layer_idx)
+    }
+
+    pub fn full_attention_layers(self) -> usize {
+        (0..self.num_hidden_layers)
+            .filter(|&i| self.is_full_attention_layer(i))
+            .count()
+    }
+
+    pub fn deltanet_layers(self) -> usize {
+        self.num_hidden_layers
+            .saturating_sub(self.full_attention_layers())
+    }
+}
+
 /// Configuration for DeltaNet state dimensions, extracted from model config.
 pub struct DeltaNetPoolConfig {
     /// Number of DeltaNet (linear attention) layers in the model.
@@ -27,20 +69,16 @@ pub struct DeltaNetPoolConfig {
 }
 
 impl DeltaNetPoolConfig {
-    pub fn from_hybrid_attention_pattern(
-        num_hidden_layers: usize,
-        full_attention_interval: usize,
+    pub fn from_hybrid_pattern(
+        pattern: HybridAttentionPattern,
         linear_num_key_heads: usize,
         linear_num_value_heads: usize,
         linear_key_head_dim: usize,
         linear_value_head_dim: usize,
         linear_conv_kernel_dim: usize,
     ) -> Self {
-        let num_deltanet_layers = (0..num_hidden_layers)
-            .filter(|i| (i + 1) % full_attention_interval != 0)
-            .count();
         Self {
-            num_deltanet_layers,
+            num_deltanet_layers: pattern.deltanet_layers(),
             num_v_heads: linear_num_value_heads,
             head_k_dim: linear_key_head_dim,
             head_v_dim: linear_value_head_dim,
@@ -226,6 +264,17 @@ impl DeltaNetPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hybrid_attention_pattern_counts_layers() {
+        let pattern = HybridAttentionPattern::new(40, 4);
+
+        assert!(pattern.is_deltanet_layer(0));
+        assert!(pattern.is_deltanet_layer(2));
+        assert!(pattern.is_full_attention_layer(3));
+        assert_eq!(pattern.full_attention_layers(), 10);
+        assert_eq!(pattern.deltanet_layers(), 30);
+    }
 
     fn test_config() -> DeltaNetPoolConfig {
         DeltaNetPoolConfig {

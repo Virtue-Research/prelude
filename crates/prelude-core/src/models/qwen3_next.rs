@@ -11,6 +11,7 @@
 //! - HuggingFace `modeling_qwen3_next.py`
 //! SGLang is licensed under the Apache License, Version 2.0.
 
+use crate::cache::deltanet_pool::HybridAttentionPattern;
 use crate::loading::var_builder::VarBuilder;
 use crate::models::commons::embedding::Embedding;
 use crate::models::commons::linear::DenseLinear;
@@ -69,8 +70,12 @@ enum LayerType {
 }
 
 impl Qwen3NextConfig {
+    fn attention_pattern(&self) -> HybridAttentionPattern {
+        HybridAttentionPattern::new(self.num_hidden_layers, self.full_attention_interval)
+    }
+
     fn layer_type(&self, idx: usize) -> LayerType {
-        if (idx + 1) % self.full_attention_interval == 0 {
+        if self.attention_pattern().is_full_attention_layer(idx) {
             LayerType::FullAttention
         } else {
             LayerType::LinearAttention
@@ -1967,9 +1972,8 @@ mod meta {
     const SUPPORTED_TASKS: &[TaskKind] = &[TaskKind::Generate];
 
     fn deltanet_config_from(cfg: &Qwen3NextConfig) -> DeltaNetPoolConfig {
-        DeltaNetPoolConfig::from_hybrid_attention_pattern(
-            cfg.num_hidden_layers,
-            cfg.full_attention_interval,
+        DeltaNetPoolConfig::from_hybrid_pattern(
+            cfg.attention_pattern(),
             cfg.linear_num_key_heads,
             cfg.linear_num_value_heads,
             cfg.linear_key_head_dim,

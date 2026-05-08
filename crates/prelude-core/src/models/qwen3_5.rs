@@ -12,6 +12,7 @@
 //! - HuggingFace `modeling_qwen3_5.py`
 //! SGLang is licensed under the Apache License, Version 2.0.
 
+use crate::cache::deltanet_pool::HybridAttentionPattern;
 use crate::loading::var_builder::VarBuilder;
 use crate::models::commons::embedding::Embedding;
 use crate::models::commons::linear::DenseLinear;
@@ -270,8 +271,12 @@ enum LayerType {
 }
 
 impl Qwen3_5Config {
+    fn attention_pattern(&self) -> HybridAttentionPattern {
+        HybridAttentionPattern::new(self.num_hidden_layers, self.full_attention_interval)
+    }
+
     fn layer_type(&self, idx: usize) -> LayerType {
-        if (idx + 1) % self.full_attention_interval == 0 {
+        if self.attention_pattern().is_full_attention_layer(idx) {
             LayerType::FullAttention
         } else {
             LayerType::LinearAttention
@@ -279,9 +284,7 @@ impl Qwen3_5Config {
     }
 
     fn full_attention_layer_count(&self) -> usize {
-        (0..self.num_hidden_layers)
-            .filter(|&i| self.layer_type(i) == LayerType::FullAttention)
-            .count()
+        self.attention_pattern().full_attention_layers()
     }
 
     fn key_dim(&self) -> usize {
@@ -3461,9 +3464,8 @@ pub(crate) mod meta {
     const SUPPORTED_TASKS: &[TaskKind] = &[TaskKind::Generate];
 
     fn deltanet_config_from(cfg: &Qwen3_5Config) -> DeltaNetPoolConfig {
-        DeltaNetPoolConfig::from_hybrid_attention_pattern(
-            cfg.num_hidden_layers,
-            cfg.full_attention_interval,
+        DeltaNetPoolConfig::from_hybrid_pattern(
+            cfg.attention_pattern(),
             cfg.linear_num_key_heads,
             cfg.linear_num_value_heads,
             cfg.linear_key_head_dim,
@@ -3602,6 +3604,7 @@ pub mod gguf {
     use std::io::{Read, Seek};
     use std::sync::Arc;
 
+    use crate::cache::deltanet_pool::HybridAttentionPattern;
     use crate::constants::GGUF_INTERMEDIATE_SIZE_MULTIPLIER;
     use crate::models::commons::Linear;
     use crate::models::commons::embedding::Embedding;
@@ -3632,6 +3635,10 @@ pub mod gguf {
     }
 
     impl Qwen3_5GgufConfig {
+        fn attention_pattern(&self) -> HybridAttentionPattern {
+            HybridAttentionPattern::new(self.num_hidden_layers, self.full_attention_interval)
+        }
+
         fn key_dim(&self) -> usize {
             self.linear_num_key_heads * self.linear_key_head_dim
         }
@@ -3649,13 +3656,11 @@ pub mod gguf {
         }
 
         fn is_recurrent(&self, layer_idx: usize) -> bool {
-            (layer_idx + 1) % self.full_attention_interval != 0
+            self.attention_pattern().is_deltanet_layer(layer_idx)
         }
 
         pub(super) fn full_attention_layer_count(&self) -> usize {
-            (0..self.num_hidden_layers)
-                .filter(|&i| !self.is_recurrent(i))
-                .count()
+            self.attention_pattern().full_attention_layers()
         }
     }
 
