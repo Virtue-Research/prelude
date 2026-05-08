@@ -21,6 +21,10 @@ use crate::engine::{
 };
 use crate::models::gemma3::meta::{Gemma3ModelBuildContext, build_gemma3_model_with_context};
 use crate::models::registry::AuxiliaryVarBuilder;
+use crate::tensor::quantized::gguf_file::Content as GgufContent;
+
+const GGUF_BASE_MODEL_REPO_URL_KEY: &str = "general.base_model.0.repo_url";
+const HF_REPO_URL_PREFIX: &str = "https://huggingface.co/";
 
 #[derive(Debug, serde::Deserialize)]
 struct SentenceTransformerModuleEntry {
@@ -252,25 +256,16 @@ fn resolve_gguf_tokenizer_repo(repo_id: &str, gguf_path: &Path) -> String {
 
     // Try reading base_model from GGUF metadata
     if let Ok(mut file) = std::fs::File::open(gguf_path) {
-        if let Ok(ct) = crate::tensor::quantized::gguf_file::Content::read(&mut file) {
-            if let Some(val) = ct.metadata.get("general.base_model.0.repo_url") {
-                if let Ok(url) = val.to_string() {
-                    // Extract "org/model" from "https://huggingface.co/org/model"
-                    if let Some(repo) = url.strip_prefix("https://huggingface.co/") {
-                        tracing::info!(base_model = %repo, "resolved tokenizer from GGUF metadata");
-                        return repo.to_string();
-                    }
-                }
-            }
+        if let Ok(ct) = GgufContent::read(&mut file)
+            && let Some(repo) = gguf_base_model_repo(&ct)
+        {
+            tracing::info!(base_model = %repo, "resolved tokenizer from GGUF metadata");
+            return repo;
         }
     }
 
     // Fallback: strip -GGUF suffix (e.g. "unsloth/Qwen3.5-0.8B-GGUF" → "unsloth/Qwen3.5-0.8B")
-    let fallback = repo_id
-        .strip_suffix("-GGUF")
-        .or_else(|| repo_id.strip_suffix("-gguf"))
-        .unwrap_or(repo_id)
-        .to_string();
+    let fallback = stripped_gguf_repo_id(repo_id).unwrap_or_else(|| repo_id.to_string());
     tracing::info!(fallback = %fallback, "using fallback tokenizer repo (stripped -GGUF suffix)");
     fallback
 }
@@ -379,11 +374,33 @@ fn load_safetensor_parts(
 }
 
 /// Detect GGUF architecture from metadata.
-fn detect_gguf_arch(ct: &crate::tensor::quantized::gguf_file::Content) -> String {
+fn detect_gguf_arch(ct: &GgufContent) -> String {
     ct.metadata
         .get("general.architecture")
         .and_then(|v| v.to_string().ok().map(|s| s.to_string()))
         .unwrap_or_else(|| "qwen3".to_string())
+}
+
+fn gguf_base_model_repo(ct: &GgufContent) -> Option<String> {
+    ct.metadata
+        .get(GGUF_BASE_MODEL_REPO_URL_KEY)
+        .and_then(|v| v.to_string().ok())
+        .and_then(|url| hf_repo_from_url(&url))
+}
+
+fn hf_repo_from_url(url: &str) -> Option<String> {
+    url.strip_prefix(HF_REPO_URL_PREFIX).map(str::to_string)
+}
+
+fn stripped_gguf_repo_id(model_id: &str) -> Option<String> {
+    model_id
+        .strip_suffix("-GGUF")
+        .or_else(|| model_id.strip_suffix("-gguf"))
+        .map(str::to_string)
+}
+
+fn stripped_hf_gguf_repo_id(model_id: &str) -> Option<String> {
+    stripped_gguf_repo_id(model_id).filter(|repo| repo.contains('/') && !repo.starts_with('/'))
 }
 
 /// Guess the HF repo that ships the tokenizer for this GGUF when the
@@ -396,10 +413,7 @@ fn detect_gguf_arch(ct: &crate::tensor::quantized::gguf_file::Content) -> String
 /// canonical "Qwen/Qwen3-0.6B" repo. Returns `None` for unmapped arches
 /// (Mistral, DeepSeek, etc.); callers fall back to `model_id` and
 /// surface a clear tokenizer-download error.
-fn guess_tokenizer_repo_from_gguf_metadata(
-    ct: &crate::tensor::quantized::gguf_file::Content,
-    arch: &str,
-) -> Option<String> {
+fn guess_tokenizer_repo_from_gguf_metadata(ct: &GgufContent, arch: &str) -> Option<String> {
     let basename = ct
         .metadata
         .get("general.basename")
@@ -448,7 +462,7 @@ fn load_gguf(
 
     let mut file = std::fs::File::open(gguf_path)
         .map_err(|e| EngineError::Internal(format!("failed to open GGUF: {e}")))?;
-    let ct = crate::tensor::quantized::gguf_file::Content::read(&mut file).map_err(tensor_err)?;
+    let ct = GgufContent::read(&mut file).map_err(tensor_err)?;
 
     let arch = detect_gguf_arch(&ct);
     tracing::info!(arch = %arch, "detected GGUF architecture");
@@ -471,24 +485,8 @@ fn load_gguf(
     {
         load_tokenizer(parent)?
     } else {
-        let tokenizer_repo = ct
-            .metadata
-            .get("general.base_model.0.repo_url")
-            .and_then(|v| v.to_string().ok())
-            .and_then(|url| {
-                url.strip_prefix("https://huggingface.co/")
-                    .map(str::to_string)
-            })
-            .or_else(|| {
-                let stripped = model_id
-                    .strip_suffix("-GGUF")
-                    .or_else(|| model_id.strip_suffix("-gguf"));
-                // Only useful when model_id is an HF-style "org/repo",
-                // not a filesystem path.
-                stripped
-                    .filter(|s| s.contains('/') && !s.starts_with('/'))
-                    .map(str::to_string)
-            })
+        let tokenizer_repo = gguf_base_model_repo(&ct)
+            .or_else(|| stripped_hf_gguf_repo_id(&model_id))
             .or_else(|| guess_tokenizer_repo_from_gguf_metadata(&ct, &arch))
             .unwrap_or_else(|| model_id.clone());
         tracing::info!(repo = %tokenizer_repo, "resolving GGUF tokenizer");
