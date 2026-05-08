@@ -32,7 +32,8 @@ use tokio::sync::mpsc;
 use crate::cache::deltanet_pool::{DeltaNetPool, DeltaNetPrefixState};
 use crate::engine::executor::{Executor, ForwardBatch, ModelOutput};
 use crate::engine::{
-    DecodeMetrics, Engine, EngineError, PreparedGenerateRequest, TokenLogprobInfo, Usage,
+    BatchPrefillResult, DecodeMetrics, Engine, EngineError, PreparedGenerateRequest,
+    TokenLogprobInfo, Usage,
 };
 use crate::scheduler::{
     FinishReason, SamplingParams, Scheduler, SchedulerConfig, SchedulerStep, SeqFinishReason,
@@ -1255,65 +1256,14 @@ fn process_step_output(
             prefill_result_idx += 1;
         }
 
-        // Populate prefix cache once a prefill reaches a reusable boundary.
-        // Non-hybrid models only need KV blocks and can use the completed
-        // prompt. Hybrid DeltaNet models additionally need a state snapshot
-        // at the exact boundary being cached, which may be inside a paged KV
-        // block for the final `prompt_len - 1` fast path.
-        if engine.cache.prefix_cache.is_some() {
-            if let (Some(seq), Some(pool), Some(result)) = (
-                scheduler.get_sequence(request_id),
-                engine.cache.paged_pool.as_ref(),
-                prefill_result,
-            ) {
-                if !result.block_table.is_empty() && !seq.input_ids.is_empty() {
-                    if let Some(dn_pool_mutex) = engine.cache.deltanet_pool.as_ref() {
-                        if computed > 0
-                            && computed < seq.input_ids.len()
-                            && let Some(slot) = seq.deltanet_slot
-                        {
-                            match dn_pool_mutex
-                                .lock()
-                                .map_err(|e| {
-                                    EngineError::Internal(format!("deltanet pool lock: {e}"))
-                                })
-                                .and_then(|pool| {
-                                    pool.snapshot_slot(slot).map_err(|e| {
-                                        EngineError::Internal(format!(
-                                            "DeltaNet prefix state snapshot failed: {e}"
-                                        ))
-                                    })
-                                }) {
-                                Ok(deltanet_state) => {
-                                    if let Err(e) = engine
-                                        .cache
-                                        .try_prefix_cache_insert_paged_with_deltanet_state(
-                                            &seq.input_ids[..computed],
-                                            &result.block_table,
-                                            pool.block_size,
-                                            deltanet_state,
-                                        )
-                                    {
-                                        tracing::warn!("hybrid prefix cache insert failed: {e}");
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "hybrid prefix state snapshot failed");
-                                }
-                            }
-                        }
-                    } else if is_final
-                        && let Err(e) = engine.cache.try_prefix_cache_insert_paged_only(
-                            &seq.input_ids,
-                            &result.block_table,
-                            pool.block_size,
-                        )
-                    {
-                        tracing::warn!("prefix cache insert (ar_loop) failed: {e}");
-                    }
-                }
-            }
-        }
+        try_insert_prefill_prefix_cache(
+            engine,
+            scheduler,
+            request_id,
+            computed,
+            is_final,
+            prefill_result,
+        );
 
         if is_final {
             // Final chunk: sample first token from logits. Mirror the decode
@@ -1451,6 +1401,74 @@ fn process_step_output(
         if let Some(state) = states.remove(&request_id) {
             finish_state(engine, state, finish_reason, prompt_len);
         }
+    }
+}
+
+fn try_insert_prefill_prefix_cache(
+    engine: &Engine,
+    scheduler: &Scheduler,
+    request_id: &str,
+    computed: usize,
+    is_final: bool,
+    prefill_result: Option<&BatchPrefillResult>,
+) {
+    if engine.cache.prefix_cache.is_none() {
+        return;
+    }
+    let (Some(seq), Some(pool), Some(result)) = (
+        scheduler.get_sequence(request_id),
+        engine.cache.paged_pool.as_ref(),
+        prefill_result,
+    ) else {
+        return;
+    };
+    if result.block_table.is_empty() || seq.input_ids.is_empty() {
+        return;
+    }
+
+    if let Some(dn_pool_mutex) = engine.cache.deltanet_pool.as_ref() {
+        if computed == 0 || computed >= seq.input_ids.len() {
+            return;
+        }
+        let Some(slot) = seq.deltanet_slot else {
+            return;
+        };
+        let deltanet_state = match dn_pool_mutex
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("deltanet pool lock: {e}")))
+            .and_then(|pool| {
+                pool.snapshot_slot(slot).map_err(|e| {
+                    EngineError::Internal(format!("DeltaNet prefix state snapshot failed: {e}"))
+                })
+            }) {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::warn!(error = %e, "hybrid prefix state snapshot failed");
+                return;
+            }
+        };
+        if let Err(e) = engine
+            .cache
+            .try_prefix_cache_insert_paged_with_deltanet_state(
+                &seq.input_ids[..computed],
+                &result.block_table,
+                pool.block_size,
+                deltanet_state,
+            )
+        {
+            tracing::warn!("hybrid prefix cache insert failed: {e}");
+        }
+        return;
+    }
+
+    if is_final
+        && let Err(e) = engine.cache.try_prefix_cache_insert_paged_only(
+            &seq.input_ids,
+            &result.block_table,
+            pool.block_size,
+        )
+    {
+        tracing::warn!("prefix cache insert (ar_loop) failed: {e}");
     }
 }
 
