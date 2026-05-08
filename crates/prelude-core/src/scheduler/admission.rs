@@ -513,6 +513,16 @@ fn prefix_prefill_leader_needed(seq: &Sequence) -> bool {
     shared_prefix_target_pending(seq) || (seq.kv_computed_len == 0 && seq.block_table.is_empty())
 }
 
+fn front_waiting_sequence(queue: &VecDeque<Sequence>) -> &Sequence {
+    queue.front().expect("waiting queue was checked non-empty")
+}
+
+fn pop_waiting_sequence(queue: &mut VecDeque<Sequence>) -> Sequence {
+    queue
+        .pop_front()
+        .expect("waiting queue was checked non-empty")
+}
+
 // ── Legacy admission helpers (used by non-chunked path) ──────────────
 
 #[derive(Default)]
@@ -532,16 +542,9 @@ impl Scheduler {
         let global_prefill_cap = self.config.max_num_batched_tokens;
 
         while !self.waiting_queue.is_empty() && admission.to_prefill.len() < available_slots {
-            let prompt_len = self
-                .waiting_queue
-                .front()
-                .expect("queue was checked non-empty")
-                .prefill_len();
+            let prompt_len = front_waiting_sequence(&self.waiting_queue).prefill_len();
             let estimated_total = {
-                let sequence = self
-                    .waiting_queue
-                    .front()
-                    .expect("queue was checked non-empty");
+                let sequence = front_waiting_sequence(&self.waiting_queue);
                 sequence.total_len() + sequence.remaining_tokens() as usize
             };
 
@@ -550,10 +553,7 @@ impl Scheduler {
             // This used to be a `break` that left oversized sequences stuck
             // forever in `waiting`, surfacing to clients as a request timeout.
             if prompt_len > global_prefill_cap {
-                let mut sequence = self
-                    .waiting_queue
-                    .pop_front()
-                    .expect("queue was checked non-empty");
+                let mut sequence = pop_waiting_sequence(&mut self.waiting_queue);
                 sequence.status = SequenceStatus::Finished;
                 sequence.finish_reason = Some(SeqFinishReason::Abort(format!(
                     "prompt length {prompt_len} exceeds max_num_batched_tokens={global_prefill_cap}; \
@@ -581,10 +581,7 @@ impl Scheduler {
                 }
             }
 
-            let mut sequence = self
-                .waiting_queue
-                .pop_front()
-                .expect("queue was checked non-empty");
+            let mut sequence = pop_waiting_sequence(&mut self.waiting_queue);
             sequence.status = SequenceStatus::Prefilling;
             prefill_token_budget = prefill_token_budget.saturating_sub(prompt_len);
             total_token_budget = total_token_budget.saturating_sub(estimated_total);
