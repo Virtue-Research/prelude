@@ -13,6 +13,7 @@ mod generate;
 mod paged_decode;
 mod paged_mixed;
 mod paged_prefill;
+mod postprocess;
 mod prefill;
 mod prefill_output;
 

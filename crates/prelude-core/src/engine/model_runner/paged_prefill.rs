@@ -211,7 +211,7 @@ impl Engine {
                 .map_err(tensor_err)?;
 
             // Chunked prompt logprobs extraction while model lock is still held.
-            let logprobs_cpu = super::generate::extract_prompt_logprobs_from_hidden_offset(
+            let logprobs_cpu = super::postprocess::extract_prompt_logprobs_from_hidden_offset(
                 &hidden,
                 lm,
                 items,
