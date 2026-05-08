@@ -1,13 +1,12 @@
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use chrono::Utc;
 use prelude_core::{
     ClassificationRequest, ClassificationResponse, ClassificationUsage, ClassifyRequest,
 };
 use tracing::info;
-use uuid::Uuid;
 
+use super::generation_common::{api_id, unix_timestamp};
 use crate::Server;
 use crate::error::ApiError;
 
@@ -20,7 +19,7 @@ pub async fn classify(
         .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg, "invalid_request_error"))?;
 
     let classify_request = ClassifyRequest {
-        request_id: format!("classify-{}", Uuid::new_v4().simple()),
+        request_id: api_id("classify"),
         model: request.model.clone(),
         inputs,
     };
@@ -45,9 +44,9 @@ pub async fn classify(
     );
 
     Ok(Json(ClassificationResponse {
-        id: format!("classify-{}", Uuid::new_v4().simple()),
+        id: api_id("classify"),
         object: "list".to_string(),
-        created: Utc::now().timestamp(),
+        created: unix_timestamp(),
         model: result.model,
         data: result.results,
         usage: ClassificationUsage::from_prompt_tokens(result.prompt_tokens),

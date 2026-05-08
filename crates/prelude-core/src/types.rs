@@ -298,6 +298,12 @@ pub struct StreamOptions {
     pub include_usage: Option<bool>,
 }
 
+impl StreamOptions {
+    pub fn include_usage(&self) -> bool {
+        self.include_usage.unwrap_or(false)
+    }
+}
+
 // TODO: implement json_object response format
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResponseFormat {
@@ -365,6 +371,17 @@ pub struct ModelInfo {
     pub id: String,
     pub created: i64,
     pub owned_by: String,
+}
+
+impl From<ModelInfo> for ModelCard {
+    fn from(info: ModelInfo) -> Self {
+        Self {
+            id: info.id,
+            object: "model".to_string(),
+            created: info.created,
+            owned_by: info.owned_by,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -30,16 +30,24 @@ pub(crate) struct ResponseMeta {
 impl ResponseMeta {
     pub fn new(prefix: &str, model: impl Into<String>) -> Self {
         Self {
-            id: format!("{prefix}-{}", Uuid::new_v4().simple()),
-            created: Utc::now().timestamp(),
+            id: api_id(prefix),
+            created: unix_timestamp(),
             model: model.into(),
         }
     }
 }
 
+pub(crate) fn api_id(prefix: &str) -> String {
+    format!("{prefix}-{}", Uuid::new_v4().simple())
+}
+
+pub(crate) fn unix_timestamp() -> i64 {
+    Utc::now().timestamp()
+}
+
 pub(crate) fn build_generate_request(params: GenerateRequestParams) -> GenerateRequest {
     GenerateRequest {
-        request_id: format!("req-{}", Uuid::new_v4().simple()),
+        request_id: api_id("req"),
         model: params.model,
         input: params.input,
         sampling: SamplingParams {

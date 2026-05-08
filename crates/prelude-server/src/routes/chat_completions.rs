@@ -32,8 +32,7 @@ pub async fn chat_completions(
     let include_usage = request
         .stream_options
         .as_ref()
-        .and_then(|o| o.include_usage)
-        .unwrap_or(false);
+        .is_some_and(|options| options.include_usage());
     let (engine_request, thinking_in_prompt) =
         parse_chat_request(&request, server.chat_template.as_deref())?;
 

@@ -6,8 +6,8 @@ use prelude_core::{
     EmbeddingValue,
 };
 use tracing::info;
-use uuid::Uuid;
 
+use super::generation_common::api_id;
 use crate::Server;
 use crate::error::ApiError;
 
@@ -39,7 +39,7 @@ pub async fn embeddings(
         .is_some_and(|f| f.eq_ignore_ascii_case("base64"));
 
     let embed_request = EmbedRequest {
-        request_id: format!("embed-{}", Uuid::new_v4().simple()),
+        request_id: api_id("embed"),
         model: request.model.clone(),
         inputs,
     };
