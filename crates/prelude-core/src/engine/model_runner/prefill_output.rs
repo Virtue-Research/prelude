@@ -8,6 +8,14 @@ pub(crate) struct PrefillOutputRows {
 }
 
 impl PrefillOutputRows {
+    pub fn seq_count_for_item(&self, item_idx: usize) -> Result<usize, EngineError> {
+        self.item_seq_counts.get(item_idx).copied().ok_or_else(|| {
+            EngineError::Internal(format!(
+                "missing prefill sequence count for item {item_idx}"
+            ))
+        })
+    }
+
     pub fn next_row(&mut self) -> Result<Vec<f32>, EngineError> {
         self.rows
             .next()

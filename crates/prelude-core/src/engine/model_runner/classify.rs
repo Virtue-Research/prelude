@@ -50,8 +50,7 @@ impl Engine {
     ) -> Result<RawClassifyOutput, EngineError> {
         self.ensure_task_supported(TaskKind::Classify)?;
 
-        let token_groups: Vec<&[Vec<u32>]> =
-            items.iter().map(|item| item.token_ids.as_slice()).collect();
+        let token_groups = super::pretokenized_token_groups(&items);
         let forward_result = self.prefill_pipeline(&token_groups)?;
 
         let model = self
@@ -101,7 +100,7 @@ pub(crate) fn classify_postprocess(
     let mut results = Vec::with_capacity(items.len());
 
     for (item_idx, item) in items.into_iter().enumerate() {
-        let num_seqs = rows.item_seq_counts[item_idx];
+        let num_seqs = rows.seq_count_for_item(item_idx)?;
         let mut item_results = Vec::with_capacity(num_seqs);
 
         for local_idx in 0..num_seqs {

@@ -3,6 +3,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
+use super::types::PreTokenizedBatchItem;
 use crate::cache::deltanet_pool::DeltaNetPool;
 use crate::engine::{DType, Device, EngineError, Tensor, tensor_err};
 
@@ -68,4 +69,8 @@ fn lock_deltanet_pool(
             .map_err(|e| EngineError::Internal(format!("deltanet pool lock: {e}")))
     })
     .transpose()
+}
+
+fn pretokenized_token_groups<R>(items: &[PreTokenizedBatchItem<R>]) -> Vec<&[Vec<u32>]> {
+    items.iter().map(|item| item.token_ids.as_slice()).collect()
 }
