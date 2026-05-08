@@ -2961,26 +2961,15 @@ pub(crate) mod meta {
     use crate::loading::var_builder::VarBuilder;
 
     use super::{Qwen3_5Config, Qwen3_5ForCausalLM};
-    use crate::cache::deltanet_pool::DeltaNetPoolConfig;
     use crate::engine::EngineError;
     use crate::engine::{CommonModelConfig, RuntimeCaps, TaskKind, WeightsBackend};
+    use crate::models::commons::hybrid_deltanet_pool_config;
     use crate::models::registry::{ArchSpec, ParsedModelConfig, candle_model_err, parse_json};
 
     const ARCHITECTURE_ALIASES: &[&str] = &["Qwen3_5", "Qwen35", "Qwen3_5Moe", "Qwen35Moe"];
     const MODEL_TYPE_ALIASES: &[&str] =
         &["qwen3_5_text", "qwen3_5", "qwen3_5_moe_text", "qwen3_5_moe"];
     const SUPPORTED_TASKS: &[TaskKind] = &[TaskKind::Generate];
-
-    fn deltanet_config_from(cfg: &Qwen3_5Config) -> DeltaNetPoolConfig {
-        DeltaNetPoolConfig::new(
-            cfg.attention_pattern().recurrent_layers(),
-            cfg.linear_num_key_heads,
-            cfg.linear_num_value_heads,
-            cfg.linear_key_head_dim,
-            cfg.linear_value_head_dim,
-            cfg.linear_conv_kernel_dim,
-        )
-    }
 
     fn common_from_config(cfg: &Qwen3_5Config) -> CommonModelConfig {
         CommonModelConfig::new(
@@ -3038,7 +3027,14 @@ pub(crate) mod meta {
         ) -> Result<ParsedModelConfig, EngineError> {
             let cfg = parse_json::<Qwen3_5Config>(content, "Qwen3.5 config")?;
             let common = common_from_config(&cfg);
-            let deltanet = Some(deltanet_config_from(&cfg));
+            let deltanet = Some(hybrid_deltanet_pool_config(
+                cfg.attention_pattern(),
+                cfg.linear_num_key_heads,
+                cfg.linear_num_value_heads,
+                cfg.linear_key_head_dim,
+                cfg.linear_value_head_dim,
+                cfg.linear_conv_kernel_dim,
+            ));
             Ok(ParsedModelConfig {
                 common,
                 deltanet,

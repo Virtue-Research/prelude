@@ -2,7 +2,7 @@ use std::convert::Infallible;
 
 use axum::response::sse::Event;
 use chrono::Utc;
-use prelude_core::{GenerateRequest, PromptInput, SamplingParams, StopConfig};
+use prelude_core::{GenerateRequest, PromptInput, SamplingParams, StopConfig, Usage};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -56,6 +56,14 @@ pub(crate) fn build_generate_request(params: GenerateRequestParams) -> GenerateR
         deadline_ms: None,
         logprobs: params.logprobs,
         prompt_logprobs: params.prompt_logprobs,
+    }
+}
+
+pub(crate) fn empty_usage() -> Usage {
+    Usage {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
     }
 }
 

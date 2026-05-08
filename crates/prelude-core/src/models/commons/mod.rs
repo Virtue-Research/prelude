@@ -7,6 +7,7 @@ pub mod linear;
 
 use crate::tensor::Tensor;
 use crate::{
+    cache::deltanet_pool::DeltaNetPoolConfig,
     engine::{RuntimeCaps, TaskKind, WeightsBackend},
     tensor::Device,
 };
@@ -51,6 +52,25 @@ impl HybridAttentionPattern {
         self.num_hidden_layers
             .saturating_sub(self.full_attention_layers())
     }
+}
+
+/// Build DeltaNet pool metadata from the shared hybrid-attention pattern.
+pub(crate) fn hybrid_deltanet_pool_config(
+    pattern: HybridAttentionPattern,
+    linear_num_key_heads: usize,
+    linear_num_value_heads: usize,
+    linear_key_head_dim: usize,
+    linear_value_head_dim: usize,
+    linear_conv_kernel_dim: usize,
+) -> DeltaNetPoolConfig {
+    DeltaNetPoolConfig::new(
+        pattern.recurrent_layers(),
+        linear_num_key_heads,
+        linear_num_value_heads,
+        linear_key_head_dim,
+        linear_value_head_dim,
+        linear_conv_kernel_dim,
+    )
 }
 
 /// Pick the next grouped-prefill batch size without leaving a single-item tail

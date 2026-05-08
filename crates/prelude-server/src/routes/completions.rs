@@ -7,13 +7,13 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use prelude_core::{
     CompletionChoice, CompletionPrompt, CompletionRequest, CompletionResponse, GenerateRequest,
-    InferenceEngine, PromptInput, StreamEvent, Usage,
+    InferenceEngine, PromptInput, StreamEvent,
 };
 use tracing::debug;
 
 use super::generation_common::{
     DEFAULT_MAX_NEW_TOKENS, GenerateRequestParams, ResponseMeta, build_generate_request,
-    sse_done_event, sse_json_event,
+    empty_usage, sse_done_event, sse_json_event,
 };
 use crate::Server;
 use crate::error::ApiError;
@@ -99,11 +99,7 @@ fn completions_stream(
                     prompt_logprobs: None,
                     prompt_token_ids: None,
                 }],
-                usage: Usage {
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    total_tokens: 0,
-                },
+                usage: empty_usage(),
                 system_fingerprint: None,
             };
             vec![sse_json_event(&chunk)]
@@ -138,11 +134,7 @@ fn completions_stream(
                 usage: if include_usage {
                     usage.clone()
                 } else {
-                    Usage {
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        total_tokens: 0,
-                    }
+                    empty_usage()
                 },
                 system_fingerprint: None,
             }));

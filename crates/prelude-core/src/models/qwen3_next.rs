@@ -1761,25 +1761,14 @@ mod meta {
     use crate::loading::var_builder::VarBuilder;
 
     use super::{Qwen3NextConfig, Qwen3NextForCausalLM};
-    use crate::cache::deltanet_pool::DeltaNetPoolConfig;
     use crate::engine::EngineError;
     use crate::engine::{CommonModelConfig, RuntimeCaps, TaskKind, WeightsBackend};
+    use crate::models::commons::hybrid_deltanet_pool_config;
     use crate::models::registry::{ArchSpec, ParsedModelConfig, candle_model_err, parse_json};
 
     const ARCHITECTURE_ALIASES: &[&str] = &["Qwen3Next"];
     const MODEL_TYPE_ALIASES: &[&str] = &["qwen3_next"];
     const SUPPORTED_TASKS: &[TaskKind] = &[TaskKind::Generate];
-
-    fn deltanet_config_from(cfg: &Qwen3NextConfig) -> DeltaNetPoolConfig {
-        DeltaNetPoolConfig::new(
-            cfg.attention_pattern().recurrent_layers(),
-            cfg.linear_num_key_heads,
-            cfg.linear_num_value_heads,
-            cfg.linear_key_head_dim,
-            cfg.linear_value_head_dim,
-            cfg.linear_conv_kernel_dim,
-        )
-    }
 
     pub(crate) struct Qwen3NextArchSpec;
 
@@ -1820,7 +1809,14 @@ mod meta {
                 cfg.num_key_value_heads,
                 cfg.head_dim,
             );
-            let deltanet = Some(deltanet_config_from(&cfg));
+            let deltanet = Some(hybrid_deltanet_pool_config(
+                cfg.attention_pattern(),
+                cfg.linear_num_key_heads,
+                cfg.linear_num_value_heads,
+                cfg.linear_key_head_dim,
+                cfg.linear_value_head_dim,
+                cfg.linear_conv_kernel_dim,
+            ));
             Ok(ParsedModelConfig {
                 common,
                 deltanet,
