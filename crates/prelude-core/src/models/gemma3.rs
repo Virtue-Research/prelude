@@ -868,6 +868,7 @@ pub(crate) mod meta {
         CommonModelConfig, EmbeddingSemantics, RuntimeCaps, TaskKind, WeightsBackend,
     };
     use crate::loading::var_builder::VarBuilder;
+    use crate::models::commons::standard_safetensors_runtime_caps;
     use crate::models::registry::{
         ArchSpec, AuxiliaryVarBuilder, ParsedModelConfig, candle_model_err,
         inject_num_labels_if_missing, parse_value,
@@ -1126,17 +1127,7 @@ pub(crate) mod meta {
             backend: WeightsBackend,
             device: &crate::tensor::Device,
         ) -> RuntimeCaps {
-            let is_safetensors = backend == WeightsBackend::Safetensors;
-            let is_generate = task == TaskKind::Generate;
-
-            RuntimeCaps {
-                supports_kv_cache: is_safetensors && is_generate,
-                supports_prefix_cache: false,
-                supports_paged_attn: device.is_cuda() && is_safetensors,
-                supports_varlen: device.is_cuda() && is_safetensors,
-                supports_deltanet: false,
-                supports_cuda_graph: false,
-            }
+            standard_safetensors_runtime_caps(task, backend, device, false, false)
         }
     }
 

@@ -1104,6 +1104,7 @@ mod meta {
     };
     use crate::engine::EngineError;
     use crate::engine::{CommonModelConfig, RuntimeCaps, TaskKind, WeightsBackend};
+    use crate::models::commons::standard_safetensors_runtime_caps;
     use crate::models::registry::{
         ArchSpec, ParsedModelConfig, candle_model_err, inject_num_labels_if_missing, parse_json,
         parse_value,
@@ -1218,17 +1219,7 @@ mod meta {
             backend: WeightsBackend,
             device: &crate::tensor::Device,
         ) -> RuntimeCaps {
-            let is_safetensors = backend == WeightsBackend::Safetensors;
-            let is_cuda = device.is_cuda();
-            let supports_cuda_varlen = is_cuda && is_safetensors;
-            RuntimeCaps {
-                supports_kv_cache: is_safetensors && task == TaskKind::Generate,
-                supports_prefix_cache: is_safetensors && is_cuda,
-                supports_paged_attn: is_cuda && is_safetensors,
-                supports_varlen: supports_cuda_varlen,
-                supports_deltanet: false,
-                supports_cuda_graph: supports_cuda_varlen && task == TaskKind::Generate,
-            }
+            standard_safetensors_runtime_caps(task, backend, device, true, true)
         }
 
         // No `gguf_aliases` and no `load_gguf` override: Qwen3 GGUF

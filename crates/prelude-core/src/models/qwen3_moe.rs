@@ -760,6 +760,7 @@ mod meta {
     use super::{Qwen3MoeConfig, Qwen3MoeModelForCausalLM};
     use crate::engine::EngineError;
     use crate::engine::{CommonModelConfig, RuntimeCaps, TaskKind, WeightsBackend};
+    use crate::models::commons::standard_safetensors_runtime_caps;
     use crate::models::registry::{ArchSpec, ParsedModelConfig, candle_model_err, parse_json};
 
     const ARCHITECTURE_ALIASES: &[&str] = &["Qwen3Moe", "Qwen3MoeModel"];
@@ -833,10 +834,6 @@ mod meta {
             backend: WeightsBackend,
             device: &crate::tensor::Device,
         ) -> RuntimeCaps {
-            let is_safetensors = backend == WeightsBackend::Safetensors;
-            let is_generate = task == TaskKind::Generate;
-
-            let is_cuda = device.is_cuda();
             // CUDA graph capture for MoE decode. cudarc 0.19's
             // `CudaStream::alloc` uses `cuMemAllocAsync` whenever the
             // device supports memory pools (true on SM90+), which IS
@@ -858,18 +855,7 @@ mod meta {
             let moe_graph = crate::config::global_runtime()
                 .map(|runtime| runtime.moe_cuda_graph)
                 .unwrap_or(true);
-            RuntimeCaps {
-                supports_kv_cache: is_safetensors && is_generate,
-                supports_prefix_cache: is_safetensors && is_cuda,
-                supports_paged_attn: is_cuda && is_safetensors,
-                supports_varlen: is_cuda && is_safetensors,
-                supports_deltanet: false,
-                // Must AND with `is_cuda`: the env-var check above doesn't
-                // know what device we're on, and a CPU run with the flag
-                // set would otherwise tell DecodeGraphCache the model
-                // supports graphs on a non-CUDA device.
-                supports_cuda_graph: is_cuda && moe_graph,
-            }
+            standard_safetensors_runtime_caps(task, backend, device, true, moe_graph)
         }
     }
 }

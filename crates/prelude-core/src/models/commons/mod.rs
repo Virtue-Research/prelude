@@ -6,6 +6,10 @@ pub mod embedding;
 pub mod linear;
 
 use crate::tensor::Tensor;
+use crate::{
+    engine::{RuntimeCaps, TaskKind, WeightsBackend},
+    tensor::Device,
+};
 
 /// Layer pattern for hybrid attention models that alternate full softmax
 /// attention layers with recurrent/linear-attention layers.
@@ -73,6 +77,31 @@ pub(crate) fn packed_sequence_offsets(seq_lens: &[usize]) -> Vec<usize> {
         offset += len;
     }
     offsets
+}
+
+/// Runtime capabilities for standard safetensors-backed attention models.
+///
+/// This keeps per-model metadata focused on policy differences instead of
+/// repeating the same backend/device checks in every `ArchSpec`.
+pub(crate) fn standard_safetensors_runtime_caps(
+    task: TaskKind,
+    backend: WeightsBackend,
+    device: &Device,
+    supports_prefix_cache: bool,
+    supports_cuda_graph: bool,
+) -> RuntimeCaps {
+    let is_safetensors = backend == WeightsBackend::Safetensors;
+    let is_cuda_safetensors = device.is_cuda() && is_safetensors;
+    let is_generate = task == TaskKind::Generate;
+
+    RuntimeCaps {
+        supports_kv_cache: is_safetensors && is_generate,
+        supports_prefix_cache: supports_prefix_cache && is_cuda_safetensors,
+        supports_paged_attn: is_cuda_safetensors,
+        supports_varlen: is_cuda_safetensors,
+        supports_deltanet: false,
+        supports_cuda_graph: supports_cuda_graph && is_cuda_safetensors && is_generate,
+    }
 }
 
 // ── Paged KV structs ────────────────────────────────────────────────────
