@@ -29,11 +29,22 @@ impl Engine {
         }
 
         let q_seq_lens: Vec<usize> = requests.iter().map(|req| req.tokens.len()).collect();
+        let max_q_len = q_seq_lens.iter().copied().max().unwrap_or(0);
+        let min_q_len = q_seq_lens.iter().copied().min().unwrap_or(0);
         let (cu_seqlens_q, max_seqlen_q) =
             super::cumulative_lengths_u32(q_seq_lens.iter().copied())?;
         let (cu_seqlens_k, max_seqlen_k) =
             super::cumulative_lengths_u32(requests.iter().map(|req| req.context_len))?;
         let total_tokens = *cu_seqlens_q.last().unwrap_or(&0) as usize;
+
+        tracing::debug!(
+            num_requests,
+            total_tokens,
+            min_q_len,
+            max_q_len,
+            max_seqlen_k,
+            "batch_mixed_paged start"
+        );
 
         // ── Build packed varlen input ──────────────────────────────────
         let mut flat_tokens: Vec<u32> = Vec::with_capacity(total_tokens);

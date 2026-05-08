@@ -4,6 +4,8 @@ use crate::cache::deltanet_pool::DeltaNetPrefixState;
 use crate::engine::{BatchPrefillResult, Engine, EngineError};
 use crate::scheduler::{Scheduler, Sequence};
 
+const PREFIX_CACHE_KEY_BLOCKS: usize = 8;
+
 struct PrefixAttach {
     deltanet_state: Option<DeltaNetPrefixState>,
     replaced_blocks: Vec<u32>,
@@ -122,7 +124,7 @@ pub(super) fn prefix_cache_key(engine: &Engine, tokens: &[u32]) -> Option<u64> {
     // Group by the first several full pages. One page is too coarse for
     // chat templates shared across unrelated policies; several pages capture
     // the policy/system prompt while still avoiding full-prompt hashing.
-    let key_tokens = (block_size * 8).min(tokens.len());
+    let key_tokens = (block_size * PREFIX_CACHE_KEY_BLOCKS).min(tokens.len());
     if key_tokens < block_size {
         return None;
     }
@@ -131,6 +133,52 @@ pub(super) fn prefix_cache_key(engine: &Engine, tokens: &[u32]) -> Option<u64> {
     block_size.hash(&mut hasher);
     tokens[..key_tokens].hash(&mut hasher);
     Some(hasher.finish())
+}
+
+fn should_insert_deltanet_prefix_state(seq: &Sequence, block_size: usize, computed: usize) -> bool {
+    if block_size == 0
+        || computed == 0
+        || computed >= seq.input_ids.len()
+        || computed % block_size != 0
+        || seq.prefix_cache_key.is_none()
+    {
+        return false;
+    }
+
+    if seq.prefix_cache_target_len == Some(computed) {
+        return true;
+    }
+
+    if computed == bootstrap_deltanet_prefix_len(seq.input_ids.len(), block_size) {
+        return true;
+    }
+
+    computed == final_reusable_deltanet_prefix_len(seq.input_ids.len(), block_size)
+}
+
+fn bootstrap_deltanet_prefix_len(prompt_len: usize, block_size: usize) -> usize {
+    if block_size == 0 {
+        return 0;
+    }
+    let key_tokens = (block_size * PREFIX_CACHE_KEY_BLOCKS).min(prompt_len);
+    let key_tokens = key_tokens - (key_tokens % block_size);
+    if key_tokens >= block_size && key_tokens < prompt_len {
+        key_tokens
+    } else {
+        0
+    }
+}
+
+fn final_reusable_deltanet_prefix_len(prompt_len: usize, block_size: usize) -> usize {
+    if block_size == 0 || prompt_len <= block_size {
+        return 0;
+    }
+    let aligned = prompt_len - (prompt_len % block_size);
+    if aligned == prompt_len {
+        aligned.saturating_sub(block_size)
+    } else {
+        aligned
+    }
 }
 
 pub(super) fn refresh_waiting_prefix_cache(engine: &Engine, scheduler: &mut Scheduler) {
@@ -242,6 +290,16 @@ pub(super) fn try_insert_prefill_prefix_cache(
             );
             return;
         }
+        if !should_insert_deltanet_prefix_state(seq, pool.block_size, computed) {
+            tracing::debug!(
+                request_id = %request_id,
+                computed,
+                prompt_len = seq.input_ids.len(),
+                target_len = ?seq.prefix_cache_target_len,
+                "skip hybrid prefix cache insert at unplanned boundary"
+            );
+            return;
+        }
         let Some(slot) = seq.deltanet_slot else {
             return;
         };
@@ -281,5 +339,63 @@ pub(super) fn try_insert_prefill_prefix_cache(
         )
     {
         tracing::warn!("prefix cache insert (ar_loop) failed: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scheduler::SamplingParams;
+
+    fn seq_with_prefix(len: usize, target_len: Option<usize>) -> Sequence {
+        let mut seq = Sequence::new(
+            "r".to_string(),
+            (0..len as u32).collect(),
+            SamplingParams::default(),
+            1,
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        seq.prefix_cache_key = Some(1);
+        seq.prefix_cache_target_len = target_len;
+        seq
+    }
+
+    #[test]
+    fn deltanet_prefix_state_insert_accepts_planned_boundary() {
+        let seq = seq_with_prefix(33, Some(16));
+        assert!(should_insert_deltanet_prefix_state(&seq, 4, 16));
+    }
+
+    #[test]
+    fn deltanet_prefix_state_insert_accepts_bootstrap_boundary() {
+        let seq = seq_with_prefix(65, None);
+        assert!(should_insert_deltanet_prefix_state(&seq, 4, 32));
+    }
+
+    #[test]
+    fn deltanet_prefix_state_insert_accepts_final_reusable_boundary() {
+        let seq = seq_with_prefix(33, None);
+        assert!(should_insert_deltanet_prefix_state(&seq, 4, 32));
+
+        let exact_block_prompt = seq_with_prefix(32, None);
+        assert!(should_insert_deltanet_prefix_state(
+            &exact_block_prompt,
+            4,
+            28
+        ));
+    }
+
+    #[test]
+    fn deltanet_prefix_state_insert_rejects_unplanned_intermediate_boundary() {
+        let seq = seq_with_prefix(33, None);
+        assert!(!should_insert_deltanet_prefix_state(&seq, 4, 8));
+        assert!(!should_insert_deltanet_prefix_state(&seq, 4, 33));
+        assert!(!should_insert_deltanet_prefix_state(&seq, 4, 30));
+
+        let mut no_key = seq_with_prefix(33, Some(16));
+        no_key.prefix_cache_key = None;
+        assert!(!should_insert_deltanet_prefix_state(&no_key, 4, 16));
     }
 }

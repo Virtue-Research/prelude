@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 
 const MAX_GROUPED_PREFILL_BATCH: usize = 8;
 const MAX_ZERO_GROUPED_PREFILL_BATCH: usize = 16;
+const MAX_VARLEN_PREFILL_PADDING_FACTOR: usize = 2;
 
 mod config;
 
@@ -1451,6 +1452,13 @@ fn grouped_prefill_take(remaining: usize) -> usize {
     grouped_prefill_batch_take(remaining, MAX_GROUPED_PREFILL_BATCH)
 }
 
+fn varlen_prefill_padding_is_bounded(batch: usize, total_tokens: usize, max_len: usize) -> bool {
+    if batch <= 1 || total_tokens == 0 || max_len <= 1 {
+        return false;
+    }
+    batch.saturating_mul(max_len) <= total_tokens.saturating_mul(MAX_VARLEN_PREFILL_PADDING_FACTOR)
+}
+
 fn qwen35_kda_decode_enabled() -> bool {
     global_runtime()
         .map(|runtime| runtime.qwen35_kda_decode)
@@ -1676,19 +1684,6 @@ fn deltanet_mixed_grouped_fused(
     if decode_indices.is_empty() && prefill_by_len.is_empty() {
         return Ok(None);
     }
-    if qwen35_kda_decode_enabled()
-        && !decode_indices.is_empty()
-        && !ops.kda_decode_available_for(
-            decode_indices.len(),
-            gdn.num_k_heads,
-            gdn.num_v_heads,
-            gdn.head_k_dim,
-            gdn.head_v_dim,
-        )
-    {
-        return Ok(None);
-    }
-
     let mut outputs: Vec<Option<Tensor>> = vec![None; seq_lens.len()];
     let mut handled_varlen_prefill = false;
     let prefill_indices: Vec<usize> = prefill_by_len
@@ -1801,30 +1796,28 @@ fn deltanet_mixed_grouped_fused(
         }
     }
 
-    if qwen35_kda_decode_enabled() && !decode_indices.is_empty() {
-        let mut rows = Vec::with_capacity(decode_indices.len());
-        let mut decode_slots = Vec::with_capacity(decode_indices.len());
+    if !decode_indices.is_empty() {
+        // Keep the fused KDA decode kernel on the pure-decode path in
+        // `deltanet_varlen_pooled`. Mixed prefill/decode batches interleave
+        // prefill state writes with decode state updates in the same layer;
+        // use the per-request decode fallback here while preserving grouped
+        // prefill for the rest of the batch.
         for &req_idx in decode_indices.iter() {
-            rows.push(packed.narrow(0, offsets[req_idx], 1)?.squeeze(0)?);
-            decode_slots.push(slot_ids[req_idx]);
-        }
-        let decode_packed = Tensor::stack(&rows, 0)?.contiguous()?;
-        let decode_slots_gpu =
-            Tensor::from_vec(decode_slots.clone(), (decode_slots.len(),), packed.device())?;
-        let out = deltanet_decode_batched_fused(
-            gdn,
-            &decode_packed,
-            pool,
-            &decode_slots,
-            Some(&decode_slots_gpu),
-            dn_layer_idx,
-            ops,
-        )?;
-        let Some(out) = out else {
-            return Ok(None);
-        };
-        for (group_pos, &req_idx) in decode_indices.iter().enumerate() {
-            outputs[req_idx] = Some(out.narrow(0, group_pos, 1)?);
+            let starts_from_zero = state_is_zero
+                .and_then(|flags| flags.get(req_idx))
+                .copied()
+                .unwrap_or(false);
+            outputs[req_idx] = Some(deltanet_single_pooled(
+                gdn,
+                packed,
+                offsets[req_idx],
+                1,
+                pool,
+                slot_ids[req_idx],
+                starts_from_zero,
+                dn_layer_idx,
+                ops,
+            )?);
         }
     }
 
@@ -1870,6 +1863,16 @@ fn deltanet_prefill_varlen_pooled_batched(
         lens.push(len);
         total_tokens += len;
         max_len = max_len.max(len);
+    }
+    if !varlen_prefill_padding_is_bounded(batch, total_tokens, max_len) {
+        tracing::debug!(
+            batch,
+            total_tokens,
+            max_len,
+            padded_tokens = batch.saturating_mul(max_len),
+            "skip Qwen3.5 varlen pooled prefill: padding amplification too high"
+        );
+        return Ok(None);
     }
 
     let starts_from_zero: Vec<bool> = indices
@@ -2954,6 +2957,23 @@ impl crate::models::ModelForward for Qwen3_5ForCausalLM {
 
     fn as_kv_cache_model(&mut self) -> Option<&mut dyn crate::models::KvCacheModel> {
         Some(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::varlen_prefill_padding_is_bounded;
+
+    #[test]
+    fn varlen_prefill_padding_guard_accepts_dense_batches() {
+        assert!(varlen_prefill_padding_is_bounded(32, 8192, 256));
+        assert!(varlen_prefill_padding_is_bounded(8, 4096, 512));
+    }
+
+    #[test]
+    fn varlen_prefill_padding_guard_rejects_sparse_long_tail_batches() {
+        assert!(!varlen_prefill_padding_is_bounded(32, 8192, 1680));
+        assert!(!varlen_prefill_padding_is_bounded(16, 2048, 1024));
     }
 }
 

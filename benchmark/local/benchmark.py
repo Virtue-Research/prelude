@@ -354,17 +354,25 @@ def prompt_from_row(row: dict, text_column: str) -> Optional[str]:
     return text if text.strip() else None
 
 
-def sample_prompts(prompts: list[str], max_samples: int, seed: int) -> list[str]:
+def sample_prompts(prompts: list[str], max_samples: int, seed: int, shuffle: bool) -> list[str]:
     if not prompts:
         return prompts
-    rng = random.Random(seed)
-    rng.shuffle(prompts)
+    prompts = list(prompts)
+    if shuffle:
+        rng = random.Random(seed)
+        rng.shuffle(prompts)
     if len(prompts) >= max_samples:
         return prompts[:max_samples]
     return [prompts[i % len(prompts)] for i in range(max_samples)]
 
 
-def sample_jsonl_prompts(path: Path, max_samples: int, seed: int, text_column: str) -> tuple[list[str], int]:
+def sample_jsonl_prompts(
+    path: Path,
+    max_samples: int,
+    seed: int,
+    text_column: str,
+    shuffle: bool,
+) -> tuple[list[str], int]:
     rng = random.Random(seed)
     prompts: list[str] = []
     total = 0
@@ -383,6 +391,10 @@ def sample_jsonl_prompts(path: Path, max_samples: int, seed: int, text_column: s
             if not text:
                 continue
             total += 1
+            if not shuffle:
+                if len(prompts) < max_samples:
+                    prompts.append(text)
+                continue
             if len(prompts) < max_samples:
                 prompts.append(text)
             else:
@@ -392,12 +404,18 @@ def sample_jsonl_prompts(path: Path, max_samples: int, seed: int, text_column: s
     return prompts, total
 
 
-def load_local_dataset_file(path: Path, max_samples: int, seed: int, text_column: str) -> list[str]:
+def load_local_dataset_file(
+    path: Path,
+    max_samples: int,
+    seed: int,
+    text_column: str,
+    shuffle: bool,
+) -> list[str]:
     """Load prompts from a local JSON/JSONL file."""
     print(f"Loading dataset file '{path}'...")
     try:
         if path.suffix.lower() == ".jsonl":
-            prompts, total = sample_jsonl_prompts(path, max_samples, seed, text_column)
+            prompts, total = sample_jsonl_prompts(path, max_samples, seed, text_column, shuffle)
         else:
             with path.open("r", encoding="utf-8") as f:
                 payload = json.load(f)
@@ -425,7 +443,7 @@ def load_local_dataset_file(path: Path, max_samples: int, seed: int, text_column
         print(f"ERROR: dataset file '{path}' has no non-empty '{text_column}' entries")
         sys.exit(1)
 
-    prompts = sample_prompts(prompts, max_samples, seed)
+    prompts = sample_prompts(prompts, max_samples, seed, shuffle)
     print(f"  Loaded {len(prompts)} prompts from {total} '{text_column}' entries in '{path}'")
     return prompts
 
@@ -437,6 +455,7 @@ def load_realworld_dataset(
     text_column: str = DEFAULT_TEXT_COLUMN,
     dataset_split: Optional[str] = None,
     dataset_config: Optional[str] = None,
+    shuffle: bool = True,
 ) -> list[str]:
     """
     Load prompts from a HuggingFace dataset.
@@ -445,7 +464,7 @@ def load_realworld_dataset(
     """
     local_path = Path(dataset).expanduser()
     if local_path.exists() and local_path.is_file():
-        return load_local_dataset_file(local_path, max_samples, seed, text_column)
+        return load_local_dataset_file(local_path, max_samples, seed, text_column, shuffle)
 
     try:
         from datasets import load_dataset as hf_load
@@ -485,7 +504,7 @@ def load_realworld_dataset(
         print(f"ERROR: dataset '{dataset}' has no non-empty '{text_column}' entries")
         sys.exit(1)
 
-    prompts = sample_prompts(prompts, max_samples, seed)
+    prompts = sample_prompts(prompts, max_samples, seed, shuffle)
     print(f"  Loaded {len(prompts)} prompts from '{dataset}' column '{text_column}'")
     return prompts
 
@@ -498,6 +517,7 @@ def build_prompts(
     text_column: str,
     dataset_split: Optional[str],
     dataset_config: Optional[str],
+    shuffle: bool,
     model: str,
     seed: int,
     rng: random.Random,
@@ -521,6 +541,7 @@ def build_prompts(
             text_column=text_column,
             dataset_split=dataset_split,
             dataset_config=dataset_config,
+            shuffle=shuffle,
         )
 
     # synthetic
@@ -1246,6 +1267,7 @@ def toml_to_namespace(cfg: dict):
     args.text_column = data_sec.get("text_column", DEFAULT_TEXT_COLUMN) if isinstance(data_sec, dict) else DEFAULT_TEXT_COLUMN
     args.dataset_split = data_sec.get("split") if isinstance(data_sec, dict) else None
     args.dataset_config = data_sec.get("config") if isinstance(data_sec, dict) else None
+    args.shuffle = data_sec.get("shuffle", True) if isinstance(data_sec, dict) else True
     pt = data_sec.get("prompt_tokens") if isinstance(data_sec, dict) else None
     args.prompt_tokens = str(pt) if pt is not None else None
 
@@ -1328,6 +1350,9 @@ async def async_main():
                                 "default is train for GSM8K, otherwise test then train")
             p.add_argument("--dataset-config", default=None,
                            help="Optional HuggingFace dataset config name")
+            p.add_argument("--preserve-order", dest="shuffle", action="store_false",
+                           help="Preserve real-world dataset order instead of seeded shuffle")
+            p.set_defaults(shuffle=True)
             p.add_argument("--prompt-tokens", default=None, metavar="N|N-M",
                            help="Token length for synthetic data: "
                                 "'128' (exact) or '10-512' (uniform range). "
@@ -1481,6 +1506,7 @@ async def async_main():
         text_column=getattr(args, "text_column", DEFAULT_TEXT_COLUMN),
         dataset_split=getattr(args, "dataset_split", None),
         dataset_config=getattr(args, "dataset_config", None),
+        shuffle=getattr(args, "shuffle", True),
         model=args.model,
         seed=args.seed,
         rng=rng,

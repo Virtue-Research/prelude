@@ -494,7 +494,9 @@ fn cap_hybrid_prefix_cache_chunk(seq: &Sequence, block_size: usize, chunk: usize
     }
 
     // Keep intermediate partial chunks block-aligned when the token budget
-    // allows it, so every completed chunk can become reusable prefix cache.
+    // allows it. Hybrid prefix-cache insertion only snapshots selected
+    // reusable boundaries, but block alignment keeps those boundaries cheap
+    // to attach when a later step reaches one.
     if after < prompt_len && after % block_size != 0 {
         let aligned_after = after - (after % block_size);
         if aligned_after > computed {

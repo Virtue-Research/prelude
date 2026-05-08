@@ -69,6 +69,7 @@ presets/
 | `--text-column` | Text column for real-world datasets (default: `question`) |
 | `--dataset-split` | Split for real-world datasets (default: `train` for GSM8K, otherwise `test` then `train`) |
 | `--dataset-config` | Optional HuggingFace dataset config |
+| `--preserve-order` | Keep real-world dataset order; useful for prefix-cache hot shard tests |
 | `--prompt-tokens N` | Exact N tokens per prompt (needs tokenizer) |
 | `--prompt-tokens N-M` | Uniform random in [N, M] (needs tokenizer) |
 
@@ -111,6 +112,11 @@ prompt_tokens = "256-768"
 # Local JSONL example:
 # dataset     = "/scratch/panmz/.cache/nemo/datasets/json/training.jsonl"
 # text_column = "input"
+#
+# Prefix-cache hot shard example:
+# dataset     = "/scratch/panmz/workspace/prelude/bench_results/qwen35_real_topicguard_20260507T_shards/shard_000_064.json"
+# text_column = "text"
+# shuffle     = false
 
 [prefix]
 enabled       = true
