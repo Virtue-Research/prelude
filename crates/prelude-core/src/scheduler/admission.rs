@@ -119,23 +119,12 @@ impl Scheduler {
             let remaining_prefill = seq.prefill_len();
             if remaining_prefill > 0 {
                 // Partially prefilled — needs more prefill tokens
-                let mut chunk = remaining_prefill;
-                if let Some(prefix_chunk) = shared_prefix_target_chunk(seq, self.config.block_size)
-                {
-                    chunk = chunk.min(prefix_chunk);
-                } else {
-                    if self.config.long_prefill_token_threshold > 0 {
-                        chunk = chunk.min(self.config.long_prefill_token_threshold);
-                    }
-                    if seq.kv_computed_len == 0
-                        && let Some(prefix_chunk) =
-                            hybrid_prefix_bootstrap_chunk(seq, self.config.block_size)
-                    {
-                        chunk = chunk.min(prefix_chunk);
-                    }
-                }
-                chunk = chunk.min(token_budget);
-                chunk = cap_hybrid_prefix_cache_chunk(seq, self.config.block_size, chunk);
+                let chunk = prefix_aware_prefill_chunk(
+                    seq,
+                    self.config.block_size,
+                    self.config.long_prefill_token_threshold,
+                    token_budget,
+                );
                 if chunk > 0 {
                     if let Some(key) = seq.prefix_cache_key {
                         scheduled_prefill_prefixes.insert(key);
@@ -360,25 +349,13 @@ impl Scheduler {
             }
 
             // Per-request prefill cap
-            let mut chunk = seq.prefill_len();
-            if let Some(prefix_chunk) = shared_prefix_target_chunk(seq, block_size) {
-                chunk = chunk.min(prefix_chunk);
-            } else {
-                if self.config.long_prefill_token_threshold > 0 {
-                    chunk = chunk.min(self.config.long_prefill_token_threshold);
-                }
-                if seq.kv_computed_len == 0
-                    && let Some(prefix_chunk) = hybrid_prefix_bootstrap_chunk(seq, block_size)
-                {
-                    chunk = chunk.min(prefix_chunk);
-                }
-            }
+            let mut chunk =
+                prefill_chunk_limit(seq, block_size, self.config.long_prefill_token_threshold);
             if seq.prefill_must_be_atomic && seq.kv_computed_len == 0 && chunk > token_budget {
                 break;
             }
             // Per-step token budget
-            chunk = chunk.min(token_budget);
-            chunk = cap_hybrid_prefix_cache_chunk(seq, block_size, chunk);
+            chunk = cap_prefill_chunk_to_step(seq, block_size, chunk, token_budget);
 
             // Deadlock prevention: if nothing else is scheduled and chunk would
             // be 0, force at least 1 token so the system makes progress.
@@ -416,6 +393,46 @@ impl Scheduler {
             self.waiting_queue.push_front(seq);
         }
     }
+}
+
+fn prefix_aware_prefill_chunk(
+    seq: &Sequence,
+    block_size: usize,
+    long_prefill_token_threshold: usize,
+    token_budget: usize,
+) -> usize {
+    let chunk = prefill_chunk_limit(seq, block_size, long_prefill_token_threshold);
+    cap_prefill_chunk_to_step(seq, block_size, chunk, token_budget)
+}
+
+fn prefill_chunk_limit(
+    seq: &Sequence,
+    block_size: usize,
+    long_prefill_token_threshold: usize,
+) -> usize {
+    let mut chunk = seq.prefill_len();
+    if let Some(prefix_chunk) = shared_prefix_target_chunk(seq, block_size) {
+        chunk = chunk.min(prefix_chunk);
+    } else {
+        if long_prefill_token_threshold > 0 {
+            chunk = chunk.min(long_prefill_token_threshold);
+        }
+        if seq.kv_computed_len == 0
+            && let Some(prefix_chunk) = hybrid_prefix_bootstrap_chunk(seq, block_size)
+        {
+            chunk = chunk.min(prefix_chunk);
+        }
+    }
+    chunk
+}
+
+fn cap_prefill_chunk_to_step(
+    seq: &Sequence,
+    block_size: usize,
+    chunk: usize,
+    token_budget: usize,
+) -> usize {
+    cap_hybrid_prefix_cache_chunk(seq, block_size, chunk.min(token_budget))
 }
 
 fn hybrid_prefix_bootstrap_chunk(seq: &Sequence, block_size: usize) -> Option<usize> {

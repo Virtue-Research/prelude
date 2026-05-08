@@ -176,8 +176,11 @@ review and should not alter serving behavior:
 - Add `CommonModelConfig::new` and
   `CommonModelConfig::with_uniform_physical_kv_layers`.
 - Replace repeated model registry `CommonModelConfig` literals.
-- Add `DeltaNetPoolConfig::from_hybrid_attention_pattern`.
-- Use that helper from Qwen3.5 and Qwen3-Next metadata.
+- Add `HybridAttentionPattern` and
+  `DeltaNetPoolConfig::from_hybrid_pattern`.
+- Use those helpers from Qwen3.5 and Qwen3-Next metadata and GGUF shape logic.
 - Remove unused `GgufLoadResult::deltanet` and related Qwen3.5 GGUF duplicate
   construction.
 - Remove stray temporary/review markers and unused runtime-cap variables.
+- Centralize prefix-aware scheduler prefill chunk selection so running and
+  waiting admission paths cannot drift.
