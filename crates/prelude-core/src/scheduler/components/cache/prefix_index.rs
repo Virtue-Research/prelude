@@ -94,8 +94,18 @@ impl PrefixMatchIndex {
     }
 
     #[inline]
+    pub fn max_blocks(&self) -> usize {
+        self.max_blocks
+    }
+
+    #[inline]
     pub fn block_size(&self) -> usize {
         self.block_size
+    }
+
+    #[inline]
+    pub fn contains_hash(&self, hash: u64) -> bool {
+        self.entries.contains_key(&hash)
     }
 
     // -----------------------------------------------------------------------
@@ -169,6 +179,21 @@ impl PrefixMatchIndex {
                     }
                 }
             }
+        }
+        out
+    }
+
+    pub fn full_block_hashes(&self, tokens: &[u32]) -> Vec<u64> {
+        let full_blocks = tokens.len() / self.block_size;
+        let mut out = Vec::with_capacity(full_blocks);
+        let mut parent_hash = 0u64;
+        for block_tokens in tokens.chunks(self.block_size).take(full_blocks) {
+            if block_tokens.len() < self.block_size {
+                break;
+            }
+            let hash = Self::hash_block(parent_hash, block_tokens);
+            out.push(hash);
+            parent_hash = hash;
         }
         out
     }

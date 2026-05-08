@@ -1127,6 +1127,8 @@ mod meta {
             num_attention_heads: cfg.num_attention_heads,
             num_key_value_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
+            kv_head_dims: None,
+            kv_num_heads: None,
         }
     }
 

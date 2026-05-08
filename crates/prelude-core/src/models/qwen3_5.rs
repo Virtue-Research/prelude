@@ -3469,6 +3469,42 @@ pub(crate) mod meta {
         }
     }
 
+    fn full_attention_layers(cfg: &Qwen3_5Config) -> usize {
+        (0..cfg.num_hidden_layers)
+            .filter(|&i| cfg.layer_type(i) == super::LayerType::FullAttention)
+            .count()
+    }
+
+    fn common_from_config(cfg: &Qwen3_5Config) -> CommonModelConfig {
+        let kv_layers = full_attention_layers(cfg);
+        CommonModelConfig {
+            vocab_size: cfg.vocab_size,
+            num_hidden_layers: cfg.num_hidden_layers,
+            max_position_embeddings: cfg.max_position_embeddings,
+            num_attention_heads: cfg.num_attention_heads,
+            num_key_value_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            kv_head_dims: Some(vec![cfg.head_dim; kv_layers]),
+            kv_num_heads: Some(vec![cfg.num_key_value_heads; kv_layers]),
+        }
+    }
+
+    fn common_from_gguf_config(cfg: &super::gguf::Qwen3_5GgufConfig) -> CommonModelConfig {
+        let kv_layers = (0..cfg.num_hidden_layers)
+            .filter(|i| (i + 1) % cfg.full_attention_interval == 0)
+            .count();
+        CommonModelConfig {
+            vocab_size: cfg.vocab_size,
+            num_hidden_layers: cfg.num_hidden_layers,
+            max_position_embeddings: cfg.max_position_embeddings,
+            num_attention_heads: cfg.num_attention_heads,
+            num_key_value_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            kv_head_dims: Some(vec![cfg.head_dim; kv_layers]),
+            kv_num_heads: Some(vec![cfg.num_key_value_heads; kv_layers]),
+        }
+    }
+
     pub(crate) struct Qwen3_5ArchSpec;
 
     pub(crate) static QWEN3_5_ARCH_SPEC: Qwen3_5ArchSpec = Qwen3_5ArchSpec;
@@ -3500,14 +3536,7 @@ pub(crate) mod meta {
             content: &str,
         ) -> Result<ParsedModelConfig, EngineError> {
             let cfg = parse_json::<Qwen3_5Config>(content, "Qwen3.5 config")?;
-            let common = CommonModelConfig {
-                vocab_size: cfg.vocab_size,
-                num_hidden_layers: cfg.num_hidden_layers,
-                max_position_embeddings: cfg.max_position_embeddings,
-                num_attention_heads: cfg.num_attention_heads,
-                num_key_value_heads: cfg.num_key_value_heads,
-                head_dim: cfg.head_dim,
-            };
+            let common = common_from_config(&cfg);
             let deltanet = Some(deltanet_config_from(&cfg));
             Ok(ParsedModelConfig {
                 common,
@@ -3560,14 +3589,7 @@ pub(crate) mod meta {
         ) -> Result<crate::models::registry::GgufLoadResult, EngineError> {
             let (model, cfg) = super::gguf::Qwen3_5GgufModel::from_gguf(ct, reader, device)
                 .map_err(candle_model_err)?;
-            let common = CommonModelConfig {
-                vocab_size: cfg.vocab_size,
-                num_hidden_layers: cfg.num_hidden_layers,
-                max_position_embeddings: cfg.max_position_embeddings,
-                num_attention_heads: cfg.num_attention_heads,
-                num_key_value_heads: cfg.num_key_value_heads,
-                head_dim: cfg.head_dim,
-            };
+            let common = common_from_gguf_config(&cfg);
             let deltanet = Some(DeltaNetPoolConfig {
                 num_deltanet_layers: (0..cfg.num_hidden_layers)
                     .filter(|i| (i + 1) % cfg.full_attention_interval != 0)

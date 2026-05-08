@@ -11,7 +11,8 @@
 //! - `PRELUDE_PREFIX_CACHE_BLOCKS=256` (max cached blocks, 0 = disabled)
 //! - `PRELUDE_PREFIX_BLOCK_SIZE=64`    (tokens per block)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 
 use crate::cache::deltanet_pool::DeltaNetPrefixState;
 use crate::cache::prefix_index::PrefixMatchIndex;
@@ -31,6 +32,13 @@ struct AssembledKvCache {
     cached_len: usize,
 }
 
+struct ExactPagedPrefixEntry {
+    full_block_hashes: Vec<u64>,
+    partial_paged_block_id: u32,
+    deltanet_state: DeltaNetPrefixState,
+    access_id: u64,
+}
+
 /// Block-level prefix KV cache with hash-trie matching.
 pub struct PrefixKvCache {
     /// Tensor-free trie index (matching, LRU, paged block tracking).
@@ -43,6 +51,13 @@ pub struct PrefixKvCache {
     kv_store: HashMap<u64, Vec<(Tensor, Tensor)>>,
     /// Optional hybrid-model state at selected block boundaries.
     deltanet_state_store: HashMap<u64, DeltaNetPrefixState>,
+    /// Non-block-aligned exact prefix snapshots. Complete pages are still
+    /// owned by the block trie entries; this entry owns only the partial tail
+    /// page plus the recurrent state at the exact boundary.
+    exact_paged_store: HashMap<u64, ExactPagedPrefixEntry>,
+    exact_lru: VecDeque<(u64, u64)>,
+    exact_access_counter: u64,
+    evicted_exact_paged_blocks: Vec<u32>,
     /// Cache of pre-assembled KV tensors, keyed by the last block hash.
     assembled_cache: HashMap<u64, AssembledKvCache>,
 }
@@ -55,6 +70,10 @@ impl PrefixKvCache {
             num_layers,
             kv_store: HashMap::new(),
             deltanet_state_store: HashMap::new(),
+            exact_paged_store: HashMap::new(),
+            exact_lru: VecDeque::new(),
+            exact_access_counter: 0,
+            evicted_exact_paged_blocks: Vec::new(),
             assembled_cache: HashMap::new(),
         }
     }
@@ -119,6 +138,12 @@ impl PrefixKvCache {
         &mut self,
         tokens: &[u32],
     ) -> Result<(usize, Vec<u32>, Option<DeltaNetPrefixState>)> {
+        if tokens.len() > 1
+            && let Some(hit) = self.match_exact_paged_with_deltanet_state(tokens)
+        {
+            return Ok(hit);
+        }
+
         let m = self.index.match_prefix(tokens);
         if m.matched_hashes.is_empty() {
             return Ok((0, vec![], None));
@@ -146,6 +171,38 @@ impl PrefixKvCache {
         }
 
         Ok((0, vec![], None))
+    }
+
+    fn match_exact_paged_with_deltanet_state(
+        &mut self,
+        tokens: &[u32],
+    ) -> Option<(usize, Vec<u32>, Option<DeltaNetPrefixState>)> {
+        let cached_len = tokens.len().checked_sub(1)?;
+        if cached_len == 0 {
+            return None;
+        }
+
+        let key = Self::exact_hash(self.index.block_size(), &tokens[..cached_len]);
+        let (full_hashes, partial_id, state) = {
+            let entry = self.exact_paged_store.get(&key)?;
+            (
+                entry.full_block_hashes.clone(),
+                entry.partial_paged_block_id,
+                entry.deltanet_state.clone(),
+            )
+        };
+
+        if !full_hashes.iter().all(|h| self.index.contains_hash(*h))
+            || !self.index.all_have_paged(&full_hashes)
+        {
+            self.remove_exact_entry(key);
+            return None;
+        }
+
+        self.touch_exact(key);
+        let mut paged_blocks = self.index.collect_paged_blocks(&full_hashes);
+        paged_blocks.push(partial_id);
+        Some((cached_len, paged_blocks, Some(state)))
     }
 
     // -----------------------------------------------------------------------
@@ -220,24 +277,152 @@ impl PrefixKvCache {
             full_block_table,
         );
         let plan = self.index.insert_blocks(tokens, Some(&paged_map));
+        let mut stored_paged_blocks = plan.stored_paged_blocks;
 
-        if let Some(state) = deltanet_state
-            && tokens.len() >= self.index.block_size()
-            && tokens.len() % self.index.block_size() == 0
-        {
-            let hash = Self::last_full_block_hash(tokens, self.index.block_size());
-            self.deltanet_state_store.insert(hash, state);
+        if let Some(state) = deltanet_state {
+            let block_size = self.index.block_size();
+            if tokens.len() >= block_size && tokens.len() % block_size == 0 {
+                let hash = Self::last_full_block_hash(tokens, block_size);
+                self.deltanet_state_store.insert(hash, state.clone());
+            }
+            if let Some(partial_id) =
+                self.partial_paged_block_id(tokens.len(), paged_block_size, full_block_table)
+            {
+                let key = Self::exact_hash(block_size, tokens);
+                let full_block_hashes = self.index.full_block_hashes(tokens);
+                if self.index.all_have_paged(&full_block_hashes) {
+                    let stored =
+                        self.insert_exact_paged_entry(key, full_block_hashes, partial_id, state);
+                    if stored {
+                        stored_paged_blocks.push(partial_id);
+                    }
+                }
+            }
         }
 
         // No KV tensor storage needed — KV lives in the paged pool.
         // Clean up any evicted entries.
-        for hash in self.index.take_evicted_hashes() {
+        let evicted_hashes = self.index.take_evicted_hashes();
+        self.remove_exact_entries_referencing(&evicted_hashes);
+        for hash in evicted_hashes {
             self.kv_store.remove(&hash);
             self.deltanet_state_store.remove(&hash);
             self.assembled_cache.remove(&hash);
         }
 
-        plan.stored_paged_blocks
+        stored_paged_blocks
+    }
+
+    fn partial_paged_block_id(
+        &self,
+        tokens_len: usize,
+        paged_block_size: usize,
+        full_block_table: &[u32],
+    ) -> Option<u32> {
+        if tokens_len == 0 {
+            return None;
+        }
+        let paged_block_size = paged_block_size.max(1);
+        if tokens_len % paged_block_size == 0 {
+            return None;
+        }
+        let partial_block_idx = (tokens_len - 1) / paged_block_size;
+        full_block_table.get(partial_block_idx).copied()
+    }
+
+    fn insert_exact_paged_entry(
+        &mut self,
+        key: u64,
+        full_block_hashes: Vec<u64>,
+        partial_paged_block_id: u32,
+        deltanet_state: DeltaNetPrefixState,
+    ) -> bool {
+        let access_id = self.next_exact_access_id();
+        if let Some(entry) = self.exact_paged_store.get_mut(&key) {
+            entry.deltanet_state = deltanet_state;
+            entry.access_id = access_id;
+            self.exact_lru.push_back((key, access_id));
+            return false;
+        }
+
+        self.exact_paged_store.insert(
+            key,
+            ExactPagedPrefixEntry {
+                full_block_hashes,
+                partial_paged_block_id,
+                deltanet_state,
+                access_id,
+            },
+        );
+        self.exact_lru.push_back((key, access_id));
+        self.evict_exact_if_needed();
+        true
+    }
+
+    fn remove_exact_entry(&mut self, key: u64) {
+        if let Some(entry) = self.exact_paged_store.remove(&key) {
+            self.evicted_exact_paged_blocks
+                .push(entry.partial_paged_block_id);
+        }
+    }
+
+    fn remove_exact_entries_referencing(&mut self, evicted_hashes: &[u64]) {
+        if evicted_hashes.is_empty() || self.exact_paged_store.is_empty() {
+            return;
+        }
+        let evicted: HashSet<u64> = evicted_hashes.iter().copied().collect();
+        let stale: Vec<u64> = self
+            .exact_paged_store
+            .iter()
+            .filter_map(|(&key, entry)| {
+                entry
+                    .full_block_hashes
+                    .iter()
+                    .any(|hash| evicted.contains(hash))
+                    .then_some(key)
+            })
+            .collect();
+        for key in stale {
+            self.remove_exact_entry(key);
+        }
+    }
+
+    fn evict_exact_if_needed(&mut self) {
+        let max_entries = self.index.max_blocks();
+        while self.exact_paged_store.len() > max_entries {
+            let Some((key, access_id)) = self.exact_lru.pop_front() else {
+                break;
+            };
+            let Some(entry) = self.exact_paged_store.get(&key) else {
+                continue;
+            };
+            if entry.access_id != access_id {
+                continue;
+            }
+            self.remove_exact_entry(key);
+        }
+    }
+
+    fn touch_exact(&mut self, key: u64) {
+        let access_id = self.next_exact_access_id();
+        if let Some(entry) = self.exact_paged_store.get_mut(&key) {
+            entry.access_id = access_id;
+            self.exact_lru.push_back((key, access_id));
+        }
+    }
+
+    fn next_exact_access_id(&mut self) -> u64 {
+        self.exact_access_counter = self.exact_access_counter.wrapping_add(1);
+        self.exact_access_counter
+    }
+
+    fn exact_hash(block_size: usize, tokens: &[u32]) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        "prelude_exact_paged_prefix_v1".hash(&mut hasher);
+        block_size.hash(&mut hasher);
+        tokens.len().hash(&mut hasher);
+        tokens.hash(&mut hasher);
+        hasher.finish()
     }
 
     fn last_full_block_hash(tokens: &[u32], block_size: usize) -> u64 {
@@ -281,7 +466,9 @@ impl PrefixKvCache {
         }
 
         // Clean up KV data for evicted entries
-        for hash in self.index.take_evicted_hashes() {
+        let evicted_hashes = self.index.take_evicted_hashes();
+        self.remove_exact_entries_referencing(&evicted_hashes);
+        for hash in evicted_hashes {
             self.kv_store.remove(&hash);
             self.deltanet_state_store.remove(&hash);
             self.assembled_cache.remove(&hash);
@@ -293,7 +480,9 @@ impl PrefixKvCache {
     /// Take any paged block IDs that were collected during eviction.
     /// The caller must decrement ref counts on these in the BlockManager.
     pub fn take_evicted_paged_blocks(&mut self) -> Vec<u32> {
-        self.index.take_evicted_paged_blocks()
+        let mut blocks = self.index.take_evicted_paged_blocks();
+        blocks.extend(self.evicted_exact_paged_blocks.drain(..));
+        blocks
     }
 
     // -----------------------------------------------------------------------

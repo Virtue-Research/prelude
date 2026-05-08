@@ -111,6 +111,14 @@ pub struct CommonModelConfig {
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub head_dim: usize,
+    /// Optional physical KV-cache shape per paged-attention layer.
+    ///
+    /// Most transformer models allocate one paged KV cache per hidden layer
+    /// with a uniform shape, so this remains `None`. Hybrid models such as
+    /// Qwen3.5 only run softmax attention on a subset of layers; when present,
+    /// the cache manager allocates exactly these physical KV layers.
+    pub kv_head_dims: Option<Vec<usize>>,
+    pub kv_num_heads: Option<Vec<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

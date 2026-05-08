@@ -9,6 +9,16 @@ fn tensor_err(e: crate::tensor::Error) -> EngineError {
 }
 
 impl CacheManager {
+    pub(crate) fn allocate_paged_block(&self) -> Result<Option<u32>, EngineError> {
+        let Some(ref bm_mutex) = self.block_manager else {
+            return Ok(None);
+        };
+        let mut bm = bm_mutex
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
+        Ok(bm.allocate())
+    }
+
     /// Retain paged KV blocks that a sequence is about to reuse from prefix
     /// cache. The cache itself already owns one reference; active sequences
     /// need their own reference so normal request finalization can free them.
@@ -23,6 +33,37 @@ impl CacheManager {
             .lock()
             .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
         bm.increment_refs(block_ids);
+        Ok(())
+    }
+
+    pub(crate) fn release_paged_blocks(&self, block_ids: &[u32]) -> Result<(), EngineError> {
+        if block_ids.is_empty() {
+            return Ok(());
+        }
+        let Some(ref bm_mutex) = self.block_manager else {
+            return Ok(());
+        };
+        let mut bm = bm_mutex
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
+        bm.decrement_refs(block_ids);
+        Ok(())
+    }
+
+    pub(crate) fn copy_paged_kv_block(&self, src: u32, dst: u32) -> Result<(), EngineError> {
+        if src == dst {
+            return Ok(());
+        }
+        let Some(pool) = self.paged_pool.as_ref() else {
+            return Ok(());
+        };
+        for cache in pool
+            .active_key_caches()
+            .iter()
+            .chain(pool.active_value_caches().iter())
+        {
+            copy_tensor_block(cache, src as usize, dst as usize)?;
+        }
         Ok(())
     }
 
@@ -212,4 +253,18 @@ impl CacheManager {
 
         &first[..common_len]
     }
+}
+
+fn copy_tensor_block(
+    cache: &crate::tensor::Tensor,
+    src: usize,
+    dst: usize,
+) -> Result<(), EngineError> {
+    let row = cache
+        .narrow(0, src, 1)
+        .map_err(tensor_err)
+        .and_then(|t| (&t + 0.0f64).map_err(tensor_err))?
+        .contiguous()
+        .map_err(tensor_err)?;
+    cache.slice_set(&row, 0, dst).map_err(tensor_err)
 }
