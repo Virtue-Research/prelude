@@ -188,11 +188,7 @@ pub(crate) fn generate_postprocess(
             output_token_ids: vec![token],
             output_text,
             finish_reason,
-            usage: Usage {
-                prompt_tokens: prompt_len,
-                completion_tokens: 1,
-                total_tokens: prompt_len + 1,
-            },
+            usage: Usage::new(prompt_len, 1),
             metrics: DecodeMetrics {
                 ttft_ms: prefill_ms,
                 prefill_ms,

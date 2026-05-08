@@ -499,11 +499,7 @@ impl Engine {
                 output_token_ids,
                 output_text: text,
                 finish_reason,
-                usage: crate::types::Usage {
-                    prompt_tokens: prompt_len as u32,
-                    completion_tokens,
-                    total_tokens: prompt_len as u32 + completion_tokens,
-                },
+                usage: crate::types::Usage::new(prompt_len as u32, completion_tokens),
                 metrics: crate::types::DecodeMetrics {
                     total_ms,
                     prefill_ms,

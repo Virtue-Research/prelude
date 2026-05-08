@@ -1376,11 +1376,7 @@ fn finish_state(
     let output_text = state.current_text(&engine.tokenizer);
     let completion_tokens = state.output_tokens.len() as u32;
     let total_ms = state.gen_start.elapsed().as_secs_f32() * 1000.0;
-    let usage = Usage {
-        prompt_tokens: prompt_len as u32,
-        completion_tokens,
-        total_tokens: prompt_len as u32 + completion_tokens,
-    };
+    let usage = Usage::new(prompt_len as u32, completion_tokens);
     let metrics = DecodeMetrics {
         ttft_ms: state.prefill_ms,
         prefill_ms: state.prefill_ms,

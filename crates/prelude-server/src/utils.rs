@@ -25,11 +25,7 @@ pub fn log_generation_metrics(
 }
 
 pub fn aggregate_usage(results: &[GenerateResult]) -> Usage {
-    let mut usage = Usage {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-    };
+    let mut usage = Usage::default();
     for result in results {
         usage.prompt_tokens = usage
             .prompt_tokens

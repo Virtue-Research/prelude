@@ -81,9 +81,6 @@ pub async fn embeddings(
             })
             .collect(),
         model: result.model,
-        usage: EmbeddingUsage {
-            prompt_tokens: result.prompt_tokens,
-            total_tokens: result.prompt_tokens,
-        },
+        usage: EmbeddingUsage::from_prompt_tokens(result.prompt_tokens),
     }))
 }

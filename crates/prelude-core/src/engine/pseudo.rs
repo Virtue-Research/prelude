@@ -177,19 +177,13 @@ impl InferenceEngine for PseudoEngine {
             .max(1)
             .try_into()
             .unwrap_or(u32::MAX);
-        let total_tokens = prompt_tokens.saturating_add(completion_tokens);
-
         let total_ms = (self.latency_ms + extra) as f32;
         Ok(GenerateResult {
             model: request.model,
             output_token_ids: token_ids,
             output_text: text,
             finish_reason,
-            usage: Usage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
-            },
+            usage: Usage::new(prompt_tokens, completion_tokens),
             metrics: DecodeMetrics {
                 ttft_ms: total_ms * 0.5,
                 prefill_ms: total_ms * 0.2,

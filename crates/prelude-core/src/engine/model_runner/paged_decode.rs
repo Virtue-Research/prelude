@@ -359,11 +359,7 @@ impl Engine {
             "stream generation finished (batch prefill)"
         );
 
-        let usage = Usage {
-            prompt_tokens: prompt_len as u32,
-            completion_tokens,
-            total_tokens: prompt_len as u32 + completion_tokens,
-        };
+        let usage = Usage::new(prompt_len as u32, completion_tokens);
         let metrics = DecodeMetrics {
             ttft_ms,
             prefill_ms,
@@ -730,11 +726,7 @@ impl Engine {
                     .decode(&state.output_tokens, true)
                     .unwrap_or_default();
 
-                let usage = Usage {
-                    prompt_tokens: state.prompt_len as u32,
-                    completion_tokens,
-                    total_tokens: state.prompt_len as u32 + completion_tokens,
-                };
+                let usage = Usage::new(state.prompt_len as u32, completion_tokens);
                 let metrics = DecodeMetrics {
                     ttft_ms: 0.0, // filled by caller
                     prefill_ms: 0.0,

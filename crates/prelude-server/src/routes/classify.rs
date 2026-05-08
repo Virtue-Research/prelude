@@ -50,10 +50,6 @@ pub async fn classify(
         created: Utc::now().timestamp(),
         model: result.model,
         data: result.results,
-        usage: ClassificationUsage {
-            prompt_tokens: result.prompt_tokens,
-            total_tokens: result.prompt_tokens,
-            completion_tokens: 0,
-        },
+        usage: ClassificationUsage::from_prompt_tokens(result.prompt_tokens),
     }))
 }
