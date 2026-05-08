@@ -1,4 +1,5 @@
 use crate::loading::var_builder::VarBuilder;
+use crate::models::commons::attn_utils::apply_partial_rotary_varlen;
 use crate::tensor::{D, DType, Device, Result, Tensor};
 
 use super::Qwen3_5Config;
@@ -44,39 +45,8 @@ impl PartialRotaryEmbedding {
         k: &Tensor,
         position_ids: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        // position_ids: [total_tokens] → index_select cos/sin
-        let cos = self.cos.index_select(position_ids, 0)?.unsqueeze(1)?; // [T, 1, rotary_dim/2]
-        let sin = self.sin.index_select(position_ids, 0)?.unsqueeze(1)?;
-
-        let q_rot = q.narrow(D::Minus1, 0, self.rotary_dim)?;
-        let q_pass = q.narrow(
-            D::Minus1,
-            self.rotary_dim,
-            q.dim(D::Minus1)? - self.rotary_dim,
-        )?;
-        let q_rot = apply_rotary_emb(&q_rot, &cos, &sin)?;
-        let q = Tensor::cat(&[q_rot, q_pass], D::Minus1)?;
-
-        let k_rot = k.narrow(D::Minus1, 0, self.rotary_dim)?;
-        let k_pass = k.narrow(
-            D::Minus1,
-            self.rotary_dim,
-            k.dim(D::Minus1)? - self.rotary_dim,
-        )?;
-        let k_rot = apply_rotary_emb(&k_rot, &cos, &sin)?;
-        let k = Tensor::cat(&[k_rot, k_pass], D::Minus1)?;
-
-        Ok((q, k))
+        apply_partial_rotary_varlen(q, k, &self.cos, &self.sin, self.rotary_dim, position_ids)
     }
-}
-
-pub(super) fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let half = x.dim(D::Minus1)? / 2;
-    let x1 = x.narrow(D::Minus1, 0, half)?;
-    let x2 = x.narrow(D::Minus1, half, half)?;
-    let part1 = (x1.broadcast_mul(cos)? - x2.broadcast_mul(sin)?)?;
-    let part2 = (x2.broadcast_mul(cos)? + x1.broadcast_mul(sin)?)?;
-    Tensor::cat(&[&part1, &part2], D::Minus1)
 }
 
 // ── RMSNormGated ────────────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 //! Shared attention utilities: RoPE, fused QKV projection, helpers.
 
 use crate::models::config::Qwen3Config;
-use crate::tensor::{DType, Device, Result, Tensor};
+use crate::tensor::{D, DType, Device, Result, Tensor};
 
 use super::linear::Linear;
 
@@ -35,6 +35,39 @@ impl RotaryEmbedding {
 
         Ok(Self { sin, cos })
     }
+}
+
+pub(crate) fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let half = x.dim(D::Minus1)? / 2;
+    let x1 = x.narrow(D::Minus1, 0, half)?;
+    let x2 = x.narrow(D::Minus1, half, half)?;
+    let part1 = (x1.broadcast_mul(cos)? - x2.broadcast_mul(sin)?)?;
+    let part2 = (x2.broadcast_mul(cos)? + x1.broadcast_mul(sin)?)?;
+    Tensor::cat(&[&part1, &part2], D::Minus1)
+}
+
+pub(crate) fn apply_partial_rotary_varlen(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    rotary_dim: usize,
+    position_ids: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    let cos = cos.index_select(position_ids, 0)?.unsqueeze(1)?;
+    let sin = sin.index_select(position_ids, 0)?.unsqueeze(1)?;
+
+    let q_rot = q.narrow(D::Minus1, 0, rotary_dim)?;
+    let q_pass = q.narrow(D::Minus1, rotary_dim, q.dim(D::Minus1)? - rotary_dim)?;
+    let q_rot = apply_rotary_emb(&q_rot, &cos, &sin)?;
+    let q = Tensor::cat(&[q_rot, q_pass], D::Minus1)?;
+
+    let k_rot = k.narrow(D::Minus1, 0, rotary_dim)?;
+    let k_pass = k.narrow(D::Minus1, rotary_dim, k.dim(D::Minus1)? - rotary_dim)?;
+    let k_rot = apply_rotary_emb(&k_rot, &cos, &sin)?;
+    let k = Tensor::cat(&[k_rot, k_pass], D::Minus1)?;
+
+    Ok((q, k))
 }
 
 // ── Fused QKV Projection ───────────────────────────────────────────
