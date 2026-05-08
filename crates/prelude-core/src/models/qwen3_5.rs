@@ -12,14 +12,14 @@
 //! - HuggingFace `modeling_qwen3_5.py`
 //! SGLang is licensed under the Apache License, Version 2.0.
 
-use crate::cache::deltanet_pool::HybridAttentionPattern;
 use crate::loading::var_builder::VarBuilder;
 use crate::models::commons::embedding::Embedding;
 use crate::models::commons::linear::DenseLinear;
 use crate::tensor::{D, DType, Device, Module, Result, Tensor};
 
 use crate::models::commons::{
-    BatchAttnContext, BatchState, LayerAttnContext, Linear, last_token_select,
+    BatchAttnContext, BatchState, HybridAttentionPattern, LayerAttnContext, Linear,
+    last_token_select,
 };
 use crate::models::resolve_or_warn;
 use crate::ops::{MaskType, PagedParams, VarlenParams};
@@ -3464,8 +3464,8 @@ pub(crate) mod meta {
     const SUPPORTED_TASKS: &[TaskKind] = &[TaskKind::Generate];
 
     fn deltanet_config_from(cfg: &Qwen3_5Config) -> DeltaNetPoolConfig {
-        DeltaNetPoolConfig::from_hybrid_pattern(
-            cfg.attention_pattern(),
+        DeltaNetPoolConfig::new(
+            cfg.attention_pattern().recurrent_layers(),
             cfg.linear_num_key_heads,
             cfg.linear_num_value_heads,
             cfg.linear_key_head_dim,
@@ -3604,8 +3604,8 @@ pub mod gguf {
     use std::io::{Read, Seek};
     use std::sync::Arc;
 
-    use crate::cache::deltanet_pool::HybridAttentionPattern;
     use crate::constants::GGUF_INTERMEDIATE_SIZE_MULTIPLIER;
+    use crate::models::commons::HybridAttentionPattern;
     use crate::models::commons::Linear;
     use crate::models::commons::embedding::Embedding;
 
@@ -3656,7 +3656,7 @@ pub mod gguf {
         }
 
         fn is_recurrent(&self, layer_idx: usize) -> bool {
-            self.attention_pattern().is_deltanet_layer(layer_idx)
+            self.attention_pattern().is_recurrent_layer(layer_idx)
         }
 
         pub(super) fn full_attention_layer_count(&self) -> usize {

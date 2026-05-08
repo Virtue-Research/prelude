@@ -176,9 +176,10 @@ review and should not alter serving behavior:
 - Add `CommonModelConfig::new` and
   `CommonModelConfig::with_uniform_physical_kv_layers`.
 - Replace repeated model registry `CommonModelConfig` literals.
-- Add `HybridAttentionPattern` and
-  `DeltaNetPoolConfig::from_hybrid_pattern`.
-- Use those helpers from Qwen3.5 and Qwen3-Next metadata and GGUF shape logic.
+- Add model-owned `HybridAttentionPattern` and keep DeltaNet pool config focused
+  on concrete pool dimensions.
+- Use that layer-pattern helper from Qwen3.5 and Qwen3-Next metadata and GGUF
+  shape logic.
 - Remove unused `GgufLoadResult::deltanet` and related Qwen3.5 GGUF duplicate
   construction.
 - Remove stray temporary/review markers and unused runtime-cap variables.

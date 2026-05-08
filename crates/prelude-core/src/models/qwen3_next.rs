@@ -11,14 +11,14 @@
 //! - HuggingFace `modeling_qwen3_next.py`
 //! SGLang is licensed under the Apache License, Version 2.0.
 
-use crate::cache::deltanet_pool::HybridAttentionPattern;
 use crate::loading::var_builder::VarBuilder;
 use crate::models::commons::embedding::Embedding;
 use crate::models::commons::linear::DenseLinear;
 use crate::tensor::{D, DType, Device, Module, Result, Tensor};
 
 use crate::models::commons::{
-    BatchAttnContext, BatchState, LayerAttnContext, Linear, last_token_select,
+    BatchAttnContext, BatchState, HybridAttentionPattern, LayerAttnContext, Linear,
+    last_token_select,
 };
 use crate::models::model_config;
 use crate::ops::{MaskType, PagedParams, VarlenParams};
@@ -1972,8 +1972,8 @@ mod meta {
     const SUPPORTED_TASKS: &[TaskKind] = &[TaskKind::Generate];
 
     fn deltanet_config_from(cfg: &Qwen3NextConfig) -> DeltaNetPoolConfig {
-        DeltaNetPoolConfig::from_hybrid_pattern(
-            cfg.attention_pattern(),
+        DeltaNetPoolConfig::new(
+            cfg.attention_pattern().recurrent_layers(),
             cfg.linear_num_key_heads,
             cfg.linear_num_value_heads,
             cfg.linear_key_head_dim,

@@ -7,6 +7,48 @@ pub mod linear;
 
 use crate::tensor::Tensor;
 
+/// Layer pattern for hybrid attention models that alternate full softmax
+/// attention layers with recurrent/linear-attention layers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HybridAttentionPattern {
+    num_hidden_layers: usize,
+    full_attention_interval: usize,
+}
+
+impl HybridAttentionPattern {
+    pub fn new(num_hidden_layers: usize, full_attention_interval: usize) -> Self {
+        assert!(
+            full_attention_interval > 0,
+            "full_attention_interval must be greater than zero"
+        );
+        Self {
+            num_hidden_layers,
+            full_attention_interval,
+        }
+    }
+
+    #[inline]
+    pub fn is_full_attention_layer(self, layer_idx: usize) -> bool {
+        (layer_idx + 1) % self.full_attention_interval == 0
+    }
+
+    #[inline]
+    pub fn is_recurrent_layer(self, layer_idx: usize) -> bool {
+        !self.is_full_attention_layer(layer_idx)
+    }
+
+    pub fn full_attention_layers(self) -> usize {
+        (0..self.num_hidden_layers)
+            .filter(|&i| self.is_full_attention_layer(i))
+            .count()
+    }
+
+    pub fn recurrent_layers(self) -> usize {
+        self.num_hidden_layers
+            .saturating_sub(self.full_attention_layers())
+    }
+}
+
 // ── Paged KV structs ────────────────────────────────────────────────────
 
 /// Per-layer paged KV context for varlen attention with paged prefix.
@@ -139,4 +181,20 @@ pub(crate) fn first_token_select(
     }
     let indices = Tensor::from_vec(first_indices, (batch_size,), hidden.device())?;
     hidden.index_select(&indices, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hybrid_attention_pattern_counts_layers() {
+        let pattern = HybridAttentionPattern::new(40, 4);
+
+        assert!(pattern.is_recurrent_layer(0));
+        assert!(pattern.is_recurrent_layer(2));
+        assert!(pattern.is_full_attention_layer(3));
+        assert_eq!(pattern.full_attention_layers(), 10);
+        assert_eq!(pattern.recurrent_layers(), 30);
+    }
 }
