@@ -20,7 +20,8 @@ use crate::tensor::{D, DType, Device, Module, Result, Tensor};
 
 use crate::models::commons::{
     BatchAttnContext, BatchState, HybridAttentionPattern, LayerAttnContext, Linear,
-    grouped_prefill_batch_take, last_token_select, packed_sequence_offsets,
+    gather_packed_sequences, grouped_prefill_batch_take, last_token_select,
+    packed_sequence_offsets, pad_packed_sequences, unpad_padded_sequences,
 };
 use crate::models::resolve_or_warn;
 use crate::ops::{MaskType, PagedParams, VarlenParams};
@@ -2424,47 +2425,6 @@ fn deltanet_prefill_varlen_pooled_batched(
         offset += len;
     }
     Ok(Some(outputs))
-}
-
-fn gather_packed_sequences(
-    packed: &Tensor,
-    offsets: &[usize],
-    lens: &[usize],
-    indices: &[usize],
-) -> Result<Tensor> {
-    if indices.is_empty() {
-        crate::tensor::bail!("gather_packed_sequences called with empty indices");
-    }
-    let mut seqs = Vec::with_capacity(indices.len());
-    for (&req_idx, &len) in indices.iter().zip(lens.iter()) {
-        seqs.push(packed.narrow(0, offsets[req_idx], len)?);
-    }
-    Tensor::cat(&seqs, 0)
-}
-
-fn pad_packed_sequences(packed: &Tensor, lens: &[usize], max_len: usize) -> Result<Tensor> {
-    let hidden = packed.dim(1)?;
-    let mut rows = Vec::with_capacity(lens.len());
-    let mut offset = 0usize;
-    for &len in lens {
-        let seq = packed.narrow(0, offset, len)?;
-        offset += len;
-        if len == max_len {
-            rows.push(seq);
-        } else {
-            let pad = Tensor::zeros((max_len - len, hidden), packed.dtype(), packed.device())?;
-            rows.push(Tensor::cat(&[&seq, &pad], 0)?);
-        }
-    }
-    Tensor::stack(&rows, 0)?.contiguous()
-}
-
-fn unpad_padded_sequences(padded: &Tensor, lens: &[usize]) -> Result<Tensor> {
-    let mut rows = Vec::with_capacity(lens.len());
-    for (idx, &len) in lens.iter().enumerate() {
-        rows.push(padded.get(idx)?.narrow(0, 0, len)?);
-    }
-    Tensor::cat(&rows, 0)
 }
 
 fn next_conv_states_from_padded_qkv(

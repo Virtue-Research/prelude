@@ -238,6 +238,54 @@ pub(crate) fn first_token_select(
     hidden.index_select(&indices, 0)
 }
 
+pub(crate) fn gather_packed_sequences(
+    packed: &Tensor,
+    offsets: &[usize],
+    lens: &[usize],
+    indices: &[usize],
+) -> crate::tensor::Result<Tensor> {
+    if indices.is_empty() {
+        crate::tensor::bail!("gather_packed_sequences called with empty indices");
+    }
+    let mut seqs = Vec::with_capacity(indices.len());
+    for (&req_idx, &len) in indices.iter().zip(lens.iter()) {
+        seqs.push(packed.narrow(0, offsets[req_idx], len)?);
+    }
+    Tensor::cat(&seqs, 0)
+}
+
+pub(crate) fn pad_packed_sequences(
+    packed: &Tensor,
+    lens: &[usize],
+    max_len: usize,
+) -> crate::tensor::Result<Tensor> {
+    let hidden = packed.dim(1)?;
+    let mut rows = Vec::with_capacity(lens.len());
+    let mut offset = 0usize;
+    for &len in lens {
+        let seq = packed.narrow(0, offset, len)?;
+        offset += len;
+        if len == max_len {
+            rows.push(seq);
+        } else {
+            let pad = Tensor::zeros((max_len - len, hidden), packed.dtype(), packed.device())?;
+            rows.push(Tensor::cat(&[&seq, &pad], 0)?);
+        }
+    }
+    Tensor::stack(&rows, 0)?.contiguous()
+}
+
+pub(crate) fn unpad_padded_sequences(
+    padded: &Tensor,
+    lens: &[usize],
+) -> crate::tensor::Result<Tensor> {
+    let mut rows = Vec::with_capacity(lens.len());
+    for (idx, &len) in lens.iter().enumerate() {
+        rows.push(padded.get(idx)?.narrow(0, 0, len)?);
+    }
+    Tensor::cat(&rows, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
