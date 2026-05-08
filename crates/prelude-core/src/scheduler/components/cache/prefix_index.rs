@@ -98,6 +98,11 @@ impl PrefixMatchIndex {
         self.block_size
     }
 
+    #[inline]
+    pub fn max_blocks(&self) -> usize {
+        self.max_blocks
+    }
+
     // -----------------------------------------------------------------------
     // Match
     // -----------------------------------------------------------------------
@@ -146,9 +151,11 @@ impl PrefixMatchIndex {
 
     /// Check if all given hashes have paged block IDs.
     pub fn all_have_paged(&self, hashes: &[u64]) -> bool {
-        hashes
-            .iter()
-            .all(|h| self.entries.get(h).is_some_and(|e| e.paged_block_ids.is_some()))
+        hashes.iter().all(|h| {
+            self.entries
+                .get(h)
+                .is_some_and(|e| e.paged_block_ids.is_some())
+        })
     }
 
     /// Build a canonical paged-attn block table from matched prefix entries.
@@ -169,6 +176,25 @@ impl PrefixMatchIndex {
             }
         }
         out
+    }
+
+    pub fn contains_hash(&self, hash: u64) -> bool {
+        self.entries.contains_key(&hash)
+    }
+
+    pub fn full_block_hashes(&self, tokens: &[u32]) -> Vec<u64> {
+        let full_blocks = tokens.len() / self.block_size;
+        let mut hashes = Vec::with_capacity(full_blocks);
+        let mut parent_hash = 0u64;
+        for block_tokens in tokens.chunks(self.block_size).take(full_blocks) {
+            if block_tokens.len() < self.block_size {
+                break;
+            }
+            let hash = Self::hash_block(parent_hash, block_tokens);
+            hashes.push(hash);
+            parent_hash = hash;
+        }
+        hashes
     }
 
     // -----------------------------------------------------------------------

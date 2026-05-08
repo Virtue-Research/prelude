@@ -1,6 +1,6 @@
-use crate::types::{ClassifyRequest, EmbedRequest, GenerateRequest, TokenLogprobInfo};
-use crate::tensor::Tensor;
 use crate::engine::sampling::LogitsProcessor;
+use crate::tensor::Tensor;
+use crate::types::{ClassifyRequest, EmbedRequest, GenerateRequest, TokenLogprobInfo};
 
 // ── Model dispatch ──────────────────────────────────────────────────────
 
@@ -111,6 +111,12 @@ pub struct CommonModelConfig {
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub head_dim: usize,
+    /// Optional per-layer KV head dimension for hybrid models whose layers do
+    /// not all share `head_dim` (for example Gemma4 sliding/full attention).
+    pub kv_head_dims: Option<Vec<usize>>,
+    /// Optional per-layer KV head count for hybrid models whose layers do not
+    /// all share `num_key_value_heads`.
+    pub kv_num_heads: Option<Vec<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

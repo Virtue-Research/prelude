@@ -1,3 +1,4 @@
+use crate::cache::deltanet_pool::DeltaNetStateSnapshot;
 use crate::cache::manager::CacheManager;
 use crate::engine::EngineError;
 use crate::engine::PreparedGenerateRequest;
@@ -8,6 +9,16 @@ fn tensor_err(e: crate::tensor::Error) -> EngineError {
 }
 
 impl CacheManager {
+    pub(crate) fn allocate_paged_block(&self) -> Result<Option<u32>, EngineError> {
+        let Some(ref bm_mutex) = self.block_manager else {
+            return Ok(None);
+        };
+        let mut bm = bm_mutex
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
+        Ok(bm.allocate())
+    }
+
     /// Retain paged KV blocks that a sequence is about to reuse from prefix
     /// cache. The cache itself already owns one reference; active sequences
     /// need their own reference so normal request finalization can free them.
@@ -25,6 +36,78 @@ impl CacheManager {
         Ok(())
     }
 
+    pub(crate) fn release_paged_blocks(&self, block_ids: &[u32]) -> Result<(), EngineError> {
+        if block_ids.is_empty() {
+            return Ok(());
+        }
+        let Some(ref bm_mutex) = self.block_manager else {
+            return Ok(());
+        };
+        let mut bm = bm_mutex
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
+        bm.decrement_refs(block_ids);
+        Ok(())
+    }
+
+    pub(crate) fn copy_paged_kv_block(&self, src: u32, dst: u32) -> Result<(), EngineError> {
+        if src == dst {
+            return Ok(());
+        }
+        let Some(pool) = self.paged_pool.as_ref() else {
+            return Ok(());
+        };
+        for cache in pool
+            .active_key_caches()
+            .iter()
+            .chain(pool.active_value_caches().iter())
+        {
+            copy_tensor_block(cache, src as usize, dst as usize)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn snapshot_deltanet_slot(
+        &self,
+        slot: u32,
+    ) -> Result<Option<DeltaNetStateSnapshot>, EngineError> {
+        let Some(pool_mutex) = self.deltanet_pool.as_ref() else {
+            return Ok(None);
+        };
+        let pool = pool_mutex
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("deltanet pool lock: {e}")))?;
+        pool.snapshot_slot(slot)
+            .map(Some)
+            .map_err(|e| EngineError::Internal(format!("deltanet snapshot: {e}")))
+    }
+
+    pub(crate) fn restore_deltanet_slot(
+        &self,
+        slot: u32,
+        state: &DeltaNetStateSnapshot,
+    ) -> Result<(), EngineError> {
+        let Some(pool_mutex) = self.deltanet_pool.as_ref() else {
+            return Ok(());
+        };
+        let pool = pool_mutex
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("deltanet pool lock: {e}")))?;
+        pool.restore_slot(slot, state)
+            .map_err(|e| EngineError::Internal(format!("deltanet restore: {e}")))
+    }
+
+    pub(crate) fn reset_deltanet_slot(&self, slot: u32) -> Result<(), EngineError> {
+        let Some(pool_mutex) = self.deltanet_pool.as_ref() else {
+            return Ok(());
+        };
+        let pool = pool_mutex
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("deltanet pool lock: {e}")))?;
+        pool.reset_slot(slot)
+            .map_err(|e| EngineError::Internal(format!("deltanet reset: {e}")))
+    }
+
     /// Match prefix cache for paged-attention runs and return only block IDs.
     /// This avoids assembling per-layer KV tensors when the caller can consume
     /// paged blocks directly.
@@ -32,18 +115,37 @@ impl CacheManager {
         &self,
         tokens: &[u32],
     ) -> Result<(usize, Vec<u32>), EngineError> {
-        let Some(ref pc_mutex) = self.prefix_cache else {
+        if self.deltanet_pool.is_some() {
             return Ok((0, vec![]));
+        }
+        let (cached_len, paged_ids, _) =
+            self.try_prefix_cache_match_paged_only_with_deltanet(tokens)?;
+        Ok((cached_len, paged_ids))
+    }
+
+    pub(crate) fn try_prefix_cache_match_paged_only_with_deltanet(
+        &self,
+        tokens: &[u32],
+    ) -> Result<(usize, Vec<u32>, Option<DeltaNetStateSnapshot>), EngineError> {
+        let Some(ref pc_mutex) = self.prefix_cache else {
+            return Ok((0, vec![], None));
         };
         let mut pc = pc_mutex
             .lock()
             .map_err(|e| EngineError::Internal(format!("prefix cache lock poisoned: {e}")))?;
-        let (cached_len, paged_ids) = pc.match_paged_blocks_only(tokens).map_err(tensor_err)?;
+        let (cached_len, paged_ids, deltanet_state) = if self.deltanet_pool.is_some() {
+            pc.match_paged_blocks_only_with_required_deltanet(tokens)
+                .map_err(tensor_err)?
+        } else {
+            pc.match_paged_blocks_only_with_deltanet(tokens)
+                .map_err(tensor_err)?
+        };
         if cached_len > 0 {
             debug!(
                 cached_tokens = cached_len,
                 suffix_tokens = tokens.len() - cached_len,
                 paged_blocks = paged_ids.len(),
+                has_deltanet_state = deltanet_state.is_some(),
                 "prefix cache match (paged blocks only)"
             );
         }
@@ -56,7 +158,7 @@ impl CacheManager {
                 .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
             bm.decrement_refs(&evicted);
         }
-        Ok((cached_len, paged_ids))
+        Ok((cached_len, paged_ids, deltanet_state))
     }
 
     /// Insert only paged block IDs into prefix cache (no KV tensor extraction).
@@ -66,14 +168,33 @@ impl CacheManager {
         block_table: &[u32],
         paged_block_size: usize,
     ) -> Result<(), EngineError> {
+        self.try_prefix_cache_insert_paged_only_with_deltanet(
+            tokens,
+            block_table,
+            paged_block_size,
+            None,
+        )
+    }
+
+    pub(crate) fn try_prefix_cache_insert_paged_only_with_deltanet(
+        &self,
+        tokens: &[u32],
+        block_table: &[u32],
+        paged_block_size: usize,
+        deltanet_state: Option<DeltaNetStateSnapshot>,
+    ) -> Result<(), EngineError> {
         let Some(ref pc_mutex) = self.prefix_cache else {
             return Ok(());
         };
         let mut pc = pc_mutex
             .lock()
             .map_err(|e| EngineError::Internal(format!("prefix cache lock poisoned: {e}")))?;
-        let stored_paged_ids =
-            pc.insert_paged_blocks_only(tokens, paged_block_size, block_table);
+        let stored_paged_ids = pc.insert_paged_blocks_only_with_deltanet(
+            tokens,
+            paged_block_size,
+            block_table,
+            deltanet_state,
+        );
         if !stored_paged_ids.is_empty()
             && let Some(ref bm_mutex) = self.block_manager
         {
@@ -129,4 +250,18 @@ impl CacheManager {
 
         &first[..common_len]
     }
+}
+
+fn copy_tensor_block(
+    cache: &crate::tensor::Tensor,
+    src: usize,
+    dst: usize,
+) -> Result<(), EngineError> {
+    let row = cache
+        .narrow(0, src, 1)
+        .map_err(tensor_err)
+        .and_then(|t| (&t + 0.0f64).map_err(tensor_err))?
+        .contiguous()
+        .map_err(tensor_err)?;
+    cache.slice_set(&row, 0, dst).map_err(tensor_err)
 }

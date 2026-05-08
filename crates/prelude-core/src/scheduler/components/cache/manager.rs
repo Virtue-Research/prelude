@@ -32,13 +32,20 @@ impl CacheManager {
         peak_activation_bytes: usize,
     ) -> Result<Self, EngineError> {
         let prefix_cache = if runtime_caps.supports_prefix_cache {
-            Self::init_prefix_cache(device, model_config.num_hidden_layers, cache_config)
+            Self::init_prefix_cache(device, model_config, cache_config)
         } else {
             None
         };
 
         let (paged_pool, block_manager) = if runtime_caps.supports_paged_attn {
-            Self::init_paged_pool(model_config, dtype, device, cache_config, kv_sharing, peak_activation_bytes)?
+            Self::init_paged_pool(
+                model_config,
+                dtype,
+                device,
+                cache_config,
+                kv_sharing,
+                peak_activation_bytes,
+            )?
         } else {
             (None, None)
         };
@@ -68,7 +75,9 @@ impl CacheManager {
     }
 
     /// Get a shared reference to the block manager (for giving to the Scheduler).
-    pub fn block_manager_arc(&self) -> Option<Arc<Mutex<crate::cache::block_manager::BlockManager>>> {
+    pub fn block_manager_arc(
+        &self,
+    ) -> Option<Arc<Mutex<crate::cache::block_manager::BlockManager>>> {
         self.block_manager.clone()
     }
 
@@ -77,17 +86,28 @@ impl CacheManager {
     /// Create a prefix cache if enabled by config.
     fn init_prefix_cache(
         device: &Device,
-        num_layers: usize,
+        model_config: &CommonModelConfig,
         cache_config: &CacheConfig,
     ) -> Option<Mutex<PrefixKvCache>> {
         let max_blocks = cache_config.prefix_cache_blocks;
         if max_blocks == 0 {
             return None;
         }
-        let block_size = cache_config.prefix_block_size;
+        let block_size = if device.is_cuda() && std::env::var("PRELUDE_PREFIX_BLOCK_SIZE").is_err()
+        {
+            if std::env::var("PRELUDE_PAGED_BLOCK_SIZE").is_ok() {
+                cache_config.paged_block_size
+            } else {
+                let ops = crate::ops::select_ops(device);
+                ops.paged_block_size_hint(model_config.head_dim)
+            }
+        } else {
+            cache_config.prefix_block_size
+        };
         // flash layout: [B, L, H, D] → concat dim 1; standard: [B, H, L, D] → concat dim 2
         let is_flash = device.is_cuda();
         let concat_dim = if is_flash { 1 } else { 2 };
+        let num_layers = model_config.num_hidden_layers;
         info!(
             max_blocks = max_blocks,
             block_size = block_size,
@@ -125,6 +145,8 @@ impl CacheManager {
 
         let num_kv_heads = config.num_key_value_heads;
         let head_dim = config.head_dim;
+        let layer_head_dims = config.kv_head_dims.as_deref();
+        let layer_num_heads = config.kv_num_heads.as_deref();
 
         // Auto-adjust block size for attention backend compatibility.
         if device.is_cuda() && std::env::var("PRELUDE_PAGED_BLOCK_SIZE").is_err() {
@@ -133,16 +155,43 @@ impl CacheManager {
             if paged_block_size != hint {
                 let old = paged_block_size;
                 paged_block_size = hint;
-                info!(old_block_size = old, new_block_size = paged_block_size, head_dim,
-                    "auto-adjusted paged_block_size per device backend hint");
+                info!(
+                    old_block_size = old,
+                    new_block_size = paged_block_size,
+                    head_dim,
+                    "auto-adjusted paged_block_size per device backend hint"
+                );
             }
         }
-        let num_layers = config.num_hidden_layers;
+        let num_layers = layer_head_dims
+            .map(|dims| dims.len())
+            .or_else(|| layer_num_heads.map(|heads| heads.len()))
+            .unwrap_or(config.num_hidden_layers);
         let x = 16 / dtype.size_in_bytes(); // vectorization factor (8 for BF16, 16 for F16)
 
         // KV sharing: count only layers that need independent cache allocations.
-        let num_shared = kv_sharing.iter().filter(|s| s.is_some()).count();
+        let num_shared = kv_sharing
+            .iter()
+            .take(num_layers)
+            .filter(|s| s.is_some())
+            .count();
         let num_physical_kv_layers = num_layers - num_shared;
+        let layer_head_dim = |i: usize| {
+            layer_head_dims
+                .and_then(|dims| dims.get(i))
+                .copied()
+                .unwrap_or(head_dim)
+        };
+        let layer_kv_heads = |i: usize| {
+            layer_num_heads
+                .and_then(|heads| heads.get(i))
+                .copied()
+                .unwrap_or(num_kv_heads)
+        };
+        let physical_kv_elems_sum: usize = (0..num_layers)
+            .filter(|&i| kv_sharing.get(i).and_then(|s| *s).is_none())
+            .map(|i| layer_kv_heads(i) * layer_head_dim(i))
+            .sum();
 
         // Auto-size: when paged_attn_blocks == 0, use the vLLM formula:
         //
@@ -160,13 +209,15 @@ impl CacheManager {
             cache_config.paged_attn_blocks
         } else {
             let bytes_per_block_per_layer = {
-                let v1 = 2 * num_kv_heads * head_dim * paged_block_size * dtype.size_in_bytes();
+                let v1 = 2 * physical_kv_elems_sum * paged_block_size * dtype.size_in_bytes();
                 let flash = if device.is_cuda() {
-                    2 * num_kv_heads * head_dim * paged_block_size * dtype.size_in_bytes()
-                } else { 0 };
+                    2 * physical_kv_elems_sum * paged_block_size * dtype.size_in_bytes()
+                } else {
+                    0
+                };
                 v1 + flash
             };
-            let total_bytes_per_block = bytes_per_block_per_layer * num_physical_kv_layers;
+            let total_bytes_per_block = bytes_per_block_per_layer;
 
             let ops = crate::ops::select_ops(device);
             let total_bytes = ops.gpu_total_memory().unwrap_or(0);
@@ -197,12 +248,14 @@ impl CacheManager {
                 gpu_memory_utilization = utilization,
                 bytes_per_block = total_bytes_per_block,
                 num_physical_kv_layers,
+                physical_kv_elems_sum,
                 "auto-sized paged KV cache (vLLM formula)"
             );
             auto_blocks
         };
 
-        let tensor_err = |e: crate::tensor::Error| EngineError::Internal(format!("tensor error: {e}"));
+        let tensor_err =
+            |e: crate::tensor::Error| EngineError::Internal(format!("tensor error: {e}"));
 
         // Allocate cache tensors. Shared layers alias their source layer's tensor.
         let mut key_caches: Vec<Tensor> = Vec::with_capacity(num_layers);
@@ -210,7 +263,11 @@ impl CacheManager {
         let mut key_caches_flash: Vec<Tensor> = Vec::with_capacity(num_layers);
         let mut value_caches_flash: Vec<Tensor> = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
-            let source = if i < kv_sharing.len() { kv_sharing[i] } else { None };
+            let source = if i < kv_sharing.len() {
+                kv_sharing[i]
+            } else {
+                None
+            };
             if let Some(src) = source {
                 // Shared layer: alias source layer's cache (Tensor is Arc — clone is pointer copy).
                 key_caches.push(key_caches[src].clone());
@@ -219,40 +276,77 @@ impl CacheManager {
                 value_caches_flash.push(value_caches_flash[src].clone());
             } else {
                 // Independent layer: allocate new cache tensors.
+                let layer_head_dim = layer_head_dim(i);
+                let layer_num_kv_heads = layer_kv_heads(i);
                 key_caches.push(
                     Tensor::zeros(
-                        (paged_blocks, num_kv_heads, head_dim / x, paged_block_size, x),
-                        dtype, device,
-                    ).map_err(tensor_err)?,
+                        (
+                            paged_blocks,
+                            layer_num_kv_heads,
+                            layer_head_dim / x,
+                            paged_block_size,
+                            x,
+                        ),
+                        dtype,
+                        device,
+                    )
+                    .map_err(tensor_err)?,
                 );
                 value_caches.push(
                     Tensor::zeros(
-                        (paged_blocks, num_kv_heads, head_dim, paged_block_size),
-                        dtype, device,
-                    ).map_err(tensor_err)?,
+                        (
+                            paged_blocks,
+                            layer_num_kv_heads,
+                            layer_head_dim,
+                            paged_block_size,
+                        ),
+                        dtype,
+                        device,
+                    )
+                    .map_err(tensor_err)?,
                 );
                 key_caches_flash.push(
                     Tensor::zeros(
-                        (paged_blocks, paged_block_size, num_kv_heads, head_dim),
-                        dtype, device,
-                    ).map_err(tensor_err)?,
+                        (
+                            paged_blocks,
+                            paged_block_size,
+                            layer_num_kv_heads,
+                            layer_head_dim,
+                        ),
+                        dtype,
+                        device,
+                    )
+                    .map_err(tensor_err)?,
                 );
                 value_caches_flash.push(
                     Tensor::zeros(
-                        (paged_blocks, paged_block_size, num_kv_heads, head_dim),
-                        dtype, device,
-                    ).map_err(tensor_err)?,
+                        (
+                            paged_blocks,
+                            paged_block_size,
+                            layer_num_kv_heads,
+                            layer_head_dim,
+                        ),
+                        dtype,
+                        device,
+                    )
+                    .map_err(tensor_err)?,
                 );
             }
         }
 
         if num_shared > 0 {
-            info!(num_shared, num_physical_kv_layers, "KV cache sharing enabled");
+            info!(
+                num_shared,
+                num_physical_kv_layers, "KV cache sharing enabled"
+            );
         }
         info!(
             num_blocks = paged_blocks,
             block_size = paged_block_size,
-            num_layers, num_kv_heads, head_dim,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            physical_kv_elems_sum,
             "paged KV cache pool allocated"
         );
 

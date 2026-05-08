@@ -12,18 +12,17 @@
 //! - HuggingFace `modeling_qwen3_5.py`
 //! SGLang is licensed under the Apache License, Version 2.0.
 
-
-use crate::tensor::{DType, Device, Module, Result, Tensor, D};
+use crate::loading::var_builder::VarBuilder;
 use crate::models::commons::embedding::Embedding;
 use crate::models::commons::linear::DenseLinear;
-use crate::loading::var_builder::VarBuilder;
+use crate::tensor::{D, DType, Device, Module, Result, Tensor};
 
 use crate::models::commons::{
-    last_token_select, BatchAttnContext,
-    BatchState, LayerAttnContext, Linear, RmsNorm,
+    BatchAttnContext, BatchState, LayerAttnContext, Linear, last_token_select,
 };
-use crate::ops::{MaskType, VarlenParams, PagedParams};
 use crate::models::resolve_or_warn;
+use crate::ops::{MaskType, PagedParams, VarlenParams};
+use std::collections::BTreeMap;
 
 // ── Config ──────────────────────────────────────────────────────────────
 
@@ -174,22 +173,82 @@ impl<'de> serde::Deserialize<'de> for Qwen3_5Config {
         Ok(Qwen3_5Config {
             vocab_size: resolve_or_warn!(r.vocab_size, 248320, "vocab_size", MODEL),
             hidden_size: resolve_or_warn!(r.hidden_size, 2048, "hidden_size", MODEL),
-            intermediate_size: resolve_or_warn!(r.intermediate_size, 6144, "intermediate_size", MODEL),
-            num_hidden_layers: resolve_or_warn!(r.num_hidden_layers, 24, "num_hidden_layers", MODEL),
-            num_attention_heads: resolve_or_warn!(r.num_attention_heads, 16, "num_attention_heads", MODEL),
-            num_key_value_heads: resolve_or_warn!(r.num_key_value_heads, 2, "num_key_value_heads", MODEL),
+            intermediate_size: resolve_or_warn!(
+                r.intermediate_size,
+                6144,
+                "intermediate_size",
+                MODEL
+            ),
+            num_hidden_layers: resolve_or_warn!(
+                r.num_hidden_layers,
+                24,
+                "num_hidden_layers",
+                MODEL
+            ),
+            num_attention_heads: resolve_or_warn!(
+                r.num_attention_heads,
+                16,
+                "num_attention_heads",
+                MODEL
+            ),
+            num_key_value_heads: resolve_or_warn!(
+                r.num_key_value_heads,
+                2,
+                "num_key_value_heads",
+                MODEL
+            ),
             head_dim: resolve_or_warn!(r.head_dim, 256, "head_dim", MODEL),
-            max_position_embeddings: resolve_or_warn!(r.max_position_embeddings, 262144, "max_position_embeddings", MODEL),
+            max_position_embeddings: resolve_or_warn!(
+                r.max_position_embeddings,
+                262144,
+                "max_position_embeddings",
+                MODEL
+            ),
             rms_norm_eps: resolve_or_warn!(r.rms_norm_eps, 1e-6, "rms_norm_eps", MODEL),
             rope_theta: resolve_or_warn!(rope_theta, 10_000_000.0, "rope_theta", MODEL),
-            partial_rotary_factor: resolve_or_warn!(partial_rotary_factor, 0.25, "partial_rotary_factor", MODEL),
-            full_attention_interval: resolve_or_warn!(r.full_attention_interval, 4, "full_attention_interval", MODEL),
+            partial_rotary_factor: resolve_or_warn!(
+                partial_rotary_factor,
+                0.25,
+                "partial_rotary_factor",
+                MODEL
+            ),
+            full_attention_interval: resolve_or_warn!(
+                r.full_attention_interval,
+                4,
+                "full_attention_interval",
+                MODEL
+            ),
             attn_output_gate: resolve_or_warn!(r.attn_output_gate, true, "attn_output_gate", MODEL),
-            linear_num_key_heads: resolve_or_warn!(r.linear_num_key_heads, 16, "linear_num_key_heads", MODEL),
-            linear_num_value_heads: resolve_or_warn!(r.linear_num_value_heads, 16, "linear_num_value_heads", MODEL),
-            linear_key_head_dim: resolve_or_warn!(r.linear_key_head_dim, 128, "linear_key_head_dim", MODEL),
-            linear_value_head_dim: resolve_or_warn!(r.linear_value_head_dim, 128, "linear_value_head_dim", MODEL),
-            linear_conv_kernel_dim: resolve_or_warn!(r.linear_conv_kernel_dim, 4, "linear_conv_kernel_dim", MODEL),
+            linear_num_key_heads: resolve_or_warn!(
+                r.linear_num_key_heads,
+                16,
+                "linear_num_key_heads",
+                MODEL
+            ),
+            linear_num_value_heads: resolve_or_warn!(
+                r.linear_num_value_heads,
+                16,
+                "linear_num_value_heads",
+                MODEL
+            ),
+            linear_key_head_dim: resolve_or_warn!(
+                r.linear_key_head_dim,
+                128,
+                "linear_key_head_dim",
+                MODEL
+            ),
+            linear_value_head_dim: resolve_or_warn!(
+                r.linear_value_head_dim,
+                128,
+                "linear_value_head_dim",
+                MODEL
+            ),
+            linear_conv_kernel_dim: resolve_or_warn!(
+                r.linear_conv_kernel_dim,
+                4,
+                "linear_conv_kernel_dim",
+                MODEL
+            ),
             tie_word_embeddings,
             num_experts: r.num_experts,
             num_experts_per_tok: r.num_experts_per_tok,
@@ -204,6 +263,23 @@ impl<'de> serde::Deserialize<'de> for Qwen3_5Config {
 enum LayerType {
     LinearAttention,
     FullAttention,
+}
+
+fn layer_timing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PRELUDE_QWEN_LAYER_TIMING").is_some())
+}
+
+// The grouped GDN prefill path batches same-length prefill rows into one
+// launcher, but cold mixed batches can stall on the current CUDA backend. Keep
+// it behind an explicit opt-in until the backend is fixed in isolation.
+fn grouped_gdn_prefill_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("PRELUDE_QWEN_ENABLE_GROUPED_GDN_PREFILL")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+            .unwrap_or(false)
+    })
 }
 
 impl Qwen3_5Config {
@@ -326,12 +402,7 @@ impl RmsNormGated {
     pub(super) fn new(head_dim: usize, num_heads: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
         // Qwen3.5-35B-A3B stores this weight as F32 in the checkpoint; compute
         // it in F32 to avoid precision loss in the DeltaNet output scaling.
-        let weight = vb.get_with_hints_dtype(
-            head_dim,
-            "weight",
-            Default::default(),
-            DType::F32,
-        )?;
+        let weight = vb.get_with_hints_dtype(head_dim, "weight", Default::default(), DType::F32)?;
         Ok(Self {
             weight,
             eps,
@@ -359,7 +430,8 @@ impl RmsNormGated {
         let z_2d = z.reshape((flat_rows, self.head_dim))?;
 
         // Fused: RMSNorm(x) * weight * SiLU(gate) in one kernel
-        let result = if let Some(r) = ops.rmsnorm_gated(&x_2d, &z_2d, &self.weight, self.eps as f32) {
+        let result = if let Some(r) = ops.rmsnorm_gated(&x_2d, &z_2d, &self.weight, self.eps as f32)
+        {
             r?
         } else {
             // Decomposed fallback (CPU or non-BF16)
@@ -383,13 +455,14 @@ pub(super) struct Qwen3_5GatedDeltaNet {
     pub(super) in_proj_z: Linear,   // hidden → value_dim
     pub(super) in_proj_b: Linear,   // hidden → num_v_heads
     pub(super) in_proj_a: Linear,   // hidden → num_v_heads
-    pub(super) conv_weight: Tensor,     // [conv_dim, kernel_size] reshaped for dot product
-    pub(super) dt_bias: Tensor,         // [num_v_heads]
-    pub(super) a_log: Tensor,           // [num_v_heads]
+    pub(super) conv_weight: Tensor, // [conv_dim, kernel_size] reshaped for dot product
+    pub(super) dt_bias: Tensor,     // [num_v_heads]
+    pub(super) dt_bias_key: Tensor, // [num_v_heads, head_k_dim]
+    pub(super) a_log: Tensor,       // [num_v_heads]
     pub(super) norm: RmsNormGated,
     pub(super) out_proj: Linear,
     // State
-    pub(super) conv_state: Option<Tensor>,      // [conv_dim, kernel-1]
+    pub(super) conv_state: Option<Tensor>, // [conv_dim, kernel-1]
     pub(super) recurrent_state: Option<Tensor>, // [num_v_heads, v_dim, k_dim] in f32
     // Config
     pub(super) num_k_heads: usize,
@@ -422,12 +495,7 @@ impl Qwen3_5GatedDeltaNet {
             key_dim * 2 + value_dim, // Q + K + V
             false,
         )?;
-        let in_proj_z = Linear::load(
-            vb.pp("in_proj_z"),
-            cfg.hidden_size,
-            value_dim,
-            false,
-        )?;
+        let in_proj_z = Linear::load(vb.pp("in_proj_z"), cfg.hidden_size, value_dim, false)?;
         let in_proj_b = Linear::load(
             vb.pp("in_proj_b"),
             cfg.hidden_size,
@@ -445,15 +513,29 @@ impl Qwen3_5GatedDeltaNet {
         let conv_weight_raw = vb.get((conv_dim, 1, cfg.linear_conv_kernel_dim), "conv1d.weight")?;
         let conv_weight = conv_weight_raw.squeeze(1)?;
 
-        let dt_bias = vb.get(cfg.linear_num_value_heads, "dt_bias")?;
-        // `A_log` is stored as F32 in Qwen3.5-35B-A3B checkpoints and is always
-        // consumed in F32; load it in native precision to avoid the BF16 truncation.
-        let a_log = vb.get_with_hints_dtype(
+        let dt_bias = vb.get_with_hints_dtype(
             cfg.linear_num_value_heads,
-            "A_log",
+            "dt_bias",
             Default::default(),
             DType::F32,
         )?;
+        let dt_bias_key = dt_bias
+            .to_dtype(DType::F32)?
+            .reshape((cfg.linear_num_value_heads,))?
+            .unsqueeze(D::Minus1)?
+            .broadcast_as((cfg.linear_num_value_heads, cfg.linear_key_head_dim))?
+            .contiguous()?;
+        // `A_log` is stored as F32 in Qwen3.5-35B-A3B checkpoints and is always
+        // consumed in F32; load it in native precision to avoid the BF16 truncation.
+        let a_log = vb
+            .get_with_hints_dtype(
+                cfg.linear_num_value_heads,
+                "A_log",
+                Default::default(),
+                DType::F32,
+            )?
+            .to_dtype(DType::F32)?
+            .contiguous()?;
 
         let norm = RmsNormGated::new(
             cfg.linear_value_head_dim,
@@ -461,12 +543,7 @@ impl Qwen3_5GatedDeltaNet {
             cfg.rms_norm_eps,
             vb.pp("norm"),
         )?;
-        let out_proj = Linear::load(
-            vb.pp("out_proj"),
-            value_dim,
-            cfg.hidden_size,
-            false,
-        )?;
+        let out_proj = Linear::load(vb.pp("out_proj"), value_dim, cfg.hidden_size, false)?;
 
         Ok(Self {
             in_proj_qkv,
@@ -475,6 +552,7 @@ impl Qwen3_5GatedDeltaNet {
             in_proj_a,
             conv_weight,
             dt_bias,
+            dt_bias_key,
             a_log,
             norm,
             out_proj,
@@ -535,10 +613,9 @@ impl Qwen3_5GatedDeltaNet {
         // path; the single-step "loop" is cheap and keeps the hot code in one
         // place.
         let device = x.device();
-        let output = self.delta_rule_prefill(
-            &mixed_qkv, &b_param, &a_param, device, ops,
-        )?
-        .unsqueeze(0)?;
+        let output = self
+            .delta_rule_prefill(&mixed_qkv, &b_param, &a_param, device, ops)?
+            .unsqueeze(0)?;
 
         // Reshape z for gated norm: [1, L, value_dim]
         let z = z.contiguous()?;
@@ -578,15 +655,13 @@ impl Qwen3_5GatedDeltaNet {
         let vdim = self.head_v_dim;
         let out_dtype = mixed_qkv.dtype();
 
-        // Fast path: FlashInfer SM90 `gdn_prefill` kernel — the one
+        // Fast path: FlashInfer `gdn_prefill` kernel — the one
         // Qwen3.5 / Qwen3-next / FLA's `chunk_gated_delta_rule` were
         // designed for. Scalar-per-head linear-space decay, no chunk
         // cumsum / no safe_gate clamp — bit-exact (within BF16) to the
         // HF reference.
         if device.is_cuda() && kdim == vdim && kdim == 128 {
-            if let Some(out) = self.delta_rule_prefill_gdn(
-                mixed_qkv, b_in, a_in, device, ops,
-            )? {
+            if let Some(out) = self.delta_rule_prefill_gdn(mixed_qkv, b_in, a_in, device, ops)? {
                 return Ok(out.to_dtype(out_dtype)?);
             }
         }
@@ -678,9 +753,7 @@ impl Qwen3_5GatedDeltaNet {
 
             // state_k[b, v] = Σ_k state_decayed[b, v, k] * k_row[b, k]
             let k_row_1xk = k_row.reshape((hv, 1, kdim))?; // broadcast over V
-            let state_k = state_decayed
-                .broadcast_mul(&k_row_1xk)?
-                .sum(D::Minus1)?; // [HV, V]
+            let state_k = state_decayed.broadcast_mul(&k_row_1xk)?.sum(D::Minus1)?; // [HV, V]
 
             // v_error = v_row - state_k; v_prime = beta * v_error
             let v_err = (v_row - state_k)?;
@@ -695,9 +768,7 @@ impl Qwen3_5GatedDeltaNet {
 
             // out[b, v] = Σ_k state[b, v, k] * q_row[b, k]
             let q_row_1xk = q_row.reshape((hv, 1, kdim))?;
-            let out = state
-                .broadcast_mul(&q_row_1xk)?
-                .sum(D::Minus1)?; // [HV, V]
+            let out = state.broadcast_mul(&q_row_1xk)?.sum(D::Minus1)?; // [HV, V]
             outputs.push(out);
         }
 
@@ -705,7 +776,9 @@ impl Qwen3_5GatedDeltaNet {
 
         // Stack outputs: [T, HV, V] → [T, value_dim] → caller dtype
         let out_stacked = Tensor::stack(&outputs, 0)?; // [T, HV, V]
-        out_stacked.reshape((t, self.value_dim))?.to_dtype(out_dtype)
+        out_stacked
+            .reshape((t, self.value_dim))?
+            .to_dtype(out_dtype)
     }
 
     /// FlashInfer-backed GDN prefill fast path for Qwen3.5 DeltaNet.
@@ -715,8 +788,8 @@ impl Qwen3_5GatedDeltaNet {
     ///     (L2-normalised), V (raw), `alpha = exp(g_scalar)` and
     ///     `beta = sigmoid(b_raw)` directly from the mixed_qkv channel
     ///     blob + the raw gate inputs. Replaces ~20 candle ops per layer.
-    ///  2. `ops.gdn_prefill_varlen` — FlashInfer's fused SM90 gdn_prefill
-    ///     TMA kernel consuming the prepped tensors.
+    ///  2. `ops.gdn_prefill_varlen` — FlashInfer's fused gdn_prefill
+    ///     kernel consuming the prepped tensors.
     ///
     /// This matches HF transformers' `chunk_gated_delta_rule` semantics
     /// bit-for-bit modulo BF16 rounding: scalar-per-head **linear-space**
@@ -724,8 +797,9 @@ impl Qwen3_5GatedDeltaNet {
     /// broadcast. The kernel math is the same one Qwen3.5 was trained
     /// against.
     ///
-    /// Returns `Ok(None)` when any backend can't serve the call (non-SM90,
-    /// shape mismatch, kernel not compiled); caller falls back.
+    /// Returns `Ok(None)` when any backend can't serve the call
+    /// (unsupported architecture, shape mismatch, kernel not compiled);
+    /// caller falls back.
     fn delta_rule_prefill_gdn(
         &mut self,
         mixed_qkv: &Tensor, // [T, 2*HK*D + HV*D] BF16
@@ -745,27 +819,31 @@ impl Qwen3_5GatedDeltaNet {
 
         // ── Stage 1: fused post-conv1d prep ────────────────────────────
         // `gdn_post_conv` wants dt_bias and A_log as F32. A_log is
-        // loaded in F32 natively; dt_bias comes from the checkpoint in
-        // BF16 (or F16), so we pre-cast once and cache the F32 copy on
-        // the layer. Stash it lazily.
-        let dt_bias_f32 = self.dt_bias.to_dtype(DType::F32)?;
-        let a_log_f32 = if self.a_log.dtype() == DType::F32 {
-            self.a_log.clone()
+        let dt_bias_f32_owned;
+        let dt_bias_f32 = if self.dt_bias.dtype() == DType::F32 {
+            &self.dt_bias
         } else {
-            self.a_log.to_dtype(DType::F32)?
+            dt_bias_f32_owned = self.dt_bias.to_dtype(DType::F32)?;
+            &dt_bias_f32_owned
         };
-        let Some(prep) = ops.gdn_post_conv(
-            mixed_qkv, a_in, b_in, &a_log_f32, &dt_bias_f32, hk, hv, kdim,
-        ) else {
+        let a_log_f32_owned;
+        let a_log_f32 = if self.a_log.dtype() == DType::F32 {
+            &self.a_log
+        } else {
+            a_log_f32_owned = self.a_log.to_dtype(DType::F32)?;
+            &a_log_f32_owned
+        };
+        let Some(prep) =
+            ops.gdn_post_conv(mixed_qkv, a_in, b_in, a_log_f32, dt_bias_f32, hk, hv, kdim)
+        else {
             // No CUDA fast path for gdn_post_conv — fall back to the
             // composed recurrence.
             return Ok(None);
         };
         let (q_bf16, k_bf16, v_bf16, alpha, beta) = prep?;
 
-        // ── cu_seqlens = [0, T] for a single packed sequence (I64) ───────
-        // Note: flashinfer expects I64, unlike cuLA's I32.
-        let cu_seqlens = Tensor::from_vec(vec![0i64, t as i64], (2,), device)?;
+        // Blackwell GDN consumes int32 cu_seqlens; Hopper converts in the CUDA backend.
+        let cu_seqlens = Tensor::from_vec(vec![0u32, t as u32], (2,), device)?;
 
         // ── Initial state: [1, HV, D, D] f32 or None ─────────────────────
         // Our own recurrent state is stored [HV, V, K]; the kernel wants a
@@ -781,9 +859,14 @@ impl Qwen3_5GatedDeltaNet {
 
         // ── Launch ───────────────────────────────────────────────────────
         let Some(result) = ops.gdn_prefill_varlen(
-            &q_bf16, &k_bf16, &v_bf16,
-            &alpha, &beta, &cu_seqlens,
-            initial_state_4d.as_ref(), scale,
+            &q_bf16,
+            &k_bf16,
+            &v_bf16,
+            &alpha,
+            &beta,
+            &cu_seqlens,
+            initial_state_4d.as_ref(),
+            scale,
         ) else {
             // Backend declined — restore recurrent_state so the composed
             // fallback picks up where we left off.
@@ -817,11 +900,7 @@ impl Qwen3_5GatedDeltaNet {
         // Lazy-init conv_state. The fast path expects `[B, D, W-1]`;
         // the fallback keeps the 2-D `[D, W-1]` layout the old code used.
         if self.conv_state.is_none() {
-            self.conv_state = Some(Tensor::zeros(
-                (self.conv_dim, pad_len),
-                dtype,
-                device,
-            )?);
+            self.conv_state = Some(Tensor::zeros((self.conv_dim, pad_len), dtype, device)?);
         }
 
         // Fast path: Ops::causal_conv1d_update
@@ -840,7 +919,7 @@ impl Qwen3_5GatedDeltaNet {
         let x_bd = x.unsqueeze(0)?; // [1, conv_dim]
         let state_flat = self.conv_state.as_ref().unwrap();
         let state_fresh = (state_flat + 0.0f64)?.contiguous()?; // [conv_dim, W-1] fresh
-        let state_bd = state_fresh.unsqueeze(0)?.contiguous()?;  // [1, conv_dim, W-1]
+        let state_bd = state_fresh.unsqueeze(0)?.contiguous()?; // [1, conv_dim, W-1]
         if let Some(res) = ops.causal_conv1d_update(
             &x_bd,
             &state_bd,
@@ -936,11 +1015,7 @@ impl Qwen3_5GatedDeltaNet {
             // Save the last `W-1` raw inputs as the new conv_state.
             let x_t_2d = x_t.squeeze(0)?; // [conv_dim, L]
             if seq_len >= pad_len {
-                self.conv_state = Some(
-                    x_t_2d
-                        .narrow(1, seq_len - pad_len, pad_len)?
-                        .contiguous()?,
-                );
+                self.conv_state = Some(x_t_2d.narrow(1, seq_len - pad_len, pad_len)?.contiguous()?);
             } else {
                 let old = if let Some(ref state) = self.conv_state {
                     state.narrow(1, seq_len, pad_len - seq_len)?
@@ -988,11 +1063,7 @@ impl Qwen3_5GatedDeltaNet {
         // Save state, same as fast path.
         let x_t_2d = x_t.squeeze(0)?;
         if seq_len >= pad_len {
-            self.conv_state = Some(
-                x_t_2d
-                    .narrow(1, seq_len - pad_len, pad_len)?
-                    .contiguous()?,
-            );
+            self.conv_state = Some(x_t_2d.narrow(1, seq_len - pad_len, pad_len)?.contiguous()?);
         } else {
             let old = if let Some(ref state) = self.conv_state {
                 state.narrow(1, seq_len, pad_len - seq_len)?
@@ -1027,8 +1098,6 @@ pub(super) struct Qwen3_5Attention {
     pub(super) k_proj: Linear,
     pub(super) v_proj: Linear,
     pub(super) o_proj: Linear,
-    pub(super) q_norm: RmsNorm,
-    pub(super) k_norm: RmsNorm,
     pub(super) q_norm_weight: Tensor,
     pub(super) k_norm_weight: Tensor,
     pub(super) rope: PartialRotaryEmbedding,
@@ -1072,24 +1141,18 @@ impl Qwen3_5Attention {
             .get(cfg.head_dim, "weight")?
             .to_dtype(DType::F32)?
             + 1.0)?;
-        let q_norm = RmsNorm::from_weight(q_norm_weight.clone(), cfg.rms_norm_eps);
 
         let k_norm_weight = (vb
             .pp("k_norm")
             .get(cfg.head_dim, "weight")?
             .to_dtype(DType::F32)?
             + 1.0)?;
-        let k_norm = RmsNorm::from_weight(k_norm_weight.clone(), cfg.rms_norm_eps);
-
-
 
         Ok(Self {
             q_proj,
             k_proj,
             v_proj,
             o_proj,
-            q_norm,
-            k_norm,
             q_norm_weight,
             k_norm_weight,
             rope,
@@ -1144,18 +1207,22 @@ impl Qwen3_5Attention {
         let v = v.reshape((total_tokens, self.num_kv_heads, self.head_dim))?;
 
         // Per-head QK normalization
-        let q = ctx.ops.rms_norm(
-            &q.reshape((total_tokens * self.num_heads, self.head_dim))?,
-            &self.q_norm_weight,
-            self.rms_norm_eps as f32,
-        )?
-        .reshape((total_tokens, self.num_heads, self.head_dim))?;
-        let k = ctx.ops.rms_norm(
-            &k.reshape((total_tokens * self.num_kv_heads, self.head_dim))?,
-            &self.k_norm_weight,
-            self.rms_norm_eps as f32,
-        )?
-        .reshape((total_tokens, self.num_kv_heads, self.head_dim))?;
+        let q = ctx
+            .ops
+            .rms_norm(
+                &q.reshape((total_tokens * self.num_heads, self.head_dim))?,
+                &self.q_norm_weight,
+                self.rms_norm_eps as f32,
+            )?
+            .reshape((total_tokens, self.num_heads, self.head_dim))?;
+        let k = ctx
+            .ops
+            .rms_norm(
+                &k.reshape((total_tokens * self.num_kv_heads, self.head_dim))?,
+                &self.k_norm_weight,
+                self.rms_norm_eps as f32,
+            )?
+            .reshape((total_tokens, self.num_kv_heads, self.head_dim))?;
 
         // Partial RoPE
         let (q, k) = self.rope.apply_varlen(&q, &k, ctx.position_ids)?;
@@ -1168,19 +1235,38 @@ impl Qwen3_5Attention {
         // Attention dispatch: paged KV cache or plain varlen
         let softmax_scale = self.softmax_scale as f32;
         let attn_output = if let Some(kv) = ctx.paged_kv {
-            ctx.ops.reshape_and_cache(&k, &v, kv.key_cache, kv.value_cache, kv.slot_mapping)?;
-            ctx.ops.paged_attention(&q, kv.key_cache, kv.value_cache, &PagedParams {
-                block_tables: kv.block_tables,
-                cu_seqlens_q: ctx.cu_seqlens_q, cu_seqlens_k: kv.cu_seqlens_k,
-                max_seqlen_q: ctx.max_seqlen_q, max_seqlen_k: kv.max_seqlen_k,
-                scale: softmax_scale, mask: MaskType::Causal, softcap: None,
-            })?
+            ctx.ops
+                .reshape_and_cache(&k, &v, kv.key_cache, kv.value_cache, kv.slot_mapping)?;
+            ctx.ops.paged_attention(
+                &q,
+                kv.key_cache,
+                kv.value_cache,
+                &PagedParams {
+                    block_tables: kv.block_tables,
+                    cu_seqlens_q: ctx.cu_seqlens_q,
+                    cu_seqlens_k: kv.cu_seqlens_k,
+                    max_seqlen_q: ctx.max_seqlen_q,
+                    max_seqlen_k: kv.max_seqlen_k,
+                    scale: softmax_scale,
+                    mask: MaskType::Causal,
+                    softcap: None,
+                },
+            )?
         } else {
-            ctx.ops.varlen_attention(&q, &k, &v, &VarlenParams {
-                cu_seqlens_q: ctx.cu_seqlens_q, cu_seqlens_k: ctx.cu_seqlens_q,
-                max_seqlen_q: ctx.max_seqlen_q, max_seqlen_k: ctx.max_seqlen_q,
-                scale: softmax_scale, mask: MaskType::Causal, softcap: None,
-            })?
+            ctx.ops.varlen_attention(
+                &q,
+                &k,
+                &v,
+                &VarlenParams {
+                    cu_seqlens_q: ctx.cu_seqlens_q,
+                    cu_seqlens_k: ctx.cu_seqlens_q,
+                    max_seqlen_q: ctx.max_seqlen_q,
+                    max_seqlen_k: ctx.max_seqlen_q,
+                    scale: softmax_scale,
+                    mask: MaskType::Causal,
+                    softcap: None,
+                },
+            )?
         };
         let attn_output = attn_output.reshape((total_tokens, self.num_heads * self.head_dim))?;
         let gated = if let Some(gate) = gate {
@@ -1193,7 +1279,12 @@ impl Qwen3_5Attention {
 
     /// Cached forward for CPU decode: handles both prefill (L>1) and decode (L=1).
     /// KV cache accumulates across calls; call `clear_cache()` between requests.
-    fn forward_with_cache(&mut self, ops: &dyn crate::ops::Ops, x: &Tensor, position_offset: usize) -> Result<Tensor> {
+    fn forward_with_cache(
+        &mut self,
+        ops: &dyn crate::ops::Ops,
+        x: &Tensor,
+        position_offset: usize,
+    ) -> Result<Tensor> {
         let seq_len = x.dim(0)?;
         let bs = BatchState::no_lora();
 
@@ -1219,18 +1310,20 @@ impl Qwen3_5Attention {
         let v = v.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
 
         // 2. Per-head QK normalization
-        let q = ops.rms_norm(
-            &q.reshape((seq_len * self.num_heads, self.head_dim))?,
-            &self.q_norm_weight,
-            self.rms_norm_eps as f32,
-        )?
-        .reshape((seq_len, self.num_heads, self.head_dim))?;
-        let k = ops.rms_norm(
-            &k.reshape((seq_len * self.num_kv_heads, self.head_dim))?,
-            &self.k_norm_weight,
-            self.rms_norm_eps as f32,
-        )?
-        .reshape((seq_len, self.num_kv_heads, self.head_dim))?;
+        let q = ops
+            .rms_norm(
+                &q.reshape((seq_len * self.num_heads, self.head_dim))?,
+                &self.q_norm_weight,
+                self.rms_norm_eps as f32,
+            )?
+            .reshape((seq_len, self.num_heads, self.head_dim))?;
+        let k = ops
+            .rms_norm(
+                &k.reshape((seq_len * self.num_kv_heads, self.head_dim))?,
+                &self.k_norm_weight,
+                self.rms_norm_eps as f32,
+            )?
+            .reshape((seq_len, self.num_kv_heads, self.head_dim))?;
 
         // 3. Partial RoPE
         let position_ids: Vec<u32> = (0..seq_len).map(|i| (position_offset + i) as u32).collect();
@@ -1276,8 +1369,7 @@ impl Qwen3_5Attention {
                     mask_data[i * total_kv_len + j] = f32::NEG_INFINITY;
                 }
             }
-            let causal_mask =
-                Tensor::from_vec(mask_data, (1, seq_len, total_kv_len), x.device())?;
+            let causal_mask = Tensor::from_vec(mask_data, (1, seq_len, total_kv_len), x.device())?;
             attn_weights
                 .to_dtype(DType::F32)?
                 .broadcast_add(&causal_mask)?
@@ -1330,7 +1422,7 @@ impl Qwen3_5Mlp {
 
 // ── Sparse MoE Block ────────────────────────────────────────────────────
 
-struct Qwen3_5SparseMoeBlock {
+pub(super) struct Qwen3_5SparseMoeBlock {
     gate: DenseLinear, // [num_experts, hidden_size]
     // Fused expert weights: gate_up [E, 2*inter, hidden], down [E, hidden, inter]
     experts_gate_up: Tensor,
@@ -1415,21 +1507,22 @@ impl Qwen3_5SparseMoeBlock {
 
         // Routing: fused kernel when available, decomposed fallback
         let router_logits = xs.apply(&self.gate)?;
-        let (topk_weights, experts_per_tok) = self.compute_routing(ops, &router_logits, n_tokens)?;
+        let (topk_weights, experts_per_tok) =
+            self.compute_routing(ops, &router_logits, n_tokens)?;
 
         // Expert dispatch: fused CUTLASS pipeline when available,
         // composed grouped_gemm + silu_mul fallback
         let mut routed_out = if let Some(r) = ops.cutlass_fused_moe(
-            xs, &experts_per_tok, &topk_weights,
-            &self.experts_gate_up, &self.experts_down,
+            xs,
+            &experts_per_tok,
+            &topk_weights,
+            &self.experts_gate_up,
+            &self.experts_down,
         ) {
             match r {
                 Ok(out) => out,
                 Err(error) => {
-                    tracing::debug!(
-                        %error,
-                        "CUTLASS fused MoE failed; falling back to composed MoE"
-                    );
+                    tracing::debug!(%error, "CUTLASS fused MoE failed; falling back to composed MoE");
                     self.forward_composed(
                         ops,
                         xs,
@@ -1441,14 +1534,23 @@ impl Qwen3_5SparseMoeBlock {
                 }
             }
         } else {
-            self.forward_composed(ops, xs, &topk_weights, &experts_per_tok, n_tokens, hidden_dim)?
+            self.forward_composed(
+                ops,
+                xs,
+                &topk_weights,
+                &experts_per_tok,
+                n_tokens,
+                hidden_dim,
+            )?
         };
 
         // 3. Shared expert
         if let Some(ref shared) = self.shared_expert {
             let shared_out = shared.forward(ops, xs)?;
             let shared_out = if let Some(ref gate_w) = self.shared_expert_gate_weight {
-                let logits = xs.broadcast_mul(&gate_w.unsqueeze(0)?)?.sum_keepdim(D::Minus1)?;
+                let logits = xs
+                    .broadcast_mul(&gate_w.unsqueeze(0)?)?
+                    .sum_keepdim(D::Minus1)?;
                 shared_out.broadcast_mul(&ops.sigmoid(&logits)?)?
             } else {
                 shared_out
@@ -1470,14 +1572,17 @@ impl Qwen3_5SparseMoeBlock {
         // norm_topk_prob is now part of the kernel call instead of an
         // outer gate; passing the wrong value would silently change the
         // routing math.
-        if let Some(result) = ops.fused_moe_routing(
-            router_logits, self.num_experts_per_tok, self.norm_topk_prob,
-        ) {
+        if let Some(result) =
+            ops.fused_moe_routing(router_logits, self.num_experts_per_tok, self.norm_topk_prob)
+        {
             let (tw, topk_ids, _, _) = result?;
             return Ok((tw, topk_ids.reshape((n_tokens, self.num_experts_per_tok))?));
         }
         // Decomposed fallback (CPU or non-BF16)
-        let routing_weights = ops.softmax(&router_logits.to_dtype(DType::F32)?, router_logits.rank() - 1)?;
+        let routing_weights = ops.softmax(
+            &router_logits.to_dtype(DType::F32)?,
+            router_logits.rank() - 1,
+        )?;
         let experts_per_tok = routing_weights
             .arg_sort_last_dim(false)?
             .narrow(D::Minus1, 0, self.num_experts_per_tok)?
@@ -1491,13 +1596,12 @@ impl Qwen3_5SparseMoeBlock {
         Ok((topk_weights, experts_per_tok))
     }
 
-    /// Composed MoE dispatch fallback.
+    /// Fused MoE dispatch (CUDA fast path).
     ///
     /// One `grouped_gemm` over the stacked `[E, 2*inter, hidden]` gate_up
-    /// weight handles all experts in a single kernel, then the `[up|gate]`
-    /// halves are split and `silu(gate) * up` is applied before
-    /// `fused_moe_gemm` applies the down projection with topk-weighted
-    /// accumulation. This replaces a sequential
+    /// weight handles all experts in a single kernel, then the activation is
+    /// applied to the split `[up|gate]` halves, then `fused_moe_gemm` applies
+    /// the down projection with topk-weighted accumulation. This replaces a sequential
     /// `for t { for k in 0..topk { two tiny matmuls } }` loop that did two
     /// D2H syncs per layer via `to_vec2()` and launched ~`n_tokens * topk * 2`
     /// tiny GEMMs — catastrophic for a 40-layer 256-expert top-8 model.
@@ -1572,7 +1676,6 @@ impl Qwen3_5SparseMoeBlock {
         ys.reshape((n_tokens, self.num_experts_per_tok, hidden_dim))?
             .sum(D::Minus2)
     }
-
 }
 
 /// Sort topk expert assignments so that all tokens routed to the same expert
@@ -1580,10 +1683,7 @@ impl Qwen3_5SparseMoeBlock {
 /// both as flat `[num_tokens * topk]` u32 tensors. The `sorted_token_ids[i]`
 /// gives the original flat assignment index (token * topk + k) for the i-th
 /// entry in the sorted expert stream, which is what `grouped_gemm` expects.
-fn sort_expert_assignments(
-    experts_per_tok: &Tensor,
-    device: &Device,
-) -> Result<(Tensor, Tensor)> {
+fn sort_expert_assignments(experts_per_tok: &Tensor, device: &Device) -> Result<(Tensor, Tensor)> {
     let flat = experts_per_tok.flatten_all()?;
     let n = flat.elem_count();
 
@@ -1701,7 +1801,8 @@ fn deltanet_varlen_pooled(
             gdn.head_k_dim,
             gdn.head_v_dim,
         ),
-        (32, 32, 128, 128)   // MHA H=32
+        (16, 16, 128, 128)   // MHA H=16
+        | (32, 32, 128, 128) // MHA H=32
         | (64, 64, 128, 128) // MHA H=64
         | (16, 32, 128, 128) // GQA H=16/HV=32 (Qwen3.5-35B-A3B)
     );
@@ -1712,14 +1813,25 @@ fn deltanet_varlen_pooled(
     // already-advanced state, producing degenerate decode output ("Paris Paris…").
     // Probe `kda_decode_available()` BEFORE entering the fast path so we never
     // touch pool state if the second stage can't run.
-    let fused_eligible = all_decode
-        && packed.device().is_cuda()
-        && fused_supported
-        && ops.kda_decode_available();
+    let fused_eligible =
+        all_decode && packed.device().is_cuda() && fused_supported && ops.kda_decode_available();
     if fused_eligible {
         if let Some(out) = deltanet_decode_batched_fused(
-            gdn, packed, pool, slot_ids, slot_ids_gpu, dn_layer_idx, ops,
+            gdn,
+            packed,
+            pool,
+            slot_ids,
+            slot_ids_gpu,
+            dn_layer_idx,
+            ops,
         )? {
+            return Ok(out);
+        }
+    }
+    if packed.device().is_cuda() && fused_supported && grouped_gdn_prefill_enabled() {
+        if let Some(out) =
+            deltanet_mixed_grouped_fused(gdn, packed, seq_lens, pool, slot_ids, dn_layer_idx, ops)?
+        {
             return Ok(out);
         }
     }
@@ -1737,11 +1849,7 @@ fn deltanet_varlen_pooled(
                 .get(slot)?
                 .contiguous()?,
         );
-        gdn.conv_state = Some(
-            pool.conv_states[dn_layer_idx]
-                .get(slot)?
-                .contiguous()?,
-        );
+        gdn.conv_state = Some(pool.conv_states[dn_layer_idx].get(slot)?.contiguous()?);
 
         let seq = packed.narrow(0, offset, len)?.unsqueeze(0)?; // [1, L, D]
         let out = gdn.forward(&seq, 0, ops)?; // [1, L, D]
@@ -1762,6 +1870,386 @@ fn deltanet_varlen_pooled(
     }
     gdn.clear_state(); // scratch is only valid within this call
     Tensor::cat(&outputs, 0) // [total_tokens, D]
+}
+
+fn deltanet_mixed_grouped_fused(
+    gdn: &mut Qwen3_5GatedDeltaNet,
+    packed: &Tensor,
+    seq_lens: &[usize],
+    pool: &mut crate::deltanet_pool::DeltaNetPool,
+    slot_ids: &[u32],
+    dn_layer_idx: usize,
+    ops: &dyn crate::ops::Ops,
+) -> Result<Option<Tensor>> {
+    if seq_lens.is_empty() || !packed.device().is_cuda() {
+        return Ok(None);
+    }
+    if gdn.head_k_dim != 128 || gdn.head_v_dim != 128 || gdn.head_k_dim != gdn.head_v_dim {
+        return Ok(None);
+    }
+
+    let mut offsets = Vec::with_capacity(seq_lens.len());
+    let mut off = 0usize;
+    for &len in seq_lens {
+        offsets.push(off);
+        off += len;
+    }
+
+    let mut decode_indices = Vec::new();
+    let mut prefill_by_len: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (idx, &len) in seq_lens.iter().enumerate() {
+        if len == 1 {
+            decode_indices.push(idx);
+        } else {
+            prefill_by_len.entry(len).or_default().push(idx);
+        }
+    }
+
+    if decode_indices.is_empty() && prefill_by_len.is_empty() {
+        return Ok(None);
+    }
+    if !decode_indices.is_empty() && !ops.kda_decode_available() {
+        return Ok(None);
+    }
+
+    let mut outputs: Vec<Option<Tensor>> = vec![None; seq_lens.len()];
+    const MAX_GROUPED_PREFILL_BATCH: usize = 32;
+    for (&seq_len, indices) in prefill_by_len.iter() {
+        let mut start = 0usize;
+        while start < indices.len() {
+            let remaining = indices.len() - start;
+            let take = if remaining == 1 {
+                1
+            } else if remaining <= MAX_GROUPED_PREFILL_BATCH {
+                remaining
+            } else if remaining - MAX_GROUPED_PREFILL_BATCH == 1 {
+                MAX_GROUPED_PREFILL_BATCH - 1
+            } else {
+                MAX_GROUPED_PREFILL_BATCH
+            };
+            if take == 1 {
+                let req_idx = indices[start];
+                outputs[req_idx] = Some(deltanet_single_pooled(
+                    gdn,
+                    packed,
+                    offsets[req_idx],
+                    seq_len,
+                    pool,
+                    slot_ids[req_idx],
+                    dn_layer_idx,
+                    ops,
+                )?);
+                start += 1;
+                continue;
+            }
+            let chunk = &indices[start..start + take];
+            let out = deltanet_prefill_group_fused(
+                gdn,
+                packed,
+                &offsets,
+                seq_len,
+                chunk,
+                pool,
+                slot_ids,
+                dn_layer_idx,
+                ops,
+            )?;
+            let Some(out) = out else {
+                return Ok(None);
+            };
+            for (group_pos, &req_idx) in chunk.iter().enumerate() {
+                outputs[req_idx] = Some(out.get(group_pos)?);
+            }
+            start += take;
+        }
+    }
+
+    if !decode_indices.is_empty() {
+        let mut rows = Vec::with_capacity(decode_indices.len());
+        let mut decode_slots = Vec::with_capacity(decode_indices.len());
+        for &req_idx in decode_indices.iter() {
+            rows.push(packed.narrow(0, offsets[req_idx], 1)?.squeeze(0)?);
+            decode_slots.push(slot_ids[req_idx]);
+        }
+        let decode_packed = Tensor::stack(&rows, 0)?.contiguous()?;
+        let decode_slots_gpu =
+            Tensor::from_vec(decode_slots.clone(), (decode_slots.len(),), packed.device())?;
+        let out = deltanet_decode_batched_fused(
+            gdn,
+            &decode_packed,
+            pool,
+            &decode_slots,
+            Some(&decode_slots_gpu),
+            dn_layer_idx,
+            ops,
+        )?;
+        let Some(out) = out else {
+            return Ok(None);
+        };
+        for (group_pos, &req_idx) in decode_indices.iter().enumerate() {
+            outputs[req_idx] = Some(out.narrow(0, group_pos, 1)?);
+        }
+    }
+
+    let mut ordered = Vec::with_capacity(seq_lens.len());
+    for item in outputs {
+        let Some(t) = item else {
+            return Ok(None);
+        };
+        ordered.push(t);
+    }
+    Ok(Some(Tensor::cat(&ordered, 0)?))
+}
+
+fn contiguous_slot_start(indices: &[usize], slot_ids: &[u32]) -> Option<usize> {
+    let (&first_req, rest) = indices.split_first()?;
+    let first_slot = *slot_ids.get(first_req)? as usize;
+    for (offset, &req_idx) in rest.iter().enumerate() {
+        if *slot_ids.get(req_idx)? as usize != first_slot + offset + 1 {
+            return None;
+        }
+    }
+    Some(first_slot)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deltanet_single_pooled(
+    gdn: &mut Qwen3_5GatedDeltaNet,
+    packed: &Tensor,
+    offset: usize,
+    seq_len: usize,
+    pool: &mut crate::deltanet_pool::DeltaNetPool,
+    slot_id: u32,
+    dn_layer_idx: usize,
+    ops: &dyn crate::ops::Ops,
+) -> Result<Tensor> {
+    let slot = slot_id as usize;
+    gdn.recurrent_state = Some(
+        pool.recurrent_states[dn_layer_idx]
+            .get(slot)?
+            .contiguous()?,
+    );
+    gdn.conv_state = Some(pool.conv_states[dn_layer_idx].get(slot)?.contiguous()?);
+
+    let seq = packed.narrow(0, offset, seq_len)?.unsqueeze(0)?;
+    let out = gdn.forward(&seq, 0, ops)?.squeeze(0)?;
+
+    if let Some(ref state) = gdn.recurrent_state {
+        let row = state.contiguous()?.unsqueeze(0)?.contiguous()?;
+        pool.recurrent_states[dn_layer_idx].slice_set(&row, 0, slot)?;
+    }
+    if let Some(ref state) = gdn.conv_state {
+        let row = state.contiguous()?.unsqueeze(0)?.contiguous()?;
+        pool.conv_states[dn_layer_idx].slice_set(&row, 0, slot)?;
+    }
+    gdn.clear_state();
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deltanet_prefill_group_fused(
+    gdn: &mut Qwen3_5GatedDeltaNet,
+    packed: &Tensor,
+    offsets: &[usize],
+    seq_len: usize,
+    indices: &[usize],
+    pool: &mut crate::deltanet_pool::DeltaNetPool,
+    slot_ids: &[u32],
+    dn_layer_idx: usize,
+    ops: &dyn crate::ops::Ops,
+) -> Result<Option<Tensor>> {
+    let batch = indices.len();
+    if batch == 0 || seq_len <= 1 {
+        return Ok(None);
+    }
+
+    let bst = BatchState::no_lora();
+    let mut seqs = Vec::with_capacity(batch);
+    for &req_idx in indices {
+        seqs.push(packed.narrow(0, offsets[req_idx], seq_len)?);
+    }
+    let x = Tensor::stack(&seqs, 0)?.contiguous()?; // [B, L, hidden]
+
+    let qkv = gdn.in_proj_qkv.forward(&x, &bst, ops)?; // [B, L, conv_dim]
+    let z = gdn.in_proj_z.forward(&x, &bst, ops)?; // [B, L, value_dim]
+    let b_raw = gdn.in_proj_b.forward(&x, &bst, ops)?; // [B, L, HV]
+    let a_raw = gdn.in_proj_a.forward(&x, &bst, ops)?; // [B, L, HV]
+
+    let pad_len = gdn.conv_kernel - 1;
+    let x_t = qkv.transpose(1, 2)?.contiguous()?; // [B, conv_dim, L]
+    let pool_conv = &pool.conv_states[dn_layer_idx];
+    let mut prefixes = Vec::with_capacity(batch);
+    for &req_idx in indices {
+        prefixes.push(pool_conv.get(slot_ids[req_idx] as usize)?.contiguous()?);
+    }
+    let prefix = Tensor::stack(&prefixes, 0)?.contiguous()?; // [B, conv_dim, W-1]
+    let x_padded = Tensor::cat(&[&prefix, &x_t], 2)?.contiguous()?;
+
+    let Some(conv) = ops.causal_conv1d_fn(
+        &x_padded,
+        &gdn.conv_weight,
+        None,
+        None,
+        /*silu_activation=*/ true,
+    ) else {
+        return Ok(None);
+    };
+    let conv = conv?;
+    let qkv_conv = conv
+        .narrow(2, pad_len, seq_len)?
+        .transpose(1, 2)?
+        .contiguous()?; // [B, L, conv_dim]
+
+    let total_tokens = batch * seq_len;
+    let mixed = qkv_conv.reshape((total_tokens, gdn.conv_dim))?;
+    let a_2d = a_raw.reshape((total_tokens, gdn.num_v_heads))?;
+    let b_2d = b_raw.reshape((total_tokens, gdn.num_v_heads))?;
+    let dt_bias_f32_owned;
+    let dt_bias_f32 = if gdn.dt_bias.dtype() == DType::F32 {
+        &gdn.dt_bias
+    } else {
+        dt_bias_f32_owned = gdn.dt_bias.to_dtype(DType::F32)?;
+        &dt_bias_f32_owned
+    };
+    let a_log_f32_owned;
+    let a_log_f32 = if gdn.a_log.dtype() == DType::F32 {
+        &gdn.a_log
+    } else {
+        a_log_f32_owned = gdn.a_log.to_dtype(DType::F32)?;
+        &a_log_f32_owned
+    };
+
+    let Some(prep) = ops.gdn_post_conv(
+        &mixed,
+        &a_2d,
+        &b_2d,
+        a_log_f32,
+        dt_bias_f32,
+        gdn.num_k_heads,
+        gdn.num_v_heads,
+        gdn.head_k_dim,
+    ) else {
+        return Ok(None);
+    };
+    let (q_bf16, k_bf16, v_bf16, alpha, beta) = prep?;
+
+    let gdn_seq_len = if batch > 1 && seq_len % 16 != 0 {
+        seq_len.div_ceil(16) * 16
+    } else {
+        seq_len
+    };
+    let (q_bf16, k_bf16, v_bf16, alpha, beta) = if gdn_seq_len != seq_len {
+        let pad = gdn_seq_len - seq_len;
+        let device = packed.device();
+
+        let q = q_bf16.reshape((batch, seq_len, q_bf16.dim(1)?, q_bf16.dim(2)?))?;
+        let q_pad = Tensor::zeros(
+            (batch, pad, q_bf16.dim(1)?, q_bf16.dim(2)?),
+            q_bf16.dtype(),
+            device,
+        )?;
+        let q = Tensor::cat(&[&q, &q_pad], 1)?
+            .reshape((batch * gdn_seq_len, q_bf16.dim(1)?, q_bf16.dim(2)?))?
+            .contiguous()?;
+
+        let k = k_bf16.reshape((batch, seq_len, k_bf16.dim(1)?, k_bf16.dim(2)?))?;
+        let k_pad = Tensor::zeros(
+            (batch, pad, k_bf16.dim(1)?, k_bf16.dim(2)?),
+            k_bf16.dtype(),
+            device,
+        )?;
+        let k = Tensor::cat(&[&k, &k_pad], 1)?
+            .reshape((batch * gdn_seq_len, k_bf16.dim(1)?, k_bf16.dim(2)?))?
+            .contiguous()?;
+
+        let v = v_bf16.reshape((batch, seq_len, v_bf16.dim(1)?, v_bf16.dim(2)?))?;
+        let v_pad = Tensor::zeros(
+            (batch, pad, v_bf16.dim(1)?, v_bf16.dim(2)?),
+            v_bf16.dtype(),
+            device,
+        )?;
+        let v = Tensor::cat(&[&v, &v_pad], 1)?
+            .reshape((batch * gdn_seq_len, v_bf16.dim(1)?, v_bf16.dim(2)?))?
+            .contiguous()?;
+
+        let alpha = alpha.reshape((batch, seq_len, alpha.dim(1)?))?;
+        let alpha_pad = (Tensor::zeros((batch, pad, alpha.dim(2)?), alpha.dtype(), device)? + 1.0)?;
+        let alpha = Tensor::cat(&[&alpha, &alpha_pad], 1)?
+            .reshape((batch * gdn_seq_len, alpha.dim(2)?))?
+            .contiguous()?;
+
+        let beta = beta.reshape((batch, seq_len, beta.dim(1)?))?;
+        let beta_pad = Tensor::zeros((batch, pad, beta.dim(2)?), beta.dtype(), device)?;
+        let beta = Tensor::cat(&[&beta, &beta_pad], 1)?
+            .reshape((batch * gdn_seq_len, beta.dim(2)?))?
+            .contiguous()?;
+
+        (q, k, v, alpha, beta)
+    } else {
+        (q_bf16, k_bf16, v_bf16, alpha, beta)
+    };
+
+    let mut cu = Vec::with_capacity(batch + 1);
+    for i in 0..=batch {
+        cu.push((i * gdn_seq_len) as u32);
+    }
+    let cu_seqlens = Tensor::from_vec(cu, (batch + 1,), packed.device())?;
+
+    let pool_state = &pool.recurrent_states[dn_layer_idx];
+    let contiguous_slots = contiguous_slot_start(indices, slot_ids);
+    let initial_state = if let Some(slot_start) = contiguous_slots {
+        pool_state.narrow(0, slot_start, batch)?.contiguous()?
+    } else {
+        let mut states = Vec::with_capacity(batch);
+        for &req_idx in indices {
+            states.push(pool_state.get(slot_ids[req_idx] as usize)?.contiguous()?);
+        }
+        Tensor::stack(&states, 0)?.contiguous()?
+    };
+
+    let scale = (gdn.head_k_dim as f32).powf(-0.5);
+    let Some(result) = ops.gdn_prefill_varlen(
+        &q_bf16,
+        &k_bf16,
+        &v_bf16,
+        &alpha,
+        &beta,
+        &cu_seqlens,
+        Some(&initial_state),
+        scale,
+    ) else {
+        return Ok(None);
+    };
+    let (out, final_state) = result?;
+
+    for (group_pos, &req_idx) in indices.iter().enumerate() {
+        let x_row = x_t.get(group_pos)?;
+        let new_conv_state = if seq_len >= pad_len {
+            x_row.narrow(1, seq_len - pad_len, pad_len)?.contiguous()?
+        } else {
+            let old = prefix
+                .get(group_pos)?
+                .narrow(1, seq_len, pad_len - seq_len)?;
+            Tensor::cat(&[&old, &x_row], 1)?.contiguous()?
+        };
+        let conv_row = new_conv_state.unsqueeze(0)?.contiguous()?;
+        pool_conv.slice_set(&conv_row, 0, slot_ids[req_idx] as usize)?;
+
+        if contiguous_slots.is_none() {
+            let row = final_state.get(group_pos)?.unsqueeze(0)?.contiguous()?;
+            pool_state.slice_set(&row, 0, slot_ids[req_idx] as usize)?;
+        }
+    }
+    if let Some(slot_start) = contiguous_slots {
+        pool_state.slice_set(&final_state, 0, slot_start)?;
+    }
+
+    let out = out
+        .reshape((batch, gdn_seq_len, gdn.value_dim))?
+        .narrow(1, 0, seq_len)?;
+    let normed = gdn.norm.forward(&out, &z.contiguous()?, ops)?;
+    let projected = gdn.out_proj.forward(&normed, &bst, ops)?;
+    Ok(Some(projected))
 }
 
 /// Batched decode-only fast path: one fused cuLA kernel call per layer for
@@ -1795,8 +2283,8 @@ fn deltanet_decode_batched_fused(
     let bst = BatchState::no_lora();
     let x = packed.unsqueeze(0)?; // [1, N, hidden]
 
-    let qkv = gdn.in_proj_qkv.forward(&x, &bst, ops)?;   // [1, N, key*2+val]
-    let z   = gdn.in_proj_z  .forward(&x, &bst, ops)?;   // [1, N, value_dim]
+    let qkv = gdn.in_proj_qkv.forward(&x, &bst, ops)?; // [1, N, key*2+val]
+    let z = gdn.in_proj_z.forward(&x, &bst, ops)?; // [1, N, value_dim]
     let b_raw_full = gdn.in_proj_b.forward(&x, &bst, ops)?; // [1, N, HV]
     let a_raw_full = gdn.in_proj_a.forward(&x, &bst, ops)?; // [1, N, HV]
 
@@ -1822,16 +2310,15 @@ fn deltanet_decode_batched_fused(
     let qkv_conv = {
         let x_bd = qkv_for_conv_2d.contiguous()?; // [N, conv_dim]
         let pool_conv = &pool.conv_states[dn_layer_idx]; // [pool_size, conv_dim, state_len]
-        let sl = pool_conv.dim(2)?;
         // causal_conv1d_update wants x: [N, dim, 1], conv_state: [pool, dim, sl]
         // We need to check if the fused kernel path is available
         if let Some(res) = ops.causal_conv1d_update(
-            &x_bd,                    // [N, conv_dim]
-            pool_conv,                // [pool_size, conv_dim, state_len]
-            &gdn.conv_weight,         // [conv_dim, width]
-            None,                     // bias
+            &x_bd,            // [N, conv_dim]
+            pool_conv,        // [pool_size, conv_dim, state_len]
+            &gdn.conv_weight, // [conv_dim, width]
+            None,             // bias
             /*silu_activation=*/ true,
-            Some(slot_ids_gpu),       // conv_state_indices [N] U32 (reinterpreted as I32)
+            Some(slot_ids_gpu), // conv_state_indices [N] U32 (reinterpreted as I32)
         ) {
             res? // [N, conv_dim]
         } else {
@@ -1839,9 +2326,7 @@ fn deltanet_decode_batched_fused(
             let mut conv_outs: Vec<Tensor> = Vec::with_capacity(n);
             for (i, &slot) in slot_ids.iter().enumerate() {
                 let slot_us = slot as usize;
-                gdn.conv_state = Some(
-                    pool_conv.get(slot_us)?.contiguous()?,
-                );
+                gdn.conv_state = Some(pool_conv.get(slot_us)?.contiguous()?);
                 let x_row = qkv_for_conv_2d.get(i)?.contiguous()?;
                 let out = gdn.conv1d_decode(&x_row, ops)?;
                 conv_outs.push(out);
@@ -1859,9 +2344,15 @@ fn deltanet_decode_batched_fused(
     let q_flat = qkv_conv.narrow(D::Minus1, 0, gdn.key_dim)?;
     let k_flat = qkv_conv.narrow(D::Minus1, gdn.key_dim, gdn.key_dim)?;
     let v_flat = qkv_conv.narrow(D::Minus1, gdn.key_dim * 2, gdn.value_dim)?;
-    let q_nhk = q_flat.reshape((n, gdn.num_k_heads, gdn.head_k_dim))?.contiguous()?;
-    let k_nhk = k_flat.reshape((n, gdn.num_k_heads, gdn.head_k_dim))?.contiguous()?;
-    let v_nhv = v_flat.reshape((n, gdn.num_v_heads, gdn.head_v_dim))?.contiguous()?;
+    let q_nhk = q_flat
+        .reshape((n, gdn.num_k_heads, gdn.head_k_dim))?
+        .contiguous()?;
+    let k_nhk = k_flat
+        .reshape((n, gdn.num_k_heads, gdn.head_k_dim))?
+        .contiguous()?;
+    let v_nhv = v_flat
+        .reshape((n, gdn.num_v_heads, gdn.head_v_dim))?
+        .contiguous()?;
 
     // Scalar-per-head a/b drop the batch-of-1 dim.
     let a_2d = a_raw_full.squeeze(0)?.contiguous()?; // [N, HV]
@@ -1874,11 +2365,11 @@ fn deltanet_decode_batched_fused(
         &a_2d,
         &b_2d,
         &gdn.a_log,
-        &gdn.dt_bias,
+        &gdn.dt_bias_key,
         &pool.recurrent_states[dn_layer_idx],
         slot_ids_gpu,
     ) {
-        Some(Ok(o)) => o,    // [N, HV, V]
+        Some(Ok(o)) => o, // [N, HV, V]
         Some(Err(e)) => return Err(e),
         None => return Ok(None),
     };
@@ -1934,7 +2425,10 @@ impl Qwen3_5DecoderLayer {
         };
 
         Ok(Self {
-            token_mixer, mlp, ln1_weight, ln2_weight,
+            token_mixer,
+            mlp,
+            ln1_weight,
+            ln2_weight,
             rms_norm_eps: cfg.rms_norm_eps as f32,
         })
     }
@@ -1972,15 +2466,25 @@ impl Qwen3_5DecoderLayer {
     ) -> Result<Tensor> {
         let h = ops.rms_norm(x, &self.ln1_weight, self.rms_norm_eps)?;
         let h = match &mut self.token_mixer {
-            TokenMixer::LinearAttention(gdn) => {
-                deltanet_varlen_pooled(gdn, &h, seq_lens, pool, slot_ids, slot_ids_gpu, dn_layer_idx, ops)?
-            }
+            TokenMixer::LinearAttention(gdn) => deltanet_varlen_pooled(
+                gdn,
+                &h,
+                seq_lens,
+                pool,
+                slot_ids,
+                slot_ids_gpu,
+                dn_layer_idx,
+                ops,
+            )?,
             TokenMixer::FullAttention(_) => {
-                crate::tensor::bail!("forward_with_paged_prefix_pooled called on FullAttention layer")
+                crate::tensor::bail!(
+                    "forward_with_paged_prefix_pooled called on FullAttention layer"
+                )
             }
         };
         let (x_res, h2) = ops.add_rmsnorm(x, &h, &self.ln2_weight, self.rms_norm_eps)?;
-        ops.add_or_fused(&x_res, &self.mlp.forward(ops, &h2)?)
+        let mlp = self.mlp.forward(ops, &h2)?;
+        ops.add_or_fused(&x_res, &mlp)
     }
 
     fn clear_cache(&mut self) {
@@ -1990,7 +2494,12 @@ impl Qwen3_5DecoderLayer {
         }
     }
 
-    fn forward_with_cache(&mut self, ops: &dyn crate::ops::Ops, x: &Tensor, position_offset: usize) -> Result<Tensor> {
+    fn forward_with_cache(
+        &mut self,
+        ops: &dyn crate::ops::Ops,
+        x: &Tensor,
+        position_offset: usize,
+    ) -> Result<Tensor> {
         let h = ops.rms_norm(x, &self.ln1_weight, self.rms_norm_eps)?;
         let h = match &mut self.token_mixer {
             TokenMixer::FullAttention(attn) => attn.forward_with_cache(ops, &h, position_offset)?,
@@ -2011,7 +2520,6 @@ impl Qwen3_5DecoderLayer {
 pub(super) struct Qwen3_5Model {
     pub(super) embed_tokens: Embedding,
     pub(super) layers: Vec<Qwen3_5DecoderLayer>,
-    pub(super) norm: RmsNorm,
     pub(super) norm_weight: Tensor,
     pub(super) rms_norm_eps: f64,
 }
@@ -2044,12 +2552,10 @@ impl Qwen3_5Model {
             .get(cfg.hidden_size, "weight")?
             .to_dtype(DType::F32)?
             + 1.0)?;
-        let norm = RmsNorm::from_weight(norm_weight.clone(), cfg.rms_norm_eps);
 
         Ok(Self {
             embed_tokens,
             layers,
-            norm,
             norm_weight,
             rms_norm_eps: cfg.rms_norm_eps,
         })
@@ -2058,10 +2564,16 @@ impl Qwen3_5Model {
     fn forward(&mut self, packed_input: &Tensor, ctx: &mut BatchAttnContext) -> Result<Tensor> {
         let mut h = self.embed_tokens.forward(packed_input)?;
         let seq_lens = ctx.seq_lens;
+        let layer_timing = layer_timing_enabled();
         if let Some(paged) = ctx.paged_kv {
             let mut attn_layer_idx = 0usize;
             let mut dn_layer_idx = 0usize;
-            for layer in self.layers.iter_mut() {
+            for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+                let layer_kind = match &layer.token_mixer {
+                    TokenMixer::FullAttention(_) => "full_attention",
+                    TokenMixer::LinearAttention(_) => "linear_attention",
+                };
+                let layer_start = layer_timing.then(std::time::Instant::now);
                 match &layer.token_mixer {
                     TokenMixer::FullAttention(_) => {
                         let layer_kv = paged.layer(attn_layer_idx);
@@ -2106,6 +2618,18 @@ impl Qwen3_5Model {
                         dn_layer_idx += 1;
                     }
                 }
+                if let Some(start) = layer_start {
+                    if h.device().is_cuda() {
+                        h.device().synchronize()?;
+                    }
+                    tracing::info!(
+                        layer_idx,
+                        layer_kind,
+                        total_tokens = h.dim(0).unwrap_or(0),
+                        elapsed_ms = format!("{:.3}", start.elapsed().as_secs_f64() * 1000.0),
+                        "qwen3_5 layer complete"
+                    );
+                }
             }
         } else {
             let layer_ctx = LayerAttnContext {
@@ -2115,11 +2639,29 @@ impl Qwen3_5Model {
                 position_ids: ctx.position_ids,
                 paged_kv: None,
             };
-            for layer in self.layers.iter_mut() {
+            for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+                let layer_kind = match &layer.token_mixer {
+                    TokenMixer::FullAttention(_) => "full_attention",
+                    TokenMixer::LinearAttention(_) => "linear_attention",
+                };
+                let layer_start = layer_timing.then(std::time::Instant::now);
                 h = layer.forward(&h, &layer_ctx, seq_lens)?;
+                if let Some(start) = layer_start {
+                    if h.device().is_cuda() {
+                        h.device().synchronize()?;
+                    }
+                    tracing::info!(
+                        layer_idx,
+                        layer_kind,
+                        total_tokens = h.dim(0).unwrap_or(0),
+                        elapsed_ms = format!("{:.3}", start.elapsed().as_secs_f64() * 1000.0),
+                        "qwen3_5 layer complete"
+                    );
+                }
             }
         }
-        ctx.ops.rms_norm(&h, &self.norm_weight, self.rms_norm_eps as f32)
+        ctx.ops
+            .rms_norm(&h, &self.norm_weight, self.rms_norm_eps as f32)
     }
 
     fn clear_cache(&mut self) {
@@ -2128,7 +2670,11 @@ impl Qwen3_5Model {
         }
     }
 
-    pub(super) fn forward_with_cache(&mut self, input_ids: &Tensor, position_offset: usize) -> Result<Tensor> {
+    pub(super) fn forward_with_cache(
+        &mut self,
+        input_ids: &Tensor,
+        position_offset: usize,
+    ) -> Result<Tensor> {
         let ops = crate::ops::select_ops(input_ids.device());
         let mut h = self.embed_tokens.forward(input_ids)?;
         for layer in self.layers.iter_mut() {
@@ -2174,7 +2720,8 @@ impl Qwen3_5ForCausalLM {
         let hidden = self.model.forward(packed_input, ctx)?;
         self.lm_head.forward(
             &last_token_select(&hidden, ctx.seq_lens)?.unsqueeze(1)?,
-            &BatchState::no_lora(), ctx.ops,
+            &BatchState::no_lora(),
+            ctx.ops,
         )
     }
 
@@ -2185,7 +2732,11 @@ impl Qwen3_5ForCausalLM {
         position_offset: usize,
     ) -> Result<Tensor> {
         let hidden = self.model.forward_with_cache(input_ids, position_offset)?;
-        self.lm_head.forward(&hidden, &BatchState::no_lora(), crate::ops::select_ops(hidden.device()))
+        self.lm_head.forward(
+            &hidden,
+            &BatchState::no_lora(),
+            crate::ops::select_ops(hidden.device()),
+        )
     }
 }
 
@@ -2199,7 +2750,11 @@ impl crate::models::LogitsSplitModel for Qwen3_5ForCausalLM {
     }
 
     fn compute_logits(&self, hidden: &Tensor) -> crate::tensor::Result<Tensor> {
-        self.lm_head.forward(hidden, &BatchState::no_lora(), crate::ops::select_ops(hidden.device()))
+        self.lm_head.forward(
+            hidden,
+            &BatchState::no_lora(),
+            crate::ops::select_ops(hidden.device()),
+        )
     }
 }
 
@@ -2246,12 +2801,11 @@ pub(crate) mod meta {
     use crate::cache::deltanet_pool::DeltaNetPoolConfig;
     use crate::engine::EngineError;
     use crate::engine::{CommonModelConfig, RuntimeCaps, TaskKind, WeightsBackend};
-    use crate::models::registry::{
-        candle_model_err, parse_json, ArchSpec, ParsedModelConfig,
-    };
+    use crate::models::registry::{ArchSpec, ParsedModelConfig, candle_model_err, parse_json};
 
     const ARCHITECTURE_ALIASES: &[&str] = &["Qwen3_5", "Qwen35", "Qwen3_5Moe", "Qwen35Moe"];
-    const MODEL_TYPE_ALIASES: &[&str] = &["qwen3_5_text", "qwen3_5", "qwen3_5_moe_text", "qwen3_5_moe"];
+    const MODEL_TYPE_ALIASES: &[&str] =
+        &["qwen3_5_text", "qwen3_5", "qwen3_5_moe_text", "qwen3_5_moe"];
     const SUPPORTED_TASKS: &[TaskKind] = &[TaskKind::Generate];
 
     fn deltanet_config_from(cfg: &Qwen3_5Config) -> DeltaNetPoolConfig {
@@ -2269,10 +2823,48 @@ pub(crate) mod meta {
         }
     }
 
+    fn full_attention_layers(cfg: &Qwen3_5Config) -> usize {
+        (0..cfg.num_hidden_layers)
+            .filter(|&i| cfg.layer_type(i) == super::LayerType::FullAttention)
+            .count()
+    }
+
+    fn common_from_config(cfg: &Qwen3_5Config) -> CommonModelConfig {
+        let kv_layers = full_attention_layers(cfg);
+        CommonModelConfig {
+            vocab_size: cfg.vocab_size,
+            num_hidden_layers: cfg.num_hidden_layers,
+            max_position_embeddings: cfg.max_position_embeddings,
+            num_attention_heads: cfg.num_attention_heads,
+            num_key_value_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            kv_head_dims: Some(vec![cfg.head_dim; kv_layers]),
+            kv_num_heads: Some(vec![cfg.num_key_value_heads; kv_layers]),
+        }
+    }
+
+    fn common_from_gguf_config(cfg: &super::gguf::Qwen3_5GgufConfig) -> CommonModelConfig {
+        let kv_layers = (0..cfg.num_hidden_layers)
+            .filter(|i| (i + 1) % cfg.full_attention_interval == 0)
+            .count();
+        CommonModelConfig {
+            vocab_size: cfg.vocab_size,
+            num_hidden_layers: cfg.num_hidden_layers,
+            max_position_embeddings: cfg.max_position_embeddings,
+            num_attention_heads: cfg.num_attention_heads,
+            num_key_value_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            kv_head_dims: Some(vec![cfg.head_dim; kv_layers]),
+            kv_num_heads: Some(vec![cfg.num_key_value_heads; kv_layers]),
+        }
+    }
+
     pub(crate) struct Qwen3_5ArchSpec;
 
     pub(crate) static QWEN3_5_ARCH_SPEC: Qwen3_5ArchSpec = Qwen3_5ArchSpec;
-    inventory::submit!(crate::models::registry::ArchSpecEntry::new(&QWEN3_5_ARCH_SPEC));
+    inventory::submit!(crate::models::registry::ArchSpecEntry::new(
+        &QWEN3_5_ARCH_SPEC
+    ));
 
     impl ArchSpec for Qwen3_5ArchSpec {
         fn name(&self) -> &'static str {
@@ -2298,14 +2890,7 @@ pub(crate) mod meta {
             content: &str,
         ) -> Result<ParsedModelConfig, EngineError> {
             let cfg = parse_json::<Qwen3_5Config>(content, "Qwen3.5 config")?;
-            let common = CommonModelConfig {
-                vocab_size: cfg.vocab_size,
-                num_hidden_layers: cfg.num_hidden_layers,
-                max_position_embeddings: cfg.max_position_embeddings,
-                num_attention_heads: cfg.num_attention_heads,
-                num_key_value_heads: cfg.num_key_value_heads,
-                head_dim: cfg.head_dim,
-            };
+            let common = common_from_config(&cfg);
             let deltanet = Some(deltanet_config_from(&cfg));
             Ok(ParsedModelConfig {
                 common,
@@ -2338,7 +2923,7 @@ pub(crate) mod meta {
 
             RuntimeCaps {
                 supports_kv_cache: false,
-                supports_prefix_cache: false,
+                supports_prefix_cache: device.is_cuda() && is_safetensors,
                 supports_paged_attn: device.is_cuda() && is_safetensors,
                 supports_varlen: device.is_cuda() && is_safetensors,
                 supports_deltanet: true,
@@ -2358,14 +2943,7 @@ pub(crate) mod meta {
         ) -> Result<crate::models::registry::GgufLoadResult, EngineError> {
             let (model, cfg) = super::gguf::Qwen3_5GgufModel::from_gguf(ct, reader, device)
                 .map_err(candle_model_err)?;
-            let common = CommonModelConfig {
-                vocab_size: cfg.vocab_size,
-                num_hidden_layers: cfg.num_hidden_layers,
-                max_position_embeddings: cfg.max_position_embeddings,
-                num_attention_heads: cfg.num_attention_heads,
-                num_key_value_heads: cfg.num_key_value_heads,
-                head_dim: cfg.head_dim,
-            };
+            let common = common_from_gguf_config(&cfg);
             let deltanet = Some(DeltaNetPoolConfig {
                 num_deltanet_layers: (0..cfg.num_hidden_layers)
                     .filter(|i| (i + 1) % cfg.full_attention_interval != 0)
@@ -2395,18 +2973,18 @@ pub mod gguf {
     //! Quantized Qwen3.5 model loaded from GGUF format.
     //!
     //! Reference: llama.cpp `src/models/qwen35.cpp` + `src/models/delta-net-base.cpp`.
-    
+
     use crate::tensor::quantized::gguf_file;
     use crate::tensor::{DType, Device, Result, Tensor};
     use std::io::{Read, Seek};
     use std::sync::Arc;
-    
+
     use crate::constants::GGUF_INTERMEDIATE_SIZE_MULTIPLIER;
-    use crate::models::commons::{Linear, RmsNorm};
+    use crate::models::commons::Linear;
     use crate::models::commons::embedding::Embedding;
-    
+
     // ── Config ──────────────────────────────────────────────────────────────
-    
+
     #[derive(Debug, Clone)]
     pub struct Qwen3_5GgufConfig {
         pub num_hidden_layers: usize,
@@ -2429,35 +3007,35 @@ pub mod gguf {
         pub full_attention_interval: usize,
         pub partial_rotary_factor: f64,
     }
-    
+
     impl Qwen3_5GgufConfig {
         fn key_dim(&self) -> usize {
             self.linear_num_key_heads * self.linear_key_head_dim
         }
-    
+
         fn value_dim(&self) -> usize {
             self.linear_num_value_heads * self.linear_value_head_dim
         }
-    
+
         fn conv_dim(&self) -> usize {
             self.key_dim() * 2 + self.value_dim()
         }
-    
+
         fn rotary_dim(&self) -> usize {
             (self.head_dim as f64 * self.partial_rotary_factor) as usize
         }
-    
+
         fn is_recurrent(&self, layer_idx: usize) -> bool {
             (layer_idx + 1) % self.full_attention_interval != 0
         }
     }
-    
+
     // ── Model ───────────────────────────────────────────────────────────────
-    
+
     pub struct Qwen3_5GgufModel {
         inner: super::Qwen3_5ForCausalLM,
     }
-    
+
     impl Qwen3_5GgufModel {
         fn load_linear<R: Read + Seek>(
             ct: &gguf_file::Content,
@@ -2468,7 +3046,7 @@ pub mod gguf {
             let qtensor = ct.tensor(reader, name, device)?;
             Linear::from_qtensor(Arc::new(qtensor))
         }
-    
+
         fn load_tensor<R: Read + Seek>(
             ct: &gguf_file::Content,
             reader: &mut R,
@@ -2478,18 +3056,18 @@ pub mod gguf {
             let qtensor = ct.tensor(reader, name, device)?;
             qtensor.dequantize(device)
         }
-    
+
         pub fn from_gguf<R: Read + Seek>(
             ct: gguf_file::Content,
             reader: &mut R,
             device: &Device,
         ) -> Result<(Self, Qwen3_5GgufConfig)> {
             let config = parse_gguf_config(&ct)?;
-    
+
             // Embedding (dequantize for lookup table)
             let embed_weight = Self::load_tensor(&ct, reader, "token_embd.weight", device)?;
             let embed_tokens = Embedding::new(embed_weight, config.hidden_size);
-    
+
             // Build PartialRotaryEmbedding from GGUF config
             let build_rope = |dtype: DType| -> Result<super::PartialRotaryEmbedding> {
                 let rotary_dim = config.rotary_dim();
@@ -2513,14 +3091,14 @@ pub mod gguf {
                     rotary_dim,
                 })
             };
-    
+
             // Build layers
             let mut layers = Vec::with_capacity(config.num_hidden_layers);
             let dtype = DType::F32;
-    
+
             for i in 0..config.num_hidden_layers {
                 let prefix = format!("blk.{i}");
-    
+
                 // Layer norms (GGUF already has +1 applied for residual RMSNorm)
                 let ln1_weight =
                     Self::load_tensor(&ct, reader, &format!("{prefix}.attn_norm.weight"), device)?;
@@ -2531,7 +3109,7 @@ pub mod gguf {
                     &format!("{prefix}.post_attention_norm.weight"),
                     device,
                 )?;
-    
+
                 // Token mixer
                 let token_mixer = if config.is_recurrent(i) {
                     // DeltaNet layer. We keep the four input
@@ -2563,7 +3141,7 @@ pub mod gguf {
                         &format!("{prefix}.ssm_alpha.weight"),
                         device,
                     )?;
-    
+
                     // Conv1d weight: GGUF stores [d_conv, conv_channels], transpose if needed
                     let conv_weight_raw = Self::load_tensor(
                         &ct,
@@ -2571,25 +3149,25 @@ pub mod gguf {
                         &format!("{prefix}.ssm_conv1d.weight"),
                         device,
                     )?;
-                    let conv_weight =
-                        if conv_weight_raw.dim(0)? == config.linear_conv_kernel_dim {
-                            conv_weight_raw.t()?.contiguous()?
-                        } else {
-                            conv_weight_raw
-                        };
-    
-                    let dt_bias = Self::load_tensor(
-                        &ct,
-                        reader,
-                        &format!("{prefix}.ssm_dt.bias"),
-                        device,
-                    )?;
-    
+                    let conv_weight = if conv_weight_raw.dim(0)? == config.linear_conv_kernel_dim {
+                        conv_weight_raw.t()?.contiguous()?
+                    } else {
+                        conv_weight_raw
+                    };
+
+                    let dt_bias =
+                        Self::load_tensor(&ct, reader, &format!("{prefix}.ssm_dt.bias"), device)?;
+                    let dt_bias_key = dt_bias
+                        .to_dtype(DType::F32)?
+                        .reshape((config.linear_num_value_heads,))?
+                        .unsqueeze(1)?
+                        .broadcast_as((config.linear_num_value_heads, config.linear_key_head_dim))?
+                        .contiguous()?;
+
                     // GGUF stores -exp(A_log); convert back: A_log = ln(-ssm_a)
-                    let ssm_a =
-                        Self::load_tensor(&ct, reader, &format!("{prefix}.ssm_a"), device)?;
-                    let a_log = ssm_a.neg()?.log()?;
-    
+                    let ssm_a = Self::load_tensor(&ct, reader, &format!("{prefix}.ssm_a"), device)?;
+                    let a_log = ssm_a.neg()?.log()?.to_dtype(DType::F32)?.contiguous()?;
+
                     // Gated RMSNorm (NO +1 for ssm_norm)
                     let norm_weight = Self::load_tensor(
                         &ct,
@@ -2603,18 +3181,18 @@ pub mod gguf {
                         num_heads: config.linear_num_value_heads,
                         head_dim: config.linear_value_head_dim,
                     };
-    
+
                     let out_proj = Self::load_linear(
                         &ct,
                         reader,
                         &format!("{prefix}.ssm_out.weight"),
                         device,
                     )?;
-    
+
                     let key_dim = config.key_dim();
                     let value_dim = config.value_dim();
                     let conv_dim = config.conv_dim();
-    
+
                     super::TokenMixer::LinearAttention(super::Qwen3_5GatedDeltaNet {
                         in_proj_qkv,
                         in_proj_z,
@@ -2622,6 +3200,7 @@ pub mod gguf {
                         in_proj_a,
                         conv_weight,
                         dt_bias,
+                        dt_bias_key,
                         a_log,
                         norm,
                         out_proj,
@@ -2638,31 +3217,19 @@ pub mod gguf {
                     })
                 } else {
                     // Full attention layer
-                    let q_proj = Self::load_linear(
-                        &ct,
-                        reader,
-                        &format!("{prefix}.attn_q.weight"),
-                        device,
-                    )?;
-                    let k_proj = Self::load_linear(
-                        &ct,
-                        reader,
-                        &format!("{prefix}.attn_k.weight"),
-                        device,
-                    )?;
-                    let v_proj = Self::load_linear(
-                        &ct,
-                        reader,
-                        &format!("{prefix}.attn_v.weight"),
-                        device,
-                    )?;
+                    let q_proj =
+                        Self::load_linear(&ct, reader, &format!("{prefix}.attn_q.weight"), device)?;
+                    let k_proj =
+                        Self::load_linear(&ct, reader, &format!("{prefix}.attn_k.weight"), device)?;
+                    let v_proj =
+                        Self::load_linear(&ct, reader, &format!("{prefix}.attn_v.weight"), device)?;
                     let o_proj = Self::load_linear(
                         &ct,
                         reader,
                         &format!("{prefix}.attn_output.weight"),
                         device,
                     )?;
-    
+
                     // QK norms (GGUF already has +1 applied)
                     let q_norm_weight = Self::load_tensor(
                         &ct,
@@ -2676,21 +3243,14 @@ pub mod gguf {
                         &format!("{prefix}.attn_k_norm.weight"),
                         device,
                     )?;
-    
-                    let q_norm =
-                        RmsNorm::from_weight(q_norm_weight.clone(), config.rms_norm_eps);
-                    let k_norm =
-                        RmsNorm::from_weight(k_norm_weight.clone(), config.rms_norm_eps);
-    
+
                     let rope = build_rope(dtype)?;
-    
+
                     super::TokenMixer::FullAttention(super::Qwen3_5Attention {
                         q_proj,
                         k_proj,
                         v_proj,
                         o_proj,
-                        q_norm,
-                        k_norm,
                         q_norm_weight,
                         k_norm_weight,
                         rope,
@@ -2705,7 +3265,7 @@ pub mod gguf {
                         attn_output_gate: true,
                     })
                 };
-    
+
                 // MLP (same for both layer types)
                 let mlp = super::MlpVariant::Dense(super::Qwen3_5Mlp {
                     gate_proj: Self::load_linear(
@@ -2727,7 +3287,7 @@ pub mod gguf {
                         device,
                     )?,
                 });
-    
+
                 layers.push(super::Qwen3_5DecoderLayer {
                     token_mixer,
                     mlp,
@@ -2736,11 +3296,10 @@ pub mod gguf {
                     rms_norm_eps: config.rms_norm_eps as f32,
                 });
             }
-    
+
             // Final norm (GGUF already has +1 applied)
             let norm_weight = Self::load_tensor(&ct, reader, "output_norm.weight", device)?;
-            let norm = RmsNorm::from_weight(norm_weight.clone(), config.rms_norm_eps);
-    
+
             // LM head
             let lm_head = if ct.tensor_infos.get("output.weight").is_some() {
                 Self::load_linear(&ct, reader, "output.weight", device)?
@@ -2748,24 +3307,23 @@ pub mod gguf {
                 // Tied embeddings: use token_embd.weight
                 Self::load_linear(&ct, reader, "token_embd.weight", device)?
             };
-    
+
             let model = super::Qwen3_5Model {
                 embed_tokens,
                 layers,
-                norm,
                 norm_weight,
                 rms_norm_eps: config.rms_norm_eps,
             };
-    
+
             let inner = super::Qwen3_5ForCausalLM { model, lm_head };
-    
+
             Ok((Self { inner }, config))
         }
-    
+
         pub fn clear_kv_cache(&mut self) {
             self.inner.clear_kv_cache();
         }
-    
+
         pub fn forward_with_cache(
             &mut self,
             input_ids: &Tensor,
@@ -2773,7 +3331,7 @@ pub mod gguf {
         ) -> Result<Tensor> {
             self.inner.forward_with_cache(input_ids, position_offset)
         }
-    
+
         pub fn forward(
             &mut self,
             packed_input: &Tensor,
@@ -2782,7 +3340,7 @@ pub mod gguf {
             self.inner.forward(packed_input, ctx)
         }
     }
-    
+
     impl crate::models::KvCacheModel for Qwen3_5GgufModel {
         fn forward_with_cache(
             &mut self,
@@ -2792,7 +3350,7 @@ pub mod gguf {
             Qwen3_5GgufModel::forward_with_cache(self, input_ids, position_offset)
         }
     }
-    
+
     impl crate::models::ModelForward for Qwen3_5GgufModel {
         fn forward(
             &mut self,
@@ -2801,57 +3359,55 @@ pub mod gguf {
         ) -> Result<Tensor> {
             self.inner.forward(packed_input, ctx)
         }
-    
+
         fn clear_kv_cache(&mut self) {
             self.clear_kv_cache();
         }
-    
+
         fn as_kv_cache_model(&mut self) -> Option<&mut dyn crate::models::KvCacheModel> {
             Some(self)
         }
     }
-    
+
     // ── GGUF Config Parsing ─────────────────────────────────────────────────
-    
+
     fn parse_gguf_config(ct: &gguf_file::Content) -> Result<Qwen3_5GgufConfig> {
         let md = &ct.metadata;
-    
+
         let get_u32 = |key: &str| -> Result<usize> {
-            let val = md.get(key)
-                .ok_or_else(|| crate::tensor::Error::Msg(format!("missing GGUF metadata: {key}")))?;
+            let val = md.get(key).ok_or_else(|| {
+                crate::tensor::Error::Msg(format!("missing GGUF metadata: {key}"))
+            })?;
             Ok(val.to_u32().map(|v| v as usize)?)
         };
-    
+
         let get_u32_or = |key: &str, default: usize| -> usize {
             md.get(key)
                 .and_then(|v| v.to_u32().ok())
                 .map(|v| v as usize)
                 .unwrap_or_else(|| {
-                    tracing::warn!(
-                        "Qwen3.5 GGUF: '{key}' not found, using default: {default}"
-                    );
+                    tracing::warn!("Qwen3.5 GGUF: '{key}' not found, using default: {default}");
                     default
                 })
         };
-    
+
         let get_f32 = |key: &str| -> Result<f64> {
-            let val = md.get(key)
-                .ok_or_else(|| crate::tensor::Error::Msg(format!("missing GGUF metadata: {key}")))?;
+            let val = md.get(key).ok_or_else(|| {
+                crate::tensor::Error::Msg(format!("missing GGUF metadata: {key}"))
+            })?;
             Ok(val.to_f32().map(|v| v as f64)?)
         };
-    
+
         let get_f32_or = |key: &str, default: f64| -> f64 {
             md.get(key)
                 .and_then(|v| v.to_f32().ok())
                 .map(|v| v as f64)
                 .unwrap_or_else(|| {
-                    tracing::warn!(
-                        "Qwen3.5 GGUF: '{key}' not found, using default: {default}"
-                    );
+                    tracing::warn!("Qwen3.5 GGUF: '{key}' not found, using default: {default}");
                     default
                 })
         };
-    
+
         // Auto-detect architecture prefix
         let default_arch = "qwen35".to_string();
         let arch = md
@@ -2863,7 +3419,7 @@ pub mod gguf {
                 );
                 &default_arch
             });
-    
+
         let num_hidden_layers = get_u32(&format!("{arch}.block_count"))?;
         let hidden_size = get_u32(&format!("{arch}.embedding_length"))?;
         let num_attention_heads = get_u32(&format!("{arch}.attention.head_count"))?;
@@ -2872,22 +3428,19 @@ pub mod gguf {
         let max_position_embeddings = get_u32(&format!("{arch}.context_length"))?;
         let rms_norm_eps = get_f32(&format!("{arch}.attention.layer_norm_rms_epsilon"))?;
         let rope_theta = get_f32(&format!("{arch}.rope.freq_base"))?;
-    
+
         let default_intermediate = hidden_size * GGUF_INTERMEDIATE_SIZE_MULTIPLIER;
-        let intermediate_size = get_u32_or(
-            &format!("{arch}.feed_forward_length"),
-            default_intermediate,
-        );
-    
+        let intermediate_size =
+            get_u32_or(&format!("{arch}.feed_forward_length"), default_intermediate);
+
         // SSM / DeltaNet specific metadata
         let ssm_d_conv = get_u32_or(&format!("{arch}.ssm.conv_kernel"), 4);
         let ssm_d_inner = get_u32_or(&format!("{arch}.ssm.inner_size"), hidden_size);
         let ssm_d_state = get_u32_or(&format!("{arch}.ssm.state_size"), 128);
         let ssm_dt_rank = get_u32_or(&format!("{arch}.ssm.time_step_rank"), 16);
         let ssm_n_group = get_u32_or(&format!("{arch}.ssm.group_count"), 16);
-        let full_attention_interval =
-            get_u32_or(&format!("{arch}.full_attention_interval"), 4);
-    
+        let full_attention_interval = get_u32_or(&format!("{arch}.full_attention_interval"), 4);
+
         // Derive linear attention dimensions from SSM params (llama.cpp convention)
         let linear_num_key_heads = ssm_n_group;
         let linear_num_value_heads = ssm_dt_rank;
@@ -2897,13 +3450,10 @@ pub mod gguf {
         } else {
             ssm_d_state
         };
-    
+
         // Partial rotary factor from rope_dimension_sections or default
-        let partial_rotary_factor = get_f32_or(
-            &format!("{arch}.rope.partial_rotary_factor"),
-            0.25,
-        );
-    
+        let partial_rotary_factor = get_f32_or(&format!("{arch}.rope.partial_rotary_factor"), 0.25);
+
         let vocab_size = ct
             .tensor_infos
             .get("token_embd.weight")
@@ -2914,7 +3464,7 @@ pub mod gguf {
                 );
                 248320
             });
-    
+
         let eos_token_ids = md
             .get("tokenizer.ggml.eos_token_id")
             .and_then(|v| v.to_u32().ok())
@@ -2925,7 +3475,7 @@ pub mod gguf {
                 );
                 vec![]
             });
-    
+
         Ok(Qwen3_5GgufConfig {
             num_hidden_layers,
             hidden_size,
@@ -2947,5 +3497,4 @@ pub mod gguf {
             partial_rotary_factor,
         })
     }
-    
 }

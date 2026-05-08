@@ -1,13 +1,11 @@
 use std::sync::Mutex;
 
-use async_trait::async_trait;
 use crate::tensor::{DType, Device};
+use async_trait::async_trait;
 use chrono::Utc;
 use fastokens::Tokenizer;
 
-use super::types::{
-    CommonModelConfig, EmbeddingSemantics, ModelDescriptor, RuntimeCaps, TaskKind,
-};
+use super::types::{CommonModelConfig, EmbeddingSemantics, ModelDescriptor, RuntimeCaps, TaskKind};
 use super::{
     ClassifyRequest, ClassifyResult, EmbedRequest, EmbedResult, EngineError, GenerateRequest,
     GenerateResult, InferenceEngine, ModelInfo, StreamEvent,
@@ -103,10 +101,11 @@ impl Engine {
     }
 
     #[inline]
-    pub(crate) fn maybe_sync_device(&self) {
+    pub fn maybe_sync_device(&self) {
         if self.sync_timing_enabled() && self.executor.device.is_cuda() {
-            // GPU synchronization is handled by the device crate (prelude-cuda)
-            // via cudarc; no-op here since we don't own the CUDA context.
+            if let Err(error) = self.executor.device.synchronize() {
+                tracing::warn!(error = %error, "CUDA sync timing failed");
+            }
         }
     }
 
@@ -118,9 +117,13 @@ impl Engine {
     /// Classify model metadata: (num_labels, label_map).
     pub fn classify_metadata(&self) -> Result<(usize, Vec<Option<String>>), EngineError> {
         self.ensure_task_supported(TaskKind::Classify)?;
-        let model = self.executor.model.lock()
+        let model = self
+            .executor
+            .model
+            .lock()
             .map_err(|e| EngineError::Internal(format!("model lock: {e}")))?;
-        let classifier = model.as_classifier()
+        let classifier = model
+            .as_classifier()
             .ok_or_else(|| EngineError::Unavailable("model has no ClassifierModel".into()))?;
         let num_labels = classifier.num_labels();
         let label_map = (0..num_labels).map(|i| classifier.get_label(i)).collect();
@@ -128,13 +131,16 @@ impl Engine {
     }
 
     /// Embedding model metadata: (dimensions, normalization).
-    pub fn embed_metadata(&self) -> Result<(usize, super::types::EmbeddingNormalization), EngineError> {
+    pub fn embed_metadata(
+        &self,
+    ) -> Result<(usize, super::types::EmbeddingNormalization), EngineError> {
         self.ensure_task_supported(TaskKind::Embed)?;
-        let model = self.executor.model.lock()
+        let model = self
+            .executor
+            .model
+            .lock()
             .map_err(|e| EngineError::Internal(format!("model lock: {e}")))?;
-        let dimensions = model.as_embedding()
-            .map(|e| e.embedding_dim())
-            .unwrap_or(0);
+        let dimensions = model.as_embedding().map(|e| e.embedding_dim()).unwrap_or(0);
         Ok((dimensions, self.embedding_semantics.normalization))
     }
 
@@ -152,18 +158,23 @@ impl Engine {
         &self,
         batch: super::executor::ForwardBatch,
     ) -> Result<super::executor::ModelOutput, EngineError> {
-        use super::executor::{ForwardBatch, ModelOutput};
+        use super::executor::ForwardBatch;
 
         match batch {
-            ForwardBatch::Mixed { requests } => {
-                self.forward_mixed(requests)
-            }
+            ForwardBatch::Mixed {
+                requests,
+                sample_greedy: _,
+            } => self.forward_mixed(requests),
             ForwardBatch::OneShot { token_groups, task } => {
                 self.forward_oneshot(token_groups, task)
             }
-            ForwardBatch::Decode { tokens, positions, block_tables, deltanet_slots } => {
-                self.forward_decode(tokens, positions, block_tables, deltanet_slots)
-            }
+            ForwardBatch::Decode {
+                tokens,
+                positions,
+                block_tables,
+                deltanet_slots,
+                sample_greedy: _,
+            } => self.forward_decode(tokens, positions, block_tables, deltanet_slots),
         }
     }
 
@@ -177,11 +188,11 @@ impl Engine {
 
         if requests.is_empty() {
             return Ok(ModelOutput {
-                logits: crate::tensor::Tensor::zeros(
-                    (0, 0), DType::F32, &Device::Cpu,
-                ).map_err(|e| EngineError::Internal(e.to_string()))?,
+                logits: crate::tensor::Tensor::zeros((0, 0), DType::F32, &Device::Cpu)
+                    .map_err(|e| EngineError::Internal(e.to_string()))?,
                 item_seq_counts: vec![],
                 prefill_results: vec![],
+                sampled_tokens: None,
             });
         }
 
@@ -198,28 +209,30 @@ impl Engine {
         block_tables: Vec<Vec<u32>>,
         deltanet_slots: Option<Vec<u32>>,
     ) -> Result<super::executor::ModelOutput, EngineError> {
-        use super::executor::ModelOutput;
         use super::BatchDecodeSeq;
+        use super::executor::ModelOutput;
 
         if tokens.is_empty() {
             return Ok(ModelOutput {
-                logits: crate::tensor::Tensor::zeros(
-                    (0, 0), DType::F32, &Device::Cpu,
-                ).map_err(|e| EngineError::Internal(e.to_string()))?,
+                logits: crate::tensor::Tensor::zeros((0, 0), DType::F32, &Device::Cpu)
+                    .map_err(|e| EngineError::Internal(e.to_string()))?,
                 item_seq_counts: vec![],
                 prefill_results: vec![],
+                sampled_tokens: None,
             });
         }
 
-        let seqs: Vec<BatchDecodeSeq> = tokens.iter().enumerate().map(|(i, &token)| {
-            BatchDecodeSeq {
+        let seqs: Vec<BatchDecodeSeq> = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, &token)| BatchDecodeSeq {
                 token,
                 position: positions[i],
                 context_len: positions[i] + 1,
                 block_table: &block_tables[i],
                 deltanet_slot: deltanet_slots.as_ref().and_then(|s| s.get(i).copied()),
-            }
-        }).collect();
+            })
+            .collect();
 
         let logits = self.batch_decode_paged(&seqs)?;
 
@@ -227,9 +240,9 @@ impl Engine {
             logits,
             item_seq_counts: vec![],
             prefill_results: vec![],
+            sampled_tokens: None,
         })
     }
-
 
     /// Forward pass for one-shot classify/embed.
     ///
@@ -246,30 +259,29 @@ impl Engine {
 
         if token_groups.is_empty() {
             return Ok(ModelOutput {
-                logits: crate::tensor::Tensor::zeros(
-                    (0, 0), DType::F32, &Device::Cpu,
-                ).map_err(|e| EngineError::Internal(e.to_string()))?,
+                logits: crate::tensor::Tensor::zeros((0, 0), DType::F32, &Device::Cpu)
+                    .map_err(|e| EngineError::Internal(e.to_string()))?,
                 item_seq_counts: vec![],
                 prefill_results: vec![],
+                sampled_tokens: None,
             });
         }
 
         // Convert Vec<Vec<Vec<u32>>> → Vec<&[Vec<u32>]> for prefill_pipeline
-        let refs: Vec<&[Vec<u32>]> = token_groups.iter()
-            .map(|g| g.as_slice())
-            .collect();
+        let refs: Vec<&[Vec<u32>]> = token_groups.iter().map(|g| g.as_slice()).collect();
 
         {
-            let forward_result = self.prefill_pipeline(&refs)?
+            let forward_result = self
+                .prefill_pipeline(&refs)?
                 .ok_or_else(|| EngineError::Internal("empty one-shot batch".into()))?;
 
             Ok(ModelOutput {
                 logits: forward_result.output,
                 item_seq_counts: forward_result.item_seq_counts,
                 prefill_results: vec![],
+                sampled_tokens: None,
             })
         }
-
     }
 }
 

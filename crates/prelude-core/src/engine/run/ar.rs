@@ -37,7 +37,7 @@ use crate::scheduler::{
     FinishReason, SamplingParams, Scheduler, SchedulerConfig, SchedulerStep, SeqFinishReason,
     Sequence,
 };
-use crate::types::{GenerateResult, StreamEvent};
+use crate::types::{GenerateRequest, GenerateResult, StreamEvent};
 
 // ── Response channel ───────────────────────────────────────────────
 
@@ -124,6 +124,12 @@ impl ArSequenceState {
 
 /// Messages from the engine API layer to the AR loop.
 pub enum ArMessage {
+    /// New generation request. Preparation/tokenization is run by the AR loop's
+    /// prepare worker path so initial batch wait can overlap that CPU work.
+    RawRequest {
+        request: GenerateRequest,
+        response: ResponseChannel,
+    },
     /// New generation request (pre-tokenized, pre-prepared).
     NewRequest {
         prepared: PreparedGenerateRequest,
@@ -131,6 +137,12 @@ pub enum ArMessage {
     },
     /// Cancel an in-flight request.
     Abort(String),
+}
+
+struct PreparedArMessage {
+    request_id: String,
+    response: ResponseChannel,
+    result: Result<PreparedGenerateRequest, EngineError>,
 }
 
 // ── Main loop ──────────────────────────────────────────────────────
@@ -152,21 +164,55 @@ pub async fn ar_loop(
     }
     let mut states: HashMap<String, ArSequenceState> = HashMap::new();
     let mut rx_open = true;
+    let (prepare_tx, mut prepare_rx) = mpsc::unbounded_channel::<PreparedArMessage>();
+    let mut pending_prepares = 0usize;
+    let mut initial_wait_consumed = false;
 
     loop {
         let deltanet_pool_ref = engine.cache.deltanet_pool.as_ref();
         // ── Phase 1: Wait for at least one request if idle ─────────
         if !scheduler.has_work() {
-            match rx.recv().await {
-                Some(msg) => handle_message(
-                    Some(&engine),
-                    msg,
-                    &mut scheduler,
-                    &mut states,
-                    deltanet_pool_ref,
-                ),
-                None => {
-                    rx_open = false;
+            loop {
+                if scheduler.has_work() || (!rx_open && pending_prepares == 0) {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    prepared = prepare_rx.recv(), if pending_prepares > 0 => {
+                        if let Some(msg) = prepared {
+                            handle_prepared_message(
+                                &engine,
+                                msg,
+                                &mut scheduler,
+                                &mut states,
+                                deltanet_pool_ref,
+                                &mut pending_prepares,
+                            );
+                        }
+                    }
+                    msg = rx.recv(), if rx_open => {
+                        match msg {
+                            Some(msg) => handle_message(
+                                Some(&engine),
+                                msg,
+                                &mut scheduler,
+                                &mut states,
+                                deltanet_pool_ref,
+                                Some(&prepare_tx),
+                                &mut pending_prepares,
+                            ),
+                            None => {
+                                rx_open = false;
+                            }
+                        }
+                    }
+                }
+                if scheduler.has_work()
+                    || (pending_prepares > 0
+                        && !initial_wait_consumed
+                        && scheduler.config().max_batch_wait_ms > 0)
+                {
+                    break;
                 }
             }
         }
@@ -179,33 +225,51 @@ pub async fn ar_loop(
             &mut scheduler,
             &mut states,
             deltanet_pool_ref,
+            Some(&prepare_tx),
+            &mut pending_prepares,
+        );
+        drain_ready_prepared_messages(
+            &engine,
+            &mut prepare_rx,
+            &mut scheduler,
+            &mut states,
+            deltanet_pool_ref,
+            &mut pending_prepares,
         );
 
         // When the server is idle, give concurrent HTTP handlers a short
         // window to finish tokenization and enqueue peers. Without this,
         // closed-loop prefill benchmarks often run the first request alone
         // and only batch the trailing requests.
-        wait_for_initial_prefill_batch(
-            Some(&engine),
-            &mut rx,
-            &mut rx_open,
-            &mut scheduler,
-            &mut states,
-            deltanet_pool_ref,
-        )
-        .await;
+        if !initial_wait_consumed
+            && wait_for_initial_prefill_batch(
+                &engine,
+                &mut rx,
+                &mut rx_open,
+                &mut prepare_rx,
+                &prepare_tx,
+                &mut pending_prepares,
+                &mut scheduler,
+                &mut states,
+                deltanet_pool_ref,
+            )
+            .await
+        {
+            initial_wait_consumed = true;
+        }
 
         refresh_waiting_prefix_cache(&engine, &mut scheduler);
 
         // ── Phase 3: Schedule next step ────────────────────────────
         // schedule_step() syncs block availability internally.
         let Some(mut step) = scheduler.schedule_step() else {
-            if !rx_open && !scheduler.has_work() {
+            if !rx_open && pending_prepares == 0 && !scheduler.has_work() {
                 break;
             }
             tokio::task::yield_now().await;
             continue;
         };
+        initial_wait_consumed = false;
 
         // ── Phase 4: Build batch + forward + process output ──────────
         // Pure decode → ForwardBatch::Decode (CUDA graph eligible).
@@ -231,7 +295,7 @@ pub async fn ar_loop(
         };
         process_step_output(&engine, &mut scheduler, &mut states, &step, &output);
 
-        if !rx_open && !scheduler.has_work() {
+        if !rx_open && pending_prepares == 0 && !scheduler.has_work() {
             break;
         }
     }
@@ -248,92 +312,41 @@ pub async fn ar_loop(
 // ── Message handling ───────────────────────────────────────────────
 
 fn handle_message(
-    engine: Option<&Engine>,
+    engine: Option<&Arc<Engine>>,
     msg: ArMessage,
     scheduler: &mut Scheduler,
     states: &mut HashMap<String, ArSequenceState>,
     deltanet_pool: Option<&std::sync::Mutex<crate::cache::deltanet_pool::DeltaNetPool>>,
+    prepare_tx: Option<&mpsc::UnboundedSender<PreparedArMessage>>,
+    pending_prepares: &mut usize,
 ) {
     match msg {
-        ArMessage::NewRequest { prepared, response } => {
-            let request_id = prepared.request.request_id.clone();
-            let mut seq = Sequence::new(
-                request_id.clone(),
-                prepared.prompt_tokens.clone(),
-                SamplingParams::default(),
-                prepared.max_new.saturating_sub(1) as u32,
-                prepared.request.stop.strings.clone(),
-                prepared.request.stop.token_ids.clone(),
-                None,
-            );
-            if let Some(engine) = engine {
-                seq.prefix_cache_key = prefix_cache_key(engine, &seq.input_ids);
-                attach_prefix_cache_reuse(engine, &mut seq);
-            }
-            // Allocate a DeltaNet pool slot for hybrid models before queueing.
-            // `allocate` zeros the slot so a fresh request always starts from
-            // clean recurrent + conv state; `release_resources` frees it when
-            // the sequence finishes.
-            //
-            // Fail the request if the pool is exhausted: `build_step_batch`
-            // only forwards `deltanet_slots` when *every* sequence in the
-            // batch has one, so a single slotless admission flips the whole
-            // batch onto the non-pooled linear-attention path that clears
-            // recurrent state every step — silently corrupting all
-            // co-batched DeltaNet requests, not just the slotless one.
-            if let Some(pool_mutex) = deltanet_pool {
-                let allocated = pool_mutex.lock().ok().and_then(|mut pool| pool.allocate());
-                match allocated {
-                    Some(slot) => {
-                        seq.deltanet_slot = Some(slot);
+        ArMessage::RawRequest { request, response } => {
+            if let (Some(engine), Some(prepare_tx)) = (engine, prepare_tx) {
+                spawn_prepare_request(engine, prepare_tx, request, response);
+                *pending_prepares += 1;
+            } else {
+                let message = "raw AR request cannot be prepared without an engine";
+                match response {
+                    ResponseChannel::Complete(tx) => {
+                        let _ = tx.send(Err(EngineError::Internal(message.into())));
                     }
-                    None => {
-                        let mut state = ArSequenceState {
-                            request_id: prepared.request.request_id.clone(),
-                            prepared: Some(prepared),
-                            response,
-                            gen_start: Instant::now(),
-                            prefill_ms: 0.0,
-                            started_sent: false,
-                            sent_text_len: 0,
-                            pending_token: None,
-                            output_tokens: Vec::new(),
-                            token_logprobs: Vec::new(),
-                            prompt_token_logprobs: None,
-                            max_new_tokens: 0,
-                        };
-                        state.ensure_started();
-                        fail_state(
-                            state,
-                            EngineError::Unavailable(
-                                "DeltaNet pool exhausted — increase `deltanet_pool_slots` or retry"
-                                    .into(),
-                            ),
-                        );
-                        return;
+                    ResponseChannel::Stream(tx) => {
+                        let _ = tx.send(StreamEvent::Error {
+                            message: message.into(),
+                        });
                     }
                 }
             }
-            scheduler.add_request(seq);
-            let max_new_tokens = prepared.max_new;
-            states.insert(
-                request_id,
-                ArSequenceState {
-                    request_id: prepared.request.request_id.clone(),
-                    prepared: Some(prepared),
-                    response,
-                    gen_start: Instant::now(),
-                    prefill_ms: 0.0,
-                    started_sent: false,
-                    sent_text_len: 0,
-                    pending_token: None,
-                    output_tokens: Vec::new(),
-                    token_logprobs: Vec::new(),
-                    prompt_token_logprobs: None,
-                    max_new_tokens,
-                },
-            );
         }
+        ArMessage::NewRequest { prepared, response } => admit_prepared_request(
+            engine.map(|e| e.as_ref()),
+            prepared,
+            response,
+            scheduler,
+            states,
+            deltanet_pool,
+        ),
         ArMessage::Abort(request_id) => {
             // Free the DeltaNet pool slot + any allocated KV blocks before
             // dropping the sequence: skipping this leaks a slot per cancelled
@@ -346,17 +359,166 @@ fn handle_message(
     }
 }
 
-fn drain_ready_messages(
+fn spawn_prepare_request(
+    engine: &Arc<Engine>,
+    prepare_tx: &mpsc::UnboundedSender<PreparedArMessage>,
+    request: GenerateRequest,
+    response: ResponseChannel,
+) {
+    let engine = Arc::clone(engine);
+    let prepare_tx = prepare_tx.clone();
+    let request_id = request.request_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = engine.prepare_generate_request(&request, 0);
+        let _ = prepare_tx.send(PreparedArMessage {
+            request_id,
+            response,
+            result,
+        });
+    });
+}
+
+fn handle_prepared_message(
+    engine: &Engine,
+    msg: PreparedArMessage,
+    scheduler: &mut Scheduler,
+    states: &mut HashMap<String, ArSequenceState>,
+    deltanet_pool: Option<&std::sync::Mutex<crate::cache::deltanet_pool::DeltaNetPool>>,
+    pending_prepares: &mut usize,
+) {
+    *pending_prepares = pending_prepares.saturating_sub(1);
+    match msg.result {
+        Ok(prepared) => admit_prepared_request(
+            Some(engine),
+            prepared,
+            msg.response,
+            scheduler,
+            states,
+            deltanet_pool,
+        ),
+        Err(error) => {
+            tracing::warn!(request_id = %msg.request_id, error = %error, "generation prepare failed");
+            match msg.response {
+                ResponseChannel::Complete(tx) => {
+                    let _ = tx.send(Err(error));
+                }
+                ResponseChannel::Stream(tx) => {
+                    let _ = tx.send(StreamEvent::Error {
+                        message: error.to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn admit_prepared_request(
     engine: Option<&Engine>,
+    prepared: PreparedGenerateRequest,
+    response: ResponseChannel,
+    scheduler: &mut Scheduler,
+    states: &mut HashMap<String, ArSequenceState>,
+    deltanet_pool: Option<&std::sync::Mutex<crate::cache::deltanet_pool::DeltaNetPool>>,
+) {
+    let request_id = prepared.request.request_id.clone();
+    let mut seq = Sequence::new(
+        request_id.clone(),
+        prepared.prompt_tokens.clone(),
+        SamplingParams::default(),
+        prepared.max_new.saturating_sub(1) as u32,
+        prepared.request.stop.strings.clone(),
+        prepared.request.stop.token_ids.clone(),
+        None,
+    );
+    // Allocate a DeltaNet pool slot for hybrid models before queueing.
+    // `allocate` zeros the slot so a fresh request always starts from
+    // clean recurrent + conv state; `release_resources` frees it when
+    // the sequence finishes.
+    //
+    // Fail the request if the pool is exhausted: `build_step_batch`
+    // only forwards `deltanet_slots` when *every* sequence in the
+    // batch has one, so a single slotless admission flips the whole
+    // batch onto the non-pooled linear-attention path that clears
+    // recurrent state every step — silently corrupting all
+    // co-batched DeltaNet requests, not just the slotless one.
+    if let Some(pool_mutex) = deltanet_pool {
+        let allocated = pool_mutex.lock().ok().and_then(|mut pool| pool.allocate());
+        match allocated {
+            Some(slot) => {
+                seq.deltanet_slot = Some(slot);
+            }
+            None => {
+                let mut state = ArSequenceState {
+                    request_id: prepared.request.request_id.clone(),
+                    prepared: Some(prepared),
+                    response,
+                    gen_start: Instant::now(),
+                    prefill_ms: 0.0,
+                    started_sent: false,
+                    sent_text_len: 0,
+                    pending_token: None,
+                    output_tokens: Vec::new(),
+                    token_logprobs: Vec::new(),
+                    prompt_token_logprobs: None,
+                    max_new_tokens: 0,
+                };
+                state.ensure_started();
+                fail_state(
+                    state,
+                    EngineError::Unavailable(
+                        "DeltaNet pool exhausted — increase `deltanet_pool_slots` or retry".into(),
+                    ),
+                );
+                return;
+            }
+        }
+    }
+    if let Some(engine) = engine {
+        seq.prefix_cache_key = prefix_cache_key(engine, &seq.input_ids);
+        attach_prefix_cache_reuse(engine, &mut seq);
+    }
+    scheduler.add_request(seq);
+    let max_new_tokens = prepared.max_new;
+    states.insert(
+        request_id,
+        ArSequenceState {
+            request_id: prepared.request.request_id.clone(),
+            prepared: Some(prepared),
+            response,
+            gen_start: Instant::now(),
+            prefill_ms: 0.0,
+            started_sent: false,
+            sent_text_len: 0,
+            pending_token: None,
+            output_tokens: Vec::new(),
+            token_logprobs: Vec::new(),
+            prompt_token_logprobs: None,
+            max_new_tokens,
+        },
+    );
+}
+
+fn drain_ready_messages(
+    engine: Option<&Arc<Engine>>,
     rx: &mut mpsc::UnboundedReceiver<ArMessage>,
     rx_open: &mut bool,
     scheduler: &mut Scheduler,
     states: &mut HashMap<String, ArSequenceState>,
     deltanet_pool: Option<&std::sync::Mutex<crate::cache::deltanet_pool::DeltaNetPool>>,
+    prepare_tx: Option<&mpsc::UnboundedSender<PreparedArMessage>>,
+    pending_prepares: &mut usize,
 ) {
     loop {
         match rx.try_recv() {
-            Ok(msg) => handle_message(engine, msg, scheduler, states, deltanet_pool),
+            Ok(msg) => handle_message(
+                engine,
+                msg,
+                scheduler,
+                states,
+                deltanet_pool,
+                prepare_tx,
+                pending_prepares,
+            ),
             Err(mpsc::error::TryRecvError::Empty) => break,
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 *rx_open = false;
@@ -366,24 +528,47 @@ fn drain_ready_messages(
     }
 }
 
-async fn wait_for_initial_prefill_batch(
-    engine: Option<&Engine>,
-    rx: &mut mpsc::UnboundedReceiver<ArMessage>,
-    rx_open: &mut bool,
+fn drain_ready_prepared_messages(
+    engine: &Engine,
+    prepare_rx: &mut mpsc::UnboundedReceiver<PreparedArMessage>,
     scheduler: &mut Scheduler,
     states: &mut HashMap<String, ArSequenceState>,
     deltanet_pool: Option<&std::sync::Mutex<crate::cache::deltanet_pool::DeltaNetPool>>,
+    pending_prepares: &mut usize,
 ) {
-    if !*rx_open || scheduler.num_running() > 0 {
-        return;
+    while let Ok(msg) = prepare_rx.try_recv() {
+        handle_prepared_message(
+            engine,
+            msg,
+            scheduler,
+            states,
+            deltanet_pool,
+            pending_prepares,
+        );
+    }
+}
+
+async fn wait_for_initial_prefill_batch(
+    engine: &Arc<Engine>,
+    rx: &mut mpsc::UnboundedReceiver<ArMessage>,
+    rx_open: &mut bool,
+    prepare_rx: &mut mpsc::UnboundedReceiver<PreparedArMessage>,
+    prepare_tx: &mpsc::UnboundedSender<PreparedArMessage>,
+    pending_prepares: &mut usize,
+    scheduler: &mut Scheduler,
+    states: &mut HashMap<String, ArSequenceState>,
+    deltanet_pool: Option<&std::sync::Mutex<crate::cache::deltanet_pool::DeltaNetPool>>,
+) -> bool {
+    if scheduler.num_running() > 0 {
+        return false;
     }
 
     let max_wait_ms = scheduler.config().max_batch_wait_ms;
     if max_wait_ms == 0
-        || scheduler.num_waiting() == 0
+        || (scheduler.num_waiting() == 0 && *pending_prepares == 0)
         || scheduler.num_waiting() >= scheduler.config().max_batch_size
     {
-        return;
+        return false;
     }
 
     let wait = tokio::time::sleep(Duration::from_millis(max_wait_ms));
@@ -391,22 +576,96 @@ async fn wait_for_initial_prefill_batch(
     loop {
         tokio::select! {
             biased;
-            msg = rx.recv() => {
+            msg = rx.recv(), if *rx_open => {
                 match msg {
-                    Some(msg) => handle_message(engine, msg, scheduler, states, deltanet_pool),
+                    Some(msg) => handle_message(
+                        Some(engine),
+                        msg,
+                        scheduler,
+                        states,
+                        deltanet_pool,
+                        Some(prepare_tx),
+                        pending_prepares,
+                    ),
                     None => {
                         *rx_open = false;
                         break;
                     }
                 }
-                drain_ready_messages(engine, rx, rx_open, scheduler, states, deltanet_pool);
+                drain_ready_messages(
+                    Some(engine),
+                    rx,
+                    rx_open,
+                    scheduler,
+                    states,
+                    deltanet_pool,
+                    Some(prepare_tx),
+                    pending_prepares,
+                );
+                drain_ready_prepared_messages(
+                    engine,
+                    prepare_rx,
+                    scheduler,
+                    states,
+                    deltanet_pool,
+                    pending_prepares,
+                );
                 if !*rx_open || scheduler.num_waiting() >= scheduler.config().max_batch_size {
+                    break;
+                }
+            }
+            prepared = prepare_rx.recv(), if *pending_prepares > 0 => {
+                if let Some(msg) = prepared {
+                    handle_prepared_message(
+                        engine,
+                        msg,
+                        scheduler,
+                        states,
+                        deltanet_pool,
+                        pending_prepares,
+                    );
+                }
+                drain_ready_prepared_messages(
+                    engine,
+                    prepare_rx,
+                    scheduler,
+                    states,
+                    deltanet_pool,
+                    pending_prepares,
+                );
+                if scheduler.num_waiting() >= scheduler.config().max_batch_size {
                     break;
                 }
             }
             _ = &mut wait => break,
         }
     }
+    if *pending_prepares > 1 || scheduler.num_waiting() > 1 {
+        while *pending_prepares > 0 && scheduler.num_waiting() < scheduler.config().max_batch_size {
+            match prepare_rx.recv().await {
+                Some(msg) => {
+                    handle_prepared_message(
+                        engine,
+                        msg,
+                        scheduler,
+                        states,
+                        deltanet_pool,
+                        pending_prepares,
+                    );
+                    drain_ready_prepared_messages(
+                        engine,
+                        prepare_rx,
+                        scheduler,
+                        states,
+                        deltanet_pool,
+                        pending_prepares,
+                    );
+                }
+                None => break,
+            }
+        }
+    }
+    true
 }
 
 fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) {
@@ -417,18 +676,10 @@ fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) {
         return;
     };
 
-    let block_ok = if engine.executor.config.head_dim == 256 {
-        pool.block_size % 64 == 0
-    } else {
-        pool.block_size % 128 == 0
-    };
-    if !block_ok {
-        return;
-    }
-
-    let (mut cached_len, mut cached_blocks) = match engine
+    let has_deltanet = engine.cache.deltanet_pool.is_some();
+    let (cached_len, mut cached_blocks, deltanet_state) = match engine
         .cache
-        .try_prefix_cache_match_paged_only(&seq.input_ids)
+        .try_prefix_cache_match_paged_only_with_deltanet(&seq.input_ids)
     {
         Ok(hit) => hit,
         Err(error) => {
@@ -437,27 +688,107 @@ fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) {
         }
     };
 
-    // Reuse only full paged-KV blocks. Prefix-cache entries can be smaller
-    // than paged blocks; sharing a partial page would let suffix writes mutate
-    // cached KV that another prompt may later reuse.
-    cached_len -= cached_len % pool.block_size;
-    cached_blocks.truncate(cached_len / pool.block_size);
-
     if cached_len == 0 || cached_len >= seq.input_ids.len() || cached_blocks.is_empty() {
         return;
     }
 
-    if let Err(error) = engine.cache.retain_paged_blocks(&cached_blocks) {
+    let deltanet_restore = if has_deltanet {
+        let Some(slot) = seq.deltanet_slot else {
+            return;
+        };
+        let Some(state) = deltanet_state.as_ref() else {
+            return;
+        };
+        Some((slot, state))
+    } else {
+        None
+    };
+
+    let block_size = pool.block_size;
+    let full_shared_blocks = cached_len / block_size;
+    let partial_tokens = cached_len % block_size;
+    let mut retained_blocks: Vec<u32> = Vec::new();
+    let mut private_partial_block: Option<u32> = None;
+    let mut block_table: Vec<u32>;
+
+    if partial_tokens == 0 {
+        cached_blocks.truncate(full_shared_blocks);
+        if cached_blocks.is_empty() {
+            return;
+        }
+        retained_blocks = cached_blocks.clone();
+        block_table = cached_blocks;
+    } else {
+        if cached_blocks.len() < full_shared_blocks + 1 {
+            return;
+        }
+        let source_partial_block = cached_blocks[full_shared_blocks];
+        retained_blocks.extend_from_slice(&cached_blocks[..full_shared_blocks]);
+        block_table = retained_blocks.clone();
+        let private_block = match engine.cache.allocate_paged_block() {
+            Ok(Some(block)) => block,
+            Ok(None) => {
+                tracing::warn!(request_id = %seq.request_id, "prefix cache partial-page copy skipped: no free KV block");
+                if let Some(slot) = seq.deltanet_slot {
+                    let _ = engine.cache.reset_deltanet_slot(slot);
+                }
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(request_id = %seq.request_id, error = %error, "prefix cache partial-page block allocation failed");
+                if let Some(slot) = seq.deltanet_slot {
+                    let _ = engine.cache.reset_deltanet_slot(slot);
+                }
+                return;
+            }
+        };
+        if let Err(error) = engine
+            .cache
+            .copy_paged_kv_block(source_partial_block, private_block)
+        {
+            let _ = engine.cache.release_paged_blocks(&[private_block]);
+            if let Some(slot) = seq.deltanet_slot {
+                let _ = engine.cache.reset_deltanet_slot(slot);
+            }
+            tracing::warn!(request_id = %seq.request_id, error = %error, "prefix cache partial-page KV copy failed");
+            return;
+        }
+        private_partial_block = Some(private_block);
+        block_table.push(private_block);
+    }
+
+    if let Err(error) = engine.cache.retain_paged_blocks(&retained_blocks) {
         tracing::warn!(request_id = %seq.request_id, error = %error, "prefix cache block retain failed");
+        if let Some(block) = private_partial_block {
+            let _ = engine.cache.release_paged_blocks(&[block]);
+        }
+        if let Some(slot) = seq.deltanet_slot {
+            let _ = engine.cache.reset_deltanet_slot(slot);
+        }
+        return;
+    }
+
+    if let Some((slot, state)) = deltanet_restore {
+        if let Err(error) = engine.cache.restore_deltanet_slot(slot, state) {
+            let _ = engine.cache.release_paged_blocks(&retained_blocks);
+            if let Some(block) = private_partial_block {
+                let _ = engine.cache.release_paged_blocks(&[block]);
+            }
+            let _ = engine.cache.reset_deltanet_slot(slot);
+            tracing::warn!(request_id = %seq.request_id, error = %error, "prefix cache DeltaNet restore failed");
+            return;
+        }
+    } else if has_deltanet {
         return;
     }
 
     seq.kv_computed_len = cached_len;
-    seq.block_table = cached_blocks;
+    seq.block_table = block_table;
     tracing::debug!(
         request_id = %seq.request_id,
         cached_len,
         cached_blocks = seq.block_table.len(),
+        partial_tokens,
         suffix_len = seq.input_ids.len() - cached_len,
         "attached AR prefix-cache reuse"
     );
@@ -602,11 +933,13 @@ fn build_step_batch(
         } else {
             None
         };
+        let sample_greedy = decode_requests_allow_executor_greedy(states, &step.decode_request_ids);
         return ForwardBatch::Decode {
             tokens,
             positions,
             block_tables,
             deltanet_slots,
+            sample_greedy,
         };
     }
 
@@ -627,6 +960,8 @@ fn build_step_batch(
     // those tokens were already cached, and the next forward would
     // start from a pointer past the (still-uncomputed) tokens — wrong
     // attention output forever.
+    let mut has_executor_sample_rows = false;
+    let mut can_executor_sample_rows = true;
     let mut prefill_keep: Vec<bool> = Vec::with_capacity(step.prefill_request_ids.len());
     for (idx, id) in step.prefill_request_ids.iter().enumerate() {
         let chunk_len = step.prefill_chunk_lens.get(idx).copied().unwrap_or(0);
@@ -684,6 +1019,10 @@ fn build_step_batch(
             continue;
         };
         let chunk_tokens = seq.input_ids[computed..end].to_vec();
+        if is_final {
+            has_executor_sample_rows = true;
+            can_executor_sample_rows &= states.get(id).map_or(false, state_allows_executor_greedy);
+        }
         let prompt_logprobs = states
             .get(id)
             .and_then(|s| s.prepared.as_ref())
@@ -747,6 +1086,8 @@ fn build_step_batch(
     });
 
     for id in &step.decode_request_ids {
+        has_executor_sample_rows = true;
+        can_executor_sample_rows &= states.get(id).map_or(false, state_allows_executor_greedy);
         if let (Some(state), Some(seq)) = (states.get(id), scheduler.get_sequence(id)) {
             let seq_len = seq.total_len();
             let position = seq_len - 1;
@@ -763,7 +1104,28 @@ fn build_step_batch(
         }
     }
 
-    ForwardBatch::Mixed { requests }
+    ForwardBatch::Mixed {
+        requests,
+        sample_greedy: has_executor_sample_rows && can_executor_sample_rows,
+    }
+}
+
+fn state_allows_executor_greedy(state: &ArSequenceState) -> bool {
+    state.is_greedy()
+        && state
+            .prepared
+            .as_ref()
+            .and_then(|p| p.request.logprobs)
+            .is_none()
+}
+
+fn decode_requests_allow_executor_greedy(
+    states: &HashMap<String, ArSequenceState>,
+    decode_request_ids: &[String],
+) -> bool {
+    decode_request_ids
+        .iter()
+        .all(|id| states.get(id).map_or(false, state_allows_executor_greedy))
 }
 
 // ── Output processing (sampling + stop conditions + delivery) ──────
@@ -824,8 +1186,10 @@ fn process_step_output(
             prefill_result_idx += 1;
         }
 
-        // Populate prefix cache on the final chunk of a prefill, so future
-        // requests sharing the same prompt prefix can skip the full prefill.
+        // Populate prefix cache after safe prefix boundaries. Pure attention
+        // models can store on the final chunk. DeltaNet models additionally
+        // need a recurrent/conv-state snapshot at the exact cached boundary,
+        // so only block-aligned chunks are reusable.
         //
         // This was previously a dead write: the `prefill.rs` non-paged path
         // populated the cache, but the paged hot path (`paged_mixed` +
@@ -838,19 +1202,47 @@ fn process_step_output(
         //
         // The prefix cache takes its own ref count on the blocks, so they
         // survive the post-decode free.
-        if is_final && engine.cache.prefix_cache.is_some() {
+        if engine.cache.prefix_cache.is_some() {
             if let (Some(seq), Some(pool), Some(result)) = (
                 scheduler.get_sequence(request_id),
                 engine.cache.paged_pool.as_ref(),
                 prefill_result,
             ) {
-                if !result.block_table.is_empty() && !seq.input_ids.is_empty() {
-                    if let Err(e) = engine.cache.try_prefix_cache_insert_paged_only(
-                        &seq.input_ids,
-                        &result.block_table,
-                        pool.block_size,
-                    ) {
-                        tracing::warn!("prefix cache insert (ar_loop) failed: {e}");
+                let has_deltanet = engine.cache.deltanet_pool.is_some();
+                let cache_len = computed.min(seq.input_ids.len());
+                let is_safe_boundary = if has_deltanet {
+                    cache_len > 0
+                        && (cache_len % pool.block_size == 0
+                            || cache_len + 1 == seq.input_ids.len())
+                } else {
+                    is_final
+                };
+                if is_safe_boundary && !result.block_table.is_empty() && cache_len > 0 {
+                    let deltanet_state = if has_deltanet {
+                        seq.deltanet_slot.and_then(|slot| {
+                            match engine.cache.snapshot_deltanet_slot(slot) {
+                                Ok(state) => state,
+                                Err(e) => {
+                                    tracing::warn!("prefix cache DeltaNet snapshot failed: {e}");
+                                    None
+                                }
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    if !has_deltanet || deltanet_state.is_some() {
+                        if let Err(e) = engine
+                            .cache
+                            .try_prefix_cache_insert_paged_only_with_deltanet(
+                                &seq.input_ids[..cache_len],
+                                &result.block_table,
+                                pool.block_size,
+                                deltanet_state,
+                            )
+                        {
+                            tracing::warn!("prefix cache insert (ar_loop) failed: {e}");
+                        }
                     }
                 }
             }
@@ -919,19 +1311,18 @@ fn process_step_output(
             .decode_request_ids
             .iter()
             .all(|id| states.get(id).map(|s| s.is_greedy()).unwrap_or(true));
+        let can_use_executor_tokens =
+            decode_requests_allow_executor_greedy(states, &step.decode_request_ids);
 
         // Greedy decode only needs argmax. Avoid the FlashInfer sampler path
         // here because it converts the full [batch, vocab] logits tensor to
         // F32 before sampling; BF16 argmax gives the same token and saves a
         // large per-step copy/conversion.
         let batched_tokens: Option<Vec<u32>> = if all_greedy {
-            // Slice the decode portion of logits: [num_decode, vocab_size]
-            output
-                .logits
-                .narrow(0, decode_start_row, num_decode)
-                .and_then(|decode_logits| decode_logits.argmax(crate::tensor::D::Minus1))
-                .and_then(|t| t.to_vec1::<u32>())
-                .ok()
+            let executor_tokens = can_use_executor_tokens
+                .then(|| sampled_tokens_for_rows(output, decode_start_row, num_decode))
+                .flatten();
+            executor_tokens.or_else(|| decode_argmax_tokens(output, decode_start_row, num_decode))
         } else {
             None
         };
@@ -1018,6 +1409,10 @@ fn batched_prefill_argmax_tokens(
         return None;
     }
 
+    if let Some(tokens) = sampled_tokens_for_rows(output, 0, final_greedy_count) {
+        return Some(tokens);
+    }
+
     output
         .logits
         .narrow(0, 0, final_greedy_count)
@@ -1028,6 +1423,35 @@ fn batched_prefill_argmax_tokens(
                 .and_then(|t| t.to_vec1::<u32>())
                 .ok()
         })
+}
+
+fn sampled_tokens_for_rows(
+    output: &ModelOutput,
+    start_row: usize,
+    row_count: usize,
+) -> Option<Vec<u32>> {
+    let tokens = output.sampled_tokens.as_ref()?;
+    if tokens.len() == row_count && start_row == 0 {
+        return Some(tokens.clone());
+    }
+    let end = start_row.checked_add(row_count)?;
+    if tokens.len() < end {
+        return None;
+    }
+    Some(tokens[start_row..end].to_vec())
+}
+
+fn decode_argmax_tokens(
+    output: &ModelOutput,
+    decode_start_row: usize,
+    num_decode: usize,
+) -> Option<Vec<u32>> {
+    output
+        .logits
+        .narrow(0, decode_start_row, num_decode)
+        .and_then(|decode_logits| decode_logits.argmax(crate::tensor::D::Minus1))
+        .and_then(|tokens| tokens.to_vec1::<u32>())
+        .ok()
 }
 
 /// Sample a token from a logits row using the sequence's sampling config.
@@ -1080,7 +1504,16 @@ fn process_single_token(
     scheduler.on_token_generated(request_id, next_token);
     state.ensure_started();
 
-    // Check stop conditions
+    // Record the sampled token before stop checks so usage and logprobs count
+    // EOS/stop-token generations consistently with HF/OpenAI semantics. Special
+    // tokens are skipped by decode(..., true), so they do not appear in text.
+    state.pending_token = Some(next_token);
+    state.output_tokens.push(next_token);
+    if let Some(ref lp) = token_logprobs {
+        state.token_logprobs.push(lp.clone());
+    }
+
+    // Check stop conditions before streaming visible text.
     if engine.is_eos(next_token) {
         completed.push((request_id.to_string(), FinishReason::Eos));
         return;
@@ -1092,12 +1525,6 @@ fn process_single_token(
         }
     }
 
-    // Append token and stream
-    state.pending_token = Some(next_token);
-    state.output_tokens.push(next_token);
-    if let Some(ref lp) = token_logprobs {
-        state.token_logprobs.push(lp.clone());
-    }
     state.emit_text_delta(&engine.tokenizer, token_logprobs);
 
     // Check max length before stop strings. Most production requests have no
@@ -1280,6 +1707,7 @@ mod tests {
     fn handle_new_request_adds_to_scheduler() {
         let mut scheduler = Scheduler::new(SchedulerConfig::default());
         let mut states = HashMap::new();
+        let mut pending_prepares = 0;
 
         let prepared = make_prepared("r1", 10);
         let (tx, _rx) = tokio::sync::oneshot::channel();
@@ -1292,6 +1720,8 @@ mod tests {
             &mut scheduler,
             &mut states,
             None,
+            None,
+            &mut pending_prepares,
         );
 
         assert_eq!(scheduler.num_waiting(), 1);
@@ -1302,6 +1732,7 @@ mod tests {
     fn handle_abort_removes_from_scheduler() {
         let mut scheduler = Scheduler::new(SchedulerConfig::default());
         let mut states = HashMap::new();
+        let mut pending_prepares = 0;
 
         let prepared = make_prepared("r1", 10);
         let (tx, _rx) = tokio::sync::oneshot::channel();
@@ -1314,6 +1745,8 @@ mod tests {
             &mut scheduler,
             &mut states,
             None,
+            None,
+            &mut pending_prepares,
         );
         assert_eq!(scheduler.num_waiting(), 1);
 
@@ -1323,6 +1756,8 @@ mod tests {
             &mut scheduler,
             &mut states,
             None,
+            None,
+            &mut pending_prepares,
         );
         assert!(states.is_empty());
     }
@@ -1432,6 +1867,7 @@ mod tests {
     #[test]
     fn prefill_state_prepared_can_be_taken() {
         let mut states = HashMap::new();
+        let mut pending_prepares = 0;
         let prepared = make_prepared("r1", 5);
         let (tx, _rx) = tokio::sync::oneshot::channel();
         handle_message(
@@ -1443,6 +1879,8 @@ mod tests {
             &mut Scheduler::new(SchedulerConfig::default()),
             &mut states,
             None,
+            None,
+            &mut pending_prepares,
         );
 
         assert!(states.get("r1").unwrap().prepared.is_some());

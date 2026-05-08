@@ -47,6 +47,17 @@ pub struct DeltaNetPool {
     pub max_slots: u32,
 }
 
+/// Snapshot of one request's DeltaNet state at a prefix boundary.
+///
+/// The tensors do not include the pool slot dimension:
+/// - recurrent: `[num_v_heads, head_v_dim, head_k_dim]`
+/// - conv: `[conv_dim, conv_kernel - 1]`
+#[derive(Clone)]
+pub struct DeltaNetStateSnapshot {
+    pub recurrent_states: Vec<Tensor>,
+    pub conv_states: Vec<Tensor>,
+}
+
 impl DeltaNetPool {
     /// Create a new DeltaNet state pool.
     ///
@@ -128,6 +139,35 @@ impl DeltaNetPool {
         for cs in &self.conv_states {
             let zero = Tensor::zeros(&cs.dims()[1..], cs.dtype(), cs.device())?;
             cs.slice_set(&zero.unsqueeze(0)?, 0, slot)?;
+        }
+        Ok(())
+    }
+
+    pub fn snapshot_slot(&self, slot: u32) -> Result<DeltaNetStateSnapshot> {
+        let slot = slot as usize;
+        let mut recurrent_states = Vec::with_capacity(self.recurrent_states.len());
+        let mut conv_states = Vec::with_capacity(self.conv_states.len());
+        for rs in &self.recurrent_states {
+            let state = rs.get(slot)?;
+            recurrent_states.push((&state + 0.0f64)?.contiguous()?);
+        }
+        for cs in &self.conv_states {
+            let state = cs.get(slot)?;
+            conv_states.push((&state + 0.0f64)?.contiguous()?);
+        }
+        Ok(DeltaNetStateSnapshot {
+            recurrent_states,
+            conv_states,
+        })
+    }
+
+    pub fn restore_slot(&self, slot: u32, snapshot: &DeltaNetStateSnapshot) -> Result<()> {
+        let slot = slot as usize;
+        for (dst, src) in self.recurrent_states.iter().zip(&snapshot.recurrent_states) {
+            dst.slice_set(&src.unsqueeze(0)?, 0, slot)?;
+        }
+        for (dst, src) in self.conv_states.iter().zip(&snapshot.conv_states) {
+            dst.slice_set(&src.unsqueeze(0)?, 0, slot)?;
         }
         Ok(())
     }
@@ -226,5 +266,29 @@ mod tests {
             .unwrap();
         let flat2: Vec<f32> = other.flatten_all().unwrap().to_vec1().unwrap();
         assert!((flat2[0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_snapshot_restore_to_same_pool_slot() {
+        let cfg = test_config();
+        let mut pool = DeltaNetPool::new(&cfg, 2, DType::F32, &Device::Cpu).unwrap();
+        let slot = pool.allocate().unwrap();
+
+        let recurrent = Tensor::ones((4, 64, 64), DType::F32, &Device::Cpu).unwrap();
+        let conv = Tensor::ones((384, 3), DType::F32, &Device::Cpu).unwrap();
+        pool.recurrent_states[0]
+            .slice_set(&recurrent.unsqueeze(0).unwrap(), 0, slot as usize)
+            .unwrap();
+        pool.conv_states[0]
+            .slice_set(&conv.unsqueeze(0).unwrap(), 0, slot as usize)
+            .unwrap();
+
+        let snapshot = pool.snapshot_slot(slot).unwrap();
+        pool.reset_slot(slot).unwrap();
+        pool.restore_slot(slot, &snapshot).unwrap();
+
+        let restored = pool.recurrent_states[0].get(slot as usize).unwrap();
+        let flat: Vec<f32> = restored.flatten_all().unwrap().to_vec1().unwrap();
+        assert!((flat[0] - 1.0).abs() < 1e-6);
     }
 }

@@ -1,6 +1,39 @@
 use std::collections::{HashSet, VecDeque};
 
-use super::{Scheduler, SchedulerStep, SeqFinishReason, Sequence, SequenceStatus};
+use super::{Scheduler, SchedulerConfig, SchedulerStep, SeqFinishReason, Sequence, SequenceStatus};
+
+fn prefill_chunk_len(seq: &Sequence, token_budget: usize, config: &SchedulerConfig) -> usize {
+    let mut chunk = seq.prefill_len().min(token_budget);
+    if config.long_prefill_token_threshold > 0 {
+        chunk = chunk.min(config.long_prefill_token_threshold);
+    }
+
+    let block_size = config.block_size.max(1);
+    if config.long_prefill_token_threshold > 0 && block_size > 1 && chunk > 0 {
+        let computed = seq.kv_computed_len;
+        let full_len = seq.input_ids.len();
+        let planned_end = computed + chunk;
+        if planned_end >= full_len && full_len > computed + 1 {
+            let aligned_end = (full_len - 1) / block_size * block_size;
+            if aligned_end > computed && aligned_end < full_len {
+                let aligned_chunk = aligned_end - computed;
+                if aligned_chunk <= token_budget {
+                    chunk = aligned_chunk;
+                }
+            } else {
+                let exact_tail_end = full_len - 1;
+                if exact_tail_end > computed && exact_tail_end < full_len {
+                    let exact_tail_chunk = exact_tail_end - computed;
+                    if exact_tail_chunk <= token_budget {
+                        chunk = exact_tail_chunk;
+                    }
+                }
+            }
+        }
+    }
+
+    chunk
+}
 
 impl Scheduler {
     /// Schedule one step using a unified per-step token budget.
@@ -16,6 +49,11 @@ impl Scheduler {
         let mut prefill_chunk_lens: Vec<usize> = Vec::new();
         let mut decode_ids: Vec<String> = Vec::new();
 
+        // Prefixes already represented by prefill work in this step. Waiting
+        // requests with the same uncached prefix should wait for that leader
+        // to populate prefix cache instead of recomputing it in the same batch.
+        let mut scheduled_prefill_prefixes: HashSet<u64> = HashSet::new();
+
         // ── 1. Schedule RUNNING requests first ────────────────────────
         for seq in &self.running {
             if token_budget == 0 {
@@ -24,12 +62,11 @@ impl Scheduler {
             let remaining_prefill = seq.prefill_len();
             if remaining_prefill > 0 {
                 // Partially prefilled — needs more prefill tokens
-                let mut chunk = remaining_prefill;
-                if self.config.long_prefill_token_threshold > 0 {
-                    chunk = chunk.min(self.config.long_prefill_token_threshold);
-                }
-                chunk = chunk.min(token_budget);
+                let chunk = prefill_chunk_len(seq, token_budget, &self.config);
                 if chunk > 0 {
+                    if let Some(key) = seq.prefix_cache_key {
+                        scheduled_prefill_prefixes.insert(key);
+                    }
                     prefill_ids.push(seq.request_id.clone());
                     prefill_chunk_lens.push(chunk);
                     token_budget -= chunk;
@@ -50,6 +87,7 @@ impl Scheduler {
                 &mut prefill_ids,
                 &mut prefill_chunk_lens,
                 &mut decode_ids,
+                scheduled_prefill_prefixes,
             );
         }
 
@@ -183,6 +221,7 @@ impl Scheduler {
         prefill_ids: &mut Vec<String>,
         prefill_chunk_lens: &mut Vec<usize>,
         decode_ids: &mut Vec<String>,
+        mut scheduled_prefill_prefixes: HashSet<u64>,
     ) {
         self.sort_waiting_queue();
 
@@ -194,7 +233,6 @@ impl Scheduler {
         let block_size = self.config.block_size;
 
         let mut admitted = 0usize;
-        let mut admitted_uncached_prefixes: HashSet<u64> = HashSet::new();
         let mut deferred_same_prefix: VecDeque<Sequence> = VecDeque::new();
         while !self.waiting_queue.is_empty() && admitted < available_slots && token_budget > 0 {
             let seq = self.waiting_queue.front().expect("queue checked non-empty");
@@ -208,7 +246,7 @@ impl Scheduler {
             if seq.kv_computed_len == 0
                 && seq.block_table.is_empty()
                 && let Some(key) = seq.prefix_cache_key
-                && admitted_uncached_prefixes.contains(&key)
+                && scheduled_prefill_prefixes.contains(&key)
             {
                 let seq = self
                     .waiting_queue
@@ -232,13 +270,7 @@ impl Scheduler {
                 break;
             }
 
-            // Per-request prefill cap
-            let mut chunk = seq.prefill_len();
-            if self.config.long_prefill_token_threshold > 0 {
-                chunk = chunk.min(self.config.long_prefill_token_threshold);
-            }
-            // Per-step token budget
-            chunk = chunk.min(token_budget);
+            let mut chunk = prefill_chunk_len(seq, token_budget, &self.config);
 
             // Deadlock prevention: if nothing else is scheduled and chunk would
             // be 0, force at least 1 token so the system makes progress.
@@ -257,7 +289,7 @@ impl Scheduler {
                 && seq.block_table.is_empty()
                 && let Some(key) = seq.prefix_cache_key
             {
-                admitted_uncached_prefixes.insert(key);
+                scheduled_prefill_prefixes.insert(key);
             }
             seq.status = SequenceStatus::Prefilling;
             self.tokens_in_use += seq.input_ids.len();
