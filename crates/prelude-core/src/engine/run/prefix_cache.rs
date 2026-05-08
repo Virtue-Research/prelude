@@ -233,6 +233,15 @@ pub(super) fn try_insert_prefill_prefix_cache(
         if computed == 0 || computed >= seq.input_ids.len() {
             return;
         }
+        if computed % pool.block_size != 0 {
+            tracing::debug!(
+                request_id = %request_id,
+                computed,
+                block_size = pool.block_size,
+                "skip hybrid prefix cache insert at non-block boundary"
+            );
+            return;
+        }
         let Some(slot) = seq.deltanet_slot else {
             return;
         };

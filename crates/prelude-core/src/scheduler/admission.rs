@@ -485,9 +485,10 @@ fn cap_hybrid_prefix_cache_chunk(seq: &Sequence, block_size: usize, chunk: usize
     let after = computed + chunk;
 
     // DeltaNet prefix entries require an exact state snapshot at the cached
-    // boundary. Keep exactly one suffix token so generation can produce logits
-    // for the first sampled token, even when the prompt is not block-aligned.
-    let final_reusable = prompt_len.saturating_sub(1);
+    // boundary. Keep the cached prefix block-aligned and strictly before the
+    // full prompt; the remaining tail is the stable Qwen3.5 fast path used by
+    // the TopicGuard workload.
+    let final_reusable = final_block_aligned_prefix(prompt_len, block_size);
     if final_reusable > computed && after > final_reusable {
         return final_reusable - computed;
     }
@@ -502,6 +503,18 @@ fn cap_hybrid_prefix_cache_chunk(seq: &Sequence, block_size: usize, chunk: usize
     }
 
     chunk
+}
+
+fn final_block_aligned_prefix(prompt_len: usize, block_size: usize) -> usize {
+    if block_size == 0 || prompt_len <= block_size {
+        return 0;
+    }
+    let aligned = prompt_len - (prompt_len % block_size);
+    if aligned == prompt_len {
+        aligned.saturating_sub(block_size)
+    } else {
+        aligned
+    }
 }
 
 fn shared_prefix_target_pending(seq: &Sequence) -> bool {
