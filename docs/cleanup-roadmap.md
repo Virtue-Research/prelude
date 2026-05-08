@@ -187,3 +187,4 @@ review and should not alter serving behavior:
   waiting admission paths cannot drift.
 - Centralize model/runtime `PRELUDE_*` feature toggles in `EngineConfig`
   instead of reading environment variables inside model/cache modules.
+- Share grouped-prefill batch slicing policy between Qwen3.5 and Qwen3-Next.

@@ -20,7 +20,7 @@ use crate::tensor::{D, DType, Device, Module, Result, Tensor};
 
 use crate::models::commons::{
     BatchAttnContext, BatchState, HybridAttentionPattern, LayerAttnContext, Linear,
-    last_token_select,
+    grouped_prefill_batch_take, last_token_select,
 };
 use crate::models::resolve_or_warn;
 use crate::ops::{MaskType, PagedParams, VarlenParams};
@@ -1795,7 +1795,7 @@ fn deltanet_varlen_grouped_zero(
             let mut start = 0usize;
             while start < indices.len() {
                 let remaining = indices.len() - start;
-                let take = grouped_prefill_take_with(remaining, MAX_ZERO_GROUPED_PREFILL_BATCH);
+                let take = grouped_prefill_batch_take(remaining, MAX_ZERO_GROUPED_PREFILL_BATCH);
                 let chunk = &indices[start..start + take];
                 let Some(out) =
                     deltanet_prefill_group_fused_zero(gdn, packed, &offsets, seq_len, chunk, ops)?
@@ -1820,7 +1820,7 @@ fn deltanet_varlen_grouped_zero(
         let mut start = 0usize;
         while start < indices.len() {
             let remaining = indices.len() - start;
-            let take = grouped_prefill_take_with(remaining, MAX_ZERO_GROUPED_PREFILL_BATCH);
+            let take = grouped_prefill_batch_take(remaining, MAX_ZERO_GROUPED_PREFILL_BATCH);
             if take == 1 || seq_len <= 1 {
                 let req_idx = indices[start];
                 gdn.clear_state();
@@ -1858,19 +1858,7 @@ fn deltanet_varlen_grouped_zero(
 }
 
 fn grouped_prefill_take(remaining: usize) -> usize {
-    grouped_prefill_take_with(remaining, MAX_GROUPED_PREFILL_BATCH)
-}
-
-fn grouped_prefill_take_with(remaining: usize, max_batch: usize) -> usize {
-    if remaining == 1 {
-        1
-    } else if remaining <= max_batch {
-        remaining
-    } else if remaining - max_batch == 1 {
-        max_batch - 1
-    } else {
-        max_batch
-    }
+    grouped_prefill_batch_take(remaining, MAX_GROUPED_PREFILL_BATCH)
 }
 
 fn qwen35_kda_decode_enabled() -> bool {

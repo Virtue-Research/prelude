@@ -49,6 +49,22 @@ impl HybridAttentionPattern {
     }
 }
 
+/// Pick the next grouped-prefill batch size without leaving a single-item tail
+/// when avoidable.
+pub(crate) fn grouped_prefill_batch_take(remaining: usize, max_batch: usize) -> usize {
+    if remaining <= 1 {
+        remaining
+    } else if max_batch <= 1 {
+        1
+    } else if remaining <= max_batch {
+        remaining
+    } else if remaining - max_batch == 1 {
+        max_batch - 1
+    } else {
+        max_batch
+    }
+}
+
 // ── Paged KV structs ────────────────────────────────────────────────────
 
 /// Per-layer paged KV context for varlen attention with paged prefix.
@@ -196,5 +212,18 @@ mod tests {
         assert!(pattern.is_full_attention_layer(3));
         assert_eq!(pattern.full_attention_layers(), 10);
         assert_eq!(pattern.recurrent_layers(), 30);
+    }
+
+    #[test]
+    fn grouped_prefill_batch_take_avoids_single_tail() {
+        assert_eq!(grouped_prefill_batch_take(1, 8), 1);
+        assert_eq!(grouped_prefill_batch_take(5, 8), 5);
+        assert_eq!(grouped_prefill_batch_take(8, 8), 8);
+        assert_eq!(grouped_prefill_batch_take(9, 8), 7);
+        assert_eq!(grouped_prefill_batch_take(10, 8), 8);
+        assert_eq!(grouped_prefill_batch_take(17, 8), 8);
+        assert_eq!(grouped_prefill_batch_take(9, 16), 9);
+        assert_eq!(grouped_prefill_batch_take(17, 16), 15);
+        assert_eq!(grouped_prefill_batch_take(18, 16), 16);
     }
 }

@@ -18,11 +18,13 @@ use crate::tensor::{D, DType, Device, Module, Result, Tensor};
 
 use crate::models::commons::{
     BatchAttnContext, BatchState, HybridAttentionPattern, LayerAttnContext, Linear,
-    last_token_select,
+    grouped_prefill_batch_take, last_token_select,
 };
 use crate::models::model_config;
 use crate::ops::{MaskType, PagedParams, VarlenParams};
 use std::collections::BTreeMap;
+
+const MAX_GROUPED_PREFILL_BATCH: usize = 8;
 
 // ── Config ──────────────────────────────────────────────────────────────
 
@@ -1545,20 +1547,11 @@ fn deltanet_mixed_grouped_fused(
     }
 
     let mut outputs: Vec<Option<Tensor>> = (0..seq_lens.len()).map(|_| None).collect();
-    const MAX_GROUPED_PREFILL_BATCH: usize = 8;
     for (&seq_len, indices) in prefill_by_len.iter() {
         let mut start = 0usize;
         while start < indices.len() {
             let remaining = indices.len() - start;
-            let take = if remaining == 1 {
-                1
-            } else if remaining <= MAX_GROUPED_PREFILL_BATCH {
-                remaining
-            } else if remaining - MAX_GROUPED_PREFILL_BATCH == 1 {
-                MAX_GROUPED_PREFILL_BATCH - 1
-            } else {
-                MAX_GROUPED_PREFILL_BATCH
-            };
+            let take = grouped_prefill_batch_take(remaining, MAX_GROUPED_PREFILL_BATCH);
             if take == 1 {
                 let req_idx = indices[start];
                 outputs[req_idx] = Some(deltanet_single_pooled(
