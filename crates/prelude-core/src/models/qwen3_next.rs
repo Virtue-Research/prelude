@@ -18,7 +18,7 @@ use crate::tensor::{D, DType, Device, Module, Result, Tensor};
 
 use crate::models::commons::{
     BatchAttnContext, BatchState, HybridAttentionPattern, LayerAttnContext, Linear,
-    grouped_prefill_batch_take, last_token_select,
+    grouped_prefill_batch_take, last_token_select, packed_sequence_offsets,
 };
 use crate::models::model_config;
 use crate::ops::{MaskType, PagedParams, VarlenParams};
@@ -1514,12 +1514,7 @@ fn deltanet_mixed_grouped_fused(
         return Ok(None);
     }
 
-    let mut offsets = Vec::with_capacity(seq_lens.len());
-    let mut off = 0usize;
-    for &len in seq_lens {
-        offsets.push(off);
-        off += len;
-    }
+    let offsets = packed_sequence_offsets(seq_lens);
 
     let mut decode_indices = Vec::new();
     let mut prefill_by_len: BTreeMap<usize, Vec<usize>> = BTreeMap::new();

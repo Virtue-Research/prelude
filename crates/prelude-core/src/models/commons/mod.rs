@@ -65,6 +65,16 @@ pub(crate) fn grouped_prefill_batch_take(remaining: usize, max_batch: usize) -> 
     }
 }
 
+pub(crate) fn packed_sequence_offsets(seq_lens: &[usize]) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(seq_lens.len());
+    let mut offset = 0usize;
+    for &len in seq_lens {
+        offsets.push(offset);
+        offset += len;
+    }
+    offsets
+}
+
 // ── Paged KV structs ────────────────────────────────────────────────────
 
 /// Per-layer paged KV context for varlen attention with paged prefix.
@@ -225,5 +235,12 @@ mod tests {
         assert_eq!(grouped_prefill_batch_take(9, 16), 9);
         assert_eq!(grouped_prefill_batch_take(17, 16), 15);
         assert_eq!(grouped_prefill_batch_take(18, 16), 16);
+    }
+
+    #[test]
+    fn packed_sequence_offsets_are_prefix_sums() {
+        assert_eq!(packed_sequence_offsets(&[]), Vec::<usize>::new());
+        assert_eq!(packed_sequence_offsets(&[3]), vec![0]);
+        assert_eq!(packed_sequence_offsets(&[3, 1, 4]), vec![0, 3, 4]);
     }
 }
