@@ -170,8 +170,10 @@ performance-critical execution paths.
 
 ## First PR Scope
 
-This PR intentionally starts with foundation cleanup only. It should be easy to
-review and should not alter serving behavior:
+This PR started with foundation cleanup and was expanded into a broader
+repo-level structure pass after review feedback. It still avoids changing model
+math, feature gates, prefix cache policy, CUDA graph enablement, or fast-path
+eligibility:
 
 - Add `CommonModelConfig::new` and
   `CommonModelConfig::with_uniform_physical_kv_layers`.
@@ -203,3 +205,60 @@ review and should not alter serving behavior:
   into a focused helper.
 - Share classify/embed pretokenized batch helpers and make prefill row-count
   mismatches return `EngineError` instead of indexing panics.
+- Extract Qwen3.5 GGUF loading into `models/qwen3_5/gguf.rs`.
+- Extract sentence-transformers embedding-module loading out of
+  `engine/loading.rs`.
+- Extract AR prefix-cache key/refresh/insert helpers into `engine/run/prefix_cache.rs`.
+- Extract CUDA graph fixed-buffer allocation/update logic into
+  `prelude-cuda/src/cuda_graph/buffers.rs`.
+- Extract GGUF and tokenizer loading helpers out of `engine/loading.rs`.
+- Extract Qwen3.5 config parsing and shared RoPE/gated-norm components into
+  sibling modules.
+- Extract generation CPU postprocess, top-logprob, stop-string, and prompt
+  logprob helpers out of `engine/model_runner/generate.rs`.
+- Extract Qwen3-Next config parsing and shared RoPE/gated-norm components into
+  sibling modules.
+
+## Current PR Progress
+
+- `engine/loading.rs`: reduced from ~1.5k lines to ~400 lines. It now keeps
+  orchestration while GGUF, tokenizer, and embedding-module loading live in
+  focused modules.
+- `models/qwen3_5.rs`: reduced from ~4k lines to ~3.1k lines. Config,
+  shared components, and GGUF support are separated without touching DeltaNet
+  fast-path logic.
+- `models/qwen3_next.rs`: reduced from ~2k lines to ~1.9k lines with the same
+  config/component boundaries as Qwen3.5.
+- `engine/model_runner/generate.rs`: reduced from ~900 lines to ~575 lines by
+  moving CPU postprocess and prompt-logprob extraction into a dedicated module.
+- `cuda_graph.rs`: graph lifecycle remains in the main file; fixed GPU buffer
+  ownership and host-to-device updates moved to `cuda_graph/buffers.rs`.
+- `engine/run/ar.rs`: prefix-cache mechanics are split from the AR loop, making
+  scheduling/result emission easier to review separately.
+
+## Validation Notes
+
+- Passing after each stage:
+  - `cargo check -p prelude-core --lib --no-default-features`
+  - `cargo check -p prelude-server --no-default-features`
+  - `cargo check -p prelude-kernelbuild`
+  - `git diff --check`
+- `cargo check -p prelude-cuda --no-default-features` is blocked in this
+  workspace before cleanup changes because `third_party/tvm-ffi` is not
+  initialized or provided through `TVM_FFI_ROOT`.
+- Global `cargo fmt --check` is still not used for this PR because unrelated
+  pre-existing formatting drift exists in CUDA/test files. Touched files are
+  formatted with targeted `rustfmt`.
+
+## Next Cleanup Batches
+
+1. Split Qwen3.5 DeltaNet execution into private modules only after adding a
+   focused compile/benchmark guard, because that file contains the TopicGuard
+   latency-sensitive path.
+2. Split `engine/run/ar.rs` further around request lifecycle and result
+   emission, now that prefix-cache mechanics are out.
+3. Separate scheduler prefix-boundary policy from prefix-cache storage types.
+4. Split `prelude-cuda/src/attn/flashinfer.rs` dispatch/planning from FFI
+   wrappers, but only with CUDA validation available.
+5. Clean server route request/response adapters after the core runner/API
+   boundaries settle.
