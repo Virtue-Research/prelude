@@ -9,7 +9,7 @@ This guide walks through adding a new model architecture to Prelude.
 - Access to the model's `config.json` (from HuggingFace or local)
 - Understanding of the model's attention mechanism (standard, GQA, sliding window, linear recurrence)
 
-**Recommended approach:** If your model is architecturally similar to an existing one (e.g., a LLaMA variant), start by copying `qwen3/` and modifying. Most transformer-based LLMs share 90%+ of the same structure.
+**Recommended approach:** If your model is architecturally similar to an existing one (e.g., a LLaMA variant), start by copying `qwen3.rs` and modifying. Most transformer-based LLMs share 90%+ of the same structure.
 
 **Reference implementations:**
 - `qwen3.rs` -- dense model (generate + classify + embed)
@@ -21,10 +21,9 @@ This guide walks through adding a new model architecture to Prelude.
 
 Adding a model requires **3 steps**:
 
-1. Create `models/<name>/mod.rs` — config struct, model struct, `ModelForward` impl
-2. Create `models/<name>/meta.rs` — `ArchSpec` impl with static instance
+1. Create `models/<name>.rs` — config struct, model struct, `ModelForward` impl, and `ArchSpec` metadata block
+2. Register the `ArchSpec` with `inventory::submit!` inside that model file
 3. Add `pub mod <name>;` in `models/mod.rs`
-4. Add one line in `ALL_ARCH_SPECS` in `models/registry.rs`
 
 No enum variants, no match arms, no central registry list.
 
@@ -32,14 +31,12 @@ No enum variants, no match arms, no central registry list.
 
 ```
 crates/prelude-core/src/models/
-  mymodel/
-    mod.rs    # Config struct, model struct, forward logic, ModelForward impl
-    meta.rs   # ArchSpec impl, static registration
+  mymodel.rs    # Config, model, forward logic, ArchSpec impl, inventory registration
 ```
 
 Each model is a **single flat file**. There is no `models/<name>/` subdirectory
-and no `meta.rs` split; one file per architecture keeps the registration and
-the implementation next to each other.
+and no `meta.rs` split; keep the private `mod meta` registration block in the
+same file as the implementation.
 
 ## Step 1: Config Struct
 
@@ -52,13 +49,13 @@ pub struct MyModelConfig {
     pub vocab_size: usize,
     pub num_hidden_layers: usize,
     pub max_position_embeddings: usize,
+    pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub head_dim: usize,
 
     // --- architecture-specific ---
     pub hidden_size: usize,
     pub intermediate_size: usize,
-    pub num_attention_heads: usize,
     #[serde(default = "default_rms_norm_eps")]
     pub rms_norm_eps: f64,
     // ...
@@ -67,8 +64,8 @@ pub struct MyModelConfig {
 fn default_rms_norm_eps() -> f64 { 1e-6 }
 ```
 
-The 5 fields (`vocab_size`, `num_hidden_layers`, `max_position_embeddings`, `num_key_value_heads`,
-`head_dim`) are extracted into `CommonModelConfig` by your `parse_config()` implementation.
+These fields are extracted into `CommonModelConfig` by your `parse_config()`
+implementation.
 
 ## Step 2: Model Struct + Forward
 
@@ -202,76 +199,82 @@ At the bottom of the same `models/<name>.rs` file, implement `ArchSpec` for
 discovery / config parsing / construction, and submit it to `inventory`:
 
 ```rust
-use super::*;
-use crate::engine::{CommonModelConfig, RuntimeCaps, TaskKind, WeightsBackend};
-use crate::engine::EngineError;
-use crate::models::registry::{
-    parse_json, model_err, ArchSpec, ParsedModelConfig,
-};
+mod meta {
+    use super::*;
+    use crate::engine::EngineError;
+    use crate::engine::{CommonModelConfig, RuntimeCaps, TaskKind, WeightsBackend};
+    use crate::models::registry::{
+        candle_model_err, parse_json, ArchSpec, ParsedModelConfig,
+    };
 
-const ARCHITECTURE_ALIASES: &[&str] = &["MyModelForCausalLM"];
-const MODEL_TYPE_ALIASES: &[&str] = &["mymodel"];
-const SUPPORTED_TASKS: &[TaskKind] = &[TaskKind::Generate];
+    const ARCHITECTURE_ALIASES: &[&str] = &["MyModelForCausalLM"];
+    const MODEL_TYPE_ALIASES: &[&str] = &["mymodel"];
+    const SUPPORTED_TASKS: &[TaskKind] = &[TaskKind::Generate];
 
-pub(crate) struct MyModelArchSpec;
-pub(crate) static MYMODEL_ARCH_SPEC: MyModelArchSpec = MyModelArchSpec;
+    pub(crate) struct MyModelArchSpec;
+    pub(crate) static MYMODEL_ARCH_SPEC: MyModelArchSpec = MyModelArchSpec;
+    inventory::submit!(crate::models::registry::ArchSpecEntry::new(
+        &MYMODEL_ARCH_SPEC
+    ));
 
-impl ArchSpec for MyModelArchSpec {
-    fn name(&self) -> &'static str { "mymodel" }
+    impl ArchSpec for MyModelArchSpec {
+        fn name(&self) -> &'static str { "mymodel" }
 
-    fn architecture_aliases(&self) -> &'static [&'static str] { ARCHITECTURE_ALIASES }
-    fn model_type_aliases(&self) -> &'static [&'static str] { MODEL_TYPE_ALIASES }
-    fn supported_tasks(&self) -> &'static [TaskKind] { SUPPORTED_TASKS }
+        fn architecture_aliases(&self) -> &'static [&'static str] { ARCHITECTURE_ALIASES }
+        fn model_type_aliases(&self) -> &'static [&'static str] { MODEL_TYPE_ALIASES }
+        fn supported_tasks(&self) -> &'static [TaskKind] { SUPPORTED_TASKS }
 
-    fn parse_config(
-        &self,
-        _task: TaskKind,
-        _raw: &serde_json::Value,
-        content: &str,
-    ) -> Result<ParsedModelConfig, EngineError> {
-        let cfg: MyModelConfig = parse_json(content, "MyModel config")?;
-        let common = CommonModelConfig {
-            vocab_size: cfg.vocab_size,
-            num_hidden_layers: cfg.num_hidden_layers,
-            max_position_embeddings: cfg.max_position_embeddings,
-            num_key_value_heads: cfg.num_key_value_heads,
-            head_dim: cfg.head_dim,
-        };
-        Ok(ParsedModelConfig {
-            common,
-            deltanet: None,
-            arch_config: Box::new(cfg),
-        })
-    }
+        fn parse_config(
+            &self,
+            _task: TaskKind,
+            _raw: &serde_json::Value,
+            content: &str,
+        ) -> Result<ParsedModelConfig, EngineError> {
+            let cfg: MyModelConfig = parse_json(content, "MyModel config")?;
+            let common = CommonModelConfig::new(
+                cfg.vocab_size,
+                cfg.num_hidden_layers,
+                cfg.max_position_embeddings,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+            );
+            Ok(ParsedModelConfig {
+                common,
+                deltanet: None,
+                arch_config: Box::new(cfg),
+            })
+        }
 
-    fn build_model(
-        &self,
-        arch_config: &dyn std::any::Any,
-        vb: VarBuilder<'_>,
-    ) -> Result<Box<dyn crate::models::ModelForward>, EngineError> {
-        let cfg = arch_config
-            .downcast_ref::<MyModelConfig>()
-            .ok_or_else(|| EngineError::Internal("unexpected config for MyModel".into()))?;
-        Ok(Box::new(
-            MyModelForCausalLM::new(cfg, vb).map_err(model_err)?,
-        ))
-    }
+        fn build_model(
+            &self,
+            arch_config: &dyn std::any::Any,
+            vb: VarBuilder<'_>,
+        ) -> Result<Box<dyn crate::models::ModelForward>, EngineError> {
+            let cfg = arch_config
+                .downcast_ref::<MyModelConfig>()
+                .ok_or_else(|| EngineError::Internal("unexpected config for MyModel".into()))?;
+            Ok(Box::new(
+                MyModelForCausalLM::new(cfg, vb).map_err(candle_model_err)?,
+            ))
+        }
 
-    fn runtime_caps(
-        &self,
-        task: TaskKind,
-        backend: WeightsBackend,
-        device: &prelude_core::tensor::Device,
-    ) -> RuntimeCaps {
-        let cuda_safetensors = device.is_cuda() && backend == WeightsBackend::Safetensors;
-        RuntimeCaps {
-            supports_kv_cache: task == TaskKind::Generate,
-            supports_prefix_cache: false,
-            supports_paged_attn: cfg!(feature = "cuda") && cuda_safetensors,
-            supports_varlen: cfg!(feature = "cuda") && cuda_safetensors,
-            supports_deltanet: false,
-            supports_cuda_graph: false,
-            supports_varlen_cpu: false,
+        fn runtime_caps(
+            &self,
+            task: TaskKind,
+            backend: WeightsBackend,
+            device: &prelude_core::tensor::Device,
+        ) -> RuntimeCaps {
+            let cuda_safetensors = device.is_cuda() && backend == WeightsBackend::Safetensors;
+            RuntimeCaps {
+                supports_kv_cache: task == TaskKind::Generate,
+                supports_prefix_cache: false,
+                supports_paged_attn: cfg!(feature = "cuda") && cuda_safetensors,
+                supports_varlen: cfg!(feature = "cuda") && cuda_safetensors,
+                supports_deltanet: false,
+                supports_cuda_graph: false,
+                supports_varlen_cpu: false,
+            }
         }
     }
 }
@@ -300,7 +303,7 @@ fn parse_config(&self, task: TaskKind, raw: &serde_json::Value, content: &str)
     -> Result<ParsedModelConfig, EngineError>
 {
     let cfg: MyModelConfig = parse_json(content, "MyModel config")?;
-    let common = CommonModelConfig { /* ... extract from cfg ... */ };
+    let common = CommonModelConfig::new(/* ... extract engine-facing fields from cfg ... */);
     let arch_config: Box<dyn std::any::Any + Send> = match task {
         TaskKind::Classify => {
             let cls_cfg = parse_json(content, "MyModel classifier config")?;
@@ -318,9 +321,9 @@ fn build_model(&self, arch_config: &dyn std::any::Any, vb: VarBuilder<'_>)
     let cfg = arch_config.downcast_ref::<MyModelArchConfig>()
         .ok_or_else(|| EngineError::Internal("unexpected config".into()))?;
     match cfg {
-        MyModelArchConfig::Dense(c) => Ok(Box::new(MyModelForCausalLM::new(c, vb).map_err(model_err)?)),
-        MyModelArchConfig::Classifier(c) => Ok(Box::new(MyModelForClassification::new(c, vb).map_err(model_err)?)),
-        MyModelArchConfig::Embedding(c) => Ok(Box::new(MyModelForEmbedding::new(c, vb).map_err(model_err)?)),
+        MyModelArchConfig::Dense(c) => Ok(Box::new(MyModelForCausalLM::new(c, vb).map_err(candle_model_err)?)),
+        MyModelArchConfig::Classifier(c) => Ok(Box::new(MyModelForClassification::new(c, vb).map_err(candle_model_err)?)),
+        MyModelArchConfig::Embedding(c) => Ok(Box::new(MyModelForEmbedding::new(c, vb).map_err(candle_model_err)?)),
     }
 }
 ```
@@ -331,34 +334,50 @@ If your architecture uses DeltaNet layers, compute the `DeltaNetPoolConfig` in `
 
 ```rust
 use crate::cache::deltanet_pool::DeltaNetPoolConfig;
+use crate::models::commons::HybridAttentionPattern;
 
 fn parse_config(&self, _task: TaskKind, _raw: &serde_json::Value, content: &str)
     -> Result<ParsedModelConfig, EngineError>
 {
     let cfg: MyModelConfig = parse_json(content, "MyModel config")?;
-    let common = CommonModelConfig { /* ... */ };
-    let deltanet = Some(DeltaNetPoolConfig {
-        num_deltanet_layers: /* ... */,
-        num_v_heads: cfg.linear_num_value_heads,
-        head_k_dim: cfg.linear_key_head_dim,
-        head_v_dim: cfg.linear_value_head_dim,
-        conv_dim: /* ... */,
-        conv_kernel: cfg.linear_conv_kernel_dim,
-    });
+    let pattern = HybridAttentionPattern::new(
+        cfg.num_hidden_layers,
+        cfg.full_attention_interval,
+    );
+    let common = CommonModelConfig::new(/* ... */)
+        .with_uniform_physical_kv_layers(pattern.full_attention_layers());
+    let deltanet = Some(DeltaNetPoolConfig::new(
+        pattern.recurrent_layers(),
+        cfg.linear_num_key_heads,
+        cfg.linear_num_value_heads,
+        cfg.linear_key_head_dim,
+        cfg.linear_value_head_dim,
+        cfg.linear_conv_kernel_dim,
+    ));
     Ok(ParsedModelConfig { common, deltanet, arch_config: Box::new(cfg) })
 }
 ```
 
 ## Step 5: Wire into the Module Tree
 
-Only **1 line** needed in existing code — the `ArchSpec` registration itself
+Only **1 line** is needed in existing code. The `ArchSpec` registration itself
 is done via `inventory::submit!` inside your model file:
 
 ```rust
 // tail of crates/prelude-core/src/models/mymodel.rs
-pub(crate) struct MyModelArchSpec;
-pub(crate) static MYMODEL_ARCH_SPEC: MyModelArchSpec = MyModelArchSpec;
-inventory::submit!(crate::models::registry::ArchSpecEntry::new(&MYMODEL_ARCH_SPEC));
+mod meta {
+    use super::*;
+
+    pub(crate) struct MyModelArchSpec;
+    pub(crate) static MYMODEL_ARCH_SPEC: MyModelArchSpec = MyModelArchSpec;
+    inventory::submit!(crate::models::registry::ArchSpecEntry::new(
+        &MYMODEL_ARCH_SPEC
+    ));
+
+    impl ArchSpec for MyModelArchSpec {
+        // ...
+    }
+}
 ```
 
 In `crates/prelude-core/src/models/mod.rs`:
@@ -367,28 +386,13 @@ In `crates/prelude-core/src/models/mod.rs`:
 pub mod mymodel;   // <-- add
 ```
 
-### 5b. Register in `all_arch_specs()`
-
-In `crates/prelude-core/src/models/registry.rs`:
-
-```rust
-static ALL_ARCH_SPECS: &[&dyn ArchSpec] = &[
-    &super::qwen3::meta::QWEN3_ARCH_SPEC,
-    // ...existing...
-    &super::mymodel::meta::MYMODEL_ARCH_SPEC,    // <-- add
-];
-```
-
-No array size to bump — it's a static slice.
-
 ## Checklist
 
-- [ ] Config struct with 5 common fields (`vocab_size`, `num_hidden_layers`, `max_position_embeddings`, `num_key_value_heads`, `head_dim`)
+- [ ] Config struct with common engine fields (`vocab_size`, `num_hidden_layers`, `max_position_embeddings`, `num_attention_heads`, `num_key_value_heads`, `head_dim`)
 - [ ] Model struct with `new()` and `forward()`
 - [ ] `impl ModelForward` with required + relevant optional methods
-- [ ] `meta.rs` with `ArchSpec` impl and static instance
+- [ ] Private `mod meta` with `ArchSpec` impl and `inventory::submit!`
 - [ ] Module exported in `models/mod.rs`
-- [ ] Registered in `ALL_ARCH_SPECS` in `models/registry.rs`
 - [ ] `cargo build` passes
 - [ ] `cargo test` passes
 - [ ] Server loads model and serves requests

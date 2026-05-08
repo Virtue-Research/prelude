@@ -189,3 +189,5 @@ review and should not alter serving behavior:
   instead of reading environment variables inside model/cache modules.
 - Share grouped-prefill batch slicing policy between Qwen3.5 and Qwen3-Next.
 - Share packed-varlen sequence offset calculation between hybrid models.
+- Refresh model-onboarding docs to match the current single-file inventory
+  registry and shared config helpers.
