@@ -105,23 +105,12 @@ impl Engine {
         };
 
         // ── DeltaNet slots ────────────────────────────────────────────
-        let deltanet_slots: Option<Vec<u32>> = if self.cache.deltanet_pool.is_some() {
-            let slots: Vec<u32> = requests.iter().filter_map(|r| r.deltanet_slot).collect();
-            if slots.len() == num_requests {
-                Some(slots)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let deltanet_slots_gpu = match deltanet_slots.as_ref() {
-            Some(slots) if self.executor.device.is_cuda() => Some(
-                Tensor::from_vec(slots.clone(), (slots.len(),), &self.executor.device)
-                    .map_err(tensor_err)?,
-            ),
-            _ => None,
-        };
+        let deltanet_slots =
+            super::collect_deltanet_slots(self.cache.deltanet_pool.is_some(), requests, |req| {
+                req.deltanet_slot
+            });
+        let deltanet_slots_gpu =
+            super::deltanet_slots_tensor(deltanet_slots.as_deref(), &self.executor.device)?;
         let deltanet_state_is_zero: Option<Vec<bool>> = deltanet_slots
             .as_ref()
             .map(|_| requests.iter().map(|req| req.position_start == 0).collect());

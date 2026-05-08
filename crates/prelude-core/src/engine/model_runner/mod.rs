@@ -72,6 +72,31 @@ fn lock_deltanet_pool(
     .transpose()
 }
 
+fn collect_deltanet_slots<T>(
+    enabled: bool,
+    items: &[T],
+    slot: impl Fn(&T) -> Option<u32>,
+) -> Option<Vec<u32>> {
+    if !enabled {
+        return None;
+    }
+
+    let slots: Vec<u32> = items.iter().filter_map(slot).collect();
+    (slots.len() == items.len()).then_some(slots)
+}
+
+fn deltanet_slots_tensor(
+    slots: Option<&[u32]>,
+    device: &Device,
+) -> Result<Option<Tensor>, EngineError> {
+    match slots {
+        Some(slots) if device.is_cuda() => Tensor::from_vec(slots.to_vec(), (slots.len(),), device)
+            .map(Some)
+            .map_err(tensor_err),
+        _ => Ok(None),
+    }
+}
+
 fn pretokenized_token_groups<R>(items: &[PreTokenizedBatchItem<R>]) -> Vec<&[Vec<u32>]> {
     items.iter().map(|item| item.token_ids.as_slice()).collect()
 }

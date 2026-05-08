@@ -60,17 +60,10 @@ impl Engine {
             &self.executor.device,
         )?;
 
-        // Build deltanet_slots from BatchDecodeSeq
-        let deltanet_slots: Option<Vec<u32>> = if self.cache.deltanet_pool.is_some() {
-            let slots: Vec<u32> = seqs.iter().filter_map(|s| s.deltanet_slot).collect();
-            if slots.len() == batch_size {
-                Some(slots)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let deltanet_slots =
+            super::collect_deltanet_slots(self.cache.deltanet_pool.is_some(), seqs, |seq| {
+                seq.deltanet_slot
+            });
 
         // Forward
         let mut model = self
