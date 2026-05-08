@@ -12,6 +12,7 @@
 //! - HuggingFace `modeling_qwen3_5.py`
 //! SGLang is licensed under the Apache License, Version 2.0.
 
+use crate::config::global_runtime;
 use crate::loading::var_builder::VarBuilder;
 use crate::models::commons::embedding::Embedding;
 use crate::models::commons::linear::DenseLinear;
@@ -24,7 +25,6 @@ use crate::models::commons::{
 use crate::models::resolve_or_warn;
 use crate::ops::{MaskType, PagedParams, VarlenParams};
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
 
 const MAX_GROUPED_PREFILL_BATCH: usize = 8;
 const MAX_ZERO_GROUPED_PREFILL_BATCH: usize = 16;
@@ -1874,45 +1874,21 @@ fn grouped_prefill_take_with(remaining: usize, max_batch: usize) -> usize {
 }
 
 fn qwen35_kda_decode_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PRELUDE_QWEN35_KDA_DECODE")
-            .map(|v| {
-                !matches!(
-                    v.as_str(),
-                    "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
-                )
-            })
-            .unwrap_or(true)
-    })
+    global_runtime()
+        .map(|runtime| runtime.qwen35_kda_decode)
+        .unwrap_or(true)
 }
 
 fn qwen35_grouped_pooled_prefill_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PRELUDE_QWEN35_GROUPED_POOLED_PREFILL")
-            .map(|v| {
-                !matches!(
-                    v.as_str(),
-                    "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
-                )
-            })
-            .unwrap_or(true)
-    })
+    global_runtime()
+        .map(|runtime| runtime.qwen35_grouped_pooled_prefill)
+        .unwrap_or(true)
 }
 
 fn qwen35_varlen_pooled_prefill_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PRELUDE_QWEN35_VARLEN_POOLED_PREFILL")
-            .map(|v| {
-                !matches!(
-                    v.as_str(),
-                    "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
-                )
-            })
-            .unwrap_or(true)
-    })
+    global_runtime()
+        .map(|runtime| runtime.qwen35_varlen_pooled_prefill)
+        .unwrap_or(true)
 }
 
 fn grouped_prefill_input(

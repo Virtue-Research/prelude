@@ -855,10 +855,8 @@ mod meta {
             // → 5.33 RPS @ conc=32) on Qwen3-30B-A3B with no failures
             // across 200 requests. PRELUDE_MOE_CUDA_GRAPH=0 keeps the
             // historical opt-out for triage.
-            let moe_graph = std::env::var("PRELUDE_MOE_CUDA_GRAPH")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .map(|v| v != 0)
+            let moe_graph = crate::config::global_runtime()
+                .map(|runtime| runtime.moe_cuda_graph)
                 .unwrap_or(true);
             RuntimeCaps {
                 supports_kv_cache: is_safetensors && is_generate,

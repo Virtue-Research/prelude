@@ -185,3 +185,5 @@ review and should not alter serving behavior:
 - Remove stray temporary/review markers and unused runtime-cap variables.
 - Centralize prefix-aware scheduler prefill chunk selection so running and
   waiting admission paths cannot drift.
+- Centralize model/runtime `PRELUDE_*` feature toggles in `EngineConfig`
+  instead of reading environment variables inside model/cache modules.
