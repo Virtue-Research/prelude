@@ -13,22 +13,22 @@ use fastokens::Tokenizer;
 use crate::cache::manager::CacheManager;
 use crate::config::EngineConfig;
 use crate::engine::{
-    EmbeddingSemantics, Engine, EngineError, ModelDescriptor, ModelExecutor, ModelVariant,
-    ResolvedModelConfig, RuntimeCaps, TaskKind, TaskOverride, WeightsBackend, has_remote_file,
-    init_runtime, load_model_config, load_safetensor_filenames, load_var_builder_from_filenames,
-    load_weights, parse_model_config_for_source, select_device, tensor_err,
+    Engine, EngineError, ModelDescriptor, ModelExecutor, ModelVariant, ResolvedModelConfig,
+    RuntimeCaps, TaskKind, TaskOverride, WeightsBackend, has_remote_file, init_runtime,
+    load_model_config, load_safetensor_filenames, load_var_builder_from_filenames, load_weights,
+    parse_model_config_for_source, select_device, tensor_err,
 };
 use crate::models::gemma3::meta::{Gemma3ModelBuildContext, build_gemma3_model_with_context};
-use crate::tensor::quantized::gguf_file::Content as GgufContent;
-
-const GGUF_BASE_MODEL_REPO_URL_KEY: &str = "general.base_model.0.repo_url";
-const HF_REPO_URL_PREFIX: &str = "https://huggingface.co/";
 
 mod embedding_modules;
+mod gguf;
+mod tokenizer;
 
 use self::embedding_modules::{
     LoadedEmbeddingModules, load_embedding_modules_from_dir, load_embedding_modules_from_repo,
 };
+use self::gguf::{load_gguf, load_hf_hub_gguf};
+use self::tokenizer::{load_tokenizer, load_tokenizer_file};
 
 impl Engine {
     pub fn from_local_path_with_task(
@@ -113,7 +113,7 @@ impl Engine {
             Ok(path) => path,
             Err(_) => {
                 tracing::info!("config.json not found, checking for GGUF files");
-                return Self::from_hf_hub_gguf(repo_id, &repo, task_override, engine_config).await;
+                return load_hf_hub_gguf(repo_id, &repo, task_override, engine_config).await;
             }
         };
         let tokenizer_path = repo.get("tokenizer.json").await.map_err(|e| {
@@ -158,79 +158,6 @@ impl Engine {
             engine_config,
         )
     }
-
-    /// Load a GGUF model from an HF Hub repo that contains .gguf files but no config.json.
-    /// Auto-selects the best GGUF file (prefers Q8_0 > Q4_K_M > largest).
-    async fn from_hf_hub_gguf(
-        repo_id: &str,
-        repo: &hf_hub::api::tokio::ApiRepo,
-        task_override: TaskOverride,
-        engine_config: EngineConfig,
-    ) -> Result<Self, EngineError> {
-        let info = repo
-            .info()
-            .await
-            .map_err(|e| EngineError::Internal(format!("failed to get repo info: {e}")))?;
-
-        let gguf_files: Vec<&str> = info
-            .siblings
-            .iter()
-            .map(|s| s.rfilename.as_str())
-            .filter(|f| f.ends_with(".gguf"))
-            .collect();
-
-        if gguf_files.is_empty() {
-            return Err(EngineError::InvalidRequest(format!(
-                "repo {repo_id} has no config.json or .gguf files"
-            )));
-        }
-
-        let selected = gguf_files
-            .iter()
-            .find(|f| f.contains("Q8_0"))
-            .or_else(|| gguf_files.iter().find(|f| f.contains("Q4_K_M")))
-            .or_else(|| gguf_files.first())
-            .unwrap();
-
-        tracing::info!(file = %selected, "auto-selected GGUF file from {repo_id}");
-
-        let gguf_path = repo
-            .get(selected)
-            .await
-            .map_err(|e| EngineError::Internal(format!("failed to download {selected}: {e}")))?;
-
-        let tokenizer_model_id = resolve_gguf_tokenizer_repo(repo_id, &gguf_path);
-
-        load_gguf(&gguf_path, tokenizer_model_id, task_override, engine_config)
-    }
-}
-
-/// Try to resolve the tokenizer source for a GGUF repo.
-/// 1. If this repo has tokenizer.json, use it directly.
-/// 2. Otherwise, read GGUF metadata for `general.base_model.0.repo_url` to find the base model.
-/// 3. Fall back to stripping `-GGUF` suffix from repo_id.
-fn resolve_gguf_tokenizer_repo(repo_id: &str, gguf_path: &Path) -> String {
-    // Check if tokenizer.json exists next to GGUF or in repo
-    if let Some(parent) = gguf_path.parent() {
-        if parent.join("tokenizer.json").exists() {
-            return repo_id.to_string();
-        }
-    }
-
-    // Try reading base_model from GGUF metadata
-    if let Ok(mut file) = std::fs::File::open(gguf_path) {
-        if let Ok(ct) = GgufContent::read(&mut file)
-            && let Some(repo) = gguf_base_model_repo(&ct)
-        {
-            tracing::info!(base_model = %repo, "resolved tokenizer from GGUF metadata");
-            return repo;
-        }
-    }
-
-    // Fallback: strip -GGUF suffix (e.g. "unsloth/Qwen3.5-0.8B-GGUF" → "unsloth/Qwen3.5-0.8B")
-    let fallback = stripped_gguf_repo_id(repo_id).unwrap_or_else(|| repo_id.to_string());
-    tracing::info!(fallback = %fallback, "using fallback tokenizer repo (stripped -GGUF suffix)");
-    fallback
 }
 
 // ── Free functions ────────────────────────────────────────────────────────
@@ -334,207 +261,6 @@ fn load_safetensor_parts(
         descriptor: built.descriptor,
         engine_config,
     })
-}
-
-/// Detect GGUF architecture from metadata.
-fn detect_gguf_arch(ct: &GgufContent) -> String {
-    ct.metadata
-        .get("general.architecture")
-        .and_then(|v| v.to_string().ok().map(|s| s.to_string()))
-        .unwrap_or_else(|| "qwen3".to_string())
-}
-
-fn gguf_base_model_repo(ct: &GgufContent) -> Option<String> {
-    ct.metadata
-        .get(GGUF_BASE_MODEL_REPO_URL_KEY)
-        .and_then(|v| v.to_string().ok())
-        .and_then(|url| hf_repo_from_url(&url))
-}
-
-fn hf_repo_from_url(url: &str) -> Option<String> {
-    url.strip_prefix(HF_REPO_URL_PREFIX).map(str::to_string)
-}
-
-fn stripped_gguf_repo_id(model_id: &str) -> Option<String> {
-    model_id
-        .strip_suffix("-GGUF")
-        .or_else(|| model_id.strip_suffix("-gguf"))
-        .map(str::to_string)
-}
-
-fn stripped_hf_gguf_repo_id(model_id: &str) -> Option<String> {
-    stripped_gguf_repo_id(model_id).filter(|repo| repo.contains('/') && !repo.starts_with('/'))
-}
-
-/// Guess the HF repo that ships the tokenizer for this GGUF when the
-/// metadata doesn't carry `general.base_model.0.repo_url`. Pieces it
-/// together from `general.basename` + `general.size_label` and a small
-/// per-arch org map (Qwen, Meta-Llama, Google).
-///
-/// Covers the common case of `Qwen/Qwen3-*-GGUF` — those uploads drop
-/// the base_model URL but encode enough metadata to reconstruct the
-/// canonical "Qwen/Qwen3-0.6B" repo. Returns `None` for unmapped arches
-/// (Mistral, DeepSeek, etc.); callers fall back to `model_id` and
-/// surface a clear tokenizer-download error.
-fn guess_tokenizer_repo_from_gguf_metadata(ct: &GgufContent, arch: &str) -> Option<String> {
-    let basename = ct
-        .metadata
-        .get("general.basename")
-        .and_then(|v| v.to_string().ok().map(|s| s.to_string()))?;
-    let size_label = ct
-        .metadata
-        .get("general.size_label")
-        .and_then(|v| v.to_string().ok().map(|s| s.to_string()));
-
-    let org = match arch {
-        "qwen3" | "qwen2" | "qwen" => "Qwen",
-        "llama" => "meta-llama",
-        "gemma2" | "gemma3" => "google",
-        _ => return None,
-    };
-
-    let repo = match size_label {
-        Some(size) if !size.is_empty() => format!("{org}/{basename}-{size}"),
-        _ => format!("{org}/{basename}"),
-    };
-    tracing::info!(
-        repo = %repo, arch, basename,
-        "guessing GGUF tokenizer repo from metadata"
-    );
-    Some(repo)
-}
-
-/// Load a quantized model from a GGUF file.
-fn load_gguf(
-    gguf_path: &Path,
-    model_id: String,
-    task_override: TaskOverride,
-    engine_config: EngineConfig,
-) -> Result<Engine, EngineError> {
-    tracing::info!(path = %gguf_path.display(), "loading GGUF model");
-    let load_start = Instant::now();
-
-    if !matches!(task_override, TaskOverride::Auto | TaskOverride::Generate) {
-        return Err(EngineError::InvalidRequest(
-            "GGUF models currently support generation only".into(),
-        ));
-    }
-
-    let (device, _dtype) = select_device(&engine_config.runtime)?;
-    let dtype = DType::F32; // working dtype for embeddings/norms
-
-    let mut file = std::fs::File::open(gguf_path)
-        .map_err(|e| EngineError::Internal(format!("failed to open GGUF: {e}")))?;
-    let ct = GgufContent::read(&mut file).map_err(tensor_err)?;
-
-    let arch = detect_gguf_arch(&ct);
-    tracing::info!(arch = %arch, "detected GGUF architecture");
-
-    // Resolve tokenizer:
-    //   1. tokenizer.json sitting next to the GGUF file → use it directly.
-    //   2. `general.base_model.0.repo_url` in GGUF metadata → derive HF repo.
-    //   3. Strip `-GGUF` suffix from `model_id` (covers `Qwen/X-GGUF` →
-    //      `Qwen/X` for users who passed an HF repo).
-    //   4. Per-arch heuristic from `general.basename` + `general.size_label`
-    //      (covers community GGUF uploads that drop the base_model URL —
-    //      most notably `Qwen/Qwen3-*-GGUF`).
-    //   5. Fall back to `model_id` as-is (which 404s — we surface a
-    //      tokenizer download error rather than crashing with a path).
-    //
-    // Steps 2 and 4 are what make `--model /path/to/foo.gguf` work without
-    // requiring a separate `--tokenizer` flag.
-    let tokenizer = if let Some(parent) = gguf_path.parent()
-        && parent.join("tokenizer.json").exists()
-    {
-        load_tokenizer(parent)?
-    } else {
-        let tokenizer_repo = gguf_base_model_repo(&ct)
-            .or_else(|| stripped_hf_gguf_repo_id(&model_id))
-            .or_else(|| guess_tokenizer_repo_from_gguf_metadata(&ct, &arch))
-            .unwrap_or_else(|| model_id.clone());
-        tracing::info!(repo = %tokenizer_repo, "resolving GGUF tokenizer");
-        download_tokenizer(&tokenizer_repo)?
-    };
-
-    // Look up architecture in the registry (inventory-based, no hardcoded model imports)
-    let arch_spec =
-        crate::models::registry::find_arch_spec_by_gguf_arch(&arch).ok_or_else(|| {
-            EngineError::InvalidRequest(format!("unsupported GGUF architecture '{arch}'"))
-        })?;
-    let result = arch_spec.load_gguf(ct, &mut file, &device)?;
-
-    let eos_token_ids = if result.eos_token_ids.is_empty() {
-        return Err(EngineError::InvalidRequest(
-            "GGUF metadata missing `tokenizer.ggml.eos_token_id`".into(),
-        ));
-    } else {
-        result.eos_token_ids
-    };
-
-    let descriptor = ModelDescriptor {
-        task: TaskKind::Generate,
-        arch_name: arch_spec.name(),
-        backend: WeightsBackend::Gguf,
-    };
-    let runtime_caps = RuntimeCaps {
-        supports_kv_cache: true,
-        ..RuntimeCaps::default()
-    };
-
-    let executor = ModelExecutor {
-        model: Mutex::new(result.model),
-        ops: crate::ops::select_ops(&device),
-        device: device.clone(),
-        dtype,
-        config: result.common,
-        runtime_caps,
-    };
-
-    tracing::info!(
-        elapsed_ms = load_start.elapsed().as_millis() as u64,
-        arch = arch_spec.name(),
-        layers = executor.config.num_hidden_layers,
-        vocab = executor.config.vocab_size,
-        "GGUF model loaded via registry"
-    );
-
-    Ok(Engine {
-        executor,
-        cache: CacheManager::none(),
-        tokenizer,
-        model_id,
-        embedding_semantics: EmbeddingSemantics::default(),
-        eos_token_ids,
-        descriptor,
-        engine_config,
-    })
-}
-
-fn load_tokenizer(model_path: &Path) -> Result<Tokenizer, EngineError> {
-    let tokenizer_path = model_path.join("tokenizer.json");
-    load_tokenizer_file(&tokenizer_path)
-}
-
-fn load_tokenizer_file(tokenizer_path: &Path) -> Result<Tokenizer, EngineError> {
-    Tokenizer::from_file(tokenizer_path).map_err(|e| {
-        EngineError::Internal(format!("failed to load {}: {e}", tokenizer_path.display()))
-    })
-}
-
-/// Download tokenizer.json from HuggingFace Hub.
-fn download_tokenizer(model_id: &str) -> Result<Tokenizer, EngineError> {
-    tracing::info!(
-        repo = model_id,
-        "downloading tokenizer from HuggingFace Hub"
-    );
-    let api = hf_hub::api::sync::Api::new()
-        .map_err(|e| EngineError::Internal(format!("hf-hub api init: {e}")))?;
-    let repo = api.model(model_id.to_string());
-    let tokenizer_path = repo
-        .get("tokenizer.json")
-        .map_err(|e| EngineError::Internal(format!("failed to download tokenizer.json: {e}")))?;
-    Tokenizer::from_file(tokenizer_path.as_path())
-        .map_err(|e| EngineError::Internal(format!("failed to load tokenizer: {e}")))
 }
 
 /// Profile peak GPU activation memory via a dummy forward pass.
