@@ -18,23 +18,35 @@ pub(crate) struct RotaryEmbedding {
 
 impl RotaryEmbedding {
     pub(crate) fn new(dtype: DType, cfg: &Qwen3Config, dev: &Device) -> Result<Self> {
-        let dim = cfg.head_dim;
-        let max_seq_len = cfg.max_position_embeddings;
-        let inv_freq: Vec<_> = (0..dim)
-            .step_by(2)
-            .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
-            .collect();
-        let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(DType::F32)?;
-        let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
-            .to_dtype(DType::F32)?
-            .reshape((max_seq_len, 1))?;
-        let freqs = t.broadcast_mul(&inv_freq)?;
-        let sin = freqs.sin()?.to_dtype(dtype)?;
-        let cos = freqs.cos()?.to_dtype(dtype)?;
-
+        let (cos, sin) = rotary_freq_tables(
+            cfg.head_dim,
+            cfg.max_position_embeddings,
+            cfg.rope_theta,
+            dtype,
+            dev,
+        )?;
         Ok(Self { sin, cos })
     }
+}
+
+pub(crate) fn rotary_freq_tables(
+    dim: usize,
+    max_position_embeddings: usize,
+    rope_theta: f64,
+    dtype: DType,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let half = dim / 2;
+    let inv_freq: Vec<f32> = (0..dim)
+        .step_by(2)
+        .map(|i| 1.0 / rope_theta.powf(i as f64 / dim as f64) as f32)
+        .collect();
+    let inv_freq = Tensor::from_vec(inv_freq, (1, half), device)?.to_dtype(DType::F32)?;
+    let positions = Tensor::arange(0u32, max_position_embeddings as u32, device)?
+        .to_dtype(DType::F32)?
+        .reshape((max_position_embeddings, 1))?;
+    let freqs = positions.broadcast_mul(&inv_freq)?;
+    Ok((freqs.cos()?.to_dtype(dtype)?, freqs.sin()?.to_dtype(dtype)?))
 }
 
 pub(crate) fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {

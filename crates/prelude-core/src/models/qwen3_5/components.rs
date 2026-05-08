@@ -1,5 +1,5 @@
 use crate::loading::var_builder::VarBuilder;
-use crate::models::commons::attn_utils::apply_partial_rotary_varlen;
+use crate::models::commons::attn_utils::{apply_partial_rotary_varlen, rotary_freq_tables};
 use crate::tensor::{D, DType, Device, Result, Tensor};
 
 use super::Qwen3_5Config;
@@ -15,21 +15,13 @@ pub(super) struct PartialRotaryEmbedding {
 impl PartialRotaryEmbedding {
     pub(super) fn new(cfg: &Qwen3_5Config, dtype: DType, device: &Device) -> Result<Self> {
         let rotary_dim = cfg.rotary_dim();
-        let half = rotary_dim / 2;
-        let inv_freq: Vec<f32> = (0..rotary_dim)
-            .step_by(2)
-            .map(|i| 1.0 / cfg.rope_theta.powf(i as f64 / rotary_dim as f64) as f32)
-            .collect();
-        // Build the [L, D/2] frequency table via broadcast_mul instead of a K=1
-        // matmul (CUTLASS/DeepGEMM only support TN layout; a literal outer-product
-        // matmul falls through to an unsupported NN kernel).
-        let inv_freq = Tensor::from_vec(inv_freq, (1, half), device)?.to_dtype(DType::F32)?;
-        let positions = Tensor::arange(0u32, cfg.max_position_embeddings as u32, device)?
-            .to_dtype(DType::F32)?
-            .reshape((cfg.max_position_embeddings, 1))?;
-        let freqs = positions.broadcast_mul(&inv_freq)?;
-        let cos = freqs.cos()?.to_dtype(dtype)?;
-        let sin = freqs.sin()?.to_dtype(dtype)?;
+        let (cos, sin) = rotary_freq_tables(
+            rotary_dim,
+            cfg.max_position_embeddings,
+            cfg.rope_theta,
+            dtype,
+            device,
+        )?;
         Ok(Self {
             cos,
             sin,

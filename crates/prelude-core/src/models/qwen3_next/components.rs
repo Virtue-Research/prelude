@@ -1,5 +1,5 @@
 use crate::loading::var_builder::VarBuilder;
-use crate::models::commons::attn_utils::apply_partial_rotary_varlen;
+use crate::models::commons::attn_utils::{apply_partial_rotary_varlen, rotary_freq_tables};
 use crate::tensor::{D, DType, Device, Result, Tensor};
 
 use super::Qwen3NextConfig;
@@ -15,16 +15,13 @@ pub(super) struct PartialRotaryEmbedding {
 impl PartialRotaryEmbedding {
     pub(super) fn new(cfg: &Qwen3NextConfig, dtype: DType, device: &Device) -> Result<Self> {
         let rotary_dim = cfg.rotary_dim();
-        let inv_freq: Vec<f32> = (0..rotary_dim)
-            .step_by(2)
-            .map(|i| 1.0 / cfg.rope_theta.powf(i as f64 / rotary_dim as f64) as f32)
-            .collect();
-        let inv_freq = Tensor::new(inv_freq, device)?;
-        let positions = Tensor::arange(0u32, cfg.max_position_embeddings as u32, device)?
-            .to_dtype(DType::F32)?;
-        let freqs = positions.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?;
-        let cos = freqs.cos()?.to_dtype(dtype)?;
-        let sin = freqs.sin()?.to_dtype(dtype)?;
+        let (cos, sin) = rotary_freq_tables(
+            rotary_dim,
+            cfg.max_position_embeddings,
+            cfg.rope_theta,
+            dtype,
+            device,
+        )?;
         Ok(Self {
             cos,
             sin,
