@@ -468,14 +468,9 @@ fn cap_hybrid_prefix_cache_chunk(seq: &Sequence, block_size: usize, chunk: usize
     let after = computed + chunk;
 
     // DeltaNet prefix entries require an exact state snapshot at the cached
-    // boundary. The reusable boundary must be strictly before the full prompt:
-    // generation still needs to run at least one suffix token to produce logits
-    // for the first sampled token. For block-aligned prompts, keep the final
-    // full block as suffix instead of caching the whole prompt.
-    let mut final_reusable = prompt_len - (prompt_len % block_size);
-    if final_reusable == prompt_len {
-        final_reusable = final_reusable.saturating_sub(block_size);
-    }
+    // boundary. Keep exactly one suffix token so generation can produce logits
+    // for the first sampled token, even when the prompt is not block-aligned.
+    let final_reusable = prompt_len.saturating_sub(1);
     if final_reusable > computed && after > final_reusable {
         return final_reusable - computed;
     }

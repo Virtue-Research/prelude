@@ -688,10 +688,7 @@ fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) -> Option<Pref
         return None;
     };
 
-    let (mut cached_len, mut cached_blocks, deltanet_state) = match if engine
-        .cache
-        .deltanet_pool
-        .is_some()
+    let (cached_len, cached_blocks, deltanet_state) = match if engine.cache.deltanet_pool.is_some()
     {
         engine
             .cache
@@ -709,31 +706,76 @@ fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) -> Option<Pref
         }
     };
 
-    // Reuse only full paged-KV blocks. Prefix-cache entries can be smaller
-    // than paged blocks; sharing a partial page would let suffix writes mutate
-    // cached KV that another prompt may later reuse.
-    cached_len -= cached_len % pool.block_size;
-    cached_blocks.truncate(cached_len / pool.block_size);
-
-    if cached_len == 0
-        || cached_len <= seq.kv_computed_len
-        || cached_len >= seq.input_ids.len()
-        || cached_blocks.is_empty()
-    {
+    if cached_len == 0 || cached_len <= seq.kv_computed_len || cached_len >= seq.input_ids.len() {
         return None;
     }
 
-    if let Err(error) = engine.cache.retain_paged_blocks(&cached_blocks) {
+    let block_size = pool.block_size.max(1);
+    let full_shared_blocks = cached_len / block_size;
+    let partial_tokens = cached_len % block_size;
+    let mut retained_blocks = Vec::new();
+    let mut block_table = Vec::new();
+    let mut private_partial_block = None;
+
+    if partial_tokens == 0 {
+        if full_shared_blocks == 0 || cached_blocks.len() < full_shared_blocks {
+            return None;
+        }
+        retained_blocks.extend_from_slice(&cached_blocks[..full_shared_blocks]);
+        block_table.extend_from_slice(&retained_blocks);
+    } else {
+        if cached_blocks.len() < full_shared_blocks + 1 {
+            return None;
+        }
+        retained_blocks.extend_from_slice(&cached_blocks[..full_shared_blocks]);
+        block_table.extend_from_slice(&retained_blocks);
+
+        let source_partial_block = cached_blocks[full_shared_blocks];
+        let private_block = match engine.cache.allocate_paged_block() {
+            Ok(Some(block)) => block,
+            Ok(None) => {
+                tracing::warn!(request_id = %seq.request_id, "prefix cache partial-page copy skipped: no free KV block");
+                return None;
+            }
+            Err(error) => {
+                tracing::warn!(request_id = %seq.request_id, error = %error, "prefix cache partial-page block allocation failed");
+                return None;
+            }
+        };
+        if let Err(error) = engine
+            .cache
+            .copy_paged_kv_block(source_partial_block, private_block)
+        {
+            let _ = engine.cache.release_paged_blocks(&[private_block]);
+            tracing::warn!(request_id = %seq.request_id, error = %error, "prefix cache partial-page KV copy failed");
+            return None;
+        }
+        private_partial_block = Some(private_block);
+        block_table.push(private_block);
+    }
+
+    if block_table.is_empty() {
+        if let Some(block) = private_partial_block {
+            let _ = engine.cache.release_paged_blocks(&[block]);
+        }
+        return None;
+    }
+
+    if let Err(error) = engine.cache.retain_paged_blocks(&retained_blocks) {
         tracing::warn!(request_id = %seq.request_id, error = %error, "prefix cache block retain failed");
+        if let Some(block) = private_partial_block {
+            let _ = engine.cache.release_paged_blocks(&[block]);
+        }
         return None;
     }
 
     seq.kv_computed_len = cached_len;
-    let replaced_blocks = std::mem::replace(&mut seq.block_table, cached_blocks);
+    let replaced_blocks = std::mem::replace(&mut seq.block_table, block_table);
     tracing::debug!(
         request_id = %seq.request_id,
         cached_len,
         cached_blocks = seq.block_table.len(),
+        partial_tokens,
         suffix_len = seq.input_ids.len() - cached_len,
         "attached AR prefix-cache reuse"
     );
@@ -1226,7 +1268,8 @@ fn process_step_output(
         // Populate prefix cache once a prefill reaches a reusable boundary.
         // Non-hybrid models only need KV blocks and can use the completed
         // prompt. Hybrid DeltaNet models additionally need a state snapshot
-        // at the exact block-aligned boundary being cached.
+        // at the exact boundary being cached, which may be inside a paged KV
+        // block for the final `prompt_len - 1` fast path.
         if engine.cache.prefix_cache.is_some() {
             if let (Some(seq), Some(pool), Some(result)) = (
                 scheduler.get_sequence(request_id),
@@ -1236,8 +1279,7 @@ fn process_step_output(
                 if !result.block_table.is_empty() && !seq.input_ids.is_empty() {
                     if let Some(dn_pool_mutex) = engine.cache.deltanet_pool.as_ref() {
                         if computed > 0
-                            && computed <= seq.input_ids.len()
-                            && computed % pool.block_size == 0
+                            && computed < seq.input_ids.len()
                             && let Some(slot) = seq.deltanet_slot
                         {
                             match dn_pool_mutex
