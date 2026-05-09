@@ -1864,7 +1864,7 @@ fn grouped_prefill_take_with(remaining: usize, max_batch: usize) -> usize {
     }
 }
 
-fn qwen35_kda_decode_enabled() -> bool {
+pub fn qwen35_kda_decode_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("PRELUDE_QWEN35_KDA_DECODE")
