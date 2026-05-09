@@ -16,6 +16,7 @@ use prelude_core::cache::block_manager::BlockManager;
 use prelude_core::config::EngineConfig;
 use prelude_core::engine::{Engine, EngineError, OwnedBatchDecodeSeq};
 use prelude_core::models::commons::{BatchAttnContext, PagedKvBatchContext};
+use prelude_core::models::qwen3_5::qwen35_kda_decode_enabled;
 
 use crate::device::GpuDType;
 
@@ -379,7 +380,7 @@ impl DecodeGraphCache {
         let has_deltanet = engine.cache.deltanet_pool.is_some();
         if has_deltanet && !Self::deltanet_graph_supported(engine, batch_size)? {
             return Err(EngineError::Internal(format!(
-                "CUDA graph capture batch {batch_size} has no DeltaNet fused decode variant"
+                "CUDA graph capture batch {batch_size} has no enabled DeltaNet fused decode variant"
             )));
         }
         let max_blocks = (seqlen_budget + self.block_size - 1) / self.block_size;
@@ -515,6 +516,12 @@ impl DecodeGraphCache {
         let Some(pool_mutex) = &engine.cache.deltanet_pool else {
             return Ok(true);
         };
+        // Graph replay updates only the GPU DeltaNet slot tensor. The unfused
+        // pooled fallback consumes CPU slot IDs that would be captured as
+        // constants, so DeltaNet graph replay requires fused KDA decode.
+        if !qwen35_kda_decode_enabled() {
+            return Ok(false);
+        }
         let pool = pool_mutex
             .lock()
             .map_err(|e| EngineError::Internal(format!("DeltaNet pool lock poisoned: {e}")))?;
