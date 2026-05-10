@@ -27,17 +27,17 @@
 //! - `output`: `[packed_seq, num_sab_heads, head_dim]` BF16
 //! - `output_state`: `[num_seqs, num_sab_heads, head_dim, head_dim]` F32
 
-use candle_core::Shape;
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::WrapErr;
+use candle_core::Shape;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
-use flashinfer::KernelRegistry;
 use flashinfer::types::{
-    DLDataType, DLDevice, DLTensor, KDLBFLOAT, KDLCUDA, KDLFLOAT, KDLINT, KDLUINT, TVMFFIAny,
+    DLDataType, DLDevice, DLTensor, TVMFFIAny, KDLBFLOAT, KDLCUDA, KDLFLOAT, KDLINT, KDLUINT,
 };
+use flashinfer::KernelRegistry;
 use half::bf16;
-use prelude_core::tensor::{DType, DeviceExt, Result, Tensor, bail};
+use prelude_core::tensor::{bail, DType, DeviceExt, Result, Tensor};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
@@ -567,10 +567,25 @@ fn sm100_aot_max_pending_calls() -> usize {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&v| v > 0)
-            .unwrap_or(128)
+            .unwrap_or(512)
     })
 }
 
+fn sm100_aot_cleanup_budget() -> usize {
+    static CLEANUP_BUDGET: OnceLock<usize> = OnceLock::new();
+    *CLEANUP_BUDGET.get_or_init(|| {
+        std::env::var("PRELUDE_GDN_SM100_CLEANUP_BUDGET")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8)
+    })
+}
+
+// SM100 AOT launches are async and consume temporary contiguous inputs after
+// returning to Rust. We keep those tensors alive behind completion events, but
+// dropping a large backlog of already-completed CUDA tensors in one forward can
+// add visible latency spikes. Clean a small bounded number per call and only
+// force synchronization when the backlog exceeds the cap.
 fn retain_sm100_aot_temporaries(stream: &CudaStream, tensors: Vec<Tensor>) -> Result<()> {
     static PENDING: OnceLock<Mutex<VecDeque<PendingAotTemps>>> = OnceLock::new();
 
@@ -582,11 +597,15 @@ fn retain_sm100_aot_temporaries(stream: &CudaStream, tensors: Vec<Tensor>) -> Re
         .lock()
         .map_err(|e| candle_core::Error::Msg(format!("FlashInfer GDN SM100 pending lock: {e}")))?;
 
-    while pending
-        .front()
-        .is_some_and(|entry| entry.event.is_complete())
-    {
-        pending.pop_front();
+    for _ in 0..sm100_aot_cleanup_budget() {
+        if pending
+            .front()
+            .is_some_and(|entry| entry.event.is_complete())
+        {
+            pending.pop_front();
+        } else {
+            break;
+        }
     }
 
     let max_pending = sm100_aot_max_pending_calls();
@@ -932,6 +951,10 @@ fn detect_sm_count() -> i32 {
         if cudaDeviceGetAttribute(&mut count, CUDA_DEV_ATTR_MULTIPROCESSOR_COUNT, dev) != 0 {
             return 132;
         }
-        if count > 0 { count } else { 132 }
+        if count > 0 {
+            count
+        } else {
+            132
+        }
     })
 }

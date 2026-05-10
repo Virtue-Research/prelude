@@ -15,6 +15,7 @@ use prelude_core::tensor::{Device, Tensor};
 use prelude_core::config::EngineConfig;
 use prelude_core::engine::{Engine, EngineError, OwnedBatchDecodeSeq};
 use prelude_core::models::commons::{BatchAttnContext, PagedKvBatchContext};
+use prelude_core::models::qwen3_5::qwen35_kda_decode_enabled;
 
 mod buffers;
 
@@ -55,11 +56,16 @@ impl DecodeGraphCache {
         has_deltanet: bool,
         model_supports_graph: bool,
     ) -> Self {
-        let enabled = config.runtime.cuda_graph && !has_deltanet && model_supports_graph;
+        let enabled = config.runtime.cuda_graph && model_supports_graph;
         let max_bs = config.runtime.cuda_graph_max_bs;
 
         if enabled {
-            tracing::info!(max_bs, block_size, "CUDA graph decode enabled");
+            tracing::info!(
+                max_bs,
+                block_size,
+                has_deltanet,
+                "CUDA graph decode enabled"
+            );
         } else if config.runtime.cuda_graph && !model_supports_graph {
             tracing::info!(
                 "CUDA graph decode disabled: model does not support graph capture \
@@ -125,6 +131,11 @@ impl DecodeGraphCache {
             Some(c) => c,
             None => return None,
         };
+        if captured.buffers.deltanet_slots.is_some()
+            && seqs.iter().any(|s| s.deltanet_slot.is_none())
+        {
+            return None;
+        }
 
         // Check block table fits
         let actual_max_blocks = seqs.iter().map(|s| s.block_table.len()).max().unwrap_or(0);
@@ -193,6 +204,11 @@ impl DecodeGraphCache {
         let stream = Self::get_stream(device)?;
 
         let has_deltanet = engine.cache.deltanet_pool.is_some();
+        if has_deltanet && !Self::deltanet_graph_supported(engine, batch_size)? {
+            return Err(EngineError::Internal(format!(
+                "CUDA graph capture batch {batch_size} has no enabled DeltaNet fused decode variant"
+            )));
+        }
         let max_blocks = (seqlen_budget + self.block_size - 1) / self.block_size;
         let buffers = DecodeGraphBuffers::allocate(
             batch_size,
@@ -228,11 +244,7 @@ impl DecodeGraphCache {
                     .as_ref()
                     .map(|m| m.lock().unwrap());
                 let dn_pool_ref = dn_pool_guard.as_deref_mut();
-                let dn_slots_vec: Option<Vec<u32>> = buffers.deltanet_slots.as_ref().map(|t| {
-                    t.to_vec1::<u32>()
-                        .unwrap_or_else(|_| vec![0u32; batch_size])
-                });
-                let dn_slots_ref = dn_slots_vec.as_deref();
+                let dn_slots_ref = buffers.deltanet_slots_cpu.as_deref();
                 let mut ctx = BatchAttnContext {
                     ops: engine.executor.ops,
                     cu_seqlens_q: &buffers.cu_seqlens_q,
@@ -324,5 +336,57 @@ impl DecodeGraphCache {
             .as_cuda_device()
             .map_err(|e| EngineError::Internal(format!("as_cuda_device: {e}")))?;
         Ok(cuda_dev.cuda_stream())
+    }
+
+    fn deltanet_graph_supported(engine: &Engine, batch_size: usize) -> Result<bool, EngineError> {
+        let Some(pool_mutex) = &engine.cache.deltanet_pool else {
+            return Ok(true);
+        };
+        // Graph replay updates only the GPU DeltaNet slot tensor. The unfused
+        // pooled fallback consumes CPU slot IDs that would be captured as
+        // constants, so DeltaNet graph replay requires fused KDA decode.
+        if !qwen35_kda_decode_enabled() {
+            return Ok(false);
+        }
+        let pool = pool_mutex
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("DeltaNet pool lock poisoned: {e}")))?;
+        if batch_size as u32 > pool.max_slots {
+            return Ok(false);
+        }
+        let Some(recurrent) = pool.recurrent_states.first() else {
+            return Ok(false);
+        };
+        let Some(conv) = pool.conv_states.first() else {
+            return Ok(false);
+        };
+        let recurrent_dims = recurrent.dims();
+        let conv_dims = conv.dims();
+        if recurrent_dims.len() != 4 || conv_dims.len() != 3 {
+            return Ok(false);
+        }
+
+        let num_v_heads = recurrent_dims[1];
+        let head_v_dim = recurrent_dims[2];
+        let head_k_dim = recurrent_dims[3];
+        let conv_dim = conv_dims[1];
+        let Some(key_projection_dim) = conv_dim.checked_sub(num_v_heads * head_v_dim) else {
+            return Ok(false);
+        };
+        let Some(denom) = 2usize.checked_mul(head_k_dim) else {
+            return Ok(false);
+        };
+        if denom == 0 || key_projection_dim % denom != 0 {
+            return Ok(false);
+        }
+        let num_k_heads = key_projection_dim / denom;
+
+        Ok(engine.executor.ops.kda_decode_available_for(
+            batch_size,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+        ))
     }
 }

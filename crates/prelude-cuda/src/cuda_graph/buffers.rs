@@ -26,6 +26,7 @@ pub(super) struct DecodeGraphBuffers {
     pub(super) fi_last_page_len: Tensor, // (bs,) I32
     // DeltaNet slot IDs - pre-allocated for hybrid models.
     pub(super) deltanet_slots: Option<Tensor>, // (bs,) U32
+    pub(super) deltanet_slots_cpu: Option<Vec<u32>>,
 }
 
 impl DecodeGraphBuffers {
@@ -43,10 +44,17 @@ impl DecodeGraphBuffers {
             crate::attn::flashinfer::allocate_fi_graph_meta(batch_size, max_total_pages, device)
                 .map_err(super::tensor_err)?;
 
-        let deltanet_slots = if has_deltanet {
-            Some(Tensor::zeros((batch_size,), DType::U32, device).map_err(super::tensor_err)?)
+        let (deltanet_slots, deltanet_slots_cpu) = if has_deltanet {
+            let slots: Vec<u32> = (0..batch_size as u32).collect();
+            (
+                Some(
+                    Tensor::from_vec(slots.clone(), (batch_size,), device)
+                        .map_err(super::tensor_err)?,
+                ),
+                Some(slots),
+            )
         } else {
-            None
+            (None, None)
         };
 
         Ok(Self {
@@ -70,6 +78,7 @@ impl DecodeGraphBuffers {
             fi_indices,
             fi_last_page_len,
             deltanet_slots,
+            deltanet_slots_cpu,
         })
     }
 }
@@ -121,7 +130,12 @@ pub(super) fn update_buffers(
     unsafe { update_tensor(&buffers.block_tables, &flat_bt, stream)? };
 
     if let Some(ref dn_buf) = buffers.deltanet_slots {
-        let dn_slots: Vec<u32> = seqs.iter().map(|s| s.deltanet_slot.unwrap_or(0)).collect();
+        let dn_slots: Vec<u32> = seqs.iter().filter_map(|s| s.deltanet_slot).collect();
+        if dn_slots.len() != bs {
+            return Err(EngineError::Internal(
+                "CUDA graph replay missing DeltaNet slot".into(),
+            ));
+        }
         unsafe { update_tensor(dn_buf, &dn_slots, stream)? };
     }
 

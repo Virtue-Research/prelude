@@ -1459,7 +1459,7 @@ fn varlen_prefill_padding_is_bounded(batch: usize, total_tokens: usize, max_len:
     batch.saturating_mul(max_len) <= total_tokens.saturating_mul(MAX_VARLEN_PREFILL_PADDING_FACTOR)
 }
 
-fn qwen35_kda_decode_enabled() -> bool {
+pub fn qwen35_kda_decode_enabled() -> bool {
     global_runtime()
         .map(|runtime| runtime.qwen35_kda_decode)
         .unwrap_or(true)
