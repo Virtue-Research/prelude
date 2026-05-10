@@ -90,6 +90,77 @@ extern "C" __global__ void fused_qknorm_rope_bf16(
     }
 }
 
+extern "C" __global__ void fused_qknorm_partial_rope_bf16_f32_weight(
+    const __nv_bfloat16* __restrict__ input,     // [total_tokens, num_heads, D]
+    const float* __restrict__ weight,            // [D] norm weight
+    const __nv_bfloat16* __restrict__ cos_table, // [max_seq_len, rotary_dim/2]
+    const __nv_bfloat16* __restrict__ sin_table, // [max_seq_len, rotary_dim/2]
+    const uint32_t* __restrict__ pos_ids,        // [total_tokens]
+    __nv_bfloat16* __restrict__ output,          // [n_rows, D]
+    uint32_t n_rows,
+    uint32_t num_heads,
+    uint32_t d,
+    uint32_t rotary_dim,
+    float eps,
+    uint32_t token_stride
+) {
+    const uint32_t warp_id = threadIdx.x / 32;
+    const uint32_t lane_id = threadIdx.x % 32;
+    const uint32_t rows_per_block = blockDim.x / 32;
+    const uint32_t row = blockIdx.x * rows_per_block + warp_id;
+    if (row >= n_rows) return;
+
+    const uint32_t epl = d / 32;
+    const uint32_t half_rot = rotary_dim / 2;
+    const uint32_t lane_xor = half_rot / epl;
+    const uint32_t token = row / num_heads;
+    const uint32_t head = row % num_heads;
+    const uint32_t pos = pos_ids[token];
+
+    const __nv_bfloat16* in_row = input + (uint64_t)token * token_stride + (uint64_t)head * d;
+    __nv_bfloat16* out_row = output + (uint64_t)row * d;
+    const uint32_t dim_start = lane_id * epl;
+
+    float vals[8];
+    float ss = 0.0f;
+    for (uint32_t e = 0; e < epl; e++) {
+        uint32_t dim = dim_start + e;
+        float v = __bfloat162float(in_row[dim]);
+        vals[e] = v;
+        ss += v * v;
+    }
+
+    ss = warp_reduce_sum(ss);
+    float scale = rsqrtf(ss / (float)d + eps);
+
+    for (uint32_t e = 0; e < epl; e++) {
+        vals[e] *= scale * weight[dim_start + e];
+    }
+
+    float partner[8];
+    for (uint32_t e = 0; e < epl; e++) {
+        partner[e] = __shfl_xor_sync(0xffffffff, vals[e], lane_xor);
+    }
+
+    for (uint32_t e = 0; e < epl; e++) {
+        uint32_t dim = dim_start + e;
+        float r = vals[e];
+        if (dim < rotary_dim) {
+            const bool first_half = dim < half_rot;
+            const uint32_t rope_d = first_half ? dim : (dim - half_rot);
+            const uint64_t cs_base = (uint64_t)pos * half_rot + rope_d;
+            float c = __bfloat162float(cos_table[cs_base]);
+            float sn = __bfloat162float(sin_table[cs_base]);
+            if (first_half) {
+                r = vals[e] * c - partner[e] * sn;
+            } else {
+                r = partner[e] * sn + vals[e] * c;
+            }
+        }
+        out_row[dim] = __float2bfloat16(r);
+    }
+}
+
 // ─── Fused QK-Norm + RoPE (THD layout) ──────────────────────────────────
 // Same as fused_qknorm_rope_bf16 but for the THD [B,L,H,D] layout.
 // Position is derived from the row index: pos = (row / num_heads) % seq_len + offset.

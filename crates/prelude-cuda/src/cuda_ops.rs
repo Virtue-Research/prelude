@@ -317,6 +317,14 @@ impl Ops for CudaOps {
         if x.dtype() != DType::BF16 {
             return None;
         }
+        if residual.dtype() != DType::BF16 {
+            return None;
+        }
+        if weight.dtype() == DType::F32 {
+            return Some(crate::ops::rmsnorm::fast_add_rmsnorm_f32_weight(
+                residual, x, weight, eps as f64,
+            ));
+        }
         // FlashInfer's fused kernel applies weight in BF16; fall through to the
         // composed path when weight is F32 so the multiply happens in F32 (HF
         // parity for models with small `+1` residual norm weights).
@@ -389,6 +397,66 @@ impl Ops for CudaOps {
             cos,
             sin,
             position_ids,
+            eps as f64,
+        ) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(Ok((q_out, k_out)))
+    }
+
+    fn fused_qknorm_partial_rope(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        q_weight: &Tensor,
+        k_weight: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        position_ids: &Tensor,
+        rotary_dim: usize,
+        eps: f32,
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        if q.dtype() != DType::BF16
+            || k.dtype() != DType::BF16
+            || q_weight.dtype() != DType::F32
+            || k_weight.dtype() != DType::F32
+        {
+            return None;
+        }
+        let head_dim = q.dims().last().copied().unwrap_or(0);
+        if k.dims().last().copied().unwrap_or(0) != head_dim
+            || head_dim > 256
+            || head_dim % 32 != 0
+            || rotary_dim == 0
+            || rotary_dim > head_dim
+            || rotary_dim % 2 != 0
+        {
+            return None;
+        }
+        let elems_per_lane = head_dim / 32;
+        if elems_per_lane == 0 || (rotary_dim / 2) % elems_per_lane != 0 {
+            return None;
+        }
+        let q_out = match crate::ops::rope::fused_qknorm_partial_rope_varlen_f32_weight(
+            q,
+            q_weight,
+            cos,
+            sin,
+            position_ids,
+            rotary_dim,
+            eps as f64,
+        ) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e)),
+        };
+        let k_out = match crate::ops::rope::fused_qknorm_partial_rope_varlen_f32_weight(
+            k,
+            k_weight,
+            cos,
+            sin,
+            position_ids,
+            rotary_dim,
             eps as f64,
         ) {
             Ok(t) => t,
