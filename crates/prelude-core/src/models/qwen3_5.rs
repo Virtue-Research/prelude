@@ -1189,30 +1189,43 @@ impl Qwen3_5Attention {
         let k = k.reshape((total_tokens, self.num_kv_heads, self.head_dim))?;
         let v = v.reshape((total_tokens, self.num_kv_heads, self.head_dim))?;
 
-        // Per-head QK normalization
-        let q = ctx
-            .ops
-            .rms_norm(
-                &q.reshape((total_tokens * self.num_heads, self.head_dim))?,
-                &self.q_norm_weight,
-                self.rms_norm_eps as f32,
-            )?
-            .reshape((total_tokens, self.num_heads, self.head_dim))?;
-        let k = ctx
-            .ops
-            .rms_norm(
-                &k.reshape((total_tokens * self.num_kv_heads, self.head_dim))?,
-                &self.k_norm_weight,
-                self.rms_norm_eps as f32,
-            )?
-            .reshape((total_tokens, self.num_kv_heads, self.head_dim))?;
+        // Per-head QK normalization + partial RoPE. Qwen3.5 carries F32
+        // `(1 + weight)` norm weights and rotates only a prefix of head_dim.
+        let (q, k) = if let Some(fused) = ctx.ops.fused_qknorm_partial_rope(
+            &q,
+            &k,
+            &self.q_norm_weight,
+            &self.k_norm_weight,
+            &self.rope.cos,
+            &self.rope.sin,
+            ctx.position_ids,
+            self.rope.rotary_dim,
+            self.rms_norm_eps as f32,
+        ) {
+            fused?
+        } else {
+            let q = ctx
+                .ops
+                .rms_norm(
+                    &q.reshape((total_tokens * self.num_heads, self.head_dim))?,
+                    &self.q_norm_weight,
+                    self.rms_norm_eps as f32,
+                )?
+                .reshape((total_tokens, self.num_heads, self.head_dim))?;
+            let k = ctx
+                .ops
+                .rms_norm(
+                    &k.reshape((total_tokens * self.num_kv_heads, self.head_dim))?,
+                    &self.k_norm_weight,
+                    self.rms_norm_eps as f32,
+                )?
+                .reshape((total_tokens, self.num_kv_heads, self.head_dim))?;
 
-        // Partial RoPE
-        let (q, k) = self.rope.apply_varlen(&q, &k, ctx.position_ids)?;
-        // FA4 / FlashInfer require stride(-1) == 1. `apply_varlen` goes through
-        // `Tensor::cat` which can leave a non-row-stride layout; force contig.
-        let q = q.contiguous()?;
-        let k = k.contiguous()?;
+            let (q, k) = self.rope.apply_varlen(&q, &k, ctx.position_ids)?;
+            // FA4 / FlashInfer require stride(-1) == 1. `apply_varlen` goes through
+            // `Tensor::cat` which can leave a non-row-stride layout; force contig.
+            (q.contiguous()?, k.contiguous()?)
+        };
         let v = v.contiguous()?;
 
         // Attention dispatch: paged KV cache or plain varlen

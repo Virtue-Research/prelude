@@ -391,6 +391,20 @@ pub trait Ops: Send + Sync {
     ) -> Option<Result<(Tensor, Tensor)>> {
         None
     }
+    fn fused_qknorm_partial_rope(
+        &self,
+        _q: &Tensor,
+        _k: &Tensor,
+        _q_weight: &Tensor,
+        _k_weight: &Tensor,
+        _cos: &Tensor,
+        _sin: &Tensor,
+        _pos: &Tensor,
+        _rotary_dim: usize,
+        _eps: f32,
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        None
+    }
     /// Q-only norm + rope. Used when the K path is fused into the KV
     /// cache write so K doesn't need to be materialized separately.
     fn fused_q_norm_rope(

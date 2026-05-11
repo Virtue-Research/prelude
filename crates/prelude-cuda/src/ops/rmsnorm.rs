@@ -112,6 +112,121 @@ pub fn fast_rmsnorm(input: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor>
     Ok(out_tensor)
 }
 
+/// Fused residual add + RMSNorm for BF16 activations with F32 weights.
+///
+/// Computes both outputs from the same pass:
+///   sum = residual + x
+///   norm = rmsnorm(sum, weight, eps)
+pub fn fast_add_rmsnorm_f32_weight(
+    residual: &Tensor,
+    x: &Tensor,
+    weight: &Tensor,
+    eps: f64,
+) -> Result<(Tensor, Tensor)> {
+    let (res_storage, res_layout) = residual.storage_and_layout();
+    let (x_storage, x_layout) = x.storage_and_layout();
+    let (w_storage, w_layout) = weight.storage_and_layout();
+
+    let res_cuda = match &*res_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("fast_add_rmsnorm_f32_weight: requires CUDA"),
+    };
+    let x_cuda = match &*x_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("fast_add_rmsnorm_f32_weight: requires CUDA"),
+    };
+    let w_cuda = match &*w_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("fast_add_rmsnorm_f32_weight: requires CUDA"),
+    };
+
+    if res_cuda.dtype() != DType::BF16 || x_cuda.dtype() != DType::BF16 {
+        candle_core::bail!("fast_add_rmsnorm_f32_weight: activations must be BF16");
+    }
+    if w_cuda.dtype() != DType::F32 {
+        candle_core::bail!("fast_add_rmsnorm_f32_weight: weight must be F32");
+    }
+
+    let shape = x_layout.shape();
+    if res_layout.shape() != shape {
+        candle_core::bail!("fast_add_rmsnorm_f32_weight: shape mismatch");
+    }
+    let dims = shape.dims();
+    let d = *dims.last().unwrap();
+    let n_rows = shape.elem_count() / d;
+    if weight.elem_count() != d {
+        candle_core::bail!("fast_add_rmsnorm_f32_weight: weight shape mismatch");
+    }
+
+    let dev = x_cuda.device().clone();
+    let n = shape.elem_count();
+
+    let res_slice = res_cuda
+        .as_cuda_slice::<half::bf16>()?
+        .slice(res_layout.start_offset()..);
+    let x_slice = x_cuda
+        .as_cuda_slice::<half::bf16>()?
+        .slice(x_layout.start_offset()..);
+    let w_slice = w_cuda
+        .as_cuda_slice::<f32>()?
+        .slice(w_layout.start_offset()..);
+
+    let sum_out = unsafe { dev.alloc::<half::bf16>(n) }?;
+    let norm_out = unsafe { dev.alloc::<half::bf16>(n) }?;
+
+    let (block_size, grid_size, shared_mem) = if d <= 256 {
+        let block = 256u32;
+        let rows_per_block = block / 32;
+        let grid = (n_rows as u32 + rows_per_block - 1) / rows_per_block;
+        (block, grid, 0u32)
+    } else {
+        let block = if d == 1024 { 128u32 } else { 256u32 };
+        let num_warps = (block + 31) / 32;
+        (block, n_rows as u32, num_warps * 4)
+    };
+
+    let func =
+        dev.get_or_load_custom_func("fast_add_rmsnorm_bf16_f32_weight", MOD_RMSNORM, PTX_RMSNORM)?;
+    let cfg = LaunchConfig {
+        grid_dim: (grid_size, 1, 1),
+        block_dim: (block_size, 1, 1),
+        shared_mem_bytes: shared_mem,
+    };
+    let mut builder = func.builder();
+    builder.arg(&res_slice);
+    builder.arg(&x_slice);
+    builder.arg(&w_slice);
+    builder.arg(&sum_out);
+    builder.arg(&norm_out);
+    let n_rows_val = n_rows as u32;
+    let d_val = d as u32;
+    let eps_val = eps as f32;
+    builder.arg(&n_rows_val);
+    builder.arg(&d_val);
+    builder.arg(&eps_val);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(res_storage);
+    drop(x_storage);
+    drop(w_storage);
+
+    let sum_storage = candle_core::CudaStorage::wrap_cuda_slice(sum_out, dev.clone());
+    let norm_storage = candle_core::CudaStorage::wrap_cuda_slice(norm_out, dev);
+    let sum = Tensor::from_storage(
+        candle_core::Storage::Cuda(sum_storage),
+        shape.clone(),
+        candle_core::op::BackpropOp::none(),
+        false,
+    );
+    let norm = Tensor::from_storage(
+        candle_core::Storage::Cuda(norm_storage),
+        shape.clone(),
+        candle_core::op::BackpropOp::none(),
+        false,
+    );
+    Ok((sum, norm))
+}
+
 /// Fused RMSNorm + SiLU gate:  output = RMSNorm(x, weight) * SiLU(gate)
 /// x, gate: BF16 [N, D].  weight: F32 [D].  output: BF16 [N, D].
 pub fn fast_rmsnorm_gated(x: &Tensor, gate: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {

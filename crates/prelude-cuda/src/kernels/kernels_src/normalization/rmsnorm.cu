@@ -226,3 +226,130 @@ extern "C" __global__ void fast_rmsnorm_bf16_f32_weight(
         }
     }
 }
+
+extern "C" __global__ void fast_add_rmsnorm_bf16_f32_weight(
+    const __nv_bfloat16* __restrict__ residual, // [N, D]
+    const __nv_bfloat16* __restrict__ input,    // [N, D]
+    const float* __restrict__ weight,           // [D]
+    __nv_bfloat16* __restrict__ sum_out,        // [N, D]
+    __nv_bfloat16* __restrict__ norm_out,       // [N, D]
+    uint32_t n_rows,
+    uint32_t d,
+    float eps
+) {
+    // ── Small D path: 1 warp per row, multiple rows per block ──
+    if (d <= 256) {
+        const uint32_t warp_id = threadIdx.x / 32;
+        const uint32_t lane_id = threadIdx.x % 32;
+        const uint32_t rows_per_block = blockDim.x / 32;
+        const uint32_t row = blockIdx.x * rows_per_block + warp_id;
+        if (row >= n_rows) return;
+
+        const __nv_bfloat16* res_row = residual + (uint64_t)row * d;
+        const __nv_bfloat16* in_row = input + (uint64_t)row * d;
+        __nv_bfloat16* sum_row = sum_out + (uint64_t)row * d;
+        __nv_bfloat16* norm_row = norm_out + (uint64_t)row * d;
+
+        const uint32_t elems_per_lane = d / 32;
+        float vals[8];  // max 256/32 = 8
+        float ss = 0.0f;
+
+        #pragma unroll
+        for (uint32_t e = 0; e < elems_per_lane; e++) {
+            uint32_t idx = lane_id * elems_per_lane + e;
+            float v = __bfloat162float(res_row[idx]) + __bfloat162float(in_row[idx]);
+            vals[e] = v;
+            ss += v * v;
+        }
+
+        ss = warp_reduce_sum(ss);
+        float scale = rsqrtf(ss / (float)d + eps);
+
+        #pragma unroll
+        for (uint32_t e = 0; e < elems_per_lane; e++) {
+            uint32_t idx = lane_id * elems_per_lane + e;
+            float v = vals[e];
+            sum_row[idx] = __float2bfloat16(v);
+            norm_row[idx] = __float2bfloat16(v * scale * weight[idx]);
+        }
+        return;
+    }
+
+    // ── Large D path: 1 block per row, vectorized input loads ──
+    extern __shared__ float smem[];
+
+    const uint32_t row = blockIdx.x;
+    if (row >= n_rows) return;
+
+    const __nv_bfloat16* res_row = residual + (uint64_t)row * d;
+    const __nv_bfloat16* in_row = input + (uint64_t)row * d;
+    __nv_bfloat16* sum_row = sum_out + (uint64_t)row * d;
+    __nv_bfloat16* norm_row = norm_out + (uint64_t)row * d;
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t block_size = blockDim.x;
+
+    float vals[8];
+    float ss = 0.0f;
+
+    const bool use_cached_vec = (d == block_size * 8);
+    if (use_cached_vec) {
+        Vec8BF16 rvec;
+        Vec8BF16 xvec;
+        rvec.load(res_row + tid * 8);
+        xvec.load(in_row + tid * 8);
+        const __nv_bfloat162* rp = rvec.as_bf162();
+        const __nv_bfloat162* xp = xvec.as_bf162();
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float2 rf = __bfloat1622float2(rp[j]);
+            float2 xf = __bfloat1622float2(xp[j]);
+            float sx = rf.x + xf.x;
+            float sy = rf.y + xf.y;
+            vals[j * 2]     = sx;
+            vals[j * 2 + 1] = sy;
+            ss += sx * sx + sy * sy;
+        }
+    } else {
+        for (uint32_t i = tid; i < d; i += block_size) {
+            float v = __bfloat162float(res_row[i]) + __bfloat162float(in_row[i]);
+            ss += v * v;
+        }
+    }
+
+    ss = block_reduce_sum(ss, smem);
+
+    __shared__ float rms_scale;
+    if (tid == 0) {
+        rms_scale = rsqrtf(ss / (float)d + eps);
+    }
+    __syncthreads();
+    float scale = rms_scale;
+
+    if (use_cached_vec) {
+        Vec8BF16 sum_result;
+        Vec8BF16 norm_result;
+        __nv_bfloat162* sp = sum_result.as_bf162_mut();
+        __nv_bfloat162* np = norm_result.as_bf162_mut();
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int idx0 = tid * 8 + j * 2;
+            float2 s;
+            float2 n;
+            s.x = vals[j * 2];
+            s.y = vals[j * 2 + 1];
+            n.x = s.x * scale * weight[idx0];
+            n.y = s.y * scale * weight[idx0 + 1];
+            sp[j] = __float22bfloat162_rn(s);
+            np[j] = __float22bfloat162_rn(n);
+        }
+        sum_result.store(sum_row + tid * 8);
+        norm_result.store(norm_row + tid * 8);
+    } else {
+        for (uint32_t i = tid; i < d; i += block_size) {
+            float v = __bfloat162float(res_row[i]) + __bfloat162float(in_row[i]);
+            sum_row[i] = __float2bfloat16(v);
+            norm_row[i] = __float2bfloat16(v * scale * weight[i]);
+        }
+    }
+}
