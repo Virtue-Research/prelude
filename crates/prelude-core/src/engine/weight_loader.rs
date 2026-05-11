@@ -91,6 +91,10 @@ pub trait Backend: Send + Sync {
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor>;
 
     fn contains_tensor(&self, name: &str) -> bool;
+
+    /// Return the stored dtype for a tensor when the backend can answer from
+    /// metadata without materializing and casting the tensor.
+    fn tensor_dtype(&self, name: &str) -> Result<Option<DType>>;
 }
 
 pub trait SimpleBackend: Send + Sync {
@@ -101,6 +105,12 @@ pub trait SimpleBackend: Send + Sync {
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor>;
 
     fn contains_tensor(&self, name: &str) -> bool;
+
+    /// Return the stored dtype for a tensor when available.
+    fn tensor_dtype(&self, name: &str) -> Result<Option<DType>> {
+        let _ = name;
+        Ok(None)
+    }
 }
 
 impl Backend for Box<dyn SimpleBackend + '_> {
@@ -122,6 +132,10 @@ impl Backend for Box<dyn SimpleBackend + '_> {
 
     fn contains_tensor(&self, name: &str) -> bool {
         self.as_ref().contains_tensor(name)
+    }
+
+    fn tensor_dtype(&self, name: &str) -> Result<Option<DType>> {
+        self.as_ref().tensor_dtype(name)
     }
 }
 
@@ -221,6 +235,11 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
     pub fn contains_tensor(&self, tensor_name: &str) -> bool {
         let path = self.path(tensor_name);
         self.data.backend.contains_tensor(&path)
+    }
+
+    pub fn tensor_dtype(&self, tensor_name: &str) -> Result<Option<DType>> {
+        let path = self.path(tensor_name);
+        self.data.backend.tensor_dtype(&path)
     }
 
     /// Retrieve the tensor associated with the given name at the current path.
@@ -351,6 +370,10 @@ impl SimpleBackend for HashMap<String, Tensor> {
     fn contains_tensor(&self, name: &str) -> bool {
         self.contains_key(name)
     }
+
+    fn tensor_dtype(&self, name: &str) -> Result<Option<DType>> {
+        Ok(self.get(name).map(Tensor::dtype))
+    }
 }
 
 impl SimpleBackend for crate::tensor::safetensors::MmapedSafetensors {
@@ -374,6 +397,10 @@ impl SimpleBackend for crate::tensor::safetensors::MmapedSafetensors {
     fn contains_tensor(&self, name: &str) -> bool {
         self.get(name).is_ok()
     }
+
+    fn tensor_dtype(&self, name: &str) -> Result<Option<DType>> {
+        Ok(Some(self.get(name)?.dtype().try_into()?))
+    }
 }
 
 impl SimpleBackend for crate::tensor::safetensors::BufferedSafetensors {
@@ -396,6 +423,10 @@ impl SimpleBackend for crate::tensor::safetensors::BufferedSafetensors {
 
     fn contains_tensor(&self, name: &str) -> bool {
         self.get(name).is_ok()
+    }
+
+    fn tensor_dtype(&self, name: &str) -> Result<Option<DType>> {
+        Ok(Some(self.get(name)?.dtype().try_into()?))
     }
 }
 
@@ -519,6 +550,11 @@ impl<R: Renamer + Sync + Send> SimpleBackend for Rename<'_, R> {
     fn contains_tensor(&self, name: &str) -> bool {
         let name = self.renamer.rename(name);
         self.inner.contains_tensor(&name)
+    }
+
+    fn tensor_dtype(&self, name: &str) -> Result<Option<DType>> {
+        let name = self.renamer.rename(name);
+        self.inner.tensor_dtype(&name)
     }
 }
 

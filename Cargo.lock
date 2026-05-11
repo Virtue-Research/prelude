@@ -2732,6 +2732,7 @@ dependencies = [
  "deepgemm",
  "flash-attn-v4",
  "flashinfer",
+ "float8",
  "half",
  "inventory",
  "prelude-core",

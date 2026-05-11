@@ -265,18 +265,29 @@ impl Qwen3SparseMoeBlock {
         // Stack expert weights once in FlashInfer CUTLASS layout (GPU only).
         // `experts_gate_up` is [num_experts, 2*inter, hidden] with [up; gate]
         // concatenation, matching CUTLASS's SwiGLU convention.
-        let (experts_gate_up, experts_down) = if experts
-            .first()
-            .map_or(false, |e| e.gate_proj.weight().device().is_cuda())
-        {
+        let dense_expert_weights = experts.first().and_then(|e| {
+            e.gate_proj
+                .weight_opt()
+                .filter(|w| w.device().is_cuda())
+                .map(|_| ())
+        });
+        let (experts_gate_up, experts_down) = if dense_expert_weights.is_some()
+            && experts.iter().all(|e| {
+                e.gate_proj.weight_opt().is_some()
+                    && e.up_proj.weight_opt().is_some()
+                    && e.down_proj.weight_opt().is_some()
+            }) {
             let gate_ws: Vec<Tensor> = experts
                 .iter()
-                .map(|e| e.gate_proj.weight().clone())
+                .filter_map(|e| e.gate_proj.weight_opt().cloned())
                 .collect();
-            let up_ws: Vec<Tensor> = experts.iter().map(|e| e.up_proj.weight().clone()).collect();
+            let up_ws: Vec<Tensor> = experts
+                .iter()
+                .filter_map(|e| e.up_proj.weight_opt().cloned())
+                .collect();
             let down_ws: Vec<Tensor> = experts
                 .iter()
-                .map(|e| e.down_proj.weight().clone())
+                .filter_map(|e| e.down_proj.weight_opt().cloned())
                 .collect();
 
             let gate_w = Tensor::stack(&gate_ws, 0)?.contiguous()?;
@@ -441,9 +452,7 @@ impl Qwen3SparseMoeBlock {
                     }
                     None => {}
                 }
-            } else if backend_policy == MoeBackendPolicy::Cutlass
-                || (backend_policy == MoeBackendPolicy::Auto && input_is_cuda)
-            {
+            } else if backend_policy == MoeBackendPolicy::Cutlass {
                 return Err(candle_core::Error::Msg(format!(
                     "MoE backend policy '{}' requires FlashInfer CUTLASS, but CUTLASS expert weights are unavailable",
                     backend_policy.as_str(),
@@ -489,9 +498,11 @@ impl GatedMlp {
         )?;
 
         let gate_up_proj = {
-            let gw = gate_proj.weight();
-            if gw.device().is_cpu() && gw.dtype() == DType::BF16 {
-                let merged_w = Tensor::cat(&[gw, up_proj.weight()], 0)?;
+            if let (Some(gw), Some(uw)) = (gate_proj.weight_opt(), up_proj.weight_opt())
+                && gw.device().is_cpu()
+                && gw.dtype() == DType::BF16
+            {
+                let merged_w = Tensor::cat(&[gw, uw], 0)?;
                 Linear::from_weight(merged_w, None).ok()
             } else {
                 None
