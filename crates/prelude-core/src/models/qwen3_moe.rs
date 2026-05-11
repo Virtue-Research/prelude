@@ -4,10 +4,10 @@ use crate::config::{MoeBackendPolicy, global_runtime};
 use crate::loading::var_builder::VarBuilder;
 use crate::models::commons::activation::Activation;
 use crate::models::commons::embedding::Embedding;
-use crate::models::commons::linear::DenseLinear;
+use crate::models::commons::linear::{DenseLinear, ScaledFp8LinearParts};
 use crate::models::config::Qwen3Config;
 use crate::profiling::{nvtx_pop, nvtx_push};
-use crate::tensor::{D, DType, Module, Result, Tensor};
+use crate::tensor::{D, DType, Device, Module, Result, Tensor};
 
 // Shared layer primitives (extracted from qwen3 into reusable modules)
 use crate::models::commons::{
@@ -28,10 +28,12 @@ fn moe_backend_policy() -> MoeBackendPolicy {
 
 fn log_moe_backend_once(requested: MoeBackendPolicy, actual: &'static str) {
     static CUTLASS: OnceLock<()> = OnceLock::new();
+    static FP8: OnceLock<()> = OnceLock::new();
     static SEQUENTIAL: OnceLock<()> = OnceLock::new();
 
     let logged = match actual {
         "flashinfer_cutlass" => &CUTLASS,
+        "flashinfer_fp8_groupwise" => &FP8,
         "sequential" => &SEQUENTIAL,
         _ => &SEQUENTIAL,
     };
@@ -92,8 +94,10 @@ impl<'de> serde::Deserialize<'de> for Qwen3MoeConfig {
             max_position_embeddings: usize,
             moe_intermediate_size: usize,
             num_experts_per_tok: usize,
-            #[serde(alias = "num_local_experts")]
-            num_experts: usize,
+            #[serde(default)]
+            num_experts: Option<usize>,
+            #[serde(default)]
+            num_local_experts: Option<usize>,
             #[serde(default)]
             attention_bias: bool,
             #[serde(default)]
@@ -119,6 +123,16 @@ impl<'de> serde::Deserialize<'de> for Qwen3MoeConfig {
         }
 
         let r = Raw::deserialize(deserializer)?;
+        let num_experts = match (r.num_experts, r.num_local_experts) {
+            (Some(a), Some(b)) if a == b => a,
+            (Some(a), Some(b)) => {
+                return Err(serde::de::Error::custom(format!(
+                    "num_experts ({a}) != num_local_experts ({b})"
+                )));
+            }
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => return Err(serde::de::Error::missing_field("num_experts")),
+        };
         let rope_theta = r
             .rope_theta
             .or_else(|| r.rope_parameters.and_then(|p| p.rope_theta));
@@ -134,7 +148,7 @@ impl<'de> serde::Deserialize<'de> for Qwen3MoeConfig {
             max_position_embeddings: r.max_position_embeddings,
             moe_intermediate_size: r.moe_intermediate_size,
             num_experts_per_tok: r.num_experts_per_tok,
-            num_experts: r.num_experts,
+            num_experts,
             attention_bias: r.attention_bias,
             sliding_window: r.sliding_window,
             max_window_layers: r.max_window_layers,
@@ -237,6 +251,13 @@ impl Qwen3MoeExpert {
 // ── Sparse MoE Block ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
+struct ScaledFp8Experts {
+    weights: Tensor,
+    input_scales: Tensor,
+    weight_scales: Tensor,
+}
+
+#[derive(Debug, Clone)]
 struct Qwen3SparseMoeBlock {
     gate: DenseLinear,
     experts: Vec<Qwen3MoeExpert>,
@@ -245,8 +266,177 @@ struct Qwen3SparseMoeBlock {
     // on supported CUDA architectures.
     experts_gate_up: Option<Tensor>,
     experts_down: Option<Tensor>,
+    experts_gate_up_fp8: Option<ScaledFp8Experts>,
+    experts_gate_fp8: Option<ScaledFp8Experts>,
+    experts_up_fp8: Option<ScaledFp8Experts>,
+    experts_down_fp8: Option<ScaledFp8Experts>,
     norm_topk_prob: bool,
     num_experts_per_tok: usize,
+}
+
+fn stack_scaled_fp8_experts(
+    experts: &[Qwen3MoeExpert],
+    select: fn(&Qwen3MoeExpert) -> &Linear,
+) -> Result<Option<ScaledFp8Experts>> {
+    let parts: Vec<Option<ScaledFp8LinearParts<'_>>> = experts
+        .iter()
+        .map(|expert| select(expert).scaled_fp8())
+        .collect();
+    let count = parts.iter().filter(|part| part.is_some()).count();
+    if count == 0 {
+        return Ok(None);
+    }
+    if count != experts.len() {
+        return Err(candle_core::Error::Msg(
+            "mixed scaled-FP8 and non-FP8 expert weights are not supported".into(),
+        ));
+    }
+
+    let first = parts[0].expect("count > 0");
+    let device = first.weight.device().clone();
+    if !device.is_cuda() {
+        return Ok(None);
+    }
+    let dims = first.weight.dims();
+    if dims.len() != 2 {
+        return Err(candle_core::Error::Msg(format!(
+            "scaled-FP8 expert weight must be rank-2, got {dims:?}"
+        )));
+    }
+    let (n, k) = (dims[0], dims[1]);
+    if n % 128 != 0 || k % 128 != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "scaled-FP8 grouped MoE requires N and K multiples of 128, got N={n}, K={k}"
+        )));
+    }
+
+    let mut weights = Vec::with_capacity(experts.len());
+    let mut input_scales = Vec::with_capacity(experts.len());
+    let mut weight_scale_grid = Vec::with_capacity(experts.len() * (n / 128) * (k / 128));
+    for part in parts.into_iter().map(|p| p.expect("all parts present")) {
+        if part.weight.dims() != [n, k] {
+            return Err(candle_core::Error::Msg(format!(
+                "scaled-FP8 expert weights must share shape [{n}, {k}], got {:?}",
+                part.weight.dims()
+            )));
+        }
+        if part.input_scale <= 0.0 || part.weight_scale <= 0.0 {
+            return Err(candle_core::Error::Msg(format!(
+                "scaled-FP8 expert scales must be positive, got input_scale={} weight_scale={}",
+                part.input_scale, part.weight_scale
+            )));
+        }
+        weights.push(part.weight.clone());
+        input_scales.push(part.input_scale);
+        weight_scale_grid.extend(std::iter::repeat(part.weight_scale).take((n / 128) * (k / 128)));
+    }
+
+    Ok(Some(ScaledFp8Experts {
+        weights: Tensor::stack(&weights, 0)?.contiguous()?,
+        input_scales: Tensor::from_vec(input_scales, (experts.len(),), &device)?,
+        weight_scales: Tensor::from_vec(
+            weight_scale_grid,
+            (experts.len(), n / 128, k / 128),
+            &device,
+        )?,
+    }))
+}
+
+fn stack_scaled_fp8_gate_up_experts(
+    experts: &[Qwen3MoeExpert],
+) -> Result<Option<ScaledFp8Experts>> {
+    let gate_parts: Vec<Option<ScaledFp8LinearParts<'_>>> = experts
+        .iter()
+        .map(|expert| expert.gate_proj.scaled_fp8())
+        .collect();
+    let up_parts: Vec<Option<ScaledFp8LinearParts<'_>>> = experts
+        .iter()
+        .map(|expert| expert.up_proj.scaled_fp8())
+        .collect();
+    let count = gate_parts.iter().filter(|part| part.is_some()).count()
+        + up_parts.iter().filter(|part| part.is_some()).count();
+    if count == 0 {
+        return Ok(None);
+    }
+    if count != experts.len() * 2 {
+        return Err(candle_core::Error::Msg(
+            "mixed scaled-FP8 and non-FP8 gate/up expert weights are not supported".into(),
+        ));
+    }
+
+    let first_gate = gate_parts[0].expect("count > 0");
+    let first_up = up_parts[0].expect("count > 0");
+    let device = first_gate.weight.device().clone();
+    if !device.is_cuda() {
+        return Ok(None);
+    }
+    if first_gate.weight.dims() != first_up.weight.dims() {
+        return Ok(None);
+    }
+    let dims = first_gate.weight.dims();
+    if dims.len() != 2 {
+        return Err(candle_core::Error::Msg(format!(
+            "scaled-FP8 gate/up expert weight must be rank-2, got {dims:?}"
+        )));
+    }
+    let (n, k) = (dims[0], dims[1]);
+    if n % 128 != 0 || k % 128 != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "scaled-FP8 grouped MoE requires N and K multiples of 128, got N={n}, K={k}"
+        )));
+    }
+
+    let mut weights = Vec::with_capacity(experts.len());
+    let mut input_scales = Vec::with_capacity(experts.len());
+    let mut weight_scale_grid = Vec::with_capacity(experts.len() * (2 * n / 128) * (k / 128));
+    for (gate, up) in gate_parts
+        .into_iter()
+        .zip(up_parts.into_iter())
+        .map(|(g, u)| {
+            (
+                g.expect("all gate parts present"),
+                u.expect("all up parts present"),
+            )
+        })
+    {
+        if gate.weight.dims() != [n, k] || up.weight.dims() != [n, k] {
+            return Err(candle_core::Error::Msg(format!(
+                "scaled-FP8 gate/up expert weights must share shape [{n}, {k}], got gate={:?} up={:?}",
+                gate.weight.dims(),
+                up.weight.dims()
+            )));
+        }
+        if (gate.input_scale - up.input_scale).abs()
+            > 1e-6 * gate.input_scale.abs().max(up.input_scale.abs()).max(1.0)
+        {
+            return Ok(None);
+        }
+        if gate.input_scale <= 0.0
+            || up.input_scale <= 0.0
+            || gate.weight_scale <= 0.0
+            || up.weight_scale <= 0.0
+        {
+            return Err(candle_core::Error::Msg(format!(
+                "scaled-FP8 gate/up expert scales must be positive, got gate=({}, {}) up=({}, {})",
+                gate.input_scale, gate.weight_scale, up.input_scale, up.weight_scale
+            )));
+        }
+
+        weights.push(Tensor::cat(&[up.weight, gate.weight], 0)?.contiguous()?);
+        input_scales.push(up.input_scale);
+        weight_scale_grid.extend(std::iter::repeat(up.weight_scale).take((n / 128) * (k / 128)));
+        weight_scale_grid.extend(std::iter::repeat(gate.weight_scale).take((n / 128) * (k / 128)));
+    }
+
+    Ok(Some(ScaledFp8Experts {
+        weights: Tensor::stack(&weights, 0)?.contiguous()?,
+        input_scales: Tensor::from_vec(input_scales, (experts.len(),), &device)?,
+        weight_scales: Tensor::from_vec(
+            weight_scale_grid,
+            (experts.len(), 2 * n / 128, k / 128),
+            &device,
+        )?,
+    }))
 }
 
 impl Qwen3SparseMoeBlock {
@@ -302,11 +492,26 @@ impl Qwen3SparseMoeBlock {
             (None, None)
         };
 
+        let experts_gate_up_fp8 = stack_scaled_fp8_gate_up_experts(&experts)?;
+        let (experts_gate_fp8, experts_up_fp8) = if experts_gate_up_fp8.is_some() {
+            (None, None)
+        } else {
+            (
+                stack_scaled_fp8_experts(&experts, |e| &e.gate_proj)?,
+                stack_scaled_fp8_experts(&experts, |e| &e.up_proj)?,
+            )
+        };
+        let experts_down_fp8 = stack_scaled_fp8_experts(&experts, |e| &e.down_proj)?;
+
         Ok(Self {
             gate,
             experts,
             experts_gate_up,
             experts_down,
+            experts_gate_up_fp8,
+            experts_gate_fp8,
+            experts_up_fp8,
+            experts_down_fp8,
             norm_topk_prob: cfg.norm_topk_prob,
             num_experts_per_tok: cfg.num_experts_per_tok,
         })
@@ -401,6 +606,83 @@ impl Qwen3SparseMoeBlock {
         Ok(ys)
     }
 
+    fn forward_fp8_composed(
+        &self,
+        ops: &dyn crate::ops::Ops,
+        xs: &Tensor,
+        topk_weights: &Tensor,
+        experts_per_tok: &Tensor,
+        hidden_dim: usize,
+        gate: Option<&ScaledFp8Experts>,
+        up: Option<&ScaledFp8Experts>,
+        down: &ScaledFp8Experts,
+        gate_up: Option<&ScaledFp8Experts>,
+    ) -> Result<Tensor> {
+        let n_tokens = xs.dim(0)?;
+        let flat = experts_per_tok.flatten_all()?;
+        let (sorted_expert_ids, sorted_token_ids) =
+            if let Some(result) = ops.moe_sort_experts(&flat) {
+                result?
+            } else {
+                sort_expert_assignments(experts_per_tok, xs.device())?
+            };
+
+        let grouped_fp8 = |input: &Tensor, experts: &ScaledFp8Experts| -> Result<Tensor> {
+            match ops.grouped_scaled_fp8_gemm(
+                input,
+                &experts.weights,
+                &experts.input_scales,
+                &experts.weight_scales,
+                &sorted_token_ids,
+                &sorted_expert_ids,
+                self.num_experts_per_tok,
+            ) {
+                Some(result) => result,
+                None => Err(candle_core::Error::Msg(
+                    "scaled-FP8 MoE requires grouped_scaled_fp8_gemm on CUDA".into(),
+                )),
+            }
+        };
+
+        let raw = if let Some(gate_up) = gate_up {
+            if let Some(result) = ops.grouped_scaled_fp8_gate_up_down(
+                xs,
+                topk_weights,
+                &gate_up.weights,
+                &gate_up.input_scales,
+                &gate_up.weight_scales,
+                &down.weights,
+                &down.input_scales,
+                &down.weight_scales,
+                &sorted_token_ids,
+                &sorted_expert_ids,
+                self.num_experts_per_tok,
+            ) {
+                return result;
+            } else {
+                let gate_up_out = grouped_fp8(xs, gate_up)?;
+                let inter = gate_up.weights.dim(1)? / 2;
+                let up_out = gate_up_out.narrow(D::Minus1, 0, inter)?.contiguous()?;
+                let gate_out = gate_up_out.narrow(D::Minus1, inter, inter)?.contiguous()?;
+                grouped_fp8(&ops.silu_mul(&gate_out, &up_out)?, down)?
+            }
+        } else {
+            let gate = gate.ok_or_else(|| {
+                candle_core::Error::Msg("scaled-FP8 MoE missing gate expert weights".into())
+            })?;
+            let up = up.ok_or_else(|| {
+                candle_core::Error::Msg("scaled-FP8 MoE missing up expert weights".into())
+            })?;
+            let gate_out = grouped_fp8(xs, gate)?;
+            let up_out = grouped_fp8(xs, up)?;
+            grouped_fp8(&ops.silu_mul(&gate_out, &up_out)?, down)?
+        };
+
+        let raw = raw.reshape((n_tokens, self.num_experts_per_tok, hidden_dim))?;
+        let weights = topk_weights.unsqueeze(D::Minus1)?.to_dtype(raw.dtype())?;
+        raw.broadcast_mul(&weights)?.sum(D::Minus2)
+    }
+
     /// Forward for varlen packed sequences: xs is (total_tokens, hidden_dim).
     #[allow(clippy::too_many_arguments)]
     fn forward_varlen(&self, ops: &dyn crate::ops::Ops, xs: &Tensor) -> Result<Tensor> {
@@ -410,6 +692,33 @@ impl Qwen3SparseMoeBlock {
         let backend_policy = moe_backend_policy();
 
         let input_is_cuda = xs.device().is_cuda();
+
+        if matches!(
+            backend_policy,
+            MoeBackendPolicy::Auto | MoeBackendPolicy::Cutlass
+        ) && input_is_cuda
+        {
+            let has_gate_up = self.experts_gate_up_fp8.is_some();
+            let has_separate_gate_up =
+                self.experts_gate_fp8.is_some() && self.experts_up_fp8.is_some();
+            if has_gate_up || has_separate_gate_up {
+                if let Some(down) = self.experts_down_fp8.as_ref() {
+                    let out = self.forward_fp8_composed(
+                        ops,
+                        xs,
+                        &topk_weights,
+                        &experts_per_tok,
+                        hidden_dim,
+                        self.experts_gate_fp8.as_ref(),
+                        self.experts_up_fp8.as_ref(),
+                        down,
+                        self.experts_gate_up_fp8.as_ref(),
+                    )?;
+                    log_moe_backend_once(backend_policy, "flashinfer_fp8_groupwise");
+                    return Ok(out);
+                }
+            }
+        }
 
         // Production path: FlashInfer's CUTLASS fused MoE handles
         // gate+up+silu+down+topk-weighted-sum in one kernel. On CUDA, `auto`
@@ -464,6 +773,26 @@ impl Qwen3SparseMoeBlock {
         log_moe_backend_once(backend_policy, "sequential");
         self.forward_sequential(ops, xs, &topk_weights, &experts_per_tok, hidden_dim)
     }
+}
+
+fn sort_expert_assignments(experts_per_tok: &Tensor, device: &Device) -> Result<(Tensor, Tensor)> {
+    let flat = experts_per_tok.flatten_all()?;
+    let n = flat.elem_count();
+
+    if n <= 1024 && device.is_cuda() {
+        let flat_2d = flat.reshape((1, n))?;
+        let (sorted_vals, sorted_idx) = flat_2d.sort_last_dim(true)?;
+        return Ok((sorted_vals.flatten_all()?, sorted_idx.flatten_all()?));
+    }
+
+    let flat_vec = flat.to_vec1::<u32>()?;
+    let mut indices: Vec<u32> = (0..n as u32).collect();
+    indices.sort_by_key(|&i| flat_vec[i as usize]);
+    let sorted_expert_ids: Vec<u32> = indices.iter().map(|&i| flat_vec[i as usize]).collect();
+    Ok((
+        Tensor::from_vec(sorted_expert_ids, (n,), device)?,
+        Tensor::from_vec(indices, (n,), device)?,
+    ))
 }
 
 // ── Gated MLP (SiLU-gated FFN, for dense layers) ──────────────────────

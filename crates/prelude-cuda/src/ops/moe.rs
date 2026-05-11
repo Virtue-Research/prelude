@@ -1,10 +1,13 @@
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::WrapErr;
 use cudarc::driver::{DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg};
-use prelude_core::tensor::{bail, DType, DeviceExt, Result, Tensor};
+use prelude_core::tensor::{DType, DeviceExt, Result, Tensor, bail};
 
 use crate::moe_ffi as ffi;
-use crate::{MOD_MOE_ROUTING, MOD_SHARED_EXPERT_GATE, PTX_MOE_ROUTING, PTX_SHARED_EXPERT_GATE};
+use crate::{
+    MOD_FP8_QUANTIZE, MOD_MOE_ROUTING, MOD_SHARED_EXPERT_GATE, PTX_FP8_QUANTIZE, PTX_MOE_ROUTING,
+    PTX_SHARED_EXPERT_GATE,
+};
 
 use std::{
     collections::HashMap,
@@ -777,6 +780,684 @@ pub fn try_grouped_gemm_sm100(
             Ok(None)
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn grouped_scaled_fp8_gemm(
+    input: &Tensor,
+    weights: &Tensor,
+    input_scales: &Tensor,
+    weight_scales: &Tensor,
+    sorted_token_ids: &Tensor,
+    sorted_expert_ids: &Tensor,
+    topk: usize,
+) -> Result<Tensor> {
+    use std::ffi::c_void;
+
+    if crate::cuda_ops::detect_sm_major() < 10 {
+        bail!("grouped_scaled_fp8_gemm requires SM100+ FlashInfer kernels");
+    }
+    if input.dtype() != DType::BF16 {
+        bail!(
+            "grouped_scaled_fp8_gemm requires BF16 input, got {:?}",
+            input.dtype()
+        );
+    }
+    if weights.dtype() != DType::F8E4M3 {
+        bail!(
+            "grouped_scaled_fp8_gemm requires F8E4M3 weights, got {:?}",
+            weights.dtype()
+        );
+    }
+
+    let input = input.contiguous()?;
+    let weights = weights.contiguous()?;
+    let input_scales = input_scales.contiguous()?;
+    let weight_scales = weight_scales.contiguous()?;
+    let sorted_token_ids = sorted_token_ids.contiguous()?;
+    let sorted_expert_ids = sorted_expert_ids.contiguous()?;
+
+    let (input_rows, k1) = input.dims2()?;
+    let (num_experts, size_n, size_k) = weights.dims3()?;
+    if size_k != k1 {
+        bail!("grouped_scaled_fp8_gemm: input K={k1} vs weights K={size_k} mismatch");
+    }
+    if size_k % 128 != 0 || size_n % 128 != 0 {
+        bail!(
+            "grouped_scaled_fp8_gemm requires N and K multiples of 128, got N={size_n}, K={size_k}"
+        );
+    }
+    if input_scales.dims() != [num_experts] {
+        bail!(
+            "grouped_scaled_fp8_gemm: input_scales shape {:?} != [{num_experts}]",
+            input_scales.dims()
+        );
+    }
+    let k_groups = size_k / 128;
+    let n_groups = size_n / 128;
+    if weight_scales.dims() != [num_experts, n_groups, k_groups] {
+        bail!(
+            "grouped_scaled_fp8_gemm: weight_scales shape {:?} != [{num_experts}, {n_groups}, {k_groups}]",
+            weight_scales.dims()
+        );
+    }
+
+    let n_real = sorted_token_ids.elem_count();
+    if n_real == 0 {
+        return Tensor::zeros((0, size_n), DType::BF16, input.device());
+    }
+    let token_divisor = if input_rows == n_real {
+        1
+    } else if input_rows * topk == n_real {
+        topk
+    } else {
+        bail!(
+            "grouped_scaled_fp8_gemm: input rows {input_rows} incompatible with assignments {n_real} and topk {topk}"
+        );
+    };
+
+    let (input_g, input_l) = input.storage_and_layout();
+    let input_cuda = as_candle_cuda(&input_g, "grouped_scaled_fp8_gemm/input")?;
+    let input_s = input_cuda
+        .as_cuda_slice::<half::bf16>()?
+        .slice(input_l.start_offset()..);
+
+    let (weights_g, _) = weights.storage_and_layout();
+    let weights_cuda = as_candle_cuda(&weights_g, "grouped_scaled_fp8_gemm/weights")?;
+    let _weights_s = weights_cuda.as_cuda_slice::<float8::F8E4M3>()?;
+
+    let (is_g, is_l) = input_scales.storage_and_layout();
+    let is_cuda = as_candle_cuda(&is_g, "grouped_scaled_fp8_gemm/input_scales")?;
+    let is_s = is_cuda.as_cuda_slice::<f32>()?.slice(is_l.start_offset()..);
+
+    let (ws_g, _) = weight_scales.storage_and_layout();
+    let ws_cuda = as_candle_cuda(&ws_g, "grouped_scaled_fp8_gemm/weight_scales")?;
+    let _ws_s = ws_cuda.as_cuda_slice::<f32>()?;
+
+    let (sti_g, sti_l) = sorted_token_ids.storage_and_layout();
+    let sti_cuda = as_candle_cuda(&sti_g, "grouped_scaled_fp8_gemm/sorted_token_ids")?;
+    let sti_s = sti_cuda
+        .as_cuda_slice::<u32>()?
+        .slice(sti_l.start_offset()..);
+
+    let (sei_g, sei_l) = sorted_expert_ids.storage_and_layout();
+    let sei_cuda = as_candle_cuda(&sei_g, "grouped_scaled_fp8_gemm/sorted_expert_ids")?;
+    let sei_s = sei_cuda
+        .as_cuda_slice::<u32>()?
+        .slice(sei_l.start_offset()..);
+
+    let dev = input_cuda.device().clone();
+    let stream = dev.cuda_stream();
+    let cu_stream = stream.cu_stream() as i64;
+    let device_id = input.device().ordinal() as i32;
+
+    let real_counts = unsafe { dev.alloc::<i32>(num_experts) }?;
+    let real_offsets = unsafe { dev.alloc::<i32>(num_experts + 1) }?;
+    let padded_offsets = unsafe { dev.alloc::<i32>(num_experts + 1) }?;
+    unsafe {
+        ffi::moe_compute_expert_offsets_light(
+            sei_s.device_ptr(&stream).0 as *const i32,
+            n_real as i32,
+            num_experts as i32,
+            real_counts.device_ptr(&stream).0 as *mut i32,
+            real_offsets.device_ptr(&stream).0 as *mut i32,
+            cu_stream,
+        );
+    }
+
+    let padded_upper = n_real + num_experts * 3;
+    let gathered = unsafe { dev.alloc::<float8::F8E4M3>(padded_upper * size_k) }?;
+    let scale_a = unsafe { dev.alloc::<f32>(k_groups * padded_upper) }?;
+    let gemm_out = unsafe { dev.alloc::<half::bf16>(padded_upper * size_n) }?;
+    let output = unsafe { dev.alloc::<half::bf16>(n_real * size_n) }?;
+
+    unsafe {
+        use cudarc::driver::result::memset_d8_async;
+        memset_d8_async(
+            gathered.device_ptr(&stream).0,
+            0,
+            padded_upper * size_k,
+            stream.cu_stream(),
+        )
+        .map_err(|e| candle_core::Error::Msg(format!("memset FP8 gathered input: {e:?}")))?;
+    }
+
+    let compute_offsets = dev.get_or_load_custom_func(
+        "moe_fp8_compute_padded_offsets",
+        MOD_FP8_QUANTIZE,
+        PTX_FP8_QUANTIZE,
+    )?;
+    let fill_scales = dev.get_or_load_custom_func(
+        "moe_fp8_fill_padded_scales",
+        MOD_FP8_QUANTIZE,
+        PTX_FP8_QUANTIZE,
+    )?;
+    let gather_quantize = dev.get_or_load_custom_func(
+        "moe_fp8_gather_quantize_bf16_padded",
+        MOD_FP8_QUANTIZE,
+        PTX_FP8_QUANTIZE,
+    )?;
+
+    let cfg_offsets = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let align = 4i32;
+    let num_experts_i = num_experts as i32;
+    {
+        let mut builder = compute_offsets.builder();
+        builder.arg(&real_offsets);
+        builder.arg(&padded_offsets);
+        builder.arg(&num_experts_i);
+        builder.arg(&align);
+        unsafe { builder.launch(cfg_offsets) }.w()?;
+    }
+
+    let cfg_scales = LaunchConfig {
+        grid_dim: (num_experts as u32, k_groups as u32, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let k_groups_i = k_groups as i32;
+    let padded_upper_i = padded_upper as i32;
+    {
+        let mut builder = fill_scales.builder();
+        builder.arg(&is_s);
+        builder.arg(&padded_offsets);
+        builder.arg(&scale_a);
+        builder.arg(&num_experts_i);
+        builder.arg(&k_groups_i);
+        builder.arg(&padded_upper_i);
+        unsafe { builder.launch(cfg_scales) }.w()?;
+    }
+
+    let cfg_gather = LaunchConfig {
+        grid_dim: (n_real as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n_real_i = n_real as i32;
+    let size_k_i = size_k as i32;
+    let token_divisor_i = token_divisor as i32;
+    {
+        let mut builder = gather_quantize.builder();
+        builder.arg(&input_s);
+        builder.arg(&sti_s);
+        builder.arg(&sei_s);
+        builder.arg(&real_offsets);
+        builder.arg(&padded_offsets);
+        builder.arg(&is_s);
+        builder.arg(&gathered);
+        builder.arg(&n_real_i);
+        builder.arg(&size_k_i);
+        builder.arg(&token_divisor_i);
+        unsafe { builder.launch(cfg_gather) }.w()?;
+    }
+
+    crate::fp8_gemm::group_fp8_gemm_nt_groupwise_raw(
+        device_id,
+        stream.cu_stream() as *mut c_void,
+        gathered.device_ptr(&stream).0 as *mut c_void,
+        &weights,
+        scale_a.device_ptr(&stream).0 as *mut c_void,
+        &weight_scales,
+        gemm_out.device_ptr(&stream).0 as *mut c_void,
+        padded_offsets.device_ptr(&stream).0 as *mut c_void,
+        padded_upper,
+        num_experts,
+        size_n,
+        size_k,
+    )?;
+
+    unsafe {
+        ffi::moe_dg_scatter_padded(
+            gemm_out.device_ptr(&stream).0 as *const c_void,
+            sti_s.device_ptr(&stream).0 as *const u32,
+            sei_s.device_ptr(&stream).0 as *const u32,
+            real_offsets.device_ptr(&stream).0 as *const i32,
+            padded_offsets.device_ptr(&stream).0 as *const i32,
+            output.device_ptr(&stream).0 as *mut c_void,
+            n_real as i32,
+            size_n as i32,
+            /*dtype=*/ 1,
+            cu_stream,
+        );
+    }
+
+    drop(input_g);
+    drop(weights_g);
+    drop(is_g);
+    drop(ws_g);
+    drop(sti_g);
+    drop(sei_g);
+    drop(real_counts);
+    drop(real_offsets);
+    drop(padded_offsets);
+    drop(gathered);
+    drop(scale_a);
+    drop(gemm_out);
+
+    let storage = candle_core::CudaStorage::wrap_cuda_slice(output, dev);
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(storage),
+        (n_real, size_n),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn grouped_scaled_fp8_gate_up_down(
+    input: &Tensor,
+    topk_weights: &Tensor,
+    gate_up_weights: &Tensor,
+    gate_up_input_scales: &Tensor,
+    gate_up_weight_scales: &Tensor,
+    down_weights: &Tensor,
+    down_input_scales: &Tensor,
+    down_weight_scales: &Tensor,
+    sorted_token_ids: &Tensor,
+    sorted_expert_ids: &Tensor,
+    topk: usize,
+) -> Result<Tensor> {
+    use std::ffi::c_void;
+
+    if crate::cuda_ops::detect_sm_major() < 10 {
+        bail!("grouped_scaled_fp8_gate_up_down requires SM100+ FlashInfer kernels");
+    }
+    if input.dtype() != DType::BF16 {
+        bail!(
+            "grouped_scaled_fp8_gate_up_down requires BF16 input, got {:?}",
+            input.dtype()
+        );
+    }
+    if topk_weights.dtype() != DType::F32 {
+        bail!(
+            "grouped_scaled_fp8_gate_up_down requires F32 topk weights, got {:?}",
+            topk_weights.dtype()
+        );
+    }
+    if gate_up_weights.dtype() != DType::F8E4M3 || down_weights.dtype() != DType::F8E4M3 {
+        bail!(
+            "grouped_scaled_fp8_gate_up_down requires F8E4M3 weights, got {:?} and {:?}",
+            gate_up_weights.dtype(),
+            down_weights.dtype()
+        );
+    }
+
+    let input = input.contiguous()?;
+    let topk_weights = topk_weights.contiguous()?;
+    let gate_up_weights = gate_up_weights.contiguous()?;
+    let gate_up_input_scales = gate_up_input_scales.contiguous()?;
+    let gate_up_weight_scales = gate_up_weight_scales.contiguous()?;
+    let down_weights = down_weights.contiguous()?;
+    let down_input_scales = down_input_scales.contiguous()?;
+    let down_weight_scales = down_weight_scales.contiguous()?;
+    let sorted_token_ids = sorted_token_ids.contiguous()?;
+    let sorted_expert_ids = sorted_expert_ids.contiguous()?;
+
+    let (input_rows, hidden) = input.dims2()?;
+    if topk_weights.dims() != [input_rows, topk] {
+        bail!(
+            "grouped_scaled_fp8_gate_up_down: topk_weights shape {:?} != [{input_rows}, {topk}]",
+            topk_weights.dims()
+        );
+    }
+    let (num_experts, gate_up_n, gate_up_k) = gate_up_weights.dims3()?;
+    let (down_experts, down_n, down_k) = down_weights.dims3()?;
+    if gate_up_n % 2 != 0 {
+        bail!("grouped_scaled_fp8_gate_up_down: gate_up N must be even, got {gate_up_n}");
+    }
+    let inter = gate_up_n / 2;
+    if gate_up_k != hidden || down_n != hidden || down_k != inter {
+        bail!(
+            "grouped_scaled_fp8_gate_up_down shape mismatch: input hidden={hidden}, gate_up={:?}, down={:?}",
+            gate_up_weights.dims(),
+            down_weights.dims()
+        );
+    }
+    if down_experts != num_experts {
+        bail!(
+            "grouped_scaled_fp8_gate_up_down expert count mismatch: gate_up={num_experts}, down={down_experts}"
+        );
+    }
+    if hidden % 128 != 0 || inter % 128 != 0 || gate_up_n % 128 != 0 {
+        bail!(
+            "grouped_scaled_fp8_gate_up_down requires hidden/inter multiples of 128, got hidden={hidden}, inter={inter}"
+        );
+    }
+    if gate_up_input_scales.dims() != [num_experts] {
+        bail!(
+            "grouped_scaled_fp8_gate_up_down: gate_up_input_scales shape {:?} != [{num_experts}]",
+            gate_up_input_scales.dims()
+        );
+    }
+    if down_input_scales.dims() != [num_experts] {
+        bail!(
+            "grouped_scaled_fp8_gate_up_down: down_input_scales shape {:?} != [{num_experts}]",
+            down_input_scales.dims()
+        );
+    }
+    let hidden_groups = hidden / 128;
+    let inter_groups = inter / 128;
+    let gate_up_groups = gate_up_n / 128;
+    if gate_up_weight_scales.dims() != [num_experts, gate_up_groups, hidden_groups] {
+        bail!(
+            "grouped_scaled_fp8_gate_up_down: gate_up_weight_scales shape {:?} != [{num_experts}, {gate_up_groups}, {hidden_groups}]",
+            gate_up_weight_scales.dims()
+        );
+    }
+    if down_weight_scales.dims() != [num_experts, hidden_groups, inter_groups] {
+        bail!(
+            "grouped_scaled_fp8_gate_up_down: down_weight_scales shape {:?} != [{num_experts}, {hidden_groups}, {inter_groups}]",
+            down_weight_scales.dims()
+        );
+    }
+
+    let n_real = sorted_token_ids.elem_count();
+    if n_real == 0 {
+        return Tensor::zeros((0, hidden), DType::BF16, input.device());
+    }
+    let token_divisor = if input_rows == n_real {
+        1
+    } else if input_rows * topk == n_real {
+        topk
+    } else {
+        bail!(
+            "grouped_scaled_fp8_gate_up_down: input rows {input_rows} incompatible with assignments {n_real} and topk {topk}"
+        );
+    };
+
+    let (input_g, input_l) = input.storage_and_layout();
+    let input_cuda = as_candle_cuda(&input_g, "grouped_scaled_fp8_gate_up_down/input")?;
+    let input_s = input_cuda
+        .as_cuda_slice::<half::bf16>()?
+        .slice(input_l.start_offset()..);
+
+    let (tw_g, tw_l) = topk_weights.storage_and_layout();
+    let tw_cuda = as_candle_cuda(&tw_g, "grouped_scaled_fp8_gate_up_down/topk_weights")?;
+    let tw_s = tw_cuda.as_cuda_slice::<f32>()?.slice(tw_l.start_offset()..);
+
+    let (guis_g, guis_l) = gate_up_input_scales.storage_and_layout();
+    let guis_cuda = as_candle_cuda(
+        &guis_g,
+        "grouped_scaled_fp8_gate_up_down/gate_up_input_scales",
+    )?;
+    let guis_s = guis_cuda
+        .as_cuda_slice::<f32>()?
+        .slice(guis_l.start_offset()..);
+
+    let (dis_g, dis_l) = down_input_scales.storage_and_layout();
+    let dis_cuda = as_candle_cuda(&dis_g, "grouped_scaled_fp8_gate_up_down/down_input_scales")?;
+    let dis_s = dis_cuda
+        .as_cuda_slice::<f32>()?
+        .slice(dis_l.start_offset()..);
+
+    let (sti_g, sti_l) = sorted_token_ids.storage_and_layout();
+    let sti_cuda = as_candle_cuda(&sti_g, "grouped_scaled_fp8_gate_up_down/sorted_token_ids")?;
+    let sti_s = sti_cuda
+        .as_cuda_slice::<u32>()?
+        .slice(sti_l.start_offset()..);
+
+    let (sei_g, sei_l) = sorted_expert_ids.storage_and_layout();
+    let sei_cuda = as_candle_cuda(&sei_g, "grouped_scaled_fp8_gate_up_down/sorted_expert_ids")?;
+    let sei_s = sei_cuda
+        .as_cuda_slice::<u32>()?
+        .slice(sei_l.start_offset()..);
+
+    let dev = input_cuda.device().clone();
+    let stream = dev.cuda_stream();
+    let cu_stream = stream.cu_stream() as i64;
+    let device_id = input.device().ordinal() as i32;
+
+    let real_counts = unsafe { dev.alloc::<i32>(num_experts) }?;
+    let real_offsets = unsafe { dev.alloc::<i32>(num_experts + 1) }?;
+    let padded_offsets = unsafe { dev.alloc::<i32>(num_experts + 1) }?;
+    unsafe {
+        ffi::moe_compute_expert_offsets_light(
+            sei_s.device_ptr(&stream).0 as *const i32,
+            n_real as i32,
+            num_experts as i32,
+            real_counts.device_ptr(&stream).0 as *mut i32,
+            real_offsets.device_ptr(&stream).0 as *mut i32,
+            cu_stream,
+        );
+    }
+
+    let align = 4usize;
+    let padded_upper = n_real + num_experts * (align - 1);
+    let grouped_layout = unsafe { dev.alloc::<i32>(padded_upper) }?;
+    let assignment_rows = unsafe { dev.alloc::<i32>(n_real) }?;
+    let qinput = unsafe { dev.alloc::<float8::F8E4M3>(padded_upper * hidden) }?;
+    let scale_a_gate_up = unsafe { dev.alloc::<f32>(hidden_groups * padded_upper) }?;
+    let gate_up_out = unsafe { dev.alloc::<half::bf16>(padded_upper * gate_up_n) }?;
+    let qdown = unsafe { dev.alloc::<float8::F8E4M3>(padded_upper * inter) }?;
+    let scale_a_down = unsafe { dev.alloc::<f32>(inter_groups * padded_upper) }?;
+    let down_out = unsafe { dev.alloc::<half::bf16>(padded_upper * hidden) }?;
+    let output = unsafe { dev.alloc::<half::bf16>(input_rows * hidden) }?;
+
+    unsafe {
+        use cudarc::driver::result::memset_d8_async;
+        memset_d8_async(
+            qinput.device_ptr(&stream).0,
+            0,
+            padded_upper * hidden,
+            stream.cu_stream(),
+        )
+        .map_err(|e| candle_core::Error::Msg(format!("memset FP8 gate_up input: {e:?}")))?;
+        memset_d8_async(
+            grouped_layout.device_ptr(&stream).0,
+            0xff,
+            padded_upper * std::mem::size_of::<i32>(),
+            stream.cu_stream(),
+        )
+        .map_err(|e| candle_core::Error::Msg(format!("memset FP8 grouped layout: {e:?}")))?;
+    }
+
+    let compute_layout = dev.get_or_load_custom_func(
+        "moe_fp8_compute_padded_layout",
+        MOD_FP8_QUANTIZE,
+        PTX_FP8_QUANTIZE,
+    )?;
+    let fill_scales = dev.get_or_load_custom_func(
+        "moe_fp8_fill_padded_scales",
+        MOD_FP8_QUANTIZE,
+        PTX_FP8_QUANTIZE,
+    )?;
+    let gather_quantize = dev.get_or_load_custom_func(
+        "moe_fp8_gather_quantize_bf16_padded",
+        MOD_FP8_QUANTIZE,
+        PTX_FP8_QUANTIZE,
+    )?;
+    let build_assignment_rows = dev.get_or_load_custom_func(
+        "moe_fp8_build_assignment_rows",
+        MOD_FP8_QUANTIZE,
+        PTX_FP8_QUANTIZE,
+    )?;
+    let silu_quantize = dev.get_or_load_custom_func(
+        "moe_fp8_silu_mul_quantize_bf16_padded",
+        MOD_FP8_QUANTIZE,
+        PTX_FP8_QUANTIZE,
+    )?;
+    let weighted_sum = dev.get_or_load_custom_func(
+        "moe_fp8_weighted_sum_padded_bf16",
+        MOD_FP8_QUANTIZE,
+        PTX_FP8_QUANTIZE,
+    )?;
+
+    let cfg_single = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let align_i = align as i32;
+    let num_experts_i = num_experts as i32;
+    {
+        let mut builder = compute_layout.builder();
+        builder.arg(&real_offsets);
+        builder.arg(&padded_offsets);
+        builder.arg(&grouped_layout);
+        builder.arg(&num_experts_i);
+        builder.arg(&align_i);
+        unsafe { builder.launch(cfg_single) }.w()?;
+    }
+
+    let cfg_scales_gate_up = LaunchConfig {
+        grid_dim: (num_experts as u32, hidden_groups as u32, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let hidden_groups_i = hidden_groups as i32;
+    let padded_upper_i = padded_upper as i32;
+    {
+        let mut builder = fill_scales.builder();
+        builder.arg(&guis_s);
+        builder.arg(&padded_offsets);
+        builder.arg(&scale_a_gate_up);
+        builder.arg(&num_experts_i);
+        builder.arg(&hidden_groups_i);
+        builder.arg(&padded_upper_i);
+        unsafe { builder.launch(cfg_scales_gate_up) }.w()?;
+    }
+
+    let cfg_gather = LaunchConfig {
+        grid_dim: (n_real as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n_real_i = n_real as i32;
+    let hidden_i = hidden as i32;
+    let token_divisor_i = token_divisor as i32;
+    {
+        let mut builder = gather_quantize.builder();
+        builder.arg(&input_s);
+        builder.arg(&sti_s);
+        builder.arg(&sei_s);
+        builder.arg(&real_offsets);
+        builder.arg(&padded_offsets);
+        builder.arg(&guis_s);
+        builder.arg(&qinput);
+        builder.arg(&n_real_i);
+        builder.arg(&hidden_i);
+        builder.arg(&token_divisor_i);
+        unsafe { builder.launch(cfg_gather) }.w()?;
+    }
+
+    let cfg_assignment_rows = LaunchConfig {
+        grid_dim: ((n_real as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    {
+        let mut builder = build_assignment_rows.builder();
+        builder.arg(&sti_s);
+        builder.arg(&sei_s);
+        builder.arg(&real_offsets);
+        builder.arg(&padded_offsets);
+        builder.arg(&assignment_rows);
+        builder.arg(&n_real_i);
+        unsafe { builder.launch(cfg_assignment_rows) }.w()?;
+    }
+
+    crate::fp8_gemm::group_fp8_gemm_nt_groupwise_raw(
+        device_id,
+        stream.cu_stream() as *mut c_void,
+        qinput.device_ptr(&stream).0 as *mut c_void,
+        &gate_up_weights,
+        scale_a_gate_up.device_ptr(&stream).0 as *mut c_void,
+        &gate_up_weight_scales,
+        gate_up_out.device_ptr(&stream).0 as *mut c_void,
+        padded_offsets.device_ptr(&stream).0 as *mut c_void,
+        padded_upper,
+        num_experts,
+        gate_up_n,
+        hidden,
+    )?;
+
+    let cfg_silu_quant = LaunchConfig {
+        grid_dim: (padded_upper as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let inter_i = inter as i32;
+    let inter_groups_i = inter_groups as i32;
+    {
+        let mut builder = silu_quantize.builder();
+        builder.arg(&gate_up_out);
+        builder.arg(&grouped_layout);
+        builder.arg(&dis_s);
+        builder.arg(&qdown);
+        builder.arg(&scale_a_down);
+        builder.arg(&inter_i);
+        builder.arg(&inter_groups_i);
+        builder.arg(&padded_upper_i);
+        unsafe { builder.launch(cfg_silu_quant) }.w()?;
+    }
+
+    crate::fp8_gemm::group_fp8_gemm_nt_groupwise_raw(
+        device_id,
+        stream.cu_stream() as *mut c_void,
+        qdown.device_ptr(&stream).0 as *mut c_void,
+        &down_weights,
+        scale_a_down.device_ptr(&stream).0 as *mut c_void,
+        &down_weight_scales,
+        down_out.device_ptr(&stream).0 as *mut c_void,
+        padded_offsets.device_ptr(&stream).0 as *mut c_void,
+        padded_upper,
+        num_experts,
+        hidden,
+        inter,
+    )?;
+
+    let cfg_weighted_sum = LaunchConfig {
+        grid_dim: (
+            input_rows as u32,
+            (hidden as u32).div_ceil(256),
+            1,
+        ),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let input_rows_i = input_rows as i32;
+    let topk_i = topk as i32;
+    {
+        let mut builder = weighted_sum.builder();
+        builder.arg(&down_out);
+        builder.arg(&assignment_rows);
+        builder.arg(&tw_s);
+        builder.arg(&output);
+        builder.arg(&input_rows_i);
+        builder.arg(&topk_i);
+        builder.arg(&hidden_i);
+        unsafe { builder.launch(cfg_weighted_sum) }.w()?;
+    }
+
+    drop(input_g);
+    drop(tw_g);
+    drop(guis_g);
+    drop(dis_g);
+    drop(sti_g);
+    drop(sei_g);
+    drop(real_counts);
+    drop(real_offsets);
+    drop(padded_offsets);
+    drop(grouped_layout);
+    drop(assignment_rows);
+    drop(qinput);
+    drop(scale_a_gate_up);
+    drop(gate_up_out);
+    drop(qdown);
+    drop(scale_a_down);
+    drop(down_out);
+
+    let storage = candle_core::CudaStorage::wrap_cuda_slice(output, dev);
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(storage),
+        (input_rows, hidden),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
 }
 
 /// GPU-accelerated sort of expert assignments using thrust::sort_by_key.

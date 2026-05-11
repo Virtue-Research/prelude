@@ -2337,10 +2337,20 @@ def main():
         sm100_modules = []
         csrc = fi_src / "csrc"
 
-        def _add_sm100_module(vid, src_files, binding_file, symbols, kind="gemm", extra_flags=None):
+        def _add_sm100_module(
+            vid,
+            src_files,
+            binding_file,
+            symbols,
+            kind="gemm",
+            extra_flags=None,
+            generated_sources=None,
+        ):
             mod_out = gen_dir / vid
             mod_out.mkdir(parents=True, exist_ok=True)
             mod_sources = []
+            if generated_sources:
+                mod_sources.extend(generated_sources)
             for sf in src_files:
                 sp = csrc / sf
                 if sp.exists():
@@ -2358,10 +2368,39 @@ def main():
                 compile_jobs.append((src, sm100_flags, ef, vinfo))
             sm100_modules.append(vinfo)
 
-        # gen_gemm_sm100_module_cutlass_fp8: FP8 GEMM via jinja. Production
-        # BF16-only builds do not call these kernels, and they dominate AOT
-        # build time on Blackwell, so only emit them for explicit FP8 builds.
-        if any(dtype.lower().startswith("fp8") for dtype in dtypes):
+        def _render_sm100_groupwise_fp8_instantiations(prefix, vid):
+            mod_out = gen_dir / vid
+            mod_out.mkdir(parents=True, exist_ok=True)
+            with open(csrc / f"{prefix}_sm100_kernel_inst.jinja") as f:
+                template = jinja2.Template(f.read())
+            sources = []
+            dtype_in = ("e4m3", "cutlass::float_e4m3_t")
+            dtype_outs = [
+                ("f16", "cutlass::half_t"),
+                ("bf16", "cutlass::bfloat16_t"),
+            ]
+            for out_name, out_type in dtype_outs:
+                for scale_major_k in ["true", "false"]:
+                    for mma_sm in [1, 2]:
+                        path = (
+                            mod_out
+                            / f"{prefix}_{dtype_in[0]}_{out_name}_major{scale_major_k}_mma{mma_sm}_sm100.cu"
+                        )
+                        path.write_text(
+                            template.render(
+                                dtype_in=dtype_in[1],
+                                dtype_out=out_type,
+                                scale_major_k=scale_major_k,
+                                mma_sm=mma_sm,
+                            )
+                        )
+                        sources.append(path)
+            return sources
+
+        # gen_gemm_sm100_module_cutlass_fp8: scalar-scale FP8 GEMM via jinja.
+        # Prelude's scaled-FP8 Linear path uses this for per-tensor static
+        # scales, while MoE uses the groupwise FP8 kernels below.
+        if True:
             fp8_out = gen_dir / "fi_fp8_gemm_cutlass"
             fp8_out.mkdir(parents=True, exist_ok=True)
             fp8_sources = []
@@ -2390,9 +2429,6 @@ def main():
                 compile_jobs.append((src, sm100_flags, fp8_extra, fp8_vinfo))
             sm100_modules.append(fp8_vinfo)
             print(f"  SM100 FP8 GEMM: {len(fp8_sources)} sources (12 jinja + 1 dispatch)")
-        else:
-            print("  SM100 FP8 GEMM: skipped for non-FP8 build")
-
         # gen_tgv_gemm_sm10x_module: TGV decode GEMM via jinja (11 tile configs per dtype)
         with open(csrc / "tgv_gemm.jinja") as f:
             tgv_templ = jinja2.Template(f.read())
@@ -2437,9 +2473,20 @@ def main():
         print(f"  SM100 TGV GEMM: {len(tgv_dtypes)} dtypes × {len(tgv_cta_configs)+1} sources each")
 
         # gen_gemm_sm100_module: groupwise GEMM + binding
+        groupwise_fp8_extra = [
+            "-DFLASHINFER_ENABLE_BF16",
+            "-DFLASHINFER_ENABLE_F16",
+            "-DFLASHINFER_ENABLE_FP8_E4M3",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+        ]
+        gemm_sm100_fp8_sources = _render_sm100_groupwise_fp8_instantiations(
+            "gemm_groupwise", "fi_gemm_sm100"
+        )
         _add_sm100_module("fi_gemm_sm100",
                           ["gemm_groupwise_sm100.cu"], "gemm_sm100_binding.cu",
-                          ["gemm_fp8_nt_groupwise"])
+                          ["gemm_fp8_nt_groupwise"],
+                          extra_flags=groupwise_fp8_extra,
+                          generated_sources=gemm_sm100_fp8_sources)
         # gen_gemm_sm100_module_cutlass_fp4: FP4 GEMM (DISABLED)
         # The upstream jinja instantiations for genericFp4GemmKernelLauncher
         # are not expanded here, so the dispatch TU leaves undefined symbols.
@@ -2453,11 +2500,16 @@ def main():
         #                   ["mxfp8_gemm_cutlass.cu"], None,
         #                   ["mxfp8_gemm", "mxfp8_gemm_tactic_num"])
         # Group GEMM SM100 (FP8 + MXFP4)
+        group_gemm_sm100_fp8_sources = _render_sm100_groupwise_fp8_instantiations(
+            "group_gemm_fp8_groupwise", "fi_group_gemm_sm100"
+        )
         _add_sm100_module("fi_group_gemm_sm100",
                           ["group_gemm_fp8_groupwise_sm100.cu",
                            "group_gemm_mxfp4_groupwise_sm100.cu"],
                           "group_gemm_sm100_binding.cu",
-                          ["group_gemm_fp8_nt_groupwise", "group_gemm_mxfp4_nt_groupwise"])
+                          ["group_gemm_fp8_nt_groupwise", "group_gemm_mxfp4_nt_groupwise"],
+                          extra_flags=groupwise_fp8_extra,
+                          generated_sources=group_gemm_sm100_fp8_sources)
 
         # ── CUTLASS Fused MoE Blackwell (BF16 path used by Qwen3 MoE) ──
         #

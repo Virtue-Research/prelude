@@ -90,6 +90,7 @@ pub(crate) mod attn;
 mod cuda_graph;
 mod cuda_ops;
 pub mod executor;
+mod fp8_gemm;
 pub(crate) mod moe_ffi;
 pub(crate) mod ops;
 #[cfg(feature = "quant-gemm")]

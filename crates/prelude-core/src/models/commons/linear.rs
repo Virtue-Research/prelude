@@ -99,6 +99,13 @@ impl LinearBackend for DenseLinear {
 
 // ── LinearBackend trait ───────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy)]
+pub struct ScaledFp8LinearParts<'a> {
+    pub weight: &'a Tensor,
+    pub input_scale: f32,
+    pub weight_scale: f32,
+}
+
 /// Backend trait for `Linear`. Exists only because Linear has multiple real
 /// runtime implementations (dense fp, Q4_0, Q4_K, GPU quant, oneDNN), one per
 /// weight format. Attention and MLP don't have an analogous trait because
@@ -125,6 +132,12 @@ pub trait LinearBackend: Module + Send + Sync + std::fmt::Debug {
     /// Whether this backend uses quantized weights.
     fn is_quantized(&self) -> bool {
         false
+    }
+
+    /// Expose scaled-FP8 linear metadata to higher-level fused kernels.
+    /// Backends that do not preserve FP8 weights return `None`.
+    fn scaled_fp8(&self) -> Option<ScaledFp8LinearParts<'_>> {
+        None
     }
 
     /// Clone into a boxed trait object.
@@ -348,6 +361,10 @@ impl Linear {
 
     pub fn weight_opt(&self) -> Option<&Tensor> {
         self.inner.weight()
+    }
+
+    pub fn scaled_fp8(&self) -> Option<ScaledFp8LinearParts<'_>> {
+        self.inner.scaled_fp8()
     }
 
     /// Access the underlying weight tensor.

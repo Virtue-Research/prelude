@@ -51,6 +51,7 @@ pub const KDLCUDA: i32 = 2;
 pub const KDLCPU: i32 = 1;
 pub const KDLBFLOAT: u8 = 4;
 pub const KDLFLOAT: u8 = 2;
+pub const KDLFLOAT8_E4M3FN: u8 = 10;
 pub const KDLINT: u8 = 0;
 pub const KDLUINT: u8 = 1;
 
@@ -73,6 +74,7 @@ pub const KTVMFFI_BOOL: i32 = 2;
 pub const KTVMFFI_FLOAT: i32 = 3;
 pub const KTVMFFI_OPAQUE_PTR: i32 = 4;
 pub const KTVMFFI_DLTENSOR_PTR: i32 = 7;
+pub const KTVMFFI_RAW_STR: i32 = 8;
 
 /// TVM safe call function signature (TVMFFISafeCallType).
 /// Each kernel variant exports `__tvm_ffi_{variant_name}` with this signature.
@@ -140,6 +142,16 @@ impl TVMFFIAny {
     pub fn opaque_ptr(ptr: *mut c_void) -> Self {
         Self {
             type_index: KTVMFFI_OPAQUE_PTR,
+            zero_padding: 0,
+            v_union: ptr as u64,
+        }
+    }
+
+    /// Pack a non-owning, null-terminated C string. The pointed-to bytes must
+    /// outlive the TVM FFI call.
+    pub fn raw_str(ptr: *const u8) -> Self {
+        Self {
+            type_index: KTVMFFI_RAW_STR,
             zero_padding: 0,
             v_union: ptr as u64,
         }

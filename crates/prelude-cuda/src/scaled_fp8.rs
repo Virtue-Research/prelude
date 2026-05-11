@@ -1,75 +1,39 @@
 use std::any::Any;
-use std::ffi::c_void;
-use std::sync::Mutex;
 
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::WrapErr;
-use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 use prelude_core::models::commons::linear::{
-    LinearBackend, ScaledFp8LinearFactory, ScaledFp8LinearFactoryEntry,
+    LinearBackend, ScaledFp8LinearFactory, ScaledFp8LinearFactoryEntry, ScaledFp8LinearParts,
 };
-use prelude_core::tensor::{bail, DType, Device, Module, Result, Tensor};
+use prelude_core::tensor::{DType, Device, Module, Result, Tensor, bail};
 
+use crate::fp8_gemm;
 use crate::{MOD_FP8_QUANTIZE, PTX_FP8_QUANTIZE};
 
 #[derive(Debug)]
 struct GpuScaledFp8Linear {
     weight: Tensor,
-    weight_scale_tma: Tensor,
+    input_scale_tensor: Tensor,
+    weight_scale_tensor: Tensor,
     input_scale: f32,
     weight_scale: f32,
     bias: Option<Tensor>,
     n: usize,
     k: usize,
-    fallback_weight: Mutex<Option<Tensor>>,
 }
 
 impl Clone for GpuScaledFp8Linear {
     fn clone(&self) -> Self {
         Self {
             weight: self.weight.clone(),
-            weight_scale_tma: self.weight_scale_tma.clone(),
+            input_scale_tensor: self.input_scale_tensor.clone(),
+            weight_scale_tensor: self.weight_scale_tensor.clone(),
             input_scale: self.input_scale,
             weight_scale: self.weight_scale,
             bias: self.bias.clone(),
             n: self.n,
             k: self.k,
-            fallback_weight: Mutex::new(None),
-        }
-    }
-}
-
-impl GpuScaledFp8Linear {
-    fn fallback_weight(&self) -> Result<Tensor> {
-        let mut fallback_weight = match self.fallback_weight.lock() {
-            Ok(fallback_weight) => fallback_weight,
-            Err(_) => bail!("scaled FP8 linear fallback weight cache lock poisoned"),
-        };
-        if let Some(weight) = fallback_weight.as_ref() {
-            return Ok(weight.clone());
-        }
-
-        let weight = self
-            .weight
-            .to_dtype(DType::BF16)?
-            .affine(self.weight_scale as f64, 0.0)?;
-        *fallback_weight = Some(weight.clone());
-        Ok(weight)
-    }
-
-    fn fallback_forward(&self, x_flat: &Tensor, out_shape: &[usize]) -> Result<Tensor> {
-        let weight = self.fallback_weight()?;
-        let x_flat = match x_flat.dtype() {
-            DType::BF16 => x_flat.clone(),
-            _ => x_flat.to_dtype(DType::BF16)?,
-        };
-        let mut out = x_flat.matmul(&weight.t()?)?;
-        if out_shape.len() > 2 {
-            out = out.reshape(out_shape)?;
-        }
-        match &self.bias {
-            Some(bias) => out.broadcast_add(bias),
-            None => Ok(out),
         }
     }
 }
@@ -99,32 +63,27 @@ impl Module for GpuScaledFp8Linear {
             _ => x_flat.to_dtype(DType::BF16)?.contiguous()?,
         };
 
-        let qinput = static_scaled_quantize(&x_flat, self.input_scale)?;
-        let k_groups = self.k.div_ceil(128);
-        let scale_a = filled_f32_tensor(x.device(), k_groups * align4(m), self.input_scale)?;
+        let m_pad = align4(m);
+        let qinput = static_scaled_quantize_padded(&x_flat, self.input_scale, m, self.k, m_pad)?;
 
-        match fp8_gemm(
+        let mut out = fp8_gemm::fp8_gemm_nt_scalar(
             &qinput,
             &self.weight,
-            &scale_a,
-            &self.weight_scale_tma,
-            m,
+            &self.input_scale_tensor,
+            &self.weight_scale_tensor,
+            m_pad,
             self.n,
             self.k,
-        ) {
-            Ok(mut out) => {
-                if out_shape.len() > 2 {
-                    out = out.reshape(out_shape.as_slice())?;
-                }
-                match &self.bias {
-                    Some(bias) => out.broadcast_add(bias),
-                    None => Ok(out),
-                }
-            }
-            Err(err) => {
-                tracing::debug!("DeepGEMM FP8 fallback to BF16 dense matmul: {err}");
-                self.fallback_forward(&x_flat, out_shape.as_slice())
-            }
+        )?;
+        if m_pad != m {
+            out = out.narrow(0, 0, m)?;
+        }
+        if out_shape.len() > 2 {
+            out = out.reshape(out_shape.as_slice())?;
+        }
+        match &self.bias {
+            Some(bias) => out.broadcast_add(bias),
+            None => Ok(out),
         }
     }
 }
@@ -136,6 +95,14 @@ impl LinearBackend for GpuScaledFp8Linear {
 
     fn is_quantized(&self) -> bool {
         true
+    }
+
+    fn scaled_fp8(&self) -> Option<ScaledFp8LinearParts<'_>> {
+        Some(ScaledFp8LinearParts {
+            weight: &self.weight,
+            input_scale: self.input_scale,
+            weight_scale: self.weight_scale,
+        })
     }
 
     fn clone_box(&self) -> Box<dyn LinearBackend> {
@@ -182,18 +149,23 @@ impl ScaledFp8LinearFactory for GpuScaledFp8Factory {
         }
 
         let weight = weight.contiguous()?;
-        let weight_scale_tma =
-            filled_f32_tensor(weight.device(), k.div_ceil(128) * align4(n), weight_scale)?;
+        if k % 128 != 0 || n % 128 != 0 {
+            bail!(
+                "scaled FP8 FlashInfer linear requires N and K multiples of 128, got N={n}, K={k}"
+            );
+        }
+        let input_scale_tensor = Tensor::from_vec(vec![input_scale], (1,), weight.device())?;
+        let weight_scale_tensor = Tensor::from_vec(vec![weight_scale], (1,), weight.device())?;
 
         Ok(Box::new(GpuScaledFp8Linear {
             weight,
-            weight_scale_tma,
+            input_scale_tensor,
+            weight_scale_tensor,
             input_scale,
             weight_scale,
             bias,
             n,
             k,
-            fallback_weight: Mutex::new(None),
         }))
     }
 }
@@ -215,22 +187,30 @@ fn scalar_f32(t: &Tensor) -> Result<f32> {
     Ok(vals[0])
 }
 
-fn filled_f32_tensor(device: &Device, len: usize, value: f32) -> Result<Tensor> {
-    Tensor::zeros((len,), DType::F32, device)?.affine(0.0, value as f64)
-}
-
-fn static_scaled_quantize(x: &Tensor, scale: f32) -> Result<Tensor> {
+pub(crate) fn static_scaled_quantize_padded(
+    x: &Tensor,
+    scale: f32,
+    m: usize,
+    k: usize,
+    m_pad: usize,
+) -> Result<Tensor> {
     if scale <= 0.0 {
-        bail!("static_scaled_quantize: scale must be positive, got {scale}");
+        bail!("static_scaled_quantize_padded: scale must be positive, got {scale}");
+    }
+    if x.dims() != [m, k] {
+        bail!(
+            "static_scaled_quantize_padded: expected input shape [{m}, {k}], got {:?}",
+            x.dims()
+        );
     }
 
     let (x_storage, x_layout) = x.storage_and_layout();
     let x_cuda = match &*x_storage {
         candle_core::Storage::Cuda(s) => s,
-        _ => bail!("static_scaled_quantize: requires CUDA input"),
+        _ => bail!("static_scaled_quantize_padded: requires CUDA input"),
     };
     let dev = x_cuda.device().clone();
-    let n = x_layout.shape().elem_count();
+    let n = m_pad * k;
     let out = unsafe { dev.alloc::<float8::F8E4M3>(n) }?;
 
     let threads = 256u32;
@@ -242,14 +222,16 @@ fn static_scaled_quantize(x: &Tensor, scale: f32) -> Result<Tensor> {
     };
 
     let func_name = match x_cuda.dtype() {
-        DType::BF16 => "static_scaled_bf16_to_fp8_e4m3",
-        DType::F16 => "static_scaled_f16_to_fp8_e4m3",
-        DType::F32 => "static_scaled_f32_to_fp8_e4m3",
-        other => bail!("static_scaled_quantize: unsupported input dtype {other:?}"),
+        DType::BF16 => "static_scaled_bf16_to_fp8_e4m3_padded",
+        DType::F16 => "static_scaled_f16_to_fp8_e4m3_padded",
+        DType::F32 => "static_scaled_f32_to_fp8_e4m3_padded",
+        other => bail!("static_scaled_quantize_padded: unsupported input dtype {other:?}"),
     };
     let func = dev.get_or_load_custom_func(func_name, MOD_FP8_QUANTIZE, PTX_FP8_QUANTIZE)?;
     let inv_scale = scale.recip();
-    let n_val = n as u32;
+    let m_val = m as u32;
+    let k_val = k as u32;
+    let m_pad_val = m_pad as u32;
 
     match x_cuda.dtype() {
         DType::BF16 => {
@@ -260,7 +242,9 @@ fn static_scaled_quantize(x: &Tensor, scale: f32) -> Result<Tensor> {
             builder.arg(&x_slice);
             builder.arg(&out);
             builder.arg(&inv_scale);
-            builder.arg(&n_val);
+            builder.arg(&m_val);
+            builder.arg(&k_val);
+            builder.arg(&m_pad_val);
             unsafe { builder.launch(cfg) }.w()?;
         }
         DType::F16 => {
@@ -271,7 +255,9 @@ fn static_scaled_quantize(x: &Tensor, scale: f32) -> Result<Tensor> {
             builder.arg(&x_slice);
             builder.arg(&out);
             builder.arg(&inv_scale);
-            builder.arg(&n_val);
+            builder.arg(&m_val);
+            builder.arg(&k_val);
+            builder.arg(&m_pad_val);
             unsafe { builder.launch(cfg) }.w()?;
         }
         DType::F32 => {
@@ -282,111 +268,20 @@ fn static_scaled_quantize(x: &Tensor, scale: f32) -> Result<Tensor> {
             builder.arg(&x_slice);
             builder.arg(&out);
             builder.arg(&inv_scale);
-            builder.arg(&n_val);
+            builder.arg(&m_val);
+            builder.arg(&k_val);
+            builder.arg(&m_pad_val);
             unsafe { builder.launch(cfg) }.w()?;
         }
         _ => unreachable!("dtype guarded above"),
     }
 
-    let out_shape = x_layout.shape().clone();
     drop(x_storage);
 
     let out_storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
     Ok(Tensor::from_storage(
         candle_core::Storage::Cuda(out_storage),
-        out_shape,
-        candle_core::op::BackpropOp::none(),
-        false,
-    ))
-}
-
-fn fp8_gemm(
-    qinput: &Tensor,
-    weight: &Tensor,
-    scale_a: &Tensor,
-    scale_b: &Tensor,
-    m: usize,
-    n: usize,
-    k: usize,
-) -> Result<Tensor> {
-    let (a_storage, a_layout) = qinput.storage_and_layout();
-    let (w_storage, w_layout) = weight.storage_and_layout();
-    let (sa_storage, sa_layout) = scale_a.storage_and_layout();
-    let (sb_storage, sb_layout) = scale_b.storage_and_layout();
-
-    let a_cuda = match &*a_storage {
-        candle_core::Storage::Cuda(s) => s,
-        _ => bail!("fp8_gemm: activations require CUDA"),
-    };
-    let w_cuda = match &*w_storage {
-        candle_core::Storage::Cuda(s) => s,
-        _ => bail!("fp8_gemm: weight requires CUDA"),
-    };
-    let sa_cuda = match &*sa_storage {
-        candle_core::Storage::Cuda(s) => s,
-        _ => bail!("fp8_gemm: activation scale requires CUDA"),
-    };
-    let sb_cuda = match &*sb_storage {
-        candle_core::Storage::Cuda(s) => s,
-        _ => bail!("fp8_gemm: weight scale requires CUDA"),
-    };
-
-    if a_cuda.dtype() != DType::F8E4M3 || w_cuda.dtype() != DType::F8E4M3 {
-        bail!(
-            "fp8_gemm: expected F8E4M3 inputs, got {:?} and {:?}",
-            a_cuda.dtype(),
-            w_cuda.dtype()
-        );
-    }
-    if sa_cuda.dtype() != DType::F32 || sb_cuda.dtype() != DType::F32 {
-        bail!(
-            "fp8_gemm: expected F32 scales, got {:?} and {:?}",
-            sa_cuda.dtype(),
-            sb_cuda.dtype()
-        );
-    }
-
-    let dev = a_cuda.device().clone();
-    let stream = dev.cuda_stream();
-    let raw_stream = stream.cu_stream() as *mut c_void;
-
-    let a_slice = a_cuda
-        .as_cuda_slice::<float8::F8E4M3>()?
-        .slice(a_layout.start_offset()..);
-    let w_slice = w_cuda
-        .as_cuda_slice::<float8::F8E4M3>()?
-        .slice(w_layout.start_offset()..);
-    let sa_slice = sa_cuda
-        .as_cuda_slice::<f32>()?
-        .slice(sa_layout.start_offset()..);
-    let sb_slice = sb_cuda
-        .as_cuda_slice::<f32>()?
-        .slice(sb_layout.start_offset()..);
-
-    let mut out = unsafe { dev.alloc::<half::bf16>(m * n) }?;
-
-    let a_ptr = a_slice.device_ptr(&stream).0 as *mut c_void;
-    let w_ptr = w_slice.device_ptr(&stream).0 as *mut c_void;
-    let sa_ptr = sa_slice.device_ptr(&stream).0 as *mut c_void;
-    let sb_ptr = sb_slice.device_ptr(&stream).0 as *mut c_void;
-    let out_ptr = out.device_ptr_mut(&stream).0 as *mut c_void;
-
-    unsafe {
-        deepgemm::fp8_gemm(
-            a_ptr, w_ptr, out_ptr, sa_ptr, sb_ptr, m as i32, n as i32, k as i32, raw_stream,
-        )
-    }
-    .map_err(candle_core::Error::Msg)?;
-
-    drop(a_storage);
-    drop(w_storage);
-    drop(sa_storage);
-    drop(sb_storage);
-
-    let out_storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
-    Ok(Tensor::from_storage(
-        candle_core::Storage::Cuda(out_storage),
-        (m, n),
+        (m_pad, k),
         candle_core::op::BackpropOp::none(),
         false,
     ))
