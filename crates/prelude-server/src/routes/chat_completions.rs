@@ -11,7 +11,8 @@ use prelude_core::{
 use tracing::info;
 
 use super::generation_common::{
-    DEFAULT_MAX_NEW_TOKENS, ResponseMeta, build_generate_request, sse_done_event, sse_json_event,
+    DEFAULT_MAX_NEW_TOKENS, GenerateRequestParams, ResponseMeta, build_generate_request,
+    sse_done_event, sse_json_event,
 };
 use crate::Server;
 use crate::error::ApiError;
@@ -31,8 +32,7 @@ pub async fn chat_completions(
     let include_usage = request
         .stream_options
         .as_ref()
-        .and_then(|o| o.include_usage)
-        .unwrap_or(false);
+        .is_some_and(|options| options.include_usage());
     let (engine_request, thinking_in_prompt) =
         parse_chat_request(&request, server.chat_template.as_deref())?;
 
@@ -252,12 +252,13 @@ async fn chat_batch(
         .map(|infos| to_chat_logprobs(infos));
 
     let (reasoning, content) = split_reasoning(&result.output_text, thinking_in_prompt);
+    let response_meta = ResponseMeta::new("chatcmpl", result.model.clone());
 
     Ok(Json(ChatCompletionResponse {
-        id: ResponseMeta::new("chatcmpl", result.model.clone()).id,
+        id: response_meta.id,
         object: "chat.completion".to_string(),
-        created: chrono::Utc::now().timestamp(),
-        model: result.model,
+        created: response_meta.created,
+        model: response_meta.model,
         choices: vec![ChatCompletionChoice {
             index: 0,
             message: Some(ChatMessageOut {
@@ -326,20 +327,20 @@ fn parse_chat_request(
     };
 
     Ok((
-        build_generate_request(
-            request.model.clone(),
-            PromptInput::Text(prompt),
-            request
+        build_generate_request(GenerateRequestParams {
+            model: request.model.clone(),
+            input: PromptInput::Text(prompt),
+            max_new_tokens: request
                 .max_completion_tokens
                 .or(request.max_tokens)
                 .unwrap_or(DEFAULT_MAX_NEW_TOKENS),
-            request.temperature,
-            request.top_p,
-            request.stop.clone(),
-            request.seed,
+            temperature: request.temperature,
+            top_p: request.top_p,
+            stop: request.stop.clone(),
+            seed: request.seed,
             logprobs,
-            None, // prompt_logprobs not supported for chat completions
-        ),
+            prompt_logprobs: None,
+        }),
         thinking_in_prompt,
     ))
 }

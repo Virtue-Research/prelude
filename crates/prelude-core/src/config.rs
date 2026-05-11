@@ -95,6 +95,8 @@ impl EngineConfig {
 pub struct CacheConfig {
     /// Tokens per block in paged KV cache.
     pub paged_block_size: usize,
+    /// Whether `PRELUDE_PAGED_BLOCK_SIZE` was provided by the operator.
+    pub paged_block_size_overridden: bool,
     /// Explicit number of paged attention blocks (0 = auto from gpu_memory_utilization).
     pub paged_attn_blocks: usize,
     /// Fraction of free GPU memory to use for KV cache (vLLM-style).
@@ -110,10 +112,12 @@ pub struct CacheConfig {
 
 impl CacheConfig {
     fn from_env() -> Self {
+        let paged_block_size_overridden = std::env::var_os("PRELUDE_PAGED_BLOCK_SIZE").is_some();
         let paged_block_size =
             parse_env_usize("PRELUDE_PAGED_BLOCK_SIZE", DEFAULT_PAGED_BLOCK_SIZE);
         Self {
             paged_block_size,
+            paged_block_size_overridden,
             paged_attn_blocks: parse_env_usize("PRELUDE_PAGED_ATTN_BLOCKS", 0),
             gpu_memory_utilization: DEFAULT_GPU_MEMORY_UTILIZATION,
             prefix_cache_blocks: parse_env_usize(
@@ -167,6 +171,14 @@ pub struct RuntimeConfig {
     pub cuda_graph: bool,
     /// MoE backend selection policy for Qwen3-MoE sparse layers.
     pub moe_backend: MoeBackendPolicy,
+    /// Enable CUDA graph capture for Qwen3-MoE decode.
+    pub moe_cuda_graph: bool,
+    /// Enable Qwen3.5 fused KDA decode.
+    pub qwen35_kda_decode: bool,
+    /// Enable Qwen3.5 grouped pooled prefill.
+    pub qwen35_grouped_pooled_prefill: bool,
+    /// Enable Qwen3.5 varlen pooled prefill.
+    pub qwen35_varlen_pooled_prefill: bool,
     /// Maximum batch size for CUDA graph capture (graphs captured for 1..=max_bs powers of 2).
     pub cuda_graph_max_bs: usize,
     /// Token count to use when profiling peak activation memory at load
@@ -226,6 +238,14 @@ impl RuntimeConfig {
             dtype: None,
             cuda_graph: true,
             moe_backend: parse_env_moe_backend()?,
+            moe_cuda_graph: parse_env_nonzero_u32_default_true("PRELUDE_MOE_CUDA_GRAPH"),
+            qwen35_kda_decode: parse_env_bool_default_true("PRELUDE_QWEN35_KDA_DECODE"),
+            qwen35_grouped_pooled_prefill: parse_env_bool_default_true(
+                "PRELUDE_QWEN35_GROUPED_POOLED_PREFILL",
+            ),
+            qwen35_varlen_pooled_prefill: parse_env_bool_default_true(
+                "PRELUDE_QWEN35_VARLEN_POOLED_PREFILL",
+            ),
             cuda_graph_max_bs: parse_env_usize(
                 "PRELUDE_CUDA_GRAPH_MAX_BS",
                 DEFAULT_CUDA_GRAPH_MAX_BS,
@@ -261,6 +281,25 @@ fn parse_env_f32(name: &str, default: f32) -> f32 {
 /// Parse a boolean env var: matches only "1" exactly.
 fn parse_env_bool_eq1(name: &str) -> bool {
     std::env::var(name).map_or(false, |v| v == "1")
+}
+
+fn parse_env_bool_default_true(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true)
+}
+
+fn parse_env_nonzero_u32_default_true(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|v| v != 0)
+        .unwrap_or(true)
 }
 
 fn parse_env_moe_backend() -> Result<MoeBackendPolicy, String> {

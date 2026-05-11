@@ -73,7 +73,6 @@ pub(crate) trait ArchSpec: Sync {
 pub(crate) struct GgufLoadResult {
     pub model: Box<dyn crate::models::ModelForward>,
     pub common: CommonModelConfig,
-    pub deltanet: Option<DeltaNetPoolConfig>,
     pub eos_token_ids: Vec<u32>,
 }
 
@@ -148,8 +147,9 @@ pub(crate) fn candle_model_err(e: crate::tensor::Error) -> EngineError {
 
 /// Wrapper for `inventory` auto-registration.
 ///
-/// Each model's `meta.rs` calls `inventory::submit!(ArchSpecEntry::new(&MY_ARCH_SPEC))`
-/// to register itself. No need to edit this file when adding a new model.
+/// Each model file registers its private `mod meta` spec with
+/// `inventory::submit!(ArchSpecEntry::new(&MY_ARCH_SPEC))`. No need to edit
+/// this file when adding a new model.
 pub(crate) struct ArchSpecEntry {
     pub spec: &'static dyn ArchSpec,
 }

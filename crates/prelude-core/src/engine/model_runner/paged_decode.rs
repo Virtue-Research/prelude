@@ -28,13 +28,8 @@ impl Engine {
             Tensor::from_vec(cu_seqlens_q, (batch_size + 1,), &self.executor.device)
                 .map_err(tensor_err)?;
 
-        // cu_seqlens_k: [0, ctx1, ctx1+ctx2, ...] — different K lengths
-        let mut cu_seqlens_k: Vec<u32> = vec![0];
-        let mut max_seqlen_k = 0usize;
-        for s in seqs {
-            cu_seqlens_k.push(cu_seqlens_k.last().unwrap() + s.context_len as u32);
-            max_seqlen_k = max_seqlen_k.max(s.context_len);
-        }
+        let (cu_seqlens_k, max_seqlen_k) =
+            super::cumulative_lengths_u32(seqs.iter().map(|s| s.context_len))?;
         let cu_seqlens_k_t =
             Tensor::from_vec(cu_seqlens_k, (batch_size + 1,), &self.executor.device)
                 .map_err(tensor_err)?;
@@ -60,30 +55,15 @@ impl Engine {
         let slot_mapping_t =
             Tensor::new(slots.as_slice(), &self.executor.device).map_err(tensor_err)?;
 
-        // block_tables: padded to max_blocks
-        let max_blocks = seqs.iter().map(|s| s.block_table.len()).max().unwrap_or(0);
-        let mut flat_bt: Vec<u32> = Vec::with_capacity(batch_size * max_blocks);
-        for s in seqs {
-            flat_bt.extend_from_slice(s.block_table);
-            flat_bt.resize(flat_bt.len() + max_blocks - s.block_table.len(), 0);
-        }
-        let block_tables_t =
-            Tensor::from_vec(flat_bt, (batch_size, max_blocks), &self.executor.device)
-                .map_err(tensor_err)?
-                .to_dtype(DType::U32)
-                .map_err(tensor_err)?;
+        let block_tables_t = super::block_tables_tensor(
+            seqs.iter().map(|seq| seq.block_table),
+            &self.executor.device,
+        )?;
 
-        // Build deltanet_slots from BatchDecodeSeq
-        let deltanet_slots: Option<Vec<u32>> = if self.cache.deltanet_pool.is_some() {
-            let slots: Vec<u32> = seqs.iter().filter_map(|s| s.deltanet_slot).collect();
-            if slots.len() == batch_size {
-                Some(slots)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let deltanet_slots =
+            super::collect_deltanet_slots(self.cache.deltanet_pool.is_some(), seqs, |seq| {
+                seq.deltanet_slot
+            });
 
         // Forward
         let mut model = self
@@ -92,7 +72,7 @@ impl Engine {
             .lock()
             .map_err(|e| EngineError::Internal(format!("model lock poisoned: {e}")))?;
 
-        let mut dn_pool_guard = self.cache.deltanet_pool.as_ref().map(|m| m.lock().unwrap());
+        let mut dn_pool_guard = super::lock_deltanet_pool(self.cache.deltanet_pool.as_ref())?;
         let dn_pool_ref = dn_pool_guard.as_deref_mut();
 
         let paged_kv = PagedKvBatchContext {
@@ -372,11 +352,7 @@ impl Engine {
             "stream generation finished (batch prefill)"
         );
 
-        let usage = Usage {
-            prompt_tokens: prompt_len as u32,
-            completion_tokens,
-            total_tokens: prompt_len as u32 + completion_tokens,
-        };
+        let usage = Usage::new(prompt_len as u32, completion_tokens);
         let metrics = DecodeMetrics {
             ttft_ms,
             prefill_ms,
@@ -743,11 +719,7 @@ impl Engine {
                     .decode(&state.output_tokens, true)
                     .unwrap_or_default();
 
-                let usage = Usage {
-                    prompt_tokens: state.prompt_len as u32,
-                    completion_tokens,
-                    total_tokens: state.prompt_len as u32 + completion_tokens,
-                };
+                let usage = Usage::new(state.prompt_len as u32, completion_tokens);
                 let metrics = DecodeMetrics {
                     ttft_ms: 0.0, // filled by caller
                     prefill_ms: 0.0,

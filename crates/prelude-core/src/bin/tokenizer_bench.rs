@@ -10,7 +10,9 @@
 static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
 
 #[cfg(not(feature = "hf_tokenizer"))]
-compile_error!("This benchmark requires the `hf_tokenizer` feature for HF comparison. Use: --features hf_tokenizer");
+compile_error!(
+    "This benchmark requires the `hf_tokenizer` feature for HF comparison. Use: --features hf_tokenizer"
+);
 
 fn main() {
     if let Err(e) = run() {
@@ -74,11 +76,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("  PASS {label:40} tokens={}", hf_ids.len());
             total_pass += 1;
         } else {
-            println!(
-                "  FAIL {label:40} hf={} ft={}",
-                hf_ids.len(),
-                ft_ids.len()
-            );
+            println!("  FAIL {label:40} hf={} ft={}", hf_ids.len(), ft_ids.len());
             for (i, (h, f)) in hf_ids.iter().zip(ft_ids.iter()).enumerate() {
                 if h != f {
                     println!("    first diff at pos {i}: hf={h} ft={f}");
@@ -105,7 +103,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut ns_pass = 0;
     let mut ns_fail = 0;
     for (label, text) in &inputs {
-        let hf_ids: Vec<u32> = hf_tok.encode(text.as_str(), false).unwrap().get_ids().to_vec();
+        let hf_ids: Vec<u32> = hf_tok
+            .encode(text.as_str(), false)
+            .unwrap()
+            .get_ids()
+            .to_vec();
         let ft_ids = ft_tok.encode_with_special_tokens(text.as_str(), false)?;
         if hf_ids == ft_ids {
             ns_pass += 1;
@@ -200,7 +202,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     for (label, text) in &inputs {
         let n_tokens = hf_encode(&hf_tok, text).len();
         // Adaptive repeats for very long inputs
-        let r = if text.len() > 100_000 { 5 } else if text.len() > 10_000 { 20 } else { repeats };
+        let r = if text.len() > 100_000 {
+            5
+        } else if text.len() > 10_000 {
+            20
+        } else {
+            repeats
+        };
 
         for _ in 0..warmup.min(r) {
             let _ = hf_encode(&hf_tok, text);
@@ -259,7 +267,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         println!(
             "  {label:40} {:>8} {:>10.1} {:>10.1} {:>7.1}x",
-            n_tok, hf_us, ft_us, hf_us / ft_us
+            n_tok,
+            hf_us,
+            ft_us,
+            hf_us / ft_us
         );
     }
 
@@ -350,9 +361,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         for h in handles {
             h.join().unwrap();
         }
-        println!(
-            "  correctness: PASS ({n_threads} threads x {per_thread} encodes)"
-        );
+        println!("  correctness: PASS ({n_threads} threads x {per_thread} encodes)");
 
         // Speed: concurrent encode
         let ft_c = Arc::clone(&ft_arc);
@@ -405,11 +414,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-
 fn hf_encode(tok: &tokenizers::Tokenizer, text: &str) -> Vec<u32> {
     tok.encode(text, true).unwrap().get_ids().to_vec()
 }
-
 
 fn build_test_inputs() -> Vec<(&'static str, String)> {
     vec![
@@ -504,7 +511,6 @@ fn build_test_inputs() -> Vec<(&'static str, String)> {
     ]
 }
 
-
 fn build_long_unique_text(target_chars: usize) -> String {
     let sentences = [
         "Artificial intelligence is transforming how we interact with technology.",
@@ -539,7 +545,6 @@ fn build_long_unique_text(target_chars: usize) -> String {
     result
 }
 
-
 fn build_long_code(target_chars: usize) -> String {
     let snippets = [
         "fn process_data(input: &[u8]) -> Vec<u8> {\n    let mut output = Vec::new();\n    for &byte in input {\n        output.push(byte ^ 0xFF);\n    }\n    output\n}\n\n",
@@ -563,7 +568,6 @@ fn build_long_code(target_chars: usize) -> String {
     result.truncate(end);
     result
 }
-
 
 fn build_multi_turn_chat(turns: usize) -> String {
     let user_messages = [
@@ -597,7 +601,6 @@ fn build_multi_turn_chat(turns: usize) -> String {
     }
     result
 }
-
 
 fn build_long_chinese(target_chars: usize) -> String {
     let paragraphs = [

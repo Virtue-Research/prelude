@@ -144,7 +144,7 @@ impl CacheManager {
         let layer_num_heads = config.kv_num_heads.as_deref();
 
         // Auto-adjust block size for attention backend compatibility.
-        if device.is_cuda() && std::env::var("PRELUDE_PAGED_BLOCK_SIZE").is_err() {
+        if device.is_cuda() && !cache_config.paged_block_size_overridden {
             let ops = crate::ops::select_ops(device);
             let hint = ops.paged_block_size_hint(head_dim);
             if paged_block_size != hint {

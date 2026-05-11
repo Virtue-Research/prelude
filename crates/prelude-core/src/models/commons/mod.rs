@@ -6,6 +6,123 @@ pub mod embedding;
 pub mod linear;
 
 use crate::tensor::Tensor;
+use crate::{
+    cache::deltanet_pool::DeltaNetPoolConfig,
+    engine::{RuntimeCaps, TaskKind, WeightsBackend},
+    tensor::Device,
+};
+
+/// Layer pattern for hybrid attention models that alternate full softmax
+/// attention layers with recurrent/linear-attention layers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HybridAttentionPattern {
+    num_hidden_layers: usize,
+    full_attention_interval: usize,
+}
+
+impl HybridAttentionPattern {
+    pub fn new(num_hidden_layers: usize, full_attention_interval: usize) -> Self {
+        assert!(
+            full_attention_interval > 0,
+            "full_attention_interval must be greater than zero"
+        );
+        Self {
+            num_hidden_layers,
+            full_attention_interval,
+        }
+    }
+
+    #[inline]
+    pub fn is_full_attention_layer(self, layer_idx: usize) -> bool {
+        (layer_idx + 1) % self.full_attention_interval == 0
+    }
+
+    #[inline]
+    pub fn is_recurrent_layer(self, layer_idx: usize) -> bool {
+        !self.is_full_attention_layer(layer_idx)
+    }
+
+    pub fn full_attention_layers(self) -> usize {
+        (0..self.num_hidden_layers)
+            .filter(|&i| self.is_full_attention_layer(i))
+            .count()
+    }
+
+    pub fn recurrent_layers(self) -> usize {
+        self.num_hidden_layers
+            .saturating_sub(self.full_attention_layers())
+    }
+}
+
+/// Build DeltaNet pool metadata from the shared hybrid-attention pattern.
+pub(crate) fn hybrid_deltanet_pool_config(
+    pattern: HybridAttentionPattern,
+    linear_num_key_heads: usize,
+    linear_num_value_heads: usize,
+    linear_key_head_dim: usize,
+    linear_value_head_dim: usize,
+    linear_conv_kernel_dim: usize,
+) -> DeltaNetPoolConfig {
+    DeltaNetPoolConfig::new(
+        pattern.recurrent_layers(),
+        linear_num_key_heads,
+        linear_num_value_heads,
+        linear_key_head_dim,
+        linear_value_head_dim,
+        linear_conv_kernel_dim,
+    )
+}
+
+/// Pick the next grouped-prefill batch size without leaving a single-item tail
+/// when avoidable.
+pub(crate) fn grouped_prefill_batch_take(remaining: usize, max_batch: usize) -> usize {
+    if remaining <= 1 {
+        remaining
+    } else if max_batch <= 1 {
+        1
+    } else if remaining <= max_batch {
+        remaining
+    } else if remaining - max_batch == 1 {
+        max_batch - 1
+    } else {
+        max_batch
+    }
+}
+
+pub(crate) fn packed_sequence_offsets(seq_lens: &[usize]) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(seq_lens.len());
+    let mut offset = 0usize;
+    for &len in seq_lens {
+        offsets.push(offset);
+        offset += len;
+    }
+    offsets
+}
+
+/// Runtime capabilities for standard safetensors-backed attention models.
+///
+/// This keeps per-model metadata focused on policy differences instead of
+/// repeating the same backend/device checks in every `ArchSpec`.
+pub(crate) fn standard_safetensors_runtime_caps(
+    task: TaskKind,
+    backend: WeightsBackend,
+    device: &Device,
+    supports_prefix_cache: bool,
+    supports_cuda_graph: bool,
+) -> RuntimeCaps {
+    let is_safetensors = backend == WeightsBackend::Safetensors;
+    let is_cuda_safetensors = device.is_cuda() && is_safetensors;
+    let is_generate = task == TaskKind::Generate;
+
+    RuntimeCaps {
+        supports_kv_cache: is_safetensors && is_generate,
+        supports_prefix_cache: supports_prefix_cache && is_cuda_safetensors,
+        supports_paged_attn: is_cuda_safetensors,
+        supports_varlen: is_cuda_safetensors,
+        supports_deltanet: false,
+        supports_cuda_graph: supports_cuda_graph && is_cuda_safetensors && is_generate,
+    }
+}
 
 // ── Paged KV structs ────────────────────────────────────────────────────
 
@@ -139,4 +256,88 @@ pub(crate) fn first_token_select(
     }
     let indices = Tensor::from_vec(first_indices, (batch_size,), hidden.device())?;
     hidden.index_select(&indices, 0)
+}
+
+pub(crate) fn gather_packed_sequences(
+    packed: &Tensor,
+    offsets: &[usize],
+    lens: &[usize],
+    indices: &[usize],
+) -> crate::tensor::Result<Tensor> {
+    if indices.is_empty() {
+        crate::tensor::bail!("gather_packed_sequences called with empty indices");
+    }
+    let mut seqs = Vec::with_capacity(indices.len());
+    for (&req_idx, &len) in indices.iter().zip(lens.iter()) {
+        seqs.push(packed.narrow(0, offsets[req_idx], len)?);
+    }
+    Tensor::cat(&seqs, 0)
+}
+
+pub(crate) fn pad_packed_sequences(
+    packed: &Tensor,
+    lens: &[usize],
+    max_len: usize,
+) -> crate::tensor::Result<Tensor> {
+    let hidden = packed.dim(1)?;
+    let mut rows = Vec::with_capacity(lens.len());
+    let mut offset = 0usize;
+    for &len in lens {
+        let seq = packed.narrow(0, offset, len)?;
+        offset += len;
+        if len == max_len {
+            rows.push(seq);
+        } else {
+            let pad = Tensor::zeros((max_len - len, hidden), packed.dtype(), packed.device())?;
+            rows.push(Tensor::cat(&[&seq, &pad], 0)?);
+        }
+    }
+    Tensor::stack(&rows, 0)?.contiguous()
+}
+
+pub(crate) fn unpad_padded_sequences(
+    padded: &Tensor,
+    lens: &[usize],
+) -> crate::tensor::Result<Tensor> {
+    let mut rows = Vec::with_capacity(lens.len());
+    for (idx, &len) in lens.iter().enumerate() {
+        rows.push(padded.get(idx)?.narrow(0, 0, len)?);
+    }
+    Tensor::cat(&rows, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hybrid_attention_pattern_counts_layers() {
+        let pattern = HybridAttentionPattern::new(40, 4);
+
+        assert!(pattern.is_recurrent_layer(0));
+        assert!(pattern.is_recurrent_layer(2));
+        assert!(pattern.is_full_attention_layer(3));
+        assert_eq!(pattern.full_attention_layers(), 10);
+        assert_eq!(pattern.recurrent_layers(), 30);
+    }
+
+    #[test]
+    fn grouped_prefill_batch_take_avoids_single_tail() {
+        assert_eq!(grouped_prefill_batch_take(1, 8), 1);
+        assert_eq!(grouped_prefill_batch_take(5, 8), 5);
+        assert_eq!(grouped_prefill_batch_take(8, 8), 8);
+        assert_eq!(grouped_prefill_batch_take(9, 8), 7);
+        assert_eq!(grouped_prefill_batch_take(10, 8), 8);
+        assert_eq!(grouped_prefill_batch_take(17, 8), 8);
+        assert_eq!(grouped_prefill_batch_take(9, 16), 9);
+        assert_eq!(grouped_prefill_batch_take(17, 16), 15);
+        assert_eq!(grouped_prefill_batch_take(18, 16), 16);
+    }
+
+    #[test]
+    fn packed_sequence_offsets_are_prefix_sums() {
+        assert_eq!(packed_sequence_offsets(&[]), Vec::<usize>::new());
+        assert_eq!(packed_sequence_offsets(&[3]), vec![0]);
+        assert_eq!(packed_sequence_offsets(&[3, 1, 4]), vec![0, 3, 4]);
+    }
 }

@@ -119,23 +119,12 @@ impl Scheduler {
             let remaining_prefill = seq.prefill_len();
             if remaining_prefill > 0 {
                 // Partially prefilled — needs more prefill tokens
-                let mut chunk = remaining_prefill;
-                if let Some(prefix_chunk) = shared_prefix_target_chunk(seq, self.config.block_size)
-                {
-                    chunk = chunk.min(prefix_chunk);
-                } else {
-                    if self.config.long_prefill_token_threshold > 0 {
-                        chunk = chunk.min(self.config.long_prefill_token_threshold);
-                    }
-                    if seq.kv_computed_len == 0
-                        && let Some(prefix_chunk) =
-                            hybrid_prefix_bootstrap_chunk(seq, self.config.block_size)
-                    {
-                        chunk = chunk.min(prefix_chunk);
-                    }
-                }
-                chunk = chunk.min(token_budget);
-                chunk = cap_hybrid_prefix_cache_chunk(seq, self.config.block_size, chunk);
+                let chunk = prefix_aware_prefill_chunk(
+                    seq,
+                    self.config.block_size,
+                    self.config.long_prefill_token_threshold,
+                    token_budget,
+                );
                 if chunk > 0 {
                     if let Some(key) = seq.prefix_cache_key {
                         scheduled_prefill_prefixes.insert(key);
@@ -360,25 +349,13 @@ impl Scheduler {
             }
 
             // Per-request prefill cap
-            let mut chunk = seq.prefill_len();
-            if let Some(prefix_chunk) = shared_prefix_target_chunk(seq, block_size) {
-                chunk = chunk.min(prefix_chunk);
-            } else {
-                if self.config.long_prefill_token_threshold > 0 {
-                    chunk = chunk.min(self.config.long_prefill_token_threshold);
-                }
-                if seq.kv_computed_len == 0
-                    && let Some(prefix_chunk) = hybrid_prefix_bootstrap_chunk(seq, block_size)
-                {
-                    chunk = chunk.min(prefix_chunk);
-                }
-            }
+            let mut chunk =
+                prefill_chunk_limit(seq, block_size, self.config.long_prefill_token_threshold);
             if seq.prefill_must_be_atomic && seq.kv_computed_len == 0 && chunk > token_budget {
                 break;
             }
             // Per-step token budget
-            chunk = chunk.min(token_budget);
-            chunk = cap_hybrid_prefix_cache_chunk(seq, block_size, chunk);
+            chunk = cap_prefill_chunk_to_step(seq, block_size, chunk, token_budget);
 
             // Deadlock prevention: if nothing else is scheduled and chunk would
             // be 0, force at least 1 token so the system makes progress.
@@ -416,6 +393,46 @@ impl Scheduler {
             self.waiting_queue.push_front(seq);
         }
     }
+}
+
+fn prefix_aware_prefill_chunk(
+    seq: &Sequence,
+    block_size: usize,
+    long_prefill_token_threshold: usize,
+    token_budget: usize,
+) -> usize {
+    let chunk = prefill_chunk_limit(seq, block_size, long_prefill_token_threshold);
+    cap_prefill_chunk_to_step(seq, block_size, chunk, token_budget)
+}
+
+fn prefill_chunk_limit(
+    seq: &Sequence,
+    block_size: usize,
+    long_prefill_token_threshold: usize,
+) -> usize {
+    let mut chunk = seq.prefill_len();
+    if let Some(prefix_chunk) = shared_prefix_target_chunk(seq, block_size) {
+        chunk = chunk.min(prefix_chunk);
+    } else {
+        if long_prefill_token_threshold > 0 {
+            chunk = chunk.min(long_prefill_token_threshold);
+        }
+        if seq.kv_computed_len == 0
+            && let Some(prefix_chunk) = hybrid_prefix_bootstrap_chunk(seq, block_size)
+        {
+            chunk = chunk.min(prefix_chunk);
+        }
+    }
+    chunk
+}
+
+fn cap_prefill_chunk_to_step(
+    seq: &Sequence,
+    block_size: usize,
+    chunk: usize,
+    token_budget: usize,
+) -> usize {
+    cap_hybrid_prefix_cache_chunk(seq, block_size, chunk.min(token_budget))
 }
 
 fn hybrid_prefix_bootstrap_chunk(seq: &Sequence, block_size: usize) -> Option<usize> {
@@ -468,15 +485,18 @@ fn cap_hybrid_prefix_cache_chunk(seq: &Sequence, block_size: usize, chunk: usize
     let after = computed + chunk;
 
     // DeltaNet prefix entries require an exact state snapshot at the cached
-    // boundary. Keep exactly one suffix token so generation can produce logits
-    // for the first sampled token, even when the prompt is not block-aligned.
-    let final_reusable = prompt_len.saturating_sub(1);
+    // boundary. Keep the cached prefix block-aligned and strictly before the
+    // full prompt; the remaining tail is the stable Qwen3.5 fast path used by
+    // the TopicGuard workload.
+    let final_reusable = final_block_aligned_prefix(prompt_len, block_size);
     if final_reusable > computed && after > final_reusable {
         return final_reusable - computed;
     }
 
     // Keep intermediate partial chunks block-aligned when the token budget
-    // allows it, so every completed chunk can become reusable prefix cache.
+    // allows it. Hybrid prefix-cache insertion only snapshots selected
+    // reusable boundaries, but block alignment keeps those boundaries cheap
+    // to attach when a later step reaches one.
     if after < prompt_len && after % block_size != 0 {
         let aligned_after = after - (after % block_size);
         if aligned_after > computed {
@@ -487,6 +507,18 @@ fn cap_hybrid_prefix_cache_chunk(seq: &Sequence, block_size: usize, chunk: usize
     chunk
 }
 
+fn final_block_aligned_prefix(prompt_len: usize, block_size: usize) -> usize {
+    if block_size == 0 || prompt_len <= block_size {
+        return 0;
+    }
+    let aligned = prompt_len - (prompt_len % block_size);
+    if aligned == prompt_len {
+        aligned.saturating_sub(block_size)
+    } else {
+        aligned
+    }
+}
+
 fn shared_prefix_target_pending(seq: &Sequence) -> bool {
     seq.prefix_cache_target_len
         .is_some_and(|target_len| seq.kv_computed_len < target_len)
@@ -494,6 +526,16 @@ fn shared_prefix_target_pending(seq: &Sequence) -> bool {
 
 fn prefix_prefill_leader_needed(seq: &Sequence) -> bool {
     shared_prefix_target_pending(seq) || (seq.kv_computed_len == 0 && seq.block_table.is_empty())
+}
+
+fn front_waiting_sequence(queue: &VecDeque<Sequence>) -> &Sequence {
+    queue.front().expect("waiting queue was checked non-empty")
+}
+
+fn pop_waiting_sequence(queue: &mut VecDeque<Sequence>) -> Sequence {
+    queue
+        .pop_front()
+        .expect("waiting queue was checked non-empty")
 }
 
 // ── Legacy admission helpers (used by non-chunked path) ──────────────
@@ -515,16 +557,9 @@ impl Scheduler {
         let global_prefill_cap = self.config.max_num_batched_tokens;
 
         while !self.waiting_queue.is_empty() && admission.to_prefill.len() < available_slots {
-            let prompt_len = self
-                .waiting_queue
-                .front()
-                .expect("queue was checked non-empty")
-                .prefill_len();
+            let prompt_len = front_waiting_sequence(&self.waiting_queue).prefill_len();
             let estimated_total = {
-                let sequence = self
-                    .waiting_queue
-                    .front()
-                    .expect("queue was checked non-empty");
+                let sequence = front_waiting_sequence(&self.waiting_queue);
                 sequence.total_len() + sequence.remaining_tokens() as usize
             };
 
@@ -533,10 +568,7 @@ impl Scheduler {
             // This used to be a `break` that left oversized sequences stuck
             // forever in `waiting`, surfacing to clients as a request timeout.
             if prompt_len > global_prefill_cap {
-                let mut sequence = self
-                    .waiting_queue
-                    .pop_front()
-                    .expect("queue was checked non-empty");
+                let mut sequence = pop_waiting_sequence(&mut self.waiting_queue);
                 sequence.status = SequenceStatus::Finished;
                 sequence.finish_reason = Some(SeqFinishReason::Abort(format!(
                     "prompt length {prompt_len} exceeds max_num_batched_tokens={global_prefill_cap}; \
@@ -564,10 +596,7 @@ impl Scheduler {
                 }
             }
 
-            let mut sequence = self
-                .waiting_queue
-                .pop_front()
-                .expect("queue was checked non-empty");
+            let mut sequence = pop_waiting_sequence(&mut self.waiting_queue);
             sequence.status = SequenceStatus::Prefilling;
             prefill_token_budget = prefill_token_budget.saturating_sub(prompt_len);
             total_token_budget = total_token_budget.saturating_sub(estimated_total);

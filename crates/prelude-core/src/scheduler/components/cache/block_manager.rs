@@ -53,8 +53,10 @@ impl BlockManager {
         }
         let mut table = Vec::with_capacity(needed);
         for _ in 0..needed {
-            let block_id = self.free_blocks.pop_front().unwrap();
-            self.ref_counts[block_id as usize] = 1;
+            let Some(block_id) = self.allocate() else {
+                self.free(&table);
+                return None;
+            };
             table.push(block_id);
         }
         Some(table)

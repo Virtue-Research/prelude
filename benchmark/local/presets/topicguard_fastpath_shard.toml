@@ -1,0 +1,15 @@
+task = "complete"
+
+concurrency = [32]
+requests    = [64]
+warmup      = 64             # Build prefix cache with the full shard before measuring hot path.
+max_tokens  = 4
+seed        = 42
+
+# output = "results/topicguard_fastpath_shard.json"
+
+[data]
+type        = "realworld"
+dataset     = "/scratch/panmz/workspace/prelude/bench_results/qwen35_real_topicguard_20260507T_shards/shard_000_064.json"
+text_column = "text"
+shuffle     = false

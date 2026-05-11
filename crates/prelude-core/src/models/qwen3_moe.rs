@@ -760,6 +760,7 @@ mod meta {
     use super::{Qwen3MoeConfig, Qwen3MoeModelForCausalLM};
     use crate::engine::EngineError;
     use crate::engine::{CommonModelConfig, RuntimeCaps, TaskKind, WeightsBackend};
+    use crate::models::commons::standard_safetensors_runtime_caps;
     use crate::models::registry::{ArchSpec, ParsedModelConfig, candle_model_err, parse_json};
 
     const ARCHITECTURE_ALIASES: &[&str] = &["Qwen3Moe", "Qwen3MoeModel"];
@@ -797,16 +798,14 @@ mod meta {
             content: &str,
         ) -> Result<ParsedModelConfig, EngineError> {
             let cfg = parse_json::<Qwen3MoeConfig>(content, "Qwen3 MoE config")?;
-            let common = CommonModelConfig {
-                vocab_size: cfg.vocab_size,
-                num_hidden_layers: cfg.num_hidden_layers,
-                max_position_embeddings: cfg.max_position_embeddings,
-                num_attention_heads: cfg.num_attention_heads,
-                num_key_value_heads: cfg.num_key_value_heads,
-                head_dim: cfg.head_dim,
-                kv_head_dims: None,
-                kv_num_heads: None,
-            };
+            let common = CommonModelConfig::new(
+                cfg.vocab_size,
+                cfg.num_hidden_layers,
+                cfg.max_position_embeddings,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+            );
             Ok(ParsedModelConfig {
                 common,
                 deltanet: None,
@@ -835,10 +834,6 @@ mod meta {
             backend: WeightsBackend,
             device: &crate::tensor::Device,
         ) -> RuntimeCaps {
-            let is_safetensors = backend == WeightsBackend::Safetensors;
-            let is_generate = task == TaskKind::Generate;
-
-            let is_cuda = device.is_cuda();
             // CUDA graph capture for MoE decode. cudarc 0.19's
             // `CudaStream::alloc` uses `cuMemAllocAsync` whenever the
             // device supports memory pools (true on SM90+), which IS
@@ -857,23 +852,10 @@ mod meta {
             // → 5.33 RPS @ conc=32) on Qwen3-30B-A3B with no failures
             // across 200 requests. PRELUDE_MOE_CUDA_GRAPH=0 keeps the
             // historical opt-out for triage.
-            let moe_graph = std::env::var("PRELUDE_MOE_CUDA_GRAPH")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .map(|v| v != 0)
+            let moe_graph = crate::config::global_runtime()
+                .map(|runtime| runtime.moe_cuda_graph)
                 .unwrap_or(true);
-            RuntimeCaps {
-                supports_kv_cache: is_safetensors && is_generate,
-                supports_prefix_cache: is_safetensors && is_cuda,
-                supports_paged_attn: is_cuda && is_safetensors,
-                supports_varlen: is_cuda && is_safetensors,
-                supports_deltanet: false,
-                // Must AND with `is_cuda`: the env-var check above doesn't
-                // know what device we're on, and a CPU run with the flag
-                // set would otherwise tell DecodeGraphCache the model
-                // supports graphs on a non-CUDA device.
-                supports_cuda_graph: is_cuda && moe_graph,
-            }
+            standard_safetensors_runtime_caps(task, backend, device, true, moe_graph)
         }
     }
 }

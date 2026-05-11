@@ -90,14 +90,7 @@ impl CacheManager {
             );
         }
         let evicted = pc.take_evicted_paged_blocks();
-        if !evicted.is_empty()
-            && let Some(ref bm_mutex) = self.block_manager
-        {
-            let mut bm = bm_mutex
-                .lock()
-                .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
-            bm.decrement_refs(&evicted);
-        }
+        self.release_paged_blocks(&evicted)?;
         Ok((cached_len, paged_ids))
     }
 
@@ -126,14 +119,7 @@ impl CacheManager {
             );
         }
         let evicted = pc.take_evicted_paged_blocks();
-        if !evicted.is_empty()
-            && let Some(ref bm_mutex) = self.block_manager
-        {
-            let mut bm = bm_mutex
-                .lock()
-                .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
-            bm.decrement_refs(&evicted);
-        }
+        self.release_paged_blocks(&evicted)?;
         Ok((cached_len, paged_ids, state))
     }
 
@@ -151,23 +137,9 @@ impl CacheManager {
             .lock()
             .map_err(|e| EngineError::Internal(format!("prefix cache lock poisoned: {e}")))?;
         let stored_paged_ids = pc.insert_paged_blocks_only(tokens, paged_block_size, block_table);
-        if !stored_paged_ids.is_empty()
-            && let Some(ref bm_mutex) = self.block_manager
-        {
-            let mut bm = bm_mutex
-                .lock()
-                .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
-            bm.increment_refs(&stored_paged_ids);
-        }
+        self.retain_paged_blocks(&stored_paged_ids)?;
         let evicted = pc.take_evicted_paged_blocks();
-        if !evicted.is_empty()
-            && let Some(ref bm_mutex) = self.block_manager
-        {
-            let mut bm = bm_mutex
-                .lock()
-                .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
-            bm.decrement_refs(&evicted);
-        }
+        self.release_paged_blocks(&evicted)?;
         debug!(
             prompt_tokens = tokens.len(),
             cached_blocks = pc.cached_blocks(),
@@ -198,23 +170,9 @@ impl CacheManager {
             block_table,
             deltanet_state,
         );
-        if !stored_paged_ids.is_empty()
-            && let Some(ref bm_mutex) = self.block_manager
-        {
-            let mut bm = bm_mutex
-                .lock()
-                .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
-            bm.increment_refs(&stored_paged_ids);
-        }
+        self.retain_paged_blocks(&stored_paged_ids)?;
         let evicted = pc.take_evicted_paged_blocks();
-        if !evicted.is_empty()
-            && let Some(ref bm_mutex) = self.block_manager
-        {
-            let mut bm = bm_mutex
-                .lock()
-                .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
-            bm.decrement_refs(&evicted);
-        }
+        self.release_paged_blocks(&evicted)?;
         debug!(
             prompt_tokens = tokens.len(),
             cached_blocks = pc.cached_blocks(),

@@ -464,6 +464,36 @@ fn test_hybrid_prefix_chunk_stops_at_final_block_boundary() {
 }
 
 #[test]
+fn test_hybrid_prefix_chunk_does_not_cache_prompt_minus_one() {
+    let config = SchedulerConfig {
+        chunked_prefill: true,
+        max_running_requests: 4,
+        max_num_batched_tokens: 4096,
+        max_total_tokens: 65536,
+        block_size: 80,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    let mut seq = make_seq_with_prefix_key("r1", 2166, 4, 1);
+    seq.status = SequenceStatus::Prefilling;
+    seq.kv_computed_len = 2080;
+    seq.block_table = (0..26).collect();
+    seq.deltanet_slot = Some(0);
+    sched.running.push(seq);
+
+    let step = sched.schedule_step().unwrap();
+    assert_eq!(step.prefill_request_ids, vec!["r1"]);
+    assert_eq!(step.prefill_chunk_lens, vec![80]);
+    assert_eq!(sched.running[0].kv_computed_len, 2160);
+    assert_eq!(sched.running[0].status, SequenceStatus::Prefilling);
+
+    let tail = sched.schedule_step().unwrap();
+    assert_eq!(tail.prefill_chunk_lens, vec![6]);
+    assert_eq!(sched.running[0].kv_computed_len, 2166);
+}
+
+#[test]
 fn test_hybrid_prefix_chunk_keeps_suffix_for_block_aligned_prompt() {
     let config = SchedulerConfig {
         chunked_prefill: true,

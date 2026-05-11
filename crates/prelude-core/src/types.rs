@@ -142,11 +142,21 @@ pub struct PromptLogprobEntry {
     pub decoded_token: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+}
+
+impl Usage {
+    pub fn new(prompt_tokens: u32, completion_tokens: u32) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -288,6 +298,12 @@ pub struct StreamOptions {
     pub include_usage: Option<bool>,
 }
 
+impl StreamOptions {
+    pub fn include_usage(&self) -> bool {
+        self.include_usage.unwrap_or(false)
+    }
+}
+
 // TODO: implement json_object response format
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResponseFormat {
@@ -355,6 +371,17 @@ pub struct ModelInfo {
     pub id: String,
     pub created: i64,
     pub owned_by: String,
+}
+
+impl From<ModelInfo> for ModelCard {
+    fn from(info: ModelInfo) -> Self {
+        Self {
+            id: info.id,
+            object: "model".to_string(),
+            created: info.created,
+            owned_by: info.owned_by,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -529,6 +556,16 @@ pub struct ClassificationUsage {
     pub completion_tokens: u32,
 }
 
+impl ClassificationUsage {
+    pub fn from_prompt_tokens(prompt_tokens: u32) -> Self {
+        Self {
+            prompt_tokens,
+            total_tokens: prompt_tokens,
+            completion_tokens: 0,
+        }
+    }
+}
+
 /// Response body for POST /v1/classify
 #[derive(Debug, Clone, Serialize)]
 pub struct ClassificationResponse {
@@ -686,6 +723,15 @@ pub struct EmbeddingResponse {
 pub struct EmbeddingUsage {
     pub prompt_tokens: u32,
     pub total_tokens: u32,
+}
+
+impl EmbeddingUsage {
+    pub fn from_prompt_tokens(prompt_tokens: u32) -> Self {
+        Self {
+            prompt_tokens,
+            total_tokens: prompt_tokens,
+        }
+    }
 }
 
 fn validate_single_choice(n: Option<u32>) -> Result<(), String> {

@@ -12,427 +12,32 @@
 //! - HuggingFace `modeling_qwen3_5.py`
 //! SGLang is licensed under the Apache License, Version 2.0.
 
+use crate::config::global_runtime;
 use crate::loading::var_builder::VarBuilder;
 use crate::models::commons::embedding::Embedding;
 use crate::models::commons::linear::DenseLinear;
 use crate::tensor::{D, DType, Device, Module, Result, Tensor};
 
 use crate::models::commons::{
-    BatchAttnContext, BatchState, LayerAttnContext, Linear, last_token_select,
+    BatchAttnContext, BatchState, LayerAttnContext, Linear, gather_packed_sequences,
+    grouped_prefill_batch_take, last_token_select, packed_sequence_offsets, pad_packed_sequences,
+    unpad_padded_sequences,
 };
-use crate::models::resolve_or_warn;
 use crate::ops::{MaskType, PagedParams, VarlenParams};
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
 
 const MAX_GROUPED_PREFILL_BATCH: usize = 8;
 const MAX_ZERO_GROUPED_PREFILL_BATCH: usize = 16;
+const MAX_VARLEN_PREFILL_PADDING_FACTOR: usize = 2;
 
-// ── Config ──────────────────────────────────────────────────────────────
+mod config;
 
-/// Custom deserializer that handles nested `text_config` for VL models
-/// and `rope_parameters.base` for rope_theta.
-#[derive(Debug, Clone)]
-pub struct Qwen3_5Config {
-    pub vocab_size: usize,
-    pub hidden_size: usize,
-    pub intermediate_size: usize,
-    pub num_hidden_layers: usize,
-    pub num_attention_heads: usize,
-    pub num_key_value_heads: usize,
-    pub head_dim: usize,
-    pub max_position_embeddings: usize,
-    pub rms_norm_eps: f64,
-    pub rope_theta: f64,
-    pub partial_rotary_factor: f64,
-    pub full_attention_interval: usize,
-    pub attn_output_gate: bool,
-    // DeltaNet
-    pub linear_num_key_heads: usize,
-    pub linear_num_value_heads: usize,
-    pub linear_key_head_dim: usize,
-    pub linear_value_head_dim: usize,
-    pub linear_conv_kernel_dim: usize,
-    pub tie_word_embeddings: bool,
-    // MoE (None for dense models)
-    pub num_experts: Option<usize>,
-    pub num_experts_per_tok: Option<usize>,
-    pub moe_intermediate_size: Option<usize>,
-    pub shared_expert_intermediate_size: Option<usize>,
-    pub norm_topk_prob: bool,
-}
+use self::config::LayerType;
+pub use self::config::Qwen3_5Config;
 
-/// Raw serde struct — all defaultable fields are Option<T> so we can warn on fallback.
-#[derive(serde::Deserialize)]
-struct RawQwen3_5Config {
-    #[serde(default)]
-    vocab_size: Option<usize>,
-    #[serde(default)]
-    hidden_size: Option<usize>,
-    #[serde(default)]
-    intermediate_size: Option<usize>,
-    #[serde(default)]
-    num_hidden_layers: Option<usize>,
-    #[serde(default)]
-    num_attention_heads: Option<usize>,
-    #[serde(default)]
-    num_key_value_heads: Option<usize>,
-    #[serde(default)]
-    head_dim: Option<usize>,
-    #[serde(default)]
-    max_position_embeddings: Option<usize>,
-    #[serde(default)]
-    rms_norm_eps: Option<f64>,
-    #[serde(default)]
-    rope_theta: Option<f64>,
-    #[serde(default)]
-    partial_rotary_factor: Option<f64>,
-    #[serde(default)]
-    full_attention_interval: Option<usize>,
-    #[serde(default)]
-    attn_output_gate: Option<bool>,
-    // DeltaNet
-    #[serde(default)]
-    linear_num_key_heads: Option<usize>,
-    #[serde(default)]
-    linear_num_value_heads: Option<usize>,
-    #[serde(default)]
-    linear_key_head_dim: Option<usize>,
-    #[serde(default)]
-    linear_value_head_dim: Option<usize>,
-    #[serde(default)]
-    linear_conv_kernel_dim: Option<usize>,
-    #[serde(default)]
-    tie_word_embeddings: bool,
-    // MoE fields (None for dense models)
-    #[serde(default)]
-    num_experts: Option<usize>,
-    #[serde(default)]
-    num_experts_per_tok: Option<usize>,
-    #[serde(default)]
-    moe_intermediate_size: Option<usize>,
-    #[serde(default)]
-    shared_expert_intermediate_size: Option<usize>,
-    #[serde(default)]
-    norm_topk_prob: Option<bool>,
-    // rope_parameters for extracting rope_theta
-    #[serde(default)]
-    rope_parameters: Option<serde_json::Value>,
-    #[serde(default)]
-    rope_scaling: Option<serde_json::Value>,
-}
+mod components;
 
-const MODEL: &str = "Qwen3.5";
-
-impl<'de> serde::Deserialize<'de> for Qwen3_5Config {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let raw: serde_json::Value = serde::Deserialize::deserialize(deserializer)?;
-
-        // `tie_word_embeddings` can live at the top level (Qwen3.5-35B-A3B) or
-        // inside `text_config` (dense Qwen3.5 variants). Read top-level first.
-        let top_tie = raw.get("tie_word_embeddings").and_then(|v| v.as_bool());
-
-        // If this is a VL model with text_config, extract the sub-object
-        let text_val = if let Some(tc) = raw.get("text_config") {
-            tc.clone()
-        } else {
-            raw.clone()
-        };
-
-        let r: RawQwen3_5Config =
-            serde_json::from_value(text_val).map_err(serde::de::Error::custom)?;
-
-        // Extract rope_theta: try direct field, then rope_parameters.rope_theta/base, then rope_scaling
-        let rope_theta = r.rope_theta.or_else(|| {
-            r.rope_parameters
-                .as_ref()
-                .and_then(|v| {
-                    v.get("rope_theta")
-                        .or_else(|| v.get("base"))
-                        .and_then(|b| b.as_f64())
-                })
-                .or_else(|| {
-                    r.rope_scaling
-                        .as_ref()
-                        .and_then(|v| v.get("base"))
-                        .and_then(|b| b.as_f64())
-                })
-        });
-
-        // Extract partial_rotary_factor: try direct field, then nested in rope_parameters
-        // (Qwen3.5-35B-A3B stores it there; dense variants store it flat).
-        let partial_rotary_factor = r.partial_rotary_factor.or_else(|| {
-            r.rope_parameters
-                .as_ref()
-                .and_then(|v| v.get("partial_rotary_factor"))
-                .and_then(|b| b.as_f64())
-        });
-
-        // tie_word_embeddings fallback: top-level JSON → text_config field → default false.
-        let tie_word_embeddings = top_tie.unwrap_or(r.tie_word_embeddings);
-
-        Ok(Qwen3_5Config {
-            vocab_size: resolve_or_warn!(r.vocab_size, 248320, "vocab_size", MODEL),
-            hidden_size: resolve_or_warn!(r.hidden_size, 2048, "hidden_size", MODEL),
-            intermediate_size: resolve_or_warn!(
-                r.intermediate_size,
-                6144,
-                "intermediate_size",
-                MODEL
-            ),
-            num_hidden_layers: resolve_or_warn!(
-                r.num_hidden_layers,
-                24,
-                "num_hidden_layers",
-                MODEL
-            ),
-            num_attention_heads: resolve_or_warn!(
-                r.num_attention_heads,
-                16,
-                "num_attention_heads",
-                MODEL
-            ),
-            num_key_value_heads: resolve_or_warn!(
-                r.num_key_value_heads,
-                2,
-                "num_key_value_heads",
-                MODEL
-            ),
-            head_dim: resolve_or_warn!(r.head_dim, 256, "head_dim", MODEL),
-            max_position_embeddings: resolve_or_warn!(
-                r.max_position_embeddings,
-                262144,
-                "max_position_embeddings",
-                MODEL
-            ),
-            rms_norm_eps: resolve_or_warn!(r.rms_norm_eps, 1e-6, "rms_norm_eps", MODEL),
-            rope_theta: resolve_or_warn!(rope_theta, 10_000_000.0, "rope_theta", MODEL),
-            partial_rotary_factor: resolve_or_warn!(
-                partial_rotary_factor,
-                0.25,
-                "partial_rotary_factor",
-                MODEL
-            ),
-            full_attention_interval: resolve_or_warn!(
-                r.full_attention_interval,
-                4,
-                "full_attention_interval",
-                MODEL
-            ),
-            attn_output_gate: resolve_or_warn!(r.attn_output_gate, true, "attn_output_gate", MODEL),
-            linear_num_key_heads: resolve_or_warn!(
-                r.linear_num_key_heads,
-                16,
-                "linear_num_key_heads",
-                MODEL
-            ),
-            linear_num_value_heads: resolve_or_warn!(
-                r.linear_num_value_heads,
-                16,
-                "linear_num_value_heads",
-                MODEL
-            ),
-            linear_key_head_dim: resolve_or_warn!(
-                r.linear_key_head_dim,
-                128,
-                "linear_key_head_dim",
-                MODEL
-            ),
-            linear_value_head_dim: resolve_or_warn!(
-                r.linear_value_head_dim,
-                128,
-                "linear_value_head_dim",
-                MODEL
-            ),
-            linear_conv_kernel_dim: resolve_or_warn!(
-                r.linear_conv_kernel_dim,
-                4,
-                "linear_conv_kernel_dim",
-                MODEL
-            ),
-            tie_word_embeddings,
-            num_experts: r.num_experts,
-            num_experts_per_tok: r.num_experts_per_tok,
-            moe_intermediate_size: r.moe_intermediate_size,
-            shared_expert_intermediate_size: r.shared_expert_intermediate_size,
-            norm_topk_prob: resolve_or_warn!(r.norm_topk_prob, true, "norm_topk_prob", MODEL),
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LayerType {
-    LinearAttention,
-    FullAttention,
-}
-
-impl Qwen3_5Config {
-    fn layer_type(&self, idx: usize) -> LayerType {
-        if (idx + 1) % self.full_attention_interval == 0 {
-            LayerType::FullAttention
-        } else {
-            LayerType::LinearAttention
-        }
-    }
-
-    fn key_dim(&self) -> usize {
-        self.linear_num_key_heads * self.linear_key_head_dim
-    }
-
-    fn value_dim(&self) -> usize {
-        self.linear_num_value_heads * self.linear_value_head_dim
-    }
-
-    /// Convolution dimension: Q + K + V flattened (Z is separate, not convolved).
-    fn conv_dim(&self) -> usize {
-        self.key_dim() * 2 + self.value_dim()
-    }
-
-    fn rotary_dim(&self) -> usize {
-        (self.head_dim as f64 * self.partial_rotary_factor) as usize
-    }
-
-    fn is_moe(&self) -> bool {
-        self.num_experts.is_some()
-    }
-}
-
-// ── RoPE with partial rotary factor ─────────────────────────────────────
-
-pub(super) struct PartialRotaryEmbedding {
-    pub(super) cos: Tensor,
-    pub(super) sin: Tensor,
-    pub(super) rotary_dim: usize,
-}
-
-impl PartialRotaryEmbedding {
-    pub(super) fn new(cfg: &Qwen3_5Config, dtype: DType, device: &Device) -> Result<Self> {
-        let rotary_dim = cfg.rotary_dim();
-        let half = rotary_dim / 2;
-        let inv_freq: Vec<f32> = (0..rotary_dim)
-            .step_by(2)
-            .map(|i| 1.0 / cfg.rope_theta.powf(i as f64 / rotary_dim as f64) as f32)
-            .collect();
-        // Build the [L, D/2] frequency table via broadcast_mul instead of a K=1
-        // matmul (CUTLASS/DeepGEMM only support TN layout; a literal outer-product
-        // matmul falls through to an unsupported NN kernel).
-        let inv_freq = Tensor::from_vec(inv_freq, (1, half), device)?.to_dtype(DType::F32)?;
-        let positions = Tensor::arange(0u32, cfg.max_position_embeddings as u32, device)?
-            .to_dtype(DType::F32)?
-            .reshape((cfg.max_position_embeddings, 1))?;
-        let freqs = positions.broadcast_mul(&inv_freq)?;
-        let cos = freqs.cos()?.to_dtype(dtype)?;
-        let sin = freqs.sin()?.to_dtype(dtype)?;
-        Ok(Self {
-            cos,
-            sin,
-            rotary_dim,
-        })
-    }
-
-    /// Apply partial RoPE with per-token position_ids for varlen paths.
-    /// q, k shape: [total_tokens, num_heads, head_dim]
-    fn apply_varlen(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        position_ids: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
-        // position_ids: [total_tokens] → index_select cos/sin
-        let cos = self.cos.index_select(position_ids, 0)?.unsqueeze(1)?; // [T, 1, rotary_dim/2]
-        let sin = self.sin.index_select(position_ids, 0)?.unsqueeze(1)?;
-
-        let q_rot = q.narrow(D::Minus1, 0, self.rotary_dim)?;
-        let q_pass = q.narrow(
-            D::Minus1,
-            self.rotary_dim,
-            q.dim(D::Minus1)? - self.rotary_dim,
-        )?;
-        let q_rot = apply_rotary_emb(&q_rot, &cos, &sin)?;
-        let q = Tensor::cat(&[q_rot, q_pass], D::Minus1)?;
-
-        let k_rot = k.narrow(D::Minus1, 0, self.rotary_dim)?;
-        let k_pass = k.narrow(
-            D::Minus1,
-            self.rotary_dim,
-            k.dim(D::Minus1)? - self.rotary_dim,
-        )?;
-        let k_rot = apply_rotary_emb(&k_rot, &cos, &sin)?;
-        let k = Tensor::cat(&[k_rot, k_pass], D::Minus1)?;
-
-        Ok((q, k))
-    }
-}
-
-pub(super) fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let half = x.dim(D::Minus1)? / 2;
-    let x1 = x.narrow(D::Minus1, 0, half)?;
-    let x2 = x.narrow(D::Minus1, half, half)?;
-    let part1 = (x1.broadcast_mul(cos)? - x2.broadcast_mul(sin)?)?;
-    let part2 = (x2.broadcast_mul(cos)? + x1.broadcast_mul(sin)?)?;
-    Tensor::cat(&[&part1, &part2], D::Minus1)
-}
-
-// ── RMSNormGated ────────────────────────────────────────────────────────
-
-pub(super) struct RmsNormGated {
-    pub(super) weight: Tensor,
-    pub(super) eps: f64,
-    pub(super) num_heads: usize,
-    pub(super) head_dim: usize,
-}
-
-impl RmsNormGated {
-    pub(super) fn new(head_dim: usize, num_heads: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        // Qwen3.5-35B-A3B stores this weight as F32 in the checkpoint; compute
-        // it in F32 to avoid precision loss in the DeltaNet output scaling.
-        let weight = vb.get_with_hints_dtype(head_dim, "weight", Default::default(), DType::F32)?;
-        Ok(Self {
-            weight,
-            eps,
-            num_heads,
-            head_dim,
-        })
-    }
-
-    /// Apply per-head RMS normalization then gate with SiLU(z).
-    /// x and z: [..., num_heads * head_dim], weight: [head_dim] (broadcast over heads).
-    fn forward(&self, x: &Tensor, z: &Tensor, ops: &dyn crate::ops::Ops) -> Result<Tensor> {
-        let orig_shape = x.shape().clone();
-        let leading: Vec<usize> = orig_shape.dims()[..orig_shape.dims().len() - 1].to_vec();
-        let mut new_shape = leading.clone();
-        new_shape.push(self.num_heads);
-        new_shape.push(self.head_dim);
-
-        // Reshape to [..., num_heads, head_dim] for per-head norm
-        let x = x.reshape(new_shape.as_slice())?;
-        let z = z.reshape(new_shape.as_slice())?;
-
-        // Flatten to 2D [...*num_heads, head_dim] for the fused kernel
-        let flat_rows = x.elem_count() / self.head_dim;
-        let x_2d = x.reshape((flat_rows, self.head_dim))?;
-        let z_2d = z.reshape((flat_rows, self.head_dim))?;
-
-        // Fused: RMSNorm(x) * weight * SiLU(gate) in one kernel
-        let result = if let Some(r) = ops.rmsnorm_gated(&x_2d, &z_2d, &self.weight, self.eps as f32)
-        {
-            r?
-        } else {
-            // Decomposed fallback (CPU or non-BF16)
-            let x_f32 = x_2d.to_dtype(DType::F32)?;
-            let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
-            let normed = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-            let normed = normed.broadcast_mul(&self.weight)?;
-            let silu_gate = ops.silu(&z_2d.to_dtype(DType::F32)?)?;
-            normed.broadcast_mul(&silu_gate)?.to_dtype(x.dtype())?
-        };
-
-        result.reshape(orig_shape)
-    }
-}
+use self::components::{PartialRotaryEmbedding, RmsNormGated};
 
 // ── Gated DeltaNet (Linear Attention) ────────────────────────────────────
 
@@ -449,7 +54,7 @@ pub(super) struct Qwen3_5GatedDeltaNet {
     dt_bias_f32_expanded: Tensor,
     a_log_f32: Tensor,
     prefill_cu_seqlens: Option<(usize, Tensor)>,
-    pub(super) norm: RmsNormGated,
+    norm: RmsNormGated,
     pub(super) out_proj: Linear,
     // State
     pub(super) conv_state: Option<Tensor>, // [conv_dim, kernel-1]
@@ -1083,7 +688,7 @@ pub(super) struct Qwen3_5Attention {
     pub(super) o_proj: Linear,
     pub(super) q_norm_weight: Tensor,
     pub(super) k_norm_weight: Tensor,
-    pub(super) rope: PartialRotaryEmbedding,
+    rope: PartialRotaryEmbedding,
     pub(super) kv_cache: Option<(Tensor, Tensor)>,
     pub(super) k_cache: Vec<Tensor>,
     pub(super) v_cache: Vec<Tensor>,
@@ -1774,12 +1379,7 @@ fn deltanet_varlen_grouped_zero(
     if gdn.head_k_dim != 128 || gdn.head_v_dim != 128 || gdn.head_k_dim != gdn.head_v_dim {
         return Ok(None);
     }
-    let mut offsets = Vec::with_capacity(seq_lens.len());
-    let mut off = 0usize;
-    for &len in seq_lens {
-        offsets.push(off);
-        off += len;
-    }
+    let offsets = packed_sequence_offsets(seq_lens);
 
     let mut prefill_by_len: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (idx, &len) in seq_lens.iter().enumerate() {
@@ -1799,7 +1399,7 @@ fn deltanet_varlen_grouped_zero(
             let mut start = 0usize;
             while start < indices.len() {
                 let remaining = indices.len() - start;
-                let take = grouped_prefill_take_with(remaining, MAX_ZERO_GROUPED_PREFILL_BATCH);
+                let take = grouped_prefill_batch_take(remaining, MAX_ZERO_GROUPED_PREFILL_BATCH);
                 let chunk = &indices[start..start + take];
                 let Some(out) =
                     deltanet_prefill_group_fused_zero(gdn, packed, &offsets, seq_len, chunk, ops)?
@@ -1824,7 +1424,7 @@ fn deltanet_varlen_grouped_zero(
         let mut start = 0usize;
         while start < indices.len() {
             let remaining = indices.len() - start;
-            let take = grouped_prefill_take_with(remaining, MAX_ZERO_GROUPED_PREFILL_BATCH);
+            let take = grouped_prefill_batch_take(remaining, MAX_ZERO_GROUPED_PREFILL_BATCH);
             if take == 1 || seq_len <= 1 {
                 let req_idx = indices[start];
                 gdn.clear_state();
@@ -1862,61 +1462,32 @@ fn deltanet_varlen_grouped_zero(
 }
 
 fn grouped_prefill_take(remaining: usize) -> usize {
-    grouped_prefill_take_with(remaining, MAX_GROUPED_PREFILL_BATCH)
+    grouped_prefill_batch_take(remaining, MAX_GROUPED_PREFILL_BATCH)
 }
 
-fn grouped_prefill_take_with(remaining: usize, max_batch: usize) -> usize {
-    if remaining == 1 {
-        1
-    } else if remaining <= max_batch {
-        remaining
-    } else if remaining - max_batch == 1 {
-        max_batch - 1
-    } else {
-        max_batch
+fn varlen_prefill_padding_is_bounded(batch: usize, total_tokens: usize, max_len: usize) -> bool {
+    if batch <= 1 || total_tokens == 0 || max_len <= 1 {
+        return false;
     }
+    batch.saturating_mul(max_len) <= total_tokens.saturating_mul(MAX_VARLEN_PREFILL_PADDING_FACTOR)
 }
 
 pub fn qwen35_kda_decode_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PRELUDE_QWEN35_KDA_DECODE")
-            .map(|v| {
-                !matches!(
-                    v.as_str(),
-                    "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
-                )
-            })
-            .unwrap_or(true)
-    })
+    global_runtime()
+        .map(|runtime| runtime.qwen35_kda_decode)
+        .unwrap_or(true)
 }
 
 fn qwen35_grouped_pooled_prefill_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PRELUDE_QWEN35_GROUPED_POOLED_PREFILL")
-            .map(|v| {
-                !matches!(
-                    v.as_str(),
-                    "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
-                )
-            })
-            .unwrap_or(true)
-    })
+    global_runtime()
+        .map(|runtime| runtime.qwen35_grouped_pooled_prefill)
+        .unwrap_or(true)
 }
 
 fn qwen35_varlen_pooled_prefill_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PRELUDE_QWEN35_VARLEN_POOLED_PREFILL")
-            .map(|v| {
-                !matches!(
-                    v.as_str(),
-                    "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
-                )
-            })
-            .unwrap_or(true)
-    })
+    global_runtime()
+        .map(|runtime| runtime.qwen35_varlen_pooled_prefill)
+        .unwrap_or(true)
 }
 
 fn grouped_prefill_input(
@@ -2111,12 +1682,7 @@ fn deltanet_mixed_grouped_fused(
         return Ok(None);
     }
 
-    let mut offsets = Vec::with_capacity(seq_lens.len());
-    let mut off = 0usize;
-    for &len in seq_lens {
-        offsets.push(off);
-        off += len;
-    }
+    let offsets = packed_sequence_offsets(seq_lens);
 
     let mut decode_indices = Vec::new();
     let mut prefill_by_len: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -2131,19 +1697,6 @@ fn deltanet_mixed_grouped_fused(
     if decode_indices.is_empty() && prefill_by_len.is_empty() {
         return Ok(None);
     }
-    if qwen35_kda_decode_enabled()
-        && !decode_indices.is_empty()
-        && !ops.kda_decode_available_for(
-            decode_indices.len(),
-            gdn.num_k_heads,
-            gdn.num_v_heads,
-            gdn.head_k_dim,
-            gdn.head_v_dim,
-        )
-    {
-        return Ok(None);
-    }
-
     let mut outputs: Vec<Option<Tensor>> = vec![None; seq_lens.len()];
     let mut handled_varlen_prefill = false;
     let prefill_indices: Vec<usize> = prefill_by_len
@@ -2256,30 +1809,28 @@ fn deltanet_mixed_grouped_fused(
         }
     }
 
-    if qwen35_kda_decode_enabled() && !decode_indices.is_empty() {
-        let mut rows = Vec::with_capacity(decode_indices.len());
-        let mut decode_slots = Vec::with_capacity(decode_indices.len());
+    if !decode_indices.is_empty() {
+        // Keep the fused KDA decode kernel on the pure-decode path in
+        // `deltanet_varlen_pooled`. Mixed prefill/decode batches interleave
+        // prefill state writes with decode state updates in the same layer;
+        // use the per-request decode fallback here while preserving grouped
+        // prefill for the rest of the batch.
         for &req_idx in decode_indices.iter() {
-            rows.push(packed.narrow(0, offsets[req_idx], 1)?.squeeze(0)?);
-            decode_slots.push(slot_ids[req_idx]);
-        }
-        let decode_packed = Tensor::stack(&rows, 0)?.contiguous()?;
-        let decode_slots_gpu =
-            Tensor::from_vec(decode_slots.clone(), (decode_slots.len(),), packed.device())?;
-        let out = deltanet_decode_batched_fused(
-            gdn,
-            &decode_packed,
-            pool,
-            &decode_slots,
-            Some(&decode_slots_gpu),
-            dn_layer_idx,
-            ops,
-        )?;
-        let Some(out) = out else {
-            return Ok(None);
-        };
-        for (group_pos, &req_idx) in decode_indices.iter().enumerate() {
-            outputs[req_idx] = Some(out.narrow(0, group_pos, 1)?);
+            let starts_from_zero = state_is_zero
+                .and_then(|flags| flags.get(req_idx))
+                .copied()
+                .unwrap_or(false);
+            outputs[req_idx] = Some(deltanet_single_pooled(
+                gdn,
+                packed,
+                offsets[req_idx],
+                1,
+                pool,
+                slot_ids[req_idx],
+                starts_from_zero,
+                dn_layer_idx,
+                ops,
+            )?);
         }
     }
 
@@ -2325,6 +1876,16 @@ fn deltanet_prefill_varlen_pooled_batched(
         lens.push(len);
         total_tokens += len;
         max_len = max_len.max(len);
+    }
+    if !varlen_prefill_padding_is_bounded(batch, total_tokens, max_len) {
+        tracing::debug!(
+            batch,
+            total_tokens,
+            max_len,
+            padded_tokens = batch.saturating_mul(max_len),
+            "skip Qwen3.5 varlen pooled prefill: padding amplification too high"
+        );
+        return Ok(None);
     }
 
     let starts_from_zero: Vec<bool> = indices
@@ -2474,47 +2035,6 @@ fn deltanet_prefill_varlen_pooled_batched(
         offset += len;
     }
     Ok(Some(outputs))
-}
-
-fn gather_packed_sequences(
-    packed: &Tensor,
-    offsets: &[usize],
-    lens: &[usize],
-    indices: &[usize],
-) -> Result<Tensor> {
-    if indices.is_empty() {
-        crate::tensor::bail!("gather_packed_sequences called with empty indices");
-    }
-    let mut seqs = Vec::with_capacity(indices.len());
-    for (&req_idx, &len) in indices.iter().zip(lens.iter()) {
-        seqs.push(packed.narrow(0, offsets[req_idx], len)?);
-    }
-    Tensor::cat(&seqs, 0)
-}
-
-fn pad_packed_sequences(packed: &Tensor, lens: &[usize], max_len: usize) -> Result<Tensor> {
-    let hidden = packed.dim(1)?;
-    let mut rows = Vec::with_capacity(lens.len());
-    let mut offset = 0usize;
-    for &len in lens {
-        let seq = packed.narrow(0, offset, len)?;
-        offset += len;
-        if len == max_len {
-            rows.push(seq);
-        } else {
-            let pad = Tensor::zeros((max_len - len, hidden), packed.dtype(), packed.device())?;
-            rows.push(Tensor::cat(&[&seq, &pad], 0)?);
-        }
-    }
-    Tensor::stack(&rows, 0)?.contiguous()
-}
-
-fn unpad_padded_sequences(padded: &Tensor, lens: &[usize]) -> Result<Tensor> {
-    let mut rows = Vec::with_capacity(lens.len());
-    for (idx, &len) in lens.iter().enumerate() {
-        rows.push(padded.get(idx)?.narrow(0, 0, len)?);
-    }
-    Tensor::cat(&rows, 0)
 }
 
 fn next_conv_states_from_padded_qkv(
@@ -3453,13 +2973,30 @@ impl crate::models::ModelForward for Qwen3_5ForCausalLM {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::varlen_prefill_padding_is_bounded;
+
+    #[test]
+    fn varlen_prefill_padding_guard_accepts_dense_batches() {
+        assert!(varlen_prefill_padding_is_bounded(32, 8192, 256));
+        assert!(varlen_prefill_padding_is_bounded(8, 4096, 512));
+    }
+
+    #[test]
+    fn varlen_prefill_padding_guard_rejects_sparse_long_tail_batches() {
+        assert!(!varlen_prefill_padding_is_bounded(32, 8192, 1680));
+        assert!(!varlen_prefill_padding_is_bounded(16, 2048, 1024));
+    }
+}
+
 pub(crate) mod meta {
     use crate::loading::var_builder::VarBuilder;
 
     use super::{Qwen3_5Config, Qwen3_5ForCausalLM};
-    use crate::cache::deltanet_pool::DeltaNetPoolConfig;
     use crate::engine::EngineError;
     use crate::engine::{CommonModelConfig, RuntimeCaps, TaskKind, WeightsBackend};
+    use crate::models::commons::hybrid_deltanet_pool_config;
     use crate::models::registry::{ArchSpec, ParsedModelConfig, candle_model_err, parse_json};
 
     const ARCHITECTURE_ALIASES: &[&str] = &["Qwen3_5", "Qwen35", "Qwen3_5Moe", "Qwen35Moe"];
@@ -3467,55 +3004,28 @@ pub(crate) mod meta {
         &["qwen3_5_text", "qwen3_5", "qwen3_5_moe_text", "qwen3_5_moe"];
     const SUPPORTED_TASKS: &[TaskKind] = &[TaskKind::Generate];
 
-    fn deltanet_config_from(cfg: &Qwen3_5Config) -> DeltaNetPoolConfig {
-        let num_deltanet_layers = (0..cfg.num_hidden_layers)
-            .filter(|i| (i + 1) % cfg.full_attention_interval != 0)
-            .count();
-        DeltaNetPoolConfig {
-            num_deltanet_layers,
-            num_v_heads: cfg.linear_num_value_heads,
-            head_k_dim: cfg.linear_key_head_dim,
-            head_v_dim: cfg.linear_value_head_dim,
-            conv_dim: cfg.linear_num_key_heads * cfg.linear_key_head_dim * 2
-                + cfg.linear_num_value_heads * cfg.linear_value_head_dim,
-            conv_kernel: cfg.linear_conv_kernel_dim,
-        }
-    }
-
-    fn full_attention_layers(cfg: &Qwen3_5Config) -> usize {
-        (0..cfg.num_hidden_layers)
-            .filter(|&i| cfg.layer_type(i) == super::LayerType::FullAttention)
-            .count()
-    }
-
     fn common_from_config(cfg: &Qwen3_5Config) -> CommonModelConfig {
-        let kv_layers = full_attention_layers(cfg);
-        CommonModelConfig {
-            vocab_size: cfg.vocab_size,
-            num_hidden_layers: cfg.num_hidden_layers,
-            max_position_embeddings: cfg.max_position_embeddings,
-            num_attention_heads: cfg.num_attention_heads,
-            num_key_value_heads: cfg.num_key_value_heads,
-            head_dim: cfg.head_dim,
-            kv_head_dims: Some(vec![cfg.head_dim; kv_layers]),
-            kv_num_heads: Some(vec![cfg.num_key_value_heads; kv_layers]),
-        }
+        CommonModelConfig::new(
+            cfg.vocab_size,
+            cfg.num_hidden_layers,
+            cfg.max_position_embeddings,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+        )
+        .with_uniform_physical_kv_layers(cfg.full_attention_layer_count())
     }
 
     fn common_from_gguf_config(cfg: &super::gguf::Qwen3_5GgufConfig) -> CommonModelConfig {
-        let kv_layers = (0..cfg.num_hidden_layers)
-            .filter(|i| (i + 1) % cfg.full_attention_interval == 0)
-            .count();
-        CommonModelConfig {
-            vocab_size: cfg.vocab_size,
-            num_hidden_layers: cfg.num_hidden_layers,
-            max_position_embeddings: cfg.max_position_embeddings,
-            num_attention_heads: cfg.num_attention_heads,
-            num_key_value_heads: cfg.num_key_value_heads,
-            head_dim: cfg.head_dim,
-            kv_head_dims: Some(vec![cfg.head_dim; kv_layers]),
-            kv_num_heads: Some(vec![cfg.num_key_value_heads; kv_layers]),
-        }
+        CommonModelConfig::new(
+            cfg.vocab_size,
+            cfg.num_hidden_layers,
+            cfg.max_position_embeddings,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+        )
+        .with_uniform_physical_kv_layers(cfg.full_attention_layer_count())
     }
 
     pub(crate) struct Qwen3_5ArchSpec;
@@ -3550,7 +3060,14 @@ pub(crate) mod meta {
         ) -> Result<ParsedModelConfig, EngineError> {
             let cfg = parse_json::<Qwen3_5Config>(content, "Qwen3.5 config")?;
             let common = common_from_config(&cfg);
-            let deltanet = Some(deltanet_config_from(&cfg));
+            let deltanet = Some(hybrid_deltanet_pool_config(
+                cfg.attention_pattern(),
+                cfg.linear_num_key_heads,
+                cfg.linear_num_value_heads,
+                cfg.linear_key_head_dim,
+                cfg.linear_value_head_dim,
+                cfg.linear_conv_kernel_dim,
+            ));
             Ok(ParsedModelConfig {
                 common,
                 deltanet,
@@ -3573,13 +3090,11 @@ pub(crate) mod meta {
 
         fn runtime_caps(
             &self,
-            task: TaskKind,
+            _task: TaskKind,
             backend: WeightsBackend,
             device: &crate::tensor::Device,
         ) -> RuntimeCaps {
             let is_safetensors = backend == WeightsBackend::Safetensors;
-            let _is_generate = task == TaskKind::Generate;
-
             RuntimeCaps {
                 supports_kv_cache: false,
                 supports_prefix_cache: device.is_cuda() && is_safetensors,
@@ -3603,21 +3118,9 @@ pub(crate) mod meta {
             let (model, cfg) = super::gguf::Qwen3_5GgufModel::from_gguf(ct, reader, device)
                 .map_err(candle_model_err)?;
             let common = common_from_gguf_config(&cfg);
-            let deltanet = Some(DeltaNetPoolConfig {
-                num_deltanet_layers: (0..cfg.num_hidden_layers)
-                    .filter(|i| (i + 1) % cfg.full_attention_interval != 0)
-                    .count(),
-                num_v_heads: cfg.linear_num_value_heads,
-                head_k_dim: cfg.linear_key_head_dim,
-                head_v_dim: cfg.linear_value_head_dim,
-                conv_dim: cfg.linear_num_key_heads * cfg.linear_key_head_dim * 2
-                    + cfg.linear_num_value_heads * cfg.linear_value_head_dim,
-                conv_kernel: cfg.linear_conv_kernel_dim,
-            });
             Ok(crate::models::registry::GgufLoadResult {
                 model: Box::new(model),
                 common,
-                deltanet,
                 eos_token_ids: cfg.eos_token_ids,
             })
         }
@@ -3625,540 +3128,7 @@ pub(crate) mod meta {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// GGUF support (from qwen3_5/gguf.rs)
+// GGUF support
 // ═══════════════════════════════════════════════════════════════════════
 
-pub mod gguf {
-    //! Quantized Qwen3.5 model loaded from GGUF format.
-    //!
-    //! Reference: llama.cpp `src/models/qwen35.cpp` + `src/models/delta-net-base.cpp`.
-
-    use crate::tensor::quantized::gguf_file;
-    use crate::tensor::{DType, Device, Result, Tensor};
-    use std::io::{Read, Seek};
-    use std::sync::Arc;
-
-    use crate::constants::GGUF_INTERMEDIATE_SIZE_MULTIPLIER;
-    use crate::models::commons::Linear;
-    use crate::models::commons::embedding::Embedding;
-
-    // ── Config ──────────────────────────────────────────────────────────────
-
-    #[derive(Debug, Clone)]
-    pub struct Qwen3_5GgufConfig {
-        pub num_hidden_layers: usize,
-        pub hidden_size: usize,
-        pub intermediate_size: usize,
-        pub num_attention_heads: usize,
-        pub num_key_value_heads: usize,
-        pub head_dim: usize,
-        pub max_position_embeddings: usize,
-        pub rms_norm_eps: f64,
-        pub rope_theta: f64,
-        pub vocab_size: usize,
-        pub eos_token_ids: Vec<u32>,
-        // DeltaNet
-        pub linear_num_key_heads: usize,
-        pub linear_num_value_heads: usize,
-        pub linear_key_head_dim: usize,
-        pub linear_value_head_dim: usize,
-        pub linear_conv_kernel_dim: usize,
-        pub full_attention_interval: usize,
-        pub partial_rotary_factor: f64,
-    }
-
-    impl Qwen3_5GgufConfig {
-        fn key_dim(&self) -> usize {
-            self.linear_num_key_heads * self.linear_key_head_dim
-        }
-
-        fn value_dim(&self) -> usize {
-            self.linear_num_value_heads * self.linear_value_head_dim
-        }
-
-        fn conv_dim(&self) -> usize {
-            self.key_dim() * 2 + self.value_dim()
-        }
-
-        fn rotary_dim(&self) -> usize {
-            (self.head_dim as f64 * self.partial_rotary_factor) as usize
-        }
-
-        fn is_recurrent(&self, layer_idx: usize) -> bool {
-            (layer_idx + 1) % self.full_attention_interval != 0
-        }
-    }
-
-    // ── Model ───────────────────────────────────────────────────────────────
-
-    pub struct Qwen3_5GgufModel {
-        inner: super::Qwen3_5ForCausalLM,
-    }
-
-    impl Qwen3_5GgufModel {
-        fn load_linear<R: Read + Seek>(
-            ct: &gguf_file::Content,
-            reader: &mut R,
-            name: &str,
-            device: &Device,
-        ) -> Result<Linear> {
-            let qtensor = ct.tensor(reader, name, device)?;
-            Linear::from_qtensor(Arc::new(qtensor))
-        }
-
-        fn load_tensor<R: Read + Seek>(
-            ct: &gguf_file::Content,
-            reader: &mut R,
-            name: &str,
-            device: &Device,
-        ) -> Result<Tensor> {
-            let qtensor = ct.tensor(reader, name, device)?;
-            qtensor.dequantize(device)
-        }
-
-        pub fn from_gguf<R: Read + Seek>(
-            ct: gguf_file::Content,
-            reader: &mut R,
-            device: &Device,
-        ) -> Result<(Self, Qwen3_5GgufConfig)> {
-            let config = parse_gguf_config(&ct)?;
-
-            // Embedding (dequantize for lookup table)
-            let embed_weight = Self::load_tensor(&ct, reader, "token_embd.weight", device)?;
-            let embed_tokens = Embedding::new(embed_weight, config.hidden_size);
-
-            // Build PartialRotaryEmbedding from GGUF config
-            let build_rope = |dtype: DType| -> Result<super::PartialRotaryEmbedding> {
-                let rotary_dim = config.rotary_dim();
-                let half = rotary_dim / 2;
-                let inv_freq: Vec<f32> = (0..rotary_dim)
-                    .step_by(2)
-                    .map(|i| 1.0 / config.rope_theta.powf(i as f64 / rotary_dim as f64) as f32)
-                    .collect();
-                let inv_freq =
-                    Tensor::from_vec(inv_freq, (1, half), device)?.to_dtype(DType::F32)?;
-                let positions =
-                    Tensor::arange(0u32, config.max_position_embeddings as u32, device)?
-                        .to_dtype(DType::F32)?
-                        .reshape((config.max_position_embeddings, 1))?;
-                let freqs = positions.broadcast_mul(&inv_freq)?;
-                let cos = freqs.cos()?.to_dtype(dtype)?;
-                let sin = freqs.sin()?.to_dtype(dtype)?;
-                Ok(super::PartialRotaryEmbedding {
-                    cos,
-                    sin,
-                    rotary_dim,
-                })
-            };
-
-            // Build layers
-            let mut layers = Vec::with_capacity(config.num_hidden_layers);
-            let dtype = DType::F32;
-
-            for i in 0..config.num_hidden_layers {
-                let prefix = format!("blk.{i}");
-
-                // Layer norms (GGUF already has +1 applied for residual RMSNorm)
-                let ln1_weight =
-                    Self::load_tensor(&ct, reader, &format!("{prefix}.attn_norm.weight"), device)?;
-
-                let ln2_weight = Self::load_tensor(
-                    &ct,
-                    reader,
-                    &format!("{prefix}.post_attention_norm.weight"),
-                    device,
-                )?;
-
-                // Token mixer
-                let token_mixer = if config.is_recurrent(i) {
-                    // DeltaNet layer. We keep the four input
-                    // projections split rather than fusing into one
-                    // matmul — see the comment in
-                    // `Qwen3_5GatedDeltaNet::new` (safetensors loader)
-                    // for the GEMM tile-alignment rationale.
-                    let in_proj_qkv = Self::load_linear(
-                        &ct,
-                        reader,
-                        &format!("{prefix}.attn_qkv.weight"),
-                        device,
-                    )?;
-                    let in_proj_z = Self::load_linear(
-                        &ct,
-                        reader,
-                        &format!("{prefix}.attn_gate.weight"),
-                        device,
-                    )?;
-                    let in_proj_b = Self::load_linear(
-                        &ct,
-                        reader,
-                        &format!("{prefix}.ssm_beta.weight"),
-                        device,
-                    )?;
-                    let in_proj_a = Self::load_linear(
-                        &ct,
-                        reader,
-                        &format!("{prefix}.ssm_alpha.weight"),
-                        device,
-                    )?;
-
-                    // Conv1d weight: GGUF stores [d_conv, conv_channels], transpose if needed
-                    let conv_weight_raw = Self::load_tensor(
-                        &ct,
-                        reader,
-                        &format!("{prefix}.ssm_conv1d.weight"),
-                        device,
-                    )?;
-                    let conv_weight = if conv_weight_raw.dim(0)? == config.linear_conv_kernel_dim {
-                        conv_weight_raw.t()?.contiguous()?
-                    } else {
-                        conv_weight_raw
-                    };
-
-                    let dt_bias =
-                        Self::load_tensor(&ct, reader, &format!("{prefix}.ssm_dt.bias"), device)?;
-
-                    // GGUF stores -exp(A_log); convert back: A_log = ln(-ssm_a)
-                    let ssm_a = Self::load_tensor(&ct, reader, &format!("{prefix}.ssm_a"), device)?;
-                    let a_log = ssm_a.neg()?.log()?;
-                    let dt_bias_f32 = dt_bias.to_dtype(DType::F32)?;
-                    let dt_bias_f32_expanded = dt_bias_f32
-                        .reshape((config.linear_num_value_heads, 1))?
-                        .broadcast_as((config.linear_num_value_heads, config.linear_key_head_dim))?
-                        .contiguous()?;
-                    let a_log_f32 = if a_log.dtype() == DType::F32 {
-                        a_log.clone()
-                    } else {
-                        a_log.to_dtype(DType::F32)?
-                    };
-
-                    // Gated RMSNorm (NO +1 for ssm_norm)
-                    let norm_weight = Self::load_tensor(
-                        &ct,
-                        reader,
-                        &format!("{prefix}.ssm_norm.weight"),
-                        device,
-                    )?;
-                    let norm = super::RmsNormGated {
-                        weight: norm_weight,
-                        eps: config.rms_norm_eps,
-                        num_heads: config.linear_num_value_heads,
-                        head_dim: config.linear_value_head_dim,
-                    };
-
-                    let out_proj = Self::load_linear(
-                        &ct,
-                        reader,
-                        &format!("{prefix}.ssm_out.weight"),
-                        device,
-                    )?;
-
-                    let key_dim = config.key_dim();
-                    let value_dim = config.value_dim();
-                    let conv_dim = config.conv_dim();
-
-                    super::TokenMixer::LinearAttention(super::Qwen3_5GatedDeltaNet {
-                        in_proj_qkv,
-                        in_proj_z,
-                        in_proj_b,
-                        in_proj_a,
-                        conv_weight,
-                        dt_bias_f32,
-                        dt_bias_f32_expanded,
-                        a_log_f32,
-                        prefill_cu_seqlens: None,
-                        norm,
-                        out_proj,
-                        conv_state: None,
-                        recurrent_state: None,
-                        num_k_heads: config.linear_num_key_heads,
-                        num_v_heads: config.linear_num_value_heads,
-                        head_k_dim: config.linear_key_head_dim,
-                        head_v_dim: config.linear_value_head_dim,
-                        key_dim,
-                        value_dim,
-                        conv_dim,
-                        conv_kernel: config.linear_conv_kernel_dim,
-                    })
-                } else {
-                    // Full attention layer
-                    let q_proj =
-                        Self::load_linear(&ct, reader, &format!("{prefix}.attn_q.weight"), device)?;
-                    let k_proj =
-                        Self::load_linear(&ct, reader, &format!("{prefix}.attn_k.weight"), device)?;
-                    let v_proj =
-                        Self::load_linear(&ct, reader, &format!("{prefix}.attn_v.weight"), device)?;
-                    let o_proj = Self::load_linear(
-                        &ct,
-                        reader,
-                        &format!("{prefix}.attn_output.weight"),
-                        device,
-                    )?;
-
-                    // QK norms (GGUF already has +1 applied)
-                    let q_norm_weight = Self::load_tensor(
-                        &ct,
-                        reader,
-                        &format!("{prefix}.attn_q_norm.weight"),
-                        device,
-                    )?;
-                    let k_norm_weight = Self::load_tensor(
-                        &ct,
-                        reader,
-                        &format!("{prefix}.attn_k_norm.weight"),
-                        device,
-                    )?;
-
-                    let rope = build_rope(dtype)?;
-
-                    super::TokenMixer::FullAttention(super::Qwen3_5Attention {
-                        q_proj,
-                        k_proj,
-                        v_proj,
-                        o_proj,
-                        q_norm_weight,
-                        k_norm_weight,
-                        rope,
-                        kv_cache: None,
-                        k_cache: Vec::new(),
-                        v_cache: Vec::new(),
-                        num_heads: config.num_attention_heads,
-                        num_kv_heads: config.num_key_value_heads,
-                        head_dim: config.head_dim,
-                        rms_norm_eps: config.rms_norm_eps,
-                        softmax_scale: 1.0 / (config.head_dim as f64).sqrt(),
-                        attn_output_gate: true,
-                    })
-                };
-
-                // MLP (same for both layer types)
-                let mlp = super::MlpVariant::Dense(super::Qwen3_5Mlp {
-                    gate_proj: Self::load_linear(
-                        &ct,
-                        reader,
-                        &format!("{prefix}.ffn_gate.weight"),
-                        device,
-                    )?,
-                    up_proj: Self::load_linear(
-                        &ct,
-                        reader,
-                        &format!("{prefix}.ffn_up.weight"),
-                        device,
-                    )?,
-                    down_proj: Self::load_linear(
-                        &ct,
-                        reader,
-                        &format!("{prefix}.ffn_down.weight"),
-                        device,
-                    )?,
-                });
-
-                layers.push(super::Qwen3_5DecoderLayer {
-                    token_mixer,
-                    mlp,
-                    ln1_weight,
-                    ln2_weight,
-                    rms_norm_eps: config.rms_norm_eps as f32,
-                });
-            }
-
-            // Final norm (GGUF already has +1 applied)
-            let norm_weight = Self::load_tensor(&ct, reader, "output_norm.weight", device)?;
-
-            // LM head
-            let lm_head = if ct.tensor_infos.get("output.weight").is_some() {
-                Self::load_linear(&ct, reader, "output.weight", device)?
-            } else {
-                // Tied embeddings: use token_embd.weight
-                Self::load_linear(&ct, reader, "token_embd.weight", device)?
-            };
-
-            let model = super::Qwen3_5Model {
-                embed_tokens,
-                layers,
-                norm_weight,
-                rms_norm_eps: config.rms_norm_eps,
-            };
-
-            let inner = super::Qwen3_5ForCausalLM { model, lm_head };
-
-            Ok((Self { inner }, config))
-        }
-
-        pub fn clear_kv_cache(&mut self) {
-            self.inner.clear_kv_cache();
-        }
-
-        pub fn forward_with_cache(
-            &mut self,
-            input_ids: &Tensor,
-            position_offset: usize,
-        ) -> Result<Tensor> {
-            self.inner.forward_with_cache(input_ids, position_offset)
-        }
-
-        pub fn forward(
-            &mut self,
-            packed_input: &Tensor,
-            ctx: &mut crate::models::commons::BatchAttnContext,
-        ) -> Result<Tensor> {
-            self.inner.forward(packed_input, ctx)
-        }
-    }
-
-    impl crate::models::KvCacheModel for Qwen3_5GgufModel {
-        fn forward_with_cache(
-            &mut self,
-            input_ids: &Tensor,
-            position_offset: usize,
-        ) -> Result<Tensor> {
-            Qwen3_5GgufModel::forward_with_cache(self, input_ids, position_offset)
-        }
-    }
-
-    impl crate::models::ModelForward for Qwen3_5GgufModel {
-        fn forward(
-            &mut self,
-            packed_input: &Tensor,
-            ctx: &mut crate::models::commons::BatchAttnContext,
-        ) -> Result<Tensor> {
-            self.inner.forward(packed_input, ctx)
-        }
-
-        fn clear_kv_cache(&mut self) {
-            self.clear_kv_cache();
-        }
-
-        fn as_kv_cache_model(&mut self) -> Option<&mut dyn crate::models::KvCacheModel> {
-            Some(self)
-        }
-    }
-
-    // ── GGUF Config Parsing ─────────────────────────────────────────────────
-
-    fn parse_gguf_config(ct: &gguf_file::Content) -> Result<Qwen3_5GgufConfig> {
-        let md = &ct.metadata;
-
-        let get_u32 = |key: &str| -> Result<usize> {
-            let val = md.get(key).ok_or_else(|| {
-                crate::tensor::Error::Msg(format!("missing GGUF metadata: {key}"))
-            })?;
-            Ok(val.to_u32().map(|v| v as usize)?)
-        };
-
-        let get_u32_or = |key: &str, default: usize| -> usize {
-            md.get(key)
-                .and_then(|v| v.to_u32().ok())
-                .map(|v| v as usize)
-                .unwrap_or_else(|| {
-                    tracing::warn!("Qwen3.5 GGUF: '{key}' not found, using default: {default}");
-                    default
-                })
-        };
-
-        let get_f32 = |key: &str| -> Result<f64> {
-            let val = md.get(key).ok_or_else(|| {
-                crate::tensor::Error::Msg(format!("missing GGUF metadata: {key}"))
-            })?;
-            Ok(val.to_f32().map(|v| v as f64)?)
-        };
-
-        let get_f32_or = |key: &str, default: f64| -> f64 {
-            md.get(key)
-                .and_then(|v| v.to_f32().ok())
-                .map(|v| v as f64)
-                .unwrap_or_else(|| {
-                    tracing::warn!("Qwen3.5 GGUF: '{key}' not found, using default: {default}");
-                    default
-                })
-        };
-
-        // Auto-detect architecture prefix
-        let default_arch = "qwen35".to_string();
-        let arch = md
-            .get("general.architecture")
-            .and_then(|v| v.to_string().ok())
-            .unwrap_or_else(|| {
-                tracing::warn!(
-                    "Qwen3.5 GGUF: 'general.architecture' not found, using default: qwen35"
-                );
-                &default_arch
-            });
-
-        let num_hidden_layers = get_u32(&format!("{arch}.block_count"))?;
-        let hidden_size = get_u32(&format!("{arch}.embedding_length"))?;
-        let num_attention_heads = get_u32(&format!("{arch}.attention.head_count"))?;
-        let num_key_value_heads = get_u32(&format!("{arch}.attention.head_count_kv"))?;
-        let head_dim = get_u32(&format!("{arch}.attention.key_length"))?;
-        let max_position_embeddings = get_u32(&format!("{arch}.context_length"))?;
-        let rms_norm_eps = get_f32(&format!("{arch}.attention.layer_norm_rms_epsilon"))?;
-        let rope_theta = get_f32(&format!("{arch}.rope.freq_base"))?;
-
-        let default_intermediate = hidden_size * GGUF_INTERMEDIATE_SIZE_MULTIPLIER;
-        let intermediate_size =
-            get_u32_or(&format!("{arch}.feed_forward_length"), default_intermediate);
-
-        // SSM / DeltaNet specific metadata
-        let ssm_d_conv = get_u32_or(&format!("{arch}.ssm.conv_kernel"), 4);
-        let ssm_d_inner = get_u32_or(&format!("{arch}.ssm.inner_size"), hidden_size);
-        let ssm_d_state = get_u32_or(&format!("{arch}.ssm.state_size"), 128);
-        let ssm_dt_rank = get_u32_or(&format!("{arch}.ssm.time_step_rank"), 16);
-        let ssm_n_group = get_u32_or(&format!("{arch}.ssm.group_count"), 16);
-        let full_attention_interval = get_u32_or(&format!("{arch}.full_attention_interval"), 4);
-
-        // Derive linear attention dimensions from SSM params (llama.cpp convention)
-        let linear_num_key_heads = ssm_n_group;
-        let linear_num_value_heads = ssm_dt_rank;
-        let linear_key_head_dim = ssm_d_state;
-        let linear_value_head_dim = if ssm_dt_rank > 0 {
-            ssm_d_inner / ssm_dt_rank
-        } else {
-            ssm_d_state
-        };
-
-        // Partial rotary factor from rope_dimension_sections or default
-        let partial_rotary_factor = get_f32_or(&format!("{arch}.rope.partial_rotary_factor"), 0.25);
-
-        let vocab_size = ct
-            .tensor_infos
-            .get("token_embd.weight")
-            .map(|t| t.shape.dims()[0])
-            .unwrap_or_else(|| {
-                tracing::warn!(
-                    "Qwen3.5 GGUF: 'token_embd.weight' tensor not found, using default vocab_size: 248320"
-                );
-                248320
-            });
-
-        let eos_token_ids = md
-            .get("tokenizer.ggml.eos_token_id")
-            .and_then(|v| v.to_u32().ok())
-            .map(|id| vec![id])
-            .unwrap_or_else(|| {
-                tracing::warn!(
-                    "Qwen3.5 GGUF: 'tokenizer.ggml.eos_token_id' not found, using empty list"
-                );
-                vec![]
-            });
-
-        Ok(Qwen3_5GgufConfig {
-            num_hidden_layers,
-            hidden_size,
-            intermediate_size,
-            num_attention_heads,
-            num_key_value_heads,
-            head_dim,
-            max_position_embeddings,
-            rms_norm_eps,
-            rope_theta,
-            vocab_size,
-            eos_token_ids,
-            linear_num_key_heads,
-            linear_num_value_heads,
-            linear_key_head_dim,
-            linear_value_head_dim,
-            linear_conv_kernel_dim: ssm_d_conv,
-            full_attention_interval,
-            partial_rotary_factor,
-        })
-    }
-}
+pub mod gguf;

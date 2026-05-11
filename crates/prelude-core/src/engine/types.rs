@@ -121,6 +121,34 @@ pub struct CommonModelConfig {
     pub kv_num_heads: Option<Vec<usize>>,
 }
 
+impl CommonModelConfig {
+    pub fn new(
+        vocab_size: usize,
+        num_hidden_layers: usize,
+        max_position_embeddings: usize,
+        num_attention_heads: usize,
+        num_key_value_heads: usize,
+        head_dim: usize,
+    ) -> Self {
+        Self {
+            vocab_size,
+            num_hidden_layers,
+            max_position_embeddings,
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim,
+            kv_head_dims: None,
+            kv_num_heads: None,
+        }
+    }
+
+    pub fn with_uniform_physical_kv_layers(mut self, physical_layers: usize) -> Self {
+        self.kv_head_dims = Some(vec![self.head_dim; physical_layers]);
+        self.kv_num_heads = Some(vec![self.num_key_value_heads; physical_layers]);
+        self
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeCaps {
     pub supports_kv_cache: bool,

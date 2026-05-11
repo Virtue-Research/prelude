@@ -222,6 +222,7 @@ impl From<CliTaskOverride> for TaskOverride {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Register device backends before anything else.
+    #[cfg(feature = "cpu")]
     prelude_cpu::register();
     #[cfg(feature = "cuda")]
     prelude_cuda::register();

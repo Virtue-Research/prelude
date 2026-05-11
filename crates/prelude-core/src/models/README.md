@@ -28,5 +28,5 @@ Resist the urge to factor out anything model-pair-specific into `commons/`.
 1. Create `<arch>.rs` with `Attention` / `Mlp` / `DecoderLayer` / `<Arch>ModelForCausalLM` structs.
 2. Use `Linear`, `RmsNorm`, `Embedding`, `RotaryEmbedding` from `commons/` for weight storage.
 3. Inside `forward`, call `ops.xxx()` for all compute (fused kernels auto-fallback).
-4. Register the architecture via the `model_config!` macro and `inventory::submit!`.
+4. Add the `ArchSpec` metadata block and register it with `inventory::submit!`.
 5. Add a config struct in `config.rs` (or its own file if large).

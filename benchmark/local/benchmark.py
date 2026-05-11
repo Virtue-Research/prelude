@@ -12,8 +12,8 @@ Data:
   synthetic  (default) pure random text; KV cache cannot reuse across requests
              --prompt-tokens N      exact N tokens per prompt (needs tokenizer)
              --prompt-tokens N-M    uniform random in [N, M] (needs tokenizer)
-  realworld  HF dataset; must have a "question" string column
-             --dataset openai/gsm8k (default)
+  realworld  HF dataset; defaults to openai/gsm8k, "question" text column
+             --dataset DATASET --text-column COLUMN
 
 Features:
   --prefix                use chat API with shared system prompt (prefix cache test)
@@ -64,6 +64,7 @@ import sys
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import aiohttp
@@ -77,6 +78,7 @@ DEFAULT_URL = "http://localhost:8000"
 DEFAULT_MODEL = "test"
 DEFAULT_TIMEOUT = 120
 DEFAULT_DATASET = "openai/gsm8k"
+DEFAULT_TEXT_COLUMN = "question"
 
 # Default system prompt for prefix cache testing when --prefix-tokens is not set
 SYSTEM_PROMPT_TEMPLATE = """You are a content safety classifier. Your task is to analyze the given content and determine if it is safe or unsafe.
@@ -341,12 +343,129 @@ def aggregate_rerun_results(all_runs: list[list[BenchmarkResult]]) -> list[Bench
 # Data Preparation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_realworld_dataset(dataset: str, max_samples: int, seed: int = 42) -> list[str]:
+def prompt_from_row(row: dict, text_column: str) -> Optional[str]:
+    value = row.get(text_column)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value
+    else:
+        text = json.dumps(value, ensure_ascii=False)
+    return text if text.strip() else None
+
+
+def sample_prompts(prompts: list[str], max_samples: int, seed: int, shuffle: bool) -> list[str]:
+    if not prompts:
+        return prompts
+    prompts = list(prompts)
+    if shuffle:
+        rng = random.Random(seed)
+        rng.shuffle(prompts)
+    if len(prompts) >= max_samples:
+        return prompts[:max_samples]
+    return [prompts[i % len(prompts)] for i in range(max_samples)]
+
+
+def sample_jsonl_prompts(
+    path: Path,
+    max_samples: int,
+    seed: int,
+    text_column: str,
+    shuffle: bool,
+) -> tuple[list[str], int]:
+    rng = random.Random(seed)
+    prompts: list[str] = []
+    total = 0
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"invalid JSON on line {line_no}: {e}") from e
+            if not isinstance(row, dict):
+                continue
+            text = prompt_from_row(row, text_column)
+            if not text:
+                continue
+            total += 1
+            if not shuffle:
+                if len(prompts) < max_samples:
+                    prompts.append(text)
+                continue
+            if len(prompts) < max_samples:
+                prompts.append(text)
+            else:
+                idx = rng.randrange(total)
+                if idx < max_samples:
+                    prompts[idx] = text
+    return prompts, total
+
+
+def load_local_dataset_file(
+    path: Path,
+    max_samples: int,
+    seed: int,
+    text_column: str,
+    shuffle: bool,
+) -> list[str]:
+    """Load prompts from a local JSON/JSONL file."""
+    print(f"Loading dataset file '{path}'...")
+    try:
+        if path.suffix.lower() == ".jsonl":
+            prompts, total = sample_jsonl_prompts(path, max_samples, seed, text_column, shuffle)
+        else:
+            with path.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, list):
+                rows = payload
+            elif isinstance(payload, dict):
+                rows = next(
+                    (value for value in payload.values() if isinstance(value, list)),
+                    [],
+                )
+            else:
+                rows = []
+            prompts = [
+                text
+                for row in rows
+                if isinstance(row, dict)
+                if (text := prompt_from_row(row, text_column))
+            ]
+            total = len(prompts)
+    except Exception as e:
+        print(f"ERROR: Failed to load dataset file '{path}': {e}")
+        sys.exit(1)
+
+    if not prompts:
+        print(f"ERROR: dataset file '{path}' has no non-empty '{text_column}' entries")
+        sys.exit(1)
+
+    prompts = sample_prompts(prompts, max_samples, seed, shuffle)
+    print(f"  Loaded {len(prompts)} prompts from {total} '{text_column}' entries in '{path}'")
+    return prompts
+
+
+def load_realworld_dataset(
+    dataset: str,
+    max_samples: int,
+    seed: int = 42,
+    text_column: str = DEFAULT_TEXT_COLUMN,
+    dataset_split: Optional[str] = None,
+    dataset_config: Optional[str] = None,
+    shuffle: bool = True,
+) -> list[str]:
     """
     Load prompts from a HuggingFace dataset.
-    The dataset must have a 'question' string column.
+    The dataset must have a string column named by `text_column`.
     Defaults to 'openai/gsm8k' (train split, 'main' config).
     """
+    local_path = Path(dataset).expanduser()
+    if local_path.exists() and local_path.is_file():
+        return load_local_dataset_file(local_path, max_samples, seed, text_column, shuffle)
+
     try:
         from datasets import load_dataset as hf_load
     except ImportError:
@@ -355,8 +474,12 @@ def load_realworld_dataset(dataset: str, max_samples: int, seed: int = 42) -> li
 
     print(f"Loading dataset '{dataset}'...")
     try:
-        if dataset == DEFAULT_DATASET:
-            ds = hf_load(dataset, "main", split="train")
+        if dataset_config:
+            ds = hf_load(dataset, dataset_config, split=dataset_split or "train")
+        elif dataset == DEFAULT_DATASET:
+            ds = hf_load(dataset, "main", split=dataset_split or "train")
+        elif dataset_split:
+            ds = hf_load(dataset, split=dataset_split)
         else:
             try:
                 ds = hf_load(dataset, split="test")
@@ -366,25 +489,24 @@ def load_realworld_dataset(dataset: str, max_samples: int, seed: int = 42) -> li
         print(f"ERROR: Failed to load dataset '{dataset}': {e}")
         sys.exit(1)
 
-    if "question" not in ds.column_names:
+    if text_column not in ds.column_names:
         available = ", ".join(ds.column_names)
-        print(f"ERROR: dataset '{dataset}' has no 'question' column. "
+        print(f"ERROR: dataset '{dataset}' has no '{text_column}' column. "
               f"Available columns: {available}")
         sys.exit(1)
 
-    questions = [str(row["question"]) for row in ds if row.get("question")]
-    if not questions:
-        print(f"ERROR: dataset '{dataset}' has no non-empty 'question' entries")
+    prompts = [
+        text
+        for row in ds
+        if (text := prompt_from_row(row, text_column))
+    ]
+    if not prompts:
+        print(f"ERROR: dataset '{dataset}' has no non-empty '{text_column}' entries")
         sys.exit(1)
 
-    rng = random.Random(seed)
-    rng.shuffle(questions)
-    # Repeat if the dataset is smaller than requested
-    while len(questions) < max_samples:
-        questions = questions * 2
-    questions = questions[:max_samples]
-    print(f"  Loaded {len(questions)} prompts from '{dataset}'")
-    return questions
+    prompts = sample_prompts(prompts, max_samples, seed, shuffle)
+    print(f"  Loaded {len(prompts)} prompts from '{dataset}' column '{text_column}'")
+    return prompts
 
 
 def build_prompts(
@@ -392,6 +514,10 @@ def build_prompts(
     data_type: str,
     prompt_tokens_spec: "None | int | tuple[int, int]",
     dataset: str,
+    text_column: str,
+    dataset_split: Optional[str],
+    dataset_config: Optional[str],
+    shuffle: bool,
     model: str,
     seed: int,
     rng: random.Random,
@@ -405,10 +531,18 @@ def build_prompts(
       - prompt_tokens_spec is (lo, hi)     → uniform random token count in [lo, hi]
 
     data_type == "realworld":
-      - load from HF dataset, 'question' column; token spec is ignored
+      - load from HF dataset text column; token spec is ignored
     """
     if data_type == "realworld":
-        return load_realworld_dataset(dataset, max_samples=count, seed=seed)
+        return load_realworld_dataset(
+            dataset,
+            max_samples=count,
+            seed=seed,
+            text_column=text_column,
+            dataset_split=dataset_split,
+            dataset_config=dataset_config,
+            shuffle=shuffle,
+        )
 
     # synthetic
     if prompt_tokens_spec is None:
@@ -1130,6 +1264,10 @@ def toml_to_namespace(cfg: dict):
     data_sec = cfg.get("data", {})
     args.data = data_sec.get("type", "synthetic") if isinstance(data_sec, dict) else "synthetic"
     args.dataset = data_sec.get("dataset", DEFAULT_DATASET) if isinstance(data_sec, dict) else DEFAULT_DATASET
+    args.text_column = data_sec.get("text_column", DEFAULT_TEXT_COLUMN) if isinstance(data_sec, dict) else DEFAULT_TEXT_COLUMN
+    args.dataset_split = data_sec.get("split") if isinstance(data_sec, dict) else None
+    args.dataset_config = data_sec.get("config") if isinstance(data_sec, dict) else None
+    args.shuffle = data_sec.get("shuffle", True) if isinstance(data_sec, dict) else True
     pt = data_sec.get("prompt_tokens") if isinstance(data_sec, dict) else None
     args.prompt_tokens = str(pt) if pt is not None else None
 
@@ -1204,7 +1342,17 @@ async def async_main():
                            help="Input data source")
             p.add_argument("--dataset", default=DEFAULT_DATASET,
                            help="HF dataset for --data realworld; "
-                                "must have a 'question' string column")
+                                "defaults to openai/gsm8k")
+            p.add_argument("--text-column", default=DEFAULT_TEXT_COLUMN,
+                           help="Dataset text column for --data realworld")
+            p.add_argument("--dataset-split", default=None,
+                           help="Dataset split for --data realworld; "
+                                "default is train for GSM8K, otherwise test then train")
+            p.add_argument("--dataset-config", default=None,
+                           help="Optional HuggingFace dataset config name")
+            p.add_argument("--preserve-order", dest="shuffle", action="store_false",
+                           help="Preserve real-world dataset order instead of seeded shuffle")
+            p.set_defaults(shuffle=True)
             p.add_argument("--prompt-tokens", default=None, metavar="N|N-M",
                            help="Token length for synthetic data: "
                                 "'128' (exact) or '10-512' (uniform range). "
@@ -1355,6 +1503,10 @@ async def async_main():
         data_type=getattr(args, "data", "synthetic"),
         prompt_tokens_spec=prompt_tokens_spec,
         dataset=getattr(args, "dataset", DEFAULT_DATASET),
+        text_column=getattr(args, "text_column", DEFAULT_TEXT_COLUMN),
+        dataset_split=getattr(args, "dataset_split", None),
+        dataset_config=getattr(args, "dataset_config", None),
+        shuffle=getattr(args, "shuffle", True),
         model=args.model,
         seed=args.seed,
         rng=rng,

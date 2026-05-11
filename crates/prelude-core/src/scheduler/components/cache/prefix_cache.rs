@@ -10,6 +10,7 @@
 //! Enable via environment variables:
 //! - `PRELUDE_PREFIX_CACHE_BLOCKS=256` (max cached blocks, 0 = disabled)
 //! - `PRELUDE_PREFIX_BLOCK_SIZE=64`    (tokens per block)
+//! - `PRELUDE_DELTANET_PREFIX_CACHE_ENTRIES=128` (max hybrid recurrent states)
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -18,6 +19,8 @@ use crate::cache::deltanet_pool::DeltaNetPrefixState;
 use crate::cache::prefix_index::PrefixMatchIndex;
 use crate::cache::prefix_plan::PrefixResources;
 use crate::tensor::{Result, Tensor};
+
+const DEFAULT_DELTANET_PREFIX_STATE_ENTRIES: usize = 128;
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -39,6 +42,11 @@ struct ExactPagedPrefixEntry {
     access_id: u64,
 }
 
+struct DeltaNetPrefixStateEntry {
+    state: DeltaNetPrefixState,
+    access_id: u64,
+}
+
 /// Block-level prefix KV cache with hash-trie matching.
 pub struct PrefixKvCache {
     /// Tensor-free trie index (matching, LRU, paged block tracking).
@@ -50,7 +58,10 @@ pub struct PrefixKvCache {
     /// Per-layer KV tensors for each cached block, keyed by block hash.
     kv_store: HashMap<u64, Vec<(Tensor, Tensor)>>,
     /// Optional hybrid-model state at selected block boundaries.
-    deltanet_state_store: HashMap<u64, DeltaNetPrefixState>,
+    deltanet_state_store: HashMap<u64, DeltaNetPrefixStateEntry>,
+    deltanet_state_lru: VecDeque<(u64, u64)>,
+    deltanet_state_access_counter: u64,
+    max_deltanet_state_entries: usize,
     /// Non-block-aligned exact prefix snapshots. Complete pages are still
     /// owned by the block trie entries; this entry owns only the partial tail
     /// page plus the recurrent state at the exact boundary.
@@ -64,18 +75,35 @@ pub struct PrefixKvCache {
 
 impl PrefixKvCache {
     pub fn new(block_size: usize, concat_dim: usize, num_layers: usize, max_blocks: usize) -> Self {
+        let max_deltanet_state_entries = Self::deltanet_state_limit_from_env(max_blocks);
         Self {
             index: PrefixMatchIndex::new(block_size, max_blocks),
             concat_dim,
             num_layers,
             kv_store: HashMap::new(),
             deltanet_state_store: HashMap::new(),
+            deltanet_state_lru: VecDeque::new(),
+            deltanet_state_access_counter: 0,
+            max_deltanet_state_entries,
             exact_paged_store: HashMap::new(),
             exact_lru: VecDeque::new(),
             exact_access_counter: 0,
             evicted_exact_paged_blocks: Vec::new(),
             assembled_cache: HashMap::new(),
         }
+    }
+
+    fn deltanet_state_limit_from_env(max_blocks: usize) -> usize {
+        if max_blocks == 0 {
+            return 0;
+        }
+        let default = DEFAULT_DELTANET_PREFIX_STATE_ENTRIES.min(max_blocks);
+        std::env::var("PRELUDE_DELTANET_PREFIX_CACHE_ENTRIES")
+            .or_else(|_| std::env::var("PRELUDE_PREFIX_CACHE_DELTANET_STATES"))
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(default)
+            .min(max_blocks)
     }
 
     /// Whether the cache is enabled (has capacity).
@@ -155,9 +183,15 @@ impl PrefixKvCache {
             if cached_len >= tokens.len() {
                 continue;
             }
-            let Some(state) = self.deltanet_state_store.get(hashes.last().unwrap()) else {
+            let last_hash = *hashes.last().unwrap();
+            let Some(state) = self
+                .deltanet_state_store
+                .get(&last_hash)
+                .map(|entry| entry.state.clone())
+            else {
                 continue;
             };
+            self.touch_deltanet_state(last_hash);
             let resources = PrefixResources {
                 paged_kv: self.index.all_have_paged(hashes),
                 recurrent_state: true,
@@ -283,7 +317,7 @@ impl PrefixKvCache {
             let block_size = self.index.block_size();
             if tokens.len() >= block_size && tokens.len() % block_size == 0 {
                 let hash = Self::last_full_block_hash(tokens, block_size);
-                self.deltanet_state_store.insert(hash, state.clone());
+                self.insert_deltanet_state(hash, state.clone());
             }
             if let Some(partial_id) =
                 self.partial_paged_block_id(tokens.len(), paged_block_size, full_block_table)
@@ -311,6 +345,54 @@ impl PrefixKvCache {
         }
 
         stored_paged_blocks
+    }
+
+    fn insert_deltanet_state(&mut self, hash: u64, state: DeltaNetPrefixState) {
+        if self.max_deltanet_state_entries == 0 {
+            self.deltanet_state_store.remove(&hash);
+            return;
+        }
+
+        let access_id = self.next_deltanet_state_access_id();
+        if let Some(entry) = self.deltanet_state_store.get_mut(&hash) {
+            entry.state = state;
+            entry.access_id = access_id;
+            self.deltanet_state_lru.push_back((hash, access_id));
+            return;
+        }
+
+        self.deltanet_state_store
+            .insert(hash, DeltaNetPrefixStateEntry { state, access_id });
+        self.deltanet_state_lru.push_back((hash, access_id));
+        self.evict_deltanet_states_if_needed();
+    }
+
+    fn touch_deltanet_state(&mut self, hash: u64) {
+        let access_id = self.next_deltanet_state_access_id();
+        if let Some(entry) = self.deltanet_state_store.get_mut(&hash) {
+            entry.access_id = access_id;
+            self.deltanet_state_lru.push_back((hash, access_id));
+        }
+    }
+
+    fn evict_deltanet_states_if_needed(&mut self) {
+        while self.deltanet_state_store.len() > self.max_deltanet_state_entries {
+            let Some((hash, access_id)) = self.deltanet_state_lru.pop_front() else {
+                break;
+            };
+            let Some(entry) = self.deltanet_state_store.get(&hash) else {
+                continue;
+            };
+            if entry.access_id != access_id {
+                continue;
+            }
+            self.deltanet_state_store.remove(&hash);
+        }
+    }
+
+    fn next_deltanet_state_access_id(&mut self) -> u64 {
+        self.deltanet_state_access_counter = self.deltanet_state_access_counter.wrapping_add(1);
+        self.deltanet_state_access_counter
     }
 
     fn partial_paged_block_id(
@@ -388,7 +470,7 @@ impl PrefixKvCache {
     }
 
     fn evict_exact_if_needed(&mut self) {
-        let max_entries = self.index.max_blocks();
+        let max_entries = self.max_deltanet_state_entries;
         while self.exact_paged_store.len() > max_entries {
             let Some((key, access_id)) = self.exact_lru.pop_front() else {
                 break;
@@ -568,11 +650,18 @@ impl PrefixKvCache {
         self.insert_blocks_inner(tokens, layer_kvs, None)?;
         Ok(())
     }
+
+    fn set_deltanet_state_entry_limit_for_test(&mut self, limit: usize) {
+        self.max_deltanet_state_entries = limit;
+        self.evict_deltanet_states_if_needed();
+        self.evict_exact_if_needed();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::deltanet_pool::{DeltaNetPool, DeltaNetPoolConfig};
     use crate::tensor::{DType, Device};
 
     fn make_kv(block_size: usize, num_layers: usize) -> Vec<(Tensor, Tensor)> {
@@ -583,6 +672,19 @@ mod tests {
                 (k, v)
             })
             .collect()
+    }
+
+    fn make_deltanet_state() -> DeltaNetPrefixState {
+        let cfg = DeltaNetPoolConfig {
+            num_deltanet_layers: 1,
+            num_v_heads: 1,
+            head_k_dim: 2,
+            head_v_dim: 2,
+            conv_dim: 4,
+            conv_kernel: 3,
+        };
+        let pool = DeltaNetPool::new(&cfg, 1, DType::BF16, &Device::Cpu).unwrap();
+        pool.snapshot_slot(0).unwrap()
     }
 
     #[test]
@@ -707,5 +809,39 @@ mod tests {
         let (cached_len, paged_ids) = cache.match_paged_blocks_only(&tokens).unwrap();
         assert_eq!(cached_len, 8);
         assert_eq!(paged_ids, vec![20]);
+    }
+
+    #[test]
+    fn test_deltanet_state_cache_uses_bounded_lru() {
+        let mut cache = PrefixKvCache::new(4, 1, 2, 16);
+        cache.set_deltanet_state_entry_limit_for_test(2);
+
+        let state = make_deltanet_state();
+        let p1 = vec![1, 2, 3, 4];
+        let p2 = vec![5, 6, 7, 8];
+        let p3 = vec![9, 10, 11, 12];
+
+        cache.insert_paged_blocks_with_deltanet_state(&p1, 4, &[101], state.clone());
+        cache.insert_paged_blocks_with_deltanet_state(&p2, 4, &[102], state.clone());
+
+        let mut q1 = p1.clone();
+        q1.push(99);
+        let (cached_len, _, state1) = cache.match_paged_blocks_with_deltanet_state(&q1).unwrap();
+        assert_eq!(cached_len, 4);
+        assert!(state1.is_some());
+
+        cache.insert_paged_blocks_with_deltanet_state(&p3, 4, &[103], state);
+
+        let mut q2 = p2.clone();
+        q2.push(99);
+        let (cached_len, paged, state2) =
+            cache.match_paged_blocks_with_deltanet_state(&q2).unwrap();
+        assert_eq!(cached_len, 0);
+        assert!(paged.is_empty());
+        assert!(state2.is_none());
+
+        let (cached_len, _, state1) = cache.match_paged_blocks_with_deltanet_state(&q1).unwrap();
+        assert_eq!(cached_len, 4);
+        assert!(state1.is_some());
     }
 }
