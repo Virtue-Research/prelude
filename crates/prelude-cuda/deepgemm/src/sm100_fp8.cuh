@@ -129,7 +129,7 @@ static SM100FP8Config select_sm100_fp8_config(int m, int n, int k, int num_sms) 
         BLOCK_M, BLOCK_N, 128, 1,                                            \
         128, 128, SWIZZLE_CD,                                                \
         STAGES, 128, 128,                                                    \
-        NUM_MC, false, 132,                                                  \
+        NUM_MC, false, PRELUDE_KERNEL_NUM_SMS,                               \
         GemmType::Normal, false,                                             \
         cutlass::float_e4m3_t, cutlass::float_e4m3_t, cutlass::bfloat16_t,  \
         deep_gemm::EpilogueIdentity>
@@ -201,7 +201,7 @@ static int sm100_fp8_gemm(
     int M, int N, int K, void* stream
 ) {
     cudaGetLastError();
-    auto cfg = select_sm100_fp8_config(M, N, K, g_num_sms);
+    auto cfg = select_sm100_fp8_config(M, N, K, kKernelNumSMs);
     auto kernel_ptr = get_sm100_fp8_kernel(cfg);
     if (!kernel_ptr) return -1;
 
@@ -333,7 +333,7 @@ static SM100FP8Config select_sm100_fp8_grouped_config(int m, int n, int k, int n
         128, BLOCK_N, 128, 1,                                                \
         128, 128, SWIZZLE_CD,                                                \
         STAGES, 128, 128,                                                    \
-        NUM_MC, false, 132,                                                  \
+        NUM_MC, false, PRELUDE_KERNEL_NUM_SMS,                               \
         GemmType::MGroupedContiguous, false,                                 \
         cutlass::float_e4m3_t, cutlass::float_e4m3_t, cutlass::bfloat16_t,  \
         deep_gemm::EpilogueIdentity>
@@ -375,7 +375,7 @@ static int sm100_m_grouped_fp8_gemm(
     int M, int N, int K, int num_groups, void* stream
 ) {
     cudaGetLastError();
-    auto cfg = select_sm100_fp8_grouped_config(M, N, K, g_num_sms);
+    auto cfg = select_sm100_fp8_grouped_config(M, N, K, kKernelNumSMs);
     auto kernel_ptr = get_sm100_fp8_grouped_kernel(cfg);
     if (!kernel_ptr) return -1;
 
@@ -496,7 +496,7 @@ static SM100FP8Config select_sm100_fp8_masked_config(int expected_m, int n, int 
         BLOCK_M, BLOCK_N, 128, NGROUPS,                                      \
         128, 128, SWIZZLE_CD,                                                \
         STAGES, 128, 128,                                                    \
-        NUM_MC, false, 132,                                                  \
+        NUM_MC, false, PRELUDE_KERNEL_NUM_SMS,                               \
         GemmType::MGroupedMasked, false,                                     \
         cutlass::float_e4m3_t, cutlass::float_e4m3_t, cutlass::bfloat16_t,  \
         deep_gemm::EpilogueIdentity>
@@ -552,7 +552,7 @@ static int sm100_m_grouped_masked_fp8_gemm(
     int M, int N, int K, int num_groups, int expected_m, void* stream
 ) {
     cudaGetLastError();
-    auto cfg = select_sm100_fp8_masked_config(expected_m, N, K, num_groups, g_num_sms);
+    auto cfg = select_sm100_fp8_masked_config(expected_m, N, K, num_groups, kKernelNumSMs);
     auto kernel_ptr = get_sm100_fp8_masked_kernel(cfg, num_groups);
     if (!kernel_ptr) return -1;
 

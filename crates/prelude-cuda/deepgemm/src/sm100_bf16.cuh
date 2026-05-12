@@ -102,7 +102,7 @@ static SM100Config select_sm100_config(int m, int n, int k, int num_sms) {
         BLOCK_M, BLOCK_N, 64, 1,                                                \
         128, 128, SWIZZLE_D,                                                    \
         STAGES, 128, 128,                                                       \
-        NUM_MC, MC_ON_A, 132,                                                   \
+        NUM_MC, MC_ON_A, PRELUDE_KERNEL_NUM_SMS,                                \
         GemmType::Normal, false, cutlass::bfloat16_t, 100>
 
 __attribute__((used)) static auto* _s100_00 = &KERNEL_TYPE_SM100(32, 16, 32, 32, 1, false);
@@ -189,7 +189,7 @@ static const void* get_sm100_kernel(const SM100Config& cfg) {
 
 static int sm100_bf16_gemm(void* A, void* B, void* D, int M, int N, int K, void* stream) {
     cudaGetLastError();
-    auto cfg = select_sm100_config(M, N, K, g_num_sms);
+    auto cfg = select_sm100_config(M, N, K, kKernelNumSMs);
     auto kernel_ptr = get_sm100_kernel(cfg);
     if (!kernel_ptr) return -1;
 
@@ -323,7 +323,7 @@ static SM100Config select_sm100_grouped_config(int m, int n, int k, int num_sms)
         128, BLOCK_N, 64, 1,                                                    \
         128, 128, SWIZZLE_D,                                                    \
         STAGES, 128, 128,                                                       \
-        NUM_MC, MC_ON_A, 132,                                                   \
+        NUM_MC, MC_ON_A, PRELUDE_KERNEL_NUM_SMS,                                \
         GemmType::MGroupedContiguous, false, cutlass::bfloat16_t, 100>
 
 // bm=128 only (grouped contiguous constraint)
@@ -370,7 +370,7 @@ static int sm100_m_grouped_bf16_gemm(
     int M, int N, int K, int num_groups, void* stream
 ) {
     cudaGetLastError();
-    auto cfg = select_sm100_grouped_config(M, N, K, g_num_sms);
+    auto cfg = select_sm100_grouped_config(M, N, K, kKernelNumSMs);
     if (getenv("DEEPGEMM_DEBUG")) {
         fprintf(stderr,
             "[deepgemm sm100 grouped] M=%d N=%d K=%d G=%d "
@@ -474,7 +474,7 @@ static SM100Config select_sm100_masked_config(int expected_m, int n, int k, int 
         BLOCK_M, BLOCK_N, 64, NGROUPS,                                          \
         128, 128, SWIZZLE_D,                                                    \
         STAGES, 128, 128,                                                       \
-        NUM_MC, false, 132,                                                     \
+        NUM_MC, false, PRELUDE_KERNEL_NUM_SMS,                                  \
         GemmType::MGroupedMasked, false, cutlass::bfloat16_t, 100>
 
 #define SM100_MASKED_CONFIGS(G, TAG) \
@@ -526,7 +526,7 @@ static int sm100_m_grouped_masked_bf16_gemm(
     int M, int N, int K, int num_groups, int expected_m, void* stream
 ) {
     cudaGetLastError();
-    auto cfg = select_sm100_masked_config(expected_m, N, K, num_groups, g_num_sms);
+    auto cfg = select_sm100_masked_config(expected_m, N, K, num_groups, kKernelNumSMs);
     auto kernel_ptr = get_sm100_masked_kernel(cfg, num_groups);
     if (!kernel_ptr) return -1;
 

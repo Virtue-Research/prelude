@@ -70,12 +70,12 @@ void deepgemm_query_config(int M, int N, int K,
     ensure_num_sms();
     ensure_gpu_arch();
     if (g_gpu_arch >= 100) {
-        auto cfg = select_sm100_config(M, N, K, g_num_sms);
+        auto cfg = select_sm100_config(M, N, K, kKernelNumSMs);
         *out_block_m = cfg.block_m; *out_block_n = cfg.block_n;
         *out_stages = cfg.num_stages; *out_smem = cfg.smem_size;
         return;
     }
-    auto cfg = select_config(M, N, K, g_num_sms);
+    auto cfg = select_config(M, N, K, kKernelNumSMs);
     *out_block_m = cfg.block_m;
     *out_block_n = cfg.block_n;
     *out_stages = cfg.num_stages;
@@ -102,7 +102,7 @@ void deepgemm_query_fp8_config(int M, int N, int K,
                                 int* out_block_m, int* out_block_n,
                                 int* out_stages, int* out_smem) {
     ensure_num_sms();
-    auto cfg = select_fp8_config(M, N, K, g_num_sms);
+    auto cfg = select_fp8_config(M, N, K, kKernelNumSMs);
     *out_block_m = cfg.block_m;
     *out_block_n = cfg.block_n;
     *out_stages = cfg.num_stages;
@@ -165,7 +165,7 @@ void deepgemm_query_grouped_config(int M, int N, int K,
                                     int* out_block_m, int* out_block_n,
                                     int* out_stages, int* out_smem) {
     ensure_num_sms();
-    auto cfg = select_grouped_config(M, N, K, g_num_sms);
+    auto cfg = select_grouped_config(M, N, K, kKernelNumSMs);
     *out_block_m = cfg.block_m;
     *out_block_n = cfg.block_n;
     *out_stages = cfg.num_stages;

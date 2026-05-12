@@ -157,7 +157,7 @@ static FP8Config select_fp8_grouped_config(int m, int n, int k, int num_sms) {
         128, 128, SWIZZLE_D,                                                   \
         STAGES, LAST_STAGES,                                                   \
         128, NUM_MATH,                                                         \
-        NUM_MC, MC_ON_A, 132,                                                  \
+        NUM_MC, MC_ON_A, PRELUDE_KERNEL_NUM_SMS,                               \
         GemmType::Normal,                                                      \
         deep_gemm::EpilogueIdentity>
 
@@ -217,7 +217,7 @@ __attribute__((used)) static auto* _fp8_2c = &KERNEL_TYPE_FP8(128, 256, 3, 1, 25
         128, 128, SWIZZLE_D,                                                   \
         STAGES, LAST_STAGES,                                                   \
         128, 256,                                                              \
-        NUM_MC, MC_ON_A, 132,                                                  \
+        NUM_MC, MC_ON_A, PRELUDE_KERNEL_NUM_SMS,                               \
         GemmType::MGroupedContiguous,                                          \
         deep_gemm::EpilogueIdentity>
 
@@ -352,7 +352,7 @@ static int sm90_fp8_gemm(
     int M, int N, int K, void* stream
 ) {
     cudaGetLastError();
-    auto cfg = select_fp8_config(M, N, K, g_num_sms);
+    auto cfg = select_fp8_config(M, N, K, kKernelNumSMs);
     auto kernel_ptr = get_fp8_kernel(cfg);
     if (!kernel_ptr) return -1;
 
@@ -383,7 +383,7 @@ static int sm90_m_grouped_fp8_gemm(
     int M, int N, int K, int num_groups, void* stream
 ) {
     cudaGetLastError();
-    auto cfg = select_fp8_grouped_config(M, N, K, g_num_sms);
+    auto cfg = select_fp8_grouped_config(M, N, K, kKernelNumSMs);
     auto kernel_ptr = get_fp8_grouped_kernel(cfg);
     if (!kernel_ptr) return -1;
 
@@ -502,7 +502,7 @@ static FP8Config select_fp8_masked_config(int expected_m, int n, int k, int num_
         128, 128, SWIZZLE_D,                                                   \
         STAGES, LAST_STAGES,                                                   \
         128, NUM_MATH,                                                         \
-        NUM_MC, MC_ON_A, 132,                                                  \
+        NUM_MC, MC_ON_A, PRELUDE_KERNEL_NUM_SMS,                               \
         GemmType::MGroupedMasked,                                              \
         deep_gemm::EpilogueIdentity>
 
@@ -576,7 +576,7 @@ static int sm90_m_grouped_masked_fp8_gemm(
     int M, int N, int K, int num_groups, int expected_m, void* stream
 ) {
     cudaGetLastError();
-    auto cfg = select_fp8_masked_config(expected_m, N, K, num_groups, g_num_sms);
+    auto cfg = select_fp8_masked_config(expected_m, N, K, num_groups, kKernelNumSMs);
     auto kernel_ptr = get_fp8_masked_kernel(cfg, num_groups);
     if (!kernel_ptr) return -1;
 
@@ -697,7 +697,7 @@ static FP8_1D1D_Config select_fp8_1d1d_config(int m, int n, int k, int num_sms) 
         BLOCK_M, BLOCK_N, 128,                                              \
         128, 128,                                                           \
         STAGES, 128, NUM_MATH,                                              \
-        NUM_MC, MC_ON_A, 132,                                               \
+        NUM_MC, MC_ON_A, PRELUDE_KERNEL_NUM_SMS,                            \
         GemmType::Normal, float>
 
 // Stages computed: smem_cd=align(bm*bn*4,1024), per_stage=bm*128+bn*128+align(bm*4,128)+align(bn*4,128)+16
@@ -747,7 +747,7 @@ static int sm90_fp8_gemm_1d1d(
     int M, int N, int K, void* stream
 ) {
     cudaGetLastError();
-    auto cfg = select_fp8_1d1d_config(M, N, K, g_num_sms);
+    auto cfg = select_fp8_1d1d_config(M, N, K, kKernelNumSMs);
     auto kernel_ptr = get_fp8_1d1d_kernel(cfg);
     if (!kernel_ptr) return -1;
 
