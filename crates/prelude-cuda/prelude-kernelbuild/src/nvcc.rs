@@ -299,7 +299,18 @@ pub fn detect_gpu_arch_str(default: &str) -> String {
 
 /// Check whether the given nvcc supports Blackwell (`compute_100`) codegen.
 /// Used to gate SM100 kernel compilation on older toolchains.
+///
+/// Setting `PRELUDE_FORCE_SM90_ONLY=1` forces this to return `false`,
+/// skipping Blackwell codegen even on a Blackwell-capable toolchain.
+/// Useful when CUDA 12.8's `ptxas` can't assemble certain Blackwell
+/// kernel templates that the headers still emit (e.g. cuLA's
+/// `kda_fwd_sm100` hits "Vector type too large, exceeds 128 bit
+/// limit"); the workaround is to bypass the SM100 cubins entirely on
+/// Hopper deployments and rely on the SM90 fallback.
 pub fn nvcc_supports_sm100(nvcc: &Path) -> bool {
+    if std::env::var_os("PRELUDE_FORCE_SM90_ONLY").is_some() {
+        return false;
+    }
     nvcc_supports_arch(nvcc, 100)
 }
 
@@ -307,7 +318,12 @@ pub fn nvcc_supports_sm100(nvcc: &Path) -> bool {
 /// Required for B300 — SM100a PTX does NOT JIT-forward to SM103, so without
 /// a native sm_103a cubin every B300 launch hits "no kernel image
 /// available" or returns -2 from the dispatch.
+///
+/// Also gated by `PRELUDE_FORCE_SM90_ONLY=1`.
 pub fn nvcc_supports_sm103(nvcc: &Path) -> bool {
+    if std::env::var_os("PRELUDE_FORCE_SM90_ONLY").is_some() {
+        return false;
+    }
     nvcc_supports_arch(nvcc, 103)
 }
 

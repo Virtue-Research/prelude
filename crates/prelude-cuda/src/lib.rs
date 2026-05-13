@@ -29,6 +29,8 @@ pub const PTX_GDN_PREFILL_RECURRENT: &str =
     include_str!(concat!(env!("OUT_DIR"), "/gdn_prefill_recurrent.ptx"));
 pub const PTX_GATHER_LOG_SOFTMAX: &str =
     include_str!(concat!(env!("OUT_DIR"), "/gather_log_softmax.ptx"));
+pub const PTX_FAST_ARGMAX_VOCAB: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/fast_argmax_vocab.ptx"));
 
 // ── Module names for cudarc caching ─────────────────────────────────
 
@@ -47,6 +49,7 @@ pub const MOD_SCATTER_KV_CACHE: &str = "kvcache_scatter_kv_cache";
 pub const MOD_GDN_POST_CONV: &str = "gdn_post_conv";
 pub const MOD_GDN_PREFILL_RECURRENT: &str = "gdn_prefill_recurrent";
 pub const MOD_GATHER_LOG_SOFTMAX: &str = "logprobs_gather_log_softmax";
+pub const MOD_FAST_ARGMAX_VOCAB: &str = "sample_fast_argmax_vocab";
 
 /// Probe whether CUDA is usable on this machine.
 /// Creates a context for device 0; the context is cached for later use.
