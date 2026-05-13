@@ -25,6 +25,7 @@ impl Engine {
                 item_seq_counts: vec![],
                 prefill_results: vec![],
                 sampled_tokens: None,
+                sampled_tokens_device: None,
             });
         }
 
@@ -329,6 +330,7 @@ impl Engine {
             item_seq_counts: vec![],
             prefill_results,
             sampled_tokens: None,
+            sampled_tokens_device: None,
         })
     }
 }
