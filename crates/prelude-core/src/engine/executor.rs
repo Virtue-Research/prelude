@@ -74,6 +74,17 @@ pub struct ModelOutput {
     /// Optional row-aligned greedy tokens.
     /// Populated only when the executor was asked to use its greedy fast path.
     pub sampled_tokens: Option<Vec<u32>>,
+    /// Optional row-aligned greedy tokens, kept on the device.
+    ///
+    /// Same data as `sampled_tokens` but materialized as a `[batch] U32`
+    /// device tensor with no host sync. Phase 3 callers (decode-loop
+    /// pipeline) read this and feed it directly as the next forward's
+    /// `input_ids` to skip the per-step `to_vec1` round-trip that
+    /// otherwise dominates host CUDA-API time.
+    ///
+    /// Producers are free to populate one, both, or neither — current
+    /// host-resident callers should keep filling `sampled_tokens`.
+    pub sampled_tokens_device: Option<Tensor>,
 }
 
 // ── Forward batch ──────────────────────────────────────────────────
@@ -236,6 +247,7 @@ mod tests {
                 item_seq_counts,
                 prefill_results: vec![],
                 sampled_tokens: None,
+                sampled_tokens_device: None,
             }));
             Ok(ExecutionHandle::new(rx))
         }

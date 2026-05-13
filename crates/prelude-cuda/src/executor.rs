@@ -126,10 +126,10 @@ fn execute_work(
             // Try CUDA graph replay first
             if let Some(result) = graph_cache.try_replay(engine, &seqs) {
                 let logits = result?;
-                let sampled_tokens = if sample_greedy {
+                let (sampled_tokens_device, sampled_tokens) = if sample_greedy {
                     greedy_argmax_tokens(&logits)
                 } else {
-                    None
+                    (None, None)
                 };
                 let elapsed_us = t0.elapsed().as_micros();
                 tracing::debug!(
@@ -144,6 +144,7 @@ fn execute_work(
                     item_seq_counts: vec![],
                     prefill_results: vec![],
                     sampled_tokens,
+                    sampled_tokens_device,
                 });
             }
 
@@ -157,7 +158,9 @@ fn execute_work(
             });
             if let Ok(output) = result.as_mut() {
                 if sample_greedy {
-                    output.sampled_tokens = greedy_argmax_tokens(&output.logits);
+                    let (dev, host) = greedy_argmax_tokens(&output.logits);
+                    output.sampled_tokens = host;
+                    output.sampled_tokens_device = dev;
                 }
             }
             let elapsed_us = t0.elapsed().as_micros();
@@ -175,7 +178,9 @@ fn execute_work(
             });
             if let Ok(output) = result.as_mut() {
                 if sample_greedy {
-                    output.sampled_tokens = greedy_argmax_tokens(&output.logits);
+                    let (dev, host) = greedy_argmax_tokens(&output.logits);
+                    output.sampled_tokens = host;
+                    output.sampled_tokens_device = dev;
                 }
             }
             let elapsed_us = t0.elapsed().as_micros();
@@ -313,20 +318,34 @@ fn free_warmup_deltanet_slots(engine: &Engine, slots: &[Option<u32>]) {
     }
 }
 
-fn greedy_argmax_tokens(logits: &Tensor) -> Option<Vec<u32>> {
+/// Greedy argmax over the LM head, returning both:
+///
+/// * the `[B] u32` **device** tensor of sampled token ids (no host
+///   sync) — for Phase 3 callers that feed it back to the next forward
+///   pass as `input_ids`.
+/// * the **host** `Vec<u32>` of the same ids (forces a per-step
+///   `to_vec1` sync) — for the existing AR loop that needs them for
+///   EOS / stop-string / streaming text logic.
+///
+/// Both `None` if the underlying argmax fails. Currently every call
+/// site asks for both, since the AR loop still does host-side EOS
+/// checking; PR-3 / PR-4 in this stack will drop the host pull on the
+/// pipelined fast path.
+fn greedy_argmax_tokens(logits: &Tensor) -> (Option<Tensor>, Option<Vec<u32>>) {
     // Hot path: 2-D logits → our multi-block argmax that uses every SM.
     // Anything else (rare; only hit by experimental code paths) falls
     // back to candle's stock single-block argmax.
     let tokens = if logits.dims().len() == 2 {
         match crate::ops::fast_argmax::fast_argmax_vocab(logits) {
-            Ok(t) => t,
+            Ok(t) => Some(t),
             Err(e) => {
                 tracing::debug!("fast_argmax_vocab → candle argmax fallback: {e}");
-                logits.argmax(D::Minus1).ok()?
+                logits.argmax(D::Minus1).ok()
             }
         }
     } else {
-        logits.argmax(D::Minus1).ok()?
+        logits.argmax(D::Minus1).ok()
     };
-    tokens.to_vec1::<u32>().ok()
+    let host = tokens.as_ref().and_then(|t| t.to_vec1::<u32>().ok());
+    (tokens, host)
 }
