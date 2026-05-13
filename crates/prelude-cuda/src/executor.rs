@@ -106,6 +106,7 @@ fn execute_work(
             block_tables,
             deltanet_slots,
             sample_greedy,
+            tokens_device: _, // wired in PR-4 (decode loop pipeline)
         } => {
             let bs = tokens.len();
             let t0 = Instant::now();
@@ -155,6 +156,7 @@ fn execute_work(
                 block_tables,
                 deltanet_slots,
                 sample_greedy,
+                tokens_device: None,
             });
             if let Ok(output) = result.as_mut() {
                 if sample_greedy {

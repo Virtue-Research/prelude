@@ -131,6 +131,17 @@ pub enum ForwardBatch {
         deltanet_slots: Option<Vec<u32>>,
         /// Pure greedy decode with no logprobs can be sampled in the executor.
         sample_greedy: bool,
+        /// Optional `[batch] U32` device tensor of input ids. When
+        /// present, overrides `tokens` for the actual `input_ids` fed
+        /// to the model; `tokens` is still required (must be the same
+        /// length) so callers that don't care about the device path
+        /// keep working and we have a host-side fallback for shapes
+        /// without a Tensor handle.
+        ///
+        /// Producers populate this from the previous step's
+        /// `ModelOutput.sampled_tokens_device` to skip the per-step
+        /// `to_vec1` host sync. See #28 / Phase 3 series.
+        tokens_device: Option<Tensor>,
     },
     /// One-shot forward for classify/embed (no decode loop).
     /// Groups of token sequences — each group is one input item which may
@@ -289,6 +300,7 @@ mod tests {
                 block_tables: vec![vec![0, 1], vec![0, 2], vec![0, 3]],
                 deltanet_slots: None,
                 sample_greedy: false,
+                tokens_device: None,
             },
         )
         .unwrap();
@@ -319,6 +331,7 @@ mod tests {
                 block_tables: vec![vec![0], vec![1]],
                 deltanet_slots: Some(vec![0, 1]),
                 sample_greedy: false,
+                tokens_device: None,
             },
         )
         .unwrap();

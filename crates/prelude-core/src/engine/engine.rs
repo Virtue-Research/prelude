@@ -160,6 +160,7 @@ impl Engine {
                 block_tables,
                 deltanet_slots,
                 sample_greedy: _,
+                tokens_device: _,
             } => self.forward_decode(tokens, positions, block_tables, deltanet_slots),
         }
     }

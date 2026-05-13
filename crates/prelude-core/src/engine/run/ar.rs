@@ -774,6 +774,9 @@ fn build_step_batch(
             block_tables,
             deltanet_slots,
             sample_greedy,
+            // tokens_device is wired in PR-4 (pipeline-depth-1 decode
+            // loop); for now we always source input ids from host.
+            tokens_device: None,
         };
     }
 
