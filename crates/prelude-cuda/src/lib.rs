@@ -31,6 +31,7 @@ pub const PTX_GATHER_LOG_SOFTMAX: &str =
     include_str!(concat!(env!("OUT_DIR"), "/gather_log_softmax.ptx"));
 pub const PTX_FAST_ARGMAX_VOCAB: &str =
     include_str!(concat!(env!("OUT_DIR"), "/fast_argmax_vocab.ptx"));
+pub const PTX_CHECK_EOS: &str = include_str!(concat!(env!("OUT_DIR"), "/check_eos.ptx"));
 
 // ── Module names for cudarc caching ─────────────────────────────────
 
@@ -50,6 +51,7 @@ pub const MOD_GDN_POST_CONV: &str = "gdn_post_conv";
 pub const MOD_GDN_PREFILL_RECURRENT: &str = "gdn_prefill_recurrent";
 pub const MOD_GATHER_LOG_SOFTMAX: &str = "logprobs_gather_log_softmax";
 pub const MOD_FAST_ARGMAX_VOCAB: &str = "sample_fast_argmax_vocab";
+pub const MOD_CHECK_EOS: &str = "sample_check_eos";
 
 /// Probe whether CUDA is usable on this machine.
 /// Creates a context for device 0; the context is cached for later use.
