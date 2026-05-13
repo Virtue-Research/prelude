@@ -99,6 +99,13 @@ impl LinearBackend for DenseLinear {
 
 // ── LinearBackend trait ───────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy)]
+pub struct ScaledFp8LinearParts<'a> {
+    pub weight: &'a Tensor,
+    pub input_scale: f32,
+    pub weight_scale: f32,
+}
+
 /// Backend trait for `Linear`. Exists only because Linear has multiple real
 /// runtime implementations (dense fp, Q4_0, Q4_K, GPU quant, oneDNN), one per
 /// weight format. Attention and MLP don't have an analogous trait because
@@ -125,6 +132,12 @@ pub trait LinearBackend: Module + Send + Sync + std::fmt::Debug {
     /// Whether this backend uses quantized weights.
     fn is_quantized(&self) -> bool {
         false
+    }
+
+    /// Expose scaled-FP8 linear metadata to higher-level fused kernels.
+    /// Backends that do not preserve FP8 weights return `None`.
+    fn scaled_fp8(&self) -> Option<ScaledFp8LinearParts<'_>> {
+        None
     }
 
     /// Clone into a boxed trait object.
@@ -178,6 +191,35 @@ fn find_quant_format(
         .map(|entry| entry.format)
 }
 
+// ── Scaled FP8 linear factory registry ───────────────────────────────────
+
+/// Factory for safetensors FP8 linear weights with explicit activation and
+/// weight scales. Device crates register optimized implementations here while
+/// core keeps the loading contract model-agnostic.
+pub trait ScaledFp8LinearFactory: Send + Sync {
+    fn name(&self) -> &str;
+    fn can_create(&self, weight: &Tensor, input_scale: &Tensor, weight_scale: &Tensor) -> bool;
+    fn create(
+        &self,
+        weight: Tensor,
+        input_scale: Tensor,
+        weight_scale: Tensor,
+        bias: Option<Tensor>,
+    ) -> Result<Box<dyn LinearBackend>>;
+}
+
+pub struct ScaledFp8LinearFactoryEntry {
+    pub factory: &'static dyn ScaledFp8LinearFactory,
+}
+
+impl ScaledFp8LinearFactoryEntry {
+    pub const fn new(factory: &'static dyn ScaledFp8LinearFactory) -> Self {
+        Self { factory }
+    }
+}
+
+inventory::collect!(ScaledFp8LinearFactoryEntry);
+
 // ── CPU Linear factory registry ─────────────────────────────────────────
 // Device crates (prelude-cpu) register optimized CPU linear backends via inventory.
 
@@ -213,6 +255,10 @@ pub struct Linear {
 impl Linear {
     /// Load from VarBuilder (reads "weight" and optionally "bias" tensors).
     pub fn load(vb: VarBuilder, in_dim: usize, out_dim: usize, bias: bool) -> Result<Self> {
+        if let Some(linear) = Self::try_load_scaled_fp8(&vb, in_dim, out_dim, bias)? {
+            return Ok(linear);
+        }
+
         let weight = vb.get((out_dim, in_dim), "weight")?;
         let bias = if bias {
             Some(vb.get(out_dim, "bias")?)
@@ -220,6 +266,50 @@ impl Linear {
             None
         };
         Self::from_dense(DenseLinear::new(weight, bias))
+    }
+
+    fn try_load_scaled_fp8(
+        vb: &VarBuilder,
+        in_dim: usize,
+        out_dim: usize,
+        bias: bool,
+    ) -> Result<Option<Self>> {
+        if !vb.contains_tensor("input_scale") || !vb.contains_tensor("weight_scale") {
+            return Ok(None);
+        }
+        if vb.tensor_dtype("weight")? != Some(DType::F8E4M3) {
+            return Ok(None);
+        }
+
+        let weight = vb.get_with_hints_dtype(
+            (out_dim, in_dim),
+            "weight",
+            Default::default(),
+            DType::F8E4M3,
+        )?;
+        let input_scale = vb.get_unchecked_dtype("input_scale", DType::F32)?;
+        let weight_scale = vb.get_unchecked_dtype("weight_scale", DType::F32)?;
+        let bias = if bias {
+            Some(vb.get(out_dim, "bias")?)
+        } else {
+            None
+        };
+
+        for entry in inventory::iter::<ScaledFp8LinearFactoryEntry> {
+            if entry
+                .factory
+                .can_create(&weight, &input_scale, &weight_scale)
+            {
+                return Ok(Some(Self {
+                    inner: entry
+                        .factory
+                        .create(weight, input_scale, weight_scale, bias)?,
+                }));
+            }
+        }
+
+        let weight = dequantize_scaled_fp8_weight(weight, &weight_scale, vb.dtype())?;
+        Ok(Some(Self::from_dense(DenseLinear::new(weight, bias))?))
     }
 
     /// Construct from a raw weight tensor (e.g., for tied embeddings / lm_head).
@@ -269,6 +359,14 @@ impl Linear {
         self.inner.is_quantized()
     }
 
+    pub fn weight_opt(&self) -> Option<&Tensor> {
+        self.inner.weight()
+    }
+
+    pub fn scaled_fp8(&self) -> Option<ScaledFp8LinearParts<'_>> {
+        self.inner.scaled_fp8()
+    }
+
     /// Access the underlying weight tensor.
     /// Panics on quantized variant — use `is_quantized()` to check first.
     pub fn weight(&self) -> &Tensor {
@@ -295,6 +393,32 @@ impl Linear {
     ) -> Result<Tensor> {
         self.inner.forward(x)
     }
+}
+
+fn dequantize_scaled_fp8_weight(
+    weight: Tensor,
+    weight_scale: &Tensor,
+    dtype: DType,
+) -> Result<Tensor> {
+    let out_dim = weight.dim(0)?;
+    let scale = if weight_scale.shape().elem_count() == 1 {
+        weight_scale.reshape(())?
+    } else {
+        let scale_dims = weight_scale.dims();
+        if scale_dims.len() == 1 && scale_dims[0] == out_dim {
+            weight_scale.reshape((out_dim, 1))?
+        } else if scale_dims.len() == 2 && scale_dims[0] == out_dim && scale_dims[1] == 1 {
+            weight_scale.clone()
+        } else {
+            crate::tensor::bail!(
+                "scaled FP8 weight_scale must be scalar or per-output-channel, got {:?}",
+                weight_scale.shape()
+            )
+        }
+    }
+    .to_dtype(dtype)?;
+
+    weight.to_dtype(dtype)?.broadcast_mul(&scale)
 }
 
 // Q4_0Linear, Q4KLinear, OnednnLinear backends live in prelude-cpu.

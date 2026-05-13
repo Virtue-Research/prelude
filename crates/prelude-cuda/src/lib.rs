@@ -10,6 +10,7 @@
 
 pub const PTX_ADD: &str = include_str!(concat!(env!("OUT_DIR"), "/add.ptx"));
 pub const PTX_SILU_MUL: &str = include_str!(concat!(env!("OUT_DIR"), "/silu_mul.ptx"));
+pub const PTX_FP8_QUANTIZE: &str = include_str!(concat!(env!("OUT_DIR"), "/fp8_quantize.ptx"));
 pub const PTX_RMSNORM: &str = include_str!(concat!(env!("OUT_DIR"), "/rmsnorm.ptx"));
 pub const PTX_RMSNORM_GATED: &str = include_str!(concat!(env!("OUT_DIR"), "/rmsnorm_gated.ptx"));
 pub const PTX_QKNORM_ROPE: &str = include_str!(concat!(env!("OUT_DIR"), "/qknorm_rope.ptx"));
@@ -33,6 +34,7 @@ pub const PTX_GATHER_LOG_SOFTMAX: &str =
 
 pub const MOD_ADD: &str = "elementwise_add";
 pub const MOD_SILU_MUL: &str = "elementwise_silu_mul";
+pub const MOD_FP8_QUANTIZE: &str = "fp8_quantize";
 pub const MOD_RMSNORM: &str = "normalization_rmsnorm";
 pub const MOD_QKNORM_ROPE: &str = "rope_qknorm";
 pub const MOD_MOE_ROUTING: &str = "moe_routing";
@@ -88,10 +90,12 @@ pub(crate) mod attn;
 mod cuda_graph;
 mod cuda_ops;
 pub mod executor;
+mod fp8_gemm;
 pub(crate) mod moe_ffi;
 pub(crate) mod ops;
 #[cfg(feature = "quant-gemm")]
 mod quant_backends;
+mod scaled_fp8;
 
 pub use attn::flashinfer::fi_fused_add_rmsnorm;
 pub use cuda_ops::cuda_ops;

@@ -586,6 +586,78 @@ impl Ops for CudaOps {
         ))
     }
 
+    fn grouped_scaled_fp8_gemm(
+        &self,
+        input: &Tensor,
+        weights: &Tensor,
+        input_scales: &Tensor,
+        weight_scales: &Tensor,
+        sorted_token_ids: &Tensor,
+        sorted_expert_ids: &Tensor,
+        topk: usize,
+    ) -> Option<Result<Tensor>> {
+        if input.dtype() != DType::BF16
+            || weights.dtype() != DType::F8E4M3
+            || input_scales.dtype() != DType::F32
+            || weight_scales.dtype() != DType::F32
+            || sorted_token_ids.dtype() != DType::U32
+            || sorted_expert_ids.dtype() != DType::U32
+        {
+            return None;
+        }
+        Some(crate::ops::moe::grouped_scaled_fp8_gemm(
+            input,
+            weights,
+            input_scales,
+            weight_scales,
+            sorted_token_ids,
+            sorted_expert_ids,
+            topk,
+        ))
+    }
+
+    fn grouped_scaled_fp8_gate_up_down(
+        &self,
+        input: &Tensor,
+        topk_weights: &Tensor,
+        gate_up_weights: &Tensor,
+        gate_up_input_scales: &Tensor,
+        gate_up_weight_scales: &Tensor,
+        down_weights: &Tensor,
+        down_input_scales: &Tensor,
+        down_weight_scales: &Tensor,
+        sorted_token_ids: &Tensor,
+        sorted_expert_ids: &Tensor,
+        topk: usize,
+    ) -> Option<Result<Tensor>> {
+        if input.dtype() != DType::BF16
+            || topk_weights.dtype() != DType::F32
+            || gate_up_weights.dtype() != DType::F8E4M3
+            || gate_up_input_scales.dtype() != DType::F32
+            || gate_up_weight_scales.dtype() != DType::F32
+            || down_weights.dtype() != DType::F8E4M3
+            || down_input_scales.dtype() != DType::F32
+            || down_weight_scales.dtype() != DType::F32
+            || sorted_token_ids.dtype() != DType::U32
+            || sorted_expert_ids.dtype() != DType::U32
+        {
+            return None;
+        }
+        Some(crate::ops::moe::grouped_scaled_fp8_gate_up_down(
+            input,
+            topk_weights,
+            gate_up_weights,
+            gate_up_input_scales,
+            gate_up_weight_scales,
+            down_weights,
+            down_input_scales,
+            down_weight_scales,
+            sorted_token_ids,
+            sorted_expert_ids,
+            topk,
+        ))
+    }
+
     fn kda_decode_batched(
         &self,
         q: &Tensor,

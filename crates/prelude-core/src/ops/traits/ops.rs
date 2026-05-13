@@ -464,6 +464,26 @@ pub trait Ops: Send + Sync {
         None
     }
 
+    /// Grouped scaled-FP8 MoE GEMM.
+    ///
+    /// `weights` is `[num_experts, N, K]` FP8, `input_scales` is
+    /// `[num_experts]`, and `weight_scales` is
+    /// `[num_experts, K/128, N/128]` in FlashInfer MN-major groupwise layout.
+    /// The output is assignment-flat `[num_tokens * topk, N]`, indexed by
+    /// the original flat top-k assignment id.
+    fn grouped_scaled_fp8_gemm(
+        &self,
+        _input: &Tensor,
+        _weights: &Tensor,
+        _input_scales: &Tensor,
+        _weight_scales: &Tensor,
+        _sorted_token_ids: &Tensor,
+        _sorted_expert_ids: &Tensor,
+        _topk: usize,
+    ) -> Option<Result<Tensor>> {
+        None
+    }
+
     /// GPU-accelerated sort of expert assignments by expert ID.
     /// Returns (sorted_expert_ids, sorted_token_ids) both as flat [n] U32 tensors.
     /// Default: returns None (caller falls back to CPU sort).
@@ -499,6 +519,27 @@ pub trait Ops: Send + Sync {
         _topk_weights: &Tensor,
         _w1: &Tensor,
         _w2: &Tensor,
+    ) -> Option<Result<Tensor>> {
+        None
+    }
+
+    /// Composed FP8 MoE fast path that keeps the gate/up and down GEMMs in
+    /// expert-grouped order, avoiding the intermediate scatter/gather between
+    /// the two expert matmuls.
+    #[allow(clippy::too_many_arguments)]
+    fn grouped_scaled_fp8_gate_up_down(
+        &self,
+        _input: &Tensor,
+        _topk_weights: &Tensor,
+        _gate_up_weights: &Tensor,
+        _gate_up_input_scales: &Tensor,
+        _gate_up_weight_scales: &Tensor,
+        _down_weights: &Tensor,
+        _down_input_scales: &Tensor,
+        _down_weight_scales: &Tensor,
+        _sorted_token_ids: &Tensor,
+        _sorted_expert_ids: &Tensor,
+        _topk: usize,
     ) -> Option<Result<Tensor>> {
         None
     }

@@ -5,7 +5,9 @@
 
 mod common;
 
+use prelude_core::loading::var_builder::VarBuilder;
 use prelude_core::tensor::{DType, Device, Module, Result, Tensor};
+use std::collections::HashMap;
 
 // == Linear ==
 
@@ -112,6 +114,36 @@ write_output(y)
             &format!("linear {:?}", cfg.dtype),
         );
     }
+    Ok(())
+}
+
+#[test]
+fn linear_load_dequantizes_scaled_fp8_without_backend() -> Result<()> {
+    let device = Device::Cpu;
+    let weight_q =
+        Tensor::from_vec(vec![1.0f32, 2.0, -1.0, 0.5], (2, 2), &device)?.to_dtype(DType::F8E4M3)?;
+    let input_scale = Tensor::from_vec(vec![0.25f32], 1, &device)?;
+    let weight_scale = Tensor::from_vec(vec![0.5f32], 1, &device)?;
+
+    let mut tensors = HashMap::new();
+    tensors.insert("weight".to_string(), weight_q);
+    tensors.insert("input_scale".to_string(), input_scale);
+    tensors.insert("weight_scale".to_string(), weight_scale);
+
+    let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+    assert_eq!(vb.tensor_dtype("weight")?, Some(DType::F8E4M3));
+
+    let linear = prelude_core::models::commons::linear::Linear::load(vb, 2, 2, false)?;
+    let x = Tensor::from_vec(vec![2.0f32, 4.0], (1, 2), &device)?;
+    let y = linear
+        .forward(
+            &x,
+            &prelude_core::models::commons::BatchState::no_lora(),
+            prelude_core::ops::select_ops(&device),
+        )?
+        .to_vec2::<f32>()?;
+
+    common::assert_close(&y[0], &[5.0, 0.0], 1e-5, "scaled_fp8_dense_fallback");
     Ok(())
 }
 

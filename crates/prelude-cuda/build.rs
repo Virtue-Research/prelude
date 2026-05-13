@@ -39,6 +39,7 @@ fn main() {
         // Our own optimized kernels
         ("elementwise", "add.cu", "add"),
         ("elementwise", "silu_mul.cu", "silu_mul"),
+        ("fp8", "quantize.cu", "fp8_quantize"),
         ("normalization", "rmsnorm.cu", "rmsnorm"),
         ("normalization", "rmsnorm_gated.cu", "rmsnorm_gated"),
         ("rope", "qknorm_rope.cu", "qknorm_rope"),
