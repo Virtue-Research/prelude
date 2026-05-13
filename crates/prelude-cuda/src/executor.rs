@@ -320,23 +320,21 @@ fn free_warmup_deltanet_slots(engine: &Engine, slots: &[Option<u32>]) {
     }
 }
 
-/// Greedy argmax over the LM head, returning both:
+/// Greedy argmax over the LM head, returning **both** the `[B] u32`
+/// device tensor *and* the host `Vec<u32>` of sampled token ids.
 ///
-/// * the `[B] u32` **device** tensor of sampled token ids (no host
-///   sync) — for Phase 3 callers that feed it back to the next forward
-///   pass as `input_ids`.
-/// * the **host** `Vec<u32>` of the same ids (forces a per-step
-///   `to_vec1` sync) — for the existing AR loop that needs them for
-///   EOS / stop-string / streaming text logic.
-///
-/// Both `None` if the underlying argmax fails. Currently every call
-/// site asks for both, since the AR loop still does host-side EOS
-/// checking; PR-3 / PR-4 in this stack will drop the host pull on the
-/// pipelined fast path.
+/// The host sync (`to_vec1::<u32>()` on the device tensor) must happen
+/// on the same thread as the kernel launches — candle's CudaDevice
+/// uses per-thread streams under the hood, so reading from the AR loop
+/// thread would skip the worker thread's stream sync and return
+/// garbage. Splitting the sync across threads was an intermediate
+/// design in this PR series; it didn't survive the correctness
+/// smoke test (got `! perceived perceived …` repetitive garbage). The
+/// pipeline-depth-1 win can be reclaimed later by either (a) doing
+/// the sync via an explicit `cudaEventSynchronize` on a shared
+/// event handle, or (b) running the to_vec1 on the worker thread but
+/// signalling a "ready for next submit" point earlier.
 fn greedy_argmax_tokens(logits: &Tensor) -> (Option<Tensor>, Option<Vec<u32>>) {
-    // Hot path: 2-D logits → our multi-block argmax that uses every SM.
-    // Anything else (rare; only hit by experimental code paths) falls
-    // back to candle's stock single-block argmax.
     let tokens = if logits.dims().len() == 2 {
         match crate::ops::fast_argmax::fast_argmax_vocab(logits) {
             Ok(t) => Some(t),
@@ -351,3 +349,4 @@ fn greedy_argmax_tokens(logits: &Tensor) -> (Option<Tensor>, Option<Vec<u32>>) {
     let host = tokens.as_ref().and_then(|t| t.to_vec1::<u32>().ok());
     (tokens, host)
 }
+

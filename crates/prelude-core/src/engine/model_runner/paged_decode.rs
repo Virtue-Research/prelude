@@ -6,6 +6,24 @@ impl Engine {
     /// Batched decode step: N sequences, each with Q=1 (one new token),
     /// different context lengths. Returns logits (N, vocab_size).
     pub fn batch_decode_paged(&self, seqs: &[BatchDecodeSeq]) -> Result<Tensor, EngineError> {
+        self.batch_decode_paged_with_device_tokens(seqs, None)
+    }
+
+    /// Same as [`Self::batch_decode_paged`] but optionally accepts a
+    /// pre-resident `[N] U32` device tensor of input ids. When `Some`,
+    /// the host `seqs[i].token` values are ignored and the device
+    /// tensor is used directly — saving the per-step `Tensor::from_vec`
+    /// H→D copy. The caller must guarantee the tensor's shape, dtype,
+    /// and row order match `seqs`.
+    ///
+    /// Used by the Phase 3 pipelined AR loop: the previous step's
+    /// `sampled_tokens_device` is threaded straight through as this
+    /// step's `input_ids` with no host round-trip.
+    pub fn batch_decode_paged_with_device_tokens(
+        &self,
+        seqs: &[BatchDecodeSeq],
+        tokens_device: Option<Tensor>,
+    ) -> Result<Tensor, EngineError> {
         // Set thread-local ops for operator overload dispatch.
         let _ops_guard = crate::ops::OpsGuard::new(self.executor.ops);
         let pool = self.cache.paged_pool.as_ref().ok_or_else(|| {
@@ -17,10 +35,27 @@ impl Engine {
             return Err(EngineError::Internal("empty decode batch".into()));
         }
 
-        // packed input: one token per sequence
-        let flat_tokens: Vec<u32> = seqs.iter().map(|s| s.token).collect();
-        let packed_input = Tensor::from_vec(flat_tokens, (batch_size,), &self.executor.device)
-            .map_err(tensor_err)?;
+        // packed input: either reuse the caller-provided device tensor
+        // (pipelined fast path) or copy `seqs[i].token` to device.
+        let packed_input = match tokens_device {
+            Some(t) => {
+                // Validate shape matches — a mismatch here would silently
+                // feed wrong ids into the embedding lookup.
+                let dims = t.dims();
+                if dims.len() != 1 || dims[0] != batch_size {
+                    return Err(EngineError::Internal(format!(
+                        "batch_decode_paged: tokens_device shape {:?} != [{batch_size}]",
+                        dims
+                    )));
+                }
+                t
+            }
+            None => {
+                let flat_tokens: Vec<u32> = seqs.iter().map(|s| s.token).collect();
+                Tensor::from_vec(flat_tokens, (batch_size,), &self.executor.device)
+                    .map_err(tensor_err)?
+            }
+        };
 
         // cu_seqlens_q: [0, 1, 2, ..., N] — each seq has Q=1
         let cu_seqlens_q: Vec<u32> = (0..=batch_size as u32).collect();
