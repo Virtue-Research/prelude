@@ -346,9 +346,26 @@ static void ensure_gpu_arch() {
 
 // ── Common launch helper ────────────────────────────────────────────
 
+// kNumSMs is a template parameter on every DeepGEMM kernel instantiation.
+// The persistent-CTA scheduler advances `next_block_idx = ++current_iter *
+// kNumSMs + blockIdx.x` so the launch grid MUST equal kNumSMs — anything
+// smaller silently drops the tiles at indices [grid_dim, kNumSMs) and every
+// kNumSMs-stride thereafter.
+//
+// Set PRELUDE_DEEPGEMM_NUM_SMS at build time to match deployment hardware
+// for optimal throughput (default 132 = H100 SXM / H200; H100 PCIe = 114,
+// H20 = 78). Mismatch is correctness-safe: a larger-than-device grid
+// oversubscribes and the GPU serializes the extras when smem doesn't fit,
+// but throughput suffers — e.g. on a 114-SM device the difference between
+// 132 and 114 means one wave's worth of work splits into two.
+#ifndef PRELUDE_KERNEL_NUM_SMS
+#define PRELUDE_KERNEL_NUM_SMS 132
+#endif
+static constexpr int kKernelNumSMs = PRELUDE_KERNEL_NUM_SMS;
+
 static int launch_kernel(const void* kernel_ptr, int num_threads, int smem_size,
                          int num_multicast, void** args, cudaStream_t stream) {
-    dim3 grid(g_num_sms, 1, 1);
+    dim3 grid(kKernelNumSMs, 1, 1);
     dim3 block(num_threads, 1, 1);
     cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 

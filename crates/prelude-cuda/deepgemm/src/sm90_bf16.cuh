@@ -164,7 +164,7 @@ static KernelConfig select_grouped_config(int m, int n, int k, int num_sms) {
         BLOCK_M, BLOCK_N, 64,                                              \
         128, 128, SWIZZLE_D,                                               \
         STAGES, 128, NUM_MATH,                                             \
-        NUM_MC, MC_ON_A, 132,                                              \
+        NUM_MC, MC_ON_A, PRELUDE_KERNEL_NUM_SMS,                           \
         GemmType::Normal, false, cutlass::bfloat16_t>
 
 __attribute__((used)) static auto* _k00 = &KERNEL_TYPE(16, 16, 32, 128, 32, 1, false);
@@ -285,7 +285,7 @@ __attribute__((used)) static auto* _kA4 = &KERNEL_TYPE(64, 208, 5, 128, 32, 1, f
         128, BLOCK_N, 64,                                                   \
         128, 128, SWIZZLE_D,                                               \
         STAGES, 128, 256,                                                   \
-        NUM_MC, MC_ON_A, 132,                                              \
+        NUM_MC, MC_ON_A, PRELUDE_KERNEL_NUM_SMS,                           \
         GemmType::MGroupedContiguous, false, cutlass::bfloat16_t>
 
 __attribute__((used)) static auto* _grp_00 = &KERNEL_TYPE_GROUPED(16, 12, 32, 1, false);
@@ -590,7 +590,7 @@ static KernelConfig select_acc_config(int m, int n, int k, int num_sms) {
         BLOCK_M, BLOCK_N, 64,                                              \
         128, 128, SWIZZLE_D,                                               \
         STAGES, 128, NUM_MATH,                                             \
-        NUM_MC, MC_ON_A, 132,                                              \
+        NUM_MC, MC_ON_A, PRELUDE_KERNEL_NUM_SMS,                           \
         GemmType::Normal, true, float>
 
 // FP32 output: block_m <= 128 (upstream constraint). sw_d=0 (no swizzle for FP32 on SM90).
@@ -638,7 +638,7 @@ static const void* get_acc_kernel(const KernelConfig& cfg) {
 
 static int sm90_bf16_gemm(void* A, void* B, void* D, int M, int N, int K, void* stream) {
     cudaGetLastError();
-    auto cfg = select_config(M, N, K, g_num_sms);
+    auto cfg = select_config(M, N, K, kKernelNumSMs);
     auto kernel_ptr = get_kernel(cfg);
     if (!kernel_ptr) return -1;
 
@@ -670,7 +670,7 @@ static int sm90_bf16_gemm_acc(void* A, void* B, void* C, void* D,
         cudaMemcpyAsync(D, C, (size_t)M * N * 4, cudaMemcpyDeviceToDevice, s);
     }
 
-    auto cfg = select_acc_config(M, N, K, g_num_sms);
+    auto cfg = select_acc_config(M, N, K, kKernelNumSMs);
     auto kernel_ptr = get_acc_kernel(cfg);
     if (!kernel_ptr) return -1;
 
@@ -693,7 +693,7 @@ static int sm90_m_grouped_bf16_gemm(
     int M, int N, int K, int num_groups, void* stream
 ) {
     cudaGetLastError();
-    auto cfg = select_grouped_config(M, N, K, g_num_sms);
+    auto cfg = select_grouped_config(M, N, K, kKernelNumSMs);
     auto kernel_ptr = get_grouped_kernel(cfg);
     if (!kernel_ptr) return -1;
 
@@ -807,7 +807,7 @@ static KernelConfig select_masked_config(int expected_m, int n, int k, int num_g
         BLOCK_M, BLOCK_N, 64,                                              \
         128, 128, SWIZZLE_D,                                               \
         STAGES, 128, NUM_MATH,                                             \
-        NUM_MC, MC_ON_A, 132,                                              \
+        NUM_MC, MC_ON_A, PRELUDE_KERNEL_NUM_SMS,                           \
         GemmType::MGroupedMasked, false, cutlass::bfloat16_t>
 
 // Core configs for each num_groups. No multicast (multicast rarely triggers for masked).
@@ -906,7 +906,7 @@ static int sm90_m_grouped_masked_bf16_gemm(
     int M, int N, int K, int num_groups, int expected_m, void* stream
 ) {
     cudaGetLastError();
-    auto cfg = select_masked_config(expected_m, N, K, num_groups, g_num_sms);
+    auto cfg = select_masked_config(expected_m, N, K, num_groups, kKernelNumSMs);
     auto kernel_ptr = get_masked_kernel(cfg, num_groups);
     if (!kernel_ptr) return -1;
 

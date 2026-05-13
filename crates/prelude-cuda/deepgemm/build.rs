@@ -43,8 +43,21 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=PRELUDE_CUDA_ARCHS");
     println!("cargo:rerun-if-env-changed=CUDA_ARCH_LIST");
+    println!("cargo:rerun-if-env-changed=PRELUDE_DEEPGEMM_NUM_SMS");
     track_submodule("DeepGEMM");
     track_submodule("cutlass");
+
+    // kNumSMs is a template parameter on the DeepGEMM kernel; the persistent-CTA
+    // scheduler advances by it per iteration so the launch grid must equal it.
+    // We instantiate one value per build — default 132 (H100 SXM / H200), set
+    // PRELUDE_DEEPGEMM_NUM_SMS to match other targets (e.g. 114 for H100 PCIe,
+    // 78 for H20). Mismatches don't cause wrong output (oversubscribe/serialize)
+    // but do hurt throughput. See common.cuh:kKernelNumSMs.
+    let kernel_num_sms: u32 = std::env::var("PRELUDE_DEEPGEMM_NUM_SMS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(132);
+    build_log!("kNumSMs (template) = {kernel_num_sms}");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -87,7 +100,8 @@ fn main() {
         .include(cutlass_dir.join("include"))
         .include(deepgemm_include)
         .include(cuda_path.join("include"))
-        .include(manifest_dir.join("src"));
+        .include(manifest_dir.join("src"))
+        .define(format!("-DPRELUDE_KERNEL_NUM_SMS={kernel_num_sms}"));
     for arch in &archs {
         opts = opts.gencode(cutlass_gencode(*arch));
     }
