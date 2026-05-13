@@ -314,8 +314,19 @@ fn free_warmup_deltanet_slots(engine: &Engine, slots: &[Option<u32>]) {
 }
 
 fn greedy_argmax_tokens(logits: &Tensor) -> Option<Vec<u32>> {
-    logits
-        .argmax(D::Minus1)
-        .and_then(|tokens| tokens.to_vec1::<u32>())
-        .ok()
+    // Hot path: 2-D logits → our multi-block argmax that uses every SM.
+    // Anything else (rare; only hit by experimental code paths) falls
+    // back to candle's stock single-block argmax.
+    let tokens = if logits.dims().len() == 2 {
+        match crate::ops::fast_argmax::fast_argmax_vocab(logits) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!("fast_argmax_vocab → candle argmax fallback: {e}");
+                logits.argmax(D::Minus1).ok()?
+            }
+        }
+    } else {
+        logits.argmax(D::Minus1).ok()?
+    };
+    tokens.to_vec1::<u32>().ok()
 }

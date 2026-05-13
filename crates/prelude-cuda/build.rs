@@ -52,6 +52,7 @@ fn main() {
         ("gdn", "post_conv.cu", "gdn_post_conv"),
         ("gdn", "prefill_recurrent.cu", "gdn_prefill_recurrent"),
         ("logprobs", "gather_log_softmax.cu", "gather_log_softmax"),
+        ("sample", "fast_argmax_vocab.cu", "fast_argmax_vocab"),
     ];
 
     // Track common headers for rerun-if-changed

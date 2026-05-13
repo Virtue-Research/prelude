@@ -4,6 +4,7 @@
 //! CudaOps calls these; they are not public API.
 
 pub(crate) mod elementwise;
+pub(crate) mod fast_argmax;
 pub(crate) mod gather_log_softmax;
 pub(crate) mod gdn_post_conv;
 pub(crate) mod gemm;

@@ -107,7 +107,25 @@ fn main() {
         compile_cu_to_obj(&nvcc, &grouped_opts);
         Some(grouped_obj)
     } else {
-        None
+        // No Blackwell target (Hopper-only build, e.g. with
+        // PRELUDE_FORCE_SM90_ONLY=1): emit a stub TU that resolves the
+        // `moe_grouped_gemm_sm100` symbol the Rust FFI declares so the
+        // link still goes through. The Rust dispatch returns -100 on
+        // this code path, mapping to a clear "built without SM100
+        // support" error.
+        let stub_src = out_dir.join("grouped_moe_sm100_stub.cu");
+        std::fs::write(
+            &stub_src,
+            "extern \"C\" int moe_grouped_gemm_sm100(\n    const void*, const void*, const unsigned int*, const int*,\n    void*, int, int, int, int, int, int, const void*) {\n    return -100;\n}\n",
+        )
+        .expect("write moe_grouped_gemm_sm100 stub");
+        let stub_obj = out_dir.join("grouped_moe_sm100_stub.o");
+        let stub_opts = ObjCompile::new(&stub_src, &stub_obj)
+            .include(cuda_path.join("include"))
+            .cpp_std("-std=c++17")
+            .gencode(cutlass_gencode(archs[0]));
+        compile_cu_to_obj(&nvcc, &stub_opts);
+        Some(stub_obj)
     };
 
     // ── Archive objects into libcutlass_gemm.a ─────────────────────
