@@ -3,6 +3,7 @@
 //! Each module wraps CUDA kernels and exposes Rust functions.
 //! CudaOps calls these; they are not public API.
 
+pub(crate) mod check_eos;
 pub(crate) mod elementwise;
 pub(crate) mod fast_argmax;
 pub(crate) mod gather_log_softmax;
