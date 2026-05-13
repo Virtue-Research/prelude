@@ -1266,12 +1266,7 @@ pub fn grouped_scaled_fp8_gate_up_down(
         PTX_FP8_QUANTIZE,
     )?;
     let gather_quantize = dev.get_or_load_custom_func(
-        "moe_fp8_gather_quantize_bf16_padded",
-        MOD_FP8_QUANTIZE,
-        PTX_FP8_QUANTIZE,
-    )?;
-    let build_assignment_rows = dev.get_or_load_custom_func(
-        "moe_fp8_build_assignment_rows",
+        "moe_fp8_gather_quantize_bf16_padded_with_rows",
         MOD_FP8_QUANTIZE,
         PTX_FP8_QUANTIZE,
     )?;
@@ -1338,26 +1333,11 @@ pub fn grouped_scaled_fp8_gate_up_down(
         builder.arg(&padded_offsets);
         builder.arg(&guis_s);
         builder.arg(&qinput);
+        builder.arg(&assignment_rows);
         builder.arg(&n_real_i);
         builder.arg(&hidden_i);
         builder.arg(&token_divisor_i);
         unsafe { builder.launch(cfg_gather) }.w()?;
-    }
-
-    let cfg_assignment_rows = LaunchConfig {
-        grid_dim: ((n_real as u32).div_ceil(256), 1, 1),
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    {
-        let mut builder = build_assignment_rows.builder();
-        builder.arg(&sti_s);
-        builder.arg(&sei_s);
-        builder.arg(&real_offsets);
-        builder.arg(&padded_offsets);
-        builder.arg(&assignment_rows);
-        builder.arg(&n_real_i);
-        unsafe { builder.launch(cfg_assignment_rows) }.w()?;
     }
 
     crate::fp8_gemm::group_fp8_gemm_nt_groupwise_raw(

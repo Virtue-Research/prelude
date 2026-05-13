@@ -182,19 +182,37 @@ extern "C" __global__ void moe_fp8_gather_quantize_bf16_padded(
     }
 }
 
-extern "C" __global__ void moe_fp8_build_assignment_rows(
+extern "C" __global__ void moe_fp8_gather_quantize_bf16_padded_with_rows(
+    const __nv_bfloat16* __restrict__ input,
     const uint32_t* __restrict__ sorted_token_ids,
     const uint32_t* __restrict__ sorted_expert_ids,
     const int32_t* __restrict__ real_offsets,
     const int32_t* __restrict__ padded_offsets,
+    const float* __restrict__ input_scales,
+    __nv_fp8_e4m3* __restrict__ gathered,
     int32_t* __restrict__ assignment_rows,
-    int n_real) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int n_real,
+    int k,
+    int token_divisor) {
+    int i = blockIdx.x;
     if (i >= n_real) return;
     int e = (int)sorted_expert_ids[i];
     int intra = i - real_offsets[e];
-    int padded_row = padded_offsets[e] + intra;
-    assignment_rows[sorted_token_ids[i]] = padded_row;
+    int row = padded_offsets[e] + intra;
+    int flat_token = (int)sorted_token_ids[i];
+    int input_row = flat_token / token_divisor;
+    float inv_scale = 1.0f / input_scales[e];
+
+    if (threadIdx.x == 0) {
+        assignment_rows[flat_token] = row;
+    }
+
+    const __nv_bfloat16* src = input + (size_t)input_row * k;
+    __nv_fp8_e4m3* dst = gathered + (size_t)row * k;
+    for (int col = threadIdx.x; col < k; col += blockDim.x) {
+        float v = __bfloat162float(src[col]) * inv_scale;
+        dst[col] = __nv_fp8_e4m3(clamp_fp8_e4m3(v));
+    }
 }
 
 extern "C" __global__ void moe_fp8_silu_mul_quantize_bf16_padded(
