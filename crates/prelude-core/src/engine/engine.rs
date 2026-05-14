@@ -160,6 +160,7 @@ impl Engine {
                 block_tables,
                 deltanet_slots,
                 sample_greedy: _,
+                tokens_device: _,
             } => self.forward_decode(tokens, positions, block_tables, deltanet_slots),
         }
     }
@@ -179,6 +180,7 @@ impl Engine {
                 item_seq_counts: vec![],
                 prefill_results: vec![],
                 sampled_tokens: None,
+                sampled_tokens_device: None,
             });
         }
 
@@ -205,6 +207,7 @@ impl Engine {
                 item_seq_counts: vec![],
                 prefill_results: vec![],
                 sampled_tokens: None,
+                sampled_tokens_device: None,
             });
         }
 
@@ -227,6 +230,7 @@ impl Engine {
             item_seq_counts: vec![],
             prefill_results: vec![],
             sampled_tokens: None,
+            sampled_tokens_device: None,
         })
     }
 
@@ -250,6 +254,7 @@ impl Engine {
                 item_seq_counts: vec![],
                 prefill_results: vec![],
                 sampled_tokens: None,
+                sampled_tokens_device: None,
             });
         }
 
@@ -266,6 +271,7 @@ impl Engine {
                 item_seq_counts: forward_result.item_seq_counts,
                 prefill_results: vec![],
                 sampled_tokens: None,
+                sampled_tokens_device: None,
             })
         }
     }
