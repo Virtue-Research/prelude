@@ -36,6 +36,18 @@ impl Engine {
         }
     }
 
+    /// Extract the sampled token's logprob, plus the top-`k` alternative
+    /// (token_id, decoded string, logprob) entries sorted descending.
+    ///
+    /// `k == 0` means the caller asked for `logprobs: true` without
+    /// `top_logprobs` — only the chosen token's logprob is needed.
+    /// In that case we skip the full-vocab sort and tokenize step,
+    /// which on a 152k-vocab Qwen3 model was the dominant hot path:
+    /// previously the function fell through to `sort_by` over every
+    /// vocab entry and then ran `tokenizer.decode` 152k times per
+    /// request (~33 ms each on real classifier traffic with k=0),
+    /// because the `if k > 0 && k < indexed.len()` guard only gated
+    /// `select_nth_unstable_by` — not the sort or the decode loop.
     pub(crate) fn extract_top_logprobs(
         logits: &Tensor,
         sampled_token: u32,
@@ -51,29 +63,6 @@ impl Engine {
         let sum_exp: f32 = logits_vec.iter().map(|&x| (x - max_logit).exp()).sum();
         let log_sum_exp = max_logit + sum_exp.ln();
 
-        let k = (k as usize).min(vocab_size);
-        let mut indexed: Vec<(u32, f32)> = logits_vec
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| (i as u32, v - log_sum_exp))
-            .collect();
-
-        if k > 0 && k < indexed.len() {
-            indexed.select_nth_unstable_by(k, |a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            indexed.truncate(k);
-        }
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        let top_logprobs: Vec<(u32, String, f32)> = indexed
-            .into_iter()
-            .map(|(id, lp)| {
-                let s = tokenizer.decode(&[id], false).unwrap_or_default();
-                (id, s, lp)
-            })
-            .collect();
-
         let sampled_logprob = logits_vec
             .get(sampled_token as usize)
             .map(|&v| v - log_sum_exp)
@@ -81,6 +70,37 @@ impl Engine {
         let sampled_token_str = tokenizer
             .decode(&[sampled_token], false)
             .unwrap_or_default();
+
+        // Top-k path runs only when the caller asked for alternatives.
+        // For k=0 the response's `top_logprobs` is an empty list and we
+        // can skip the O(N log N) sort + 152k tokenizer.decode loop
+        // entirely. Use `select_nth_unstable_by` then a k-sized sort —
+        // that's O(N + k log k), independent of vocab_size beyond the
+        // linear scan we already paid for log_sum_exp.
+        let top_logprobs: Vec<(u32, String, f32)> = if k == 0 {
+            Vec::new()
+        } else {
+            let k_capped = (k as usize).min(vocab_size);
+            let mut indexed: Vec<(u32, f32)> = logits_vec
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (i as u32, v - log_sum_exp))
+                .collect();
+            if k_capped < indexed.len() {
+                indexed.select_nth_unstable_by(k_capped, |a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                indexed.truncate(k_capped);
+            }
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            indexed
+                .into_iter()
+                .map(|(id, lp)| {
+                    let s = tokenizer.decode(&[id], false).unwrap_or_default();
+                    (id, s, lp)
+                })
+                .collect()
+        };
 
         Ok(TokenLogprobInfo {
             token: sampled_token_str,
