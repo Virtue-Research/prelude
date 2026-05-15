@@ -36,6 +36,57 @@ impl Engine {
         }
     }
 
+    /// Batched: compute log P(sampled_token) for each row of `logits`.
+    /// Returns one f32 per row, in input order.
+    ///
+    /// Uses `ops.gather_log_softmax` (fused PTX kernel that mirrors
+    /// vLLM's `_topk_log_softmax_kernel`) when available — two
+    /// full-vocab reads, one scalar write per row, **no `[N, vocab]`
+    /// log_softmax temporary is materialised**. Falls through to an
+    /// on-device `log_softmax` + `gather` path when the backend
+    /// declines (e.g. CPU). Either way the D→H copy is just `N` f32s
+    /// instead of the per-row full-vocab DtoH the legacy path did.
+    ///
+    /// This replaces the old per-request hot path that, on real
+    /// classifier traffic, ate ~33 ms per `is_final` row pulling
+    /// 152k f32s to host just to compute one normalizer.
+    pub(crate) fn batched_sampled_logprobs(
+        &self,
+        logits: &Tensor,
+        sampled_tokens: &[u32],
+    ) -> Result<Vec<f32>, EngineError> {
+        if sampled_tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = sampled_tokens.len();
+        let dev = logits.device();
+        let target_ids =
+            Tensor::from_vec(sampled_tokens.to_vec(), (n,), dev).map_err(tensor_err)?;
+
+        let result = match self.executor.ops.gather_log_softmax(logits, &target_ids) {
+            Some(res) => res.map_err(tensor_err)?,
+            None => {
+                // Fallback for backends without the fused op: cast to
+                // f32, log_softmax along the vocab dim, then gather.
+                // Still keeps D→H at O(N) — the temp [N, vocab] f32
+                // tensor lives on-device.
+                let logits_f32 = logits
+                    .to_dtype(crate::tensor::DType::F32)
+                    .map_err(tensor_err)?;
+                let log_probs =
+                    candle_nn::ops::log_softmax(&logits_f32, crate::tensor::D::Minus1)
+                        .map_err(tensor_err)?;
+                let idx = target_ids.reshape((n, 1)).map_err(tensor_err)?;
+                log_probs
+                    .gather(&idx, 1)
+                    .map_err(tensor_err)?
+                    .flatten_all()
+                    .map_err(tensor_err)?
+            }
+        };
+        result.to_vec1::<f32>().map_err(tensor_err)
+    }
+
     /// Extract the sampled token's logprob, plus the top-`k` alternative
     /// (token_id, decoded string, logprob) entries sorted descending.
     ///
