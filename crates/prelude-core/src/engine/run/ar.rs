@@ -1015,6 +1015,50 @@ fn process_step_output(
     let mut logit_row = 0usize; // tracks position in output.logits
     let prefill_argmax_tokens = batched_prefill_argmax_tokens(scheduler, states, step, output);
 
+    // Pre-compute the decode side's batched argmax once. The decode
+    // loop below uses it for sampling; we ALSO use it here to feed the
+    // batched logprob precompute below, avoiding two argmax kernels.
+    let num_prefill = step.prefill_request_ids.len();
+    let num_decode = step.decode_request_ids.len();
+    let decode_batched_tokens: Option<Vec<u32>> = if num_decode > 0 {
+        let all_greedy = step
+            .decode_request_ids
+            .iter()
+            .all(|id| states.get(id).map(|s| s.is_greedy()).unwrap_or(true));
+        let can_use_executor_tokens =
+            decode_requests_allow_executor_greedy(states, &step.decode_request_ids);
+        if all_greedy {
+            let exec = can_use_executor_tokens
+                .then(|| sampled_tokens_for_rows(output, num_prefill, num_decode))
+                .flatten();
+            exec.or_else(|| decode_argmax_tokens(output, num_prefill, num_decode))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Pre-compute log P(sampled_token) for rows whose request asked for
+    // `logprobs: true` with `top_logprobs: 0` (= `Some(0)` in our
+    // internal repr). One fused GPU `gather_log_softmax` over the
+    // selected rows replaces the per-row hot path that previously
+    // pulled the full [vocab] F32 tensor to host and re-computed
+    // log_sum_exp in Rust — measured ~33 ms/row on Qwen3-30B (vocab
+    // 151,936) BF16. See `Engine::batched_sampled_logprobs`.
+    //
+    // We only batch the k=0 case here because k > 0 also needs the
+    // top-k alternative tokens' strings (per-row tokenizer.decode),
+    // which doesn't fit the same batched shape.
+    let batched_logprobs: HashMap<usize, f32> = compute_batched_k0_logprobs(
+        engine,
+        states,
+        step,
+        output,
+        prefill_argmax_tokens.as_ref(),
+        decode_batched_tokens.as_ref(),
+    );
+
     // ── Prefill results ───────────────────────────────────────────
     let mut prefill_result_idx = 0usize;
     for (i, request_id) in step.prefill_request_ids.iter().enumerate() {
@@ -1102,9 +1146,10 @@ fn process_step_output(
             };
 
             if prefill_argmax_tokens.is_some() || row.is_some() {
-                let lp = row
-                    .as_ref()
-                    .and_then(|r| extract_token_logprobs(engine, r, token, state));
+                let precomputed = batched_logprobs.get(&logit_row).copied();
+                let lp = row.as_ref().and_then(|r| {
+                    extract_token_logprobs(engine, r, token, state, precomputed)
+                });
                 process_single_token(
                     engine,
                     scheduler,
@@ -1121,30 +1166,15 @@ fn process_step_output(
     }
 
     // ── Decode results (batched GPU sampling) ──────────────────────
-    let num_decode = step.decode_request_ids.len();
     if num_decode > 0 {
-        let decode_start_row = logit_row;
+        let _decode_start_row = logit_row; // = num_prefill (kept as sanity check below)
+        debug_assert_eq!(_decode_start_row, num_prefill);
 
-        // Check if all decode sequences are greedy
-        let all_greedy = step
-            .decode_request_ids
-            .iter()
-            .all(|id| states.get(id).map(|s| s.is_greedy()).unwrap_or(true));
-        let can_use_executor_tokens =
-            decode_requests_allow_executor_greedy(states, &step.decode_request_ids);
-
-        // Greedy decode only needs argmax. Avoid the FlashInfer sampler path
-        // here because it converts the full [batch, vocab] logits tensor to
-        // F32 before sampling; BF16 argmax gives the same token and saves a
-        // large per-step copy/conversion.
-        let batched_tokens: Option<Vec<u32>> = if all_greedy {
-            let executor_tokens = can_use_executor_tokens
-                .then(|| sampled_tokens_for_rows(output, decode_start_row, num_decode))
-                .flatten();
-            executor_tokens.or_else(|| decode_argmax_tokens(output, decode_start_row, num_decode))
-        } else {
-            None
-        };
+        // Greedy decode only needs argmax. We computed this up-front
+        // already (see `decode_batched_tokens` above) so the batched
+        // logprob precompute can use it; reuse it here instead of
+        // recomputing the argmax kernel.
+        let batched_tokens = decode_batched_tokens.clone();
 
         for (i, request_id) in step.decode_request_ids.iter().enumerate() {
             let Some(state) = states.get_mut(request_id) else {
@@ -1175,9 +1205,10 @@ fn process_step_output(
             // Per-token top-k logprobs when requested. Without this the
             // /v1/completions response leaves `logprobs.tokens = [first_only]`
             // and downstream tools count tokens via `len(logprobs.tokens)`.
+            let precomputed = batched_logprobs.get(&logit_row).copied();
             let lp = row
                 .as_ref()
-                .and_then(|r| extract_token_logprobs(engine, r, token, state));
+                .and_then(|r| extract_token_logprobs(engine, r, token, state, precomputed));
 
             process_single_token(
                 engine,
@@ -1299,14 +1330,117 @@ fn sample_token(row: &crate::tensor::Tensor, state: &mut ArSequenceState) -> u32
         .unwrap_or_else(|_| argmax_fallback())
 }
 
+/// Collect (logit_row, sampled_token) pairs for rows whose request
+/// asked for `logprobs: true` with `top_logprobs: 0` (k=0) and whose
+/// sampled token is known upfront (greedy is_final prefill +
+/// greedy decode). One batched GPU `gather_log_softmax` over the
+/// selected rows produces all the sampled-token logprobs in one shot.
+///
+/// k > 0 rows aren't included here — they fall through to the per-row
+/// CPU path which still needs the full vocab on host for the top-k
+/// alternatives' tokenizer.decode loop. Non-greedy rows aren't
+/// included either because we don't know the sampled token until the
+/// per-row `sample_token` runs in the loops below.
+fn compute_batched_k0_logprobs(
+    engine: &Engine,
+    states: &HashMap<String, ArSequenceState>,
+    step: &SchedulerStep,
+    output: &ModelOutput,
+    prefill_argmax_tokens: Option<&Vec<u32>>,
+    decode_batched_tokens: Option<&Vec<u32>>,
+) -> HashMap<usize, f32> {
+    let mut rows: Vec<usize> = Vec::new();
+    let mut tokens: Vec<u32> = Vec::new();
+
+    let wants_k0 = |request_id: &str| -> bool {
+        states
+            .get(request_id)
+            .and_then(|s| s.prepared.as_ref())
+            .and_then(|p| p.request.logprobs)
+            == Some(0)
+    };
+
+    // Prefill: is_final + greedy rows whose tokens we already computed.
+    if let Some(argmax) = prefill_argmax_tokens {
+        for (i, request_id) in step.prefill_request_ids.iter().enumerate() {
+            if i >= argmax.len() {
+                break;
+            }
+            if wants_k0(request_id) {
+                rows.push(i);
+                tokens.push(argmax[i]);
+            }
+        }
+    }
+
+    // Decode: greedy rows whose tokens come from the precomputed batched_tokens.
+    if let Some(toks) = decode_batched_tokens {
+        let num_prefill = step.prefill_request_ids.len();
+        for (i, request_id) in step.decode_request_ids.iter().enumerate() {
+            if i >= toks.len() {
+                break;
+            }
+            if wants_k0(request_id) {
+                rows.push(num_prefill + i);
+                tokens.push(toks[i]);
+            }
+        }
+    }
+
+    if rows.is_empty() {
+        return HashMap::new();
+    }
+
+    // Slice the relevant rows from output.logits and run one batched
+    // gather_log_softmax. The fused CUDA kernel keeps everything
+    // on-device and DtoH's just `rows.len()` f32s; the fallback uses
+    // candle's log_softmax + gather and is still O(N) DtoH, not
+    // O(N * vocab) like the legacy per-row path.
+    let dev = output.logits.device();
+    let idx_vec: Vec<u32> = rows.iter().map(|&x| x as u32).collect();
+    let Ok(idx_t) = crate::tensor::Tensor::from_vec(idx_vec, (rows.len(),), dev) else {
+        return HashMap::new();
+    };
+    let Ok(selected) = output.logits.index_select(&idx_t, 0) else {
+        return HashMap::new();
+    };
+    match engine.batched_sampled_logprobs(&selected, &tokens) {
+        Ok(lps) => rows.into_iter().zip(lps).collect(),
+        Err(error) => {
+            tracing::warn!(%error, "batched_sampled_logprobs failed; falling back to per-row CPU path");
+            HashMap::new()
+        }
+    }
+}
+
 /// Compute top-k logprobs for a sampled token if the request asked for them.
+///
+/// `precomputed_sampled_logprob` short-circuits the k=0 case to skip the
+/// per-row full-vocab DtoH + CPU softmax — see
+/// [`Engine::batched_sampled_logprobs`] for the batched GPU pass that
+/// produces these values. For k > 0 the caller still needs the per-row
+/// CPU path to materialise the top-k alternative tokens' strings.
 fn extract_token_logprobs(
     engine: &Engine,
     row: &crate::tensor::Tensor,
     token: u32,
     state: &ArSequenceState,
+    precomputed_sampled_logprob: Option<f32>,
 ) -> Option<TokenLogprobInfo> {
     let k = state.prepared.as_ref()?.request.logprobs?;
+    if k == 0
+        && let Some(lp) = precomputed_sampled_logprob
+    {
+        return Some(TokenLogprobInfo {
+            token: engine
+                .tokenizer
+                .decode(&[token], false)
+                .unwrap_or_default(),
+            token_id: token,
+            logprob: lp,
+            top_logprobs: Vec::new(),
+        });
+    }
     Engine::extract_top_logprobs(row, token, k, &engine.tokenizer).ok()
 }
 
