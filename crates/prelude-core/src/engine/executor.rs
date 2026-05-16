@@ -87,6 +87,31 @@ pub struct ModelOutput {
     pub sampled_tokens_device: Option<Tensor>,
 }
 
+impl ModelOutput {
+    /// Populate [`Self::sampled_tokens`] (the host `Vec<u32>`) from
+    /// [`Self::sampled_tokens_device`] if needed. Idempotent: no-op
+    /// when `sampled_tokens` is already `Some` or when there's nothing
+    /// to sync.
+    ///
+    /// This is where the per-step host stall actually happens — the
+    /// device-to-host `to_vec1::<u32>()` forces a stream sync that
+    /// waits for the entire forward to drain. Callers control when to
+    /// pay it:
+    ///
+    /// * Serial path: right after `handle.recv().await`.
+    /// * Pipelined path: right after `prev_handle.recv()` and *after*
+    ///   `executor.submit(new_batch)`, so the new batch's kernels are
+    ///   already queued by the time the sync fires.
+    pub fn materialize_sampled_tokens_host(&mut self) {
+        if self.sampled_tokens.is_some() {
+            return;
+        }
+        if let Some(ref dev) = self.sampled_tokens_device {
+            self.sampled_tokens = dev.to_vec1::<u32>().ok();
+        }
+    }
+}
+
 // ── Forward batch ──────────────────────────────────────────────────
 
 /// What the Executor should run. Built by the scheduling loop from

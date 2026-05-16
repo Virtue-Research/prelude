@@ -160,8 +160,8 @@ impl Engine {
                 block_tables,
                 deltanet_slots,
                 sample_greedy: _,
-                tokens_device: _,
-            } => self.forward_decode(tokens, positions, block_tables, deltanet_slots),
+                tokens_device,
+            } => self.forward_decode(tokens, positions, block_tables, deltanet_slots, tokens_device),
         }
     }
 
@@ -190,12 +190,20 @@ impl Engine {
     }
 
     /// Forward pass for batched decode (one token per sequence, paged KV).
+    ///
+    /// `tokens_device` is an optional pre-resident `[B] U32` device
+    /// tensor of input ids. When `Some`, `batch_decode_paged` skips the
+    /// `Tensor::from_vec(flat_tokens)` H→D copy and uses the tensor
+    /// directly — wired up by the pipelined AR loop so the next step's
+    /// input is the previous step's `sampled_tokens_device` with no
+    /// host round-trip.
     fn forward_decode(
         &self,
         tokens: Vec<u32>,
         positions: Vec<usize>,
         block_tables: Vec<Vec<u32>>,
         deltanet_slots: Option<Vec<u32>>,
+        tokens_device: Option<crate::tensor::Tensor>,
     ) -> Result<super::executor::ModelOutput, EngineError> {
         use super::BatchDecodeSeq;
         use super::executor::ModelOutput;
@@ -223,7 +231,7 @@ impl Engine {
             })
             .collect();
 
-        let logits = self.batch_decode_paged(&seqs)?;
+        let logits = self.batch_decode_paged_with_device_tokens(&seqs, tokens_device)?;
 
         Ok(ModelOutput {
             logits,

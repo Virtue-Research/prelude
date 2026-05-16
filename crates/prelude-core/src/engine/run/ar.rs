@@ -193,6 +193,42 @@ pub async fn ar_loop(
     let mut pending_prepares = 0usize;
     let mut initial_wait_consumed = false;
 
+    // Phase 3 (PR-4): pipeline-depth-1 decode loop. **EXPERIMENTAL.**
+    //
+    // When `PRELUDE_DECODE_PIPELINE=1` is set in the environment AND
+    // the current+previous batches are both pure `Decode` with an
+    // identical request set, we feed the previous step's
+    // `sampled_tokens_device` straight into the next step's
+    // `tokens_device` and defer the host `materialize_sampled_tokens_host`
+    // sync until *after* the next batch has been submitted. That hides
+    // the ~6.88 ms per-step `cuMemcpyDtoHAsync_v2` stall behind the
+    // next batch's GPU forward, which our nsys traces (#27) flagged as
+    // 96.8% of CUDA-API time.
+    //
+    // Status: the loop machinery + engine plumbing (`tokens_device` on
+    // `ForwardBatch::Decode`, `batch_decode_paged_with_device_tokens`)
+    // ship in this PR and are correctness-safe when the flag is unset
+    // (default). With the flag on, smoke-testing shows token-history
+    // staleness bugs in the host-state update path for batches that
+    // straddle prefill→decode transitions — the pipeline keeps the
+    // host scheduler state one step behind the device, which a few
+    // downstream consumers (token-history append, streaming emit) still
+    // assume to be up-to-date. Tracked as a follow-up.
+    //
+    // Anything else (Mixed batches, request-set churn, sample_greedy
+    // off, or the flag unset) falls through to the serial path with
+    // the sync still inside the same step.
+    let pipeline_decode = std::env::var_os("PRELUDE_DECODE_PIPELINE").is_some();
+    if pipeline_decode {
+        tracing::warn!(
+            "PRELUDE_DECODE_PIPELINE=1 is set — decode loop will pipeline \
+             pure-Decode batches. EXPERIMENTAL: known correctness issues \
+             on prefill→decode transitions; do not enable in production."
+        );
+    }
+    // (prev_output, prev_step) carried across iterations when piping.
+    let mut pending: Option<(ModelOutput, SchedulerStep)> = None;
+
     loop {
         let deltanet_pool_ref = engine.cache.deltanet_pool.as_ref();
         // ── Phase 1: Wait for at least one request if idle ─────────
@@ -288,6 +324,17 @@ pub async fn ar_loop(
         // ── Phase 3: Schedule next step ────────────────────────────
         // schedule_step() syncs block availability internally.
         let Some(mut step) = scheduler.schedule_step() else {
+            // Drain any pipelined pending output before deciding to break.
+            if let Some((mut prev_output, prev_step)) = pending.take() {
+                prev_output.materialize_sampled_tokens_host();
+                process_step_output(
+                    &engine,
+                    &mut scheduler,
+                    &mut states,
+                    &prev_step,
+                    &prev_output,
+                );
+            }
             if !rx_open && pending_prepares == 0 && !scheduler.has_work() {
                 break;
             }
@@ -297,32 +344,169 @@ pub async fn ar_loop(
         initial_wait_consumed = false;
 
         // ── Phase 4: Build batch + forward + process output ──────────
-        // Pure decode → ForwardBatch::Decode (CUDA graph eligible).
-        // Anything with prefill → ForwardBatch::Mixed (single forward pass).
+        // Pipelining is only safe when this step's input ids can be
+        // sourced from the previous step's `sampled_tokens_device`
+        // tensor — that's the only way we can build & submit this
+        // step's batch without first calling `process_step_output` for
+        // the previous step (which is what the pipeline defers).
+        //
+        // Conditions, all required:
+        //   (a) pipeline flag on,
+        //   (b) prev step was pure `Decode` (no prefill rows; otherwise
+        //       prev's sampled_tokens_device shape / row meaning doesn't
+        //       line up with the next decode batch's input ids),
+        //   (c) this step is pure `Decode`,
+        //   (d) prev's decode request set equals this step's, in the
+        //       same order.
+        //
+        // When *any* condition fails we drain pending before building
+        // this step's batch — same scheduling/state behavior as the
+        // pre-PR-4 serial loop for that step.
+        let can_pipeline = pipeline_decode
+            && step.prefill_request_ids.is_empty()
+            && pending.as_ref().is_some_and(|(prev_out, prev_step)| {
+                prev_step.prefill_request_ids.is_empty()
+                    && prev_step.decode_request_ids == step.decode_request_ids
+                    && prev_out
+                        .sampled_tokens_device
+                        .as_ref()
+                        .is_some_and(|t| t.dims().len() == 1)
+            });
+
+        if !can_pipeline {
+            if let Some((mut prev_output, prev_step)) = pending.take() {
+                prev_output.materialize_sampled_tokens_host();
+                process_step_output(
+                    &engine,
+                    &mut scheduler,
+                    &mut states,
+                    &prev_step,
+                    &prev_output,
+                );
+            }
+        }
+
         // `build_step_batch` may shrink `step` in place when the KV
         // block pool is exhausted (see the `retain`/rollback paths
         // inside) so process_step_output, fail_step, etc. all see a
         // step that exactly matches what the executor actually ran.
-        let batch = build_step_batch(&engine, &mut scheduler, &mut states, &mut step);
+        let mut batch = build_step_batch(&engine, &mut scheduler, &mut states, &mut step);
+
+        if can_pipeline {
+            // Re-check decode_request_ids after build_step_batch may
+            // have shrunk the step (OOM / KV-pool rollback); if the
+            // request set changed, drop pipeline injection for this
+            // step and fall back to host-resident tokens.
+            if let (
+                Some((prev_output, prev_step)),
+                ForwardBatch::Decode {
+                    tokens,
+                    tokens_device,
+                    ..
+                },
+            ) = (pending.as_ref(), &mut batch)
+            {
+                if let Some(prev_dev) = prev_output.sampled_tokens_device.as_ref() {
+                    let dims = prev_dev.dims();
+                    if dims.len() == 1
+                        && dims[0] == tokens.len()
+                        && prev_step.decode_request_ids == step.decode_request_ids
+                    {
+                        *tokens_device = Some(prev_dev.clone());
+                    }
+                }
+            }
+        }
+
         let handle = match executor.submit(batch) {
             Ok(h) => h,
             Err(error) => {
+                // Drain pending so we don't lose its host-side state
+                // updates (token history, EOS, etc.) before failing
+                // this step.
+                if let Some((mut prev_output, prev_step)) = pending.take() {
+                    prev_output.materialize_sampled_tokens_host();
+                    process_step_output(
+                        &engine,
+                        &mut scheduler,
+                        &mut states,
+                        &prev_step,
+                        &prev_output,
+                    );
+                }
                 fail_step(&engine, &mut scheduler, &mut states, &step, error);
                 continue;
             }
         };
-        let output = match handle.recv().await {
+
+        // Pipeline depth 1: while the GPU worker is processing
+        // `batch`, do the host-side work for the *previous* step
+        // (process_step_output: EOS check, token history append,
+        // streaming emit, scheduler state update). This is the entire
+        // win — both threads run in parallel for the duration of the
+        // worker's CPU+GPU work for `batch`.
+        if pipeline_decode {
+            if let Some((mut prev_output, prev_step)) = pending.take() {
+                prev_output.materialize_sampled_tokens_host();
+                process_step_output(
+                    &engine,
+                    &mut scheduler,
+                    &mut states,
+                    &prev_step,
+                    &prev_output,
+                );
+            }
+        }
+
+        let new_output = match handle.recv().await {
             Ok(o) => o,
             Err(error) => {
+                if let Some((mut prev_output, prev_step)) = pending.take() {
+                    prev_output.materialize_sampled_tokens_host();
+                    process_step_output(
+                        &engine,
+                        &mut scheduler,
+                        &mut states,
+                        &prev_step,
+                        &prev_output,
+                    );
+                }
                 fail_step(&engine, &mut scheduler, &mut states, &step, error);
                 continue;
             }
         };
-        process_step_output(&engine, &mut scheduler, &mut states, &step, &output);
 
-        if !rx_open && pending_prepares == 0 && !scheduler.has_work() {
+        if pipeline_decode {
+            // Stash `new_output` for the next iteration's host
+            // processing; we've already drained prev above.
+            pending = Some((new_output, step));
+        } else {
+            // Serial path: sync + process this batch immediately.
+            let mut output = new_output;
+            output.materialize_sampled_tokens_host();
+            process_step_output(&engine, &mut scheduler, &mut states, &step, &output);
+        }
+
+        if !rx_open
+            && pending_prepares == 0
+            && !scheduler.has_work()
+            && pending.is_none()
+        {
             break;
         }
+    }
+
+    // Final drain after the loop exits (only relevant for the
+    // pipelined branch — `pending` is always None otherwise).
+    if let Some((mut prev_output, prev_step)) = pending.take() {
+        prev_output.materialize_sampled_tokens_host();
+        process_step_output(
+            &engine,
+            &mut scheduler,
+            &mut states,
+            &prev_step,
+            &prev_output,
+        );
     }
 
     // Shutdown: fail remaining requests
