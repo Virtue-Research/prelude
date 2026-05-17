@@ -503,6 +503,33 @@ impl Qwen3SparseMoeBlock {
         };
         let experts_down_fp8 = stack_scaled_fp8_experts(&experts, |e| &e.down_proj)?;
 
+        // The per-expert `experts` tensors are a full second copy of the MoE
+        // expert weights: they are stacked above into independent, contiguous
+        // fused tensors (`experts_gate_up`/`experts_down` and the FP8
+        // variants) for the FlashInfer/CUTLASS grouped GEMM. `experts` is
+        // ONLY read by `forward_sequential` (the CPU / `Sequential`-policy
+        // reference path). On CUDA with the default `Auto` (or forced
+        // `Cutlass`) policy, `forward_varlen` fails closed and never reaches
+        // `forward_sequential`, so keeping `experts` resident just pins ~half
+        // the model's weights in VRAM for nothing (e.g. 64 experts × 48
+        // layers ≈ 29 GB on a 16B-param Qwen3-MoE). Drop it whenever a fused
+        // GPU path exists and the policy is not `Sequential`; `experts_gate_up`
+        // / FP8 stacks are CUDA-only by construction, so their presence
+        // already implies the fused path will be taken.
+        let has_fused = (experts_gate_up.is_some() && experts_down.is_some())
+            || experts_gate_up_fp8.is_some()
+            || (experts_gate_fp8.is_some() && experts_up_fp8.is_some());
+        let mut experts = experts;
+        if has_fused && moe_backend_policy() != MoeBackendPolicy::Sequential {
+            let dropped = experts.len();
+            experts = Vec::new();
+            tracing::info!(
+                dropped_per_expert_modules = dropped,
+                "dropped per-expert MoE weights after building fused layout \
+                 (fused grouped-GEMM path active; sequential fallback unreachable)"
+            );
+        }
+
         Ok(Self {
             gate,
             experts,
