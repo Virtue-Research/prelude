@@ -1205,6 +1205,7 @@ fn test_rollback_prefill_full_reset_frees_and_recredits() {
     assert!(sched.tokens_in_use > 0);
     // Simulate blocks the ar-loop would have stranded on pool exhaustion.
     sched.running[0].block_table = vec![0, 1, 2, 3];
+    sched.running[0].prefix_attach_gen = Some(7);
 
     sched.rollback_prefill(&step.prefill_request_ids);
 
@@ -1215,6 +1216,10 @@ fn test_rollback_prefill_full_reset_frees_and_recredits() {
     assert_eq!(s.status, SequenceStatus::Waiting);
     assert!(s.block_table.is_empty(), "stranded blocks must be cleared");
     assert_eq!(sched.tokens_in_use, 0, "tokens_in_use must be re-credited");
+    assert_eq!(
+        s.prefix_attach_gen, None,
+        "recycled seq must be re-matchable regardless of cache generation"
+    );
 }
 
 fn bounded_admission_config() -> SchedulerConfig {
@@ -1341,4 +1346,10 @@ fn test_preempt_for_progress_requeues_and_resets_victim() {
     assert_eq!(v.kv_computed_len, 0);
     assert!(v.block_table.is_empty());
     assert_eq!(v.preempt_count, 1);
+    assert_eq!(v.prefix_attach_gen, None, "preempted seq must be re-matchable");
+}
+
+#[test]
+fn test_sequence_prefix_attach_gen_defaults_none() {
+    assert_eq!(make_seq("r", 8, 1).prefix_attach_gen, None);
 }

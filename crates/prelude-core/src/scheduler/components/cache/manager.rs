@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::tensor::{DType, Device, Tensor};
@@ -16,6 +17,12 @@ pub struct CacheManager {
     pub paged_pool: Option<PagedKvPool>,
     pub(crate) block_manager: Option<Arc<Mutex<crate::cache::block_manager::BlockManager>>>,
     pub deltanet_pool: Option<Mutex<DeltaNetPool>>,
+    /// Monotonic counter bumped whenever a prefix-cache insert stores new
+    /// blocks. `refresh_waiting_prefix_cache` uses it to re-match a waiting
+    /// request only when the cache actually changed since that request's
+    /// last attempt, instead of O(waiting × prompt) re-matching every
+    /// AR-loop iteration under a large waiting backlog.
+    pub(crate) prefix_cache_gen: AtomicU64,
 }
 
 impl CacheManager {
@@ -74,7 +81,14 @@ impl CacheManager {
             paged_pool,
             block_manager,
             deltanet_pool,
+            prefix_cache_gen: AtomicU64::new(0),
         })
+    }
+
+    /// Current prefix-cache content generation (bumped on each insert that
+    /// stores new blocks).
+    pub(crate) fn prefix_cache_generation(&self) -> u64 {
+        self.prefix_cache_gen.load(Ordering::Relaxed)
     }
 
     /// Empty CacheManager for paths where no cache is needed (e.g. GGUF CPU).
@@ -84,6 +98,7 @@ impl CacheManager {
             paged_pool: None,
             block_manager: None,
             deltanet_pool: None,
+            prefix_cache_gen: AtomicU64::new(0),
         }
     }
 

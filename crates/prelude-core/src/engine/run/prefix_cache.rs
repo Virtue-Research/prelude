@@ -191,16 +191,33 @@ pub(super) fn refresh_waiting_prefix_cache(engine: &Engine, scheduler: &mut Sche
         tracing::debug!(planned, "planned shared prefix-cache boundaries");
     }
 
+    // Re-match a waiting request only when the prefix cache actually
+    // changed since this request's last attempt. Without this, a large
+    // waiting backlog (extreme overcommit) is re-prefix-matched in full
+    // every AR-loop iteration — an O(waiting × prompt) hot loop that
+    // collapses throughput into an effective wedge — because a request
+    // whose maximal cacheable prefix is already attached but whose
+    // *planned* target is deeper never satisfies the old skip-guard.
+    let cache_gen = engine.cache.prefix_cache_generation();
     let mut refreshed = 0usize;
     let mut blocks_to_release: Vec<Vec<u32>> = Vec::new();
     scheduler.for_each_waiting_mut(|seq| {
+        // Already attempted at this cache generation → nothing new could
+        // deepen this request's prefix; skip until the cache changes.
+        if seq.prefix_attach_gen == Some(cache_gen) {
+            return;
+        }
         if seq.kv_computed_len > 0
             && seq
                 .prefix_cache_target_len
                 .is_none_or(|target_len| seq.kv_computed_len >= target_len)
         {
+            seq.prefix_attach_gen = Some(cache_gen);
             return;
         }
+        // Record the attempt up-front so a fruitless match (returns None)
+        // is not repeated until the cache generation advances.
+        seq.prefix_attach_gen = Some(cache_gen);
         let Some(attach) = attach_prefix_cache_reuse(engine, seq) else {
             return;
         };

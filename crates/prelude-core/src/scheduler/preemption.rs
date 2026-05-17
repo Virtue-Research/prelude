@@ -18,6 +18,7 @@ impl Scheduler {
         victim.kv_computed_len = 0;
         victim.block_table.clear();
         victim.deltanet_slot = None;
+        victim.prefix_attach_gen = None;
         victim.preempt_count += 1;
 
         self.effective_new_token_ratio = self.config.new_token_ratio;

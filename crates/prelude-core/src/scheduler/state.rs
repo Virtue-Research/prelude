@@ -108,6 +108,12 @@ pub struct Sequence {
     /// but only if the full prompt runs in one forward pass.
     pub prefill_must_be_atomic: bool,
     pub preempt_count: u32,
+    /// Prefix-cache content generation at this request's last attach
+    /// attempt while waiting. `refresh_waiting_prefix_cache` re-matches a
+    /// waiting request only when the cache changed since this generation,
+    /// so a large waiting backlog is not O(waiting × prompt) re-matched
+    /// every AR-loop iteration. `None` = never attempted.
+    pub prefix_attach_gen: Option<u64>,
 }
 
 impl Sequence {
@@ -139,6 +145,7 @@ impl Sequence {
             deltanet_slot: None,
             prefill_must_be_atomic: false,
             preempt_count: 0,
+            prefix_attach_gen: None,
         }
     }
 
@@ -447,6 +454,9 @@ impl Scheduler {
                 sequence.kv_computed_len = 0;
                 sequence.block_table.clear();
                 sequence.deltanet_slot = None;
+                // Lost its prefix → must be re-matched once it is back in
+                // the waiting queue, regardless of cache generation.
+                sequence.prefix_attach_gen = None;
                 returned.push(sequence);
             } else {
                 kept.push(sequence);

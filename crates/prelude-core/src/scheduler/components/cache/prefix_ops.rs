@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use crate::cache::deltanet_pool::DeltaNetPrefixState;
 use crate::cache::manager::CacheManager;
 use crate::engine::EngineError;
@@ -137,6 +139,9 @@ impl CacheManager {
             .lock()
             .map_err(|e| EngineError::Internal(format!("prefix cache lock poisoned: {e}")))?;
         let stored_paged_ids = pc.insert_paged_blocks_only(tokens, paged_block_size, block_table);
+        if !stored_paged_ids.is_empty() {
+            self.prefix_cache_gen.fetch_add(1, Ordering::Relaxed);
+        }
         self.retain_paged_blocks(&stored_paged_ids)?;
         let evicted = pc.take_evicted_paged_blocks();
         self.release_paged_blocks(&evicted)?;
@@ -170,6 +175,9 @@ impl CacheManager {
             block_table,
             deltanet_state,
         );
+        if !stored_paged_ids.is_empty() {
+            self.prefix_cache_gen.fetch_add(1, Ordering::Relaxed);
+        }
         self.retain_paged_blocks(&stored_paged_ids)?;
         let evicted = pc.take_evicted_paged_blocks();
         self.release_paged_blocks(&evicted)?;
