@@ -32,6 +32,12 @@ impl BlockManager {
         self.free_blocks.len()
     }
 
+    /// Total physical block capacity (free + in-use), constant after `new`.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.ref_counts.len()
+    }
+
     #[inline]
     pub fn block_size(&self) -> usize {
         self.block_size

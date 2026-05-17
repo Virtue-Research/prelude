@@ -1183,3 +1183,162 @@ fn test_available_blocks_default() {
     // Without block_manager, available_blocks stays at MAX (no limit).
     assert_eq!(sched.available_blocks, usize::MAX);
 }
+
+// ── KV-overcommit wedge fix: rollback / bounded admission / preemption ──
+
+#[test]
+fn test_rollback_prefill_full_reset_frees_and_recredits() {
+    // Strengthens test_rollback_prefill_resets_partial: a deferred prefill
+    // must fully reset — block_table cleared and tokens_in_use re-credited —
+    // so stranded blocks can never permanently wedge the pool.
+    let config = SchedulerConfig {
+        chunked_prefill: true,
+        max_num_batched_tokens: 50,
+        max_total_tokens: 65536,
+        ..Default::default()
+    };
+    let mut sched = Scheduler::new(config);
+
+    sched.add_request(make_seq("r1", 200, 20));
+    let step = sched.schedule_step().unwrap();
+    assert_eq!(sched.running[0].kv_computed_len, 50);
+    assert!(sched.tokens_in_use > 0);
+    // Simulate blocks the ar-loop would have stranded on pool exhaustion.
+    sched.running[0].block_table = vec![0, 1, 2, 3];
+
+    sched.rollback_prefill(&step.prefill_request_ids);
+
+    assert_eq!(sched.num_running(), 0);
+    assert_eq!(sched.num_waiting(), 1);
+    let s = &sched.waiting_queue[0];
+    assert_eq!(s.kv_computed_len, 0);
+    assert_eq!(s.status, SequenceStatus::Waiting);
+    assert!(s.block_table.is_empty(), "stranded blocks must be cleared");
+    assert_eq!(sched.tokens_in_use, 0, "tokens_in_use must be re-credited");
+}
+
+fn bounded_admission_config() -> SchedulerConfig {
+    SchedulerConfig {
+        chunked_prefill: true,
+        max_num_batched_tokens: 8192,
+        block_size: 16,
+        decode_reservation_cap: 0,
+        max_total_tokens: 65536,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_bounded_admission_holds_back_when_inflight_growth_reserved() {
+    // An in-flight chunked prefill (Prefilling, block_table not yet grown to
+    // its full footprint) reserves its remaining growth, so a second request
+    // is NOT admitted into a collectively over-pool state.
+    let mut sched = Scheduler::new(bounded_admission_config());
+    sched.available_blocks = 13; // exactly r1's full-prompt footprint (200/16)
+
+    let mut r1 = make_seq("r1", 200, 8);
+    r1.status = SequenceStatus::Prefilling;
+    sched.running.push(r1); // reserved_growth = ceil(200/16) - 0 = 13
+
+    sched.add_request(make_seq("r2", 16, 8)); // needs ceil(16/16)=1 block
+    let step = sched.schedule_step();
+    let admitted_r2 = step
+        .as_ref()
+        .map(|s| s.prefill_request_ids.iter().any(|id| id == "r2"))
+        .unwrap_or(false);
+    assert!(
+        !admitted_r2,
+        "r2 must be held back: 1 + reserved_growth(13) > available(13)"
+    );
+    assert!(sched.waiting_queue.iter().any(|s| s.request_id == "r2"));
+}
+
+#[test]
+fn test_bounded_admission_admits_when_no_inflight_growth() {
+    // With no in-flight prefill, reserved_growth is 0, so the same request
+    // that was held back above is admitted against the same budget.
+    let mut sched = Scheduler::new(bounded_admission_config());
+    sched.available_blocks = 13;
+    sched.add_request(make_seq("r2", 16, 8));
+    let step = sched.schedule_step().expect("should schedule");
+    assert!(
+        step.prefill_request_ids.iter().any(|id| id == "r2"),
+        "r2 admitted when no in-flight prefill growth is reserved"
+    );
+}
+
+fn running_seq(id: &str, arrival: std::time::Instant, leader: bool) -> Sequence {
+    let mut s = make_seq(id, 32, 4);
+    s.status = SequenceStatus::Prefilling;
+    s.arrival_time = arrival;
+    if leader {
+        s.kv_computed_len = 0;
+        s.block_table.clear();
+    } else {
+        // Not a prefix leader: has progressed and holds blocks.
+        s.kv_computed_len = 8;
+        s.block_table = vec![0];
+    }
+    s
+}
+
+#[test]
+fn test_preempt_protects_oldest_and_prefix_leader() {
+    let mut sched = Scheduler::new(SchedulerConfig::default());
+    let base = std::time::Instant::now();
+    // oldest (protected by FCFS), leader (protected to not starve peers),
+    // and a normal newer request — only the normal one may be the victim.
+    sched
+        .running
+        .push(running_seq("oldest", base, true));
+    sched.running.push(running_seq(
+        "leader",
+        base + std::time::Duration::from_secs(1),
+        true,
+    ));
+    sched.running.push(running_seq(
+        "normal",
+        base + std::time::Duration::from_secs(2),
+        false,
+    ));
+
+    assert!(sched.preempt_for_progress());
+    // Only the non-protected "normal" request may be evicted.
+    let v = &sched.waiting_queue[0];
+    assert_eq!(v.request_id, "normal");
+    assert!(sched.running.iter().any(|s| s.request_id == "oldest"));
+    assert!(sched.running.iter().any(|s| s.request_id == "leader"));
+}
+
+#[test]
+fn test_preempt_for_progress_none_when_all_protected() {
+    // Single running request = the oldest = protected ⇒ no eviction.
+    let mut sched = Scheduler::new(SchedulerConfig::default());
+    sched
+        .running
+        .push(running_seq("only", std::time::Instant::now(), true));
+    assert!(!sched.preempt_for_progress());
+    assert_eq!(sched.num_running(), 1);
+}
+
+#[test]
+fn test_preempt_for_progress_requeues_and_resets_victim() {
+    let mut sched = Scheduler::new(SchedulerConfig::default());
+    let base = std::time::Instant::now();
+    sched.running.push(running_seq("oldest", base, true));
+    sched.running.push(running_seq(
+        "victim",
+        base + std::time::Duration::from_secs(1),
+        false,
+    ));
+
+    assert!(sched.preempt_for_progress());
+    assert_eq!(sched.num_running(), 1);
+    assert_eq!(sched.waiting_queue.len(), 1);
+    let v = &sched.waiting_queue[0];
+    assert_eq!(v.request_id, "victim");
+    assert_eq!(v.status, SequenceStatus::Waiting);
+    assert_eq!(v.kv_computed_len, 0);
+    assert!(v.block_table.is_empty());
+    assert_eq!(v.preempt_count, 1);
+}

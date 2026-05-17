@@ -44,12 +44,20 @@ impl CacheManager {
             (None, None)
         };
 
+        // Physical paged-KV pool capacity (constant). The prefix cache pins
+        // pool blocks via refcount; its eviction budget MUST be bounded by
+        // this, else it can pin the whole pool and starve live admission.
+        let num_paged_blocks = block_manager
+            .as_ref()
+            .and_then(|bm| bm.lock().ok().map(|b| b.capacity()));
+
         let prefix_cache = if runtime_caps.supports_prefix_cache {
             Self::init_prefix_cache(
                 device,
                 model_config.num_hidden_layers,
                 cache_config,
                 paged_pool.as_ref().map(|pool| pool.block_size),
+                num_paged_blocks,
             )
         } else {
             None
@@ -94,17 +102,33 @@ impl CacheManager {
         num_layers: usize,
         cache_config: &CacheConfig,
         paged_block_size: Option<usize>,
+        num_paged_blocks: Option<usize>,
     ) -> Option<Mutex<PrefixKvCache>> {
-        let max_blocks = cache_config.prefix_cache_blocks;
-        if max_blocks == 0 {
+        let configured_max_blocks = cache_config.prefix_cache_blocks;
+        if configured_max_blocks == 0 {
             return None;
         }
+        // Clamp the prefix-cache block budget to half the physical paged pool.
+        // The cache pins pool blocks by refcount and only evicts (its LRU) once
+        // its block count exceeds this budget. If the budget exceeds the
+        // physical pool the LRU never fires under physical pressure, so the
+        // cache pins the whole pool and live admission permanently wedges
+        // (observed: pool 871, default budget 4096 → free blocks → ~49).
+        // Half the pool keeps the hot shared prefix while always leaving
+        // headroom for live requests; LRU evicts the cold unique-suffix
+        // chains first.
+        let max_blocks = match num_paged_blocks {
+            Some(n) if n > 0 => configured_max_blocks.min((n / 2).max(1)),
+            _ => configured_max_blocks,
+        };
         let block_size = paged_block_size.unwrap_or(cache_config.prefix_block_size);
         // flash layout: [B, L, H, D] → concat dim 1; standard: [B, H, L, D] → concat dim 2
         let is_flash = device.is_cuda();
         let concat_dim = if is_flash { 1 } else { 2 };
         info!(
             max_blocks = max_blocks,
+            configured_max_blocks = configured_max_blocks,
+            num_paged_blocks = num_paged_blocks.unwrap_or(0),
             block_size = block_size,
             concat_dim = concat_dim,
             num_layers = num_layers,

@@ -192,6 +192,15 @@ pub async fn ar_loop(
     let (prepare_tx, mut prepare_rx) = mpsc::unbounded_channel::<PreparedArMessage>();
     let mut pending_prepares = 0usize;
     let mut initial_wait_consumed = false;
+    // No-forward-progress watchdog. Counts consecutive scheduling steps that
+    // ran nothing while work was still pending (KV-pool-exhaustion wedge). On
+    // threshold we force progress by preempting one non-protected running
+    // request (frees its blocks so the protected oldest can complete). Reset
+    // on any step that actually ran work. Bounded admission + full rollback
+    // should make this a rare belt-and-suspenders; the `yield_now` also keeps
+    // a wedged interval from hot-spinning the CPU.
+    const NO_PROGRESS_PREEMPT_THRESHOLD: u32 = 16;
+    let mut consecutive_no_progress: u32 = 0;
 
     loop {
         let deltanet_pool_ref = engine.cache.deltanet_pool.as_ref();
@@ -291,6 +300,32 @@ pub async fn ar_loop(
             if !rx_open && pending_prepares == 0 && !scheduler.has_work() {
                 break;
             }
+            // Nothing schedulable but work is still pending: a wedge symptom.
+            // Force progress once the watchdog trips.
+            if scheduler.has_work() {
+                consecutive_no_progress = consecutive_no_progress.saturating_add(1);
+                if consecutive_no_progress >= NO_PROGRESS_PREEMPT_THRESHOLD {
+                    if scheduler.preempt_for_progress() {
+                        tracing::warn!(
+                            num_running = scheduler.num_running(),
+                            num_waiting = scheduler.num_waiting(),
+                            available_blocks = scheduler.available_blocks,
+                            "AR no-progress watchdog: preempted a request to break a wedge"
+                        );
+                    } else if consecutive_no_progress % 256 == 0 {
+                        // Nothing preemptable (e.g. all work stuck in waiting):
+                        // throttled so a persistent wedge does not spam logs.
+                        tracing::warn!(
+                            consecutive_no_progress,
+                            num_running = scheduler.num_running(),
+                            num_waiting = scheduler.num_waiting(),
+                            available_blocks = scheduler.available_blocks,
+                            "AR no-progress watchdog: pending work but nothing schedulable or preemptable"
+                        );
+                    }
+                    consecutive_no_progress = 0;
+                }
+            }
             tokio::task::yield_now().await;
             continue;
         };
@@ -299,15 +334,21 @@ pub async fn ar_loop(
         // ── Phase 4: Build batch + forward + process output ──────────
         // Pure decode → ForwardBatch::Decode (CUDA graph eligible).
         // Anything with prefill → ForwardBatch::Mixed (single forward pass).
-        // `build_step_batch` may shrink `step` in place when the KV
-        // block pool is exhausted (see the `retain`/rollback paths
-        // inside) so process_step_output, fail_step, etc. all see a
-        // step that exactly matches what the executor actually ran.
-        let batch = build_step_batch(&engine, &mut scheduler, &mut states, &mut step);
+        // `build_step_batch` may shrink `step` in place when the KV block
+        // pool is exhausted so process_step_output, fail_step, etc. all see a
+        // step that exactly matches what the executor actually ran. It also
+        // returns the ids of prefills that were dropped due to pool
+        // exhaustion; those are fully rolled back (blocks freed, accounting
+        // re-credited, re-queued to the waiting front) AFTER the surviving
+        // step is processed — never mid-build (rollback_prefill rebuilds
+        // `running`, which would desync the index-parallel processing).
+        let (batch, deferred_prefill_ids) =
+            build_step_batch(&engine, &mut scheduler, &mut states, &mut step);
         let handle = match executor.submit(batch) {
             Ok(h) => h,
             Err(error) => {
                 fail_step(&engine, &mut scheduler, &mut states, &step, error);
+                scheduler.rollback_prefill(&deferred_prefill_ids);
                 continue;
             }
         };
@@ -315,10 +356,30 @@ pub async fn ar_loop(
             Ok(o) => o,
             Err(error) => {
                 fail_step(&engine, &mut scheduler, &mut states, &step, error);
+                scheduler.rollback_prefill(&deferred_prefill_ids);
                 continue;
             }
         };
         process_step_output(&engine, &mut scheduler, &mut states, &step, &output);
+        scheduler.rollback_prefill(&deferred_prefill_ids);
+
+        // Forward-progress watchdog. If this step ran nothing (every prefill
+        // deferred for lack of KV blocks, no decode) yet work is still
+        // pending, the engine is wedging. Trip the counter; on threshold
+        // preempt one non-protected running request so the protected oldest
+        // can complete. `yield_now` prevents a hot-spin while it ramps.
+        if step.prefill_request_ids.is_empty() && step.decode_request_ids.is_empty() {
+            if scheduler.has_work() {
+                consecutive_no_progress = consecutive_no_progress.saturating_add(1);
+                if consecutive_no_progress >= NO_PROGRESS_PREEMPT_THRESHOLD {
+                    scheduler.preempt_for_progress();
+                    consecutive_no_progress = 0;
+                }
+                tokio::task::yield_now().await;
+            }
+        } else {
+            consecutive_no_progress = 0;
+        }
 
         if !rx_open && pending_prepares == 0 && !scheduler.has_work() {
             break;
@@ -684,8 +745,16 @@ fn build_step_batch(
     scheduler: &mut Scheduler,
     states: &mut HashMap<String, ArSequenceState>,
     step: &mut SchedulerStep,
-) -> ForwardBatch {
+) -> (ForwardBatch, Vec<String>) {
     use crate::engine::executor::StepRequest;
+
+    // Prefill requests whose chunk could not get KV blocks this step. The
+    // caller fully rolls these back via `Scheduler::rollback_prefill` AFTER
+    // the forward/process for the surviving step is done — never mid-build,
+    // since rollback_prefill rebuilds `running` and `get_sequence*` only scan
+    // `running`, which would desync the index-parallel `prefill_keep`/
+    // `process_step_output` walk.
+    let mut deferred_prefill_ids: Vec<String> = Vec::new();
 
     // Pure decode → use Decode variant for CUDA graph eligibility
     if step.prefill_request_ids.is_empty() {
@@ -768,16 +837,19 @@ fn build_step_batch(
             None
         };
         let sample_greedy = decode_requests_allow_executor_greedy(states, &step.decode_request_ids);
-        return ForwardBatch::Decode {
-            tokens,
-            positions,
-            block_tables,
-            deltanet_slots,
-            sample_greedy,
-            // tokens_device is wired in PR-4 (pipeline-depth-1 decode
-            // loop); for now we always source input ids from host.
-            tokens_device: None,
-        };
+        return (
+            ForwardBatch::Decode {
+                tokens,
+                positions,
+                block_tables,
+                deltanet_slots,
+                sample_greedy,
+                // tokens_device is wired in PR-4 (pipeline-depth-1 decode
+                // loop); for now we always source input ids from host.
+                tokens_device: None,
+            },
+            deferred_prefill_ids,
+        );
     }
 
     // Mixed or prefill-only → build unified StepRequests
@@ -790,14 +862,16 @@ fn build_step_batch(
         .unwrap_or(16);
     let batch_needs_paged_prefill = prefill_batch_needs_kv(scheduler, step);
 
-    // ── Prefill: try to allocate blocks; if pool is exhausted, drop the
-    // request from `step` AND roll back the kv_computed_len bump that
-    // `Scheduler::schedule_step` performed when planning this step. The
-    // request stays in the scheduler so the same chunk can be retried
-    // next step; failing to roll back would make the scheduler think
-    // those tokens were already cached, and the next forward would
-    // start from a pointer past the (still-uncomputed) tokens — wrong
-    // attention output forever.
+    // ── Prefill: try to allocate blocks; if the pool is exhausted, drop the
+    // request from `step` and record its id in `deferred_prefill_ids`. The
+    // caller fully rolls these back via `Scheduler::rollback_prefill` once
+    // the surviving step's forward/process is done: that frees the stranded
+    // partial blocks, re-credits accounting, resets kv_computed_len=0, and
+    // re-queues the request to the waiting front so it is cleanly retried or
+    // preempted. The previous behaviour only rolled back kv_computed_len and
+    // left the partially-allocated blocks stranded in the still-`running`
+    // sequence — a permanent leak that wedged the engine once the pool was
+    // transiently overcommitted.
     let mut has_executor_sample_rows = false;
     let mut can_executor_sample_rows = true;
     let mut prefill_keep: Vec<bool> = Vec::with_capacity(step.prefill_request_ids.len());
@@ -842,12 +916,12 @@ fn build_step_batch(
                     got = actual,
                     "KV block pool exhausted during prefill chunk allocation — deferring"
                 );
-                if let Some(seq_mut) = scheduler.get_sequence_mut(id) {
-                    seq_mut.kv_computed_len = seq_mut.kv_computed_len.saturating_sub(chunk_len);
-                    if seq_mut.status == crate::scheduler::SequenceStatus::Decoding {
-                        seq_mut.status = crate::scheduler::SequenceStatus::Prefilling;
-                    }
-                }
+                // Do NOT mutate the sequence here: a partial in-place rollback
+                // leaves the already-allocated blocks stranded in block_table
+                // while the seq stays in `running` (never forwarded, never
+                // freed) — the permanent-wedge leak. Defer full cleanup to the
+                // caller's post-process `rollback_prefill`.
+                deferred_prefill_ids.push(id.clone());
                 prefill_keep.push(false);
                 continue;
             }
@@ -945,10 +1019,13 @@ fn build_step_batch(
         }
     }
 
-    ForwardBatch::Mixed {
-        requests,
-        sample_greedy: has_executor_sample_rows && can_executor_sample_rows,
-    }
+    (
+        ForwardBatch::Mixed {
+            requests,
+            sample_greedy: has_executor_sample_rows && can_executor_sample_rows,
+        },
+        deferred_prefill_ids,
+    )
 }
 
 fn prefill_batch_needs_kv(scheduler: &Scheduler, step: &SchedulerStep) -> bool {

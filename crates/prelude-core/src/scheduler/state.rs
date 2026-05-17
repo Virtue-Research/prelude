@@ -420,6 +420,9 @@ impl Scheduler {
     }
 
     pub fn rollback_prefill(&mut self, request_ids: &[String]) {
+        if request_ids.is_empty() {
+            return;
+        }
         let deferred: std::collections::HashSet<&str> =
             request_ids.iter().map(String::as_str).collect();
         let mut kept = Vec::with_capacity(self.running.len());
@@ -427,7 +430,12 @@ impl Scheduler {
 
         for mut sequence in self.running.drain(..) {
             if deferred.contains(sequence.request_id.as_str()) {
-                self.tokens_in_use = self.tokens_in_use.saturating_sub(sequence.input_ids.len());
+                // Debit total_len() (input + output), matching the credit/debit
+                // used by admission and preempt_one_from_running. For a fresh
+                // prefill output_ids is empty so this equals input_ids.len();
+                // for a decode-phase seq that hit the prefill-defer path this
+                // avoids permanently leaking output_ids.len() from tokens_in_use.
+                self.tokens_in_use = self.tokens_in_use.saturating_sub(sequence.total_len());
                 if !sequence.block_table.is_empty() {
                     if let Some(ref bm) = self.block_manager {
                         if let Ok(mut bm) = bm.lock() {

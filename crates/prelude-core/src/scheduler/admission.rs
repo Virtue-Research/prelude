@@ -311,6 +311,33 @@ impl Scheduler {
 
         let block_size = self.config.block_size;
 
+        // Forward-progress invariant: never admit a request unless the
+        // physically-free pool can also cover the *remaining* prefill growth
+        // of every request already running. `available_blocks` is re-synced
+        // from the physical pool each schedule_step, but a chunked long
+        // prefill has only physically allocated its chunks-so-far — its
+        // future chunks are an unmaterialised commitment the per-step sync
+        // cannot see. Without reserving for it, a later step over-admits
+        // against an inflated free count, the collective set exceeds the
+        // pool, and every chunk strands (now rolled back by the caller, but
+        // that is churn, not progress). Reserving the in-flight growth makes
+        // the admitted+running set collectively pool-bounded, so every
+        // admitted request can be driven to completion.
+        let reserved_growth: usize = if block_size == 0 {
+            0
+        } else {
+            self.running
+                .iter()
+                .filter(|s| s.status == SequenceStatus::Prefilling)
+                .map(|s| {
+                    s.input_ids
+                        .len()
+                        .div_ceil(block_size)
+                        .saturating_sub(s.block_table.len())
+                })
+                .sum()
+        };
+
         let mut admitted = 0usize;
         let mut deferred_same_prefix: VecDeque<Sequence> = VecDeque::new();
         while !self.waiting_queue.is_empty() && admitted < available_slots && token_budget > 0 {
@@ -344,7 +371,13 @@ impl Scheduler {
                     .min(self.config.decode_reservation_cap as u32) as usize;
             let blocks_needed = total_tokens.div_ceil(block_size);
             let new_blocks_needed = blocks_needed.saturating_sub(seq.block_table.len());
-            if new_blocks_needed > self.available_blocks {
+            // Bounded admission: the candidate's full footprint PLUS the
+            // unmaterialised growth of all in-flight prefills must fit the
+            // physically-free pool. (Newly admitted prefills in this same
+            // pass are bounded by the per-admit `available_blocks` decrement
+            // below.) Healthy path: `available_blocks` is large so this is a
+            // no-op; only under genuine pool pressure does it hold work back.
+            if new_blocks_needed.saturating_add(reserved_growth) > self.available_blocks {
                 break;
             }
 
@@ -524,7 +557,7 @@ fn shared_prefix_target_pending(seq: &Sequence) -> bool {
         .is_some_and(|target_len| seq.kv_computed_len < target_len)
 }
 
-fn prefix_prefill_leader_needed(seq: &Sequence) -> bool {
+pub(super) fn prefix_prefill_leader_needed(seq: &Sequence) -> bool {
     shared_prefix_target_pending(seq) || (seq.kv_computed_len == 0 && seq.block_table.is_empty())
 }
 
