@@ -348,9 +348,35 @@ pub(super) fn try_insert_prefill_prefix_cache(
         return;
     }
 
-    if is_final
+    // Pure paged-attention path (no DeltaNet). Besides the final whole-prompt
+    // insert, publish the *planned shared prefix* as soon as the leader has
+    // prefilled through it — without waiting for is_final. When many requests
+    // arrive with the same long system prompt, plan_waiting_shared_prefixes()
+    // elects one leader and parks the peers; with an is_final-only insert the
+    // peers stay parked until the leader also finishes its own (possibly very
+    // long) suffix. Publishing at the shared boundary lets the peers attach
+    // and overlap their suffix prefill with the leader's instead of idling.
+    // Only the block-aligned shared portion is cached (not the leader's
+    // private suffix); the later is_final whole-prompt insert is an idempotent
+    // superset in the block-hash prefix trie.
+    let insert_tokens: Option<&[u32]> = if is_final {
+        Some(seq.input_ids.as_slice())
+    } else if let Some(target) = seq.prefix_cache_target_len {
+        if seq.prefix_cache_key.is_some()
+            && target >= pool.block_size
+            && target < seq.input_ids.len()
+            && computed >= target
+        {
+            Some(&seq.input_ids[..target])
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(tokens) = insert_tokens
         && let Err(e) = engine.cache.try_prefix_cache_insert_paged_only(
-            &seq.input_ids,
+            tokens,
             &result.block_table,
             pool.block_size,
         )
