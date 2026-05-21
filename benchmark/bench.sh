@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# bench.sh — Benchmark Prelude vs vLLM / SGLang / vllm.rs / llama.cpp
+# bench.sh — Benchmark Prelude vs vLLM
 #
 # Usage:
 #   ./benchmark/bench.sh                   # all engines
 #   ./benchmark/bench.sh prelude --gpu     # Prelude GPU only
-#   ./benchmark/bench.sh sglang --gpu      # SGLang GPU only
+#   ./benchmark/bench.sh vllm --gpu        # vLLM GPU only
 #   ./benchmark/bench.sh --gpu             # all GPU engines
 #   ./benchmark/bench.sh --cpu             # all CPU engines
 #   ./benchmark/bench.sh --gpu --cu12      # use CUDA 12 Docker images (default: CUDA 13)
@@ -59,22 +59,13 @@ CPU_NAME=$(lscpu 2>/dev/null | awk -F: '/Model name/ {gsub(/^[ \t]+/, "", $2); p
 declare -A ENGINES
 ENGINES=(
     [prelude]="prelude|Prelude|8099|no|/health|180|native"
-    [prelude-gguf]="prelude-gguf|Prelude-GGUF|8098|no|/health|180|native"
-    [vllm.rs]="vllm-rs|vLLM.rs|8002|yes|/v1/models|180|native"
     [vllm]="vllm|vLLM|8003|yes|/v1/models|300|docker"
-    [vllm-cpu]="vllm-cpu|vLLM-CPU|8005|no|/v1/models|300|docker"
-    [sglang]="sglang|SGLang|8004|yes|/v1/models|300|docker"
-    [sglang-cpu]="sglang-cpu|SGLang-CPU|8006|no|/v1/models|300|docker"
-    [llama.cpp]="llama-cpp|llama.cpp|8007|no|/health|120|native"
 )
 
 # Docker image per engine (only for docker-type engines)
 declare -A DOCKER_IMAGES
 DOCKER_IMAGES=(
     [vllm]="vllm/vllm-openai:latest-cu130"
-    [vllm-cpu]="vllm/vllm-openai:latest"
-    [sglang]="lmsysorg/sglang:latest-cu130"
-    [sglang-cpu]="lmsysorg/sglang:latest"
 )
 
 # ── Helpers ──
@@ -260,8 +251,8 @@ log "Config: model=$MODEL traffic=$TRAFFIC concurrency=$CONCURRENCY gpu=$HAS_GPU
 echo ""
 
 # Dispatch
-GPU_ENGINES=(prelude vllm.rs vllm sglang)
-CPU_ENGINES=(prelude prelude-gguf llama.cpp vllm-cpu sglang-cpu)
+GPU_ENGINES=(prelude vllm)
+CPU_ENGINES=(prelude)
 
 run_single_engine() {
     local target="$1"
