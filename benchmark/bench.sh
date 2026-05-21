@@ -124,7 +124,8 @@ check_engine() {
 
 start_engine() {
     local engine="$1" port="$2"
-    local hf_cache="${HOME}/.cache/huggingface"
+    local hf_cache="${HF_DOCKER_CACHE:-${HOME}/.cache/huggingface-docker}"
+    mkdir -p "$hf_cache"
     local cvd="${CUDA_VISIBLE_DEVICES:-0}"
     case "$engine" in
         prelude)
