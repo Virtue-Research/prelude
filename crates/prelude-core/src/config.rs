@@ -31,7 +31,13 @@ pub fn global_cache_config() -> Option<&'static CacheConfig> {
 // ── Defaults (single source of truth — CLI and from_env() both reference these) ──
 
 pub const DEFAULT_GPU_MEMORY_UTILIZATION: f32 = 0.9;
-pub const DEFAULT_CUDA_GRAPH_MAX_BS: usize = 32;
+/// Upper bound for CUDA-graph capture batch sizes. Was 32; bumped to
+/// 512 to match vLLM's default coverage so high-concurrency decode
+/// batches no longer fall through to the eager path. The cache itself
+/// captures sparsely (a fixed ~15-entry list of common batch sizes) and
+/// pads inputs at replay, so a larger ceiling doesn't multiply the
+/// graph count or memory footprint.
+pub const DEFAULT_CUDA_GRAPH_MAX_BS: usize = 512;
 /// Mirrors the scheduler's `max_num_batched_tokens` default, so the
 /// activation profiler probes the same shape the engine actually runs
 /// in the default config.
