@@ -157,8 +157,33 @@ impl Qwen3Attention {
     }
 
     // ── Varlen forward (unified: GPU flash-attn / CPU cpu_ops) ──────────
+    //
+    // Exposed as three callables — pre-attn, attention, post-attn — so the
+    // CUDA-graph machinery can capture the pre/post halves into shape-stable
+    // graphs (they depend only on `num_tokens`, not on `cu_seqlens_*`) while
+    // attention itself stays eager. `forward()` is the unchanged composed
+    // path for the eager hot path.
 
     pub(crate) fn forward(&self, x: &Tensor, ctx: &LayerAttnContext) -> Result<Tensor> {
+        let total_q = x.dim(0)?;
+        let (q, k, v) = self.forward_pre_attn(x, ctx)?;
+        let attn_out = self.forward_attention(&q, &k, &v, ctx)?;
+        self.forward_post_attn(&attn_out, total_q, ctx.ops)
+    }
+
+    /// Pre-attention: fused QKV projection + QK-norm + RoPE + optional KV
+    /// write to the paged cache. Output `q` is normed/roped; `k`/`v` are
+    /// returned for the varlen path (and have been written to the paged
+    /// cache via `slot_mapping` when `ctx.paged_kv` is set).
+    ///
+    /// Shape-stable in `num_tokens = x.dim(0)`: no kernel here is keyed on
+    /// per-sequence boundaries, so a CUDA graph captured at one bucket
+    /// replays for any prefill packed to that bucket.
+    pub(crate) fn forward_pre_attn(
+        &self,
+        x: &Tensor,
+        ctx: &LayerAttnContext,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let total_q = x.dim(0)?;
         let bs = BatchState::no_lora();
         let ops = ctx.ops;
@@ -167,7 +192,6 @@ impl Qwen3Attention {
         let (q, k, v) = self.fused_qkv_projection(x, total_q, &bs, ops)?;
         nvtx_pop!();
 
-        // QK-norm + RoPE + optional cache write (OpsBundle picks optimal fuse path)
         nvtx_push!("attn_qknorm_rope_cache");
         let kv_cache = ctx
             .paged_kv
@@ -185,12 +209,24 @@ impl Qwen3Attention {
             kv_cache,
         )?;
         nvtx_pop!();
+        Ok((q, k, v))
+    }
 
-        // Attention
+    /// Attention kernel — eager path. Variable layout (cu_seqlens) makes
+    /// this the one piece that CUDA graphs can't reuse across prefill
+    /// steps. Paged when `ctx.paged_kv` is set, varlen otherwise.
+    pub(crate) fn forward_attention(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        ctx: &LayerAttnContext,
+    ) -> Result<Tensor> {
         nvtx_push!("attn_kernel");
+        let ops = ctx.ops;
         let attn_out = if let Some(kv) = ctx.paged_kv {
             ops.paged_attention(
-                &q,
+                q,
                 kv.key_cache,
                 kv.value_cache,
                 &crate::ops::PagedParams {
@@ -206,9 +242,9 @@ impl Qwen3Attention {
             )?
         } else {
             ops.varlen_attention(
-                &q,
-                &k,
-                &v,
+                q,
+                k,
+                v,
                 &crate::ops::VarlenParams {
                     cu_seqlens_q: ctx.cu_seqlens_q,
                     cu_seqlens_k: ctx.cu_seqlens_q,
@@ -221,8 +257,18 @@ impl Qwen3Attention {
             )?
         };
         nvtx_pop!();
+        Ok(attn_out)
+    }
 
+    /// Post-attention: O projection. Shape-stable in `total_q`.
+    pub(crate) fn forward_post_attn(
+        &self,
+        attn_out: &Tensor,
+        total_q: usize,
+        ops: &dyn crate::ops::Ops,
+    ) -> Result<Tensor> {
         nvtx_push!("attn_o_proj");
+        let bs = BatchState::no_lora();
         let r = self
             .o_proj
             .forward(&attn_out.reshape((total_q, self.hidden_size))?, &bs, ops);

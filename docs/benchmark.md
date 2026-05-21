@@ -28,9 +28,14 @@ uv pip install "genai-bench @ git+https://github.com/rucnyz/genai-bench.git"
 
 ### 3. Pull baseline Docker images
 
+`bench.sh` defaults to the cu130 builds, which are noticeably faster on
+CUDA-13 hosts than the engines' `:latest` (cu128) tags. Override with
+`VLLM_IMAGE` / `SGLANG_IMAGE`, or pass `--cu12` to bench.sh to swap both
+back to `:latest`.
+
 ```bash
-docker pull lmsysorg/sglang:latest
-docker pull vllm/vllm-openai:latest
+docker pull lmsysorg/sglang:latest-cu130
+docker pull vllm/vllm-openai:latest-cu130-ubuntu2404
 ```
 
 ### 4. Verify
