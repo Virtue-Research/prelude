@@ -50,6 +50,8 @@ fn main() -> Result<()> {
     let tvm_src = tvm_ffi_dir.join("src");
     let tvm_include = tvm_ffi_dir.join("include");
     let dlpack_include = tvm_ffi_dir.join("3rdparty/dlpack/include");
+    let libbacktrace_include = tvm_ffi_dir.join("3rdparty/libbacktrace");
+    let libbacktrace_config = PathBuf::from(env::var("OUT_DIR")?).join("libbacktrace");
 
     if !tvm_src.exists() {
         anyhow::bail!(
@@ -89,6 +91,8 @@ fn main() -> Result<()> {
         .pic(true)
         .include(&tvm_include)
         .include(&dlpack_include)
+        .include(&libbacktrace_include)
+        .include(&libbacktrace_config)
         .define("TVM_FFI_EXPORTS", None)
         .define("NDEBUG", None)
         .warnings(false);
@@ -206,6 +210,22 @@ fn compile_libbacktrace(tvm_ffi_dir: &Path) -> Result<()> {
 "#
     };
     std::fs::write(config_dir.join("config.h"), config_h)?;
+    let supported_h = if cfg!(target_os = "linux") {
+        r#"
+#define BACKTRACE_SUPPORTED 1
+#define BACKTRACE_USES_MALLOC 0
+#define BACKTRACE_SUPPORTS_THREADS 1
+#define BACKTRACE_SUPPORTS_DATA 1
+"#
+    } else {
+        r#"
+#define BACKTRACE_SUPPORTED 0
+#define BACKTRACE_USES_MALLOC 0
+#define BACKTRACE_SUPPORTS_THREADS 0
+#define BACKTRACE_SUPPORTS_DATA 0
+"#
+    };
+    std::fs::write(config_dir.join("backtrace-supported.h"), supported_h)?;
 
     let core_files = [
         "backtrace.c",
