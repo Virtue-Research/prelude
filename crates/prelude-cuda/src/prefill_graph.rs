@@ -54,12 +54,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cudarc::driver::CudaStream;
+use cudarc::driver::{CudaStream, DevicePtr};
+use prelude_core::cache::block_manager::BlockManager;
 use prelude_core::config::EngineConfig;
+use prelude_core::engine::EngineError;
+use prelude_core::engine::executor::StepRequest;
 use prelude_core::tensor::{DType, Device, Tensor};
 
-fn tensor_err(e: prelude_core::tensor::Error) -> prelude_core::engine::EngineError {
-    prelude_core::engine::EngineError::Internal(format!("tensor: {e}"))
+use crate::device::GpuDType;
+
+fn tensor_err(e: prelude_core::tensor::Error) -> EngineError {
+    EngineError::Internal(format!("tensor: {e}"))
 }
 
 /// `(num_tokens_bucket, num_reqs_bucket)`.
@@ -215,10 +220,162 @@ pub(crate) fn try_pick_bucket(
     cache.round_up(num_tokens, num_reqs)
 }
 
-#[allow(dead_code)]
-pub(crate) fn get_stream(device: &Device) -> Result<Arc<CudaStream>, prelude_core::engine::EngineError> {
+pub(crate) fn get_stream(device: &Device) -> Result<Arc<CudaStream>, EngineError> {
     let cuda_dev = device
         .as_cuda_device()
-        .map_err(|e| prelude_core::engine::EngineError::Internal(format!("as_cuda_device: {e}")))?;
+        .map_err(|e| EngineError::Internal(format!("as_cuda_device: {e}")))?;
     Ok(cuda_dev.cuda_stream())
+}
+
+/// CPU-side data returned by `update_buffers` for reuse downstream
+/// (specifically, the FlashInfer plan precompute).
+pub(crate) struct PrefillCpuData {
+    pub(crate) cu_seqlens_k: Vec<u32>,
+    pub(crate) block_tables: Vec<Vec<u32>>,
+}
+
+/// Populate the bucket's pre-allocated GPU buffers from a real prefill
+/// step's request list. Padding strategy:
+///
+/// - Tokens past `real_total_tokens` get replicas of the first request's
+///   first-slot (so `slot_mapping` / `position_ids` / `packed_input`
+///   point at well-formed cache entries — the FA kernel does work on
+///   them but the result is sliced away).
+/// - Request slots past `requests.len()` get zero-length sequences
+///   (`cu_seqlens_q[i] == cu_seqlens_q[i-1]`), which makes the FA inner
+///   loop a no-op for those slots. Their `block_tables` row gets the
+///   first request's block table to keep address resolution safe.
+pub(crate) fn update_buffers(
+    buffers: &MixedGraphBuffers,
+    requests: &[StepRequest],
+    block_size: usize,
+    stream: &Arc<CudaStream>,
+) -> Result<PrefillCpuData, EngineError> {
+    let num_reqs = requests.len();
+    let bucket_num_reqs = buffers.key.num_reqs;
+    let bucket_num_tokens = buffers.key.num_tokens;
+    debug_assert!(
+        num_reqs > 0 && num_reqs <= bucket_num_reqs,
+        "update_buffers: num_reqs {num_reqs} must be in 1..={bucket_num_reqs}"
+    );
+
+    let real_total_tokens: usize = requests.iter().map(|r| r.tokens.len()).sum();
+    debug_assert!(
+        real_total_tokens > 0 && real_total_tokens <= bucket_num_tokens,
+        "update_buffers: real_total_tokens {real_total_tokens} must be in 1..={bucket_num_tokens}"
+    );
+
+    // ── packed_input + position_ids + slot_mapping (length bucket_num_tokens) ──
+    let mut packed_tokens: Vec<u32> = Vec::with_capacity(bucket_num_tokens);
+    let mut position_ids: Vec<u32> = Vec::with_capacity(bucket_num_tokens);
+    let mut slot_mapping: Vec<i64> = Vec::with_capacity(bucket_num_tokens);
+
+    for r in requests {
+        for (i, &tok) in r.tokens.iter().enumerate() {
+            packed_tokens.push(tok);
+            position_ids.push((r.position_start + i) as u32);
+            slot_mapping.push(BlockManager::slot(
+                &r.block_table,
+                r.position_start + i,
+                block_size,
+            ));
+        }
+    }
+    // Pad with a dummy slot from requests[0]
+    let dummy_token = requests[0].tokens.first().copied().unwrap_or(0);
+    let dummy_pos = requests[0].position_start as u32;
+    let dummy_slot = BlockManager::slot(
+        &requests[0].block_table,
+        requests[0].position_start,
+        block_size,
+    );
+    for _ in real_total_tokens..bucket_num_tokens {
+        packed_tokens.push(dummy_token);
+        position_ids.push(dummy_pos);
+        slot_mapping.push(dummy_slot);
+    }
+
+    unsafe { update_tensor(&buffers.packed_input, &packed_tokens, stream)? };
+    unsafe { update_tensor(&buffers.position_ids, &position_ids, stream)? };
+    unsafe { update_tensor(&buffers.slot_mapping, &slot_mapping, stream)? };
+
+    // ── cu_seqlens_q (length bucket_num_reqs + 1) ──
+    let mut cu_q: Vec<u32> = Vec::with_capacity(bucket_num_reqs + 1);
+    cu_q.push(0);
+    for r in requests {
+        cu_q.push(cu_q.last().unwrap() + r.tokens.len() as u32);
+    }
+    let last_q = *cu_q.last().unwrap();
+    for _ in num_reqs..bucket_num_reqs {
+        cu_q.push(last_q);
+    }
+    unsafe { update_tensor(&buffers.cu_seqlens_q, &cu_q, stream)? };
+
+    // ── cu_seqlens_k (length bucket_num_reqs + 1) ──
+    let mut cu_k: Vec<u32> = Vec::with_capacity(bucket_num_reqs + 1);
+    cu_k.push(0);
+    for r in requests {
+        cu_k.push(cu_k.last().unwrap() + r.context_len as u32);
+    }
+    let last_k = *cu_k.last().unwrap();
+    for _ in num_reqs..bucket_num_reqs {
+        cu_k.push(last_k);
+    }
+    unsafe { update_tensor(&buffers.cu_seqlens_k, &cu_k, stream)? };
+
+    // ── block_tables (bucket_num_reqs × max_blocks) ──
+    let max_blocks = buffers.max_blocks;
+    let mut flat_bt: Vec<u32> = Vec::with_capacity(bucket_num_reqs * max_blocks);
+    let mut per_seq_bt: Vec<Vec<u32>> = Vec::with_capacity(bucket_num_reqs);
+    for r in requests {
+        flat_bt.extend_from_slice(&r.block_table);
+        flat_bt.resize(flat_bt.len() + max_blocks - r.block_table.len(), 0);
+        per_seq_bt.push(r.block_table.clone());
+    }
+    let dummy_bt = &requests[0].block_table;
+    for _ in num_reqs..bucket_num_reqs {
+        flat_bt.extend_from_slice(dummy_bt);
+        flat_bt.resize(flat_bt.len() + max_blocks - dummy_bt.len(), 0);
+        per_seq_bt.push(dummy_bt.clone());
+    }
+    unsafe { update_tensor(&buffers.block_tables, &flat_bt, stream)? };
+
+    Ok(PrefillCpuData {
+        cu_seqlens_k: cu_k,
+        block_tables: per_seq_bt,
+    })
+}
+
+/// memcpy host data into a pre-allocated GPU tensor without realloc.
+/// Mirrors `cuda_graph::buffers::update_tensor` (same safety preconditions).
+unsafe fn update_tensor<T: GpuDType + candle_core::cuda_backend::CudaDType>(
+    tensor: &Tensor,
+    data: &[T],
+    stream: &Arc<CudaStream>,
+) -> Result<(), EngineError> {
+    debug_assert!(
+        data.len() <= tensor.elem_count(),
+        "update_tensor: data len {} exceeds tensor elem_count {}",
+        data.len(),
+        tensor.elem_count(),
+    );
+    let (guard, _layout) = tensor.storage_and_layout();
+    match &*guard {
+        prelude_core::tensor::Storage::Cuda(cs) => {
+            let slice = <T as candle_core::cuda_backend::CudaDType>::as_cuda_slice(cs)
+                .map_err(|e| EngineError::Internal(format!("as_cuda_slice: {e}")))?;
+            let (dev_ptr, _g) = slice.device_ptr(stream);
+            let raw_stream = stream.cu_stream();
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async(dev_ptr, data, raw_stream)
+                    .map_err(|e| EngineError::Internal(format!("memcpy_htod: {e}")))?;
+            }
+        }
+        _ => {
+            return Err(EngineError::Internal(
+                "update_tensor: expected CUDA storage".into(),
+            ));
+        }
+    }
+    Ok(())
 }
