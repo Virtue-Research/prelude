@@ -162,18 +162,19 @@ pub(crate) struct MixedGraphCache {
 }
 
 impl MixedGraphCache {
-    /// Capture a graph for one bucket. Steps mirror `DecodeGraphCache::capture`
-    /// but call `LogitsSplitModel::forward_hidden_states` (the body of the
-    /// model BEFORE `last_token_select` + `lm_head`) so the graph stays
-    /// independent of per-request CPU `seq_lens`.
+    /// Capture a graph for one bucket using `seed_requests` to seed the
+    /// buffers (so the warmup eager forward writes to the seed requests'
+    /// real KV cache slots — idempotent re-writes during the capture pass,
+    /// no scratch-block corruption of other in-flight requests).
     ///
-    /// `seqlen_k_capture` is the upper bound on per-request KV context
-    /// length the captured kernel will support — sets `max_blocks` for
-    /// `block_tables` and is passed to FA as `max_seqlen_k`.
+    /// `seqlen_k_capture` sets the upper bound on per-request KV context
+    /// length the captured kernel will support (drives `max_blocks` and
+    /// the FA `max_seqlen_k` scalar baked into the graph).
     pub(crate) fn capture(
         &mut self,
         engine: &Engine,
         key: BucketKey,
+        seed_requests: &[StepRequest],
         seqlen_k_capture: usize,
         block_size: usize,
     ) -> Result<(), EngineError> {
@@ -191,34 +192,15 @@ impl MixedGraphCache {
         })?;
         let stream = get_stream(device)?;
 
-        // KV cache needs enough blocks per request to cover both the
-        // new tokens for this step *and* the prior context. Size for
-        // the worst case: an entire bucket's worth of K seen by any
-        // single request.
         let max_blocks = (seqlen_k_capture + block_size - 1) / block_size;
         let buffers = MixedGraphBuffers::allocate(key, max_blocks, seqlen_k_capture, device)?;
 
-        // ── Initial buffer state (so the capture-time forward sees
-        //    well-formed input). Treat the bucket as "one request with
-        //    all `num_tokens` tokens, all other request slots empty".
-        //    Subsequent replays will overwrite these via update_buffers.
-        let mut init_cu_q: Vec<u32> = vec![0u32; key.num_reqs + 1];
-        // request 0 has all bucket tokens; later slots stay at cumulative=num_tokens
-        for v in init_cu_q.iter_mut().skip(1) {
-            *v = key.num_tokens as u32;
-        }
-        let init_cu_k = init_cu_q.clone();
-        let init_positions: Vec<u32> = (0..key.num_tokens as u32).collect();
-        let init_slots: Vec<i64> = (0..key.num_tokens as i64).collect();
-        let init_packed: Vec<u32> = vec![0u32; key.num_tokens];
-        let init_block_tables: Vec<u32> = vec![0u32; key.num_reqs * max_blocks];
-
-        unsafe { update_tensor(&buffers.packed_input, &init_packed, &stream)? };
-        unsafe { update_tensor(&buffers.position_ids, &init_positions, &stream)? };
-        unsafe { update_tensor(&buffers.slot_mapping, &init_slots, &stream)? };
-        unsafe { update_tensor(&buffers.cu_seqlens_q, &init_cu_q, &stream)? };
-        unsafe { update_tensor(&buffers.cu_seqlens_k, &init_cu_k, &stream)? };
-        unsafe { update_tensor(&buffers.block_tables, &init_block_tables, &stream)? };
+        // Seed the bucket buffers with real request data. Capture warmup
+        // then writes to real KV slots that already belong to these
+        // requests — overwriting their own values is a no-op semantically,
+        // so no foreign-request cache corruption.
+        let _cpu_seed =
+            update_buffers(&buffers, seed_requests, block_size, &stream)?;
 
         let mut model = engine
             .executor
@@ -365,9 +347,11 @@ impl MixedGraphCache {
         let real_total_tokens: usize = requests.iter().map(|r| r.tokens.len()).sum();
         let key = self.round_up(real_total_tokens, real_num_reqs)?;
 
-        // Capture lazily if this bucket hasn't been seen yet.
+        // Capture lazily if this bucket hasn't been seen yet, using the
+        // current requests as seeds so the warmup writes to their own
+        // KV slots (no foreign-request corruption).
         if !self.graphs.contains_key(&key) {
-            if let Err(e) = self.capture(engine, key, seqlen_k_capture, block_size) {
+            if let Err(e) = self.capture(engine, key, requests, seqlen_k_capture, block_size) {
                 tracing::warn!(?key, error = %e, "MixedGraph capture failed; falling back to eager");
                 return None;
             }
