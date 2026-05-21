@@ -68,13 +68,16 @@ ENGINES=(
     [llama.cpp]="llama-cpp|llama.cpp|8007|no|/health|120|native"
 )
 
-# Docker image per engine (only for docker-type engines)
+# Docker image per engine (only for docker-type engines).
+# vLLM and SGLang publish CUDA-specific tags; on hosts with CUDA 13 the
+# `cu130` builds are noticeably faster than the default `latest` (cu128).
+# Override individual tags via VLLM_IMAGE / SGLANG_IMAGE env vars.
 declare -A DOCKER_IMAGES
 DOCKER_IMAGES=(
-    [vllm]="vllm/vllm-openai:latest-cu130"
-    [vllm-cpu]="vllm/vllm-openai:latest"
-    [sglang]="lmsysorg/sglang:latest-cu130"
-    [sglang-cpu]="lmsysorg/sglang:latest"
+    [vllm]="${VLLM_IMAGE:-vllm/vllm-openai:latest-cu130-ubuntu2404}"
+    [vllm-cpu]="${VLLM_CPU_IMAGE:-vllm/vllm-openai:latest}"
+    [sglang]="${SGLANG_IMAGE:-lmsysorg/sglang:latest-cu130}"
+    [sglang-cpu]="${SGLANG_CPU_IMAGE:-lmsysorg/sglang:latest}"
 )
 
 # ── Helpers ──

@@ -35,15 +35,20 @@ INPUT_TOKENS=512 OUTPUT_TOKENS=32 MAX_REQUESTS=100 CONCURRENCY=4 \
 
 ## Engines and Docker Images
 
-| Engine    | Image                              | GPU            | CPU                     |
-|-----------|-------------------------------------|----------------|-------------------------|
-| prelude   | `prelude-dev` (root Dockerfile)     | Y              | Y (`--device cpu`)      |
-| vllm      | `vllm/vllm-openai:latest`          | Y              | Y (needs `vllm-cpu`)    |
-| sglang    | `lmsysorg/sglang:latest`           | Y              | Y (needs `sglang-cpu`)  |
-| llama.cpp | `prelude-others` (Dockerfile.others)| Y (`-ngl 99`)  | Y (`-ngl 0`)            |
-| vllm.rs   | `prelude-others` (Dockerfile.others)| Y              | N                       |
+| Engine    | Default GPU image                          | GPU            | CPU                     |
+|-----------|--------------------------------------------|----------------|-------------------------|
+| prelude   | `prelude-dev` (root Dockerfile)            | Y              | Y (`--device cpu`)      |
+| vllm      | `vllm/vllm-openai:latest-cu130-ubuntu2404` | Y              | Y (needs `vllm-cpu`)    |
+| sglang    | `lmsysorg/sglang:latest-cu130`     | Y              | Y (needs `sglang-cpu`)  |
+| llama.cpp | `prelude-others` (Dockerfile.others)       | Y (`-ngl 99`)  | Y (`-ngl 0`)            |
+| vllm.rs   | `prelude-others` (Dockerfile.others)       | Y              | N                       |
 
-Images are auto-built on first run and reused afterwards.
+Images are auto-built on first run and reused afterwards. The cu130
+defaults run noticeably faster on CUDA-13 hosts than the engines'
+default `:latest` tags (which currently ship a cu128 base); override
+via `VLLM_IMAGE` / `SGLANG_IMAGE` if you need a specific version. The
+top-level `benchmark/bench.sh` also accepts `--cu12` to swap both back
+to the `:latest` images.
 
 ## GGUF Auto-Conversion
 
@@ -82,6 +87,8 @@ docker build -f docker/xeon.Dockerfile -t sglang-cpu .
 | `PORT`         | `8000`             | Server port                    |
 | `HF_TOKEN`     | -                  | HuggingFace token (gated models)|
 | `LLAMA_CPP_CONVERT` | (auto-detected) | Path to convert_hf_to_gguf.py |
+| `VLLM_IMAGE`   | `vllm/vllm-openai:latest-cu130-ubuntu2404` | vLLM Docker image to pull/run |
+| `SGLANG_IMAGE` | `lmsysorg/sglang:latest-cu130`     | SGLang Docker image to pull/run |
 
 ## Results
 
