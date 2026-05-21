@@ -15,8 +15,9 @@ OUTPUT_PATH = Path("scratch_runs/policyguard_first10_vllm_outputs.jsonl")
 NUM_SAMPLES = 10
 MAX_TOKENS = 3
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000/v1")
-VLLM_API_KEY = os.environ.get("VLLM_API_KEY", "token-abc123")
-VLLM_MODEL = os.environ.get("VLLM_MODEL", MODEL_ID)
+VLLM_API_KEY = os.environ.get("VLLM_API_KEY")
+# launch_vllm.sh uses --served-model-name topicguard, so make it the default.
+VLLM_MODEL = os.environ.get("VLLM_MODEL", "topicguard")
 REQUEST_TIMEOUT_S = 600
 STOP = ["<|im_end|>"]
 
@@ -67,13 +68,15 @@ def generate_one(messages):
         "stop": STOP,
     }
     data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    # Only attach auth header when the server is started with --api-key.
+    if VLLM_API_KEY:
+        headers["Authorization"] = f"Bearer {VLLM_API_KEY}"
+
     req = request.Request(
         f"{VLLM_BASE_URL.rstrip('/')}/chat/completions",
         data=data,
-        headers={
-            "Authorization": f"Bearer {VLLM_API_KEY}",
-            "Content-Type": "application/json",
-        },
+        headers=headers,
         method="POST",
     )
 
