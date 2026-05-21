@@ -434,12 +434,26 @@ impl MixedGraphCache {
     }
 
     pub(crate) fn new(config: &EngineConfig, model_supports_graph: bool) -> Self {
-        let enabled = enabled_from_config(config, model_supports_graph);
+        // Opt-in via env var. The whole-forward bucket-capture design
+        // measurably regresses variable-length workloads (chatml c=32
+        // shows -23% RPS, c=128 shows -9%) because chunked-prefill
+        // chunks of 100-500 tokens get rounded up to 256/512 buckets,
+        // costing 50%+ padding overhead that exceeds the saved CUDA
+        // dispatch time. Closing that gap properly needs per-layer
+        // piecewise capture (vLLM-style) so non-attention pieces run
+        // at the exact `num_tokens` — that's a separate (much larger)
+        // workstream. For now the cache stays off by default; opt-in
+        // to experiment on workloads with uniform prefill chunk sizes
+        // (e.g., synthetic D(1900,3)).
+        let opt_in = std::env::var("PRELUDE_ENABLE_MIXED_GRAPH")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let enabled = enabled_from_config(config, model_supports_graph) && opt_in;
         if enabled {
             tracing::info!(
                 token_buckets = ?TOKEN_BUCKETS,
                 req_buckets = ?REQ_BUCKETS,
-                "MixedGraphCache enabled — lazy capture on first use"
+                "MixedGraphCache enabled (PRELUDE_ENABLE_MIXED_GRAPH=1) — lazy capture on first use"
             );
         }
         Self {
