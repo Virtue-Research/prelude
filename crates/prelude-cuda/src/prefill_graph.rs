@@ -57,8 +57,9 @@ use std::sync::Arc;
 use cudarc::driver::{CudaStream, DevicePtr};
 use prelude_core::cache::block_manager::BlockManager;
 use prelude_core::config::EngineConfig;
-use prelude_core::engine::EngineError;
 use prelude_core::engine::executor::StepRequest;
+use prelude_core::engine::{Engine, EngineError};
+use prelude_core::models::commons::{BatchAttnContext, PagedKvBatchContext};
 use prelude_core::tensor::{DType, Device, Tensor};
 
 use crate::device::GpuDType;
@@ -161,6 +162,293 @@ pub(crate) struct MixedGraphCache {
 }
 
 impl MixedGraphCache {
+    /// Capture a graph for one bucket. Steps mirror `DecodeGraphCache::capture`
+    /// but call `LogitsSplitModel::forward_hidden_states` (the body of the
+    /// model BEFORE `last_token_select` + `lm_head`) so the graph stays
+    /// independent of per-request CPU `seq_lens`.
+    ///
+    /// `seqlen_k_capture` is the upper bound on per-request KV context
+    /// length the captured kernel will support — sets `max_blocks` for
+    /// `block_tables` and is passed to FA as `max_seqlen_k`.
+    pub(crate) fn capture(
+        &mut self,
+        engine: &Engine,
+        key: BucketKey,
+        seqlen_k_capture: usize,
+        block_size: usize,
+    ) -> Result<(), EngineError> {
+        if !self.enabled {
+            return Err(EngineError::Internal(
+                "MixedGraphCache::capture called while disabled".into(),
+            ));
+        }
+        if self.graphs.contains_key(&key) {
+            return Ok(()); // already captured
+        }
+        let device = &engine.executor.device;
+        let pool = engine.cache.paged_pool.as_ref().ok_or_else(|| {
+            EngineError::Internal("mixed prefill graph capture requires paged pool".into())
+        })?;
+        let stream = get_stream(device)?;
+
+        // KV cache needs enough blocks per request to cover both the
+        // new tokens for this step *and* the prior context. Size for
+        // the worst case: an entire bucket's worth of K seen by any
+        // single request.
+        let max_blocks = (seqlen_k_capture + block_size - 1) / block_size;
+        let buffers = MixedGraphBuffers::allocate(key, max_blocks, seqlen_k_capture, device)?;
+
+        // ── Initial buffer state (so the capture-time forward sees
+        //    well-formed input). Treat the bucket as "one request with
+        //    all `num_tokens` tokens, all other request slots empty".
+        //    Subsequent replays will overwrite these via update_buffers.
+        let mut init_cu_q: Vec<u32> = vec![0u32; key.num_reqs + 1];
+        // request 0 has all bucket tokens; later slots stay at cumulative=num_tokens
+        for v in init_cu_q.iter_mut().skip(1) {
+            *v = key.num_tokens as u32;
+        }
+        let init_cu_k = init_cu_q.clone();
+        let init_positions: Vec<u32> = (0..key.num_tokens as u32).collect();
+        let init_slots: Vec<i64> = (0..key.num_tokens as i64).collect();
+        let init_packed: Vec<u32> = vec![0u32; key.num_tokens];
+        let init_block_tables: Vec<u32> = vec![0u32; key.num_reqs * max_blocks];
+
+        unsafe { update_tensor(&buffers.packed_input, &init_packed, &stream)? };
+        unsafe { update_tensor(&buffers.position_ids, &init_positions, &stream)? };
+        unsafe { update_tensor(&buffers.slot_mapping, &init_slots, &stream)? };
+        unsafe { update_tensor(&buffers.cu_seqlens_q, &init_cu_q, &stream)? };
+        unsafe { update_tensor(&buffers.cu_seqlens_k, &init_cu_k, &stream)? };
+        unsafe { update_tensor(&buffers.block_tables, &init_block_tables, &stream)? };
+
+        let mut model = engine
+            .executor
+            .model
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("model lock poisoned: {e}")))?;
+        let lm = model.as_logits_model_mut().ok_or_else(|| {
+            EngineError::Internal(
+                "mixed prefill graph capture: model doesn't implement LogitsSplitModel".into(),
+            )
+        })?;
+
+        let key_caches = pool.active_key_caches();
+        let value_caches = pool.active_value_caches();
+
+        // q_seq_lens shouldn't actually be read by forward_hidden_states
+        // (no last_token_select inside), but the field is non-optional
+        // on BatchAttnContext. Use a benign "one token per request".
+        let q_seq_lens: Vec<usize> = vec![1usize; key.num_reqs];
+
+        // Macro so capture and warmup phases construct an identical ctx
+        // referencing the bucket buffers.
+        macro_rules! run_forward {
+            ($lm:expr, $manage:expr) => {{
+                let paged_kv = PagedKvBatchContext {
+                    key_caches: &key_caches,
+                    value_caches: &value_caches,
+                    slot_mapping: &buffers.slot_mapping,
+                    block_tables: &buffers.block_tables,
+                    cu_seqlens_k: &buffers.cu_seqlens_k,
+                    max_seqlen_k: seqlen_k_capture,
+                };
+                let mut ctx = BatchAttnContext {
+                    ops: engine.executor.ops,
+                    cu_seqlens_q: &buffers.cu_seqlens_q,
+                    max_seqlen_q: key.num_tokens,
+                    position_ids: &buffers.position_ids,
+                    seq_lens: &q_seq_lens,
+                    paged_kv: Some(&paged_kv),
+                    deltanet_pool: None,
+                    deltanet_slots: None,
+                    deltanet_state_is_zero: None,
+                    deltanet_slots_gpu: None,
+                };
+                if $manage {
+                    engine.executor.ops.begin_forward();
+                }
+                let result = $lm
+                    .forward_hidden_states(&buffers.packed_input, &mut ctx)
+                    .map_err(tensor_err);
+                if $manage {
+                    engine.executor.ops.end_forward();
+                }
+                result
+            }};
+        }
+
+        // Warmup eager forward — primes any lazy state (FA plan caches,
+        // kernel registries) so the captured graph contains the steady-state
+        // kernel launches.
+        let _ = run_forward!(lm, true)?;
+        stream
+            .synchronize()
+            .map_err(|e| EngineError::Internal(format!("warmup sync: {e}")))?;
+
+        // Pre-compute FlashInfer plan against the bucket buffers. The
+        // captured FA kernel reads the populated plan tensors directly.
+        {
+            let num_qo_heads = engine.executor.config.num_attention_heads;
+            let head_dim = engine.executor.config.head_dim;
+            crate::attn::flashinfer::precompute_paged_plan_capture(
+                (key.num_reqs, num_qo_heads, head_dim),
+                &key_caches[0],
+                &buffers.cu_seqlens_q,
+                &buffers.block_tables,
+                &buffers.cu_seqlens_k,
+                1.0 / (head_dim as f32).sqrt(),
+                &buffers.fi_indptr,
+                &buffers.fi_indices,
+                &buffers.fi_last_page_len,
+            )
+            .map_err(tensor_err)?;
+        }
+
+        tracing::debug!(
+            num_tokens = key.num_tokens,
+            num_reqs = key.num_reqs,
+            "MixedGraph: begin_capture"
+        );
+        stream
+            .begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )
+            .map_err(|e| EngineError::Internal(format!("begin_capture: {e}")))?;
+
+        // Plan was pre-populated above; skip begin/end_forward inside capture.
+        let hidden_output = run_forward!(lm, false)?;
+
+        let graph = stream
+            .end_capture(
+                cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+            )
+            .map_err(|e| EngineError::Internal(format!("end_capture: {e}")))?
+            .ok_or_else(|| EngineError::Internal("end_capture returned None".into()))?;
+
+        drop(model);
+
+        tracing::info!(
+            num_tokens = key.num_tokens,
+            num_reqs = key.num_reqs,
+            "MixedGraph captured"
+        );
+        self.graphs.insert(
+            key,
+            CapturedMixedGraph {
+                graph,
+                buffers,
+                hidden_output,
+            },
+        );
+        Ok(())
+    }
+
+    /// Try to dispatch a prefill step through the cache. On first
+    /// encounter of a bucket, captures lazily. On subsequent hits,
+    /// updates the bucket buffers from `requests` and replays. Returns
+    /// `Some(Ok(hidden_view))` with shape `[real_total_tokens, hidden]`
+    /// — caller does eager `last_token_select` + `lm_head`.
+    ///
+    /// `seqlen_k_capture` is only consulted on first-time capture. It
+    /// should be the engine's `max_position_embeddings` or a per-bucket
+    /// upper bound large enough to cover any expected `max_seqlen_k`.
+    pub(crate) fn try_replay(
+        &mut self,
+        engine: &Engine,
+        requests: &[StepRequest],
+        seqlen_k_capture: usize,
+        block_size: usize,
+    ) -> Option<Result<Tensor, EngineError>> {
+        if !self.enabled || requests.is_empty() {
+            return None;
+        }
+        let real_num_reqs = requests.len();
+        let real_total_tokens: usize = requests.iter().map(|r| r.tokens.len()).sum();
+        let key = self.round_up(real_total_tokens, real_num_reqs)?;
+
+        // Capture lazily if this bucket hasn't been seen yet.
+        if !self.graphs.contains_key(&key) {
+            if let Err(e) = self.capture(engine, key, seqlen_k_capture, block_size) {
+                tracing::warn!(?key, error = %e, "MixedGraph capture failed; falling back to eager");
+                return None;
+            }
+        }
+        let captured = self.graphs.get(&key)?;
+
+        // Check that the real request's KV context fits within the
+        // captured `max_seqlen_k`.
+        let max_seqlen_k_real: usize = requests.iter().map(|r| r.context_len).max().unwrap_or(0);
+        if max_seqlen_k_real > captured.buffers.max_seqlen_k_capture {
+            tracing::debug!(
+                max_seqlen_k_real,
+                cap = captured.buffers.max_seqlen_k_capture,
+                "MixedGraph: real context exceeds capture cap; falling back"
+            );
+            return None;
+        }
+
+        // Block-table fit check.
+        let actual_max_blocks = requests
+            .iter()
+            .map(|r| r.block_table.len())
+            .max()
+            .unwrap_or(0);
+        if actual_max_blocks > captured.buffers.max_blocks {
+            return None;
+        }
+
+        let stream = match get_stream(&engine.executor.device) {
+            Ok(s) => s,
+            Err(e) => return Some(Err(e)),
+        };
+
+        // Update buffers (pad to bucket).
+        let cpu_data = match update_buffers(&captured.buffers, requests, block_size, &stream) {
+            Ok(d) => d,
+            Err(e) => return Some(Err(e)),
+        };
+
+        // Recompute FlashInfer plan at bucket size.
+        {
+            let pool = engine.cache.paged_pool.as_ref()?;
+            let key_caches = pool.active_key_caches();
+            let num_qo_heads = engine.executor.config.num_attention_heads;
+            let head_dim = engine.executor.config.head_dim;
+            if let Err(e) = crate::attn::flashinfer::precompute_paged_plan_replay(
+                (key.num_reqs, num_qo_heads, head_dim),
+                &key_caches[0],
+                &cpu_data.cu_seqlens_k,
+                &cpu_data.block_tables,
+                block_size,
+                &captured.buffers.fi_indptr,
+                &captured.buffers.fi_indices,
+                &captured.buffers.fi_last_page_len,
+            )
+            .map_err(tensor_err)
+            {
+                return Some(Err(e));
+            }
+        }
+
+        // Replay and slice the hidden output back to `real_total_tokens`.
+        match captured.graph.launch() {
+            Ok(()) => {
+                if real_total_tokens == key.num_tokens {
+                    Some(Ok(captured.hidden_output.clone()))
+                } else {
+                    Some(
+                        captured
+                            .hidden_output
+                            .narrow(0, 0, real_total_tokens)
+                            .map_err(tensor_err),
+                    )
+                }
+            }
+            Err(e) => Some(Err(EngineError::Internal(format!(
+                "MixedGraph replay failed: {e}"
+            )))),
+        }
+    }
+
     pub(crate) fn new(config: &EngineConfig, model_supports_graph: bool) -> Self {
         let enabled = enabled_from_config(config, model_supports_graph);
         if enabled {
