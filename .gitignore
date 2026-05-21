@@ -6,9 +6,12 @@ target/
 temp/
 .claude/
 bench_results/
+hf_downloads/
 benchmark/__pycache__/
 __pycache__/
 /models/
+random_sample_10.txt
+policy_group_counts_*.txt
 
 # Local-only runs of external benchmarking harnesses
 benchmark/results/

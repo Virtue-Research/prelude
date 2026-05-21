@@ -23,6 +23,8 @@ MODEL="${MODEL:-Virtue-AI-HUB/topicguard-qwen3-15b-bf16-272k-compact-nouserprefi
 DATASET_URL="${DATASET_URL:-https://huggingface.co/datasets/Virtue-AI-HUB/PolicyGuardData/blob/main/jingyang/labeled_272k_20260513_compact_nouserprefix_chatml.jsonl}"
 SAMPLES="${SAMPLES:-10}"
 WARMUP_SAMPLES="${WARMUP_SAMPLES:-5}"
+SAMPLE_MODE="${SAMPLE_MODE:-random}"
+RANDOM_SEED="${RANDOM_SEED:-20260521}"
 MAX_TOKENS="${MAX_TOKENS:-3}"
 TEMPERATURE="${TEMPERATURE:-0}"
 REQUEST_TIMEOUT_S="${REQUEST_TIMEOUT_S:-120}"
@@ -206,11 +208,14 @@ run_policyguard_eval() {
     TEMPERATURE_VALUE="$TEMPERATURE" \
     SAMPLES_VALUE="$SAMPLES" \
     WARMUP_SAMPLES_VALUE="$WARMUP_SAMPLES" \
+    SAMPLE_MODE_VALUE="$SAMPLE_MODE" \
+    RANDOM_SEED_VALUE="$RANDOM_SEED" \
     REQUEST_TIMEOUT_S_VALUE="$REQUEST_TIMEOUT_S" \
     HF_TOKEN_VALUE="$HF_TOKEN" \
     python3 - <<'PY'
 import json
 import os
+import random
 import statistics
 import time
 import urllib.error
@@ -223,21 +228,38 @@ def normalize_dataset_url(url: str) -> str:
     return url
 
 
-def load_first_jsonl_rows(url: str, n: int):
+def load_jsonl_rows(url: str, n: int, sample_mode: str, random_seed: int):
     headers = {"User-Agent": "policyguard-bench"}
     hf_token = os.environ.get("HF_TOKEN_VALUE", "")
     if hf_token:
         headers["Authorization"] = f"Bearer {hf_token}"
     req = urllib.request.Request(normalize_dataset_url(url), headers=headers)
+    if sample_mode not in {"first", "random"}:
+        raise ValueError(f"unsupported SAMPLE_MODE={sample_mode!r}, expected 'first' or 'random'")
+
+    rng = random.Random(random_seed)
     rows = []
+    seen = 0
     with urllib.request.urlopen(req, timeout=60) as resp:
         for raw in resp:
-            if len(rows) >= n:
-                break
             line = raw.decode("utf-8").strip()
             if not line:
                 continue
-            rows.append(json.loads(line))
+            item = json.loads(line)
+            if sample_mode == "first":
+                if len(rows) < n:
+                    rows.append(item)
+                else:
+                    break
+            else:
+                # Reservoir sampling: uniform random sample without loading full file.
+                seen += 1
+                if len(rows) < n:
+                    rows.append(item)
+                else:
+                    j = rng.randint(1, seen)
+                    if j <= n:
+                        rows[j - 1] = item
     return rows
 
 
@@ -288,9 +310,16 @@ max_tokens = int(os.environ["MAX_TOKENS_VALUE"])
 temperature = float(os.environ["TEMPERATURE_VALUE"])
 samples = int(os.environ["SAMPLES_VALUE"])
 warmup_samples = int(os.environ.get("WARMUP_SAMPLES_VALUE", "0"))
+sample_mode = os.environ.get("SAMPLE_MODE_VALUE", "first")
+random_seed = int(os.environ.get("RANDOM_SEED_VALUE", "42"))
 timeout_s = int(os.environ["REQUEST_TIMEOUT_S_VALUE"])
 
-rows = load_first_jsonl_rows(dataset_url, samples + warmup_samples)
+rows = load_jsonl_rows(
+    dataset_url,
+    samples + warmup_samples,
+    sample_mode=sample_mode,
+    random_seed=random_seed,
+)
 warmup_rows = rows[:warmup_samples]
 eval_rows = rows[warmup_samples : warmup_samples + samples]
 latencies = []
@@ -368,6 +397,8 @@ else:
 
 stats = {
     "samples_requested": samples,
+    "sample_mode": sample_mode,
+    "random_seed": random_seed,
     "warmup_requested": warmup_samples,
     "warmup_loaded": len(warmup_rows),
     "samples_loaded": len(eval_rows),
@@ -472,6 +503,86 @@ run_engine() {
     sleep 2
 }
 
+print_sample_preview() {
+    DATASET_URL_VALUE="$DATASET_URL" \
+    SAMPLES_VALUE="$SAMPLES" \
+    WARMUP_SAMPLES_VALUE="$WARMUP_SAMPLES" \
+    SAMPLE_MODE_VALUE="$SAMPLE_MODE" \
+    RANDOM_SEED_VALUE="$RANDOM_SEED" \
+    HF_TOKEN_VALUE="$HF_TOKEN" \
+    python3 - <<'PY'
+import json
+import os
+import random
+import urllib.request
+
+
+def normalize_dataset_url(url: str) -> str:
+    if "/blob/" in url:
+        return url.replace("/blob/", "/resolve/")
+    return url
+
+
+def load_jsonl_rows(url: str, n: int, sample_mode: str, random_seed: int):
+    headers = {"User-Agent": "policyguard-bench-preview"}
+    hf_token = os.environ.get("HF_TOKEN_VALUE", "")
+    if hf_token:
+        headers["Authorization"] = f"Bearer {hf_token}"
+    req = urllib.request.Request(normalize_dataset_url(url), headers=headers)
+    if sample_mode not in {"first", "random"}:
+        raise ValueError(f"unsupported SAMPLE_MODE={sample_mode!r}, expected 'first' or 'random'")
+
+    rng = random.Random(random_seed)
+    rows = []
+    seen = 0
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8").strip()
+            if not line:
+                continue
+            item = json.loads(line)
+            if sample_mode == "first":
+                if len(rows) < n:
+                    rows.append(item)
+                else:
+                    break
+            else:
+                seen += 1
+                if len(rows) < n:
+                    rows.append(item)
+                else:
+                    j = rng.randint(1, seen)
+                    if j <= n:
+                        rows[j - 1] = item
+    return rows
+
+
+def one_line(s: str, n: int = 140) -> str:
+    s = " ".join(s.split())
+    return s[:n] + ("..." if len(s) > n else "")
+
+
+samples = int(os.environ["SAMPLES_VALUE"])
+warmup = int(os.environ["WARMUP_SAMPLES_VALUE"])
+sample_mode = os.environ.get("SAMPLE_MODE_VALUE", "random")
+seed = int(os.environ.get("RANDOM_SEED_VALUE", "20260521"))
+dataset_url = os.environ["DATASET_URL_VALUE"]
+
+rows = load_jsonl_rows(dataset_url, samples + warmup, sample_mode=sample_mode, random_seed=seed)
+eval_rows = rows[warmup : warmup + samples]
+
+print("")
+print("=== Sample Preview (evaluation set) ===")
+print(f"mode={sample_mode} seed={seed} warmup={warmup} eval={len(eval_rows)}")
+for i, row in enumerate(eval_rows, start=1):
+    msgs = row.get("messages", [])
+    user = next((m.get("content", "") for m in msgs if m.get("role") == "user"), "")
+    assistant = next((m.get("content", "") for m in msgs if m.get("role") == "assistant"), "")
+    label = assistant.split("|", 1)[0] if assistant else ""
+    print(f"{i:02d}\t{label}\t{one_line(user)}")
+PY
+}
+
 print_summary() {
     CSV_FILE_VALUE="$CSV_FILE" python3 - <<'PY'
 import csv
@@ -542,6 +653,7 @@ fi
 log "Model: $MODEL"
 log "Dataset: $DATASET_URL"
 log "Samples: $SAMPLES (+warmup=$WARMUP_SAMPLES), max_tokens=$MAX_TOKENS, temperature=$TEMPERATURE"
+log "Sample mode: $SAMPLE_MODE (seed=$RANDOM_SEED)"
 if [ "$FILTER" != "cpu" ]; then
     log "Selected idle GPU: $CUDA_VISIBLE_DEVICES"
 fi
@@ -551,6 +663,7 @@ else
     warn "HF token not set (HF_TOKEN/HUGGING_FACE_HUB_TOKEN). Private/gated model or dataset may fail with 401."
 fi
 log "Results dir: $RESULTS_DIR"
+print_sample_preview
 
 run_single() {
     local target="$1"
