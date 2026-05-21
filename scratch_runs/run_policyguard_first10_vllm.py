@@ -14,6 +14,7 @@ DATA_FILE = "chat_prompts.jsonl"
 OUTPUT_PATH = Path("scratch_runs/policyguard_first10_vllm_outputs.jsonl")
 NUM_SAMPLES = 10
 MAX_TOKENS = 3
+WARMUP_REQUESTS = 2
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000/v1")
 VLLM_API_KEY = os.environ.get("VLLM_API_KEY")
 # launch_vllm.sh uses --served-model-name topicguard, so make it the default.
@@ -103,6 +104,12 @@ def main():
 
     print(f"Loaded {len(samples)} samples from {DATASET_ID}/{DATA_FILE}")
     print(f"Calling vLLM server at {VLLM_BASE_URL} with model={VLLM_MODEL!r}")
+    warmup_count = min(WARMUP_REQUESTS, len(samples))
+    if warmup_count > 0:
+        print(f"Running {warmup_count} warmup request(s)...")
+        for i in range(warmup_count):
+            generate_one(samples[i]["input_messages"])
+        print("Warmup complete. Starting timed run.")
 
     rows = []
     started = time.time()
@@ -119,12 +126,27 @@ def main():
         print(f"[{row['index']}] {row['elapsed_s']}s pred={row['prediction']!r}")
 
     elapsed = time.time() - started
+    avg_elapsed_s = sum(row["elapsed_s"] for row in rows) / len(rows) if rows else 0.0
 
     with open(OUTPUT_PATH, "w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        summary = {
+            "type": "summary",
+            "dataset": f"{DATASET_ID}/{DATA_FILE}",
+            "model": VLLM_MODEL,
+            "base_url": VLLM_BASE_URL,
+            "num_samples": len(rows),
+            "warmup_requests": warmup_count,
+            "max_tokens": MAX_TOKENS,
+            "total_elapsed_s": round(elapsed, 3),
+            "avg_elapsed_s": round(avg_elapsed_s, 3),
+            "output_path": str(OUTPUT_PATH),
+        }
+        handle.write(json.dumps(summary, ensure_ascii=False) + "\n")
 
     print(f"Generated {len(rows)} outputs in {elapsed:.2f}s")
+    print(f"Average per-sample latency: {avg_elapsed_s:.3f}s")
     print(f"Wrote {OUTPUT_PATH}")
     for row in rows:
         print(f"[{row['index']}] pred={row['prediction']!r}")
