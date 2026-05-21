@@ -22,6 +22,7 @@ PRELUDE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 MODEL="${MODEL:-Virtue-AI-HUB/topicguard-qwen3-15b-bf16-272k-compact-nouserprefix}"
 DATASET_URL="${DATASET_URL:-https://huggingface.co/datasets/Virtue-AI-HUB/PolicyGuardData/blob/main/jingyang/labeled_272k_20260513_compact_nouserprefix_chatml.jsonl}"
 SAMPLES="${SAMPLES:-10}"
+WARMUP_SAMPLES="${WARMUP_SAMPLES:-5}"
 MAX_TOKENS="${MAX_TOKENS:-3}"
 TEMPERATURE="${TEMPERATURE:-0}"
 REQUEST_TIMEOUT_S="${REQUEST_TIMEOUT_S:-120}"
@@ -192,6 +193,9 @@ run_policyguard_eval() {
 
     mkdir -p "$run_dir"
     log "Running first ${SAMPLES} samples: $display ($device), max_tokens=$MAX_TOKENS"
+    if [ "$WARMUP_SAMPLES" -gt 0 ]; then
+        log "Warmup samples: $WARMUP_SAMPLES (not counted in summary)"
+    fi
 
     API_BASE="$api_base" \
     MODEL_NAME="$MODEL" \
@@ -201,6 +205,7 @@ run_policyguard_eval() {
     MAX_TOKENS_VALUE="$MAX_TOKENS" \
     TEMPERATURE_VALUE="$TEMPERATURE" \
     SAMPLES_VALUE="$SAMPLES" \
+    WARMUP_SAMPLES_VALUE="$WARMUP_SAMPLES" \
     REQUEST_TIMEOUT_S_VALUE="$REQUEST_TIMEOUT_S" \
     HF_TOKEN_VALUE="$HF_TOKEN" \
     python3 - <<'PY'
@@ -282,15 +287,34 @@ stats_json = os.environ["STATS_JSON"]
 max_tokens = int(os.environ["MAX_TOKENS_VALUE"])
 temperature = float(os.environ["TEMPERATURE_VALUE"])
 samples = int(os.environ["SAMPLES_VALUE"])
+warmup_samples = int(os.environ.get("WARMUP_SAMPLES_VALUE", "0"))
 timeout_s = int(os.environ["REQUEST_TIMEOUT_S_VALUE"])
 
-rows = load_first_jsonl_rows(dataset_url, samples)
+rows = load_first_jsonl_rows(dataset_url, samples + warmup_samples)
+warmup_rows = rows[:warmup_samples]
+eval_rows = rows[warmup_samples : warmup_samples + samples]
 latencies = []
 successes = 0
 errors = 0
 
+# Warmup requests are sent but excluded from final stats/output file.
+for row in warmup_rows:
+    messages = to_messages(row)
+    try:
+        call_chat(
+            api_base=api_base,
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            timeout_s=timeout_s,
+        )
+    except Exception:
+        # Warmup failures should not fail the run; evaluation phase remains authoritative.
+        pass
+
 with open(output_jsonl, "w", encoding="utf-8") as fout:
-    for idx, row in enumerate(rows):
+    for idx, row in enumerate(eval_rows):
         messages = to_messages(row)
         record = {
             "index": idx,
@@ -344,7 +368,9 @@ else:
 
 stats = {
     "samples_requested": samples,
-    "samples_loaded": len(rows),
+    "warmup_requested": warmup_samples,
+    "warmup_loaded": len(warmup_rows),
+    "samples_loaded": len(eval_rows),
     "successes": successes,
     "errors": errors,
     "avg_latency_ms": avg_ms,
@@ -515,7 +541,7 @@ fi
 
 log "Model: $MODEL"
 log "Dataset: $DATASET_URL"
-log "Samples: $SAMPLES, max_tokens=$MAX_TOKENS, temperature=$TEMPERATURE"
+log "Samples: $SAMPLES (+warmup=$WARMUP_SAMPLES), max_tokens=$MAX_TOKENS, temperature=$TEMPERATURE"
 if [ "$FILTER" != "cpu" ]; then
     log "Selected idle GPU: $CUDA_VISIBLE_DEVICES"
 fi
