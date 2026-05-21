@@ -1,230 +1,224 @@
-//! Piecewise CUDA graph capture/replay for prefill steps.
+//! Mixed prefill/decode CUDA graph capture/replay.
 //!
-//! Closes the prefill TTFT gap with vLLM's `cudagraph_mode=FULL_AND_PIECEWISE`:
-//! vLLM splits the model at attention via `torch.compile` and CUDA-graphs
-//! every non-attention piece; prelude historically ran prefill fully eager
-//! and paid the per-layer kernel-launch overhead 48 times.
+//! `DecodeGraphCache` covers the pure-decode (Q=1 per slot) hot path
+//! with one graph per batch size. For mixed prefill+decode batches —
+//! which dominate TTFT — we need a separate cache keyed on
+//! `(num_tokens, num_requests)` where the packed-input + cu_seqlens
+//! shapes vary per call.
 //!
-//! ## Design
+//! ## Approach (post-investigation of vLLM v0.20 cu130)
 //!
-//! Prelude doesn't have `torch.compile`, so we hand-split the model into
-//! pieces in the model code itself (see `Qwen3Attention::{forward_pre_attn,
-//! forward_attention, forward_post_attn}` and the matching MoE decoder
-//! layer methods). The runtime composition per layer is:
+//! vLLM's `cudagraph_mode=FULL_AND_PIECEWISE` splits the model at
+//! `unified_attention_with_output` via torch.compile and captures
+//! every non-attention piece into its own CUDA graph. That requires
+//! per-layer per-piece per-bucket capture (~48*2*N graphs) and the
+//! associated buffer-stitching machinery.
 //!
-//! ```text
-//! pre_piece  = input_norm + QKV proj + QK-norm + RoPE + paged KV write
-//! attention  = paged_attention (eager — cu_seqlens varies per call)
-//! post_piece = O proj + post-attn norm + MoE FFN
-//! ```
+//! prelude doesn't have torch.compile, so we take the simpler route
+//! that's still tractable: capture the *whole* `forward_hidden_states`
+//! call at a discrete set of `num_tokens` buckets. Attention's kernel
+//! reads `cu_seqlens_q` / `cu_seqlens_k` from GPU tensors at runtime,
+//! so the same captured graph handles any seq-length distribution
+//! that fits the bucket. `last_token_select` + `lm_head` run eager
+//! after replay (they depend on per-request CPU `seq_lens`).
 //!
-//! Both pieces are *shape-stable in `num_tokens`*: every kernel inside
-//! depends only on the packed token count, never on per-sequence
-//! boundaries. So a graph captured at `num_tokens = 4096` replays for
-//! any prefill packed to that bucket — extra padding rows are inert.
+//! ## Buffer set per bucket
 //!
-//! ## Capture strategy (lazy, like vLLM's `CUDAGraphWrapper`)
+//! - `packed_input`  `(bucket_num_tokens,)` U32
+//! - `position_ids`  `(bucket_num_tokens,)` U32
+//! - `slot_mapping`  `(bucket_num_tokens,)` I64
+//! - `cu_seqlens_q`  `(bucket_num_reqs + 1,)` U32 — updated each replay
+//! - `cu_seqlens_k`  `(bucket_num_reqs + 1,)` U32 — updated each replay
+//! - `block_tables`  `(bucket_num_reqs, max_blocks)` U32
+//! - FlashInfer plan buffers (`fi_indptr`, `fi_indices`, `fi_last_page_len`)
 //!
-//! - Capture sizes are picked from a sparse list (1, 32, 64, 128, 256,
-//!   512, 1024, 2048, 4096, 8192) — every dispatch rounds up to the
-//!   smallest enclosing bucket.
-//! - We capture on **first encounter** of a `(bucket, layer_idx, piece)`
-//!   triple, not at startup. Saves multi-minute warmup over the ~1800
-//!   graph instantiations that exhaustive capture would imply, and only
-//!   pays for buckets the real workload actually hits.
+//! All addresses are fixed at allocation time; on replay we
+//! `memcpy_htod` the actual contents into the same buffers, recompute
+//! the FA plan, then launch the captured graph.
 //!
-//! ## Shared persistent buffers per bucket
+//! ## Dispatch
 //!
-//! Each bucket owns one set of fixed-address tensors that every layer's
-//! pieces read from / write to:
+//! At call time we round `num_tokens` up to the smallest captured
+//! bucket and pad `num_requests` similarly. Padded request slots get
+//! zero-length sequences (`cu_seqlens_q[i] == cu_seqlens_q[i+1]`); the
+//! FA inner loop emits no rows for those, so the captured kernel can
+//! be shared cleanly across actual `num_requests` values up to the
+//! bucket maximum. Token-side padding past the actual `num_tokens` is
+//! written from a dummy slot reused across the padded region.
 //!
-//! - `hidden`   `[bucket, hidden_size]`   layer input + post-piece output
-//! - `residual` `[bucket, hidden_size]`   running residual carry-in/out
-//! - `q`        `[bucket, num_heads, head_dim]`     pre-piece Q output
-//! - `k` / `v`  `[bucket, num_kv_heads, head_dim]`  pre-piece K, V
-//! - `attn_out` `[bucket, num_heads, head_dim]`     attention output
-//!
-//! The captured graphs reference these addresses directly. Between
-//! layers, the post-piece writes back into `hidden` so layer i+1's
-//! pre-piece reads the same buffer — no buffer ping-pong needed.
-//!
-//! ## Dispatch flow at runtime
-//!
-//! ```text
-//! prefill step with num_tokens = N:
-//!   bucket = round_up(N, capture_sizes)
-//!   buffers = ensure_buffers(bucket)
-//!   pad N → bucket (zero-fill the extra rows in hidden)
-//!   for layer in 0..num_layers:
-//!     pre_graph[bucket][layer].replay()      # reads hidden, writes q,k,v
-//!     attn_out_eager = attention_eager(q, k, v, ctx)   # reads true cu_seqlens
-//!     # ensure attn_out lives at the captured address (memcpy if needed)
-//!     post_graph[bucket][layer].replay()     # reads attn_out + residual, writes hidden
-//!   slice hidden[..N] back to the caller
-//! ```
-//!
-//! Attention itself is the only thing not graphed (its kernel registry
-//! is keyed on per-sequence varlen state).
-//!
-//! ## Wiring (TODO: subsequent commits)
-//!
-//! 1. **Buffer allocation** (`BucketBuffers::allocate`) — fix sizes from
-//!    the model config (`hidden_size`, `num_heads`, `num_kv_heads`,
-//!    `head_dim`) and pre-allocate on the model device.
-//! 2. **Graph capture for one piece** (`PrefillGraphCache::capture_pre` /
-//!    `capture_post`) — modelled after `DecodeGraphCache::capture` in
-//!    `cuda_graph.rs`: warmup forward, `begin_capture`, run the piece
-//!    against the bucket buffers, `end_capture`.
-//! 3. **Replay** (`PrefillGraphCache::try_replay_pre` / `_post`) — copy
-//!    real-shape inputs into the bucket buffers, launch the captured
-//!    graph, return a view into the bucket output buffer.
-//! 4. **Engine wiring** (`crates/prelude-core/src/engine/model_runner/
-//!    paged_mixed.rs::batch_mixed_paged` or equivalent) — when the
-//!    request mix is pure-prefill and the cache is enabled, dispatch
-//!    through `forward_with_prefill_graph` instead of the eager forward.
-//!
-//! Initial wiring will only support `Qwen3MoeModelForCausalLM`; other
-//! architectures (`Qwen3ModelForCausalLM`, hybrid Qwen3.5) follow in
-//! later changes once the cache shape is proven.
+//! Cache lookup tries the exact `(num_tokens_bucket, num_reqs_bucket)`
+//! pair first; if not yet captured, the bench-path falls through to
+//! eager and we capture lazily on the first hit — same pattern as
+//! `CUDAGraphWrapper.concrete_cudagraph_entries` in vLLM.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use cudarc::driver::CudaStream;
 use prelude_core::config::EngineConfig;
+use prelude_core::tensor::{DType, Device, Tensor};
 
-/// Bucket sizes for prefill `num_tokens` capture, in increasing order.
-/// Dispatch rounds the actual `num_tokens` up to the smallest enclosing
-/// bucket. Values mirror vLLM's `compile_ranges_endpoints=[8192]` plus
-/// a finer-grained low end since prelude's chunked prefill produces
-/// smaller mixed steps than vLLM's prefill-only chunks.
-pub(crate) const DEFAULT_PREFILL_BUCKETS: &[usize] = &[
-    32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
+fn tensor_err(e: prelude_core::tensor::Error) -> prelude_core::engine::EngineError {
+    prelude_core::engine::EngineError::Internal(format!("tensor: {e}"))
+}
+
+/// `(num_tokens_bucket, num_reqs_bucket)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct BucketKey {
+    pub num_tokens: usize,
+    pub num_reqs: usize,
+}
+
+/// Sparse `num_tokens` buckets. Mirrors vLLM's
+/// `compile_ranges_endpoints=[8192]` — finer at the low end where
+/// chunked-prefill steps live, coarser higher up.
+const TOKEN_BUCKETS: &[usize] = &[
+    64, 128, 256, 512, 1024, 2048, 4096, 8192,
 ];
 
-/// Which half of a decoder layer this graph belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum PiecePhase {
-    /// `input_norm` + QKV + QK-norm + RoPE + (paged) KV write.
-    PreAttn,
-    /// O proj + post-attn norm + MoE / dense FFN.
-    PostAttn,
+/// Sparse `num_requests` buckets.
+const REQ_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
+
+/// Returns true if `cuda_graph` is on and the model is graphable.
+fn enabled_from_config(config: &EngineConfig, model_supports_graph: bool) -> bool {
+    config.runtime.cuda_graph && model_supports_graph
 }
 
-/// Cache key: which layer, which phase, which bucket.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct GraphKey {
-    pub layer_idx: usize,
-    pub phase: PiecePhase,
-    pub bucket: usize,
+/// Pre-allocated fixed-address GPU buffers for one mixed prefill graph.
+pub(crate) struct MixedGraphBuffers {
+    pub(crate) key: BucketKey,
+    pub(crate) packed_input: Tensor,   // (num_tokens,) U32
+    pub(crate) position_ids: Tensor,   // (num_tokens,) U32
+    pub(crate) slot_mapping: Tensor,   // (num_tokens,) I64
+    pub(crate) cu_seqlens_q: Tensor,   // (num_reqs+1,) U32
+    pub(crate) cu_seqlens_k: Tensor,   // (num_reqs+1,) U32
+    pub(crate) block_tables: Tensor,   // (num_reqs, max_blocks) U32
+    pub(crate) max_blocks: usize,
+    pub(crate) max_seqlen_k_capture: usize,
+    pub(crate) fi_indptr: Tensor,        // (num_reqs+1,) I32
+    pub(crate) fi_indices: Tensor,       // (num_reqs * max_blocks,) I32
+    pub(crate) fi_last_page_len: Tensor, // (num_reqs,) I32
 }
 
-/// Per-bucket pre-allocated input/output tensors. Shared across layers
-/// — layer i's post-piece writes `hidden`, layer i+1's pre-piece reads
-/// it back. See module-level docs for the buffer-layout invariants the
-/// captured graphs rely on.
-///
-/// (Skeleton — fields will be filled by `BucketBuffers::allocate` in the
-/// follow-up commit that wires capture.)
-#[allow(dead_code)]
-pub(crate) struct BucketBuffers {
-    pub bucket: usize,
-    // hidden:    Tensor [bucket, hidden_size]
-    // residual:  Tensor [bucket, hidden_size]
-    // q:         Tensor [bucket, num_heads, head_dim]
-    // k:         Tensor [bucket, num_kv_heads, head_dim]
-    // v:         Tensor [bucket, num_kv_heads, head_dim]
-    // attn_out:  Tensor [bucket, num_heads, head_dim]
-    // slot_mapping: Tensor [bucket] (i64, indirection table written
-    //               with real slot indices before each replay)
-    // position_ids: Tensor [bucket] (u32, same pattern)
+impl MixedGraphBuffers {
+    pub(crate) fn allocate(
+        key: BucketKey,
+        max_blocks: usize,
+        max_seqlen_k_capture: usize,
+        device: &Device,
+    ) -> Result<Self, prelude_core::engine::EngineError> {
+        let max_total_pages = key.num_reqs * max_blocks;
+        let (fi_indptr, fi_indices, fi_last_page_len) =
+            crate::attn::flashinfer::allocate_fi_graph_meta(
+                key.num_reqs,
+                max_total_pages,
+                device,
+            )
+            .map_err(tensor_err)?;
+
+        Ok(Self {
+            key,
+            packed_input: Tensor::zeros((key.num_tokens,), DType::U32, device).map_err(tensor_err)?,
+            position_ids: Tensor::zeros((key.num_tokens,), DType::U32, device).map_err(tensor_err)?,
+            slot_mapping: Tensor::zeros((key.num_tokens,), DType::I64, device).map_err(tensor_err)?,
+            cu_seqlens_q: Tensor::zeros((key.num_reqs + 1,), DType::U32, device).map_err(tensor_err)?,
+            cu_seqlens_k: Tensor::zeros((key.num_reqs + 1,), DType::U32, device).map_err(tensor_err)?,
+            block_tables: Tensor::zeros((key.num_reqs, max_blocks), DType::U32, device).map_err(tensor_err)?,
+            max_blocks,
+            max_seqlen_k_capture,
+            fi_indptr,
+            fi_indices,
+            fi_last_page_len,
+        })
+    }
 }
 
-/// Captured `CudaGraph` for one (layer, phase, bucket) triple.
-///
-/// (Skeleton — the `cudarc::driver::CudaGraph` handle and the output
-/// `Tensor` views land in the capture commit.)
-#[allow(dead_code)]
-pub(crate) struct CapturedPiece {
-    pub key: GraphKey,
-    // graph: cudarc::driver::CudaGraph,
-    // output_view: Tensor,  // view into the bucket's hidden / q-k-v
+/// One captured `forward_hidden_states` graph at a specific bucket.
+pub(crate) struct CapturedMixedGraph {
+    pub(crate) graph: cudarc::driver::CudaGraph,
+    pub(crate) buffers: MixedGraphBuffers,
+    /// Hidden output, shape `(num_tokens, hidden_size)`. Caller slices
+    /// `[0..actual_num_tokens]` before running `last_token_select` +
+    /// `lm_head` eager.
+    pub(crate) hidden_output: Tensor,
 }
 
-/// Piecewise prefill graph cache. One per engine.
+/// Cache of captured mixed prefill+decode graphs.
 ///
-/// **Lifecycle**: constructed by the engine after model load, lives as
-/// long as the model. `try_replay_pre` / `try_replay_post` are called
-/// during prefill steps; if the bucket isn't captured yet, the call
-/// returns `None` and the caller falls back to eager.
-///
-/// **Thread-safety**: owned by the GPU worker thread (mirrors
-/// `DecodeGraphCache`); no `Arc<Mutex<…>>` wrapping needed.
-pub(crate) struct PrefillGraphCache {
-    /// Per-bucket pre-allocated buffer set (allocated lazily on first
-    /// use of a bucket).
-    buffers: HashMap<usize, BucketBuffers>,
-    /// Captured graphs, keyed by `(layer_idx, phase, bucket)`.
-    graphs: HashMap<GraphKey, CapturedPiece>,
-    /// Sparse capture sizes; runtime rounds up to the smallest of these
-    /// that fits the actual `num_tokens`.
-    buckets: Vec<usize>,
-    /// Master enable flag (mirrors `cuda_graph` + `model_supports_graph`
-    /// in `DecodeGraphCache`).
+/// Owned by the GPU worker thread (same lifetime/threading model as
+/// `DecodeGraphCache`).
+pub(crate) struct MixedGraphCache {
+    graphs: HashMap<BucketKey, CapturedMixedGraph>,
+    /// Sorted ascending.
+    token_buckets: Vec<usize>,
+    req_buckets: Vec<usize>,
     enabled: bool,
 }
 
-#[allow(dead_code)]
-impl PrefillGraphCache {
+impl MixedGraphCache {
     pub(crate) fn new(config: &EngineConfig, model_supports_graph: bool) -> Self {
-        let enabled = config.runtime.cuda_graph && model_supports_graph;
+        let enabled = enabled_from_config(config, model_supports_graph);
         if enabled {
             tracing::info!(
-                buckets = ?DEFAULT_PREFILL_BUCKETS,
-                "PrefillGraphCache enabled — lazy capture on first use"
+                token_buckets = ?TOKEN_BUCKETS,
+                req_buckets = ?REQ_BUCKETS,
+                "MixedGraphCache enabled — lazy capture on first use"
             );
         }
         Self {
-            buffers: HashMap::new(),
             graphs: HashMap::new(),
-            buckets: DEFAULT_PREFILL_BUCKETS.to_vec(),
+            token_buckets: TOKEN_BUCKETS.to_vec(),
+            req_buckets: REQ_BUCKETS.to_vec(),
             enabled,
         }
     }
 
-    /// Round `num_tokens` up to the smallest captured bucket that fits.
-    /// Returns `None` if the workload exceeds the largest bucket (caller
-    /// falls back to eager).
-    pub(crate) fn round_up_bucket(&self, num_tokens: usize) -> Option<usize> {
-        self.buckets.iter().copied().find(|&b| b >= num_tokens)
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled
     }
 
-    /// Stub — returns `None` until the capture/replay machinery lands.
-    /// Once wired, this either replays the captured pre-piece graph for
-    /// layer `layer_idx` at `bucket`, or captures and replays on first
-    /// encounter.
-    pub(crate) fn try_replay_pre(
-        &mut self,
-        _layer_idx: usize,
-        _bucket: usize,
-        // hidden, residual inputs go here
-    ) -> Option<()> {
-        if !self.enabled {
-            return None;
-        }
-        // TODO(yz): capture/replay impl
-        None
+    /// Round (num_tokens, num_reqs) up to the smallest captured pair.
+    pub(crate) fn round_up(&self, num_tokens: usize, num_reqs: usize) -> Option<BucketKey> {
+        let nt = self.token_buckets.iter().copied().find(|&b| b >= num_tokens)?;
+        let nr = self.req_buckets.iter().copied().find(|&b| b >= num_reqs)?;
+        Some(BucketKey {
+            num_tokens: nt,
+            num_reqs: nr,
+        })
     }
 
-    /// Stub — symmetric for the post-piece.
-    pub(crate) fn try_replay_post(
-        &mut self,
-        _layer_idx: usize,
-        _bucket: usize,
-        // attn_out, residual inputs go here
-    ) -> Option<()> {
-        if !self.enabled {
-            return None;
-        }
-        // TODO(yz): capture/replay impl
-        None
+    /// Look up a captured graph for an exact bucket key.
+    pub(crate) fn get(&self, key: BucketKey) -> Option<&CapturedMixedGraph> {
+        self.graphs.get(&key)
     }
+
+    pub(crate) fn insert(&mut self, captured: CapturedMixedGraph) {
+        let key = captured.buffers.key;
+        self.graphs.insert(key, captured);
+    }
+
+    pub(crate) fn contains(&self, key: BucketKey) -> bool {
+        self.graphs.contains_key(&key)
+    }
+}
+
+/// Resolve the bucket key and return whether a captured graph exists
+/// for it. Cheap pre-check on the dispatch hot path.
+pub(crate) fn try_pick_bucket(
+    cache: &MixedGraphCache,
+    num_tokens: usize,
+    num_reqs: usize,
+) -> Option<BucketKey> {
+    if !cache.is_enabled() {
+        return None;
+    }
+    cache.round_up(num_tokens, num_reqs)
+}
+
+#[allow(dead_code)]
+pub(crate) fn get_stream(device: &Device) -> Result<Arc<CudaStream>, prelude_core::engine::EngineError> {
+    let cuda_dev = device
+        .as_cuda_device()
+        .map_err(|e| prelude_core::engine::EngineError::Internal(format!("as_cuda_device: {e}")))?;
+    Ok(cuda_dev.cuda_stream())
 }
