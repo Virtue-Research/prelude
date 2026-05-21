@@ -63,8 +63,8 @@ ENGINES=(
 
 declare -A DOCKER_IMAGES
 DOCKER_IMAGES=(
-    [vllm]="vllm/vllm-openai:latest-cu130"
-    [sglang]="lmsysorg/sglang:latest-cu130"
+    [vllm]="${VLLM_IMAGE:-vllm/vllm-openai:latest-cu130-ubuntu2404}"
+    [sglang]="${SGLANG_IMAGE:-lmsysorg/sglang:latest-cu130}"
 )
 
 # ── Helpers (from bench.sh) ──
