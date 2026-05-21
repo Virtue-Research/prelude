@@ -46,22 +46,100 @@ use std::process::Command;
 use crate::build_log;
 
 /// Detect the local CUDA toolkit's major.minor release from `nvcc
-/// --version` and return the matching PyTorch wheel index URL. Returns
-/// `None` if nvcc is missing or the release banner can't be parsed.
+/// --version` and return a PyTorch wheel index URL that actually
+/// hosts torch wheels. CUDA toolkits often outpace PyTorch's wheel
+/// releases (e.g. CUDA 13.2 has no `cu132` wheels yet, only `cu130`),
+/// so we probe `https://download.pytorch.org/whl/cu{XY}/torch/` for
+/// the exact match first and then walk downward through plausible
+/// tags until one returns a non-empty torch listing.
 ///
-/// Example: CUDA 12.8 → `https://download.pytorch.org/whl/cu128`.
+/// Returns `None` only if nvcc is missing/unparseable or no probed
+/// index advertises any torch wheel.
+///
+/// Example: CUDA 13.2 → probes cu132 (empty) → cu130 → hits, returns
+/// `https://download.pytorch.org/whl/cu130`.
 pub fn detect_torch_cuda_index() -> Option<String> {
+    let (major, minor) = nvcc_release()?;
+    for tag in candidate_cu_tags(major, minor) {
+        let url = format!("https://download.pytorch.org/whl/{tag}");
+        if torch_index_has_wheels(&url) {
+            if tag != format!("cu{major}{minor}") {
+                build_log!(
+                    "nvcc reports CUDA {major}.{minor} → cu{major}{minor} \
+                     has no torch wheels; falling back to {tag}"
+                );
+            }
+            return Some(url);
+        }
+    }
+    None
+}
+
+/// Parse `nvcc --version`'s "release X.Y," banner into `(major, minor)`.
+fn nvcc_release() -> Option<(u32, u32)> {
     let output = Command::new("nvcc").arg("--version").output().ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     let release = text.split("release ").nth(1)?;
     let version = release.split(',').next()?.trim();
-    let parts: Vec<&str> = version.split('.').collect();
-    if parts.len() >= 2 {
-        let cu_tag = format!("{}{}", parts[0], parts[1]);
-        Some(format!("https://download.pytorch.org/whl/cu{cu_tag}"))
-    } else {
-        None
+    let mut parts = version.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Build a descending list of plausible `cu{XY}` tags starting from the
+/// exact detected version. Walks down the minor digit first, then the
+/// major, stopping at cu118 (oldest PyTorch publishes for routinely).
+fn candidate_cu_tags(major: u32, minor: u32) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::new();
+    let mut m = major;
+    let mut n = minor as i32;
+    loop {
+        if m == 0 {
+            break;
+        }
+        let tag_num = m * 10 + (n.max(0) as u32);
+        if tag_num < 118 {
+            break;
+        }
+        tags.push(format!("cu{tag_num}"));
+        n -= 1;
+        if n < 0 {
+            if m == 0 {
+                break;
+            }
+            m -= 1;
+            n = 9;
+        }
     }
+    tags
+}
+
+/// Probe `<index_url>/torch/` and return true iff the listing actually
+/// contains torch wheel files (substring `torch-`). A 404 / network
+/// error / empty body all map to false. The check uses `curl` with a
+/// short timeout to keep build scripts responsive on flaky networks.
+fn torch_index_has_wheels(index_url: &str) -> bool {
+    let probe_url = format!("{index_url}/torch/");
+    let output = match Command::new("curl")
+        .args([
+            "-fsS",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "15",
+            &probe_url,
+        ])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let body = String::from_utf8_lossy(&output.stdout);
+    body.contains("torch-")
 }
 
 /// Whether `uv` is callable on PATH. Cached lookup — we only probe once
@@ -186,6 +264,15 @@ impl PythonVenv {
         }
         if let Some(idx) = opts.extra_index_url {
             cmd.args(["--extra-index-url", idx]);
+            // uv defaults to `first-index`: only consider a package at the
+            // first index where it appears. With a CUDA torch index added,
+            // common deps like `packaging` resolve to whatever stale copy
+            // the wheel mirror happens to host instead of the pypi.org
+            // current release. Switch to `unsafe-best-match` so uv picks
+            // the highest compatible version across all indexes.
+            if self.has_uv {
+                cmd.args(["--index-strategy", "unsafe-best-match"]);
+            }
         }
         for pkg in packages {
             cmd.arg(pkg);

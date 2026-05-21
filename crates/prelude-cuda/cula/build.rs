@@ -405,6 +405,14 @@ assert (
 
     let torch_index = detect_torch_cuda_index();
 
+    // Step 0: bump setuptools to a PEP 639-aware release. cuLA's
+    // pyproject.toml uses `license = "Apache-2.0"` (SPDX string form,
+    // PEP 639), which setuptools < 77 rejects with "license must match
+    // anyOf [{file},{text}]". `uv venv` provisions setuptools 70.x by
+    // default, so without this step the no-build-isolation install of
+    // cuLA fails before any code compiles.
+    venv.pip_install(&["--upgrade", "setuptools>=77", "wheel"], InstallOpts::new())?;
+
     // Step 1: torch (must be first for cuLA's setup.py to import it).
     venv.pip_install(
         &["torch"],

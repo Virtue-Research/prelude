@@ -63,11 +63,18 @@ fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let workspace_root = manifest_dir.join("../../..");
 
+    // DeepGEMM pins its own CUTLASS commit (currently v4.2.1) via
+    // `DeepGEMM/third-party/cutlass`. Upstream DeepGEMM's kernel sources
+    // (e.g. sm100_fp8_paged_mqa_logits.cuh) call CUTE intrinsics like
+    // `cute::SM100_MMA_F8F6F4_SS::fma(...)` against that specific
+    // CUTLASS ABI; using the workspace-root cutlass (which we bump for
+    // cutlass-gemm/flashinfer/fa4 independently) breaks compilation
+    // whenever the two diverge. Prefer DeepGEMM's nested cutlass first.
     let cutlass_dir = locate_source(
         "CUTLASS_ROOT",
         "cutlass",
         "include/cutlass/cutlass.h",
-        &workspace_root.join("third_party/cutlass"),
+        &workspace_root.join("third_party/DeepGEMM/third-party/cutlass"),
     );
     let deepgemm_dir = ensure_deepgemm(&out_dir, &workspace_root);
     let deepgemm_include = deepgemm_dir.join("deep_gemm/include");

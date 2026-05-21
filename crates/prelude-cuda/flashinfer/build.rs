@@ -38,6 +38,7 @@ use prelude_kernelbuild::dispatch;
 use prelude_kernelbuild::nvcc::{
     detect_compute_cap, find_cuda, link_cuda_runtime_static, track_submodule,
 };
+use prelude_kernelbuild::venv::{InstallOpts, PythonVenv, detect_torch_cuda_index};
 
 // ── Manifest schema ─────────────────────────────────────────────────
 //
@@ -86,7 +87,7 @@ fn main() -> Result<()> {
     let kernels_dir = out_dir.join("kernels");
 
     let fi_src = find_flashinfer_source(&manifest_dir)?;
-    ensure_kernels(&kernels_dir, &manifest_dir, &fi_src)?;
+    let venv_python = ensure_kernels(&kernels_dir, &manifest_dir, &fi_src)?;
 
     // Phase 3: archive + whole-archive link. Use Append mode because
     // compile_kernels.py emits .o files with overlapping basenames
@@ -97,7 +98,7 @@ fn main() -> Result<()> {
         archive::archive_and_whole_link(&objects, &out_dir, "flashinfer_kernels", ArMode::Append)
             .map_err(anyhow::Error::msg)?;
     if has_kernels {
-        link_cutlass_dsl_runtime_if_available()?;
+        prelude_kernelbuild::venv::link_cutlass_dsl_runtime(&venv_python);
         link_cuda_runtime_static(&find_cuda());
     }
 
@@ -141,7 +142,7 @@ fn find_flashinfer_source(manifest_dir: &Path) -> Result<PathBuf> {
 
 // ── Kernel compilation ───────────────────────────────────────────────
 
-fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fi_src: &Path) -> Result<()> {
+fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fi_src: &Path) -> Result<PathBuf> {
     let script = manifest_dir.join("scripts/compile_kernels.py");
     let manifest = kernels_dir.join("manifest.json");
     let config_path = kernels_dir.join("build_config.txt");
@@ -154,6 +155,11 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fi_src: &Path) -> Res
         "flashinfer_src={}\narchs={archs}\nhead_dims={head_dims}\ndtypes={dtypes}\nmla_dims={mla_dims}\n",
         fi_src.display()
     );
+
+    // Always provision the venv: even when kernels are cached, the link
+    // step needs the venv's nvidia_cutlass_dsl lib dir.
+    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
+    let python = ensure_flashinfer_python_env(&out_dir, fi_src)?;
 
     // Script-mtime vs manifest-mtime cache check. flashinfer's compile
     // script does its own fine-grained .o mtime checks internally, so
@@ -170,7 +176,7 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fi_src: &Path) -> Res
         if manifest_mtime > script_mtime && config_matches {
             let n = archive::collect_obj_files(kernels_dir).len();
             build_log!("{n} kernel objects up-to-date");
-            return Ok(());
+            return Ok(python);
         }
         if !config_matches {
             build_log!("kernel configuration changed, recompiling...");
@@ -185,7 +191,6 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fi_src: &Path) -> Res
         }
     }
 
-    let python = find_python()?;
     let workers = env::var("PRELUDE_FLASHINFER_WORKERS").unwrap_or_else(|_| {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -223,7 +228,7 @@ fn ensure_kernels(kernels_dir: &Path, manifest_dir: &Path, fi_src: &Path) -> Res
 
     std::fs::write(config_path, build_config)?;
 
-    Ok(())
+    Ok(python)
 }
 
 fn default_archs() -> String {
@@ -247,19 +252,51 @@ fn default_archs() -> String {
         .join(",")
 }
 
-fn find_python() -> Result<PathBuf> {
-    for candidate in ["python3", "python"] {
-        if Command::new(candidate).arg("--version").output().is_ok() {
-            return Ok(PathBuf::from(candidate));
-        }
+/// Provision (or reuse) a Python venv with flashinfer's runtime deps
+/// (torch + filelock + numpy + cutlass-dsl + ...). compile_kernels.py
+/// adds `fi_src` to `sys.path` and imports `flashinfer.jit.*`, which
+/// runs `third_party/flashinfer/flashinfer/__init__.py`; that file
+/// transitively requires these packages. Without a venv the script
+/// runs against system python3 and crashes if any dep is missing.
+///
+/// torch is fetched from `detect_torch_cuda_index()`, which probes
+/// PyTorch's wheel index and falls back across CUDA tags when nvcc's
+/// exact CUDA release has no matching upload (e.g. CUDA 13.2 → cu130).
+fn ensure_flashinfer_python_env(out_dir: &Path, fi_src: &Path) -> Result<PathBuf> {
+    const PROBE: &str =
+        "import filelock, numpy, einops, torch, cutlass, tvm_ffi";
+    let venv_dir = out_dir.join("flashinfer-venv");
+    let venv = PythonVenv::ensure(&venv_dir).map_err(anyhow::Error::msg)?;
+    if venv.check_import(PROBE) {
+        build_log!("flashinfer venv ready (cached) at {}", venv_dir.display());
+        return Ok(venv.python_path().to_path_buf());
     }
-    anyhow::bail!("Python 3 not found")
-}
 
-fn link_cutlass_dsl_runtime_if_available() -> Result<()> {
-    let python = find_python()?;
-    prelude_kernelbuild::venv::link_cutlass_dsl_runtime(&python);
-    Ok(())
+    let torch_index = detect_torch_cuda_index();
+    if let Some(ref idx) = torch_index {
+        build_log!("torch index: {idx}");
+    }
+    build_log!(
+        "installing flashinfer Python deps into venv from {}/requirements.txt...",
+        fi_src.display()
+    );
+    let req_path = fi_src.join("requirements.txt");
+    let req_str = req_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("requirements path not utf-8: {}", req_path.display()))?;
+    venv.pip_install(
+        &["-r", req_str],
+        InstallOpts::new().extra_index_url(torch_index.as_deref()),
+    )
+    .map_err(anyhow::Error::msg)?;
+
+    if !venv.check_import(PROBE) {
+        anyhow::bail!(
+            "flashinfer deps not importable after install — probe: `{PROBE}`"
+        );
+    }
+    build_log!("flashinfer venv ready at {}", venv_dir.display());
+    Ok(venv.python_path().to_path_buf())
 }
 
 // ── Dispatch codegen ─────────────────────────────────────────────────
