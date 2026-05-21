@@ -233,7 +233,7 @@ start_vllm() {
         --ipc=host \
         -v "${HF_CACHE}:/root/.cache/huggingface:ro" \
         -e HF_TOKEN="${HF_TOKEN}" \
-        vllm/vllm-openai:latest \
+        "${VLLM_IMAGE:-vllm/vllm-openai:latest-cu130-ubuntu2404}" \
         --model "${MODEL}" \
         --host 0.0.0.0 \
         --port 8000 \
@@ -257,7 +257,7 @@ start_sglang() {
         --ipc=host \
         -v "${HF_CACHE}:/root/.cache/huggingface:ro" \
         -e HF_TOKEN="${HF_TOKEN}" \
-        lmsysorg/sglang:latest \
+        "${SGLANG_IMAGE:-lmsysorg/sglang:latest-cu130}" \
         python3 -m sglang.launch_server \
         --model-path "${MODEL}" \
         --host 0.0.0.0 \
