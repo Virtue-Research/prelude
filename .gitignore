@@ -31,3 +31,6 @@ analysis/
 
 # Per-developer agent instructions — not checked in.
 CLAUDE.md
+nohup.out
+lauch_genai_bench.sh
+sampled_500_groups_x_10.jsonl
