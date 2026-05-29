@@ -118,22 +118,76 @@ impl Engine {
         })?;
         let shared_blocks = &allocation_plan.prefix_reuse.cached_block_ids;
         let mut block_tables = Vec::with_capacity(allocation_plan.entries.len());
+
+        // Reclaim idle (cache-only) prefix blocks to cover any shortfall BEFORE
+        // taking the (non-reentrant) bm lock below — reclaim itself locks bm, so
+        // it must run first. With the half-pool clamp gone this is what keeps the
+        // prefix cache from pinning the pool and starving this allocation.
+        //
+        // CRITICAL: the matched shared-prefix blocks (`shared_blocks`) are still
+        // cache-only (ref_count == 1) at this point — they are not pinned to this
+        // request until the per-entry `increment_refs` in the loop below. Reclaim
+        // would treat them as idle and could free the very chain we are about to
+        // reuse (then `increment_refs` revives a freed id and `allocate()` could
+        // alias it into another entry → KV corruption). So pin them across the
+        // reclaim, then drop that one temporary reference once we hold bm; each
+        // entry re-pins its own reference in the loop. (Unlike the AR-loop reuse
+        // path, which retains at match time, the planner matches without pinning.)
+        let new_total: usize = allocation_plan.entries.iter().map(|e| e.new_blocks).sum();
+        if !shared_blocks.is_empty() {
+            self.cache.retain_paged_blocks(shared_blocks)?;
+        }
+        if new_total > 0 {
+            let available = {
+                let bm = bm_mutex
+                    .lock()
+                    .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
+                bm.available()
+            };
+            if available < new_total {
+                if let Err(e) = self.cache.reclaim_idle_prefix_blocks(new_total - available) {
+                    if !shared_blocks.is_empty() {
+                        let _ = self.cache.release_paged_blocks(shared_blocks);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
         let mut bm = bm_mutex
             .lock()
             .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
+        if !shared_blocks.is_empty() {
+            // Drop the temporary cross-reclaim pin; the loop below takes one
+            // reference per reusing sequence (preserving the original accounting).
+            bm.decrement_refs(shared_blocks);
+        }
 
+        // All-or-nothing: if the pool runs dry mid-loop (more likely now that the
+        // cache may hold nearly the whole pool and reclaim can free < requested),
+        // roll back every ref/allocation this call already committed before
+        // returning Err — block tables are plain Vec with no Drop, so a partial
+        // commit would otherwise leak shared-prefix refs and private blocks.
+        let n_shared = shared_blocks.len();
         for entry in &allocation_plan.entries {
             let mut bt = Vec::with_capacity(entry.total_blocks);
             if !shared_blocks.is_empty() {
                 bt.extend_from_slice(shared_blocks);
                 bm.increment_refs(shared_blocks);
             }
-
             for _ in 0..entry.new_blocks {
-                let block = bm
-                    .allocate()
-                    .ok_or_else(|| EngineError::Internal(format!("{context}: no free blocks")))?;
-                bt.push(block);
+                match bm.allocate() {
+                    Some(block) => bt.push(block),
+                    None => {
+                        block_tables.push(bt); // include the partial table in the undo set
+                        for t in &block_tables {
+                            let k = n_shared.min(t.len());
+                            bm.decrement_refs(&t[..k]); // undo this call's shared increment_refs
+                            bm.free(&t[k..]); // free freshly-allocated private blocks
+                        }
+                        return Err(EngineError::Internal(format!("{context}: no free blocks")));
+                    }
+                }
             }
             block_tables.push(bt);
         }

@@ -52,6 +52,45 @@ impl CacheManager {
         Ok(())
     }
 
+    /// Demand-driven reclaim: free at least `needed` physical KV blocks by
+    /// evicting idle (cache-only, ref_count == 1) prefix-cache leaves, LRU-first.
+    /// Returns the number of blocks actually freed (may be < needed if the rest
+    /// of the cache is live-shared — the caller then falls through to defer/preempt).
+    ///
+    /// Lock order is the global invariant: prefix_cache FIRST, then block_manager.
+    /// The reclaimability predicate takes a SHORT block-manager lock per candidate
+    /// (never held across the final `release_paged_blocks`, which also locks it),
+    /// so the non-reentrant mutex is never nested with itself.
+    pub(crate) fn reclaim_idle_prefix_blocks(&self, needed: usize) -> Result<usize, EngineError> {
+        if needed == 0 {
+            return Ok(0);
+        }
+        let Some(ref pc_mutex) = self.prefix_cache else {
+            return Ok(0);
+        };
+        let Some(ref bm_mutex) = self.block_manager else {
+            return Ok(0);
+        };
+        let bm_arc = bm_mutex.clone();
+        let mut pc = pc_mutex
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("prefix cache lock poisoned: {e}")))?;
+        let mut is_reclaimable = |ids: &[u32]| -> bool {
+            match bm_arc.lock() {
+                Ok(bm) => ids.iter().all(|&b| bm.ref_count(b) == 1),
+                Err(_) => false,
+            }
+        };
+        let evicted = pc.reclaim_idle_blocks(needed, &mut is_reclaimable);
+        drop(pc);
+        let freed = evicted.len();
+        self.release_paged_blocks(&evicted)?;
+        if freed > 0 {
+            debug!(needed, freed, "prefix cache demand reclaim");
+        }
+        Ok(freed)
+    }
+
     pub(crate) fn copy_paged_kv_block(&self, src: u32, dst: u32) -> Result<(), EngineError> {
         if src == dst {
             return Ok(());
@@ -233,4 +272,90 @@ fn copy_tensor_block(
         .contiguous()
         .map_err(tensor_err)?;
     cache.slice_set(&row, 0, dst).map_err(tensor_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::block_manager::BlockManager;
+    use crate::cache::prefix_cache::PrefixKvCache;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Mutex};
+
+    // Two full blocks of 4 tokens each: trie chain root -> leaf.
+    const TOKENS: &[u32] = &[0, 1, 2, 3, 4, 5, 6, 7];
+
+    fn manager(bm: BlockManager, pc: PrefixKvCache) -> CacheManager {
+        CacheManager {
+            prefix_cache: Some(Mutex::new(pc)),
+            paged_pool: None,
+            block_manager: Some(Arc::new(Mutex::new(bm))),
+            deltanet_pool: None,
+            prefix_cache_gen: AtomicU64::new(0),
+        }
+    }
+
+    fn lock_bm(cm: &CacheManager) -> std::sync::MutexGuard<'_, BlockManager> {
+        cm.block_manager.as_ref().unwrap().lock().unwrap()
+    }
+
+    fn exhaust(cm: &CacheManager) {
+        let mut bm = lock_bm(cm);
+        while bm.allocate().is_some() {}
+        assert_eq!(bm.available(), 0);
+    }
+
+    // Directly drives the A2 path that the live benchmark never reaches (admission
+    // control + budget-LRU preempt it): allocate-exhausted -> reclaim -> freed.
+    #[test]
+    fn reclaim_frees_idle_cache_blocks_on_exhaustion() {
+        let bs = 4;
+        let mut bm = BlockManager::new(16, bs);
+        let (b0, b1) = (bm.allocate().unwrap(), bm.allocate().unwrap());
+        let cm = manager(bm, PrefixKvCache::new(bs, 1, 1, 64));
+
+        // Insert the two blocks as a cached chain, retain (cache ref), then drop
+        // the sequence ref → blocks are idle (rc==1, cache-only, not in free list).
+        {
+            let mut pc = cm.prefix_cache.as_ref().unwrap().lock().unwrap();
+            let stored = pc.insert_paged_blocks_only(TOKENS, bs, &[b0, b1]);
+            lock_bm(&cm).increment_refs(&stored);
+        }
+        lock_bm(&cm).decrement_refs(&[b0, b1]);
+        assert_eq!(lock_bm(&cm).ref_count(b0), 1); // cache-only idle
+
+        // Fill the rest of the pool with "live" blocks (rc==1, NOT in the trie).
+        exhaust(&cm);
+
+        let freed = cm.reclaim_idle_prefix_blocks(2).unwrap();
+        assert_eq!(freed, 2, "both idle cache leaves reclaimed");
+        let bm = lock_bm(&cm);
+        assert_eq!(bm.available(), 2, "reclaimed blocks returned to the pool");
+        assert_eq!(bm.ref_count(b0), 0);
+        assert_eq!(bm.ref_count(b1), 0);
+    }
+
+    // The rc==1 predicate must protect blocks also referenced by a live sequence.
+    #[test]
+    fn reclaim_skips_live_shared_cache_blocks() {
+        let bs = 4;
+        let mut bm = BlockManager::new(16, bs);
+        let (b0, b1) = (bm.allocate().unwrap(), bm.allocate().unwrap());
+        let cm = manager(bm, PrefixKvCache::new(bs, 1, 1, 64));
+
+        // Insert + retain but KEEP the sequence ref → blocks are live-shared (rc==2).
+        {
+            let mut pc = cm.prefix_cache.as_ref().unwrap().lock().unwrap();
+            let stored = pc.insert_paged_blocks_only(TOKENS, bs, &[b0, b1]);
+            lock_bm(&cm).increment_refs(&stored);
+        }
+        assert_eq!(lock_bm(&cm).ref_count(b0), 2);
+        exhaust(&cm);
+
+        let freed = cm.reclaim_idle_prefix_blocks(2).unwrap();
+        assert_eq!(freed, 0, "live-shared cache blocks must never be reclaimed");
+        let bm = lock_bm(&cm);
+        assert_eq!(bm.available(), 0);
+        assert!(bm.ref_count(b0) >= 2 && bm.ref_count(b1) >= 2);
+    }
 }

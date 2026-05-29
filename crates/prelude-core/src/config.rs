@@ -40,10 +40,11 @@ pub const DEFAULT_PAGED_BLOCK_SIZE: usize = 128;
 /// Default logical prefix-cache capacity, measured in paged KV blocks.
 ///
 /// The cache stores references to blocks that already live in the paged KV
-/// pool. A moderate default avoids silently disabling prefix reuse for models
-/// that advertise support, while `PRELUDE_PREFIX_CACHE_BLOCKS=0` remains the
-/// explicit opt-out.
-pub const DEFAULT_PREFIX_CACHE_BLOCKS: usize = 4096;
+/// pool. The default is "unbounded": the effective budget is derived from the
+/// physical pool (pool minus a reserve floor) in `init_prefix_cache`, since
+/// demand-driven reclaim now lets the cache safely use almost the whole pool.
+/// `PRELUDE_PREFIX_CACHE_BLOCKS=N` sets an explicit cap; `=0` is the opt-out.
+pub const DEFAULT_PREFIX_CACHE_BLOCKS: usize = usize::MAX;
 pub const DEFAULT_PREFIX_BLOCK_SIZE: usize = DEFAULT_PAGED_BLOCK_SIZE;
 pub const DEFAULT_DELTANET_POOL_SLOTS: u32 = 8;
 pub const DEFAULT_TEMPERATURE: f32 = 1.0;

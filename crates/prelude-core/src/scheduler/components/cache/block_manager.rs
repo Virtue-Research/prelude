@@ -92,8 +92,10 @@ impl BlockManager {
         self.decrement_refs(block_table);
     }
 
-    /// Get the ref count for a block (for debugging/testing).
-    #[cfg(test)]
+    /// Ref count for a block. `1` means a block is held solely by the prefix
+    /// cache (idle, not in `free_blocks`) and is therefore reclaimable on demand;
+    /// `>= 2` means it is also live in a running sequence and must not be dropped.
+    #[inline]
     pub fn ref_count(&self, block_id: u32) -> u32 {
         self.ref_counts[block_id as usize]
     }

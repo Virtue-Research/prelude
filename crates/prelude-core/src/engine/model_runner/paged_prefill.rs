@@ -338,6 +338,36 @@ impl Engine {
         let bm_mutex = self.cache.block_manager.as_ref().ok_or_else(|| {
             EngineError::Internal("allocate_blocks_chunked: block manager unavailable".into())
         })?;
+
+        // Reclaim idle prefix blocks to cover the shortfall before taking the
+        // (non-reentrant) bm lock — reclaim itself locks bm, so it runs first.
+        // Safe to reclaim here without pinning: the reused blocks live in
+        // `existing_block_tables`, i.e. they are already referenced by their
+        // sequence (ref_count >= 2 if also cached, or absent from the trie if
+        // private), so reclaim's ref_count==1 predicate can never free them.
+        // (The planner plan-path differs: it reuses matched-but-unpinned cache
+        // blocks and must pin them across reclaim — see allocate_block_tables_from_plan.)
+        let new_total: usize = seq_lens
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| {
+                let need = t.div_ceil(block_size);
+                let have = existing_block_tables.get(i).map(|v| v.len()).unwrap_or(0);
+                need.saturating_sub(have)
+            })
+            .sum();
+        if new_total > 0 {
+            let available = {
+                let bm = bm_mutex
+                    .lock()
+                    .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
+                bm.available()
+            };
+            if available < new_total {
+                self.cache.reclaim_idle_prefix_blocks(new_total - available)?;
+            }
+        }
+
         let mut bm = bm_mutex
             .lock()
             .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
