@@ -232,7 +232,13 @@ impl RuntimeConfig {
     fn from_env() -> Result<Self, String> {
         Ok(Self {
             device: "auto".to_string(),
-            fused_kv_cache_write: parse_env_bool_eq1("PRELUDE_FUSED_KV_CACHE_WRITE"),
+            // Q-prologue fusion REQUIRES the fused K norm+rope cache-write path:
+            // the in-kernel Q prologue and the K written by the fused kernel use
+            // the same RoPE convention, while the rms_norm+rope_thd fallback does
+            // not (Q·K misalignment -> deterministic garbage; see the
+            // fa3_q_prologue_deadlock_fix report). Auto-enable when fusing.
+            fused_kv_cache_write: parse_env_bool_eq1("PRELUDE_FUSED_KV_CACHE_WRITE")
+                || parse_env_bool_eq1("PRELUDE_ATTN_FA3_FUSE_Q_NORM_ROPE"),
             cpu_thread_bind: std::env::var("SGLANG_CPU_OMP_THREADS_BIND")
                 .ok()
                 .filter(|s| !s.is_empty()),

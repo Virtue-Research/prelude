@@ -202,6 +202,26 @@ fn load_safetensor_parts(
     // Without this, the 10% reserve from `gpu_memory_utilization=0.9`
     // can be insufficient for large-vocab MoE models (Qwen3.5-35B-A3B
     // needs ~8 GB for the lm_head matmul alone at 8192 tokens).
+    // Snapshot used GPU memory NOW — right after weight loading and BEFORE the
+    // activation profiling forward. Sizing the KV pool from `total - free`
+    // taken AFTER profiling double-counts activations: the cudarc allocator
+    // retains the profiling run's pages (mempool release threshold), so they
+    // show up in "used" AND get added again as `peak_activation_bytes`. That
+    // overcharge made prelude's KV pool ~3% smaller than vLLM's at the same
+    // --gpu-memory-utilization (924k vs 955k tokens at 0.85 on H200), which
+    // cost ~4pp prefix-cache hit rate on shared-prefix workloads. This is
+    // vLLM's accounting: weights+context measured at load time, activations
+    // added separately from the profiling pass.
+    let weights_bytes_at_load = if device.is_cuda() {
+        let ops = crate::ops::select_ops(&device);
+        match (ops.gpu_total_memory(), ops.gpu_free_memory()) {
+            (Some(total), Some(free)) => Some(total.saturating_sub(free)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     let peak_activation_bytes = if device.is_cuda() {
         profile_peak_activation(
             &mut built.model,
@@ -233,6 +253,7 @@ fn load_safetensor_parts(
         &engine_config.cache,
         &kv_sharing,
         peak_activation_bytes,
+        weights_bytes_at_load,
     )?;
 
     tracing::info!(
