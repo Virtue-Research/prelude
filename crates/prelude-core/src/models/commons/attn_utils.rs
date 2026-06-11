@@ -141,10 +141,12 @@ pub(crate) fn fa3_fuse_q_norm_rope_enabled() -> bool {
             .map(|v| v == "1")
             .unwrap_or(false);
         // The candle-fa3-0102 backend also supports the in-kernel Q prologue
-        // (RMSNorm+RoPE fused into the attention mainloop).
+        // (RMSNorm+RoPE fused into the attention mainloop). It is the default
+        // attention backend (opt out: PRELUDE_ATTN_FA3_0102=0), matching
+        // prefer_fa3_0102() in prelude-cuda.
         let fa3_0102 = std::env::var("PRELUDE_ATTN_FA3_0102")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+            .map(|v| v != "0")
+            .unwrap_or(true);
         let fuse = std::env::var("PRELUDE_ATTN_FA3_FUSE_Q_NORM_ROPE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);

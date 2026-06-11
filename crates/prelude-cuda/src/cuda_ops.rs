@@ -82,17 +82,18 @@ fn prefer_flashinfer_attn() -> bool {
     })
 }
 
-/// Prefer the candle-fa3-0102 backend (vendored vLLM 0.22 FA3 hopper kernel)
-/// when `PRELUDE_ATTN_FA3_0102=1`. Checked before the candle-flash-attn-v3
-/// fork and FA4 on both the paged and non-paged varlen paths.
+/// Prefer the candle-fa3-0102 backend (vendored vLLM 0.22 FA3 hopper kernel).
+/// Default ON when compiled with the `fa3-0102` feature; opt out with
+/// `PRELUDE_ATTN_FA3_0102=0`. Checked before the candle-flash-attn-v3 fork
+/// and FA4 on both the paged and non-paged varlen paths.
 #[cfg(feature = "fa3-0102")]
 fn prefer_fa3_0102() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| {
         std::env::var("PRELUDE_ATTN_FA3_0102")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+            .map(|v| v != "0")
+            .unwrap_or(true)
     })
 }
 
@@ -324,14 +325,16 @@ impl Ops for CudaOps {
         params: &PagedParams,
     ) -> Result<Tensor> {
         let seqused_k = cu_seqlens_to_lens(params.cu_seqlens_k)?;
-        // PRELUDE_ATTN_FA3_0102=1: prefer the candle-fa3-0102 backend (vendored
-        // vLLM 0.22 FA3 hopper kernel) on the paged path. bf16/hdim128 only.
+        // candle-fa3-0102 backend (vendored vLLM 0.22 FA3 hopper kernel),
+        // default-on when compiled in (opt out: PRELUDE_ATTN_FA3_0102=0).
+        // sm90 + bf16/hdim128 only.
         // With PRELUDE_ATTN_FA3_FUSE_Q_NORM_ROPE=1 the model passes RAW Q plus
         // q_prologue (norm weight + rotary tables) and the kernel applies
         // RMSNorm+RoPE in its prologue; Q positions are derived in-kernel
         // (seqused_k - seqlen_q + i), so position_ids are not needed.
         #[cfg(feature = "fa3-0102")]
         if prefer_fa3_0102()
+            && detect_sm_major() >= 9
             && q.dtype() == DType::BF16
             && q.dims().last() == Some(&128)
             && matches!(params.mask, MaskType::Causal)
@@ -1018,7 +1021,8 @@ impl Ops for CudaOps {
 
 #[cfg(feature = "fa3-0102")]
 /// Try candle-fa3-0102 (vendored vLLM 0.22 FA3 hopper kernel) for non-paged
-/// varlen attention when PRELUDE_ATTN_FA3_0102=1. bf16 + head_dim 128 only;
+/// varlen attention (default-on unless PRELUDE_ATTN_FA3_0102=0). bf16 +
+/// head_dim 128 only;
 /// sliding-window masks are not wired up (fall through to other backends).
 fn try_fa3_0102_varlen(
     q: &Tensor,
