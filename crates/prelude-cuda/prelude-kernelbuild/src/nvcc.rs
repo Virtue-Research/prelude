@@ -474,6 +474,124 @@ fn emit_cuda_lib_search_paths(cuda_path: &Path) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Incremental-compile (per-file mtime) helpers
+// ─────────────────────────────────────────────────────────────────────
+
+/// Env var that forces a full recompile of every kernel, bypassing the
+/// per-file mtime skip. Set `PRELUDE_KERNEL_FORCE_REBUILD=1` when you
+/// suspect the incremental logic missed a dependency (or want a clean
+/// timing run).
+pub const FORCE_REBUILD_ENV: &str = "PRELUDE_KERNEL_FORCE_REBUILD";
+
+fn force_rebuild() -> bool {
+    matches!(
+        env::var(FORCE_REBUILD_ENV).ok().as_deref(),
+        Some(v) if !v.is_empty() && v != "0"
+    )
+}
+
+/// Last-modified time of a path, or `None` if it can't be stat-ed.
+fn mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Sidecar makefile-style depfile we ask nvcc to emit next to each output,
+/// e.g. `foo.ptx` → `foo.ptx.d`. It records the source plus every header
+/// nvcc pulled in, which is how a header edit invalidates the cached output.
+fn depfile_path(output: &Path) -> PathBuf {
+    let mut name = output
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    name.push(".d");
+    output.with_file_name(name)
+}
+
+/// Parse a make-style depfile (as emitted by `nvcc -MD -MF`) into its list
+/// of prerequisite paths.
+///
+/// The format is one logical rule using `\`-newline continuations:
+///
+/// ```text
+/// out.ptx : a.cu \
+///     header_a.cuh \
+///     header_b.h
+/// ```
+///
+/// Everything up to the first unescaped `:` (the target) is dropped, line
+/// continuations are joined, and `\ ` escaped spaces inside paths are
+/// preserved.
+fn parse_depfile(contents: &str) -> Vec<PathBuf> {
+    // Join `\`-newline (and `\`-CRLF) continuations into one stream.
+    let joined = contents.replace("\\\r\n", " ").replace("\\\n", " ");
+    // Drop the target: everything before the first ':'.
+    let prereqs = match joined.split_once(':') {
+        Some((_, rest)) => rest,
+        None => joined.as_str(),
+    };
+
+    let mut deps = Vec::new();
+    let mut current = String::new();
+    let mut chars = prereqs.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // `\ ` is an escaped space embedded in a path.
+            '\\' if chars.peek() == Some(&' ') => {
+                chars.next();
+                current.push(' ');
+            }
+            c if c.is_whitespace() => {
+                if !current.is_empty() {
+                    deps.push(PathBuf::from(std::mem::take(&mut current)));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        deps.push(PathBuf::from(current));
+    }
+    deps
+}
+
+/// Return `true` when `output` can be reused without recompiling: it exists,
+/// is at least as new as `src`, and is newer than every prerequisite recorded
+/// in its sidecar depfile.
+///
+/// Returns `false` (i.e. "must rebuild") whenever the output, the depfile, or
+/// any prerequisite is missing/unreadable/newer — the safe default is always
+/// to recompile so a stale or first-time build can never be silently skipped.
+fn output_is_fresh(output: &Path, src: &Path) -> bool {
+    let out_mtime = match mtime(output) {
+        Some(t) => t,
+        None => return false,
+    };
+    match mtime(src) {
+        Some(t) if t > out_mtime => return false,
+        Some(_) => {}
+        // Source vanished — let nvcc produce the real error.
+        None => return false,
+    }
+
+    // Without a depfile we have no record of which headers were pulled in,
+    // so we conservatively rebuild (this also covers the very first build).
+    let depfile = depfile_path(output);
+    let contents = match std::fs::read_to_string(&depfile) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    for dep in parse_depfile(&contents) {
+        match mtime(&dep) {
+            Some(t) if t > out_mtime => return false,
+            Some(_) => {}
+            // A prerequisite moved/disappeared since the last build: rebuild.
+            None => return false,
+        }
+    }
+    true
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // nvcc compile helpers
 // ─────────────────────────────────────────────────────────────────────
 
@@ -516,6 +634,20 @@ impl<'a> PtxCompile<'a> {
 /// Compile one `.cu` file to `.ptx` via nvcc. Panics on failure — build
 /// scripts don't have a meaningful recovery path for a busted nvcc invoke.
 pub fn compile_cu_to_ptx(nvcc: &Path, opts: &PtxCompile<'_>) {
+    let src_name = opts
+        .src
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    // Per-file mtime skip: if the .ptx is newer than its source and every
+    // header recorded in the sidecar depfile, there is nothing to do.
+    if !force_rebuild() && output_is_fresh(opts.out_ptx, opts.src) {
+        build_log!("[nvcc] {src_name} (ptx) ↺ up-to-date, skipping");
+        return;
+    }
+
+    let depfile = depfile_path(opts.out_ptx);
     let mut cmd = Command::new(nvcc);
     cmd.arg("--ptx")
         .arg(opts.src)
@@ -524,7 +656,12 @@ pub fn compile_cu_to_ptx(nvcc: &Path, opts: &PtxCompile<'_>) {
         .arg(format!("-arch=sm_{}", opts.compute_cap))
         .arg("-O3")
         .arg("--use_fast_math")
-        .arg("--expt-relaxed-constexpr");
+        .arg("--expt-relaxed-constexpr")
+        // Emit a make-style depfile so the next build can mtime-skip when
+        // neither the source nor any included header has changed.
+        .arg("-MD")
+        .arg("-MF")
+        .arg(&depfile);
     for inc in &opts.includes {
         cmd.arg(format!("-I{}", inc.display()));
     }
@@ -623,13 +760,26 @@ pub fn compile_cu_to_obj(nvcc: &Path, opts: &ObjCompile<'_>) {
         .first()
         .cloned()
         .unwrap_or_else(|| "default".into());
+
+    // Per-file mtime skip: reuse the .o when it is newer than its source and
+    // every header recorded in the sidecar depfile.
+    if !force_rebuild() && output_is_fresh(opts.out_obj, opts.src) {
+        build_log!("[nvcc] {src_name} ({primary_arch}) ↺ up-to-date, skipping");
+        return;
+    }
+
     build_log!("[nvcc] {src_name} ({primary_arch})");
 
+    let depfile = depfile_path(opts.out_obj);
     let mut cmd = Command::new(nvcc);
     cmd.arg(opts.cpp_std.as_deref().unwrap_or("-std=c++20"))
         .arg(opts.opt_level.as_deref().unwrap_or("-O3"))
         .arg("--expt-relaxed-constexpr")
-        .arg("--expt-extended-lambda");
+        .arg("--expt-extended-lambda")
+        // Emit a make-style depfile to drive the next build's mtime skip.
+        .arg("-MD")
+        .arg("-MF")
+        .arg(&depfile);
     // -fPIC is Linux-only (ELF position-independent code). Windows
     // COFF is always position-independent so the flag doesn't exist.
     if opts.fpic && !cfg!(target_os = "windows") {
@@ -656,4 +806,167 @@ pub fn compile_cu_to_obj(nvcc: &Path, opts: &ObjCompile<'_>) {
         panic!("nvcc failed for {}", opts.src.display());
     }
     build_log!("[nvcc] {src_name} ✓");
+}
+
+#[cfg(test)]
+mod incremental_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn depfile_path_appends_d() {
+        assert_eq!(depfile_path(Path::new("/o/foo.ptx")), Path::new("/o/foo.ptx.d"));
+        assert_eq!(depfile_path(Path::new("/o/bar.o")), Path::new("/o/bar.o.d"));
+    }
+
+    #[test]
+    fn parse_depfile_drops_target_and_joins_continuations() {
+        let dep = "out.ptx : a.cu \\\n    /usr/include/foo.h \\\n    hdr.cuh\n";
+        let deps = parse_depfile(dep);
+        assert_eq!(
+            deps,
+            vec![
+                PathBuf::from("a.cu"),
+                PathBuf::from("/usr/include/foo.h"),
+                PathBuf::from("hdr.cuh"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_depfile_handles_escaped_spaces() {
+        let dep = "out.o: /path/with\\ space/h.cuh src.cu\n";
+        let deps = parse_depfile(dep);
+        assert_eq!(
+            deps,
+            vec![
+                PathBuf::from("/path/with space/h.cuh"),
+                PathBuf::from("src.cu"),
+            ]
+        );
+    }
+
+    #[test]
+    fn fresh_output_skips_stale_output_rebuilds() {
+        let dir = std::env::temp_dir().join(format!("prelude_inc_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("k.cu");
+        let hdr = dir.join("k.cuh");
+        let out = dir.join("k.ptx");
+        let depf = depfile_path(&out);
+
+        std::fs::write(&src, b"src").unwrap();
+        std::fs::write(&hdr, b"hdr").unwrap();
+        std::fs::write(&out, b"ptx").unwrap();
+        std::fs::write(&depf, format!("{} : {} {}\n", out.display(), src.display(), hdr.display()))
+            .unwrap();
+
+        // Output is newest → fresh.
+        let now = std::time::SystemTime::now();
+        for p in [&src, &hdr] {
+            set_mtime(p, now - Duration::from_secs(10));
+        }
+        set_mtime(&out, now);
+        assert!(output_is_fresh(&out, &src), "output newer than inputs must be fresh");
+
+        // Touch a header newer than the output → stale.
+        set_mtime(&hdr, now + Duration::from_secs(10));
+        assert!(!output_is_fresh(&out, &src), "header edit must invalidate output");
+
+        // No depfile at all → always rebuild.
+        std::fs::remove_file(&depf).unwrap();
+        assert!(!output_is_fresh(&out, &src), "missing depfile must rebuild");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn set_mtime(path: &Path, t: std::time::SystemTime) {
+        let ft = filetime_from(t);
+        // Use libc-free approach via utimensat is overkill for a test; fall
+        // back to the filetime-style trick by re-writing then setting via the
+        // standard library is not available, so shell out to `touch -d`.
+        let secs = ft;
+        let _ = Command::new("touch")
+            .arg("-d")
+            .arg(format!("@{secs}"))
+            .arg(path)
+            .status();
+    }
+
+    fn filetime_from(t: std::time::SystemTime) -> i64 {
+        match t.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs() as i64,
+            Err(e) => -(e.duration().as_secs() as i64),
+        }
+    }
+
+    /// Try to locate an nvcc without panicking (unlike [`find_cuda`]), so the
+    /// end-to-end test can no-op on hosts that lack a CUDA toolkit.
+    fn try_find_nvcc() -> Option<PathBuf> {
+        for var in ["CUDA_HOME", "CUDA_PATH"] {
+            if let Ok(p) = env::var(var) {
+                let n = Path::new(&p).join("bin/nvcc");
+                if n.exists() {
+                    return Some(n);
+                }
+            }
+        }
+        for p in ["/usr/local/cuda", "/opt/cuda"] {
+            let n = Path::new(p).join("bin/nvcc");
+            if n.exists() {
+                return Some(n);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn end_to_end_compile_then_skip_then_rebuild() {
+        let Some(nvcc) = try_find_nvcc() else {
+            eprintln!("skipping: no nvcc on this host");
+            return;
+        };
+        // sm_80 (Ampere) is supported by every CUDA toolkit we build with.
+        if !nvcc_supports_arch(&nvcc, 80) {
+            eprintln!("skipping: nvcc lacks sm_80");
+            return;
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("prelude_inc_e2e_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("k.cu");
+        let hdr = dir.join("k.cuh");
+        let out = dir.join("k.ptx");
+        std::fs::write(&hdr, b"#define BUMP(v) ((v) + 1.0f)\n").unwrap();
+        std::fs::write(
+            &src,
+            b"#include \"k.cuh\"\nextern \"C\" __global__ void k(float* x){ x[threadIdx.x] = BUMP(x[threadIdx.x]); }\n",
+        )
+        .unwrap();
+
+        let opts = PtxCompile::new(&src, &out, 80).include(&dir);
+
+        // 1) First call compiles and produces the .ptx + sidecar depfile.
+        compile_cu_to_ptx(&nvcc, &opts);
+        assert!(out.exists(), "first compile must produce the ptx");
+        assert!(depfile_path(&out).exists(), "first compile must write a depfile");
+        let mtime1 = mtime(&out).unwrap();
+
+        // 2) Nothing changed → must be skipped (output mtime unchanged).
+        std::thread::sleep(Duration::from_millis(1100));
+        compile_cu_to_ptx(&nvcc, &opts);
+        assert_eq!(mtime(&out).unwrap(), mtime1, "unchanged inputs must skip recompile");
+
+        // 3) Editing the *header* must trigger a rebuild (newer ptx mtime).
+        std::thread::sleep(Duration::from_millis(1100));
+        std::fs::write(&hdr, b"#define BUMP(v) ((v) + 2.0f)\n").unwrap();
+        compile_cu_to_ptx(&nvcc, &opts);
+        assert!(
+            mtime(&out).unwrap() > mtime1,
+            "a header edit must force a recompile"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -1,5 +1,10 @@
 [build]
-rustflags = ["-C", "target-cpu=native"]
+# `-fuse-ld=mold`: link the ~720MB CUDA-heavy binary with mold instead of GNU
+# ld. Linking is the dominant single-threaded cost of every incremental build
+# (a 1-line Rust edit relinks ~1GB of static CUDA archives); mold cuts that from
+# minutes to seconds. Requires `mold` (ld.mold) on PATH — installed in the
+# prelude conda env. Needs gcc >= 12.1 (we have 13.3).
+rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=mold"]
 
 [env]
 PYTHON_EXECUTABLE = { value = ".venv/bin/python3", relative = true }

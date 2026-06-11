@@ -263,8 +263,7 @@ fn default_archs() -> String {
 /// PyTorch's wheel index and falls back across CUDA tags when nvcc's
 /// exact CUDA release has no matching upload (e.g. CUDA 13.2 → cu130).
 fn ensure_flashinfer_python_env(out_dir: &Path, fi_src: &Path) -> Result<PathBuf> {
-    const PROBE: &str =
-        "import filelock, numpy, einops, torch, cutlass, tvm_ffi";
+    const PROBE: &str = "import filelock, numpy, einops, torch, cutlass, tvm_ffi";
     let venv_dir = out_dir.join("flashinfer-venv");
     let venv = PythonVenv::ensure(&venv_dir).map_err(anyhow::Error::msg)?;
     if venv.check_import(PROBE) {
@@ -291,9 +290,7 @@ fn ensure_flashinfer_python_env(out_dir: &Path, fi_src: &Path) -> Result<PathBuf
     .map_err(anyhow::Error::msg)?;
 
     if !venv.check_import(PROBE) {
-        anyhow::bail!(
-            "flashinfer deps not importable after install — probe: `{PROBE}`"
-        );
+        anyhow::bail!("flashinfer deps not importable after install — probe: `{PROBE}`");
     }
     build_log!("flashinfer venv ready at {}", venv_dir.display());
     Ok(venv.python_path().to_path_buf())

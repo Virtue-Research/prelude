@@ -14,6 +14,7 @@ Generates:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import shutil
@@ -965,10 +966,17 @@ def generate_utility_sources(
                 # TVM FFI exports (e.g. __tvm_ffi_sampling_from_probs) undefined.
                 if not (out / binding_file).exists():
                     if kind == "norm":
-                        # Remove layernorm binding export
+                        # Remove the plain `layernorm` binding export (its body
+                        # is stripped from norm.cu above because it pulls in
+                        # TensorRT-LLM headers). Match on a whole-word boundary
+                        # so we DON'T also clobber unrelated ops whose names
+                        # merely contain "layernorm" as a substring — e.g.
+                        # `fused_dit_layernorm` / `fused_dit_layernorm_run`,
+                        # whose multi-line declaration would otherwise lose its
+                        # first line and leave an orphaned parameter list.
                         src_text = binding_path.read_text()
                         lines = [l for l in src_text.split('\n')
-                                 if 'layernorm' not in l]
+                                 if not re.search(r'\blayernorm\b', l)]
                         (out / binding_file).write_text('\n'.join(lines))
                     else:
                         shutil.copy2(binding_path, out / binding_file)
