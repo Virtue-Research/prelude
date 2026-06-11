@@ -1,0 +1,3 @@
+/target
+# build/test transcripts kept locally, not committed
+*.log
