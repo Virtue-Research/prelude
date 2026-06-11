@@ -62,6 +62,7 @@ impl CacheManager {
             Self::init_prefix_cache(
                 device,
                 model_config.num_hidden_layers,
+                model_config.max_position_embeddings,
                 cache_config,
                 paged_pool.as_ref().map(|pool| pool.block_size),
                 num_paged_blocks,
@@ -115,6 +116,7 @@ impl CacheManager {
     fn init_prefix_cache(
         device: &Device,
         num_layers: usize,
+        max_model_len: usize,
         cache_config: &CacheConfig,
         paged_block_size: Option<usize>,
         num_paged_blocks: Option<usize>,
@@ -123,20 +125,32 @@ impl CacheManager {
         if configured_max_blocks == 0 {
             return None;
         }
-        // Clamp the prefix-cache block budget to half the physical paged pool.
-        // The cache pins pool blocks by refcount and only evicts (its LRU) once
-        // its block count exceeds this budget. If the budget exceeds the
-        // physical pool the LRU never fires under physical pressure, so the
-        // cache pins the whole pool and live admission permanently wedges
-        // (observed: pool 871, default budget 4096 → free blocks → ~49).
-        // Half the pool keeps the hot shared prefix while always leaving
-        // headroom for live requests; LRU evicts the cold unique-suffix
-        // chains first.
-        let max_blocks = match num_paged_blocks {
-            Some(n) if n > 0 => configured_max_blocks.min((n / 2).max(1)),
-            _ => configured_max_blocks,
-        };
         let block_size = paged_block_size.unwrap_or(cache_config.prefix_block_size);
+        // Demand-driven reclaim (see CacheManager::reclaim_idle_prefix_blocks) lets
+        // the cache use almost the whole pool: idle (cache-only) blocks are
+        // reclaimed on physical pressure, so it can't wedge live admission.
+        // Keep a small reserve floor so the cache never pins the *entire* pool —
+        // enough for one max-length request, but capped at 1/8 of the pool so a
+        // very-large-context model (whose single-request worst case could
+        // otherwise be a large fraction of the pool) doesn't sacrifice most of the
+        // cache. Beyond this floor, reclaim (idle blocks) and the no-progress
+        // preemption backstop guarantee forward progress, so the floor only needs
+        // to keep a little reclaim headroom.
+        let pool_blocks = num_paged_blocks.unwrap_or(0);
+        let reserve_floor = if pool_blocks > 0 {
+            max_model_len
+                .div_ceil(block_size.max(1))
+                .min(pool_blocks / 8)
+                .max(1)
+        } else {
+            0
+        };
+        let max_blocks = if pool_blocks > 0 {
+            let budget_cap = pool_blocks.saturating_sub(reserve_floor).max(1);
+            configured_max_blocks.min(budget_cap)
+        } else {
+            configured_max_blocks
+        };
         // flash layout: [B, L, H, D] → concat dim 1; standard: [B, H, L, D] → concat dim 2
         let is_flash = device.is_cuda();
         let concat_dim = if is_flash { 1 } else { 2 };
@@ -144,6 +158,7 @@ impl CacheManager {
             max_blocks = max_blocks,
             configured_max_blocks = configured_max_blocks,
             num_paged_blocks = num_paged_blocks.unwrap_or(0),
+            reserve_floor = reserve_floor,
             block_size = block_size,
             concat_dim = concat_dim,
             num_layers = num_layers,

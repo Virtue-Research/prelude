@@ -731,11 +731,81 @@ async fn wait_for_initial_prefill_batch(
 
 // ── Batch construction ─────────────────────────────────────────────
 
-/// Build a prefill ForwardBatch, handling both full and chunked prefill.
+/// Grow `id`'s block_table up to `target` blocks, allocating until it reaches
+/// `target` or the pool is exhausted. Returns the resulting block_table length.
+fn grow_prefill_block_table(scheduler: &mut Scheduler, id: &str, target: usize) -> usize {
+    loop {
+        let len = match scheduler.get_sequence(id) {
+            Some(s) => s.block_table.len(),
+            None => return 0,
+        };
+        if len >= target {
+            return len;
+        }
+        match scheduler.allocate_block() {
+            Some(block) => match scheduler.get_sequence_mut(id) {
+                Some(seq_mut) => seq_mut.block_table.push(block),
+                None => return len,
+            },
+            None => return len,
+        }
+    }
+}
+
+/// For each decoding sequence whose next token crosses a block boundary, grow
+/// its block_table by one block — reclaiming idle (cache-only) prefix-cache
+/// blocks if the pool is momentarily exhausted, then retrying once. Afterwards
+/// drop from `decode_ids` any request whose block_table still cannot cover its
+/// decode position (KV exhausted even after reclaim); those stay in the
+/// scheduler and retry next step. Dropping is mandatory: `process_step_output`
+/// indexes the forward output by position in `decode_ids`, so a length mismatch
+/// would misalign every logits row after the first skip and mis-sample tokens.
 ///
-/// Final chunk: takes `prepared` from state (consumed).
-/// Partial chunk: builds a minimal item from cached prompt tokens; `prepared`
-/// stays in state for the final chunk (which needs logits_processor).
+/// Consolidates the formerly-duplicated pure-decode and mixed-batch copies.
+fn grow_block_tables_for_decode(
+    engine: &Engine,
+    scheduler: &mut Scheduler,
+    decode_ids: &mut Vec<String>,
+    block_size: usize,
+) {
+    for id in decode_ids.iter() {
+        let Some(seq) = scheduler.get_sequence(id) else {
+            continue;
+        };
+        // total_len()-1 is the decode token's 0-indexed position (output_ids
+        // already contains it); a new block is needed only at a block boundary.
+        if (seq.total_len() - 1) % block_size != 0 {
+            continue;
+        }
+        let mut block = scheduler.allocate_block();
+        if block.is_none() {
+            let _ = engine.cache.reclaim_idle_prefix_blocks(1);
+            block = scheduler.allocate_block();
+        }
+        if let Some(new_block) = block {
+            if let Some(seq_mut) = scheduler.get_sequence_mut(id) {
+                seq_mut.block_table.push(new_block);
+            }
+        }
+    }
+    decode_ids.retain(|id| {
+        let Some(seq) = scheduler.get_sequence(id) else {
+            return false;
+        };
+        let position = seq.total_len() - 1;
+        if seq.block_table.len() * block_size <= position {
+            tracing::warn!(
+                request_id = %id,
+                position,
+                blocks = seq.block_table.len(),
+                "KV block pool exhausted for decode — deferring this request"
+            );
+            return false;
+        }
+        true
+    });
+}
+
 /// Build a ForwardBatch for the current step.
 ///
 /// Pure decode → ForwardBatch::Decode (CUDA graph eligible).
@@ -769,47 +839,7 @@ fn build_step_batch(
             .as_ref()
             .map(|p| p.block_size)
             .unwrap_or(16);
-        for id in &step.decode_request_ids {
-            if let Some(seq) = scheduler.get_sequence(id) {
-                let seq_len = seq.total_len();
-                let position = seq_len - 1; // 0-indexed position of the decode token
-                if position % block_size == 0 {
-                    if let Some(new_block) = scheduler.allocate_block() {
-                        if let Some(seq_mut) = scheduler.get_sequence_mut(id) {
-                            seq_mut.block_table.push(new_block);
-                        }
-                    }
-                }
-            }
-        }
-        // Filter out requests whose block_table doesn't cover the current
-        // decode position (allocate_block above returned None — KV pool
-        // exhausted). We MUST drop these IDs from `step` itself: the
-        // outer loop in `process_step_output` indexes the forward output
-        // by position in `step.decode_request_ids`, so a length mismatch
-        // between the batch we forward and the IDs we iterate would
-        // misalign every logits row after the first skip and silently
-        // mis-sample tokens for unrelated requests. The skipped requests
-        // stay in the scheduler so the next step retries once blocks free.
-        let mut deferred: Vec<String> = Vec::new();
-        step.decode_request_ids.retain(|id| {
-            let Some(seq) = scheduler.get_sequence(id) else {
-                deferred.push(id.clone());
-                return false;
-            };
-            let position = seq.total_len() - 1;
-            if seq.block_table.len() * block_size <= position {
-                tracing::warn!(
-                    request_id = %id,
-                    position,
-                    blocks = seq.block_table.len(),
-                    "KV block pool exhausted for decode — deferring this request"
-                );
-                deferred.push(id.clone());
-                return false;
-            }
-            true
-        });
+        grow_block_tables_for_decode(engine, scheduler, &mut step.decode_request_ids, block_size);
 
         let cap = step.decode_request_ids.len();
         let mut tokens = Vec::with_capacity(cap);
@@ -895,20 +925,15 @@ fn build_step_batch(
         let deltanet_slot = seq.deltanet_slot;
         let needs_kv_cache = batch_needs_paged_prefill;
         if needs_kv_cache && current_blocks < total_blocks_needed {
-            for _ in current_blocks..total_blocks_needed {
-                match scheduler.allocate_block() {
-                    Some(block) => {
-                        if let Some(seq_mut) = scheduler.get_sequence_mut(id) {
-                            seq_mut.block_table.push(block);
-                        }
-                    }
-                    None => break,
-                }
+            let mut actual = grow_prefill_block_table(scheduler, id, total_blocks_needed);
+            if actual < total_blocks_needed {
+                // Pool exhausted: reclaim idle (cache-only) prefix blocks and
+                // retry once before deferring (escalation: free→reclaim→defer).
+                let _ = engine
+                    .cache
+                    .reclaim_idle_prefix_blocks(total_blocks_needed - actual);
+                actual = grow_prefill_block_table(scheduler, id, total_blocks_needed);
             }
-            let actual = scheduler
-                .get_sequence(id)
-                .map(|s| s.block_table.len())
-                .unwrap_or(0);
             if actual < total_blocks_needed {
                 tracing::warn!(
                     request_id = %id,
@@ -966,38 +991,10 @@ fn build_step_batch(
             .retain(|_| keep_iter.next().unwrap_or(false));
     }
 
-    // ── Decode: same pattern as the pure-decode branch above. Try to
-    // grow block_table; drop deferred requests from step.decode_request_ids
-    // so the index-parallel logits walk in process_step_output stays
-    // aligned with what we actually forward.
-    for id in &step.decode_request_ids {
-        if let Some(seq) = scheduler.get_sequence(id) {
-            let position = seq.total_len() - 1;
-            if position % block_size == 0 {
-                if let Some(new_block) = scheduler.allocate_block() {
-                    if let Some(seq_mut) = scheduler.get_sequence_mut(id) {
-                        seq_mut.block_table.push(new_block);
-                    }
-                }
-            }
-        }
-    }
-    step.decode_request_ids.retain(|id| {
-        let Some(seq) = scheduler.get_sequence(id) else {
-            return false;
-        };
-        let position = seq.total_len() - 1;
-        if seq.block_table.len() * block_size <= position {
-            tracing::warn!(
-                request_id = %id,
-                position,
-                blocks = seq.block_table.len(),
-                "KV block pool exhausted for decode in mixed batch — deferring"
-            );
-            return false;
-        }
-        true
-    });
+    // ── Decode: grow block tables (reclaiming on exhaustion) and drop any
+    // request the pool still can't cover, keeping step.decode_request_ids
+    // aligned with the index-parallel logits walk in process_step_output.
+    grow_block_tables_for_decode(engine, scheduler, &mut step.decode_request_ids, block_size);
 
     for id in &step.decode_request_ids {
         has_executor_sample_rows = true;

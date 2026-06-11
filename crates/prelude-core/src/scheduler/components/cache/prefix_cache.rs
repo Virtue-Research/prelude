@@ -567,6 +567,33 @@ impl PrefixKvCache {
         blocks
     }
 
+    /// Demand-driven reclaim: free up to `target` paged blocks by evicting idle
+    /// (cache-only) LRU leaf entries, ignoring the configured budget.
+    /// `is_reclaimable(paged_ids)` must return true only when every paged block
+    /// of a leaf is held solely by the cache (ref_count == 1). Returns the paged
+    /// block IDs whose ref counts the caller must now decrement — same contract
+    /// as `take_evicted_paged_blocks`.
+    pub fn reclaim_idle_blocks(
+        &mut self,
+        target: usize,
+        is_reclaimable: &mut dyn FnMut(&[u32]) -> bool,
+    ) -> Vec<u32> {
+        if !self.index.enabled() {
+            return Vec::new();
+        }
+        self.index.reclaim_leaves(target, is_reclaimable);
+        // Tear down side stores for the hashes just evicted (mirror insert path:
+        // exact entries via remove_exact_entries_referencing, then the 3 maps).
+        let evicted_hashes = self.index.take_evicted_hashes();
+        self.remove_exact_entries_referencing(&evicted_hashes);
+        for hash in evicted_hashes {
+            self.kv_store.remove(&hash);
+            self.deltanet_state_store.remove(&hash);
+            self.assembled_cache.remove(&hash);
+        }
+        self.take_evicted_paged_blocks()
+    }
+
     // -----------------------------------------------------------------------
     // Internal: KV assembly
     // -----------------------------------------------------------------------

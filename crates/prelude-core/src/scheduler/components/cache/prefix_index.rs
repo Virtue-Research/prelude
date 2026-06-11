@@ -383,6 +383,73 @@ impl PrefixMatchIndex {
         }
     }
 
+    /// Demand-driven reclaim: free up to `target` paged blocks by evicting
+    /// LRU leaf entries whose paged blocks are reclaimable, IGNORING `max_blocks`.
+    ///
+    /// `is_reclaimable(paged_ids)` is supplied by the caller and returns true
+    /// only when every paged block of the leaf is held solely by the cache
+    /// (ref_count == 1). Leaves that are still live (predicate false) are kept
+    /// and re-queued. Mirrors `evict_if_needed`'s leaf walk + childless-parent
+    /// promotion; freed block IDs accumulate in `evicted_paged_blocks` /
+    /// `evicted_hashes` for the caller to drain and release. Returns blocks freed.
+    pub fn reclaim_leaves(
+        &mut self,
+        target: usize,
+        is_reclaimable: &mut dyn FnMut(&[u32]) -> bool,
+    ) -> usize {
+        let mut freed = 0usize;
+        // Live leaves examined this pass: kept aside, re-queued at the end so a
+        // single call examines each leaf at most once (guarantees termination).
+        let mut kept: Vec<(u64, u64)> = Vec::new();
+        while freed < target {
+            let Some((hash, access_id)) = self.leaf_lru.pop_front() else {
+                break;
+            };
+            // Skip stale or non-leaf entries (same as evict_if_needed).
+            if !self.leaf_set.contains(&hash) {
+                continue;
+            }
+            let Some(entry) = self.entries.get(&hash) else {
+                continue;
+            };
+            if entry.access_id != access_id || entry.children > 0 {
+                continue;
+            }
+            // Only reclaim if every paged block is idle (cache-only).
+            if let Some(paged_ids) = entry.paged_block_ids.as_deref() {
+                if !is_reclaimable(paged_ids) {
+                    kept.push((hash, access_id));
+                    continue;
+                }
+            }
+
+            let entry = self.entries.remove(&hash).unwrap();
+            self.leaf_set.remove(&hash);
+            self.evicted_hashes.push(hash);
+
+            if let Some(paged_ids) = entry.paged_block_ids {
+                freed += paged_ids.len();
+                self.evicted_paged_blocks.extend_from_slice(&paged_ids);
+            }
+
+            // If parent becomes childless, it becomes a new leaf candidate.
+            if let Some(parent) = entry.parent {
+                if let Some(parent_entry) = self.entries.get_mut(&parent) {
+                    parent_entry.children = parent_entry.children.saturating_sub(1);
+                    if parent_entry.children == 0 {
+                        self.leaf_set.insert(parent);
+                        self.leaf_lru.push_back((parent, parent_entry.access_id));
+                    }
+                }
+            }
+        }
+        // Re-queue the live leaves we kept, preserving their (older) LRU position.
+        for s in kept.into_iter().rev() {
+            self.leaf_lru.push_front(s);
+        }
+        freed
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
@@ -522,6 +589,85 @@ mod tests {
         index.insert_blocks(&tokens, Some(&paged_map));
         let evicted_paged = index.take_evicted_paged_blocks();
         assert!(!evicted_paged.is_empty());
+    }
+
+    #[test]
+    fn test_reclaim_leaves_peels_cold_chain_lru() {
+        // chain root(10) -> mid(11) -> leaf(12); only the leaf is evictable.
+        let mut index = PrefixMatchIndex::new(4, 16);
+        let tokens: Vec<u32> = (0..12).collect();
+        let paged_map = PrefixMatchIndex::compute_paged_map(12, 4, 4, &[10, 11, 12]);
+        index.insert_blocks(&tokens, Some(&paged_map));
+        assert_eq!(index.cached_blocks(), 3);
+
+        // target=1 evicts ONLY the deepest leaf (12); interior 10/11 untouched.
+        let freed = index.reclaim_leaves(1, &mut |_ids| true);
+        assert_eq!(freed, 1);
+        assert_eq!(index.cached_blocks(), 2);
+        assert_eq!(index.take_evicted_paged_blocks(), vec![12]);
+
+        // target=2 peels the rest bottom-up (11 then promoted 10).
+        let freed = index.reclaim_leaves(2, &mut |_ids| true);
+        assert_eq!(freed, 2);
+        assert_eq!(index.cached_blocks(), 0);
+        assert_eq!(index.take_evicted_paged_blocks(), vec![11, 10]);
+    }
+
+    #[test]
+    fn test_reclaim_leaves_skips_live_then_requeues() {
+        let mut index = PrefixMatchIndex::new(4, 16);
+        let tokens: Vec<u32> = (0..12).collect();
+        let paged_map = PrefixMatchIndex::compute_paged_map(12, 4, 4, &[10, 11, 12]);
+        index.insert_blocks(&tokens, Some(&paged_map));
+
+        // All live (predicate false): nothing freed, nothing removed.
+        let freed = index.reclaim_leaves(3, &mut |_ids| false);
+        assert_eq!(freed, 0);
+        assert_eq!(index.cached_blocks(), 3);
+        assert!(index.take_evicted_paged_blocks().is_empty());
+
+        // The kept leaf must NOT have been lost — a later idle reclaim finds it.
+        let freed = index.reclaim_leaves(1, &mut |_ids| true);
+        assert_eq!(freed, 1);
+        assert_eq!(index.take_evicted_paged_blocks(), vec![12]);
+    }
+
+    #[test]
+    fn test_reclaim_leaves_just_enough_across_chains() {
+        // Two independent single-block chains (no shared prefix) → two leaves.
+        let mut index = PrefixMatchIndex::new(4, 16);
+        index.insert_blocks(
+            &(0..4).collect::<Vec<_>>(),
+            Some(&PrefixMatchIndex::compute_paged_map(4, 4, 4, &[10])),
+        );
+        index.insert_blocks(
+            &(100..104).collect::<Vec<_>>(),
+            Some(&PrefixMatchIndex::compute_paged_map(4, 4, 4, &[20])),
+        );
+        assert_eq!(index.cached_blocks(), 2);
+
+        // target=1 frees exactly one block; the other survives (just-enough).
+        let freed = index.reclaim_leaves(1, &mut |_ids| true);
+        assert_eq!(freed, 1);
+        assert_eq!(index.cached_blocks(), 1);
+        assert_eq!(index.take_evicted_paged_blocks().len(), 1);
+    }
+
+    #[test]
+    fn test_reclaim_leaves_predicate_sees_paged_ids() {
+        let mut index = PrefixMatchIndex::new(4, 16);
+        let tokens: Vec<u32> = (0..12).collect();
+        let paged_map = PrefixMatchIndex::compute_paged_map(12, 4, 4, &[10, 11, 12]);
+        index.insert_blocks(&tokens, Some(&paged_map));
+
+        let mut seen: Vec<u32> = Vec::new();
+        let freed = index.reclaim_leaves(1, &mut |ids| {
+            seen.extend_from_slice(ids);
+            true
+        });
+        assert_eq!(freed, 1);
+        // predicate was consulted with the leaf's paged ids.
+        assert_eq!(seen, vec![12]);
     }
 
     #[test]
