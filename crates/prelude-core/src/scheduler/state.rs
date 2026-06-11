@@ -415,6 +415,41 @@ impl Scheduler {
         }
     }
 
+    /// Submit-ahead pipeline: optimistically advance a sequence's length by one
+    /// token at SUBMIT time (before the forward result is known), so the next
+    /// step can be scheduled/built. The real token value is written later by
+    /// `record_generated_token` at process time. Pushes a placeholder; length,
+    /// position and `tokens_in_use` accounting all advance now.
+    pub fn pipeline_advance(&mut self, request_id: &str) {
+        if let Some(sequence) = self
+            .running
+            .iter_mut()
+            .find(|sequence| sequence.request_id == request_id)
+        {
+            sequence.output_ids.push(0);
+            self.tokens_in_use += 1;
+        }
+    }
+
+    /// Submit-ahead pipeline: write the real token value into the placeholder
+    /// pushed by `pipeline_advance` (the last output id), at process time.
+    /// Length/accounting were already advanced — do NOT push again.
+    pub fn record_generated_token(&mut self, request_id: &str, token_id: u32) {
+        if let Some(sequence) = self
+            .running
+            .iter_mut()
+            .find(|sequence| sequence.request_id == request_id)
+        {
+            if let Some(last) = sequence.output_ids.last_mut() {
+                *last = token_id;
+            } else {
+                // Defensive: no placeholder (shouldn't happen in pipeline mode).
+                sequence.output_ids.push(token_id);
+                self.tokens_in_use += 1;
+            }
+        }
+    }
+
     pub fn finish_request(&mut self, request_id: &str, reason: SeqFinishReason) {
         if let Some(sequence) = self
             .running

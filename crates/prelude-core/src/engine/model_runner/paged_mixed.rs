@@ -13,6 +13,7 @@ impl Engine {
     pub(crate) fn batch_mixed_paged(
         &self,
         requests: &[StepRequest],
+        decode_tokens_device: Option<&Tensor>,
     ) -> Result<ModelOutput, EngineError> {
         let pool = self.cache.paged_pool.as_ref().ok_or_else(|| {
             EngineError::Internal("batch_mixed_paged requires paged attention pool".into())
@@ -77,8 +78,36 @@ impl Engine {
             );
         }
 
-        let packed_input = Tensor::from_vec(flat_tokens, (total_tokens,), &self.executor.device)
-            .map_err(tensor_err)?;
+        let mut packed_input =
+            Tensor::from_vec(flat_tokens, (total_tokens,), &self.executor.device)
+                .map_err(tensor_err)?;
+        // Async pipeline: override the DECODE rows' input ids with the previous
+        // step's device-resident sampled tokens (device→device, no host sync).
+        // Decode rows are the trailing requests (is_prefill_* == false), each
+        // q_len==1, so they occupy the last `num_decode` slots of packed_input.
+        if let Some(dev_tokens) = decode_tokens_device {
+            let num_decode = requests
+                .iter()
+                .filter(|r| !r.is_prefill_final && !r.is_prefill_partial)
+                .count();
+            let dev_n = dev_tokens.dims1().map_err(tensor_err)?;
+            if num_decode > 0 && dev_n == num_decode && num_decode <= total_tokens {
+                let start = total_tokens - num_decode;
+                let dev_tokens = dev_tokens
+                    .to_dtype(packed_input.dtype())
+                    .map_err(tensor_err)?;
+                packed_input = packed_input
+                    .slice_assign(&[start..total_tokens], &dev_tokens)
+                    .map_err(tensor_err)?;
+            } else {
+                tracing::warn!(
+                    num_decode,
+                    dev_n,
+                    total_tokens,
+                    "decode_tokens_device shape mismatch — ignoring device input ids"
+                );
+            }
+        }
         let cu_seqlens_q_t =
             Tensor::from_vec(cu_seqlens_q, (num_requests + 1,), &self.executor.device)
                 .map_err(tensor_err)?;

@@ -121,6 +121,22 @@ pub enum ForwardBatch {
         requests: Vec<StepRequest>,
         /// Rows that need sampling are pure greedy with no logprobs.
         sample_greedy: bool,
+        /// Optional `[num_decode] U32` device tensor of input ids for the
+        /// DECODE rows (the trailing requests with `is_prefill_* == false`),
+        /// in the same order they appear in `requests`. When present, these
+        /// override the host `StepRequest.tokens` for the decode rows' actual
+        /// `input_ids`, letting the async pipeline feed the previous step's
+        /// `sampled_tokens_device` device→device with no host round-trip.
+        /// `None` = source all input ids from host (current behaviour).
+        decode_tokens_device: Option<Tensor>,
+        /// Submit-ahead pipeline (stage 3): host row indices into the PREVIOUS
+        /// step's output, one per decode row (same order as the decode rows).
+        /// The device executor resolves these against its stored
+        /// previous-step `sampled_tokens_device` *inside the worker* (so the
+        /// gather is ordered after the previous forward on the same thread,
+        /// with no host round-trip) and fills `decode_tokens_device`. Lets the
+        /// AR loop build+submit step N+1 before receiving step N's result.
+        decode_prev_rows: Option<Vec<u32>>,
     },
     /// Pure decode batch (Q=1 for all): eligible for CUDA graph replay.
     Decode {
@@ -142,6 +158,11 @@ pub enum ForwardBatch {
         /// `ModelOutput.sampled_tokens_device` to skip the per-step
         /// `to_vec1` host sync. See #28 / Phase 3 series.
         tokens_device: Option<Tensor>,
+        /// Submit-ahead pipeline (stage 3): host row indices into the previous
+        /// step's output, one per decode row. Resolved to `tokens_device` by
+        /// the device executor against its stored previous-step sampled tokens
+        /// (worker-internal gather). See `ForwardBatch::Mixed::decode_prev_rows`.
+        decode_prev_rows: Option<Vec<u32>>,
     },
     /// One-shot forward for classify/embed (no decode loop).
     /// Groups of token sequences — each group is one input item which may
@@ -284,6 +305,8 @@ mod tests {
             ForwardBatch::Mixed {
                 requests: vec![],
                 sample_greedy: false,
+                decode_tokens_device: None,
+                decode_prev_rows: None,
             },
         )
         .unwrap();
@@ -301,6 +324,7 @@ mod tests {
                 deltanet_slots: None,
                 sample_greedy: false,
                 tokens_device: None,
+                decode_prev_rows: None,
             },
         )
         .unwrap();
@@ -332,6 +356,7 @@ mod tests {
                 deltanet_slots: Some(vec![0, 1]),
                 sample_greedy: false,
                 tokens_device: None,
+                decode_prev_rows: None,
             },
         )
         .unwrap();
