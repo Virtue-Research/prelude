@@ -81,10 +81,7 @@ pub fn fast_argmax_vocab(logits: &Tensor) -> Result<Tensor> {
     // ── Shape / dtype gate ──────────────────────────────────────────
     let dims = logits.dims();
     if dims.len() != 2 {
-        candle_core::bail!(
-            "fast_argmax_vocab: expected 2-D tensor, got {:?}",
-            dims
-        );
+        candle_core::bail!("fast_argmax_vocab: expected 2-D tensor, got {:?}", dims);
     }
     let (b, v) = (dims[0] as u32, dims[1] as u32);
     if b == 0 || v == 0 {
@@ -275,11 +272,7 @@ mod tests {
 
         let cpu_ref = cpu_argmax(&logits, b, v);
 
-        let candle_idx: Vec<u32> = logits
-            .argmax(D::Minus1)
-            .unwrap()
-            .to_vec1::<u32>()
-            .unwrap();
+        let candle_idx: Vec<u32> = logits.argmax(D::Minus1).unwrap().to_vec1::<u32>().unwrap();
 
         let fast_idx: Vec<u32> = fast_argmax_vocab(&logits)
             .unwrap()

@@ -1391,11 +1391,7 @@ pub fn grouped_scaled_fp8_gate_up_down(
     )?;
 
     let cfg_weighted_sum = LaunchConfig {
-        grid_dim: (
-            input_rows as u32,
-            (hidden as u32).div_ceil(256),
-            1,
-        ),
+        grid_dim: (input_rows as u32, (hidden as u32).div_ceil(256), 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };

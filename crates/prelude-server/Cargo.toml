@@ -62,6 +62,11 @@ cuda = [
 ]
 # CUDA GGUF quantized linear kernels (llama.cpp MMQ/MMVQ via quant-gemm).
 cuda-gguf = ["cuda", "prelude-cuda/gguf-quant"]
+# FlashAttention-3 (Hopper) backend — opt-in (heavy CUTLASS compile).
+flash-attn-v3 = ["cuda", "prelude-core/flash-attn-v3", "prelude-cuda/flash-attn-v3"]
+# candle-fa3-0102 backend (vendored vLLM 0.22 FA3 hopper kernel, prebuilt .a).
+# Runtime opt-in via PRELUDE_ATTN_FA3_0102=1.
+fa3-0102 = ["cuda", "prelude-cuda/fa3-0102"]
 # AMD GPU inference — bare-metal KFD via t0-gpu (zero HIP/ROCm dependency).
 # Disabled until t0-gpu upstream fixes `tests/t0_original` submodule entry.
 # amd = ["dep:prelude-amd"]

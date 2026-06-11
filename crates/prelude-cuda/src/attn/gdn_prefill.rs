@@ -27,17 +27,17 @@
 //! - `output`: `[packed_seq, num_sab_heads, head_dim]` BF16
 //! - `output_state`: `[num_seqs, num_sab_heads, head_dim, head_dim]` F32
 
+use candle_core::Shape;
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::WrapErr;
-use candle_core::Shape;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
-use flashinfer::types::{
-    DLDataType, DLDevice, DLTensor, TVMFFIAny, KDLBFLOAT, KDLCUDA, KDLFLOAT, KDLINT, KDLUINT,
-};
 use flashinfer::KernelRegistry;
+use flashinfer::types::{
+    DLDataType, DLDevice, DLTensor, KDLBFLOAT, KDLCUDA, KDLFLOAT, KDLINT, KDLUINT, TVMFFIAny,
+};
 use half::bf16;
-use prelude_core::tensor::{bail, DType, DeviceExt, Result, Tensor};
+use prelude_core::tensor::{DType, DeviceExt, Result, Tensor, bail};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
@@ -951,10 +951,6 @@ fn detect_sm_count() -> i32 {
         if cudaDeviceGetAttribute(&mut count, CUDA_DEV_ATTR_MULTIPROCESSOR_COUNT, dev) != 0 {
             return 132;
         }
-        if count > 0 {
-            count
-        } else {
-            132
-        }
+        if count > 0 { count } else { 132 }
     })
 }

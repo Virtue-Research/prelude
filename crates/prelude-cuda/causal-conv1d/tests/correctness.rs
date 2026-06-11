@@ -209,8 +209,7 @@ fn init_blc_to_bcl(init: &[f64], b: usize, k_minus_1: usize, d: usize) -> Vec<f6
     for bi in 0..b {
         for t in 0..k_minus_1 {
             for c in 0..d {
-                out[bi * d * k_minus_1 + c * k_minus_1 + t] =
-                    init[bi * k_minus_1 * d + t * d + c];
+                out[bi * d * k_minus_1 + c * k_minus_1 + t] = init[bi * k_minus_1 * d + t * d + c];
             }
         }
     }
@@ -369,10 +368,7 @@ fn fwd_bf16_channellast_honors_initial_states() {
         .collect();
     let err = max_abs(&ref_blc, &got);
     eprintln!("fwd_bf16_channellast_honors_initial_states: max_abs_err={err:.6e}");
-    assert!(
-        err < 5e-2,
-        "channellast initial_states max_abs_err={err}"
-    );
+    assert!(err < 5e-2, "channellast initial_states max_abs_err={err}");
 }
 
 /// BF16 forward + fused SiLU (the path Qwen3.5 uses in prefill).
