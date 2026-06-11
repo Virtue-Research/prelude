@@ -1293,9 +1293,7 @@ fn test_preempt_protects_oldest_and_prefix_leader() {
     let base = std::time::Instant::now();
     // oldest (protected by FCFS), leader (protected to not starve peers),
     // and a normal newer request — only the normal one may be the victim.
-    sched
-        .running
-        .push(running_seq("oldest", base, true));
+    sched.running.push(running_seq("oldest", base, true));
     sched.running.push(running_seq(
         "leader",
         base + std::time::Duration::from_secs(1),
@@ -1346,7 +1344,10 @@ fn test_preempt_for_progress_requeues_and_resets_victim() {
     assert_eq!(v.kv_computed_len, 0);
     assert!(v.block_table.is_empty());
     assert_eq!(v.preempt_count, 1);
-    assert_eq!(v.prefix_attach_gen, None, "preempted seq must be re-matchable");
+    assert_eq!(
+        v.prefix_attach_gen, None,
+        "preempted seq must be re-matchable"
+    );
 }
 
 #[test]

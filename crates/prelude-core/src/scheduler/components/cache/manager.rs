@@ -37,6 +37,7 @@ impl CacheManager {
         cache_config: &CacheConfig,
         kv_sharing: &[Option<usize>],
         peak_activation_bytes: usize,
+        weights_bytes_at_load: Option<usize>,
     ) -> Result<Self, EngineError> {
         let (paged_pool, block_manager) = if runtime_caps.supports_paged_attn {
             Self::init_paged_pool(
@@ -46,6 +47,7 @@ impl CacheManager {
                 cache_config,
                 kv_sharing,
                 peak_activation_bytes,
+                weights_bytes_at_load,
             )?
         } else {
             (None, None)
@@ -180,6 +182,7 @@ impl CacheManager {
         cache_config: &CacheConfig,
         kv_sharing: &[Option<usize>],
         peak_activation_bytes: usize,
+        weights_bytes_at_load: Option<usize>,
     ) -> Result<
         (
             Option<PagedKvPool>,
@@ -268,7 +271,12 @@ impl CacheManager {
             //   requested = total * utilization
             //   non_kv = weights_memory + peak_activation
             //   available = requested - non_kv
-            let weights_bytes = total_bytes.saturating_sub(free_bytes);
+            // Weights+context as measured RIGHT AFTER model load (vLLM
+            // semantics). Falling back to `total - free` taken now would
+            // double-count the activation-profiling pages retained by the
+            // cudarc allocator (they are also added as peak_activation below).
+            let weights_bytes =
+                weights_bytes_at_load.unwrap_or_else(|| total_bytes.saturating_sub(free_bytes));
             let requested = (total_bytes as f64 * utilization as f64) as usize;
             let non_kv = weights_bytes + peak_activation_bytes;
             let available_for_kv = requested.saturating_sub(non_kv);

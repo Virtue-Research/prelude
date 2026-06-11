@@ -1,10 +1,19 @@
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cache::deltanet_pool::DeltaNetPrefixState;
 use crate::engine::{BatchPrefillResult, Engine, EngineError};
 use crate::scheduler::{Scheduler, Sequence};
 
 const PREFIX_CACHE_KEY_BLOCKS: usize = 8;
+
+// Cumulative prefix-cache hit accounting, comparable to vLLM's
+// "Prefix cache hit rate" (cached tokens / prompt tokens). Hits accrue at
+// attach time (delta over any previous attach); queries accrue once per
+// request at its final prefill chunk. Logged every 256 finished prefills.
+static PREFIX_HIT_TOKENS: AtomicU64 = AtomicU64::new(0);
+static PREFIX_QUERY_TOKENS: AtomicU64 = AtomicU64::new(0);
+static PREFIX_QUERY_REQS: AtomicU64 = AtomicU64::new(0);
 
 struct PrefixAttach {
     deltanet_state: Option<DeltaNetPrefixState>,
@@ -14,6 +23,9 @@ struct PrefixAttach {
 fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) -> Option<PrefixAttach> {
     if engine.cache.prefix_cache.is_none() || seq.input_ids.len() <= 1 {
         return None;
+    }
+    if engine.cache.lazy_prefix_enabled() {
+        return attach_prefix_cache_reuse_lazy(engine, seq);
     }
     let Some(pool) = engine.cache.paged_pool.as_ref() else {
         return None;
@@ -100,6 +112,10 @@ fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) -> Option<Pref
         return None;
     }
 
+    PREFIX_HIT_TOKENS.fetch_add(
+        (cached_len - seq.kv_computed_len) as u64,
+        Ordering::Relaxed,
+    );
     seq.kv_computed_len = cached_len;
     let replaced_blocks = std::mem::replace(&mut seq.block_table, block_table);
     tracing::debug!(
@@ -112,6 +128,48 @@ fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) -> Option<Pref
     );
     Some(PrefixAttach {
         deltanet_state,
+        replaced_blocks,
+    })
+}
+
+/// vLLM-style lazy prefix attach: match full cached blocks straight off the
+/// hash-aware BlockManager. The match already takes the sequence's reference
+/// on every hit block (reviving free ones), so there is no separate retain
+/// step and no partial-page copy — full blocks only.
+fn attach_prefix_cache_reuse_lazy(engine: &Engine, seq: &mut Sequence) -> Option<PrefixAttach> {
+    let (cached_len, blocks) = match engine.cache.try_prefix_cache_match_lazy(&seq.input_ids) {
+        Ok(hit) => hit,
+        Err(error) => {
+            tracing::warn!(request_id = %seq.request_id, error = %error, "lazy prefix cache match failed");
+            return None;
+        }
+    };
+    if cached_len == 0 {
+        return None;
+    }
+    if cached_len <= seq.kv_computed_len {
+        // No deeper than what this request already attached — return the refs
+        // the match just took.
+        if let Err(error) = engine.cache.release_paged_blocks(&blocks) {
+            tracing::warn!(request_id = %seq.request_id, error = %error, "lazy prefix match rollback failed");
+        }
+        return None;
+    }
+    PREFIX_HIT_TOKENS.fetch_add(
+        (cached_len - seq.kv_computed_len) as u64,
+        Ordering::Relaxed,
+    );
+    seq.kv_computed_len = cached_len;
+    let replaced_blocks = std::mem::replace(&mut seq.block_table, blocks);
+    tracing::debug!(
+        request_id = %seq.request_id,
+        cached_len,
+        cached_blocks = seq.block_table.len(),
+        suffix_len = seq.input_ids.len() - cached_len,
+        "attached lazy prefix-cache reuse"
+    );
+    Some(PrefixAttach {
+        deltanet_state: None,
         replaced_blocks,
     })
 }
@@ -283,6 +341,22 @@ pub(super) fn try_insert_prefill_prefix_cache(
     if engine.cache.prefix_cache.is_none() {
         return;
     }
+    // Hit-rate accounting: one query per request, at its final prefill chunk.
+    if is_final && let Some(seq) = scheduler.get_sequence(request_id) {
+        let q = PREFIX_QUERY_TOKENS.fetch_add(seq.input_ids.len() as u64, Ordering::Relaxed)
+            + seq.input_ids.len() as u64;
+        let n = PREFIX_QUERY_REQS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_multiple_of(256) {
+            let h = PREFIX_HIT_TOKENS.load(Ordering::Relaxed);
+            tracing::info!(
+                requests = n,
+                hit_tokens = h,
+                query_tokens = q,
+                hit_rate_pct = format!("{:.1}", h as f64 / q.max(1) as f64 * 100.0),
+                "prefix cache cumulative hit rate"
+            );
+        }
+    }
     let (Some(seq), Some(pool), Some(result)) = (
         scheduler.get_sequence(request_id),
         engine.cache.paged_pool.as_ref(),
@@ -359,7 +433,23 @@ pub(super) fn try_insert_prefill_prefix_cache(
     // Only the block-aligned shared portion is cached (not the leader's
     // private suffix); the later is_final whole-prompt insert is an idempotent
     // superset in the block-hash prefix trie.
-    let insert_tokens: Option<&[u32]> = if is_final {
+    // Lazy mode: register full blocks as soon as each prefill chunk lands
+    // (vLLM caches blocks the moment they fill). Hash stamping is idempotent
+    // and takes no refs, so unconditional per-chunk publishing is safe and
+    // lets concurrent sibling requests hit the shared prefix without waiting
+    // for the leader to finish its whole prompt.
+    let insert_tokens: Option<&[u32]> = if engine.cache.lazy_prefix_enabled() {
+        let upto = if is_final {
+            seq.input_ids.len()
+        } else {
+            computed.min(seq.input_ids.len())
+        };
+        if upto >= pool.block_size {
+            Some(&seq.input_ids[..upto])
+        } else {
+            None
+        }
+    } else if is_final {
         Some(seq.input_ids.as_slice())
     } else if let Some(target) = seq.prefix_cache_target_len {
         if seq.prefix_cache_key.is_some()
@@ -374,14 +464,24 @@ pub(super) fn try_insert_prefill_prefix_cache(
     } else {
         None
     };
-    if let Some(tokens) = insert_tokens
-        && let Err(e) = engine.cache.try_prefix_cache_insert_paged_only(
+    if let Some(tokens) = insert_tokens {
+        if engine.cache.lazy_prefix_enabled() {
+            // vLLM-style: stamp content hashes onto the request's own blocks.
+            // No cache-held refs — the blocks stay matchable after the request
+            // frees them, until physically reused (lazy eviction).
+            if let Err(e) = engine
+                .cache
+                .prefix_cache_insert_lazy(tokens, &result.block_table)
+            {
+                tracing::warn!("lazy prefix cache insert failed: {e}");
+            }
+        } else if let Err(e) = engine.cache.try_prefix_cache_insert_paged_only(
             tokens,
             &result.block_table,
             pool.block_size,
-        )
-    {
-        tracing::warn!("prefix cache insert (ar_loop) failed: {e}");
+        ) {
+            tracing::warn!("prefix cache insert (ar_loop) failed: {e}");
+        }
     }
 }
 
