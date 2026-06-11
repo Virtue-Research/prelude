@@ -131,3 +131,23 @@ pub(crate) fn fused_qkv_projection(
         v.reshape((total, num_kv_heads, head_dim))?,
     ))
 }
+
+/// Plan A: fuse Q RMSNorm+RoPE into FA3 attention prologue (requires FA3 paged path).
+pub(crate) fn fa3_fuse_q_norm_rope_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        let fa3 = std::env::var("PRELUDE_ATTN_FA3")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        // The candle-fa3-0102 backend also supports the in-kernel Q prologue
+        // (RMSNorm+RoPE fused into the attention mainloop).
+        let fa3_0102 = std::env::var("PRELUDE_ATTN_FA3_0102")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let fuse = std::env::var("PRELUDE_ATTN_FA3_FUSE_Q_NORM_ROPE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        (fa3 || fa3_0102) && fuse
+    })
+}

@@ -1,6 +1,10 @@
 //! Attention backends — GPU implementations of flash attention variants.
 
 pub(crate) mod causal_conv1d;
+#[cfg(feature = "fa3-0102")]
+pub(crate) mod fa3_0102;
+#[cfg(feature = "flash-attn-v3")]
+pub(crate) mod flash_v3;
 pub(crate) mod flash_v4;
 pub(crate) mod flashinfer;
 pub(crate) mod gdn_prefill;

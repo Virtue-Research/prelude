@@ -325,6 +325,7 @@ impl Gemma3Attention {
                     scale: self.softmax_scale,
                     mask,
                     softcap: None,
+                    q_prologue: None,
                 },
             )?
         } else {

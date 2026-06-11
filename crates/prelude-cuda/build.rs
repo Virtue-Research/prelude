@@ -157,6 +157,36 @@ fn main() {
     link_cuda_runtime_dynamic(&cuda_root);
     link_cublas_dynamic(&cuda_root);
 
+    // ── fa3-0102: prebuilt vendored vLLM 0.22 FA3 hopper kernel ─────
+    // Static lib produced out-of-band by candle-fa3-0102's
+    // _build_v3_kernel_prelude.sh (CUDA 13.2 + CUTLASS 3.8, sm90a).
+    // Built automatically here on first use if missing (~3 min).
+    if std::env::var("CARGO_FEATURE_FA3_0102").is_ok() {
+        println!("cargo:rerun-if-env-changed=FA3_0102_PRELUDE_PREBUILT_DIR");
+        let lib_dir = std::env::var("FA3_0102_PRELUDE_PREBUILT_DIR")
+            .unwrap_or_else(|_| "/data/xueying/fa3_0102_prelude_prebuilt".to_string());
+        let lib = PathBuf::from(&lib_dir).join("libprelude_fa3_0102.a");
+        if !lib.exists() {
+            let script = PathBuf::from(&manifest_dir)
+                .join("../candle-fa3-0102/_build_v3_kernel_prelude.sh");
+            let status = std::process::Command::new("bash")
+                .arg(&script)
+                .status()
+                .unwrap_or_else(|e| panic!("fa3-0102 kernel build failed to start: {e}"));
+            assert!(
+                status.success() && lib.exists(),
+                "fa3-0102 prebuilt lib missing and {} failed (expected {})",
+                script.display(),
+                lib.display()
+            );
+        }
+        // Track the prebuilt archive so out-of-band kernel rebuilds force a relink.
+        println!("cargo:rerun-if-changed={}", lib.display());
+        println!("cargo:rustc-link-search=native={lib_dir}");
+        println!("cargo:rustc-link-lib=static=prelude_fa3_0102");
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
+
     // ── Phase 3: Link cuda_dialect_runtime_static.a ─────────────────
     //
     // The MLIR-generated .o files in cuLA/FA4's DSL kernel archives

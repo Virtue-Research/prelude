@@ -640,6 +640,7 @@ impl Qwen3NextAttention {
                     scale: softmax_scale,
                     mask: MaskType::Causal,
                     softcap: None,
+                    q_prologue: None,
                 },
             )?
         } else {

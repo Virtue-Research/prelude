@@ -102,6 +102,17 @@ pub struct PagedParams<'a> {
     pub scale: f32,
     pub mask: MaskType,
     pub softcap: Option<f32>,
+    /// When set with FA3 + `PRELUDE_ATTN_FA3_FUSE_Q_NORM_ROPE=1`, Q RMSNorm+RoPE
+    /// runs inside the FA3 attention SMEM prologue instead of a standalone kernel.
+    pub q_prologue: Option<QAttnPrologue<'a>>,
+}
+
+pub struct QAttnPrologue<'a> {
+    pub q_weight: &'a Tensor,
+    pub cos: &'a Tensor,
+    pub sin: &'a Tensor,
+    pub position_ids: &'a Tensor,
+    pub eps: f32,
 }
 
 // ── KV cache ───────────────────────────────────────────────────────

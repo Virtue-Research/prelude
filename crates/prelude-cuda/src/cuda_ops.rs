@@ -68,6 +68,46 @@ fn cu_seqlens_to_lens(cu_seqlens: &Tensor) -> Result<Tensor> {
     hi.sub(&lo)
 }
 
+/// Prefer the FlashAttention-3 paged path (candle-flash-attn-v3, sm90) over
+/// FA4 when `PRELUDE_ATTN_FA3=1`. Default (unset) keeps FA4 first. Cached for
+/// the process lifetime so the env read happens once.
+#[cfg(feature = "flash-attn-v3")]
+fn prefer_flashinfer_attn() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("PRELUDE_ATTN_FA3")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Prefer the candle-fa3-0102 backend (vendored vLLM 0.22 FA3 hopper kernel)
+/// when `PRELUDE_ATTN_FA3_0102=1`. Checked before the candle-flash-attn-v3
+/// fork and FA4 on both the paged and non-paged varlen paths.
+#[cfg(feature = "fa3-0102")]
+fn prefer_fa3_0102() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("PRELUDE_ATTN_FA3_0102")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Fuse Q RMSNorm+RoPE into FA3 attention prologue (Plan A).
+#[cfg(feature = "flash-attn-v3")]
+fn fa3_fuse_q_norm_rope() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("PRELUDE_ATTN_FA3_FUSE_Q_NORM_ROPE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 // ── The single impl ───────────────────────────────────────────────
 // Basic tensor ops (matmul, unary, binary, etc.) are handled by candle-core natively.
 // CudaOps only overrides fused/inference-specific ops.
@@ -255,6 +295,18 @@ impl Ops for CudaOps {
         // All three backends are stride-aware on Q/K/V (requires only stride(-1) == 1):
         // FA4 reads strides from DLTensor, FlashInfer reads q.stride(0)/stride(1) in
         // its C++ wrapper, and the composed SDPA fallback materializes via to_dtype.
+        #[cfg(feature = "fa3-0102")]
+        if prefer_fa3_0102() {
+            if let Some(r) = try_fa3_0102_varlen(q, k, v, params) {
+                return r;
+            }
+        }
+        #[cfg(feature = "flash-attn-v3")]
+        if prefer_flashinfer_attn() {
+            if let Some(r) = try_fa3_varlen(q, k, v, params) {
+                return r;
+            }
+        }
         if let Some(r) = try_fa4_varlen(q, k, v, params) {
             return r;
         }
@@ -271,8 +323,84 @@ impl Ops for CudaOps {
         value_cache: &Tensor,
         params: &PagedParams,
     ) -> Result<Tensor> {
-        // FA4 paged: handles both prefill (Q>1) and decode (Q=1).
         let seqused_k = cu_seqlens_to_lens(params.cu_seqlens_k)?;
+        // PRELUDE_ATTN_FA3_0102=1: prefer the candle-fa3-0102 backend (vendored
+        // vLLM 0.22 FA3 hopper kernel) on the paged path. bf16/hdim128 only.
+        // With PRELUDE_ATTN_FA3_FUSE_Q_NORM_ROPE=1 the model passes RAW Q plus
+        // q_prologue (norm weight + rotary tables) and the kernel applies
+        // RMSNorm+RoPE in its prologue; Q positions are derived in-kernel
+        // (seqused_k - seqlen_q + i), so position_ids are not needed.
+        #[cfg(feature = "fa3-0102")]
+        if prefer_fa3_0102()
+            && q.dtype() == DType::BF16
+            && q.dims().last() == Some(&128)
+            && matches!(params.mask, MaskType::Causal)
+        {
+            let prologue = params.q_prologue.as_ref().map(|p| crate::attn::fa3_0102::QPrologue {
+                q_weight: p.q_weight,
+                cos: p.cos,
+                sin: p.sin,
+                eps: p.eps,
+            });
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            let fused = prologue.is_some();
+            ONCE.call_once(|| {
+                tracing::info!(fused_q_prologue = fused, "attention backend: candle-fa3-0102 paged (vendored vLLM 0.22 FA3 hopper kernel)");
+            });
+            return crate::attn::fa3_0102::varlen_paged(
+                q,
+                key_cache,
+                value_cache,
+                params.block_tables,
+                params.cu_seqlens_q,
+                &seqused_k,
+                params.max_seqlen_q,
+                params.max_seqlen_k,
+                params.scale,
+                prologue,
+            );
+        }
+        // PRELUDE_ATTN_FA3=1: prefer FlashAttention-3 (candle-flash-attn-v3,
+        // Hopper SM90) over FA4 on the paged path. Only compiled when the
+        // `flash-attn-v3` feature is enabled.
+        #[cfg(feature = "flash-attn-v3")]
+        if prefer_flashinfer_attn() {
+            let block_size = key_cache.dim(1)?;
+            if block_size % 128 == 0 {
+                // FA3 paged needs both cumulative K offsets and per-sequence K
+                // lengths. The latter prevents padded block-table entries from
+                // contributing to attention when sequences in the batch differ.
+                let q_prologue = if fa3_fuse_q_norm_rope() {
+                    params.q_prologue.as_ref().map(|p| candle_flash_attn_v3::QPrologueParams {
+                        q_norm_weight: p.q_weight.clone(),
+                        cos: p.cos.clone(),
+                        sin: p.sin.clone(),
+                        position_ids: p.position_ids.clone(),
+                        eps: p.eps,
+                    })
+                } else {
+                    None
+                };
+                return crate::attn::flash_v3::varlen_paged(
+                    q,
+                    key_cache,
+                    value_cache,
+                    params.block_tables,
+                    params.cu_seqlens_q,
+                    params.cu_seqlens_k,
+                    &seqused_k,
+                    params.max_seqlen_q,
+                    params.max_seqlen_k,
+                    params.scale,
+                    q_prologue,
+                );
+            }
+            tracing::warn!(
+                block_size,
+                "PRELUDE_ATTN_FA3=1 requested but FA3 paged requires block_size % 128 == 0; falling back to FA4"
+            );
+        }
+        // FA4 paged: handles both prefill (Q>1) and decode (Q=1).
         if let Some(r) = crate::attn::flash_v4::try_varlen_paged(
             q,
             key_cache,
@@ -286,7 +414,7 @@ impl Ops for CudaOps {
         ) {
             return r;
         }
-        // FlashInfer fallback (SM80 without FA4, or non-BF16).
+        // FlashInfer fallback (SM80 without FA4, non-BF16, or PRELUDE_ATTN_FA3 when FA4 declines).
         if let Some(r) = try_flashinfer_paged(q, key_cache, value_cache, params) {
             return r;
         }
@@ -294,6 +422,13 @@ impl Ops for CudaOps {
     }
 
     fn paged_block_size_hint(&self, head_dim: usize) -> usize {
+        #[cfg(feature = "flash-attn-v3")]
+        if prefer_flashinfer_attn() {
+            // FA3 paged KV requires page_block_size to be divisible by the kernel N tile.
+            // 128 works for the supported paged head dims here and keeps FA4 parity.
+            return 128;
+        }
+
         // Prefer block_size == FA4 tile_n so `paged_non_tma=false` and the
         // compiled TMA paged kernels are eligible. Fall through to the
         // FlashInfer-compatible value for head_dim combinations FA4 doesn't
@@ -380,29 +515,18 @@ impl Ops for CudaOps {
         if head_dim > 256 {
             return None;
         }
-        let q_out = match crate::ops::rope::fused_qknorm_rope_varlen(
+        // Single merged launch over Q+K rows (halves kernel launches per
+        // attention layer); bit-exact vs two separate fused_qknorm_rope_varlen.
+        Some(crate::ops::rope::fused_qknorm_rope_qk_varlen(
             q,
-            q_weight,
-            cos,
-            sin,
-            position_ids,
-            eps as f64,
-        ) {
-            Ok(t) => t,
-            Err(e) => return Some(Err(e)),
-        };
-        let k_out = match crate::ops::rope::fused_qknorm_rope_varlen(
             k,
+            q_weight,
             k_weight,
             cos,
             sin,
             position_ids,
             eps as f64,
-        ) {
-            Ok(t) => t,
-            Err(e) => return Some(Err(e)),
-        };
-        Some(Ok((q_out, k_out)))
+        ))
     }
 
     fn fused_qknorm_partial_rope(
@@ -891,6 +1015,89 @@ impl Ops for CudaOps {
 }
 
 // ── Attention dispatch helpers ─────────────────────────────────────
+
+#[cfg(feature = "fa3-0102")]
+/// Try candle-fa3-0102 (vendored vLLM 0.22 FA3 hopper kernel) for non-paged
+/// varlen attention when PRELUDE_ATTN_FA3_0102=1. bf16 + head_dim 128 only;
+/// sliding-window masks are not wired up (fall through to other backends).
+fn try_fa3_0102_varlen(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    p: &VarlenParams,
+) -> Option<Result<Tensor>> {
+    if detect_sm_major() < 9
+        || q.dtype() != DType::BF16
+        || q.dims().last().copied().unwrap_or(0) != 128
+    {
+        return None;
+    }
+    let causal = match &p.mask {
+        MaskType::Causal => true,
+        MaskType::Bidirectional => false,
+        _ => return None,
+    };
+    Some(crate::attn::fa3_0102::varlen(
+        q,
+        k,
+        v,
+        p.cu_seqlens_q,
+        p.cu_seqlens_k,
+        p.max_seqlen_q,
+        p.max_seqlen_k,
+        p.scale,
+        causal,
+    ))
+}
+
+#[cfg(feature = "flash-attn-v3")]
+/// Try FA3 for varlen attention when PRELUDE_ATTN_FA3=1.
+fn try_fa3_varlen(q: &Tensor, k: &Tensor, v: &Tensor, p: &VarlenParams) -> Option<Result<Tensor>> {
+    if detect_sm_major() < 9 || !matches!(q.dtype(), DType::BF16 | DType::F16) {
+        return None;
+    }
+    let head_dim = q.dims().last().copied().unwrap_or(0);
+    if !matches!(head_dim, 64 | 128 | 256) {
+        return None;
+    }
+
+    let result = match &p.mask {
+        MaskType::Causal => crate::attn::flash_v3::varlen_causal(
+            q,
+            k,
+            v,
+            p.cu_seqlens_q,
+            p.cu_seqlens_k,
+            p.max_seqlen_q,
+            p.max_seqlen_k,
+            p.scale,
+        ),
+        MaskType::Bidirectional => crate::attn::flash_v3::varlen_bidirectional(
+            q,
+            k,
+            v,
+            p.cu_seqlens_q,
+            p.cu_seqlens_k,
+            p.max_seqlen_q,
+            p.max_seqlen_k,
+            p.scale,
+        ),
+        MaskType::SlidingWindow { left, right } => crate::attn::flash_v3::varlen_windowed(
+            q,
+            k,
+            v,
+            p.cu_seqlens_q,
+            p.cu_seqlens_k,
+            p.max_seqlen_q,
+            p.max_seqlen_k,
+            p.scale,
+            Some(*left),
+            Some(*right),
+        ),
+        MaskType::Custom(_) => return None,
+    };
+    Some(result)
+}
 
 /// Try FA4 for varlen attention. Returns None if FA4 can't handle this request.
 fn try_fa4_varlen(q: &Tensor, k: &Tensor, v: &Tensor, p: &VarlenParams) -> Option<Result<Tensor>> {
