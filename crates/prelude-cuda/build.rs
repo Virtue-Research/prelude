@@ -163,10 +163,36 @@ fn main() {
     // Built automatically here on first use if missing (~3 min).
     if std::env::var("CARGO_FEATURE_FA3_0102").is_ok() {
         println!("cargo:rerun-if-env-changed=FA3_0102_PRELUDE_PREBUILT_DIR");
+        println!("cargo:rerun-if-env-changed=CUDA_HOME_FA3");
+        println!("cargo:rerun-if-env-changed=CUTLASS38");
         let lib_dir = std::env::var("FA3_0102_PRELUDE_PREBUILT_DIR")
             .unwrap_or_else(|_| "/data/xueying/fa3_0102_prelude_prebuilt".to_string());
         let lib = PathBuf::from(&lib_dir).join("libprelude_fa3_0102.a");
         if !lib.exists() {
+            // The fa3-0102 kernel needs CUDA 13.2 + CUTLASS 3.8 to compile (or a
+            // prebuilt archive). These are NOT available on a stock CUDA box or in
+            // CI, so before shelling out we preflight the toolchain and fail with
+            // an actionable message instead of a cryptic "script failed" panic.
+            // Override paths via CUDA_HOME_FA3 / CUTLASS38 / FA3_0102_PRELUDE_PREBUILT_DIR.
+            let cuda_home = std::env::var("CUDA_HOME_FA3")
+                .unwrap_or_else(|_| "/usr/local/cuda-13.2".to_string());
+            let cutlass = std::env::var("CUTLASS38")
+                .unwrap_or_else(|_| "/data/xueying/cutlass38/include".to_string());
+            let missing: Vec<&str> = [
+                (PathBuf::from(&cuda_home).join("bin/nvcc").exists(), "CUDA 13.2 toolkit (set CUDA_HOME_FA3)"),
+                (PathBuf::from(&cutlass).join("cutlass/cutlass.h").exists(), "CUTLASS 3.8 headers (set CUTLASS38)"),
+            ]
+            .iter()
+            .filter_map(|(ok, name)| if *ok { None } else { Some(*name) })
+            .collect();
+            assert!(
+                missing.is_empty(),
+                "feature `fa3-0102` is enabled but the kernel cannot be built here.\n\
+                 Missing build prerequisites: {missing:?}\n\
+                 Provide a prebuilt archive via FA3_0102_PRELUDE_PREBUILT_DIR=<dir containing libprelude_fa3_0102.a>,\n\
+                 or set CUDA_HOME_FA3 (CUDA 13.2) and CUTLASS38 (CUTLASS 3.8 include dir) so it can compile.\n\
+                 If you do not need this backend, build without `--features fa3-0102`."
+            );
             let script = PathBuf::from(&manifest_dir)
                 .join("../candle-fa3-0102/_build_v3_kernel_prelude.sh");
             let status = std::process::Command::new("bash")
