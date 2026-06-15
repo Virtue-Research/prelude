@@ -56,19 +56,22 @@ default = ["cpu"]
 # CPU-only inference (oneDNN matmul, AVX-512 kernels)
 cpu = ["dep:prelude-cpu"]
 # CUDA inference — core GPU backends (FlashInfer, FA4, CUTLASS, DeepGEMM,
-# cuLA, candle-fa3-0102). fa3-0102 is the default attention backend on
-# sm90/bf16/hdim128; opt out at runtime with PRELUDE_ATTN_FA3_0102=0.
+# cuLA). Does NOT pull in candle-fa3-0102: that kernel needs CUDA 13.2 +
+# CUTLASS 3.8 (or a prebuilt .a) and would break portable/CI builds, so it
+# is opt-in via the explicit `fa3-0102` feature below.
 cuda = [
     "dep:prelude-cuda",
     "prelude-core/cuda",
-    "prelude-cuda/fa3-0102",
 ]
 # CUDA GGUF quantized linear kernels (llama.cpp MMQ/MMVQ via quant-gemm).
 cuda-gguf = ["cuda", "prelude-cuda/gguf-quant"]
 # FlashAttention-3 (Hopper) backend — opt-in (heavy CUTLASS compile).
 flash-attn-v3 = ["cuda", "prelude-core/flash-attn-v3", "prelude-cuda/flash-attn-v3"]
 # candle-fa3-0102 backend (vendored vLLM 0.22 FA3 hopper kernel, prebuilt .a).
-# Now implied by `cuda` (kept as an alias for existing build scripts).
+# Opt-in: requires CUDA 13.2 + CUTLASS 3.8 at build time (or a prebuilt
+# libprelude_fa3_0102.a via FA3_0102_PRELUDE_PREBUILT_DIR). When compiled in
+# it is the default attention backend on sm90/bf16/hdim128; opt out at
+# runtime with PRELUDE_ATTN_FA3_0102=0.
 fa3-0102 = ["cuda", "prelude-cuda/fa3-0102"]
 # AMD GPU inference — bare-metal KFD via t0-gpu (zero HIP/ROCm dependency).
 # Disabled until t0-gpu upstream fixes `tests/t0_original` submodule entry.
