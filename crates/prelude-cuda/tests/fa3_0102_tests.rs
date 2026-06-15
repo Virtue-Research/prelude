@@ -204,8 +204,9 @@ fn ragged_varlen_causal_vs_ref() {
     let scale = 1.0 / (HEAD_DIM as f32).sqrt();
     let max = *lens.iter().max().unwrap();
 
-    let out = prelude_cuda::attn_fa3_0102_varlen_for_tests(&q, &k, &v, &cu, &cu, max, max, scale, true)
-        .unwrap();
+    let out =
+        prelude_cuda::attn_fa3_0102_varlen_for_tests(&q, &k, &v, &cu, &cu, max, max, scale, true)
+            .unwrap();
 
     let mut off = 0;
     for (i, &len) in lens.iter().enumerate() {
@@ -282,7 +283,12 @@ fn paged_decode_nontma_vs_ref() {
         let vs = v.narrow(0, koff, klen).unwrap();
         let want = sdpa_ref(&qs, &ks, &vs, true, scale);
         let got = out.narrow(0, i, 1).unwrap();
-        cmp(&format!("paged-decode seq{i} klen{klen}"), &got, &want, 2e-2);
+        cmp(
+            &format!("paged-decode seq{i} klen{klen}"),
+            &got,
+            &want,
+            2e-2,
+        );
         koff += klen;
     }
 }
@@ -327,7 +333,12 @@ fn paged_chunked_prefill_history_vs_ref() {
         let vs = v.narrow(0, koff, klens[i]).unwrap();
         let want = sdpa_ref(&qs, &ks, &vs, true, scale);
         let got = out.narrow(0, qoff, qlens[i]).unwrap();
-        cmp(&format!("paged-chunk seq{i} q{} k{}", qlens[i], klens[i]), &got, &want, 2e-2);
+        cmp(
+            &format!("paged-chunk seq{i} q{} k{}", qlens[i], klens[i]),
+            &got,
+            &want,
+            2e-2,
+        );
         qoff += qlens[i];
         koff += klens[i];
     }

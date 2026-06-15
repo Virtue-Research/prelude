@@ -56,7 +56,12 @@ fn rope_tables(max_pos: usize, dev: &Device) -> (Tensor, Tensor) {
 }
 
 /// Scatter contiguous K/V (already normed+roped) into a paged cache.
-fn build_paged(k: &Tensor, v: &Tensor, seq_lens: &[usize], dev: &Device) -> (Tensor, Tensor, Tensor) {
+fn build_paged(
+    k: &Tensor,
+    v: &Tensor,
+    seq_lens: &[usize],
+    dev: &Device,
+) -> (Tensor, Tensor, Tensor) {
     let max_pages = seq_lens.iter().map(|l| l.div_ceil(PAGE)).max().unwrap();
     let total_pages: usize = seq_lens.iter().map(|l| l.div_ceil(PAGE)).sum();
     let mut tables = vec![0u32; seq_lens.len() * max_pages];
@@ -105,8 +110,20 @@ fn cu(lens: &[usize], dev: &Device) -> Tensor {
 }
 
 fn stats(a: &Tensor, b: &Tensor) -> (f32, f64) {
-    let x = a.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
-    let y = b.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let x = a
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let y = b
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
     let mut max_abs = 0f32;
     let (mut dot, mut n1, mut n2) = (0f64, 0f64, 0f64);
     for (p, q) in x.iter().zip(y.iter()) {
@@ -141,7 +158,8 @@ fn run_case(name: &str, qlens: &[usize], klens: &[usize]) {
         .flat_map(|&l| (0..l as u32).collect::<Vec<_>>())
         .collect();
     let k_pos = Tensor::from_vec(k_pos, (total_k,), &dev).unwrap();
-    let k_roped = prelude_cuda::qknorm_rope_for_tests(&k_raw, &kw, &cos, &sin, &k_pos, eps as f64).unwrap();
+    let k_roped =
+        prelude_cuda::qknorm_rope_for_tests(&k_raw, &kw, &cos, &sin, &k_pos, eps as f64).unwrap();
     let (kc, vc, bt) = build_paged(&k_roped, &v, klens, &dev);
 
     let cu_q = cu(qlens, &dev);
@@ -157,7 +175,8 @@ fn run_case(name: &str, qlens: &[usize], klens: &[usize]) {
         .flat_map(|(&ql, &kl)| ((kl - ql) as u32..kl as u32).collect::<Vec<_>>())
         .collect();
     let q_pos = Tensor::from_vec(q_pos, (total_q,), &dev).unwrap();
-    let q_ref = prelude_cuda::qknorm_rope_for_tests(&q_raw, &qw, &cos, &sin, &q_pos, eps as f64).unwrap();
+    let q_ref =
+        prelude_cuda::qknorm_rope_for_tests(&q_raw, &qw, &cos, &sin, &q_pos, eps as f64).unwrap();
     let out_ref = prelude_cuda::attn_fa3_0102_varlen_paged_for_tests(
         &q_ref, &kc, &vc, &bt, &cu_q, &seqused, max_q, max_k, scale, None,
     )
@@ -215,5 +234,9 @@ fn fuse_decode_packgqa() {
 
 #[test]
 fn fuse_mixed_ragged() {
-    run_case("mixed 333,777,1001,150", &[333, 777, 1001, 150], &[333, 777, 1001, 150]);
+    run_case(
+        "mixed 333,777,1001,150",
+        &[333, 777, 1001, 150],
+        &[333, 777, 1001, 150],
+    );
 }

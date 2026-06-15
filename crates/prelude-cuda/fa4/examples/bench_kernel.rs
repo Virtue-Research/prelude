@@ -641,15 +641,39 @@ fn bench_varlen_batch(registry: &KernelRegistry) {
 
     let ms = cuda_bench(20, 100, || unsafe {
         flash_attn_v4::fa4_varlen_fwd(
-            registry, func, q_gpu, k_gpu, v_gpu, o_gpu,
-            std::ptr::null_mut(), scale, std::ptr::null_mut(), cu_gpu, cu_gpu,
-            &q_shape, &q_strides, &k_shape, &k_strides, &k_shape, &k_strides,
-            &o_shape, &lse_shape, &cu_shape, 0, None, None, None, None,
+            registry,
+            func,
+            q_gpu,
+            k_gpu,
+            v_gpu,
+            o_gpu,
+            std::ptr::null_mut(),
+            scale,
+            std::ptr::null_mut(),
+            cu_gpu,
+            cu_gpu,
+            &q_shape,
+            &q_strides,
+            &k_shape,
+            &k_strides,
+            &k_shape,
+            &k_strides,
+            &o_shape,
+            &lse_shape,
+            &cu_shape,
+            0,
+            None,
+            None,
+            None,
+            None,
             KernelDtype::BF16,
         )
         .expect("fa4 kernel failed");
     });
-    println!("  FA4 (CuTeDSL)         : {:8.1} us/fwd", ms as f64 * 1000.0);
+    println!(
+        "  FA4 (CuTeDSL)         : {:8.1} us/fwd",
+        ms as f64 * 1000.0
+    );
     println!("FA4_VARLEN_BATCH_US {:.1}", ms as f64 * 1000.0);
     unsafe {
         cudaFree(q_gpu);

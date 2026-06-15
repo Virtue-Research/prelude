@@ -131,4 +131,3 @@ pub(crate) fn fused_qkv_projection(
         v.reshape((total, num_kv_heads, head_dim))?,
     ))
 }
-

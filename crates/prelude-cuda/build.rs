@@ -179,8 +179,14 @@ fn main() {
             let cutlass = std::env::var("CUTLASS38")
                 .unwrap_or_else(|_| "/data/xueying/cutlass38/include".to_string());
             let missing: Vec<&str> = [
-                (PathBuf::from(&cuda_home).join("bin/nvcc").exists(), "CUDA 13.2 toolkit (set CUDA_HOME_FA3)"),
-                (PathBuf::from(&cutlass).join("cutlass/cutlass.h").exists(), "CUTLASS 3.8 headers (set CUTLASS38)"),
+                (
+                    PathBuf::from(&cuda_home).join("bin/nvcc").exists(),
+                    "CUDA 13.2 toolkit (set CUDA_HOME_FA3)",
+                ),
+                (
+                    PathBuf::from(&cutlass).join("cutlass/cutlass.h").exists(),
+                    "CUTLASS 3.8 headers (set CUTLASS38)",
+                ),
             ]
             .iter()
             .filter_map(|(ok, name)| if *ok { None } else { Some(*name) })
@@ -193,8 +199,8 @@ fn main() {
                  or set CUDA_HOME_FA3 (CUDA 13.2) and CUTLASS38 (CUTLASS 3.8 include dir) so it can compile.\n\
                  If you do not need this backend, build without `--features fa3-0102`."
             );
-            let script = PathBuf::from(&manifest_dir)
-                .join("../candle-fa3-0102/_build_v3_kernel_prelude.sh");
+            let script =
+                PathBuf::from(&manifest_dir).join("../candle-fa3-0102/_build_v3_kernel_prelude.sh");
             let status = std::process::Command::new("bash")
                 .arg(&script)
                 .status()

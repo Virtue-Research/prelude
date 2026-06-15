@@ -815,7 +815,10 @@ mod incremental_tests {
 
     #[test]
     fn depfile_path_appends_d() {
-        assert_eq!(depfile_path(Path::new("/o/foo.ptx")), Path::new("/o/foo.ptx.d"));
+        assert_eq!(
+            depfile_path(Path::new("/o/foo.ptx")),
+            Path::new("/o/foo.ptx.d")
+        );
         assert_eq!(depfile_path(Path::new("/o/bar.o")), Path::new("/o/bar.o.d"));
     }
 
@@ -858,8 +861,11 @@ mod incremental_tests {
         std::fs::write(&src, b"src").unwrap();
         std::fs::write(&hdr, b"hdr").unwrap();
         std::fs::write(&out, b"ptx").unwrap();
-        std::fs::write(&depf, format!("{} : {} {}\n", out.display(), src.display(), hdr.display()))
-            .unwrap();
+        std::fs::write(
+            &depf,
+            format!("{} : {} {}\n", out.display(), src.display(), hdr.display()),
+        )
+        .unwrap();
 
         // Output is newest → fresh.
         let now = std::time::SystemTime::now();
@@ -867,11 +873,17 @@ mod incremental_tests {
             set_mtime(p, now - Duration::from_secs(10));
         }
         set_mtime(&out, now);
-        assert!(output_is_fresh(&out, &src), "output newer than inputs must be fresh");
+        assert!(
+            output_is_fresh(&out, &src),
+            "output newer than inputs must be fresh"
+        );
 
         // Touch a header newer than the output → stale.
         set_mtime(&hdr, now + Duration::from_secs(10));
-        assert!(!output_is_fresh(&out, &src), "header edit must invalidate output");
+        assert!(
+            !output_is_fresh(&out, &src),
+            "header edit must invalidate output"
+        );
 
         // No depfile at all → always rebuild.
         std::fs::remove_file(&depf).unwrap();
@@ -932,8 +944,7 @@ mod incremental_tests {
             return;
         }
 
-        let dir =
-            std::env::temp_dir().join(format!("prelude_inc_e2e_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("prelude_inc_e2e_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("k.cu");
         let hdr = dir.join("k.cuh");
@@ -950,13 +961,20 @@ mod incremental_tests {
         // 1) First call compiles and produces the .ptx + sidecar depfile.
         compile_cu_to_ptx(&nvcc, &opts);
         assert!(out.exists(), "first compile must produce the ptx");
-        assert!(depfile_path(&out).exists(), "first compile must write a depfile");
+        assert!(
+            depfile_path(&out).exists(),
+            "first compile must write a depfile"
+        );
         let mtime1 = mtime(&out).unwrap();
 
         // 2) Nothing changed → must be skipped (output mtime unchanged).
         std::thread::sleep(Duration::from_millis(1100));
         compile_cu_to_ptx(&nvcc, &opts);
-        assert_eq!(mtime(&out).unwrap(), mtime1, "unchanged inputs must skip recompile");
+        assert_eq!(
+            mtime(&out).unwrap(),
+            mtime1,
+            "unchanged inputs must skip recompile"
+        );
 
         // 3) Editing the *header* must trigger a rebuild (newer ptx mtime).
         std::thread::sleep(Duration::from_millis(1100));

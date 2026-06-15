@@ -336,12 +336,15 @@ impl Ops for CudaOps {
             && q.dims().last() == Some(&128)
             && matches!(params.mask, MaskType::Causal)
         {
-            let prologue = params.q_prologue.as_ref().map(|p| crate::attn::fa3_0102::QPrologue {
-                q_weight: p.q_weight,
-                cos: p.cos,
-                sin: p.sin,
-                eps: p.eps,
-            });
+            let prologue = params
+                .q_prologue
+                .as_ref()
+                .map(|p| crate::attn::fa3_0102::QPrologue {
+                    q_weight: p.q_weight,
+                    cos: p.cos,
+                    sin: p.sin,
+                    eps: p.eps,
+                });
             static ONCE: std::sync::Once = std::sync::Once::new();
             let fused = prologue.is_some();
             ONCE.call_once(|| {
@@ -371,13 +374,16 @@ impl Ops for CudaOps {
                 // lengths. The latter prevents padded block-table entries from
                 // contributing to attention when sequences in the batch differ.
                 let q_prologue = if fa3_fuse_q_norm_rope() {
-                    params.q_prologue.as_ref().map(|p| candle_flash_attn_v3::QPrologueParams {
-                        q_norm_weight: p.q_weight.clone(),
-                        cos: p.cos.clone(),
-                        sin: p.sin.clone(),
-                        position_ids: p.position_ids.clone(),
-                        eps: p.eps,
-                    })
+                    params
+                        .q_prologue
+                        .as_ref()
+                        .map(|p| candle_flash_attn_v3::QPrologueParams {
+                            q_norm_weight: p.q_weight.clone(),
+                            cos: p.cos.clone(),
+                            sin: p.sin.clone(),
+                            position_ids: p.position_ids.clone(),
+                            eps: p.eps,
+                        })
                 } else {
                     None
                 };

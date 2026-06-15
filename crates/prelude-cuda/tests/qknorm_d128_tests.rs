@@ -24,7 +24,10 @@ fn randn_bf16(shape: &[usize], dev: &Device, off: f64) -> Tensor {
 /// Build the serving-shaped inputs: q/k are non-contiguous views into a fused
 /// QKV projection output (token stride = (HQ+2*HKV)*D), plus rope tables and
 /// ragged position ids.
-fn build_inputs(total_tokens: usize, dev: &Device) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) {
+fn build_inputs(
+    total_tokens: usize,
+    dev: &Device,
+) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) {
     let fused = randn_bf16(&[total_tokens, HQ + 2 * HKV, D], dev, 0.0);
     let q = fused.narrow(1, 0, HQ).unwrap();
     let k = fused.narrow(1, HQ, HKV).unwrap();
@@ -81,11 +84,13 @@ fn d128_bit_exact_vs_generic() {
             qknorm_rope_qk_for_tests(&q, &k, &qw, &kw, &cos, &sin, &pos, 1e-6, Some(false))
                 .unwrap();
         let (qd, kd) =
-            qknorm_rope_qk_for_tests(&q, &k, &qw, &kw, &cos, &sin, &pos, 1e-6, Some(true))
-                .unwrap();
+            qknorm_rope_qk_for_tests(&q, &k, &qw, &kw, &cos, &sin, &pos, 1e-6, Some(true)).unwrap();
         assert_eq!(bits(&qg), bits(&qd), "Q mismatch at T={total_tokens}");
         assert_eq!(bits(&kg), bits(&kd), "K mismatch at T={total_tokens}");
-        println!("T={total_tokens}: bit-exact OK ({} Q rows)", total_tokens * HQ);
+        println!(
+            "T={total_tokens}: bit-exact OK ({} Q rows)",
+            total_tokens * HQ
+        );
     }
 }
 
@@ -98,14 +103,14 @@ fn d128_perf_vs_generic() {
     for (label, force) in [("generic", Some(false)), ("d128", Some(true))] {
         // warmup
         for _ in 0..20 {
-            let _ = qknorm_rope_qk_for_tests(&q, &k, &qw, &kw, &cos, &sin, &pos, 1e-6, force)
-                .unwrap();
+            let _ =
+                qknorm_rope_qk_for_tests(&q, &k, &qw, &kw, &cos, &sin, &pos, 1e-6, force).unwrap();
         }
         dev.synchronize().unwrap();
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
-            let _ = qknorm_rope_qk_for_tests(&q, &k, &qw, &kw, &cos, &sin, &pos, 1e-6, force)
-                .unwrap();
+            let _ =
+                qknorm_rope_qk_for_tests(&q, &k, &qw, &kw, &cos, &sin, &pos, 1e-6, force).unwrap();
         }
         dev.synchronize().unwrap();
         let us = t0.elapsed().as_micros() as f64 / iters as f64;

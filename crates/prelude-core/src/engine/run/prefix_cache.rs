@@ -112,10 +112,7 @@ fn attach_prefix_cache_reuse(engine: &Engine, seq: &mut Sequence) -> Option<Pref
         return None;
     }
 
-    PREFIX_HIT_TOKENS.fetch_add(
-        (cached_len - seq.kv_computed_len) as u64,
-        Ordering::Relaxed,
-    );
+    PREFIX_HIT_TOKENS.fetch_add((cached_len - seq.kv_computed_len) as u64, Ordering::Relaxed);
     seq.kv_computed_len = cached_len;
     let replaced_blocks = std::mem::replace(&mut seq.block_table, block_table);
     tracing::debug!(
@@ -155,10 +152,7 @@ fn attach_prefix_cache_reuse_lazy(engine: &Engine, seq: &mut Sequence) -> Option
         }
         return None;
     }
-    PREFIX_HIT_TOKENS.fetch_add(
-        (cached_len - seq.kv_computed_len) as u64,
-        Ordering::Relaxed,
-    );
+    PREFIX_HIT_TOKENS.fetch_add((cached_len - seq.kv_computed_len) as u64, Ordering::Relaxed);
     seq.kv_computed_len = cached_len;
     let replaced_blocks = std::mem::replace(&mut seq.block_table, blocks);
     tracing::debug!(

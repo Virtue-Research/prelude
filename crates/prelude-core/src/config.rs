@@ -370,9 +370,7 @@ pub mod attn_flags {
     /// attention prologue (Plan A). Default off.
     pub fn fuse_q_norm_rope() -> bool {
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| {
-            super::parse_env_bool_default_false("PRELUDE_ATTN_FA3_FUSE_Q_NORM_ROPE")
-        })
+        *V.get_or_init(|| super::parse_env_bool_default_false("PRELUDE_ATTN_FA3_FUSE_Q_NORM_ROPE"))
     }
 
     /// `PRELUDE_QKNORM_D128` — use the D=128 specialized qknorm+rope kernel.
