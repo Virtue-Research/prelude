@@ -308,10 +308,17 @@ impl Ops for CudaOps {
         // cfg! gates mean a build without the fused kernels can never report
         // the capability, so prelude-core's view can't diverge from the
         // #[cfg]-gated dispatch below.
+        //
+        // Also gate on the device-static sm check the paged_attention dispatch
+        // applies (>= sm90): the model SKIPS its own Q qknorm+rope when this
+        // returns true, so reporting the capability on a GPU the fused kernel
+        // won't accept would feed raw Q to the fallback. Per-call guards
+        // (BF16 / head_dim==128 / causal) aren't visible here; paged_attention
+        // bails loudly if a prologue reaches a backend that can't apply it.
         use prelude_core::config::attn_flags;
         let fa3_0102 = cfg!(feature = "fa3-0102") && attn_flags::fa3_0102_enabled();
         let fa3_fork = cfg!(feature = "flash-attn-v3") && attn_flags::fa3_fork_enabled();
-        (fa3_0102 || fa3_fork) && attn_flags::fuse_q_norm_rope()
+        (fa3_0102 || fa3_fork) && attn_flags::fuse_q_norm_rope() && detect_sm_major() >= 9
     }
 
     fn paged_attention(
@@ -404,6 +411,20 @@ impl Ops for CudaOps {
             tracing::warn!(
                 block_size,
                 "PRELUDE_ATTN_FA3=1 requested but FA3 paged requires block_size % 128 == 0; falling back to FA4"
+            );
+        }
+        // A fused Q-prologue was supplied: the model passed RAW Q and skipped
+        // its own qknorm+rope, trusting Ops::fuse_q_norm_rope_prologue(). Only
+        // the fa3-0102 / flash-attn-v3 paged paths above apply the prologue. If
+        // neither accepted this shape (wrong dtype / head_dim / mask /
+        // block_size), FA4 and FlashInfer would attend over un-normed,
+        // un-roped Q → silent garbage. Fail loudly instead.
+        if params.q_prologue.is_some() {
+            prelude_core::bail!(
+                "paged_attention: fused Q-prologue requested but no fused-prologue backend \
+                 accepted this shape (need fa3-0102 sm90/bf16/hdim128/causal, or flash-attn-v3 \
+                 with block_size % 128 == 0); refusing to attend over raw Q. Set \
+                 PRELUDE_ATTN_FA3_FUSE_Q_NORM_ROPE=0 for this configuration."
             );
         }
         // FA4 paged: handles both prefill (Q>1) and decode (Q=1).
