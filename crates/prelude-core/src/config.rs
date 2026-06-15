@@ -45,6 +45,14 @@ pub const DEFAULT_PAGED_BLOCK_SIZE: usize = 128;
 /// demand-driven reclaim now lets the cache safely use almost the whole pool.
 /// `PRELUDE_PREFIX_CACHE_BLOCKS=N` sets an explicit cap; `=0` is the opt-out.
 pub const DEFAULT_PREFIX_CACHE_BLOCKS: usize = usize::MAX;
+/// Finite fallback cap for the non-paged (CPU / no KV-pool) prefix cache.
+///
+/// On the paged path the "unbounded" default above is clamped to the physical
+/// pool size in `init_prefix_cache`. With no pool (`pool_blocks == 0`) there is
+/// nothing to derive a budget from, so the tensor prefix cache would grow
+/// without bound. Cap it at this finite default (the pre-"unbounded" value)
+/// unless the operator sets an explicit `PRELUDE_PREFIX_CACHE_BLOCKS`.
+pub const DEFAULT_NONPAGED_PREFIX_CACHE_BLOCKS: usize = 4096;
 pub const DEFAULT_PREFIX_BLOCK_SIZE: usize = DEFAULT_PAGED_BLOCK_SIZE;
 pub const DEFAULT_DELTANET_POOL_SLOTS: u32 = 8;
 pub const DEFAULT_TEMPERATURE: f32 = 1.0;

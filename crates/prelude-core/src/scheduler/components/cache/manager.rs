@@ -151,7 +151,12 @@ impl CacheManager {
             let budget_cap = pool_blocks.saturating_sub(reserve_floor).max(1);
             configured_max_blocks.min(budget_cap)
         } else {
-            configured_max_blocks
+            // No physical pool to derive a budget from (non-paged / CPU). The
+            // "unbounded" default (usize::MAX) would let the tensor prefix cache
+            // grow without bound, since PrefixMatchIndex only evicts while
+            // entries.len() > max_blocks. Clamp to a finite fallback; an
+            // explicit PRELUDE_PREFIX_CACHE_BLOCKS still wins when smaller.
+            configured_max_blocks.min(crate::config::DEFAULT_NONPAGED_PREFIX_CACHE_BLOCKS)
         };
         // flash layout: [B, L, H, D] → concat dim 1; standard: [B, H, L, D] → concat dim 2
         let is_flash = device.is_cuda();
