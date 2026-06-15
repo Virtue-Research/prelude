@@ -299,6 +299,29 @@ pub async fn ar_loop(
 
         refresh_waiting_prefix_cache(&engine, &mut scheduler);
 
+        // ── Submit-ahead correctness gate (bug #2) ─────────────────
+        // If the in-flight step did NOT sample on the executor-greedy device
+        // path, its sampled tokens are not device-resident, so the next step's
+        // decode rows cannot gather them device→device and would fall back to
+        // the STALE host `pending_token` (this in-flight step hasn't been
+        // processed yet → pending_token is the token from two steps ago, or 0
+        // after prefill). Drain it now — before scheduling/building the next
+        // step — so the host tokens it builds from are correct. Greedy steps
+        // skip this and keep the submit-ahead overlap (drained after submit).
+        //
+        // This also closes the finishing-row block-free race (bug #1): the
+        // only steps that still overlap are executor-greedy, and the greedy
+        // path in execute_work copies sampled tokens device→host (a sync)
+        // before returning. With the single sequential GPU worker, an
+        // in-flight greedy step's reads of a finishing row's KV blocks
+        // therefore complete before any later step can reallocate and write
+        // those blocks (free_blocks here is host bookkeeping only).
+        if inflight.as_ref().map_or(false, |f| !f.executor_greedy) {
+            if let Some(f) = inflight.take() {
+                drain_inflight(&engine, &mut scheduler, &mut states, f).await;
+            }
+        }
+
         // ── Phase 3: Schedule next step ────────────────────────────
         // schedule_step() syncs block availability internally.
         nvtx_push!("ar_schedule");
@@ -385,6 +408,16 @@ pub async fn ar_loop(
         }
         consecutive_no_progress = 0;
 
+        // Whether this step's sampling is device-resident (executor-greedy).
+        // Read before `batch` is moved into submit; recorded on the InFlight so
+        // the next iteration knows whether it can overlap (greedy) or must
+        // drain this step before building the next one (non-greedy → bug #2).
+        let step_executor_greedy = match &batch {
+            ForwardBatch::Decode { sample_greedy, .. } => *sample_greedy,
+            ForwardBatch::Mixed { sample_greedy, .. } => *sample_greedy,
+            _ => false,
+        };
+
         nvtx_push!("ar_submit");
         let submit_result = executor.submit(batch);
         nvtx_pop!(); // ar_submit
@@ -425,6 +458,7 @@ pub async fn ar_loop(
             deferred: deferred_prefill_ids,
             row_map,
             prefill_snap,
+            executor_greedy: step_executor_greedy,
         });
     }
 
@@ -871,6 +905,13 @@ struct InFlight {
     /// so process_step_output doesn't recompute them from the live sequence
     /// (which the next step's schedule has already advanced).
     prefill_snap: Vec<(usize, bool)>,
+    /// Whether this step sampled with the executor-greedy device path, i.e.
+    /// its sampled tokens are device-resident (`last_sampled`) and the NEXT
+    /// step's decode rows can gather them device→device. When false (any
+    /// temperature/logprobs row), the next step cannot gather and would fall
+    /// back to a STALE host `pending_token`, so this step must be drained
+    /// before the next one is built (see the early-drain in the run loop).
+    executor_greedy: bool,
 }
 
 /// Host row indices into the previous step's output for this step's decode
