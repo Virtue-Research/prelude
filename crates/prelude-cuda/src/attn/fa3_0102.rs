@@ -1,8 +1,8 @@
 //! candle-fa3-0102 backend: vendored vLLM 0.22 FA3 hopper kernel (SM90).
 //!
 //! Raw-pointer FFI to `run_mha_v3_prelude` in `libprelude_fa3_0102.a`, built by
-//! `crates/candle-fa3-0102/_build_v3_kernel_prelude.sh` (CUDA 13.2 + CUTLASS
-//! 3.8.0). The host-side parameter assembly inside that entry is a
+//! `crates/prelude-cuda/fa3_0102/_build_v3_kernel_prelude.sh` (CUDA 13.2 +
+//! CUTLASS 3.8.0). The host-side parameter assembly inside that entry is a
 //! field-for-field port of vLLM 0.22's `hopper/flash_api.cpp`
 //! (vllm-project/flash-attention@bce2942), so this wrapper only has to hand
 //! over device pointers, strides and shapes.

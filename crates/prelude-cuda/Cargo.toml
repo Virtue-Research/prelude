@@ -16,11 +16,12 @@ default = []
 # Opt-in: heavy CUTLASS hopper kernel compile. Enable PRELUDE_ATTN_FA3=1 at
 # runtime to prefer it over FA4 on the paged attention path.
 flash-attn-v3 = ["dep:candle-flash-attn-v3"]
-# candle-fa3-0102 backend: vendored vLLM 0.22 FA3 hopper kernel (bf16/hdim128/
-# sm90) linked as a prebuilt static lib via raw-ptr FFI — no candle-core 0.10.2
-# dependency. build.rs runs crates/candle-fa3-0102/_build_v3_kernel_prelude.sh
-# if the lib is missing. Default attention backend when compiled in (implied
-# by prelude-server's `cuda` feature); opt out with PRELUDE_ATTN_FA3_0102=0.
+# fa3-0102 backend: vendored vLLM 0.22 FA3 hopper kernel (bf16/hdim128/sm90)
+# linked as a prebuilt static lib via raw-ptr FFI — no candle-core 0.10.2
+# dependency. build.rs runs fa3_0102/_build_v3_kernel_prelude.sh (sources in
+# fa3_0102/hkernel_v3vllm/) if the lib is missing. Opt-in (needs CUDA 13.2 +
+# CUTLASS 3.8); default attention backend when compiled in, opt out at runtime
+# with PRELUDE_ATTN_FA3_0102=0.
 fa3-0102 = []
 # GGUF quantized linear kernels (llama.cpp MMQ/MMVQ). Kept opt-in because
 # safetensors BF16/FP16 models do not use them and the CUDA templates are

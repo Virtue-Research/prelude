@@ -158,8 +158,8 @@ fn main() {
     link_cublas_dynamic(&cuda_root);
 
     // ── fa3-0102: prebuilt vendored vLLM 0.22 FA3 hopper kernel ─────
-    // Static lib produced out-of-band by candle-fa3-0102's
-    // _build_v3_kernel_prelude.sh (CUDA 13.2 + CUTLASS 3.8, sm90a).
+    // Static lib produced out-of-band by fa3_0102/_build_v3_kernel_prelude.sh
+    // (CUDA 13.2 + CUTLASS 3.8, sm90a) from fa3_0102/hkernel_v3vllm/.
     // Built automatically here on first use if missing (~3 min).
     if std::env::var("CARGO_FEATURE_FA3_0102").is_ok() {
         println!("cargo:rerun-if-env-changed=FA3_0102_PRELUDE_PREBUILT_DIR");
@@ -199,8 +199,7 @@ fn main() {
                  or set CUDA_HOME_FA3 (CUDA 13.2) and CUTLASS38 (CUTLASS 3.8 include dir) so it can compile.\n\
                  If you do not need this backend, build without `--features fa3-0102`."
             );
-            let script =
-                PathBuf::from(&manifest_dir).join("../candle-fa3-0102/_build_v3_kernel_prelude.sh");
+            let script = PathBuf::from(&manifest_dir).join("fa3_0102/_build_v3_kernel_prelude.sh");
             let status = std::process::Command::new("bash")
                 .arg(&script)
                 .status()
