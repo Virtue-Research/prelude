@@ -375,12 +375,6 @@ pub mod attn_flags {
         })
     }
 
-    /// Q-prologue fusion is actually active: an FA3 backend that supports the
-    /// in-kernel prologue is selected AND fusion is requested.
-    pub fn fuse_q_norm_rope_active() -> bool {
-        (fa3_fork_enabled() || fa3_0102_enabled()) && fuse_q_norm_rope()
-    }
-
     /// `PRELUDE_QKNORM_D128` — use the D=128 specialized qknorm+rope kernel.
     /// Default on; opt out with `=0` (generic kernel).
     pub fn qknorm_d128_enabled() -> bool {

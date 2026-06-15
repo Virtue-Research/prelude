@@ -284,6 +284,15 @@ pub trait Ops: Send + Sync {
         crate::bail!("paged_attention: requires device backend")
     }
 
+    /// Whether this backend will fuse Q RMSNorm+RoPE into the attention SMEM
+    /// prologue (Plan A) for a paged forward. The model asks *the ops object*
+    /// rather than reading backend env vars, so a build compiled without the
+    /// fused FA3 kernels can never claim the capability (cf. PagedParams::
+    /// q_prologue). Backends without a fused prologue return false (default).
+    fn fuse_q_norm_rope_prologue(&self) -> bool {
+        false
+    }
+
     // ════════════════════════════════════════════════════════════════
     // KV cache
     // ════════════════════════════════════════════════════════════════

@@ -172,7 +172,7 @@ impl Qwen3Attention {
         let kv_cache = ctx
             .paged_kv
             .map(|kv| (kv.key_cache, kv.value_cache, kv.slot_mapping));
-        let fuse_q_in_fa3 = kv_cache.is_some() && super::commons::attn_utils::fa3_fuse_q_norm_rope_enabled();
+        let fuse_q_in_fa3 = kv_cache.is_some() && ops.fuse_q_norm_rope_prologue();
         let q_prologue = if fuse_q_in_fa3 {
             Some(crate::ops::QAttnPrologue {
                 q_weight: &self.q_norm_weight,

@@ -132,11 +132,3 @@ pub(crate) fn fused_qkv_projection(
     ))
 }
 
-/// Plan A: fuse Q RMSNorm+RoPE into FA3 attention prologue (requires FA3 paged path).
-///
-/// Delegates to the centralized [`crate::config::attn_flags`] so prelude-core
-/// and prelude-cuda share one parse and one truthiness rule — the model can no
-/// longer disagree with the backend about whether fusion is on.
-pub(crate) fn fa3_fuse_q_norm_rope_enabled() -> bool {
-    crate::config::attn_flags::fuse_q_norm_rope_active()
-}

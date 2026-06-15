@@ -302,6 +302,18 @@ impl Ops for CudaOps {
         prelude_core::ops::traits::attention::varlen_attention(q, k, v, params)
     }
 
+    fn fuse_q_norm_rope_prologue(&self) -> bool {
+        // Capability ∧ request: report fusion only for an FA3 backend actually
+        // compiled into THIS crate (cfg!), AND-ed with the runtime flag. The
+        // cfg! gates mean a build without the fused kernels can never report
+        // the capability, so prelude-core's view can't diverge from the
+        // #[cfg]-gated dispatch below.
+        use prelude_core::config::attn_flags;
+        let fa3_0102 = cfg!(feature = "fa3-0102") && attn_flags::fa3_0102_enabled();
+        let fa3_fork = cfg!(feature = "flash-attn-v3") && attn_flags::fa3_fork_enabled();
+        (fa3_0102 || fa3_fork) && attn_flags::fuse_q_norm_rope()
+    }
+
     fn paged_attention(
         &self,
         q: &Tensor,
