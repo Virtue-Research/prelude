@@ -119,6 +119,14 @@ fn main() -> Result<()> {
     // ── Phase 2: Compile libbacktrace ──────────────────────────────
     compile_libbacktrace(&tvm_ffi_dir)?;
 
+    // src/ffi/backtrace.cc does `#include <backtrace.h>` (libbacktrace's public
+    // header) and the sources also pull the generated "backtrace-supported.h"
+    // (written into OUT_DIR/libbacktrace by compile_libbacktrace). Put both on
+    // the Phase-1 include path, else backtrace.cc fails with
+    // `backtrace.h: No such file or directory`.
+    build.include(tvm_ffi_dir.join("3rdparty/libbacktrace"));
+    build.include(PathBuf::from(env::var("OUT_DIR")?).join("libbacktrace"));
+
     // Use +whole-archive so kernel .o files can resolve TVM symbols at link time.
     build.link_lib_modifier("+whole-archive");
     build
@@ -206,6 +214,41 @@ fn compile_libbacktrace(tvm_ffi_dir: &Path) -> Result<()> {
 "#
     };
     std::fs::write(config_dir.join("config.h"), config_h)?;
+
+    // libbacktrace also #includes "backtrace-supported.h", which upstream
+    // generates from backtrace-supported.h.in via ./configure. We compile the
+    // sources directly with cc (no autoconf run), so generate it ourselves
+    // with the values configure would pick for this platform. Without this,
+    // state.c fails: `backtrace-supported.h: No such file or directory`.
+    let backtrace_supported_h = if cfg!(target_os = "linux") {
+        // x86_64/aarch64 ELF: full support, mmap-based (no malloc), threaded.
+        r#"
+#define BACKTRACE_SUPPORTED 1
+#define BACKTRACE_USES_MALLOC 0
+#define BACKTRACE_SUPPORTS_THREADS 1
+#define BACKTRACE_SUPPORTS_DATA 1
+"#
+    } else if cfg!(target_os = "macos") {
+        // Mach-O: supported, malloc-based; data syminfo unsupported.
+        r#"
+#define BACKTRACE_SUPPORTED 1
+#define BACKTRACE_USES_MALLOC 1
+#define BACKTRACE_SUPPORTS_THREADS 1
+#define BACKTRACE_SUPPORTS_DATA 0
+"#
+    } else {
+        // Unknown target: declare unsupported so callers degrade gracefully.
+        r#"
+#define BACKTRACE_SUPPORTED 0
+#define BACKTRACE_USES_MALLOC 1
+#define BACKTRACE_SUPPORTS_THREADS 0
+#define BACKTRACE_SUPPORTS_DATA 0
+"#
+    };
+    std::fs::write(
+        config_dir.join("backtrace-supported.h"),
+        backtrace_supported_h,
+    )?;
 
     let core_files = [
         "backtrace.c",
