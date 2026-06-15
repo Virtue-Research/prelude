@@ -246,7 +246,7 @@ impl RuntimeConfig {
             // not (Q·K misalignment -> deterministic garbage; see the
             // fa3_q_prologue_deadlock_fix report). Auto-enable when fusing.
             fused_kv_cache_write: parse_env_bool_eq1("PRELUDE_FUSED_KV_CACHE_WRITE")
-                || parse_env_bool_eq1("PRELUDE_ATTN_FA3_FUSE_Q_NORM_ROPE"),
+                || attn_flags::fuse_q_norm_rope(),
             cpu_thread_bind: std::env::var("SGLANG_CPU_OMP_THREADS_BIND")
                 .ok()
                 .filter(|s| !s.is_empty()),
@@ -298,6 +298,16 @@ fn parse_env_bool_eq1(name: &str) -> bool {
     std::env::var(name).map_or(false, |v| v == "1")
 }
 
+/// Parse a boolean env var defaulting to false: on when set to a truthy value
+/// ("1"/"true"/"yes"/"on", case-insensitive). The default-off counterpart to
+/// [`parse_env_bool_default_true`]; used for the attention backend toggles so
+/// every reader applies the *same* truthiness rule (see [`attn_flags`]).
+fn parse_env_bool_default_false(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 fn parse_env_bool_default_true(name: &str) -> bool {
     std::env::var(name)
         .map(|v| {
@@ -321,5 +331,67 @@ fn parse_env_moe_backend() -> Result<MoeBackendPolicy, String> {
     match std::env::var("PRELUDE_MOE_BACKEND") {
         Ok(value) if !value.is_empty() => MoeBackendPolicy::parse(&value),
         _ => Ok(MoeBackendPolicy::Auto),
+    }
+}
+
+// ── Attention / cache backend flags (single source of truth) ──────────────
+
+/// Centralized parsing for the attention-backend and prefix-cache toggles.
+///
+/// These flags were previously parsed independently in prelude-cuda
+/// (`cuda_ops.rs`, `ops/rope.rs`), the model layer (`models/commons/attn_utils.rs`),
+/// and `RuntimeConfig::from_env`, each with its own `OnceLock<bool>` cache and —
+/// worse — *different* truthiness rules: the fuse flag accepted "1"/"true" in
+/// the ops/model layers but only "1" in config, so `=true` turned on Q-prologue
+/// fusion while `fused_kv_cache_write` stayed off → Q·K misalignment garbage.
+///
+/// Parsing each flag exactly once here, with one truthiness rule per polarity,
+/// makes that divergence impossible. Reads are process-lifetime cached, so the
+/// env var is consulted once. (Env set *after* first read is not observed, same
+/// as the previous per-callsite OnceLock behavior.)
+pub mod attn_flags {
+    use std::sync::OnceLock;
+
+    /// `PRELUDE_ATTN_FA3` — prefer the candle-flash-attn-v3 (FA3 fork) paged
+    /// path over FA4. Default off.
+    pub fn fa3_fork_enabled() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| super::parse_env_bool_default_false("PRELUDE_ATTN_FA3"))
+    }
+
+    /// `PRELUDE_ATTN_FA3_0102` — prefer the candle-fa3-0102 backend (vendored
+    /// vLLM 0.22 FA3 hopper kernel). Default on; opt out with `=0`.
+    pub fn fa3_0102_enabled() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| super::parse_env_bool_default_true("PRELUDE_ATTN_FA3_0102"))
+    }
+
+    /// `PRELUDE_ATTN_FA3_FUSE_Q_NORM_ROPE` — fuse Q RMSNorm+RoPE into the FA3
+    /// attention prologue (Plan A). Default off.
+    pub fn fuse_q_norm_rope() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            super::parse_env_bool_default_false("PRELUDE_ATTN_FA3_FUSE_Q_NORM_ROPE")
+        })
+    }
+
+    /// Q-prologue fusion is actually active: an FA3 backend that supports the
+    /// in-kernel prologue is selected AND fusion is requested.
+    pub fn fuse_q_norm_rope_active() -> bool {
+        (fa3_fork_enabled() || fa3_0102_enabled()) && fuse_q_norm_rope()
+    }
+
+    /// `PRELUDE_QKNORM_D128` — use the D=128 specialized qknorm+rope kernel.
+    /// Default on; opt out with `=0` (generic kernel).
+    pub fn qknorm_d128_enabled() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| super::parse_env_bool_default_true("PRELUDE_QKNORM_D128"))
+    }
+
+    /// `PRELUDE_PREFIX_LAZY` — vLLM-style lazy hash-aware prefix eviction.
+    /// Default on; opt out with `=0`.
+    pub fn prefix_lazy_enabled() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| super::parse_env_bool_default_true("PRELUDE_PREFIX_LAZY"))
     }
 }

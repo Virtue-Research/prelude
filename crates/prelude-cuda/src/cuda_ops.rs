@@ -68,18 +68,15 @@ fn cu_seqlens_to_lens(cu_seqlens: &Tensor) -> Result<Tensor> {
     hi.sub(&lo)
 }
 
-/// Prefer the FlashAttention-3 paged path (candle-flash-attn-v3, sm90) over
-/// FA4 when `PRELUDE_ATTN_FA3=1`. Default (unset) keeps FA4 first. Cached for
-/// the process lifetime so the env read happens once.
+// Attention-backend selection flags are parsed once in prelude-core's
+// `config::attn_flags` (single source of truth, one truthiness rule). These
+// thin wrappers keep the `#[cfg]` gating local to the kernels that exist.
+
+/// Prefer the FlashAttention-3 *fork* (candle-flash-attn-v3, sm90) paged path
+/// over FA4 when `PRELUDE_ATTN_FA3=1`. Default (unset) keeps FA4 first.
 #[cfg(feature = "flash-attn-v3")]
-fn prefer_flashinfer_attn() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("PRELUDE_ATTN_FA3")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
+fn prefer_fa3_fork() -> bool {
+    prelude_core::config::attn_flags::fa3_fork_enabled()
 }
 
 /// Prefer the candle-fa3-0102 backend (vendored vLLM 0.22 FA3 hopper kernel).
@@ -88,25 +85,13 @@ fn prefer_flashinfer_attn() -> bool {
 /// and FA4 on both the paged and non-paged varlen paths.
 #[cfg(feature = "fa3-0102")]
 fn prefer_fa3_0102() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("PRELUDE_ATTN_FA3_0102")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-    })
+    prelude_core::config::attn_flags::fa3_0102_enabled()
 }
 
 /// Fuse Q RMSNorm+RoPE into FA3 attention prologue (Plan A).
 #[cfg(feature = "flash-attn-v3")]
 fn fa3_fuse_q_norm_rope() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("PRELUDE_ATTN_FA3_FUSE_Q_NORM_ROPE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    prelude_core::config::attn_flags::fuse_q_norm_rope()
 }
 
 // ── The single impl ───────────────────────────────────────────────
@@ -303,7 +288,7 @@ impl Ops for CudaOps {
             }
         }
         #[cfg(feature = "flash-attn-v3")]
-        if prefer_flashinfer_attn() {
+        if prefer_fa3_fork() {
             if let Some(r) = try_fa3_varlen(q, k, v, params) {
                 return r;
             }
@@ -367,7 +352,7 @@ impl Ops for CudaOps {
         // Hopper SM90) over FA4 on the paged path. Only compiled when the
         // `flash-attn-v3` feature is enabled.
         #[cfg(feature = "flash-attn-v3")]
-        if prefer_flashinfer_attn() {
+        if prefer_fa3_fork() {
             let block_size = key_cache.dim(1)?;
             if block_size % 128 == 0 {
                 // FA3 paged needs both cumulative K offsets and per-sequence K
@@ -426,7 +411,7 @@ impl Ops for CudaOps {
 
     fn paged_block_size_hint(&self, head_dim: usize) -> usize {
         #[cfg(feature = "flash-attn-v3")]
-        if prefer_flashinfer_attn() {
+        if prefer_fa3_fork() {
             // FA3 paged KV requires page_block_size to be divisible by the kernel N tile.
             // 128 works for the supported paged head dims here and keeps FA4 parity.
             return 128;

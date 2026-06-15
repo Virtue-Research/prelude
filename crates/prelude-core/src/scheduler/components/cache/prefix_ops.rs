@@ -16,14 +16,7 @@ impl CacheManager {
     /// for hybrid models (DeltaNet prefix state is keyed by trie hashes) and
     /// the non-paged tensor cache. Escape hatch: PRELUDE_PREFIX_LAZY=0.
     pub(crate) fn lazy_prefix_enabled(&self) -> bool {
-        use std::sync::OnceLock;
-        static V: OnceLock<bool> = OnceLock::new();
-        let env_on = *V.get_or_init(|| {
-            std::env::var("PRELUDE_PREFIX_LAZY")
-                .map(|v| v != "0")
-                .unwrap_or(true)
-        });
-        env_on
+        crate::config::attn_flags::prefix_lazy_enabled()
             && self.prefix_cache.is_some()
             && self.block_manager.is_some()
             && self.deltanet_pool.is_none()

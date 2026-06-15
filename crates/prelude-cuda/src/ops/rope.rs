@@ -6,15 +6,9 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use crate::{MOD_QKNORM_ROPE, PTX_QKNORM_ROPE};
 
 /// D=128 specialized qknorm+rope kernel enabled? (escape hatch:
-/// PRELUDE_QKNORM_D128=0 → generic kernel)
+/// PRELUDE_QKNORM_D128=0 → generic kernel). Parsed centrally in prelude-core.
 fn qknorm_d128_enabled() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("PRELUDE_QKNORM_D128")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-    })
+    prelude_core::config::attn_flags::qknorm_d128_enabled()
 }
 
 /// Fused per-head QK-Norm + RoPE for varlen attention.
