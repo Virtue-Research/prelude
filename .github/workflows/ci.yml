@@ -64,7 +64,13 @@ jobs:
         run: cargo check --lib --bins -p prelude-core -p prelude-cpu -p prelude-server
 
       - name: test (CPU-only crates)
-        run: cargo test -p prelude-cpu -p prelude-server
+        # The prelude-cpu oneDNN/brgemm tests require an AVX-512 VNNI CPU. The
+        # free GitHub runner lacks it: the availability probe is optimistic, the
+        # kernel build then hits dnnl_brgemm_finalize "unimplemented", and the
+        # FFI's CHECK_DNNL aborts the whole test process (SIGABRT). Skip that
+        # module here — it runs on AVX-512 hardware (dev box / self-hosted).
+        # Everything else (the rest of prelude-cpu + all of prelude-server) runs.
+        run: cargo test -p prelude-cpu -p prelude-server -- --skip onednn::ops::tests
 
   gpu:
     name: GPU kernel tests (self-hosted / manual)
