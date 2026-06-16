@@ -12,7 +12,7 @@ use candle_core::{DType, Device, Tensor};
 
 const HEAD_DIM: usize = 128;
 const H_Q: usize = 32;
-const H_KV: usize = 4; // topicguard qwen3 GQA ratio 8
+const H_KV: usize = 4; // Qwen3-MoE GQA ratio 8 (32 Q / 4 KV)
 const PAGE: usize = 128;
 
 fn dev() -> Device {

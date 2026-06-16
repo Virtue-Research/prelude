@@ -279,7 +279,7 @@ fn bench_varlen(registry: &KernelRegistry, cublas: &CuBlas, cublas_handle: cubla
             num_heads_k: 8,
         },
         BenchConfig {
-            name: "topicguard",
+            name: "qwen3_moe_gqa32x4",
             head_dim: 128,
             num_heads_q: 32,
             num_heads_k: 4,
@@ -462,7 +462,7 @@ fn bench_paged(registry: &KernelRegistry) {
             num_heads_k: 8,
         },
         BenchConfig {
-            name: "topicguard",
+            name: "qwen3_moe_gqa32x4",
             head_dim: 128,
             num_heads_q: 32,
             num_heads_k: 4,
@@ -594,7 +594,7 @@ fn bench_paged(registry: &KernelRegistry) {
 // ── Main ────────────────────────────────────────────────────────────
 
 // ── Realistic server prefill step: varlen batch of NSEQ sequences x S tokens ──
-// Matches the topicguard server's max_num_batched_tokens=8192 prefill forward
+// Matches the server's max_num_batched_tokens=8192 prefill forward
 // (GQA 32/4, d=128, causal, bf16). FA4 kernel only — reports us/fwd.
 fn bench_varlen_batch(registry: &KernelRegistry) {
     const NSEQ: usize = 4;
