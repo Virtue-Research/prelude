@@ -70,6 +70,8 @@ crates/candle-fa3-bench/
 # ── Local scratch scripts and benchmark suite — not checked in. ──
 scripts/
 bench_scripts/
+# machine-specific reproduction scripts (hardcoded paths + dataset refs)
+bench_repro/
 # one-off verification outputs
 verify_out_*.txt
 

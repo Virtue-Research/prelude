@@ -13,9 +13,9 @@
 #   - Exposes run_mha_v3_prelude (stream-aware, paged-capable) alongside run_mha_v3.
 set -uo pipefail
 CUDA=${CUDA_HOME_FA3:-/usr/local/cuda-13.2}
-CUT=${CUTLASS38:-/data/xueying/cutlass38/include}
+CUT=${CUTLASS38:?set CUTLASS38 to the CUTLASS 3.8 include dir (e.g. /path/to/cutlass/include)}
 SRC="$(cd "$(dirname "$0")" && pwd)/hkernel_v3vllm"
-OUT=${FA3_0102_PRELUDE_PREBUILT_DIR:-/data/xueying/fa3_0102_prelude_prebuilt}
+OUT=${FA3_0102_PRELUDE_PREBUILT_DIR:?set FA3_0102_PRELUDE_PREBUILT_DIR to the output dir for libprelude_fa3_0102.a}
 mkdir -p "$OUT"
 DIS="-DFLASHATTENTION_DISABLE_BACKWARD -DFLASHATTENTION_DISABLE_FP8 -DFLASHATTENTION_DISABLE_FP16 -DFLASHATTENTION_DISABLE_HDIM64 -DFLASHATTENTION_DISABLE_HDIM96 -DFLASHATTENTION_DISABLE_HDIM192 -DFLASHATTENTION_DISABLE_HDIM256 -DFLASHATTENTION_DISABLE_SM8 -DFLASHATTENTION_DISABLE_APPENDKV -DFLASHATTENTION_DISABLE_SOFTCAP -DFLASHATTENTION_DISABLE_CLUSTER"
 COMMON="-I $SRC -I $CUT -gencode arch=compute_90a,code=sm_90a -std=c++17 -O3 --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler -fPIC -DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED -DCUTLASS_ENABLE_GDC_FOR_SM90 -DCUTLASS_DEBUG_TRACE_LEVEL=0 -DNDEBUG $DIS"

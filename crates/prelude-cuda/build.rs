@@ -165,8 +165,11 @@ fn main() {
         println!("cargo:rerun-if-env-changed=FA3_0102_PRELUDE_PREBUILT_DIR");
         println!("cargo:rerun-if-env-changed=CUDA_HOME_FA3");
         println!("cargo:rerun-if-env-changed=CUTLASS38");
+        // Default to the cargo build-script OUT_DIR so a fresh clone builds the
+        // archive in-tree; point FA3_0102_PRELUDE_PREBUILT_DIR at a shared dir to
+        // reuse a cached archive across builds.
         let lib_dir = std::env::var("FA3_0102_PRELUDE_PREBUILT_DIR")
-            .unwrap_or_else(|_| "/data/xueying/fa3_0102_prelude_prebuilt".to_string());
+            .unwrap_or_else(|_| std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo"));
         let lib = PathBuf::from(&lib_dir).join("libprelude_fa3_0102.a");
         if !lib.exists() {
             // The fa3-0102 kernel needs CUDA 13.2 + CUTLASS 3.8 to compile (or a
@@ -176,8 +179,9 @@ fn main() {
             // Override paths via CUDA_HOME_FA3 / CUTLASS38 / FA3_0102_PRELUDE_PREBUILT_DIR.
             let cuda_home = std::env::var("CUDA_HOME_FA3")
                 .unwrap_or_else(|_| "/usr/local/cuda-13.2".to_string());
-            let cutlass = std::env::var("CUTLASS38")
-                .unwrap_or_else(|_| "/data/xueying/cutlass38/include".to_string());
+            // No default: the CUTLASS 3.8 include dir is machine-specific, so an
+            // unset CUTLASS38 falls through to the actionable error below.
+            let cutlass = std::env::var("CUTLASS38").unwrap_or_default();
             let missing: Vec<&str> = [
                 (
                     PathBuf::from(&cuda_home).join("bin/nvcc").exists(),
@@ -202,6 +206,9 @@ fn main() {
             let script = PathBuf::from(&manifest_dir).join("fa3_0102/_build_v3_kernel_prelude.sh");
             let status = std::process::Command::new("bash")
                 .arg(&script)
+                .env("FA3_0102_PRELUDE_PREBUILT_DIR", &lib_dir)
+                .env("CUDA_HOME_FA3", &cuda_home)
+                .env("CUTLASS38", &cutlass)
                 .status()
                 .unwrap_or_else(|e| panic!("fa3-0102 kernel build failed to start: {e}"));
             assert!(

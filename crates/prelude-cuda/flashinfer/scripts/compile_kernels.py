@@ -1294,7 +1294,7 @@ def _cutlass_moe_blackwell_compile_flags(flags: List[str]) -> List[str]:
 
 
 def _should_compile_cutlass_moe_blackwell_source(src: Path, archs: List[int]) -> bool:
-    # TopicGuard/Qwen3 production weights are dense BF16. The upstream
+    # Production qwen3 moe weights are dense BF16. The upstream
     # SM100/SM103 JIT spec is broad and also pulls in fp16, uint, FP8/FP4 and
     # older generated kernels. Several of those translation units compile very
     # slowly or stall under static AOT, so keep the AOT archive to the BF16

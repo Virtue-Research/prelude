@@ -535,8 +535,8 @@ fn cap_hybrid_prefix_cache_chunk(seq: &Sequence, block_size: usize, chunk: usize
 
     // DeltaNet prefix entries require an exact state snapshot at the cached
     // boundary. Keep the cached prefix block-aligned and strictly before the
-    // full prompt; the remaining tail is the stable Qwen3.5 fast path used by
-    // the TopicGuard workload.
+    // full prompt; the remaining tail is the stable fast path used by the
+    // qwen3 moe workload.
     let final_reusable = final_block_aligned_prefix(prompt_len, block_size);
     if final_reusable > computed && after > final_reusable {
         return final_reusable - computed;
