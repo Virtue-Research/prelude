@@ -34,9 +34,12 @@ jobs:
 
       - name: Install Rust (stable + rustfmt + clippy)
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-            --default-toolchain stable --component rustfmt clippy
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          # The ubuntu runner ships rustup; just pin stable and add components.
+          # (rustup component add takes space-separated names; rustup-init's
+          #  --component does not, which is why the curl form failed.)
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustc --version && cargo --version
 
       - name: Cache cargo + target
         uses: actions/cache@v4
