@@ -36,6 +36,11 @@ pub const DEFAULT_CUDA_GRAPH_MAX_BS: usize = 32;
 /// activation profiler probes the same shape the engine actually runs
 /// in the default config.
 pub const DEFAULT_PROFILE_TOKENS: usize = 8192;
+/// Mirrors the scheduler's `max_running_requests` default. Used to bound the
+/// realistic logits allocation in the activation profiler: the profiling
+/// forward materializes `[profile_tokens, vocab]` logits, but in serving only
+/// the last token of each of at most this many sequences needs logits.
+pub const DEFAULT_PROFILE_MAX_SEQS: usize = 256;
 pub const DEFAULT_PAGED_BLOCK_SIZE: usize = 128;
 /// Default logical prefix-cache capacity, measured in paged KV blocks.
 ///
@@ -197,6 +202,10 @@ pub struct RuntimeConfig {
     /// `--max-num-batched-tokens`; the env override is for tests /
     /// non-server callers.
     pub profile_tokens: usize,
+    /// Max concurrent sequences assumed when sizing the realistic logits
+    /// allocation during activation profiling. Server CLI sets this from
+    /// `--max-running-requests`; env override for tests / non-server callers.
+    pub profile_max_seqs: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +275,10 @@ impl RuntimeConfig {
                 DEFAULT_CUDA_GRAPH_MAX_BS,
             ),
             profile_tokens: parse_env_usize("PRELUDE_PROFILE_TOKENS", DEFAULT_PROFILE_TOKENS),
+            profile_max_seqs: parse_env_usize(
+                "PRELUDE_PROFILE_MAX_SEQS",
+                DEFAULT_PROFILE_MAX_SEQS,
+            ),
         })
     }
 }

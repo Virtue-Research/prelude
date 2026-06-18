@@ -37,7 +37,7 @@ impl CacheManager {
         cache_config: &CacheConfig,
         kv_sharing: &[Option<usize>],
         peak_activation_bytes: usize,
-        weights_bytes_at_load: Option<usize>,
+        nonkv_static_bytes: Option<usize>,
     ) -> Result<Self, EngineError> {
         let (paged_pool, block_manager) = if runtime_caps.supports_paged_attn {
             Self::init_paged_pool(
@@ -47,7 +47,7 @@ impl CacheManager {
                 cache_config,
                 kv_sharing,
                 peak_activation_bytes,
-                weights_bytes_at_load,
+                nonkv_static_bytes,
             )?
         } else {
             (None, None)
@@ -187,7 +187,7 @@ impl CacheManager {
         cache_config: &CacheConfig,
         kv_sharing: &[Option<usize>],
         peak_activation_bytes: usize,
-        weights_bytes_at_load: Option<usize>,
+        nonkv_static_bytes: Option<usize>,
     ) -> Result<
         (
             Option<PagedKvPool>,
@@ -274,16 +274,18 @@ impl CacheManager {
 
             // vLLM formula:
             //   requested = total * utilization
-            //   non_kv = weights_memory + peak_activation
+            //   non_kv = nonkv_static + peak_activation
             //   available = requested - non_kv
-            // Weights+context as measured RIGHT AFTER model load (vLLM
-            // semantics). Falling back to `total - free` taken now would
-            // double-count the activation-profiling pages retained by the
-            // cudarc allocator (they are also added as peak_activation below).
-            let weights_bytes =
-                weights_bytes_at_load.unwrap_or_else(|| total_bytes.saturating_sub(free_bytes));
+            // `nonkv_static` = logical weights (Σ tensor bytes) + CUDA context,
+            // computed in `engine::loading` to match vLLM's accounting against
+            // ALLOCATED bytes (not the physical cudarc snapshot, which over-counts
+            // via pool reservation/fragmentation). Falls back to `total - free`
+            // only if that computation was unavailable (e.g. non-CUDA / query
+            // failure), which is slightly conservative.
+            let nonkv_static_bytes =
+                nonkv_static_bytes.unwrap_or_else(|| total_bytes.saturating_sub(free_bytes));
             let requested = (total_bytes as f64 * utilization as f64) as usize;
-            let non_kv = weights_bytes + peak_activation_bytes;
+            let non_kv = nonkv_static_bytes + peak_activation_bytes;
             let available_for_kv = requested.saturating_sub(non_kv);
 
             let auto_blocks = if total_bytes_per_block > 0 {
@@ -295,7 +297,7 @@ impl CacheManager {
                 auto_blocks,
                 total_gpu_mb = total_bytes / (1024 * 1024),
                 free_gpu_mb = free_bytes / (1024 * 1024),
-                weights_mb = weights_bytes / (1024 * 1024),
+                nonkv_static_mb = nonkv_static_bytes / (1024 * 1024),
                 peak_activation_mb = peak_activation_bytes / (1024 * 1024),
                 available_for_kv_mb = available_for_kv / (1024 * 1024),
                 gpu_memory_utilization = utilization,
