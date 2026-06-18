@@ -94,6 +94,7 @@ pub mod device;
 pub(crate) mod attn;
 mod cuda_graph;
 mod cuda_ops;
+mod prefill_graph;
 pub mod executor;
 mod fp8_gemm;
 pub(crate) mod moe_ffi;

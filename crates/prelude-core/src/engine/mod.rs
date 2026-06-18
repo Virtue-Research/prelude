@@ -37,11 +37,12 @@ mod types;
 // ── Re-exports: plan types + engine struct ──
 pub(crate) use self::engine::ModelVariant;
 pub use self::engine::{Engine, ModelExecutor};
+pub use self::types::BatchPrefillResult;
 pub use self::types::OwnedBatchDecodeSeq;
 pub use self::types::PagedKvPool;
 pub use self::types::TaskOverride;
 pub(crate) use self::types::{
-    BatchDecodeSeq, BatchPrefillResult, CacheAllocationPlan, CacheAllocationPlanEntry,
+    BatchDecodeSeq, CacheAllocationPlan, CacheAllocationPlanEntry,
     CommonModelConfig, DecodePlan, EmbeddingActivation, EmbeddingDenseLayerSpec,
     EmbeddingNormalization, EmbeddingPooling, EmbeddingSemantics, ExecutionKind, GenerateBatchPlan,
     ModelDescriptor, PreTokenizedClassifyItem, PreTokenizedEmbedItem, PrefillPlan,

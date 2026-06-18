@@ -41,13 +41,28 @@ struct CapturedGraph {
 
 /// Cache of captured CUDA graphs, keyed by `batch_size`.
 ///
+/// Capture sizes are sparse (powers of 2 plus a few in-between sizes
+/// up to `max_bs`), and `try_replay` rounds the actual batch size *up*
+/// to the smallest captured bucket, padding the input buffers with
+/// replicas of `seqs[0]`. Padded slots do real but irrelevant work;
+/// their rows are sliced away from the returned output tensor.
+///
 /// Owned by the GPU worker thread — no `Arc`/`Mutex` needed.
 pub(crate) struct DecodeGraphCache {
     graphs: HashMap<usize, CapturedGraph>,
+    /// Sorted ascending. Capture set is the subset that's `<= max_bs`.
+    capture_sizes: Vec<usize>,
     max_bs: usize,
     block_size: usize,
     enabled: bool,
 }
+
+/// Default capture batch sizes. Mirrors vLLM's sparse list — finer at
+/// the low end where decode latency matters most, coarser higher up.
+/// Filtered by `max_bs` at construction.
+const DEFAULT_CAPTURE_SIZES: &[usize] = &[
+    1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512,
+];
 
 impl DecodeGraphCache {
     pub fn new(
@@ -73,25 +88,37 @@ impl DecodeGraphCache {
             );
         }
 
+        let capture_sizes: Vec<usize> = DEFAULT_CAPTURE_SIZES
+            .iter()
+            .copied()
+            .filter(|&s| s <= max_bs)
+            .collect();
+
         Self {
             graphs: HashMap::new(),
+            capture_sizes,
             max_bs,
             block_size,
             enabled,
         }
     }
 
-    /// Eagerly capture graphs for all batch sizes at startup.
+    /// Eagerly capture graphs for the sparse `capture_sizes` set at
+    /// startup. Sparse rather than dense (1..=max_bs) so that the
+    /// number of graphs stays small (~15) even when `max_bs` is bumped
+    /// to 512+, and runtime padding makes any actual `bs in (0, max_bs]`
+    /// pick the smallest enclosing captured size.
     pub fn warmup_all(&mut self, engine: &Engine) {
         if !self.enabled {
             return;
         }
 
         let t0 = std::time::Instant::now();
-        let total = self.max_bs;
+        let total = self.capture_sizes.len();
         let mut captured = 0;
 
-        for bs in 1..=self.max_bs {
+        let sizes = self.capture_sizes.clone();
+        for bs in sizes {
             // Allocate for up to 8192 seqlen (just buffer size, not a constraint)
             match self.capture(engine, bs, 8192) {
                 Ok(()) => {
@@ -111,8 +138,17 @@ impl DecodeGraphCache {
         tracing::info!(captured, total, elapsed_ms, "CUDA graph warmup complete");
     }
 
+    /// Round `bs` up to the smallest captured bucket size, if any fits.
+    fn round_up_bucket(&self, bs: usize) -> Option<usize> {
+        self.capture_sizes.iter().copied().find(|&b| b >= bs)
+    }
+
     /// Try to replay a captured graph for this decode batch.
     /// Returns `None` if not eligible; caller falls back to eager.
+    ///
+    /// `bs` is rounded up to the smallest captured bucket; padded slots
+    /// get replicas of `seqs[0]` (see [`update_buffers`]). Output is
+    /// sliced back to `[bs, vocab]` before returning.
     pub fn try_replay(
         &mut self,
         engine: &Engine,
@@ -127,7 +163,13 @@ impl DecodeGraphCache {
             return None;
         }
 
-        let captured = match self.graphs.get(&bs) {
+        // Round up to a captured bucket size.
+        let bucket = match self.round_up_bucket(bs) {
+            Some(b) => b,
+            None => return None,
+        };
+
+        let captured = match self.graphs.get(&bucket) {
             Some(c) => c,
             None => return None,
         };
@@ -148,14 +190,19 @@ impl DecodeGraphCache {
             Err(e) => return Some(Err(e)),
         };
 
-        // Update input buffers (returns CPU-side data for plan reuse)
+        // Update input buffers (returns CPU-side data for plan reuse).
+        // update_buffers pads to `bucket` slots, replicating seqs[0] for
+        // padding so the captured kernels see well-formed inputs.
         let cpu_data = match update_buffers(&captured.buffers, seqs, self.block_size, &stream) {
             Ok(d) => d,
             Err(e) => return Some(Err(e)),
         };
 
-        // Pre-compute FlashInfer plan outside the graph.
-        // Uses CPU-side data from update_buffers to avoid GPU→CPU syncs.
+        // Pre-compute FlashInfer plan at bucket size — the captured FA
+        // kernel reads plan indices for all `bucket` slots, so we have
+        // to populate the plan tensors at `bucket` granularity (using
+        // the same seqs[0]-replicated cu_seqlens_k / block_tables that
+        // update_buffers already returned).
         {
             let pool = match engine.cache.paged_pool.as_ref() {
                 Some(p) => p,
@@ -166,7 +213,7 @@ impl DecodeGraphCache {
             let head_dim = engine.executor.config.head_dim;
 
             if let Err(e) = crate::attn::flashinfer::precompute_paged_plan_replay(
-                (bs, num_qo_heads, head_dim),
+                (bucket, num_qo_heads, head_dim),
                 &key_caches[0],
                 &cpu_data.cu_seqlens_k,
                 &cpu_data.block_tables,
@@ -181,9 +228,20 @@ impl DecodeGraphCache {
             }
         }
 
-        // Replay
+        // Replay, then slice the bucket-sized output back to `bs`.
         match captured.graph.launch() {
-            Ok(()) => Some(Ok(captured.output.clone())),
+            Ok(()) => {
+                if bs == bucket {
+                    Some(Ok(captured.output.clone()))
+                } else {
+                    Some(
+                        captured
+                            .output
+                            .narrow(0, 0, bs)
+                            .map_err(tensor_err),
+                    )
+                }
+            }
             Err(e) => Some(Err(EngineError::Internal(format!(
                 "CUDA graph replay failed: {e}"
             )))),

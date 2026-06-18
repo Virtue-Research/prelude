@@ -92,6 +92,13 @@ pub(super) struct CpuBatchData {
 
 /// Update all pre-allocated buffers from the current decode batch.
 /// Returns CPU-side data for reuse by FlashInfer plan computation.
+///
+/// Supports `seqs.len() <= buffers.batch_size` — when the actual batch
+/// is smaller than the captured bucket size, the remaining slots are
+/// padded with replicas of `seqs[0]` so the captured graph's kernels
+/// see well-formed inputs across all `bucket` slots. The padded slots
+/// do real (but irrelevant) work; their outputs are sliced away by the
+/// caller via `Tensor::narrow(0, 0, actual_bs)`.
 pub(super) fn update_buffers(
     buffers: &DecodeGraphBuffers,
     seqs: &[OwnedBatchDecodeSeq],
@@ -99,42 +106,56 @@ pub(super) fn update_buffers(
     stream: &Arc<CudaStream>,
 ) -> Result<CpuBatchData, EngineError> {
     let bs = seqs.len();
-    debug_assert_eq!(bs, buffers.batch_size);
+    let bucket = buffers.batch_size;
+    debug_assert!(
+        bs > 0 && bs <= bucket,
+        "update_buffers: actual bs {bs} must be in 1..={bucket}"
+    );
 
-    let tokens: Vec<u32> = seqs.iter().map(|s| s.token).collect();
-    unsafe { update_tensor(&buffers.packed_input, &tokens, stream)? };
+    // Helper: index into seqs, replicating seqs[0] for padded slots.
+    let slot_of = |i: usize| -> &OwnedBatchDecodeSeq { &seqs[i.min(bs - 1)] };
 
-    let mut cu_k: Vec<u32> = Vec::with_capacity(bs + 1);
+    let mut tokens: Vec<u32> = Vec::with_capacity(bucket);
+    let mut cu_k: Vec<u32> = Vec::with_capacity(bucket + 1);
     cu_k.push(0);
-    for s in seqs {
-        cu_k.push(cu_k.last().unwrap() + s.context_len as u32);
-    }
-    unsafe { update_tensor(&buffers.cu_seqlens_k, &cu_k, stream)? };
-
-    let positions: Vec<u32> = seqs.iter().map(|s| s.position as u32).collect();
-    unsafe { update_tensor(&buffers.position_ids, &positions, stream)? };
-
-    let slots: Vec<i64> = seqs
-        .iter()
-        .map(|s| BlockManager::slot(&s.block_table, s.position, block_size))
-        .collect();
-    unsafe { update_tensor(&buffers.slot_mapping, &slots, stream)? };
-
+    let mut positions: Vec<u32> = Vec::with_capacity(bucket);
+    let mut slots: Vec<i64> = Vec::with_capacity(bucket);
     let max_blocks = buffers.max_blocks;
-    let mut flat_bt: Vec<u32> = Vec::with_capacity(bs * max_blocks);
-    let per_seq_bt: Vec<Vec<u32>> = seqs.iter().map(|s| s.block_table.clone()).collect();
-    for s in seqs {
+    let mut flat_bt: Vec<u32> = Vec::with_capacity(bucket * max_blocks);
+    // Plan computation needs per-seq block tables for *all* `bucket` slots
+    // (the captured graph reads plan indices for every slot, padded
+    // slots included). Replicate seqs[0]'s block table for padding.
+    let mut per_seq_bt: Vec<Vec<u32>> = Vec::with_capacity(bucket);
+
+    for i in 0..bucket {
+        let s = slot_of(i);
+        tokens.push(s.token);
+        cu_k.push(cu_k.last().unwrap() + s.context_len as u32);
+        positions.push(s.position as u32);
+        slots.push(BlockManager::slot(&s.block_table, s.position, block_size));
         flat_bt.extend_from_slice(&s.block_table);
         flat_bt.resize(flat_bt.len() + max_blocks - s.block_table.len(), 0);
+        per_seq_bt.push(s.block_table.clone());
     }
+
+    unsafe { update_tensor(&buffers.packed_input, &tokens, stream)? };
+    unsafe { update_tensor(&buffers.cu_seqlens_k, &cu_k, stream)? };
+    unsafe { update_tensor(&buffers.position_ids, &positions, stream)? };
+    unsafe { update_tensor(&buffers.slot_mapping, &slots, stream)? };
     unsafe { update_tensor(&buffers.block_tables, &flat_bt, stream)? };
 
     if let Some(ref dn_buf) = buffers.deltanet_slots {
-        let dn_slots: Vec<u32> = seqs.iter().filter_map(|s| s.deltanet_slot).collect();
-        if dn_slots.len() != bs {
-            return Err(EngineError::Internal(
-                "CUDA graph replay missing DeltaNet slot".into(),
-            ));
+        let mut dn_slots: Vec<u32> = Vec::with_capacity(bucket);
+        for i in 0..bucket {
+            let s = slot_of(i);
+            match s.deltanet_slot {
+                Some(slot) => dn_slots.push(slot),
+                None => {
+                    return Err(EngineError::Internal(
+                        "CUDA graph replay missing DeltaNet slot".into(),
+                    ));
+                }
+            }
         }
         unsafe { update_tensor(dn_buf, &dn_slots, stream)? };
     }

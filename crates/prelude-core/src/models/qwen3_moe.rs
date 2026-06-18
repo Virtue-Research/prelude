@@ -957,24 +957,59 @@ impl MoeDecoderLayer {
         residual: Option<&Tensor>,
         ctx: &LayerAttnContext,
     ) -> Result<(Tensor, Tensor)> {
+        let total_q = hidden.dim(0)?;
+        let (q, k, v, residual_new) = self.forward_pre_attn(hidden, residual, ctx)?;
+        nvtx_push!("attn");
+        let attn_out = self.self_attn.forward_attention(&q, &k, &v, ctx)?;
+        nvtx_pop!();
+        self.forward_post_attn(&attn_out, residual_new, total_q, ctx)
+    }
+
+    /// Pre-attention piece: input RMSNorm with residual carry-in, then the
+    /// attention's QKV projection + QK-norm + RoPE + (optional) paged KV
+    /// write. Returns the inputs needed to run the attention kernel plus
+    /// the running residual for the post-attn piece to fold back in.
+    ///
+    /// Shape-stable in `num_tokens`: every kernel here depends only on
+    /// the packed token count, never on per-sequence `cu_seqlens_*`.
+    pub(crate) fn forward_pre_attn(
+        &self,
+        hidden: &Tensor,
+        residual: Option<&Tensor>,
+        ctx: &LayerAttnContext,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let ops = ctx.ops;
         nvtx_push!("input_norm");
-        let (residual, hidden) = self
+        let (residual_new, normed) = self
             .input_layernorm
             .forward_residual(hidden, residual, ops)?;
         nvtx_pop!();
-        nvtx_push!("attn");
-        let hidden = self.self_attn.forward(&hidden, ctx)?;
-        nvtx_pop!();
+        let (q, k, v) = self.self_attn.forward_pre_attn(&normed, ctx)?;
+        Ok((q, k, v, residual_new))
+    }
+
+    /// Post-attention piece: O projection, residual + RMSNorm, MoE FFN.
+    /// Also shape-stable in `total_q`. Consumes the `residual_new` from
+    /// the pre-attn piece (move semantics so the graph-replay path can
+    /// own it cleanly).
+    pub(crate) fn forward_post_attn(
+        &self,
+        attn_out: &Tensor,
+        residual_new: Tensor,
+        total_q: usize,
+        ctx: &LayerAttnContext,
+    ) -> Result<(Tensor, Tensor)> {
+        let ops = ctx.ops;
+        let o_out = self.self_attn.forward_post_attn(attn_out, total_q, ops)?;
         nvtx_push!("post_attn_norm");
-        let (residual, hidden) =
-            self.post_attention_layernorm
-                .forward_residual(&hidden, Some(&residual), ops)?;
+        let (residual_out, normed) = self
+            .post_attention_layernorm
+            .forward_residual(&o_out, Some(&residual_new), ops)?;
         nvtx_pop!();
         nvtx_push!("ffn");
-        let hidden = self.feed_forward.forward_2d(ops, &hidden)?;
+        let hidden_out = self.feed_forward.forward_2d(ops, &normed)?;
         nvtx_pop!();
-        Ok((hidden, residual))
+        Ok((hidden_out, residual_out))
     }
 }
 

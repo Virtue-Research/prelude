@@ -10,10 +10,12 @@ use std::time::Instant;
 use prelude_core::engine::executor::{
     ExecutionHandle, Executor, ForwardBatch, ModelOutput, StepRequest,
 };
+use prelude_core::engine::BatchPrefillResult;
 use prelude_core::engine::{Engine, EngineError, OwnedBatchDecodeSeq};
 use prelude_core::tensor::{D, Tensor};
 
 use crate::cuda_graph::DecodeGraphCache;
+use crate::prefill_graph::MixedGraphCache;
 
 struct GpuWork {
     batch: ForwardBatch,
@@ -57,6 +59,8 @@ impl CudaExecutor {
                 if supports_graph {
                     graph_cache.warmup_all(&worker_engine);
                 }
+                let mut mixed_graph_cache =
+                    MixedGraphCache::new(&worker_engine.engine_config, supports_graph);
                 warmup_mixed_prefill(&worker_engine, false);
                 warmup_mixed_prefill(&worker_engine, true);
                 let _ = ready_tx.send(());
@@ -67,7 +71,13 @@ impl CudaExecutor {
                     .expect("GPU executor worker runtime");
                 rt.block_on(async {
                     while let Some(work) = work_rx.recv().await {
-                        let result = execute_work(&worker_engine, work.batch, &mut graph_cache);
+                        let result = execute_work(
+                            &worker_engine,
+                            work.batch,
+                            &mut graph_cache,
+                            &mut mixed_graph_cache,
+                            block_size,
+                        );
                         let _ = work.result_tx.send(result);
                     }
                 });
@@ -94,10 +104,18 @@ impl Executor for CudaExecutor {
 }
 
 /// Execute a forward batch, using CUDA graph replay for decode when possible.
+/// Upper bound on per-request KV context length the mixed-prefill
+/// graph cache captures for. Conservative; the captured FA kernel
+/// processes more tiles than needed for smaller actual `max_seqlen_k`,
+/// but the per-iteration cost stays bounded.
+const MIXED_GRAPH_SEQLEN_K_CAP: usize = 8192;
+
 fn execute_work(
     engine: &Engine,
     batch: ForwardBatch,
     graph_cache: &mut DecodeGraphCache,
+    mixed_graph_cache: &mut MixedGraphCache,
+    block_size: usize,
 ) -> Result<ModelOutput, EngineError> {
     match batch {
         ForwardBatch::Decode {
@@ -174,6 +192,61 @@ fn execute_work(
             sample_greedy,
         } => {
             let t0 = Instant::now();
+
+            // Try the mixed prefill+decode graph cache first. Eligibility:
+            //   * no prompt-logprobs requested (graph captures only
+            //     `forward_hidden_states`; the per-token logprob path needs
+            //     `gather_log_softmax` on the full hidden span and a
+            //     different output shape)
+            //   * no DeltaNet (we don't capture the hybrid recurrent state
+            //     yet — that's a follow-up milestone)
+            //   * every request actually needs paged KV (mixed batches
+            //     where the cache is bypassed don't make sense to graph)
+            let mixed_eligible = requests.iter().all(|r| {
+                r.prompt_logprobs.is_none() && r.deltanet_slot.is_none() && r.needs_kv_cache
+            });
+
+            if mixed_eligible
+                && let Some(result) =
+                    mixed_graph_cache.try_replay(engine, &requests, MIXED_GRAPH_SEQLEN_K_CAP, block_size)
+            {
+                match result {
+                    Ok(hidden) => match build_mixed_output_from_hidden(
+                        engine,
+                        &requests,
+                        &hidden,
+                        sample_greedy,
+                        t0.elapsed().as_secs_f32() * 1000.0,
+                    ) {
+                        Ok(mut output) => {
+                            if sample_greedy {
+                                let (dev, host) = greedy_argmax_tokens(&output.logits);
+                                output.sampled_tokens = host;
+                                output.sampled_tokens_device = dev;
+                            }
+                            let elapsed_us = t0.elapsed().as_micros();
+                            tracing::debug!(
+                                elapsed_us,
+                                sample_greedy,
+                                path = "mixed_graph",
+                                "forward step"
+                            );
+                            return Ok(output);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "MixedGraph hit but post-processing failed; falling back to eager"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, "MixedGraph replay failed; falling back to eager");
+                    }
+                }
+            }
+
+            // Eager fallback.
             let mut result = engine.forward_batch(ForwardBatch::Mixed {
                 requests,
                 sample_greedy,
@@ -331,6 +404,79 @@ fn free_warmup_deltanet_slots(engine: &Engine, slots: &[Option<u32>]) {
 ///
 /// Both `None` if the underlying argmax fails. Currently every call
 /// site asks for both, since the AR loop still does host-side EOS
+/// Build a `ModelOutput` from the hidden tensor produced by a
+/// `MixedGraphCache` graph replay. The graph captures only
+/// `forward_hidden_states`; this function runs the eager tail
+/// (`last_token_select` + `compute_logits`) plus the per-request
+/// metadata that `batch_mixed_paged` would produce for a non-
+/// prompt-logprobs Mixed batch. Caller is responsible for setting
+/// `sampled_tokens` / `sampled_tokens_device` from the returned logits.
+fn build_mixed_output_from_hidden(
+    engine: &Engine,
+    requests: &[StepRequest],
+    hidden: &Tensor,
+    _sample_greedy: bool,
+    forward_ms: f32,
+) -> Result<ModelOutput, EngineError> {
+    let q_seq_lens: Vec<usize> = requests.iter().map(|r| r.tokens.len()).collect();
+
+    // Last-token index per request into the packed `[total_tokens, hidden]`
+    // tensor — same logic as `crate::models::commons::last_token_select`.
+    let mut last_indices: Vec<u32> = Vec::with_capacity(requests.len());
+    let mut off = 0u32;
+    for &len in &q_seq_lens {
+        last_indices.push(off + len as u32 - 1);
+        off += len as u32;
+    }
+    let indices = Tensor::from_vec(last_indices, (requests.len(),), hidden.device())
+        .map_err(|e| EngineError::Internal(format!("last-token indices: {e}")))?;
+    let last_hidden = hidden
+        .index_select(&indices, 0)
+        .map_err(|e| EngineError::Internal(format!("index_select: {e}")))?;
+
+    // lm_head — needs the model lock briefly.
+    let logits_2d = {
+        let model = engine
+            .executor
+            .model
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("model lock poisoned: {e}")))?;
+        let lm = model.as_logits_model().ok_or_else(|| {
+            EngineError::Internal(
+                "MixedGraph post-processing: model doesn't implement LogitsSplitModel".into(),
+            )
+        })?;
+        lm.compute_logits(&last_hidden)
+            .map_err(|e| EngineError::Internal(format!("compute_logits: {e}")))?
+    };
+
+    // Build prefill_results for the prefill chunks in the batch (mirrors
+    // the loop in `batch_mixed_paged::build_per_request_results`). No
+    // prompt-logprobs path since we filtered eligibility on it upstream.
+    let mut prefill_results: Vec<BatchPrefillResult> = Vec::new();
+    for req in requests {
+        if req.is_prefill_final || req.is_prefill_partial {
+            prefill_results.push(BatchPrefillResult {
+                first_token: 0,
+                block_table: req.block_table.clone(),
+                prompt_len: req.position_start + req.tokens.len(),
+                prefill_ms: forward_ms,
+                deltanet_slot: req.deltanet_slot,
+                first_token_logprobs: None,
+                prompt_token_logprobs: None,
+            });
+        }
+    }
+
+    Ok(ModelOutput {
+        logits: logits_2d,
+        item_seq_counts: vec![],
+        prefill_results,
+        sampled_tokens: None,
+        sampled_tokens_device: None,
+    })
+}
+
 /// checking; PR-3 / PR-4 in this stack will drop the host pull on the
 /// pipelined fast path.
 fn greedy_argmax_tokens(logits: &Tensor) -> (Option<Tensor>, Option<Vec<u32>>) {
