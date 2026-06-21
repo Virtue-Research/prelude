@@ -404,12 +404,20 @@ impl Scheduler {
         self.get_decode_batch()
     }
 
-    pub fn on_token_generated(&mut self, request_id: &str, token_id: u32) {
-        if let Some(sequence) = self
-            .running
+    /// Mutable handle to a running sequence by request id, or `None` if it is
+    /// not currently running. Shared lookup for the token-append / finish paths.
+    fn running_sequence_mut(&mut self, request_id: &str) -> Option<&mut Sequence> {
+        self.running
             .iter_mut()
             .find(|sequence| sequence.request_id == request_id)
-        {
+    }
+
+    /// Non-pipeline single-shot append: push a generated token and advance
+    /// accounting in one call. Equivalent to `pipeline_advance` immediately
+    /// followed by `record_generated_token`; retained for the synchronous
+    /// (non-submit-ahead) path and scheduler tests.
+    pub fn on_token_generated(&mut self, request_id: &str, token_id: u32) {
+        if let Some(sequence) = self.running_sequence_mut(request_id) {
             sequence.output_ids.push(token_id);
             self.tokens_in_use += 1;
         }
@@ -421,11 +429,7 @@ impl Scheduler {
     /// `record_generated_token` at process time. Pushes a placeholder; length,
     /// position and `tokens_in_use` accounting all advance now.
     pub fn pipeline_advance(&mut self, request_id: &str) {
-        if let Some(sequence) = self
-            .running
-            .iter_mut()
-            .find(|sequence| sequence.request_id == request_id)
-        {
+        if let Some(sequence) = self.running_sequence_mut(request_id) {
             sequence.output_ids.push(0);
             self.tokens_in_use += 1;
         }
@@ -435,11 +439,7 @@ impl Scheduler {
     /// pushed by `pipeline_advance` (the last output id), at process time.
     /// Length/accounting were already advanced — do NOT push again.
     pub fn record_generated_token(&mut self, request_id: &str, token_id: u32) {
-        if let Some(sequence) = self
-            .running
-            .iter_mut()
-            .find(|sequence| sequence.request_id == request_id)
-        {
+        if let Some(sequence) = self.running_sequence_mut(request_id) {
             if let Some(last) = sequence.output_ids.last_mut() {
                 *last = token_id;
             } else {
@@ -451,11 +451,7 @@ impl Scheduler {
     }
 
     pub fn finish_request(&mut self, request_id: &str, reason: SeqFinishReason) {
-        if let Some(sequence) = self
-            .running
-            .iter_mut()
-            .find(|sequence| sequence.request_id == request_id)
-        {
+        if let Some(sequence) = self.running_sequence_mut(request_id) {
             sequence.status = SequenceStatus::Finished;
             sequence.finish_reason = Some(reason);
         }

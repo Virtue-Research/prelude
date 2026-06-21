@@ -23,20 +23,10 @@ impl CacheManager {
     }
 
     /// Chained content hashes for every FULL block of `tokens`, capped at
-    /// `max_blocks` entries. Same recipe as the trie path:
-    /// `h_i = hash(h_{i-1}, block_tokens_i)`.
+    /// `max_blocks` entries. Delegates to the trie's single hash-chaining recipe
+    /// so the lazy paged path and the trie path can never drift.
     fn chain_block_hashes(tokens: &[u32], block_size: usize, max_blocks: usize) -> Vec<u64> {
-        let full = (tokens.len() / block_size).min(max_blocks);
-        let mut hashes = Vec::with_capacity(full);
-        let mut parent = 0u64;
-        for block_tokens in tokens.chunks(block_size).take(full) {
-            if block_tokens.len() < block_size {
-                break;
-            }
-            parent = super::prefix_index::PrefixMatchIndex::hash_block(parent, block_tokens);
-            hashes.push(parent);
-        }
-        hashes
+        super::prefix_index::PrefixMatchIndex::chain_block_hashes(tokens, block_size, max_blocks)
     }
 
     /// Lazy prefix match: longest cached full-block prefix of `tokens`.
@@ -161,6 +151,17 @@ impl CacheManager {
         let mut pc = pc_mutex
             .lock()
             .map_err(|e| EngineError::Internal(format!("prefix cache lock poisoned: {e}")))?;
+        // Nothing cached in the trie → nothing to reclaim. This is ALWAYS the case
+        // in lazy (vLLM-style) mode, where the hash-aware BlockManager owns
+        // eviction (revive-on-hit + LRU-evict inside `allocate()`) and the trie is
+        // deliberately never populated — it stays allocated only as the "prefix
+        // caching enabled" signal for the non-lazy/hybrid/non-paged paths. Skipping
+        // here avoids building the reclaim closure + walking an empty trie on every
+        // pressure event. (Gating on the trie being empty rather than the lazy env
+        // flag keeps this env-independent and unit-testable.)
+        if pc.cached_blocks() == 0 {
+            return Ok(0);
+        }
         let mut is_reclaimable = |ids: &[u32]| -> bool {
             match bm_arc.lock() {
                 Ok(bm) => ids.iter().all(|&b| bm.ref_count(b) == 1),

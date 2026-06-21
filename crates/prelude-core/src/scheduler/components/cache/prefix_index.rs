@@ -183,12 +183,17 @@ impl PrefixMatchIndex {
         out
     }
 
-    pub fn full_block_hashes(&self, tokens: &[u32]) -> Vec<u64> {
-        let full_blocks = tokens.len() / self.block_size;
+    /// Chained content hashes for every FULL `block_size`-aligned block of
+    /// `tokens`, capped at `max_blocks` entries: `h_i = hash(h_{i-1}, block_i)`.
+    /// The single source of truth for the hash-chaining recipe — `full_block_hashes`
+    /// and the lazy paged path (`CacheManager::chain_block_hashes`) both delegate
+    /// here so the recipe can never drift between them.
+    pub fn chain_block_hashes(tokens: &[u32], block_size: usize, max_blocks: usize) -> Vec<u64> {
+        let full_blocks = (tokens.len() / block_size).min(max_blocks);
         let mut out = Vec::with_capacity(full_blocks);
         let mut parent_hash = 0u64;
-        for block_tokens in tokens.chunks(self.block_size).take(full_blocks) {
-            if block_tokens.len() < self.block_size {
+        for block_tokens in tokens.chunks(block_size).take(full_blocks) {
+            if block_tokens.len() < block_size {
                 break;
             }
             let hash = Self::hash_block(parent_hash, block_tokens);
@@ -196,6 +201,10 @@ impl PrefixMatchIndex {
             parent_hash = hash;
         }
         out
+    }
+
+    pub fn full_block_hashes(&self, tokens: &[u32]) -> Vec<u64> {
+        Self::chain_block_hashes(tokens, self.block_size, usize::MAX)
     }
 
     // -----------------------------------------------------------------------
@@ -345,12 +354,12 @@ impl PrefixMatchIndex {
     // Eviction (LRU on leaf nodes only)
     // -----------------------------------------------------------------------
 
-    fn evict_if_needed(&mut self) {
-        while self.entries.len() > self.max_blocks {
-            let Some((hash, access_id)) = self.leaf_lru.pop_front() else {
-                break;
-            };
-            // Skip stale or non-leaf entries
+    /// Pop the next genuinely-evictable leaf from the LRU front, skipping stale
+    /// queue entries (already-evicted, re-promoted, or touched-since-queued) and
+    /// non-leaves. Returns `(hash, access_id)` of a live leaf, or `None` when the
+    /// queue is exhausted. Shared by `evict_if_needed` and `reclaim_leaves`.
+    fn pop_evictable_leaf(&mut self) -> Option<(u64, u64)> {
+        while let Some((hash, access_id)) = self.leaf_lru.pop_front() {
             if !self.leaf_set.contains(&hash) {
                 continue;
             }
@@ -360,26 +369,45 @@ impl PrefixMatchIndex {
             if entry.access_id != access_id || entry.children > 0 {
                 continue;
             }
+            return Some((hash, access_id));
+        }
+        None
+    }
 
-            let entry = self.entries.remove(&hash).unwrap();
-            self.leaf_set.remove(&hash);
-            self.evicted_hashes.push(hash);
+    /// Remove a leaf entry, record it as evicted, and promote a now-childless
+    /// parent to a new leaf candidate. The entry's paged block IDs are pushed to
+    /// `evicted_paged_blocks` for the caller to release; returns how many were
+    /// freed. Shared by `evict_if_needed` and `reclaim_leaves`.
+    fn remove_leaf_and_promote_parent(&mut self, hash: u64) -> usize {
+        let entry = self.entries.remove(&hash).unwrap();
+        self.leaf_set.remove(&hash);
+        self.evicted_hashes.push(hash);
 
-            // Collect paged block IDs for deferred ref count decrement
-            if let Some(paged_ids) = entry.paged_block_ids {
-                self.evicted_paged_blocks.extend_from_slice(&paged_ids);
-            }
+        let mut freed = 0;
+        if let Some(paged_ids) = entry.paged_block_ids {
+            freed = paged_ids.len();
+            self.evicted_paged_blocks.extend_from_slice(&paged_ids);
+        }
 
-            // If parent becomes childless, it becomes a new leaf
-            if let Some(parent) = entry.parent {
-                if let Some(parent_entry) = self.entries.get_mut(&parent) {
-                    parent_entry.children = parent_entry.children.saturating_sub(1);
-                    if parent_entry.children == 0 {
-                        self.leaf_set.insert(parent);
-                        self.leaf_lru.push_back((parent, parent_entry.access_id));
-                    }
+        // If the parent becomes childless, it becomes a new leaf.
+        if let Some(parent) = entry.parent {
+            if let Some(parent_entry) = self.entries.get_mut(&parent) {
+                parent_entry.children = parent_entry.children.saturating_sub(1);
+                if parent_entry.children == 0 {
+                    self.leaf_set.insert(parent);
+                    self.leaf_lru.push_back((parent, parent_entry.access_id));
                 }
             }
+        }
+        freed
+    }
+
+    fn evict_if_needed(&mut self) {
+        while self.entries.len() > self.max_blocks {
+            let Some((hash, _access_id)) = self.pop_evictable_leaf() else {
+                break;
+            };
+            self.remove_leaf_and_promote_parent(hash);
         }
     }
 
@@ -402,46 +430,24 @@ impl PrefixMatchIndex {
         // single call examines each leaf at most once (guarantees termination).
         let mut kept: Vec<(u64, u64)> = Vec::new();
         while freed < target {
-            let Some((hash, access_id)) = self.leaf_lru.pop_front() else {
+            let Some((hash, access_id)) = self.pop_evictable_leaf() else {
                 break;
             };
-            // Skip stale or non-leaf entries (same as evict_if_needed).
-            if !self.leaf_set.contains(&hash) {
-                continue;
-            }
-            let Some(entry) = self.entries.get(&hash) else {
-                continue;
+            // Only reclaim if every paged block is idle (cache-only); otherwise
+            // keep the live leaf aside and re-queue it after this pass.
+            let reclaimable = match self
+                .entries
+                .get(&hash)
+                .and_then(|e| e.paged_block_ids.as_deref())
+            {
+                Some(paged_ids) => is_reclaimable(paged_ids),
+                None => true,
             };
-            if entry.access_id != access_id || entry.children > 0 {
+            if !reclaimable {
+                kept.push((hash, access_id));
                 continue;
             }
-            // Only reclaim if every paged block is idle (cache-only).
-            if let Some(paged_ids) = entry.paged_block_ids.as_deref() {
-                if !is_reclaimable(paged_ids) {
-                    kept.push((hash, access_id));
-                    continue;
-                }
-            }
-
-            let entry = self.entries.remove(&hash).unwrap();
-            self.leaf_set.remove(&hash);
-            self.evicted_hashes.push(hash);
-
-            if let Some(paged_ids) = entry.paged_block_ids {
-                freed += paged_ids.len();
-                self.evicted_paged_blocks.extend_from_slice(&paged_ids);
-            }
-
-            // If parent becomes childless, it becomes a new leaf candidate.
-            if let Some(parent) = entry.parent {
-                if let Some(parent_entry) = self.entries.get_mut(&parent) {
-                    parent_entry.children = parent_entry.children.saturating_sub(1);
-                    if parent_entry.children == 0 {
-                        self.leaf_set.insert(parent);
-                        self.leaf_lru.push_back((parent, parent_entry.access_id));
-                    }
-                }
-            }
+            freed += self.remove_leaf_and_promote_parent(hash);
         }
         // Re-queue the live leaves we kept, preserving their (older) LRU position.
         for s in kept.into_iter().rev() {
