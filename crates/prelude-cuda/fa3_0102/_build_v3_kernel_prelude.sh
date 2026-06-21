@@ -12,7 +12,10 @@
 #     which we don't compile; dropped for clarity).
 #   - Exposes run_mha_v3_prelude (stream-aware, paged-capable) alongside run_mha_v3.
 set -uo pipefail
-CUDA=${CUDA_HOME_FA3:-/usr/local/cuda-13.2}
+# CUDA 13.2 root. No hardcoded default — prelude-cuda/build.rs owns the literal
+# (FA3_0102_DEFAULT_CUDA_HOME) and sets this automatically; standalone runs must
+# export CUDA_HOME_FA3 to the CUDA 13.2 toolkit root.
+CUDA=${CUDA_HOME_FA3:?set CUDA_HOME_FA3 to the CUDA 13.2 toolkit root (build.rs sets this automatically)}
 CUT=${CUTLASS38:?set CUTLASS38 to the CUTLASS 3.8 include dir (e.g. /path/to/cutlass/include)}
 SRC="$(cd "$(dirname "$0")" && pwd)/hkernel_v3vllm"
 OUT=${FA3_0102_PRELUDE_PREBUILT_DIR:?set FA3_0102_PRELUDE_PREBUILT_DIR to the output dir for libprelude_fa3_0102.a}
