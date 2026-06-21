@@ -9,6 +9,54 @@ pub(crate) async fn has_remote_file(repo: &hf_hub::api::tokio::ApiRepo, filename
     repo.get(filename).await.is_ok()
 }
 
+/// Sum the **logical** GPU footprint of all weight tensors across the given
+/// safetensors shards, in bytes: `Σ numel(tensor) * dtype.size_in_bytes()`.
+///
+/// This is the byte count the weights occupy once loaded at `dtype` — the same
+/// quantity vLLM's memory profiler attributes to "model weights" (torch's
+/// `allocated_bytes` for the params). It deliberately does NOT measure the
+/// physical GPU delta: the cudarc async mempool rounds allocations up and
+/// retains freed pages, so a `total - free` snapshot over-counts weights by the
+/// pool's reservation/fragmentation (≈1.5 GB on a 30 GB MoE model here). KV-cache
+/// sizing must budget against the logical bytes so prelude's pool matches vLLM's
+/// at the same `--gpu-memory-utilization`.
+///
+/// Reads only the safetensors JSON headers (cheap, no tensor data). Returns
+/// `None` if any header can't be read/parsed, so the caller falls back to the
+/// physical snapshot.
+pub(crate) fn sum_safetensors_logical_bytes(filenames: &[PathBuf], dtype: DType) -> Option<usize> {
+    if filenames.is_empty() {
+        return None;
+    }
+    let elem_size = dtype.size_in_bytes();
+    let mut total: usize = 0;
+    for path in filenames {
+        let mut file = std::fs::File::open(path).ok()?;
+        // safetensors layout: u64 little-endian header length, then JSON header.
+        let mut len_buf = [0u8; 8];
+        std::io::Read::read_exact(&mut file, &mut len_buf).ok()?;
+        let header_len = u64::from_le_bytes(len_buf) as usize;
+        let mut header_buf = vec![0u8; header_len];
+        std::io::Read::read_exact(&mut file, &mut header_buf).ok()?;
+        let header: serde_json::Value = serde_json::from_slice(&header_buf).ok()?;
+        let obj = header.as_object()?;
+        for (name, meta) in obj {
+            if name == "__metadata__" {
+                continue;
+            }
+            // numel = product of the tensor's shape; multiply by the *loaded*
+            // dtype size (candle converts every shard tensor to `dtype` on load).
+            let shape = meta.get("shape")?.as_array()?;
+            let mut numel: usize = 1;
+            for dim in shape {
+                numel = numel.checked_mul(dim.as_u64()? as usize)?;
+            }
+            total = total.checked_add(numel.checked_mul(elem_size)?)?;
+        }
+    }
+    Some(total)
+}
+
 /// Download safetensor weight files from an HF Hub repo.
 ///
 /// Sharded models (with `model.safetensors.index.json`) are downloaded
@@ -79,15 +127,6 @@ pub(crate) fn find_safetensor_files(model_path: &Path) -> Result<Vec<PathBuf>, E
         .collect();
     files.sort();
     Ok(files)
-}
-
-pub(crate) fn load_weights(
-    model_path: &Path,
-    dtype: DType,
-    device: &Device,
-) -> Result<VarBuilder<'static>, EngineError> {
-    let filenames = find_safetensor_files(model_path)?;
-    load_var_builder_from_filenames(&filenames, dtype, device)
 }
 
 pub(crate) fn load_var_builder_from_filenames(

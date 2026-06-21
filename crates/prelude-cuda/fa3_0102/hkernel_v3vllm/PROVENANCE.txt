@@ -1,0 +1,1 @@
+vllm-project/flash-attention hopper/ @ (clone 2026-06-09); CUTLASS 3.8.0 commit 62750a2b75c802660e4894434dc55e839f322277

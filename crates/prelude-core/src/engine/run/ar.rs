@@ -33,6 +33,7 @@ use crate::engine::executor::{Executor, ForwardBatch, ModelOutput};
 use crate::engine::{
     DecodeMetrics, Engine, EngineError, PreparedGenerateRequest, TokenLogprobInfo, Usage,
 };
+use crate::profiling::{nvtx_pop, nvtx_push};
 use crate::scheduler::{
     FinishReason, SamplingParams, Scheduler, SchedulerConfig, SchedulerStep, SeqFinishReason,
     Sequence,
@@ -201,6 +202,10 @@ pub async fn ar_loop(
     // a wedged interval from hot-spinning the CPU.
     const NO_PROGRESS_PREEMPT_THRESHOLD: u32 = 16;
     let mut consecutive_no_progress: u32 = 0;
+    // Submit-ahead pipeline: the step submitted in the previous iteration whose
+    // result we haven't processed yet. While it runs on the GPU we build+submit
+    // the next step, then come back to process it — keeping the GPU fed.
+    let mut inflight: Option<InFlight> = None;
 
     loop {
         let deltanet_pool_ref = engine.cache.deltanet_pool.as_ref();
@@ -294,9 +299,41 @@ pub async fn ar_loop(
 
         refresh_waiting_prefix_cache(&engine, &mut scheduler);
 
+        // ── Submit-ahead correctness gate (bug #2) ─────────────────
+        // If the in-flight step did NOT sample on the executor-greedy device
+        // path, its sampled tokens are not device-resident, so the next step's
+        // decode rows cannot gather them device→device and would fall back to
+        // the STALE host `pending_token` (this in-flight step hasn't been
+        // processed yet → pending_token is the token from two steps ago, or 0
+        // after prefill). Drain it now — before scheduling/building the next
+        // step — so the host tokens it builds from are correct. Greedy steps
+        // skip this and keep the submit-ahead overlap (drained after submit).
+        //
+        // This also closes the finishing-row block-free race (bug #1): the
+        // only steps that still overlap are executor-greedy, and the greedy
+        // path in execute_work copies sampled tokens device→host (a sync)
+        // before returning. With the single sequential GPU worker, an
+        // in-flight greedy step's reads of a finishing row's KV blocks
+        // therefore complete before any later step can reallocate and write
+        // those blocks (free_blocks here is host bookkeeping only).
+        if inflight.as_ref().map_or(false, |f| !f.executor_greedy) {
+            if let Some(f) = inflight.take() {
+                drain_inflight(&engine, &mut scheduler, &mut states, f).await;
+            }
+        }
+
         // ── Phase 3: Schedule next step ────────────────────────────
         // schedule_step() syncs block availability internally.
-        let Some(mut step) = scheduler.schedule_step() else {
+        nvtx_push!("ar_schedule");
+        let scheduled = scheduler.schedule_step();
+        nvtx_pop!(); // ar_schedule
+        let Some(mut step) = scheduled else {
+            // Submit-ahead: drain the in-flight step first so its requests can
+            // complete/free state before we idle or break.
+            if let Some(f) = inflight.take() {
+                drain_inflight(&engine, &mut scheduler, &mut states, f).await;
+                continue;
+            }
             if !rx_open && pending_prepares == 0 && !scheduler.has_work() {
                 break;
             }
@@ -342,33 +379,23 @@ pub async fn ar_loop(
         // re-credited, re-queued to the waiting front) AFTER the surviving
         // step is processed — never mid-build (rollback_prefill rebuilds
         // `running`, which would desync the index-parallel processing).
-        let (batch, deferred_prefill_ids) =
-            build_step_batch(&engine, &mut scheduler, &mut states, &mut step);
-        let handle = match executor.submit(batch) {
-            Ok(h) => h,
-            Err(error) => {
-                fail_step(&engine, &mut scheduler, &mut states, &step, error);
-                scheduler.rollback_prefill(&deferred_prefill_ids);
-                continue;
-            }
-        };
-        let output = match handle.recv().await {
-            Ok(o) => o,
-            Err(error) => {
-                fail_step(&engine, &mut scheduler, &mut states, &step, error);
-                scheduler.rollback_prefill(&deferred_prefill_ids);
-                continue;
-            }
-        };
-        process_step_output(&engine, &mut scheduler, &mut states, &step, &output);
-        scheduler.rollback_prefill(&deferred_prefill_ids);
+        nvtx_push!("ar_build_batch");
+        let (batch, deferred_prefill_ids, prefill_snap) = build_step_batch(
+            &engine,
+            &mut scheduler,
+            &mut states,
+            &mut step,
+            inflight.as_ref().map(|f| &f.row_map),
+        );
+        nvtx_pop!(); // ar_build_batch
 
-        // Forward-progress watchdog. If this step ran nothing (every prefill
-        // deferred for lack of KV blocks, no decode) yet work is still
-        // pending, the engine is wedging. Trip the counter; on threshold
-        // preempt one non-protected running request so the protected oldest
-        // can complete. `yield_now` prevents a hot-spin while it ramps.
+        // Block-pool exhaustion dropped every row — nothing to run this step.
+        // Roll back, drain any in-flight step, trip the watchdog, retry.
         if step.prefill_request_ids.is_empty() && step.decode_request_ids.is_empty() {
+            scheduler.rollback_prefill(&deferred_prefill_ids);
+            if let Some(f) = inflight.take() {
+                drain_inflight(&engine, &mut scheduler, &mut states, f).await;
+            }
             if scheduler.has_work() {
                 consecutive_no_progress = consecutive_no_progress.saturating_add(1);
                 if consecutive_no_progress >= NO_PROGRESS_PREEMPT_THRESHOLD {
@@ -377,16 +404,74 @@ pub async fn ar_loop(
                 }
                 tokio::task::yield_now().await;
             }
-        } else {
-            consecutive_no_progress = 0;
+            continue;
+        }
+        consecutive_no_progress = 0;
+
+        // Whether this step's sampling is device-resident (executor-greedy).
+        // Read before `batch` is moved into submit; recorded on the InFlight so
+        // the next iteration knows whether it can overlap (greedy) or must
+        // drain this step before building the next one (non-greedy → bug #2).
+        //
+        // `sample_greedy` is a property of the *batch* (greedy + no logprobs);
+        // the overlap additionally requires the *executor* to actually resolve
+        // the next step's decode ids from the device-resident sampled tokens.
+        // CPU (and any backend that runs the generic host forward) never
+        // populates `sampled_tokens_device`, so the device→device gather would
+        // silently fall back to the stale host `pending_token` → wrong decode
+        // input id on every greedy step past the first. Gate on the capability
+        // so those backends always take the drain-before-build safe path.
+        let step_executor_greedy =
+            executor.resolves_device_decode_ids() && batch_sample_greedy(&batch);
+
+        nvtx_push!("ar_submit");
+        let submit_result = executor.submit(batch);
+        nvtx_pop!(); // ar_submit
+        let handle = match submit_result {
+            Ok(h) => h,
+            Err(error) => {
+                fail_step(&engine, &mut scheduler, &mut states, &step, error);
+                scheduler.rollback_prefill(&deferred_prefill_ids);
+                if let Some(f) = inflight.take() {
+                    drain_inflight(&engine, &mut scheduler, &mut states, f).await;
+                }
+                continue;
+            }
+        };
+
+        // Submit-ahead pipeline: the CURRENT step is now running on the GPU.
+        // Process the PREVIOUS in-flight step (its forward is already done or
+        // finishing) — this overlaps with the current step's GPU compute.
+        // It MUST run before advancing the current step so it overwrites the
+        // previous step's placeholder output ids (still the last entry).
+        if let Some(f) = inflight.take() {
+            drain_inflight(&engine, &mut scheduler, &mut states, f).await;
         }
 
-        if !rx_open && pending_prepares == 0 && !scheduler.has_work() {
-            break;
-        }
+        // Optimistically advance the CURRENT step's sampling rows (length /
+        // position / accounting) so the NEXT iteration can schedule+build
+        // before this step's result is known. The real token values are
+        // written when this step is drained next iteration.
+        nvtx_push!("ar_advance");
+        optimistic_advance_step(&mut scheduler, &step);
+        nvtx_pop!(); // ar_advance
+
+        // Stash the CURRENT step as in-flight.
+        let row_map = build_row_map(&step);
+        inflight = Some(InFlight {
+            handle,
+            step,
+            deferred: deferred_prefill_ids,
+            row_map,
+            prefill_snap,
+            executor_greedy: step_executor_greedy,
+        });
     }
 
-    // Shutdown: fail remaining requests
+    // Shutdown: drain any in-flight step, then fail remaining requests.
+    if let Some(f) = inflight.take() {
+        drain_inflight(&engine, &mut scheduler, &mut states, f).await;
+    }
     let deltanet_pool_ref = engine.cache.deltanet_pool.as_ref();
     for (id, state) in states.drain() {
         release_resources(deltanet_pool_ref, &mut scheduler, &id);
@@ -806,6 +891,110 @@ fn grow_block_tables_for_decode(
     });
 }
 
+/// request_id → row index in the previous step's output logits. The device
+/// executor uses these indices to gather the previous step's
+/// `sampled_tokens_device` for this step's decode rows (worker-internal,
+/// submit-ahead pipeline).
+type PrevRowMap = HashMap<String, usize>;
+
+/// A step that has been submitted to the executor but not yet processed.
+/// The submit-ahead pipeline keeps one of these in flight: while the GPU runs
+/// step N, the AR loop builds+submits step N+1, then comes back to recv+process
+/// step N. `row_map` lets step N+1's decode rows gather their input ids from
+/// step N's device sampled tokens.
+struct InFlight {
+    handle: crate::engine::executor::ExecutionHandle,
+    step: SchedulerStep,
+    deferred: Vec<String>,
+    row_map: PrevRowMap,
+    /// Per prefill row (computed end offset, is_final) captured at BUILD time,
+    /// so process_step_output doesn't recompute them from the live sequence
+    /// (which the next step's schedule has already advanced).
+    prefill_snap: Vec<(usize, bool)>,
+    /// Whether this step sampled with the executor-greedy device path, i.e.
+    /// its sampled tokens are device-resident (`last_sampled`) and the NEXT
+    /// step's decode rows can gather them device→device. When false (any
+    /// temperature/logprobs row), the next step cannot gather and would fall
+    /// back to a STALE host `pending_token`, so this step must be drained
+    /// before the next one is built (see the early-drain in the run loop).
+    executor_greedy: bool,
+}
+
+/// Host row indices into the previous step's output for this step's decode
+/// rows, in `decode_ids` order. Returns `None` (→ host token fallback in the
+/// executor) when there is no previous step, no decode rows, or any decode
+/// request is missing from the previous row map (so we never feed a wrong
+/// token). Passed to the executor as `decode_prev_rows`.
+fn prev_decode_rows(prev_row_map: Option<&PrevRowMap>, decode_ids: &[String]) -> Option<Vec<u32>> {
+    let map = prev_row_map?;
+    if decode_ids.is_empty() {
+        return None;
+    }
+    let mut rows = Vec::with_capacity(decode_ids.len());
+    for id in decode_ids {
+        rows.push(*map.get(id)? as u32);
+    }
+    Some(rows)
+}
+
+/// Build the row map for a step's output logits: prefill rows first
+/// (`0..num_prefill`), then decode rows (`num_prefill..`), matching the order
+/// `build_step_batch` appended them (post block-exhaustion compaction).
+fn build_row_map(step: &SchedulerStep) -> PrevRowMap {
+    let mut row_map: PrevRowMap =
+        HashMap::with_capacity(step.prefill_request_ids.len() + step.decode_request_ids.len());
+    for (i, id) in step.prefill_request_ids.iter().enumerate() {
+        row_map.insert(id.clone(), i);
+    }
+    let np = step.prefill_request_ids.len();
+    for (j, id) in step.decode_request_ids.iter().enumerate() {
+        row_map.insert(id.clone(), np + j);
+    }
+    row_map
+}
+
+/// Submit-ahead pipeline: optimistically advance (by one token) every sequence
+/// that produced a token in `step` — decode rows always, and prefill rows that
+/// reached their final chunk (kv_computed_len >= prompt len, so they sampled a
+/// first token). Length/position/accounting advance now; the real token value
+/// is written by `process_step_output` → `process_single_token` one step later.
+fn optimistic_advance_step(scheduler: &mut Scheduler, step: &SchedulerStep) {
+    let final_prefill: Vec<String> = step
+        .prefill_request_ids
+        .iter()
+        .filter(|id| {
+            scheduler
+                .get_sequence(id)
+                .map(|s| s.kv_computed_len >= s.input_ids.len())
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    for id in final_prefill {
+        scheduler.pipeline_advance(&id);
+    }
+    for id in &step.decode_request_ids {
+        scheduler.pipeline_advance(id);
+    }
+}
+
+/// Receive and process an in-flight step's result (submit-ahead pipeline):
+/// `recv` its forward output, run `process_step_output` (records the real
+/// token values into the placeholders, runs stop checks, streams text), then
+/// roll back any prefill chunks that were deferred for that step.
+async fn drain_inflight(
+    engine: &Engine,
+    scheduler: &mut Scheduler,
+    states: &mut HashMap<String, ArSequenceState>,
+    f: InFlight,
+) {
+    match f.handle.recv().await {
+        Ok(out) => process_step_output(engine, scheduler, states, &f.step, &out, &f.prefill_snap),
+        Err(error) => fail_step(engine, scheduler, states, &f.step, error),
+    }
+    scheduler.rollback_prefill(&f.deferred);
+}
+
 /// Build a ForwardBatch for the current step.
 ///
 /// Pure decode → ForwardBatch::Decode (CUDA graph eligible).
@@ -815,7 +1004,8 @@ fn build_step_batch(
     scheduler: &mut Scheduler,
     states: &mut HashMap<String, ArSequenceState>,
     step: &mut SchedulerStep,
-) -> (ForwardBatch, Vec<String>) {
+    prev_row_map: Option<&PrevRowMap>,
+) -> (ForwardBatch, Vec<String>, Vec<(usize, bool)>) {
     use crate::engine::executor::StepRequest;
 
     // Prefill requests whose chunk could not get KV blocks this step. The
@@ -852,7 +1042,7 @@ fn build_step_batch(
                 let position = seq.total_len() - 1;
                 tokens.push(state.pending_token.unwrap_or(0));
                 // position = total_len() - 1: the decode token's 0-indexed position
-                // (output_ids already contains this token from on_token_generated)
+                // (output_ids already contains this token from pipeline_advance)
                 positions.push(position);
                 block_tables.push(seq.block_table.clone());
                 if let Some(slot) = seq.deltanet_slot {
@@ -874,11 +1064,13 @@ fn build_step_batch(
                 block_tables,
                 deltanet_slots,
                 sample_greedy,
-                // tokens_device is wired in PR-4 (pipeline-depth-1 decode
-                // loop); for now we always source input ids from host.
                 tokens_device: None,
+                // Submit-ahead: executor gathers decode input ids from the
+                // previous step's device sampled tokens using these row indices.
+                decode_prev_rows: prev_decode_rows(prev_row_map, &step.decode_request_ids),
             },
             deferred_prefill_ids,
+            Vec::new(), // no prefill rows → no snapshot
         );
     }
 
@@ -1016,12 +1208,31 @@ fn build_step_batch(
         }
     }
 
+    // Snapshot per prefill row (computed end offset, is_final) AT BUILD TIME.
+    // process_step_output runs one step later in the pipeline, by when the next
+    // step's schedule has already advanced seq.kv_computed_len — so it must use
+    // these snapshots instead of recomputing is_final/computed from the live
+    // sequence. Prefill rows are the first `n_prefill` entries of `requests`.
+    let n_prefill = step.prefill_request_ids.len();
+    let prefill_snap: Vec<(usize, bool)> = requests
+        .iter()
+        .take(n_prefill)
+        .map(|r| (r.context_len, r.is_prefill_final))
+        .collect();
+
     (
         ForwardBatch::Mixed {
             requests,
             sample_greedy: has_executor_sample_rows && can_executor_sample_rows,
+            decode_tokens_device: None,
+            // Decode rows (appended after prefill, in step.decode_request_ids
+            // order) take their input ids from the previous step's device
+            // sampled tokens via these row indices (resolved in the executor);
+            // prefill rows always use host ids.
+            decode_prev_rows: prev_decode_rows(prev_row_map, &step.decode_request_ids),
         },
         deferred_prefill_ids,
+        prefill_snap,
     )
 }
 
@@ -1065,6 +1276,18 @@ fn state_allows_executor_greedy(state: &ArSequenceState) -> bool {
             .is_none()
 }
 
+/// Whether the built batch asked the executor to sample greedily on its fast
+/// path. This is necessary but NOT sufficient for the submit-ahead overlap —
+/// the executor must ALSO resolve the next step's decode ids device→device
+/// (`Executor::resolves_device_decode_ids`). See the gate at the submit site.
+fn batch_sample_greedy(batch: &ForwardBatch) -> bool {
+    match batch {
+        ForwardBatch::Decode { sample_greedy, .. } => *sample_greedy,
+        ForwardBatch::Mixed { sample_greedy, .. } => *sample_greedy,
+        _ => false,
+    }
+}
+
 fn decode_requests_allow_executor_greedy(
     states: &HashMap<String, ArSequenceState>,
     decode_request_ids: &[String],
@@ -1084,10 +1307,12 @@ fn process_step_output(
     states: &mut HashMap<String, ArSequenceState>,
     step: &SchedulerStep,
     output: &ModelOutput,
+    prefill_snap: &[(usize, bool)],
 ) {
     let mut completed: Vec<(String, FinishReason)> = Vec::new();
     let mut logit_row = 0usize; // tracks position in output.logits
-    let prefill_argmax_tokens = batched_prefill_argmax_tokens(scheduler, states, step, output);
+    let prefill_argmax_tokens =
+        batched_prefill_argmax_tokens(scheduler, states, step, output, prefill_snap);
 
     // Pre-compute the decode side's batched argmax once. The decode
     // loop below uses it for sampling; we ALSO use it here to feed the
@@ -1146,31 +1371,25 @@ fn process_step_output(
             continue;
         };
 
-        let _ = step.prefill_chunk_lens.get(i); // chunk_len unused here; see kv_computed_len below
-        let full_prompt_len = seq.input_ids.len();
-        // scheduler::schedule_step already incremented kv_computed_len to reflect
-        // this chunk's tokens. Don't add chunk_len again — doing so double-counts
-        // and flags the second-to-last chunk as final on prompts where the last
-        // chunk is shorter than the chunk budget.
-        let computed = seq.kv_computed_len;
-        let is_final = computed >= full_prompt_len;
+        let _ = step.prefill_chunk_lens.get(i);
+        // Use the BUILD-TIME snapshot of (computed, is_final). In the submit-
+        // ahead pipeline the next step's schedule has already advanced
+        // seq.kv_computed_len by the time we process this step, so recomputing
+        // from the live sequence would mis-classify partial/final chunks. Fall
+        // back to the live value only if the snapshot is missing (sync path).
+        let (computed, is_final) = prefill_snap.get(i).copied().unwrap_or_else(|| {
+            let c = seq.kv_computed_len;
+            (c, c >= seq.input_ids.len())
+        });
 
-        // Update scheduler sequence block table and state from prefill result.
-        // kv_computed_len and status were already updated by the scheduler
-        // during schedule_step (eagerly, before forward).
-        //
-        // Hold onto `result` past the increment so the prefix-cache write
-        // below can read the SAME entry. Earlier this code recovered it
-        // via `prefill_results.get(prefill_result_idx.saturating_sub(1))`,
-        // which silently read the previous request's block_table whenever
-        // this request's `prefill_results.get(...)` was None — so the
-        // prefix cache could be populated against tokens that belonged to
-        // a different sequence.
+        // Update per-request prefill metadata from the forward result.
+        // NOTE: do NOT clobber seq.block_table here. build_step_batch is the
+        // authority for the block table and the next step's build may have
+        // already grown it; result.block_table is the (older, possibly shorter)
+        // build-time snapshot, so re-assigning it would shrink/corrupt the
+        // pipeline-advanced table.
         let prefill_result = output.prefill_results.get(prefill_result_idx);
         if let Some(result) = prefill_result {
-            if let Some(seq_mut) = scheduler.get_sequence_mut(request_id) {
-                seq_mut.block_table = result.block_table.clone();
-            }
             state.prefill_ms += result.prefill_ms;
             state.prompt_token_logprobs = result.prompt_token_logprobs.clone();
             prefill_result_idx += 1;
@@ -1221,9 +1440,9 @@ fn process_step_output(
 
             if prefill_argmax_tokens.is_some() || row.is_some() {
                 let precomputed = batched_logprobs.get(&logit_row).copied();
-                let lp = row.as_ref().and_then(|r| {
-                    extract_token_logprobs(engine, r, token, state, precomputed)
-                });
+                let lp = row
+                    .as_ref()
+                    .and_then(|r| extract_token_logprobs(engine, r, token, state, precomputed));
                 process_single_token(
                     engine,
                     scheduler,
@@ -1316,12 +1535,19 @@ fn batched_prefill_argmax_tokens(
     states: &HashMap<String, ArSequenceState>,
     step: &SchedulerStep,
     output: &ModelOutput,
+    prefill_snap: &[(usize, bool)],
 ) -> Option<Vec<u32>> {
     let mut final_greedy_count = 0usize;
     for (i, request_id) in step.prefill_request_ids.iter().enumerate() {
         let state = states.get(request_id)?;
         let seq = scheduler.get_sequence(request_id)?;
-        if seq.kv_computed_len >= seq.input_ids.len() {
+        // Use the build-time is_final snapshot (the live seq.kv_computed_len has
+        // already been advanced by the next step's schedule in the pipeline).
+        let is_final = prefill_snap
+            .get(i)
+            .map(|s| s.1)
+            .unwrap_or_else(|| seq.kv_computed_len >= seq.input_ids.len());
+        if is_final {
             if !state.is_greedy() {
                 return None;
             }
@@ -1506,10 +1732,7 @@ fn extract_token_logprobs(
         && let Some(lp) = precomputed_sampled_logprob
     {
         return Some(TokenLogprobInfo {
-            token: engine
-                .tokenizer
-                .decode(&[token], false)
-                .unwrap_or_default(),
+            token: engine.tokenizer.decode(&[token], false).unwrap_or_default(),
             token_id: token,
             logprob: lp,
             top_logprobs: Vec::new(),
@@ -1528,7 +1751,9 @@ fn process_single_token(
     token_logprobs: Option<TokenLogprobInfo>,
     completed: &mut Vec<(String, FinishReason)>,
 ) {
-    scheduler.on_token_generated(request_id, next_token);
+    // Submit-ahead pipeline: the length was already advanced optimistically at
+    // submit time (placeholder pushed); write the real token value now.
+    scheduler.record_generated_token(request_id, next_token);
     state.ensure_started();
 
     // Record the sampled token before stop checks so usage and logprobs count
@@ -1720,6 +1945,68 @@ mod tests {
             is_greedy: true,
             logits_processor: LogitsProcessor::from_sampling(42, Sampling::ArgMax),
         }
+    }
+
+    // ── submit-ahead overlap gate ──────────────────────────────────
+
+    /// An executor that does NOT resolve decode ids on the device (e.g. CPU,
+    /// or any backend on the generic host forward path). Mirrors the trait
+    /// default `resolves_device_decode_ids() == false`.
+    struct HostFallbackExecutor;
+    impl Executor for HostFallbackExecutor {
+        fn submit(
+            &self,
+            _batch: ForwardBatch,
+        ) -> Result<crate::engine::executor::ExecutionHandle, EngineError> {
+            unreachable!("not submitted in this test")
+        }
+        // resolves_device_decode_ids() uses the trait default → false.
+    }
+
+    /// An executor that DOES keep sampled tokens device-resident (mirrors CUDA).
+    struct DeviceGatherExecutor;
+    impl Executor for DeviceGatherExecutor {
+        fn submit(
+            &self,
+            _batch: ForwardBatch,
+        ) -> Result<crate::engine::executor::ExecutionHandle, EngineError> {
+            unreachable!("not submitted in this test")
+        }
+        fn resolves_device_decode_ids(&self) -> bool {
+            true
+        }
+    }
+
+    fn greedy_decode_batch() -> ForwardBatch {
+        ForwardBatch::Decode {
+            tokens: vec![1],
+            positions: vec![0],
+            block_tables: vec![vec![0]],
+            deltanet_slots: None,
+            sample_greedy: true,
+            tokens_device: None,
+            decode_prev_rows: None,
+        }
+    }
+
+    /// Regression: a greedy batch must only be eligible for the submit-ahead
+    /// overlap when the executor actually resolves decode ids device→device.
+    /// Without the capability gate, a greedy CPU step would stay in-flight and
+    /// the next step would decode from the stale host `pending_token`.
+    #[test]
+    fn overlap_gate_requires_device_decode_capability() {
+        let batch = greedy_decode_batch();
+        assert!(batch_sample_greedy(&batch));
+
+        // Host-fallback executor: greedy batch, but NO device gather → no overlap.
+        let cpu = HostFallbackExecutor;
+        assert!(!cpu.resolves_device_decode_ids());
+        assert!(!(cpu.resolves_device_decode_ids() && batch_sample_greedy(&batch)));
+
+        // Device-gather executor: overlap allowed.
+        let gpu = DeviceGatherExecutor;
+        assert!(gpu.resolves_device_decode_ids());
+        assert!(gpu.resolves_device_decode_ids() && batch_sample_greedy(&batch));
     }
 
     // ── handle_message tests ───────────────────────────────────────

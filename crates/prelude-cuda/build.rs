@@ -18,6 +18,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Default CUDA toolkit root for the `fa3-0102` kernel. The kernel's host
+/// objects are linked into a CUDA-13 process, so it MUST compile against CUDA
+/// 13.2 (mixing a 12.9-built object into a 13.x process risks `cudaDeviceProp`
+/// ABI skew). Overridable via `CUDA_HOME_FA3`. This is the single source of
+/// truth for the literal — `_build_v3_kernel_prelude.sh` requires the env var
+/// (set automatically here) rather than carrying its own copy.
+const FA3_0102_DEFAULT_CUDA_HOME: &str = "/usr/local/cuda-13.2";
+
 use prelude_kernelbuild::nvcc::{
     ObjCompile, PtxCompile, compile_cu_to_obj, compile_cu_to_ptx, detect_compute_cap, find_cuda,
     link_cublas_dynamic, link_cuda_runtime_dynamic, nvcc_path,
@@ -157,6 +165,92 @@ fn main() {
     link_cuda_runtime_dynamic(&cuda_root);
     link_cublas_dynamic(&cuda_root);
 
+    // ── fa3-0102: prebuilt vendored vLLM 0.22 FA3 hopper kernel ─────
+    // Static lib produced out-of-band by fa3_0102/_build_v3_kernel_prelude.sh
+    // (CUDA 13.2 + CUTLASS 3.8, sm90a) from fa3_0102/hkernel_v3vllm/.
+    // Built automatically here on first use if missing (~3 min).
+    if std::env::var("CARGO_FEATURE_FA3_0102").is_ok() {
+        println!("cargo:rerun-if-env-changed=FA3_0102_PRELUDE_PREBUILT_DIR");
+        println!("cargo:rerun-if-env-changed=CUDA_HOME_FA3");
+        println!("cargo:rerun-if-env-changed=CUTLASS38");
+        // Default to the cargo build-script OUT_DIR so a fresh clone builds the
+        // archive in-tree; point FA3_0102_PRELUDE_PREBUILT_DIR at a shared dir to
+        // reuse a cached archive across builds.
+        let lib_dir = std::env::var("FA3_0102_PRELUDE_PREBUILT_DIR")
+            .unwrap_or_else(|_| std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo"));
+        let lib = PathBuf::from(&lib_dir).join("libprelude_fa3_0102.a");
+        // Track the kernel sources + build script so editing a `.cu`/header
+        // re-runs this build script (emits rerun-if-changed for each file) AND
+        // returns the newest source mtime. Without this, cargo only re-ran on
+        // the output `.a`, so a kernel-source edit silently relinked the STALE
+        // archive (the `if !lib.exists()` guard saw the old archive present).
+        let kernel_src_dir = PathBuf::from(&manifest_dir).join("fa3_0102/hkernel_v3vllm");
+        let build_script =
+            PathBuf::from(&manifest_dir).join("fa3_0102/_build_v3_kernel_prelude.sh");
+        println!("cargo:rerun-if-changed={}", build_script.display());
+        let newest_src = track_sources_newest_mtime(&kernel_src_dir).max(file_mtime(&build_script));
+        // Rebuild when the archive is missing OR any source is newer than it.
+        // (A user-supplied prebuilt archive normally has no in-tree sources
+        // newer than it, so this only fires for genuine source edits.)
+        let lib_is_stale = match (lib.exists(), file_mtime(&lib), newest_src) {
+            (false, _, _) => true,
+            (true, Some(lib_mtime), Some(src_mtime)) => src_mtime > lib_mtime,
+            _ => false,
+        };
+        if lib_is_stale {
+            // The fa3-0102 kernel needs CUDA 13.2 + CUTLASS 3.8 to compile (or a
+            // prebuilt archive). These are NOT available on a stock CUDA box or in
+            // CI, so before shelling out we preflight the toolchain and fail with
+            // an actionable message instead of a cryptic "script failed" panic.
+            // Override paths via CUDA_HOME_FA3 / CUTLASS38 / FA3_0102_PRELUDE_PREBUILT_DIR.
+            let cuda_home = std::env::var("CUDA_HOME_FA3")
+                .unwrap_or_else(|_| FA3_0102_DEFAULT_CUDA_HOME.to_string());
+            // No default: the CUTLASS 3.8 include dir is machine-specific, so an
+            // unset CUTLASS38 falls through to the actionable error below.
+            let cutlass = std::env::var("CUTLASS38").unwrap_or_default();
+            let missing: Vec<&str> = [
+                (
+                    PathBuf::from(&cuda_home).join("bin/nvcc").exists(),
+                    "CUDA 13.2 toolkit (set CUDA_HOME_FA3)",
+                ),
+                (
+                    PathBuf::from(&cutlass).join("cutlass/cutlass.h").exists(),
+                    "CUTLASS 3.8 headers (set CUTLASS38)",
+                ),
+            ]
+            .iter()
+            .filter_map(|(ok, name)| if *ok { None } else { Some(*name) })
+            .collect();
+            assert!(
+                missing.is_empty(),
+                "feature `fa3-0102` is enabled but the kernel cannot be built here.\n\
+                 Missing build prerequisites: {missing:?}\n\
+                 Provide a prebuilt archive via FA3_0102_PRELUDE_PREBUILT_DIR=<dir containing libprelude_fa3_0102.a>,\n\
+                 or set CUDA_HOME_FA3 (CUDA 13.2) and CUTLASS38 (CUTLASS 3.8 include dir) so it can compile.\n\
+                 If you do not need this backend, build without `--features fa3-0102`."
+            );
+            let script = PathBuf::from(&manifest_dir).join("fa3_0102/_build_v3_kernel_prelude.sh");
+            let status = std::process::Command::new("bash")
+                .arg(&script)
+                .env("FA3_0102_PRELUDE_PREBUILT_DIR", &lib_dir)
+                .env("CUDA_HOME_FA3", &cuda_home)
+                .env("CUTLASS38", &cutlass)
+                .status()
+                .unwrap_or_else(|e| panic!("fa3-0102 kernel build failed to start: {e}"));
+            assert!(
+                status.success() && lib.exists(),
+                "fa3-0102 prebuilt lib missing and {} failed (expected {})",
+                script.display(),
+                lib.display()
+            );
+        }
+        // Track the prebuilt archive so out-of-band kernel rebuilds force a relink.
+        println!("cargo:rerun-if-changed={}", lib.display());
+        println!("cargo:rustc-link-search=native={lib_dir}");
+        println!("cargo:rustc-link-lib=static=prelude_fa3_0102");
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
+
     // ── Phase 3: Link cuda_dialect_runtime_static.a ─────────────────
     //
     // The MLIR-generated .o files in cuLA/FA4's DSL kernel archives
@@ -227,6 +321,29 @@ fn link_cuda_dialect_runtime(_out_dir: &std::path::Path, manifest_dir: &std::pat
         "  [prelude-cuda] WARNING: libcuda_dialect_runtime_static.a not found; \
                dist/LTO builds with CuTeDSL kernels may fail to link"
     );
+}
+
+/// Modification time of a single file, or `None` if it doesn't exist / can't stat.
+fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Recursively emit `cargo:rerun-if-changed` for every file under `dir` and
+/// return the newest modification time found (so the caller can detect a stale
+/// build artifact). Returns `None` for a missing/empty/unreadable directory.
+fn track_sources_newest_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    let mut newest: Option<std::time::SystemTime> = None;
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            newest = newest.max(track_sources_newest_mtime(&path));
+        } else {
+            println!("cargo:rerun-if-changed={}", path.display());
+            newest = newest.max(file_mtime(&path));
+        }
+    }
+    newest
 }
 
 fn find_file_recursive(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {

@@ -32,25 +32,16 @@ const BLOCK_SIZE: u32 = 256;
 pub fn check_eos(tokens: &Tensor, eos_ids: &Tensor) -> Result<Tensor> {
     // ── Shape + dtype validation ────────────────────────────────────
     if tokens.dims().len() != 1 {
-        candle_core::bail!(
-            "check_eos: tokens must be 1-D, got {:?}",
-            tokens.dims()
-        );
+        candle_core::bail!("check_eos: tokens must be 1-D, got {:?}", tokens.dims());
     }
     if eos_ids.dims().len() != 1 {
-        candle_core::bail!(
-            "check_eos: eos_ids must be 1-D, got {:?}",
-            eos_ids.dims()
-        );
+        candle_core::bail!("check_eos: eos_ids must be 1-D, got {:?}", eos_ids.dims());
     }
     if tokens.dtype() != DType::U32 {
         candle_core::bail!("check_eos: tokens must be U32, got {:?}", tokens.dtype());
     }
     if eos_ids.dtype() != DType::U32 {
-        candle_core::bail!(
-            "check_eos: eos_ids must be U32, got {:?}",
-            eos_ids.dtype()
-        );
+        candle_core::bail!("check_eos: eos_ids must be U32, got {:?}", eos_ids.dtype());
     }
 
     let b = tokens.dims()[0] as u32;
@@ -97,11 +88,7 @@ pub fn check_eos(tokens: &Tensor, eos_ids: &Tensor) -> Result<Tensor> {
         block_dim: (block, 1, 1),
         shared_mem_bytes: 0,
     };
-    let func = cuda_dev.get_or_load_custom_func(
-        "check_eos_u32",
-        MOD_CHECK_EOS,
-        PTX_CHECK_EOS,
-    )?;
+    let func = cuda_dev.get_or_load_custom_func("check_eos_u32", MOD_CHECK_EOS, PTX_CHECK_EOS)?;
     let mut builder = func.builder();
     builder.arg(&tok_slice);
     builder.arg(&eos_slice);
@@ -148,8 +135,7 @@ mod tests {
             Err(_) => return,
         };
         // Qwen3 has two EOS-ish tokens: <|im_end|>=151645, <|endoftext|>=151643.
-        let tokens =
-            Tensor::from_vec(vec![151645u32, 7, 151643, 151644, 0], (5,), &dev).unwrap();
+        let tokens = Tensor::from_vec(vec![151645u32, 7, 151643, 151644, 0], (5,), &dev).unwrap();
         let eos_ids = Tensor::from_vec(vec![151645u32, 151643], (2,), &dev).unwrap();
         let done = check_eos(&tokens, &eos_ids).unwrap();
         let got: Vec<u8> = done.to_vec1().unwrap();

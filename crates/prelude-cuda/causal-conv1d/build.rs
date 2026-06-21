@@ -143,6 +143,13 @@ fn main() -> Result<()> {
         // because one of ATen's headers pulls cstdint in first; we have
         // no such header, so force-include it via nvcc.
         "--pre-include=cstdint",
+        // Same story for <algorithm>: `causal_conv1d_common.h` calls
+        // std::max(std::initializer_list) (the <algorithm> overload) without
+        // including it. It used to compile only because an older host stdlib
+        // pulled <algorithm> in transitively; gcc-13's libstdc++ no longer
+        // does, so force-include it (CUDA version is irrelevant — 12.9 and
+        // 13.2 both fail without this).
+        "--pre-include=algorithm",
         "-Xcompiler",
         "-fPIC",
         // Keep warnings visible but don't fail the build on upstream's

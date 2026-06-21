@@ -1,0 +1,106 @@
+name: CI
+
+# PR-triggered build / lint / test for the CPU-buildable crates. The CUDA
+# crates (prelude-cuda + its sub-crates, candle-flash-attn-v3) need nvcc +
+# CUTLASS and only build/run on the GPU job below, which is manual-dispatch /
+# self-hosted. Without this job `cargo test --workspace` looked green while
+# validating nothing (the kernel suites are all GPU-gated).
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cpu:
+    name: CPU build / lint / test
+    # Pinned (not ubuntu-latest) so the toolchain/glibc the build links against
+    # doesn't shift under us when GitHub rolls `latest` to a new image.
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          # oneDNN + causal-conv1d submodules are needed: prelude-core depends
+          # on prelude-cpu, whose default `onednn` feature builds onednn-ffi
+          # (CMake build of third_party/oneDNN).
+          submodules: recursive
+
+      - name: Install C/C++ toolchain (oneDNN CMake build)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake pkg-config
+
+      - name: Install Rust (stable + rustfmt + clippy)
+        run: |
+          # The ubuntu runner ships rustup; just pin stable and add components.
+          # (rustup component add takes space-separated names; rustup-init's
+          #  --component does not, which is why the curl form failed.)
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustc --version && cargo --version
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-cpu-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('.gitmodules') }}
+          restore-keys: ci-cpu-
+
+      - name: rustfmt (whole workspace)
+        run: cargo fmt --all --check
+
+      # CPU crates only, default features (no `cuda`). prelude-core is built as
+      # a lib here; its unit tests pull a prelude-cuda dev-dependency (nvcc), so
+      # they run on the GPU job, not here.
+      - name: clippy (CPU crates)
+        run: cargo clippy --lib --bins -p prelude-core -p prelude-cpu -p prelude-server
+
+      - name: check (CPU crates)
+        run: cargo check --lib --bins -p prelude-core -p prelude-cpu -p prelude-server
+
+      - name: test (CPU-only crates)
+        # The prelude-cpu oneDNN/brgemm tests require an AVX-512 VNNI CPU. The
+        # free GitHub runner lacks it: the availability probe is optimistic, the
+        # kernel build then hits dnnl_brgemm_finalize "unimplemented", and the
+        # FFI's CHECK_DNNL aborts the whole test process (SIGABRT). Skip that
+        # module here — it runs on AVX-512 hardware (dev box / self-hosted).
+        # Everything else (the rest of prelude-cpu + all of prelude-server) runs.
+        run: cargo test -p prelude-cpu -p prelude-server -- --skip onednn::ops::tests
+
+  gpu:
+    name: GPU kernel tests (self-hosted / manual)
+    # Manual dispatch only — needs a self-hosted Hopper (sm90) runner with
+    # CUDA 13.2 + CUTLASS 3.8 (for fa3-0102) on PATH. Each suite documents the
+    # exact features / hardware it needs. Not a required check.
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: [self-hosted, gpu]
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # fa3-0102 + fused-prologue suites: #![cfg(feature = "fa3-0102")], sm90 +
+      # bf16/hdim128. Requires CUDA 13.2 + CUTLASS 3.8 (or a prebuilt archive
+      # via FA3_0102_PRELUDE_PREBUILT_DIR; see prelude-cuda/build.rs).
+      - name: fa3-0102 kernel correctness
+        run: cargo test -p prelude-cuda --features fa3-0102 --test fa3_0102_tests -- --nocapture
+
+      - name: fa3-0102 fused Q-prologue
+        run: cargo test -p prelude-cuda --features fa3-0102 --test fa3_0102_fuse_tests -- --nocapture
+
+      # qknorm d128 kernel: GPU-only (opens Device::new_cuda(0)). Default
+      # prelude-cuda features are enough (no fa3-0102 needed).
+      - name: qknorm d128 kernel
+        run: cargo test -p prelude-cuda --test qknorm_d128_tests -- --nocapture
+
+      # prelude-core integration tests (pull the prelude-cuda dev-dependency).
+      - name: prelude-core (GPU integration)
+        run: cargo test -p prelude-core

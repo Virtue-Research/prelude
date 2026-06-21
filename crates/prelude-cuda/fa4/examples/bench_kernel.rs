@@ -278,6 +278,12 @@ fn bench_varlen(registry: &KernelRegistry, cublas: &CuBlas, cublas_handle: cubla
             num_heads_q: 64,
             num_heads_k: 8,
         },
+        BenchConfig {
+            name: "qwen3_moe_gqa32x4",
+            head_dim: 128,
+            num_heads_q: 32,
+            num_heads_k: 4,
+        },
     ];
 
     let seq_lens: &[usize] = &[128, 256, 512, 1024, 2048, 4096, 8192];
@@ -455,6 +461,12 @@ fn bench_paged(registry: &KernelRegistry) {
             num_heads_q: 64,
             num_heads_k: 8,
         },
+        BenchConfig {
+            name: "qwen3_moe_gqa32x4",
+            head_dim: 128,
+            num_heads_q: 32,
+            num_heads_k: 4,
+        },
     ];
 
     // Prefill: Q tokens > 1, paged KV cache
@@ -581,12 +593,107 @@ fn bench_paged(registry: &KernelRegistry) {
 
 // ── Main ────────────────────────────────────────────────────────────
 
+// ── Realistic server prefill step: varlen batch of NSEQ sequences x S tokens ──
+// Matches the server's max_num_batched_tokens=8192 prefill forward
+// (GQA 32/4, d=128, causal, bf16). FA4 kernel only — reports us/fwd.
+fn bench_varlen_batch(registry: &KernelRegistry) {
+    const NSEQ: usize = 4;
+    const S: usize = 2048;
+    const HQ: usize = 32;
+    const HKV: usize = 4;
+    const D: usize = 128;
+    let total = NSEQ * S;
+    println!(
+        "\n= FA4 realistic prefill: varlen {}x{} (total {}), GQA {}/{}, d={}, causal, bf16",
+        NSEQ, S, total, HQ, HKV, D
+    );
+    let key = KernelKey::new(D as u32, (HQ / HKV) as u32, true, false);
+    let func = match registry.get(&key) {
+        Some(f) => f,
+        None => {
+            println!("  SKIP (kernel hdim{D}_gqa{} not compiled)", HQ / HKV);
+            return;
+        }
+    };
+    let q_gpu = gpu_alloc(total * HQ * D * 2);
+    let k_gpu = gpu_alloc(total * HKV * D * 2);
+    let v_gpu = gpu_alloc(total * HKV * D * 2);
+    let o_gpu = gpu_alloc(total * HQ * D * 2);
+    let mut cu_data = [0i32; NSEQ + 1];
+    for (i, c) in cu_data.iter_mut().enumerate() {
+        *c = (i * S) as i32;
+    }
+    let cu_gpu = gpu_alloc((NSEQ + 1) * 4);
+    cuda_check(
+        unsafe { cudaMemcpy(cu_gpu, cu_data.as_ptr() as _, (NSEQ + 1) * 4, 1) },
+        "memcpy cu",
+    );
+    cuda_check(unsafe { cudaDeviceSynchronize() }, "sync init");
+
+    let q_shape: [i64; 3] = [total as _, HQ as _, D as _];
+    let k_shape: [i64; 3] = [total as _, HKV as _, D as _];
+    let o_shape = q_shape;
+    let lse_shape: [i64; 2] = [HQ as _, total as _];
+    let cu_shape: [i64; 1] = [(NSEQ + 1) as _];
+    let q_strides: [i64; 3] = [(HQ * D) as _, D as _, 1];
+    let k_strides: [i64; 3] = [(HKV * D) as _, D as _, 1];
+    let scale = 1.0 / (D as f32).sqrt();
+
+    let ms = cuda_bench(20, 100, || unsafe {
+        flash_attn_v4::fa4_varlen_fwd(
+            registry,
+            func,
+            q_gpu,
+            k_gpu,
+            v_gpu,
+            o_gpu,
+            std::ptr::null_mut(),
+            scale,
+            std::ptr::null_mut(),
+            cu_gpu,
+            cu_gpu,
+            &q_shape,
+            &q_strides,
+            &k_shape,
+            &k_strides,
+            &k_shape,
+            &k_strides,
+            &o_shape,
+            &lse_shape,
+            &cu_shape,
+            0,
+            None,
+            None,
+            None,
+            None,
+            KernelDtype::BF16,
+        )
+        .expect("fa4 kernel failed");
+    });
+    println!(
+        "  FA4 (CuTeDSL)         : {:8.1} us/fwd",
+        ms as f64 * 1000.0
+    );
+    println!("FA4_VARLEN_BATCH_US {:.1}", ms as f64 * 1000.0);
+    unsafe {
+        cudaFree(q_gpu);
+        cudaFree(k_gpu);
+        cudaFree(v_gpu);
+        cudaFree(o_gpu);
+        cudaFree(cu_gpu);
+    }
+}
+
 fn main() {
     let registry = KernelRegistry::new();
     println!(
         "{:=<80}",
         format!("= FA4 Benchmark — SM{} ", registry.arch())
     );
+    if std::env::args().any(|a| a == "--varlen-batch") {
+        bench_varlen_batch(&registry);
+        return;
+    }
 
     let cublas =
         CuBlas::load().expect("failed to dlopen libcublas.so — is CUDA toolkit installed?");

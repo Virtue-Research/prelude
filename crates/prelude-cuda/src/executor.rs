@@ -65,9 +65,19 @@ impl CudaExecutor {
                     .enable_all()
                     .build()
                     .expect("GPU executor worker runtime");
+                // Previous step's device-resident greedy tokens, for the
+                // submit-ahead pipeline. Updated by execute_work each step;
+                // read by the next step's decode-row gather. Single worker
+                // thread ⇒ sequential ⇒ N's write precedes N+1's read.
+                let mut last_sampled: Option<Tensor> = None;
                 rt.block_on(async {
                     while let Some(work) = work_rx.recv().await {
-                        let result = execute_work(&worker_engine, work.batch, &mut graph_cache);
+                        let result = execute_work(
+                            &worker_engine,
+                            work.batch,
+                            &mut graph_cache,
+                            &mut last_sampled,
+                        );
                         let _ = work.result_tx.send(result);
                     }
                 });
@@ -91,13 +101,42 @@ impl Executor for CudaExecutor {
             .map_err(|_| EngineError::Internal("GPU worker thread has exited".into()))?;
         Ok(ExecutionHandle::new(result_rx))
     }
+
+    /// CUDA keeps the previous step's argmax in `last_sampled` (device-resident)
+    /// and resolves `decode_prev_rows` via `gather_decode_rows` inside the worker
+    /// — so the AR loop may safely overlap a greedy step. See the trait doc.
+    fn resolves_device_decode_ids(&self) -> bool {
+        true
+    }
+}
+
+/// Submit-ahead pipeline: gather the decode rows' input ids from the previous
+/// step's device-resident sampled tokens, using host row indices. Runs on the
+/// worker thread AFTER the previous forward stored `last_sampled` (sequential
+/// processing on one thread → ordered, no host round-trip, no cross-stream
+/// race). Returns `None` (→ host fallback) on any shape/index problem.
+fn gather_decode_rows(last_sampled: &Option<Tensor>, rows: &[u32]) -> Option<Tensor> {
+    let prev = last_sampled.as_ref()?;
+    if rows.is_empty() {
+        return None;
+    }
+    let n = prev.dims1().ok()?;
+    if rows.iter().any(|&r| r as usize >= n) {
+        return None;
+    }
+    let idx = Tensor::from_vec(rows.to_vec(), (rows.len(),), prev.device()).ok()?;
+    prev.index_select(&idx, 0).ok()
 }
 
 /// Execute a forward batch, using CUDA graph replay for decode when possible.
+/// `last_sampled` holds the previous step's device-resident greedy tokens so
+/// this step's decode rows can be fed device→device (submit-ahead pipeline);
+/// it is updated with this step's sampled tokens before returning.
 fn execute_work(
     engine: &Engine,
     batch: ForwardBatch,
     graph_cache: &mut DecodeGraphCache,
+    last_sampled: &mut Option<Tensor>,
 ) -> Result<ModelOutput, EngineError> {
     match batch {
         ForwardBatch::Decode {
@@ -106,10 +145,17 @@ fn execute_work(
             block_tables,
             deltanet_slots,
             sample_greedy,
-            tokens_device: _, // wired in PR-4 (decode loop pipeline)
+            tokens_device,
+            decode_prev_rows,
         } => {
             let bs = tokens.len();
             let t0 = Instant::now();
+            // Resolve submit-ahead device input ids (worker-internal gather).
+            let tokens_device = tokens_device.or_else(|| {
+                decode_prev_rows
+                    .as_ref()
+                    .and_then(|rows| gather_decode_rows(last_sampled, rows))
+            });
 
             // Build OwnedBatchDecodeSeq for graph cache lookup
             let seqs: Vec<OwnedBatchDecodeSeq> = tokens
@@ -124,39 +170,46 @@ fn execute_work(
                 })
                 .collect();
 
-            // Try CUDA graph replay first
-            if let Some(result) = graph_cache.try_replay(engine, &seqs) {
-                let logits = result?;
-                let (sampled_tokens_device, sampled_tokens) = if sample_greedy {
-                    greedy_argmax_tokens(&logits)
-                } else {
-                    (None, None)
-                };
-                let elapsed_us = t0.elapsed().as_micros();
-                tracing::debug!(
-                    bs,
-                    elapsed_us,
-                    sample_greedy,
-                    path = "cuda_graph",
-                    "decode step"
-                );
-                return Ok(ModelOutput {
-                    logits,
-                    item_seq_counts: vec![],
-                    prefill_results: vec![],
-                    sampled_tokens,
-                    sampled_tokens_device,
-                });
-            }
+            // CUDA graph replay captures host-resident input ids, so it cannot
+            // serve the async device-token path. Only attempt graph replay when
+            // no device input ids are supplied.
+            if tokens_device.is_none() {
+                if let Some(result) = graph_cache.try_replay(engine, &seqs) {
+                    let logits = result?;
+                    let (sampled_tokens_device, sampled_tokens) = if sample_greedy {
+                        greedy_argmax_tokens(&logits)
+                    } else {
+                        (None, None)
+                    };
+                    *last_sampled = sampled_tokens_device.clone();
+                    let elapsed_us = t0.elapsed().as_micros();
+                    tracing::debug!(
+                        bs,
+                        elapsed_us,
+                        sample_greedy,
+                        path = "cuda_graph",
+                        "decode step"
+                    );
+                    return Ok(ModelOutput {
+                        logits,
+                        item_seq_counts: vec![],
+                        prefill_results: vec![],
+                        sampled_tokens,
+                        sampled_tokens_device,
+                    });
+                }
+            } // end: graph replay only when tokens_device.is_none()
 
-            // Fallback to eager execution
+            // Fallback to eager execution (also the path when device input ids
+            // are supplied — graph replay is skipped above).
             let mut result = engine.forward_batch(ForwardBatch::Decode {
                 tokens,
                 positions,
                 block_tables,
                 deltanet_slots,
                 sample_greedy,
-                tokens_device: None,
+                tokens_device,
+                decode_prev_rows: None, // already resolved into tokens_device
             });
             if let Ok(output) = result.as_mut() {
                 if sample_greedy {
@@ -164,6 +217,7 @@ fn execute_work(
                     output.sampled_tokens = host;
                     output.sampled_tokens_device = dev;
                 }
+                *last_sampled = output.sampled_tokens_device.clone();
             }
             let elapsed_us = t0.elapsed().as_micros();
             tracing::debug!(bs, elapsed_us, sample_greedy, path = "eager", "decode step");
@@ -172,11 +226,21 @@ fn execute_work(
         ForwardBatch::Mixed {
             requests,
             sample_greedy,
+            decode_tokens_device,
+            decode_prev_rows,
         } => {
             let t0 = Instant::now();
+            // Resolve submit-ahead device input ids for the decode rows.
+            let decode_tokens_device = decode_tokens_device.or_else(|| {
+                decode_prev_rows
+                    .as_ref()
+                    .and_then(|rows| gather_decode_rows(last_sampled, rows))
+            });
             let mut result = engine.forward_batch(ForwardBatch::Mixed {
                 requests,
                 sample_greedy,
+                decode_tokens_device,
+                decode_prev_rows: None, // already resolved into decode_tokens_device
             });
             if let Ok(output) = result.as_mut() {
                 if sample_greedy {
@@ -184,6 +248,7 @@ fn execute_work(
                     output.sampled_tokens = host;
                     output.sampled_tokens_device = dev;
                 }
+                *last_sampled = output.sampled_tokens_device.clone();
             }
             let elapsed_us = t0.elapsed().as_micros();
             tracing::debug!(elapsed_us, sample_greedy, path = "mixed", "forward step");
@@ -281,6 +346,8 @@ fn warmup_mixed_prefill(engine: &Engine, needs_kv_cache: bool) {
     let result = engine.forward_batch(ForwardBatch::Mixed {
         requests,
         sample_greedy: true,
+        decode_tokens_device: None,
+        decode_prev_rows: None,
     });
 
     free_warmup_deltanet_slots(engine, &deltanet_slots);

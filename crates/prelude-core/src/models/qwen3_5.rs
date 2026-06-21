@@ -851,6 +851,7 @@ impl Qwen3_5Attention {
                     scale: softmax_scale,
                     mask: MaskType::Causal,
                     softcap: None,
+                    q_prologue: None,
                 },
             )?
         } else {

@@ -11,6 +11,82 @@ fn tensor_err(e: crate::tensor::Error) -> EngineError {
 }
 
 impl CacheManager {
+    /// vLLM-style lazy prefix cache active? Default ON for the pure-paged
+    /// path (standard attention models); the legacy hash-trie path remains
+    /// for hybrid models (DeltaNet prefix state is keyed by trie hashes) and
+    /// the non-paged tensor cache. Escape hatch: PRELUDE_PREFIX_LAZY=0.
+    pub(crate) fn lazy_prefix_enabled(&self) -> bool {
+        crate::config::attn_flags::prefix_lazy_enabled()
+            && self.prefix_cache.is_some()
+            && self.block_manager.is_some()
+            && self.deltanet_pool.is_none()
+    }
+
+    /// Chained content hashes for every FULL block of `tokens`, capped at
+    /// `max_blocks` entries. Delegates to the trie's single hash-chaining recipe
+    /// so the lazy paged path and the trie path can never drift.
+    fn chain_block_hashes(tokens: &[u32], block_size: usize, max_blocks: usize) -> Vec<u64> {
+        super::prefix_index::PrefixMatchIndex::chain_block_hashes(tokens, block_size, max_blocks)
+    }
+
+    /// Lazy prefix match: longest cached full-block prefix of `tokens`.
+    /// Matched blocks are ref'd for the caller (revived if free) — release
+    /// them with `release_paged_blocks` if the attach is aborted. Guarantees
+    /// at least one token is left to prefill (match capped at (len-1)/bs).
+    pub(crate) fn try_prefix_cache_match_lazy(
+        &self,
+        tokens: &[u32],
+    ) -> Result<(usize, Vec<u32>), EngineError> {
+        let Some(ref bm_mutex) = self.block_manager else {
+            return Ok((0, Vec::new()));
+        };
+        let mut bm = bm_mutex
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
+        let block_size = bm.block_size().max(1);
+        if tokens.len() < block_size + 1 {
+            return Ok((0, Vec::new()));
+        }
+        let max_matchable = (tokens.len() - 1) / block_size;
+        let hashes = Self::chain_block_hashes(tokens, block_size, max_matchable);
+        let blocks = bm.lookup_and_touch_prefix(&hashes);
+        let cached_len = blocks.len() * block_size;
+        Ok((cached_len, blocks))
+    }
+
+    /// Lazy prefix insert: register content hashes on the full blocks of
+    /// `block_table` covering `tokens`. Idempotent; first writer wins. Bumps
+    /// the prefix-cache generation when anything new becomes matchable.
+    pub(crate) fn prefix_cache_insert_lazy(
+        &self,
+        tokens: &[u32],
+        block_table: &[u32],
+    ) -> Result<(), EngineError> {
+        let Some(ref bm_mutex) = self.block_manager else {
+            return Ok(());
+        };
+        let mut bm = bm_mutex
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("block manager lock: {e}")))?;
+        let block_size = bm.block_size().max(1);
+        let full = (tokens.len() / block_size).min(block_table.len());
+        if full == 0 {
+            return Ok(());
+        }
+        let hashes = Self::chain_block_hashes(tokens, block_size, full);
+        let pairs: Vec<(u64, u32)> = hashes
+            .iter()
+            .copied()
+            .zip(block_table.iter().copied())
+            .collect();
+        let newly_cached = bm.assign_block_hashes(&pairs);
+        drop(bm);
+        if newly_cached > 0 {
+            self.prefix_cache_gen.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     pub(crate) fn allocate_paged_block(&self) -> Result<Option<u32>, EngineError> {
         let Some(ref bm_mutex) = self.block_manager else {
             return Ok(None);
@@ -75,6 +151,17 @@ impl CacheManager {
         let mut pc = pc_mutex
             .lock()
             .map_err(|e| EngineError::Internal(format!("prefix cache lock poisoned: {e}")))?;
+        // Nothing cached in the trie → nothing to reclaim. This is ALWAYS the case
+        // in lazy (vLLM-style) mode, where the hash-aware BlockManager owns
+        // eviction (revive-on-hit + LRU-evict inside `allocate()`) and the trie is
+        // deliberately never populated — it stays allocated only as the "prefix
+        // caching enabled" signal for the non-lazy/hybrid/non-paged paths. Skipping
+        // here avoids building the reclaim closure + walking an empty trie on every
+        // pressure event. (Gating on the trie being empty rather than the lazy env
+        // flag keeps this env-independent and unit-testable.)
+        if pc.cached_blocks() == 0 {
+            return Ok(0);
+        }
         let mut is_reclaimable = |ids: &[u32]| -> bool {
             match bm_arc.lock() {
                 Ok(bm) => ids.iter().all(|&b| bm.ref_count(b) == 1),

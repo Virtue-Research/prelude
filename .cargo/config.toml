@@ -1,7 +1,12 @@
 [build]
+# NOTE: do NOT add `-fuse-ld=mold` here. Linking the ~720MB CUDA-heavy binary
+# with mold cuts incremental relink from minutes to seconds, but a repo-wide
+# flag breaks every build for anyone without `mold` (ld.mold) on PATH and
+# gcc >= 12.1. Opt in locally without committing it, e.g. export
+#   RUSTFLAGS="-C target-cpu=native -C link-arg=-fuse-ld=mold"
+# or use a gitignored ~/.cargo/config.toml override.
 rustflags = ["-C", "target-cpu=native"]
 
 [env]
-PYTHON_EXECUTABLE = { value = ".venv/bin/python3", relative = true }
 # Force pcre2-sys to build from source (static link), no runtime libpcre2-8.so dependency
 PCRE2_SYS_STATIC = "1"

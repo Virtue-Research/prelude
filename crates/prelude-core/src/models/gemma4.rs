@@ -601,6 +601,7 @@ impl Gemma4Attention {
                     scale: 1.0,
                     mask,
                     softcap: self.softcap,
+                    q_prologue: None,
                 },
             )?
         } else {

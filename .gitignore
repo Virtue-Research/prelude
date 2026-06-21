@@ -1,4 +1,5 @@
 target/
+target-codex-fa3/
 .DS_Store
 .idea
 .vscode
@@ -28,3 +29,50 @@ analysis/
 
 # Per-developer agent instructions — not checked in.
 CLAUDE.md
+
+# Large benchmark dataset and generated sweep output — not checked in.
+sampled_500x10.json
+sampled_500_groups_x_10.jsonl
+sweep_results/
+# Root-level ad-hoc scratch scripts/logs only — anchored with a leading slash so
+# an in-tree build script named `_*.sh` (e.g. crates/.../_build_*.sh) is NOT
+# silently excluded from the repo.
+/_*.sh
+/_*.log
+logs/
+
+# Nsight Systems profiler output — large local-only artifacts (~600MB).
+nsys_prof/
+*.nsys-rep
+*.sqlite
+
+# ── Ad-hoc / superseded test scripts (kept locally, excluded from the repo) ──
+# superseded by scripts/analyze_perreq_breakdown.py
+analyze_fa3_breakdown.py
+# superseded by bench_rps_clean.sh
+bench_prelude.sh
+bench_vllm.sh
+# one-off verification / launch helpers
+e2e_fuse_bench.sh
+run_fuse_verify.sh
+reproduce_gap_breakdown.py
+microbench_vllm_attn.py
+verify_fa.py
+launch_prelude.sh
+launch_vllm.sh
+launch_vllm_docker.sh
+# candle-fa3-bench: legacy microbench for the fork FA3 path (superseded by
+# prelude-cuda tests + verify tooling); removed from the workspace to stop
+# --workspace builds from force-compiling the fork's CUTLASS kernels.
+crates/candle-fa3-bench/
+
+# ── Local scratch scripts and benchmark suite — not checked in. ──
+scripts/
+bench_scripts/
+# machine-specific reproduction scripts (hardcoded paths + dataset refs)
+bench_repro/
+# one-off verification outputs
+verify_out_*.txt
+
+# ── Internal reports — not checked in. ──
+reports/

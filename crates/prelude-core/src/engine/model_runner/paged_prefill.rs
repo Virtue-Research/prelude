@@ -364,7 +364,8 @@ impl Engine {
                 bm.available()
             };
             if available < new_total {
-                self.cache.reclaim_idle_prefix_blocks(new_total - available)?;
+                self.cache
+                    .reclaim_idle_prefix_blocks(new_total - available)?;
             }
         }
 

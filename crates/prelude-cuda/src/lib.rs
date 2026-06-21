@@ -105,6 +105,53 @@ mod scaled_fp8;
 pub use attn::flashinfer::fi_fused_add_rmsnorm;
 pub use cuda_ops::cuda_ops;
 
+// Test-only re-export for the d128 qknorm+rope bit-exactness tests.
+pub use ops::rope::fused_qknorm_rope_qk_varlen_force as qknorm_rope_qk_for_tests;
+
+// Test-only re-exports for the fa3-0102 backend (tests/fa3_0102_tests.rs,
+// tests/fa3_0102_fuse_tests.rs).
+#[cfg(feature = "fa3-0102")]
+pub use attn::fa3_0102::varlen as attn_fa3_0102_varlen_for_tests;
+#[cfg(feature = "fa3-0102")]
+#[allow(clippy::too_many_arguments)]
+pub fn attn_fa3_0102_varlen_paged_for_tests(
+    q: &prelude_core::tensor::Tensor,
+    key_cache: &prelude_core::tensor::Tensor,
+    value_cache: &prelude_core::tensor::Tensor,
+    block_tables: &prelude_core::tensor::Tensor,
+    cu_seqlens_q: &prelude_core::tensor::Tensor,
+    seqused_k: &prelude_core::tensor::Tensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    softmax_scale: f32,
+    prologue: Option<(
+        &prelude_core::tensor::Tensor,
+        &prelude_core::tensor::Tensor,
+        &prelude_core::tensor::Tensor,
+        f32,
+    )>,
+) -> prelude_core::tensor::Result<prelude_core::tensor::Tensor> {
+    attn::fa3_0102::varlen_paged(
+        q,
+        key_cache,
+        value_cache,
+        block_tables,
+        cu_seqlens_q,
+        seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        prologue.map(|(w, c, s, e)| attn::fa3_0102::QPrologue {
+            q_weight: w,
+            cos: c,
+            sin: s,
+            eps: e,
+        }),
+    )
+}
+// Standalone single-tensor qknorm+rope (reference path for the fuse tests).
+pub use ops::rope::fused_qknorm_rope_varlen as qknorm_rope_for_tests;
+
 // ── Sub-crate re-exports ────────────────────────────────────────────
 
 pub use cula;

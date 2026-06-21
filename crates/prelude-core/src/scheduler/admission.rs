@@ -134,7 +134,23 @@ impl Scheduler {
                     token_budget -= chunk;
                 }
             } else {
-                // Fully prefilled — needs 1 decode token
+                // Fully prefilled — needs 1 decode token. In the submit-ahead
+                // pipeline a sequence may have been optimistically advanced to
+                // its full token count (placeholder pushed) but not yet
+                // finished by process; don't schedule another decode for it
+                // (no over-compute). No-op in the synchronous path (finished
+                // requests are already drained before scheduling).
+                //
+                // NOTE: Sequence::max_new_tokens is request.max_new - 1 (the
+                // prefill produces the first token), while output_ids counts
+                // ALL generated tokens (prefill first token + decode tokens).
+                // So the request is exhausted when output_ids.len() reaches the
+                // TOTAL = max_new_tokens + 1, i.e. output_ids.len() >
+                // max_new_tokens. Using remaining_tokens()==0 here would stop
+                // one token early and the request would never finish.
+                if seq.output_ids.len() > seq.max_new_tokens as usize {
+                    continue;
+                }
                 decode_ids.push(seq.request_id.clone());
                 token_budget -= 1;
             }
@@ -519,8 +535,8 @@ fn cap_hybrid_prefix_cache_chunk(seq: &Sequence, block_size: usize, chunk: usize
 
     // DeltaNet prefix entries require an exact state snapshot at the cached
     // boundary. Keep the cached prefix block-aligned and strictly before the
-    // full prompt; the remaining tail is the stable Qwen3.5 fast path used by
-    // the TopicGuard workload.
+    // full prompt; the remaining tail is the stable fast path used by the
+    // qwen3 moe workload.
     let final_reusable = final_block_aligned_prefix(prompt_len, block_size);
     if final_reusable > computed && after > final_reusable {
         return final_reusable - computed;

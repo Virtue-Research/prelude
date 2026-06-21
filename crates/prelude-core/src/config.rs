@@ -36,6 +36,11 @@ pub const DEFAULT_CUDA_GRAPH_MAX_BS: usize = 32;
 /// activation profiler probes the same shape the engine actually runs
 /// in the default config.
 pub const DEFAULT_PROFILE_TOKENS: usize = 8192;
+/// Mirrors the scheduler's `max_running_requests` default. Used to bound the
+/// realistic logits allocation in the activation profiler: the profiling
+/// forward materializes `[profile_tokens, vocab]` logits, but in serving only
+/// the last token of each of at most this many sequences needs logits.
+pub const DEFAULT_PROFILE_MAX_SEQS: usize = 256;
 pub const DEFAULT_PAGED_BLOCK_SIZE: usize = 128;
 /// Default logical prefix-cache capacity, measured in paged KV blocks.
 ///
@@ -45,6 +50,26 @@ pub const DEFAULT_PAGED_BLOCK_SIZE: usize = 128;
 /// demand-driven reclaim now lets the cache safely use almost the whole pool.
 /// `PRELUDE_PREFIX_CACHE_BLOCKS=N` sets an explicit cap; `=0` is the opt-out.
 pub const DEFAULT_PREFIX_CACHE_BLOCKS: usize = usize::MAX;
+/// Finite fallback cap for the non-paged (CPU / no KV-pool) prefix cache.
+///
+/// On the paged path the "unbounded" default above is clamped to the physical
+/// pool size in `init_prefix_cache`. With no pool (`pool_blocks == 0`) there is
+/// nothing to derive a budget from, so the tensor prefix cache would grow
+/// without bound. Cap it at this finite default (the pre-"unbounded" value)
+/// unless the operator sets an explicit `PRELUDE_PREFIX_CACHE_BLOCKS`.
+///
+/// NOTE: this is a block *count*, not a byte budget — it ignores per-entry KV
+/// size (layers × heads × head_dim × dtype). It exists only to stop unbounded
+/// growth on the rarely-used non-paged path; the paged path derives a real
+/// pool-relative budget in `init_prefix_cache` instead.
+pub const DEFAULT_NONPAGED_PREFIX_CACHE_BLOCKS: usize = 4096;
+/// Upper bound on the prefix-cache reserve floor, as a fraction (1/N) of the
+/// physical KV-block pool. The reserve floor keeps the prefix cache from pinning
+/// the *entire* pool (enough headroom for live admission + reclaim); it is sized
+/// to one max-length request but never allowed to exceed `pool / N`, so a very
+/// large-context model can't sacrifice most of the cache to the floor. See
+/// `init_prefix_cache`.
+pub const PREFIX_RESERVE_POOL_FRACTION: usize = 8;
 pub const DEFAULT_PREFIX_BLOCK_SIZE: usize = DEFAULT_PAGED_BLOCK_SIZE;
 pub const DEFAULT_DELTANET_POOL_SLOTS: u32 = 8;
 pub const DEFAULT_TEMPERATURE: f32 = 1.0;
@@ -189,6 +214,10 @@ pub struct RuntimeConfig {
     /// `--max-num-batched-tokens`; the env override is for tests /
     /// non-server callers.
     pub profile_tokens: usize,
+    /// Max concurrent sequences assumed when sizing the realistic logits
+    /// allocation during activation profiling. Server CLI sets this from
+    /// `--max-running-requests`; env override for tests / non-server callers.
+    pub profile_max_seqs: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,7 +261,13 @@ impl RuntimeConfig {
     fn from_env() -> Result<Self, String> {
         Ok(Self {
             device: "auto".to_string(),
-            fused_kv_cache_write: parse_env_bool_eq1("PRELUDE_FUSED_KV_CACHE_WRITE"),
+            // Q-prologue fusion REQUIRES the fused K norm+rope cache-write path:
+            // the in-kernel Q prologue and the K written by the fused kernel use
+            // the same RoPE convention, while the rms_norm+rope_thd fallback does
+            // not (Q·K misalignment -> deterministic garbage; see the
+            // fa3_q_prologue_deadlock_fix report). Auto-enable when fusing.
+            fused_kv_cache_write: parse_env_bool_eq1("PRELUDE_FUSED_KV_CACHE_WRITE")
+                || attn_flags::fuse_q_norm_rope(),
             cpu_thread_bind: std::env::var("SGLANG_CPU_OMP_THREADS_BIND")
                 .ok()
                 .filter(|s| !s.is_empty()),
@@ -252,6 +287,7 @@ impl RuntimeConfig {
                 DEFAULT_CUDA_GRAPH_MAX_BS,
             ),
             profile_tokens: parse_env_usize("PRELUDE_PROFILE_TOKENS", DEFAULT_PROFILE_TOKENS),
+            profile_max_seqs: parse_env_usize("PRELUDE_PROFILE_MAX_SEQS", DEFAULT_PROFILE_MAX_SEQS),
         })
     }
 }
@@ -279,19 +315,37 @@ fn parse_env_f32(name: &str, default: f32) -> f32 {
         .unwrap_or(default)
 }
 
+/// Canonical truthy / falsy spellings for boolean env vars (case-insensitive).
+/// Both rich parsers below share these so their truthiness rule can never drift
+/// apart — the only difference between them is the default for an *unset* var.
+const ENV_TRUE: &[&str] = &["1", "true", "yes", "on"];
+const ENV_FALSE: &[&str] = &["0", "false", "no", "off"];
+
 /// Parse a boolean env var: matches only "1" exactly.
+///
+/// This is the STRICT legacy form (intentionally narrower than [`ENV_TRUE`]),
+/// retained for flags that predate the rich parsers. Prefer
+/// [`parse_env_bool_default_false`] / [`parse_env_bool_default_true`] for new
+/// flags so operators get the same "1/true/yes/on" spelling everywhere.
 fn parse_env_bool_eq1(name: &str) -> bool {
     std::env::var(name).map_or(false, |v| v == "1")
 }
 
+/// Parse a boolean env var defaulting to false: on when set to a truthy value
+/// ([`ENV_TRUE`], case-insensitive). The default-off counterpart to
+/// [`parse_env_bool_default_true`]; used for the attention backend toggles so
+/// every reader applies the *same* truthiness rule (see [`attn_flags`]).
+fn parse_env_bool_default_false(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| ENV_TRUE.contains(&v.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Parse a boolean env var defaulting to true: off only for an explicit falsy
+/// value ([`ENV_FALSE`], case-insensitive); any other value is on.
 fn parse_env_bool_default_true(name: &str) -> bool {
     std::env::var(name)
-        .map(|v| {
-            !matches!(
-                v.to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
+        .map(|v| !ENV_FALSE.contains(&v.to_ascii_lowercase().as_str()))
         .unwrap_or(true)
 }
 
@@ -307,5 +361,59 @@ fn parse_env_moe_backend() -> Result<MoeBackendPolicy, String> {
     match std::env::var("PRELUDE_MOE_BACKEND") {
         Ok(value) if !value.is_empty() => MoeBackendPolicy::parse(&value),
         _ => Ok(MoeBackendPolicy::Auto),
+    }
+}
+
+// ── Attention / cache backend flags (single source of truth) ──────────────
+
+/// Centralized parsing for the attention-backend and prefix-cache toggles.
+///
+/// These flags were previously parsed independently in prelude-cuda
+/// (`cuda_ops.rs`, `ops/rope.rs`), the model layer (`models/commons/attn_utils.rs`),
+/// and `RuntimeConfig::from_env`, each with its own `OnceLock<bool>` cache and —
+/// worse — *different* truthiness rules: the fuse flag accepted "1"/"true" in
+/// the ops/model layers but only "1" in config, so `=true` turned on Q-prologue
+/// fusion while `fused_kv_cache_write` stayed off → Q·K misalignment garbage.
+///
+/// Parsing each flag exactly once here, with one truthiness rule per polarity,
+/// makes that divergence impossible. Reads are process-lifetime cached, so the
+/// env var is consulted once. (Env set *after* first read is not observed, same
+/// as the previous per-callsite OnceLock behavior.)
+pub mod attn_flags {
+    use std::sync::OnceLock;
+
+    /// `PRELUDE_ATTN_FA3` — prefer the candle-flash-attn-v3 (FA3 fork) paged
+    /// path over FA4. Default off.
+    pub fn fa3_fork_enabled() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| super::parse_env_bool_default_false("PRELUDE_ATTN_FA3"))
+    }
+
+    /// `PRELUDE_ATTN_FA3_0102` — prefer the candle-fa3-0102 backend (vendored
+    /// vLLM 0.22 FA3 hopper kernel). Default on; opt out with `=0`.
+    pub fn fa3_0102_enabled() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| super::parse_env_bool_default_true("PRELUDE_ATTN_FA3_0102"))
+    }
+
+    /// `PRELUDE_ATTN_FA3_FUSE_Q_NORM_ROPE` — fuse Q RMSNorm+RoPE into the FA3
+    /// attention prologue (Plan A). Default off.
+    pub fn fuse_q_norm_rope() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| super::parse_env_bool_default_false("PRELUDE_ATTN_FA3_FUSE_Q_NORM_ROPE"))
+    }
+
+    /// `PRELUDE_QKNORM_D128` — use the D=128 specialized qknorm+rope kernel.
+    /// Default on; opt out with `=0` (generic kernel).
+    pub fn qknorm_d128_enabled() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| super::parse_env_bool_default_true("PRELUDE_QKNORM_D128"))
+    }
+
+    /// `PRELUDE_PREFIX_LAZY` — vLLM-style lazy hash-aware prefix eviction.
+    /// Default on; opt out with `=0`.
+    pub fn prefix_lazy_enabled() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| super::parse_env_bool_default_true("PRELUDE_PREFIX_LAZY"))
     }
 }

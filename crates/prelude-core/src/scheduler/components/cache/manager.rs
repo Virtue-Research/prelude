@@ -37,6 +37,7 @@ impl CacheManager {
         cache_config: &CacheConfig,
         kv_sharing: &[Option<usize>],
         peak_activation_bytes: usize,
+        nonkv_static_bytes: Option<usize>,
     ) -> Result<Self, EngineError> {
         let (paged_pool, block_manager) = if runtime_caps.supports_paged_attn {
             Self::init_paged_pool(
@@ -46,6 +47,7 @@ impl CacheManager {
                 cache_config,
                 kv_sharing,
                 peak_activation_bytes,
+                nonkv_static_bytes,
             )?
         } else {
             (None, None)
@@ -140,7 +142,7 @@ impl CacheManager {
         let reserve_floor = if pool_blocks > 0 {
             max_model_len
                 .div_ceil(block_size.max(1))
-                .min(pool_blocks / 8)
+                .min(pool_blocks / crate::config::PREFIX_RESERVE_POOL_FRACTION)
                 .max(1)
         } else {
             0
@@ -149,7 +151,12 @@ impl CacheManager {
             let budget_cap = pool_blocks.saturating_sub(reserve_floor).max(1);
             configured_max_blocks.min(budget_cap)
         } else {
-            configured_max_blocks
+            // No physical pool to derive a budget from (non-paged / CPU). The
+            // "unbounded" default (usize::MAX) would let the tensor prefix cache
+            // grow without bound, since PrefixMatchIndex only evicts while
+            // entries.len() > max_blocks. Clamp to a finite fallback; an
+            // explicit PRELUDE_PREFIX_CACHE_BLOCKS still wins when smaller.
+            configured_max_blocks.min(crate::config::DEFAULT_NONPAGED_PREFIX_CACHE_BLOCKS)
         };
         // flash layout: [B, L, H, D] → concat dim 1; standard: [B, H, L, D] → concat dim 2
         let is_flash = device.is_cuda();
@@ -180,6 +187,7 @@ impl CacheManager {
         cache_config: &CacheConfig,
         kv_sharing: &[Option<usize>],
         peak_activation_bytes: usize,
+        nonkv_static_bytes: Option<usize>,
     ) -> Result<
         (
             Option<PagedKvPool>,
@@ -266,11 +274,18 @@ impl CacheManager {
 
             // vLLM formula:
             //   requested = total * utilization
-            //   non_kv = weights_memory + peak_activation
+            //   non_kv = nonkv_static + peak_activation
             //   available = requested - non_kv
-            let weights_bytes = total_bytes.saturating_sub(free_bytes);
+            // `nonkv_static` = logical weights (Σ tensor bytes) + CUDA context,
+            // computed in `engine::loading` to match vLLM's accounting against
+            // ALLOCATED bytes (not the physical cudarc snapshot, which over-counts
+            // via pool reservation/fragmentation). Falls back to `total - free`
+            // only if that computation was unavailable (e.g. non-CUDA / query
+            // failure), which is slightly conservative.
+            let nonkv_static_bytes =
+                nonkv_static_bytes.unwrap_or_else(|| total_bytes.saturating_sub(free_bytes));
             let requested = (total_bytes as f64 * utilization as f64) as usize;
-            let non_kv = weights_bytes + peak_activation_bytes;
+            let non_kv = nonkv_static_bytes + peak_activation_bytes;
             let available_for_kv = requested.saturating_sub(non_kv);
 
             let auto_blocks = if total_bytes_per_block > 0 {
@@ -282,7 +297,7 @@ impl CacheManager {
                 auto_blocks,
                 total_gpu_mb = total_bytes / (1024 * 1024),
                 free_gpu_mb = free_bytes / (1024 * 1024),
-                weights_mb = weights_bytes / (1024 * 1024),
+                nonkv_static_mb = nonkv_static_bytes / (1024 * 1024),
                 peak_activation_mb = peak_activation_bytes / (1024 * 1024),
                 available_for_kv_mb = available_for_kv / (1024 * 1024),
                 gpu_memory_utilization = utilization,

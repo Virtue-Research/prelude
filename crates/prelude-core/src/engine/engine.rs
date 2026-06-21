@@ -150,7 +150,9 @@ impl Engine {
             ForwardBatch::Mixed {
                 requests,
                 sample_greedy: _,
-            } => self.forward_mixed(requests),
+                decode_tokens_device,
+                decode_prev_rows: _, // resolved to decode_tokens_device by the device executor
+            } => self.forward_mixed(requests, decode_tokens_device),
             ForwardBatch::OneShot { token_groups, task } => {
                 self.forward_oneshot(token_groups, task)
             }
@@ -160,8 +162,15 @@ impl Engine {
                 block_tables,
                 deltanet_slots,
                 sample_greedy: _,
-                tokens_device: _,
-            } => self.forward_decode(tokens, positions, block_tables, deltanet_slots),
+                tokens_device,
+                decode_prev_rows: _, // resolved to tokens_device by the device executor
+            } => self.forward_decode(
+                tokens,
+                positions,
+                block_tables,
+                deltanet_slots,
+                tokens_device,
+            ),
         }
     }
 
@@ -170,6 +179,7 @@ impl Engine {
     fn forward_mixed(
         &self,
         requests: Vec<super::executor::StepRequest>,
+        decode_tokens_device: Option<crate::tensor::Tensor>,
     ) -> Result<super::executor::ModelOutput, EngineError> {
         use super::executor::ModelOutput;
 
@@ -184,7 +194,7 @@ impl Engine {
             });
         }
 
-        let mixed_results = self.batch_mixed_paged(&requests)?;
+        let mixed_results = self.batch_mixed_paged(&requests, decode_tokens_device.as_ref())?;
 
         Ok(mixed_results)
     }
@@ -196,6 +206,7 @@ impl Engine {
         positions: Vec<usize>,
         block_tables: Vec<Vec<u32>>,
         deltanet_slots: Option<Vec<u32>>,
+        tokens_device: Option<crate::tensor::Tensor>,
     ) -> Result<super::executor::ModelOutput, EngineError> {
         use super::BatchDecodeSeq;
         use super::executor::ModelOutput;
@@ -223,7 +234,7 @@ impl Engine {
             })
             .collect();
 
-        let logits = self.batch_decode_paged(&seqs)?;
+        let logits = self.batch_decode_paged(&seqs, tokens_device.as_ref())?;
 
         Ok(ModelOutput {
             logits,

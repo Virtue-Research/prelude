@@ -13,6 +13,7 @@ members = [
     "crates/prelude-cuda/causal-conv1d",
     "crates/prelude-cuda/prelude-kernelbuild",
     "crates/prelude-cuda/prelude-cutedsl",
+    "crates/candle-flash-attn-v3",
     "crates/onednn-ffi",
 ]
 exclude = [
@@ -56,6 +57,7 @@ uuid = { version = "1.22.0", features = ["v4", "serde"] }
 
 # ML / Tensor computation
 candle-core = { git = "https://github.com/rucnyz/candle", branch = "prelude" }
+candle-flash-attn-v3 = { version = "0.9.2", path = "crates/candle-flash-attn-v3" }
 candle-nn = { git = "https://github.com/rucnyz/candle", branch = "prelude" }
 prelude-cuda = { path = "crates/prelude-cuda" }
 
@@ -86,13 +88,27 @@ rand = "0.10.0"
 bc-mimalloc = { version = "0.1", features = ["v3"] }
 float8 = { version = "0.7.0", features = ["num-traits", "rand_distr"] }
 
+# `release` is tuned as the FAST-ITERATION profile, not the max-perf one.
+# Rationale: a 1-line Rust edit was taking ~4.5 min, almost entirely thin-LTO
+# over the whole dep graph + relinking ~1GB of static CUDA archives. The hot
+# path is in precompiled CUDA kernels, so cross-crate LTO buys little here.
+#   * lto = false        — skip the multi-minute single-threaded LTO link step
+#   * incremental = true — rustc reuses prior codegen (off by default in release)
+#   * codegen-units = 256 — maximize parallel codegen on a small edit
+#   * strip = false      — skip the strip pass; keeps symbols for profiling
+# For real benchmark/throughput numbers use `--profile dist` (fat LTO below).
 [profile.release]
-lto = "thin"
-strip = true
+lto = false
+incremental = true
+codegen-units = 256
+strip = false
 
-# Full optimization for distribution: cargo build --profile dist
+# Full optimization for distribution AND for trustworthy benchmarks:
+#   cargo build -p prelude-server --profile dist --features cuda
 [profile.dist]
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+incremental = false
+strip = true
 panic = "abort"

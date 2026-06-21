@@ -298,6 +298,10 @@ async fn build_engine(cli: &Cli) -> anyhow::Result<Arc<dyn InferenceEngine>> {
     // under-allocated (when CLI < default) or activation under-estimated
     // (when CLI > default).
     engine_config.runtime.profile_tokens = cli.max_num_batched_tokens;
+    // Bound the realistic logits allocation in activation profiling to the
+    // actual concurrency cap (matches vLLM's profile_run, which samples one
+    // token per sequence for at most max_num_seqs sequences).
+    engine_config.runtime.profile_max_seqs = cli.max_running_requests;
     info!(?engine_config, "engine config loaded");
 
     // Auto-detect: explicit --model-path wins. Otherwise, if --model points

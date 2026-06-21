@@ -102,6 +102,17 @@ pub struct PagedParams<'a> {
     pub scale: f32,
     pub mask: MaskType,
     pub softcap: Option<f32>,
+    /// When set with FA3 + `PRELUDE_ATTN_FA3_FUSE_Q_NORM_ROPE=1`, Q RMSNorm+RoPE
+    /// runs inside the FA3 attention SMEM prologue instead of a standalone kernel.
+    pub q_prologue: Option<QAttnPrologue<'a>>,
+}
+
+pub struct QAttnPrologue<'a> {
+    pub q_weight: &'a Tensor,
+    pub cos: &'a Tensor,
+    pub sin: &'a Tensor,
+    pub position_ids: &'a Tensor,
+    pub eps: f32,
 }
 
 // ── KV cache ───────────────────────────────────────────────────────
@@ -273,6 +284,15 @@ pub trait Ops: Send + Sync {
         crate::bail!("paged_attention: requires device backend")
     }
 
+    /// Whether this backend will fuse Q RMSNorm+RoPE into the attention SMEM
+    /// prologue (Plan A) for a paged forward. The model asks *the ops object*
+    /// rather than reading backend env vars, so a build compiled without the
+    /// fused FA3 kernels can never claim the capability (cf. PagedParams::
+    /// q_prologue). Backends without a fused prologue return false (default).
+    fn fuse_q_norm_rope_prologue(&self) -> bool {
+        false
+    }
+
     // ════════════════════════════════════════════════════════════════
     // KV cache
     // ════════════════════════════════════════════════════════════════
@@ -284,6 +304,10 @@ pub trait Ops: Send + Sync {
         }
     }
     fn paged_block_size_hint(&self, _head_dim: usize) -> usize {
+        // Generic fallback for backends with no kernel tile-alignment constraint
+        // (CPU / non-CUDA): a small page keeps prefix-cache granularity fine and
+        // has no attention-kernel divisibility requirement. CUDA overrides this
+        // with its FA4/FA3 N-tile-aligned hint.
         16
     }
     fn reshape_and_cache(

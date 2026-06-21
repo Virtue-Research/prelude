@@ -172,18 +172,62 @@ impl Qwen3Attention {
         let kv_cache = ctx
             .paged_kv
             .map(|kv| (kv.key_cache, kv.value_cache, kv.slot_mapping));
-        let (q, k) = ops.qknorm_rope_and_cache(
-            &q,
-            &k,
-            &v,
-            &self.q_norm_weight,
-            &self.k_norm_weight,
-            &self.rotary_emb.cos,
-            &self.rotary_emb.sin,
-            ctx.position_ids,
-            self.rms_norm_eps as f32,
-            kv_cache,
-        )?;
+        // Fuse Q-norm+RoPE into the FA3 prologue and write K via the fused
+        // K-norm+rope+cache kernel ONLY when there's a paged KV cache to write
+        // and the backend supports the fused prologue. One decision expressed as
+        // one match: the fused arm's guard already implies `kv_cache.is_some()`,
+        // so there is no dead "fuse but no paged kv" branch to guard against.
+        let fuse_q_in_fa3 = kv_cache.is_some() && ops.fuse_q_norm_rope_prologue();
+        let (q_prologue, q, k) = match kv_cache {
+            Some((kc, vc, sm)) if fuse_q_in_fa3 => {
+                // No silent fallback: the rms_norm+rope_thd path's RoPE
+                // convention does NOT match the in-kernel Q prologue — mixing
+                // them silently corrupts the KV cache (deterministic garbage;
+                // see fa3_q_prologue_deadlock_fix report §十).
+                match ops.fused_knorm_rope_cache_write(
+                    &k,
+                    &v,
+                    &self.k_norm_weight,
+                    &self.rotary_emb.cos,
+                    &self.rotary_emb.sin,
+                    ctx.position_ids,
+                    kc,
+                    vc,
+                    sm,
+                    self.rms_norm_eps as f32,
+                ) {
+                    Some(r) => r?,
+                    None => crate::bail!(
+                        "fuse_q_in_fa3 requires the fused K norm+rope cache-write \
+                         kernel (bf16 K + fused_kv_cache_write enabled); refusing \
+                         the rope_thd fallback to avoid Q/K RoPE convention mismatch"
+                    ),
+                }
+                let q_prologue = crate::ops::QAttnPrologue {
+                    q_weight: &self.q_norm_weight,
+                    cos: &self.rotary_emb.cos,
+                    sin: &self.rotary_emb.sin,
+                    position_ids: ctx.position_ids,
+                    eps: self.rms_norm_eps as f32,
+                };
+                (Some(q_prologue), q.clone(), k.clone())
+            }
+            kv_cache => {
+                let (q, k) = ops.qknorm_rope_and_cache(
+                    &q,
+                    &k,
+                    &v,
+                    &self.q_norm_weight,
+                    &self.k_norm_weight,
+                    &self.rotary_emb.cos,
+                    &self.rotary_emb.sin,
+                    ctx.position_ids,
+                    self.rms_norm_eps as f32,
+                    kv_cache,
+                )?;
+                (None, q, k)
+            }
+        };
         nvtx_pop!();
 
         // Attention
@@ -202,6 +246,7 @@ impl Qwen3Attention {
                     scale: self.softmax_scale,
                     mask: crate::ops::MaskType::Causal,
                     softcap: None,
+                    q_prologue,
                 },
             )?
         } else {

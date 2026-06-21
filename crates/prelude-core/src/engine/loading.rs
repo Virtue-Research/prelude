@@ -14,9 +14,9 @@ use crate::cache::manager::CacheManager;
 use crate::config::EngineConfig;
 use crate::engine::{
     Engine, EngineError, ModelDescriptor, ModelExecutor, ModelVariant, ResolvedModelConfig,
-    RuntimeCaps, TaskKind, TaskOverride, WeightsBackend, has_remote_file, init_runtime,
-    load_model_config, load_safetensor_filenames, load_var_builder_from_filenames, load_weights,
-    parse_model_config_for_source, select_device, tensor_err,
+    RuntimeCaps, TaskKind, TaskOverride, WeightsBackend, find_safetensor_files, has_remote_file,
+    init_runtime, load_model_config, load_safetensor_filenames, load_var_builder_from_filenames,
+    parse_model_config_for_source, select_device, sum_safetensors_logical_bytes, tensor_err,
 };
 use crate::models::gemma3::meta::{Gemma3ModelBuildContext, build_gemma3_model_with_context};
 
@@ -50,6 +50,10 @@ impl Engine {
 
         let (device, dtype) = select_device(&engine_config.runtime)?;
         init_runtime(&device, &engine_config.runtime);
+        // Baseline free GPU memory BEFORE any weights/embeddings hit the device.
+        // Subtracting this from free-after-load yields the pure weight footprint
+        // (vLLM accounting); see `load_safetensor_parts`.
+        let free_before_load = free_gpu_bytes(&device);
 
         let resolved = load_model_config(model_path, task_override)?;
         let embedding_modules = load_embedding_modules_from_dir(
@@ -59,7 +63,9 @@ impl Engine {
             DType::F32,
             &device,
         )?;
-        let vb = load_weights(model_path, dtype, &device)?;
+        let weight_files = find_safetensor_files(model_path)?;
+        let weights_logical_bytes = sum_safetensors_logical_bytes(&weight_files, dtype);
+        let vb = load_var_builder_from_filenames(&weight_files, dtype, &device)?;
         let tokenizer = load_tokenizer(model_path)?;
         load_safetensor_parts(
             model_id,
@@ -71,6 +77,8 @@ impl Engine {
             dtype,
             load_start,
             engine_config,
+            free_before_load,
+            weights_logical_bytes,
         )
     }
 
@@ -124,6 +132,10 @@ impl Engine {
 
         let (device, dtype) = select_device(&engine_config.runtime)?;
         init_runtime(&device, &engine_config.runtime);
+        // Baseline free GPU memory BEFORE any weights/embeddings hit the device.
+        // Subtracting this from free-after-load yields the pure weight footprint
+        // (vLLM accounting); see `load_safetensor_parts`.
+        let free_before_load = free_gpu_bytes(&device);
         let load_start = Instant::now();
 
         let resolved = {
@@ -144,6 +156,7 @@ impl Engine {
         )
         .await?;
 
+        let weights_logical_bytes = sum_safetensors_logical_bytes(&weight_files, dtype);
         let vb = load_var_builder_from_filenames(&weight_files, dtype, &device)?;
         let tokenizer = load_tokenizer_file(&tokenizer_path)?;
         load_safetensor_parts(
@@ -156,11 +169,25 @@ impl Engine {
             dtype,
             load_start,
             engine_config,
+            free_before_load,
+            weights_logical_bytes,
         )
     }
 }
 
 // ── Free functions ────────────────────────────────────────────────────────
+
+/// Free GPU memory in bytes, or `None` on non-CUDA devices / query failure.
+///
+/// Used to snapshot the device baseline right after `init_runtime` (CUDA
+/// context created, no weights yet) so the weight footprint can be measured
+/// as a delta — see `load_safetensor_parts`.
+fn free_gpu_bytes(device: &Device) -> Option<usize> {
+    if !device.is_cuda() {
+        return None;
+    }
+    crate::ops::select_ops(device).gpu_free_memory()
+}
 
 fn load_safetensor_parts(
     model_id: String,
@@ -172,6 +199,8 @@ fn load_safetensor_parts(
     dtype: DType,
     load_start: Instant,
     engine_config: EngineConfig,
+    free_before_load: Option<usize>,
+    weights_logical_bytes: Option<usize>,
 ) -> Result<Engine, EngineError> {
     // Initialize global config before building the model, so that model
     // constructors can read cache/runtime settings via global accessors.
@@ -191,17 +220,56 @@ fn load_safetensor_parts(
     // Read KV sharing map from model before moving it into the executor.
     let kv_sharing = built.model.kv_cache_sharing();
 
-    // ── Activation memory profiling (vLLM-style) ──────────────────
+    // ── KV-cache memory budget: match vLLM's `determine_available_memory` ──
     //
-    // Before sizing the KV cache, run a dummy forward pass to measure
-    // peak GPU memory consumed by activations. This is the same
-    // approach vLLM uses in `determine_available_memory`:
+    //   available_kv = total * utilization - non_kv
+    //   non_kv       = weights_logical + context + peak_activation
     //
-    //   available_kv = total * utilization - weights - peak_activation
+    // The whole point is that prelude's KV pool equals vLLM's at the SAME
+    // --gpu-memory-utilization. That requires accounting each term the way
+    // vLLM does — against LOGICAL (allocated) bytes, not the physical GPU
+    // snapshot, because the cudarc async mempool rounds allocations up and
+    // retains freed pages, so `total - free` over-counts:
     //
-    // Without this, the 10% reserve from `gpu_memory_utilization=0.9`
-    // can be insufficient for large-vocab MoE models (Qwen3.5-35B-A3B
-    // needs ~8 GB for the lm_head matmul alone at 8192 tokens).
+    //   • weights_logical: Σ tensor numel × dtype (from the safetensors headers),
+    //     NOT the physical `free_before_load - free_after_load` delta. The delta
+    //     includes the cudarc pool's reservation/fragmentation (~1.5 GB on this
+    //     30 GB MoE model) that vLLM never charges. Falls back to the delta, then
+    //     to `total - free`, if the analytic sum is unavailable.
+    //   • context = total - free_before_load: the CUDA context / driver overhead
+    //     present before weights loaded. vLLM folds the same quantity into its
+    //     peak_memory via the `non_torch_allocations` term, so we keep it.
+    //   • peak_activation: profiled below (logits over-count corrected there).
+    //
+    // (Earlier this charged the physical `total - free` delta as "weights",
+    // which over-reserved and shrank prelude's pool vs vLLM — needing util 0.88
+    // to match vLLM's 0.85. The logical accounting closes that gap.)
+    let context_bytes = if device.is_cuda() {
+        let ops = crate::ops::select_ops(&device);
+        match (ops.gpu_total_memory(), free_before_load) {
+            (Some(total), Some(before)) => total.saturating_sub(before),
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    let weights_plus_context_bytes = if device.is_cuda() {
+        let ops = crate::ops::select_ops(&device);
+        weights_logical_bytes
+            .map(|w| w + context_bytes)
+            // Fallbacks: physical load delta, then absolute total-free.
+            .or_else(|| match (free_before_load, ops.gpu_free_memory()) {
+                (Some(before), Some(free_after)) => Some(before.saturating_sub(free_after)),
+                _ => None,
+            })
+            .or_else(|| match (ops.gpu_total_memory(), ops.gpu_free_memory()) {
+                (Some(t), Some(f)) => Some(t.saturating_sub(f)),
+                _ => None,
+            })
+    } else {
+        None
+    };
+
     let peak_activation_bytes = if device.is_cuda() {
         profile_peak_activation(
             &mut built.model,
@@ -209,6 +277,7 @@ fn load_safetensor_parts(
             &common_config,
             dtype,
             engine_config.runtime.profile_tokens,
+            engine_config.runtime.profile_max_seqs,
         )
         .unwrap_or(0)
     } else {
@@ -233,6 +302,7 @@ fn load_safetensor_parts(
         &engine_config.cache,
         &kv_sharing,
         peak_activation_bytes,
+        weights_plus_context_bytes,
     )?;
 
     tracing::info!(
@@ -280,12 +350,22 @@ fn load_safetensor_parts(
 /// Returns 0 on any failure — the caller falls back to the old
 /// heuristic (which works for small models; only large-vocab MoE
 /// models hit the edge case).
+///
+/// The forward materializes `[profile_tokens, vocab]` logits — the worst case
+/// that serving never hits, where only the last token of each of at most
+/// `profile_max_seqs` sequences needs logits. We measure the physical peak,
+/// then subtract that full-token logits tensor and add back a realistic
+/// `profile_max_seqs`-row allocation, matching how vLLM's `profile_run` sizes
+/// activations (one sampled token per sequence). Without this the lm_head
+/// logits (~2.4 GB at 8192 tokens × 152k vocab) dominate the reserve and shrink
+/// the KV pool well below vLLM's at the same utilization.
 fn profile_peak_activation(
     model: &mut ModelVariant,
     device: &Device,
     config: &crate::engine::CommonModelConfig,
     dtype: DType,
     profile_tokens: usize,
+    profile_max_seqs: usize,
 ) -> Result<usize, EngineError> {
     use crate::tensor::Tensor;
 
@@ -343,27 +423,78 @@ fn profile_peak_activation(
         };
         // logits are alive → peak memory is captured by cudaMemGetInfo
         let free_during = ops.gpu_free_memory().unwrap_or(free_before);
-        let peak_activation = free_before.saturating_sub(free_during);
+        let measured_peak = free_before.saturating_sub(free_during);
+
+        // Correct the logits over-count: the live tensor is [profile_tokens, vocab],
+        // but serving only needs logits for the last token of ≤ profile_max_seqs
+        // sequences. Read the actual logits footprint from the tensor (robust to
+        // a padded lm_head vocab), then swap the full-token rows for a realistic
+        // profile_max_seqs-row allocation. Keep whatever non-logits residual the
+        // snapshot captured (layer/attention/MoE working set).
+        let logit_rows = _logits
+            .dims()
+            .first()
+            .copied()
+            .unwrap_or(profile_tokens)
+            .max(1);
+        let logits_bytes = _logits.elem_count() * _logits.dtype().size_in_bytes();
+        let real_rows = profile_max_seqs.clamp(1, logit_rows);
+        let realistic_logits_bytes = logits_bytes / logit_rows * real_rows;
+        let peak_activation = measured_peak
+            .saturating_sub(logits_bytes)
+            .saturating_add(realistic_logits_bytes);
 
         drop(_logits);
         model.clear_kv_cache();
 
         tracing::info!(
             peak_activation_mb = peak_activation / (1024 * 1024),
+            measured_peak_mb = measured_peak / (1024 * 1024),
+            full_logits_mb = logits_bytes / (1024 * 1024),
+            realistic_logits_mb = realistic_logits_bytes / (1024 * 1024),
             profile_tokens,
-            "activation profiling complete"
+            profile_max_seqs,
+            "activation profiling complete (logits over-count corrected)"
         );
 
         Ok(peak_activation)
     } else {
-        // Model doesn't support forward_with_cache (unusual).
-        // Fall back to config-based estimate.
-        let lm_head_bytes = profile_tokens * config.vocab_size * dtype.size_in_bytes();
+        // No `forward_with_cache` path (e.g. Qwen3-MoE) → can't measure the peak,
+        // so estimate it analytically with the SAME vLLM-aligned shape the measured
+        // branch produces: realistic logits + a bounded transformer working set.
+        //
+        //   • realistic logits = profile_max_seqs × vocab × dtype — serving samples
+        //     one token per sequence, so logits never span all profile_tokens. The
+        //     old estimate charged the full `profile_tokens × vocab` (~2.4 GB at
+        //     8192×152k), which over-reserved and shrank the pool ~2.4 GB below
+        //     vLLM's at the same utilization.
+        //   • working set ≈ a few residual-stream-sized buffers (attention QKV / MLP
+        //     intermediates that peak within a block). Bounded, not exact — the
+        //     (1 - utilization) headroom covers any real overshoot, so this only
+        //     affects how closely the pool tracks vLLM, not safety.
+        let dsz = dtype.size_in_bytes();
+        let real_rows = profile_max_seqs.clamp(1, profile_tokens);
+        let realistic_logits = real_rows
+            .saturating_mul(config.vocab_size)
+            .saturating_mul(dsz);
+        let hidden = config
+            .num_attention_heads
+            .saturating_mul(config.head_dim)
+            .max(1);
+        let working_set = 4usize
+            .saturating_mul(profile_tokens)
+            .saturating_mul(hidden)
+            .saturating_mul(dsz);
+        let estimate = realistic_logits.saturating_add(working_set);
         tracing::info!(
-            lm_head_mb = lm_head_bytes / (1024 * 1024),
-            "using config-based activation estimate (no KV cache model)"
+            estimate_mb = estimate / (1024 * 1024),
+            realistic_logits_mb = realistic_logits / (1024 * 1024),
+            working_set_mb = working_set / (1024 * 1024),
+            profile_tokens,
+            profile_max_seqs,
+            "config-based activation estimate (no forward_with_cache; vLLM-aligned)"
         );
-        Ok(lm_head_bytes)
+        Ok(estimate)
     }
 }
 

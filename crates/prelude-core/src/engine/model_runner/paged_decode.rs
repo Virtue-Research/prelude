@@ -5,7 +5,11 @@ use crate::models::commons::PagedKvBatchContext;
 impl Engine {
     /// Batched decode step: N sequences, each with Q=1 (one new token),
     /// different context lengths. Returns logits (N, vocab_size).
-    pub fn batch_decode_paged(&self, seqs: &[BatchDecodeSeq]) -> Result<Tensor, EngineError> {
+    pub fn batch_decode_paged(
+        &self,
+        seqs: &[BatchDecodeSeq],
+        tokens_device: Option<&Tensor>,
+    ) -> Result<Tensor, EngineError> {
         // Set thread-local ops for operator overload dispatch.
         let _ops_guard = crate::ops::OpsGuard::new(self.executor.ops);
         let pool = self.cache.paged_pool.as_ref().ok_or_else(|| {
@@ -17,10 +21,19 @@ impl Engine {
             return Err(EngineError::Internal("empty decode batch".into()));
         }
 
-        // packed input: one token per sequence
-        let flat_tokens: Vec<u32> = seqs.iter().map(|s| s.token).collect();
-        let packed_input = Tensor::from_vec(flat_tokens, (batch_size,), &self.executor.device)
-            .map_err(tensor_err)?;
+        // packed input: one token per sequence. Async pipeline feeds the
+        // previous step's device-resident sampled tokens directly (device→
+        // device, no host round-trip); fall back to host `s.token` otherwise.
+        let packed_input = match tokens_device {
+            Some(dev) if dev.dims1().map(|n| n == batch_size).unwrap_or(false) => dev
+                .to_dtype(crate::tensor::DType::U32)
+                .map_err(tensor_err)?,
+            _ => {
+                let flat_tokens: Vec<u32> = seqs.iter().map(|s| s.token).collect();
+                Tensor::from_vec(flat_tokens, (batch_size,), &self.executor.device)
+                    .map_err(tensor_err)?
+            }
+        };
 
         // cu_seqlens_q: [0, 1, 2, ..., N] — each seq has Q=1
         let cu_seqlens_q: Vec<u32> = (0..=batch_size as u32).collect();
@@ -559,7 +572,7 @@ impl Engine {
                 .collect();
 
             // GPU forward
-            let logits_2d = match self.batch_decode_paged(&decode_seqs) {
+            let logits_2d = match self.batch_decode_paged(&decode_seqs, None) {
                 Ok(l) => l,
                 Err(e) => {
                     tracing::error!(error = %e, "batch_decode_paged failed");

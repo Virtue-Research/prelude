@@ -73,9 +73,8 @@ impl Engine {
                 let logits_f32 = logits
                     .to_dtype(crate::tensor::DType::F32)
                     .map_err(tensor_err)?;
-                let log_probs =
-                    candle_nn::ops::log_softmax(&logits_f32, crate::tensor::D::Minus1)
-                        .map_err(tensor_err)?;
+                let log_probs = candle_nn::ops::log_softmax(&logits_f32, crate::tensor::D::Minus1)
+                    .map_err(tensor_err)?;
                 let idx = target_ids.reshape((n, 1)).map_err(tensor_err)?;
                 log_probs
                     .gather(&idx, 1)

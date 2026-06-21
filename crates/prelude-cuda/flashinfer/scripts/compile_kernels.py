@@ -14,6 +14,7 @@ Generates:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import shutil
@@ -965,10 +966,17 @@ def generate_utility_sources(
                 # TVM FFI exports (e.g. __tvm_ffi_sampling_from_probs) undefined.
                 if not (out / binding_file).exists():
                     if kind == "norm":
-                        # Remove layernorm binding export
+                        # Remove the plain `layernorm` binding export (its body
+                        # is stripped from norm.cu above because it pulls in
+                        # TensorRT-LLM headers). Match on a whole-word boundary
+                        # so we DON'T also clobber unrelated ops whose names
+                        # merely contain "layernorm" as a substring — e.g.
+                        # `fused_dit_layernorm` / `fused_dit_layernorm_run`,
+                        # whose multi-line declaration would otherwise lose its
+                        # first line and leave an orphaned parameter list.
                         src_text = binding_path.read_text()
                         lines = [l for l in src_text.split('\n')
-                                 if 'layernorm' not in l]
+                                 if not re.search(r'\blayernorm\b', l)]
                         (out / binding_file).write_text('\n'.join(lines))
                     else:
                         shutil.copy2(binding_path, out / binding_file)
@@ -1286,7 +1294,7 @@ def _cutlass_moe_blackwell_compile_flags(flags: List[str]) -> List[str]:
 
 
 def _should_compile_cutlass_moe_blackwell_source(src: Path, archs: List[int]) -> bool:
-    # TopicGuard/Qwen3 production weights are dense BF16. The upstream
+    # Production qwen3 moe weights are dense BF16. The upstream
     # SM100/SM103 JIT spec is broad and also pulls in fp16, uint, FP8/FP4 and
     # older generated kernels. Several of those translation units compile very
     # slowly or stall under static AOT, so keep the AOT archive to the BF16

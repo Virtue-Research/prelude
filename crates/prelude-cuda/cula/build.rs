@@ -411,7 +411,10 @@ assert (
     // anyOf [{file},{text}]". `uv venv` provisions setuptools 70.x by
     // default, so without this step the no-build-isolation install of
     // cuLA fails before any code compiles.
-    venv.pip_install(&["--upgrade", "setuptools>=77", "wheel"], InstallOpts::new())?;
+    venv.pip_install(
+        &["--upgrade", "setuptools>=77", "wheel"],
+        InstallOpts::new(),
+    )?;
 
     // Step 1: torch (must be first for cuLA's setup.py to import it).
     venv.pip_install(
