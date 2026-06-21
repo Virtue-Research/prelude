@@ -67,6 +67,13 @@ unsafe extern "C" {
 /// Q-prologue fusion inputs: in-kernel per-head RMSNorm + RoPE on raw Q.
 /// `cos`/`sin` are (max_pos, head_dim/2) bf16 rotate-half tables; positions
 /// are derived in-kernel (seqused_k - seqlen_q + i), so no position_ids.
+///
+/// This is the backend-local view of `prelude_core::ops::QAttnPrologue`,
+/// intentionally minus `position_ids` (this kernel computes positions itself,
+/// unlike the `flash-attn-v3` fork which is fed explicit ids). It is NOT
+/// accidental drift from the core struct — the field is dropped by design.
+/// Constructed both from a borrowed `QAttnPrologue` (paged_attention dispatch)
+/// and from a raw tuple (the direct FFI entry in `lib.rs`).
 pub struct QPrologue<'a> {
     pub q_weight: &'a Tensor,
     pub cos: &'a Tensor,
@@ -194,8 +201,13 @@ fn call_v3(
     let stream = cb::tensor_stream(q)?;
     let out = Tensor::zeros(&[total_q, h, d], DType::BF16, q.device())?;
     let softmax_lse = Tensor::zeros(&[h * total_q], DType::F32, q.device())?;
-    // Scheduler metadata: [prepare_seqlen_q (b_r) | num_nheads_in_l2 (b_r) | semaphore]
-    let b_rounded = b.div_ceil(4) * 4;
+    // Scheduler metadata buffer, mirroring the vLLM-FA3 host layout:
+    //   [ prepare_seqlen_q (b_rounded) | num_nheads_in_l2 (b_rounded) | semaphore ]
+    // The batch count is rounded UP to a multiple of 4 (`SCHED_BATCH_ALIGN`) to
+    // match the kernel's 4-wide vectorized writes into these arrays; the trailing
+    // `1` is the single tile-count semaphore word. `* 2` = the two b_rounded arrays.
+    const SCHED_BATCH_ALIGN: usize = 4;
+    let b_rounded = b.div_ceil(SCHED_BATCH_ALIGN) * SCHED_BATCH_ALIGN;
     let sched = Tensor::zeros(&[1 + b_rounded * 2], DType::U32, q.device())?;
 
     {

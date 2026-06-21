@@ -88,12 +88,6 @@ fn prefer_fa3_0102() -> bool {
     prelude_core::config::attn_flags::fa3_0102_enabled()
 }
 
-/// Fuse Q RMSNorm+RoPE into FA3 attention prologue (Plan A).
-#[cfg(feature = "flash-attn-v3")]
-fn fa3_fuse_q_norm_rope() -> bool {
-    prelude_core::config::attn_flags::fuse_q_norm_rope()
-}
-
 // ── The single impl ───────────────────────────────────────────────
 // Basic tensor ops (matmul, unary, binary, etc.) are handled by candle-core natively.
 // CudaOps only overrides fused/inference-specific ops.
@@ -380,7 +374,11 @@ impl Ops for CudaOps {
                 // FA3 paged needs both cumulative K offsets and per-sequence K
                 // lengths. The latter prevents padded block-table entries from
                 // contributing to attention when sequences in the batch differ.
-                let q_prologue = if fa3_fuse_q_norm_rope() {
+                // `params.q_prologue` is only `Some` when the model already chose
+                // to fuse (gated on `Ops::fuse_q_norm_rope_prologue()`, which
+                // itself requires `attn_flags::fuse_q_norm_rope()`), so a separate
+                // flag re-check here is redundant — map it through directly.
+                let q_prologue =
                     params
                         .q_prologue
                         .as_ref()
@@ -390,10 +388,7 @@ impl Ops for CudaOps {
                             sin: p.sin.clone(),
                             position_ids: p.position_ids.clone(),
                             eps: p.eps,
-                        })
-                } else {
-                    None
-                };
+                        });
                 return crate::attn::flash_v3::varlen_paged(
                     q,
                     key_cache,
