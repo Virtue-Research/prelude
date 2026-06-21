@@ -57,7 +57,19 @@ pub const DEFAULT_PREFIX_CACHE_BLOCKS: usize = usize::MAX;
 /// nothing to derive a budget from, so the tensor prefix cache would grow
 /// without bound. Cap it at this finite default (the pre-"unbounded" value)
 /// unless the operator sets an explicit `PRELUDE_PREFIX_CACHE_BLOCKS`.
+///
+/// NOTE: this is a block *count*, not a byte budget — it ignores per-entry KV
+/// size (layers × heads × head_dim × dtype). It exists only to stop unbounded
+/// growth on the rarely-used non-paged path; the paged path derives a real
+/// pool-relative budget in `init_prefix_cache` instead.
 pub const DEFAULT_NONPAGED_PREFIX_CACHE_BLOCKS: usize = 4096;
+/// Upper bound on the prefix-cache reserve floor, as a fraction (1/N) of the
+/// physical KV-block pool. The reserve floor keeps the prefix cache from pinning
+/// the *entire* pool (enough headroom for live admission + reclaim); it is sized
+/// to one max-length request but never allowed to exceed `pool / N`, so a very
+/// large-context model can't sacrifice most of the cache to the floor. See
+/// `init_prefix_cache`.
+pub const PREFIX_RESERVE_POOL_FRACTION: usize = 8;
 pub const DEFAULT_PREFIX_BLOCK_SIZE: usize = DEFAULT_PAGED_BLOCK_SIZE;
 pub const DEFAULT_DELTANET_POOL_SLOTS: u32 = 8;
 pub const DEFAULT_TEMPERATURE: f32 = 1.0;
@@ -275,10 +287,7 @@ impl RuntimeConfig {
                 DEFAULT_CUDA_GRAPH_MAX_BS,
             ),
             profile_tokens: parse_env_usize("PRELUDE_PROFILE_TOKENS", DEFAULT_PROFILE_TOKENS),
-            profile_max_seqs: parse_env_usize(
-                "PRELUDE_PROFILE_MAX_SEQS",
-                DEFAULT_PROFILE_MAX_SEQS,
-            ),
+            profile_max_seqs: parse_env_usize("PRELUDE_PROFILE_MAX_SEQS", DEFAULT_PROFILE_MAX_SEQS),
         })
     }
 }
@@ -306,29 +315,37 @@ fn parse_env_f32(name: &str, default: f32) -> f32 {
         .unwrap_or(default)
 }
 
+/// Canonical truthy / falsy spellings for boolean env vars (case-insensitive).
+/// Both rich parsers below share these so their truthiness rule can never drift
+/// apart — the only difference between them is the default for an *unset* var.
+const ENV_TRUE: &[&str] = &["1", "true", "yes", "on"];
+const ENV_FALSE: &[&str] = &["0", "false", "no", "off"];
+
 /// Parse a boolean env var: matches only "1" exactly.
+///
+/// This is the STRICT legacy form (intentionally narrower than [`ENV_TRUE`]),
+/// retained for flags that predate the rich parsers. Prefer
+/// [`parse_env_bool_default_false`] / [`parse_env_bool_default_true`] for new
+/// flags so operators get the same "1/true/yes/on" spelling everywhere.
 fn parse_env_bool_eq1(name: &str) -> bool {
     std::env::var(name).map_or(false, |v| v == "1")
 }
 
 /// Parse a boolean env var defaulting to false: on when set to a truthy value
-/// ("1"/"true"/"yes"/"on", case-insensitive). The default-off counterpart to
+/// ([`ENV_TRUE`], case-insensitive). The default-off counterpart to
 /// [`parse_env_bool_default_true`]; used for the attention backend toggles so
 /// every reader applies the *same* truthiness rule (see [`attn_flags`]).
 fn parse_env_bool_default_false(name: &str) -> bool {
     std::env::var(name)
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| ENV_TRUE.contains(&v.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
 }
 
+/// Parse a boolean env var defaulting to true: off only for an explicit falsy
+/// value ([`ENV_FALSE`], case-insensitive); any other value is on.
 fn parse_env_bool_default_true(name: &str) -> bool {
     std::env::var(name)
-        .map(|v| {
-            !matches!(
-                v.to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
+        .map(|v| !ENV_FALSE.contains(&v.to_ascii_lowercase().as_str()))
         .unwrap_or(true)
 }
 

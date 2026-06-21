@@ -10,7 +10,9 @@ const PREFIX_CACHE_KEY_BLOCKS: usize = 8;
 // Cumulative prefix-cache hit accounting, comparable to vLLM's
 // "Prefix cache hit rate" (cached tokens / prompt tokens). Hits accrue at
 // attach time (delta over any previous attach); queries accrue once per
-// request at its final prefill chunk. Logged every 256 finished prefills.
+// request at its final prefill chunk. Logged every `PREFIX_HIT_LOG_EVERY`
+// finished prefills (a coarse cadence so steady-state serving doesn't spam logs).
+const PREFIX_HIT_LOG_EVERY: u64 = 256;
 static PREFIX_HIT_TOKENS: AtomicU64 = AtomicU64::new(0);
 static PREFIX_QUERY_TOKENS: AtomicU64 = AtomicU64::new(0);
 static PREFIX_QUERY_REQS: AtomicU64 = AtomicU64::new(0);
@@ -340,7 +342,7 @@ pub(super) fn try_insert_prefill_prefix_cache(
         let q = PREFIX_QUERY_TOKENS.fetch_add(seq.input_ids.len() as u64, Ordering::Relaxed)
             + seq.input_ids.len() as u64;
         let n = PREFIX_QUERY_REQS.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_multiple_of(256) {
+        if n.is_multiple_of(PREFIX_HIT_LOG_EVERY) {
             let h = PREFIX_HIT_TOKENS.load(Ordering::Relaxed);
             tracing::info!(
                 requests = n,

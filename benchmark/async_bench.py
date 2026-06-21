@@ -15,6 +15,9 @@ async def one_request(session, url, model, prompt, max_tokens, decode_priority_m
         "temperature": 0.0,
         "stream": True,
         "stream_options": {"include_usage": True},
+        # Force exactly `max_tokens` decode steps for every request so throughput
+        # is measured over a fixed, comparable amount of work (no early EOS makes
+        # output length data-dependent and the RPS number noisy / unreproducible).
         "ignore_eos": True,
     }
     if decode_priority_max_remaining_tokens is not None:

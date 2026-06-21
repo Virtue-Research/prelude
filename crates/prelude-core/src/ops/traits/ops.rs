@@ -304,6 +304,10 @@ pub trait Ops: Send + Sync {
         }
     }
     fn paged_block_size_hint(&self, _head_dim: usize) -> usize {
+        // Generic fallback for backends with no kernel tile-alignment constraint
+        // (CPU / non-CUDA): a small page keeps prefix-cache granularity fine and
+        // has no attention-kernel divisibility requirement. CUDA overrides this
+        // with its FA4/FA3 N-tile-aligned hint.
         16
     }
     fn reshape_and_cache(

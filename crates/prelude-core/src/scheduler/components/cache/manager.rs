@@ -142,7 +142,7 @@ impl CacheManager {
         let reserve_floor = if pool_blocks > 0 {
             max_model_len
                 .div_ceil(block_size.max(1))
-                .min(pool_blocks / 8)
+                .min(pool_blocks / crate::config::PREFIX_RESERVE_POOL_FRACTION)
                 .max(1)
         } else {
             0

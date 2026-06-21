@@ -17,6 +17,8 @@ env:
 jobs:
   cpu:
     name: CPU build / lint / test
+    # Pinned (not ubuntu-latest) so the toolchain/glibc the build links against
+    # doesn't shift under us when GitHub rolls `latest` to a new image.
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout (with submodules)
