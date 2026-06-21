@@ -412,11 +412,17 @@ pub async fn ar_loop(
         // Read before `batch` is moved into submit; recorded on the InFlight so
         // the next iteration knows whether it can overlap (greedy) or must
         // drain this step before building the next one (non-greedy → bug #2).
-        let step_executor_greedy = match &batch {
-            ForwardBatch::Decode { sample_greedy, .. } => *sample_greedy,
-            ForwardBatch::Mixed { sample_greedy, .. } => *sample_greedy,
-            _ => false,
-        };
+        //
+        // `sample_greedy` is a property of the *batch* (greedy + no logprobs);
+        // the overlap additionally requires the *executor* to actually resolve
+        // the next step's decode ids from the device-resident sampled tokens.
+        // CPU (and any backend that runs the generic host forward) never
+        // populates `sampled_tokens_device`, so the device→device gather would
+        // silently fall back to the stale host `pending_token` → wrong decode
+        // input id on every greedy step past the first. Gate on the capability
+        // so those backends always take the drain-before-build safe path.
+        let step_executor_greedy =
+            executor.resolves_device_decode_ids() && batch_sample_greedy(&batch);
 
         nvtx_push!("ar_submit");
         let submit_result = executor.submit(batch);
@@ -1036,7 +1042,7 @@ fn build_step_batch(
                 let position = seq.total_len() - 1;
                 tokens.push(state.pending_token.unwrap_or(0));
                 // position = total_len() - 1: the decode token's 0-indexed position
-                // (output_ids already contains this token from on_token_generated)
+                // (output_ids already contains this token from pipeline_advance)
                 positions.push(position);
                 block_tables.push(seq.block_table.clone());
                 if let Some(slot) = seq.deltanet_slot {
@@ -1268,6 +1274,18 @@ fn state_allows_executor_greedy(state: &ArSequenceState) -> bool {
             .as_ref()
             .and_then(|p| p.request.logprobs)
             .is_none()
+}
+
+/// Whether the built batch asked the executor to sample greedily on its fast
+/// path. This is necessary but NOT sufficient for the submit-ahead overlap —
+/// the executor must ALSO resolve the next step's decode ids device→device
+/// (`Executor::resolves_device_decode_ids`). See the gate at the submit site.
+fn batch_sample_greedy(batch: &ForwardBatch) -> bool {
+    match batch {
+        ForwardBatch::Decode { sample_greedy, .. } => *sample_greedy,
+        ForwardBatch::Mixed { sample_greedy, .. } => *sample_greedy,
+        _ => false,
+    }
 }
 
 fn decode_requests_allow_executor_greedy(
@@ -1927,6 +1945,68 @@ mod tests {
             is_greedy: true,
             logits_processor: LogitsProcessor::from_sampling(42, Sampling::ArgMax),
         }
+    }
+
+    // ── submit-ahead overlap gate ──────────────────────────────────
+
+    /// An executor that does NOT resolve decode ids on the device (e.g. CPU,
+    /// or any backend on the generic host forward path). Mirrors the trait
+    /// default `resolves_device_decode_ids() == false`.
+    struct HostFallbackExecutor;
+    impl Executor for HostFallbackExecutor {
+        fn submit(
+            &self,
+            _batch: ForwardBatch,
+        ) -> Result<crate::engine::executor::ExecutionHandle, EngineError> {
+            unreachable!("not submitted in this test")
+        }
+        // resolves_device_decode_ids() uses the trait default → false.
+    }
+
+    /// An executor that DOES keep sampled tokens device-resident (mirrors CUDA).
+    struct DeviceGatherExecutor;
+    impl Executor for DeviceGatherExecutor {
+        fn submit(
+            &self,
+            _batch: ForwardBatch,
+        ) -> Result<crate::engine::executor::ExecutionHandle, EngineError> {
+            unreachable!("not submitted in this test")
+        }
+        fn resolves_device_decode_ids(&self) -> bool {
+            true
+        }
+    }
+
+    fn greedy_decode_batch() -> ForwardBatch {
+        ForwardBatch::Decode {
+            tokens: vec![1],
+            positions: vec![0],
+            block_tables: vec![vec![0]],
+            deltanet_slots: None,
+            sample_greedy: true,
+            tokens_device: None,
+            decode_prev_rows: None,
+        }
+    }
+
+    /// Regression: a greedy batch must only be eligible for the submit-ahead
+    /// overlap when the executor actually resolves decode ids device→device.
+    /// Without the capability gate, a greedy CPU step would stay in-flight and
+    /// the next step would decode from the stale host `pending_token`.
+    #[test]
+    fn overlap_gate_requires_device_decode_capability() {
+        let batch = greedy_decode_batch();
+        assert!(batch_sample_greedy(&batch));
+
+        // Host-fallback executor: greedy batch, but NO device gather → no overlap.
+        let cpu = HostFallbackExecutor;
+        assert!(!cpu.resolves_device_decode_ids());
+        assert!(!(cpu.resolves_device_decode_ids() && batch_sample_greedy(&batch)));
+
+        // Device-gather executor: overlap allowed.
+        let gpu = DeviceGatherExecutor;
+        assert!(gpu.resolves_device_decode_ids());
+        assert!(gpu.resolves_device_decode_ids() && batch_sample_greedy(&batch));
     }
 
     // ── handle_message tests ───────────────────────────────────────

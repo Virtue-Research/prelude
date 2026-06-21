@@ -192,6 +192,26 @@ pub trait Executor: Send + Sync + 'static {
     /// and return an `ExecutionHandle` backed by a oneshot channel.
     /// The caller awaits the result with `handle.recv().await`.
     fn submit(&self, batch: ForwardBatch) -> Result<ExecutionHandle, EngineError>;
+
+    /// Whether this executor keeps the previous step's sampled tokens
+    /// device-resident and resolves `decode_prev_rows` into the next step's
+    /// `decode_tokens_device`/`tokens_device` *inside the worker* (device→device,
+    /// no host round-trip).
+    ///
+    /// This is the capability the submit-ahead overlap in the AR loop relies on:
+    /// when a greedy step stays in-flight, the next step's decode input ids must
+    /// be gathered from that device tensor, NOT from the host `pending_token`
+    /// (which is still stale until the in-flight step is drained). An executor
+    /// that returns `false` (the default — e.g. `CpuExecutor`, which runs the
+    /// generic host `Engine::forward_batch` path and never populates
+    /// `sampled_tokens_device`) MUST have its in-flight step drained before the
+    /// next one is built, so the AR loop gates the overlap on this.
+    ///
+    /// Default `false`: a backend only opts in once it actually implements the
+    /// device-resident gather.
+    fn resolves_device_decode_ids(&self) -> bool {
+        false
+    }
 }
 
 // ── Registration ───────────────────────────────────────────────────

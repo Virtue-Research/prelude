@@ -101,6 +101,13 @@ impl Executor for CudaExecutor {
             .map_err(|_| EngineError::Internal("GPU worker thread has exited".into()))?;
         Ok(ExecutionHandle::new(result_rx))
     }
+
+    /// CUDA keeps the previous step's argmax in `last_sampled` (device-resident)
+    /// and resolves `decode_prev_rows` via `gather_decode_rows` inside the worker
+    /// — so the AR loop may safely overlap a greedy step. See the trait doc.
+    fn resolves_device_decode_ids(&self) -> bool {
+        true
+    }
 }
 
 /// Submit-ahead pipeline: gather the decode rows' input ids from the previous
