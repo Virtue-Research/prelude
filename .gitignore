@@ -34,8 +34,11 @@ CLAUDE.md
 sampled_500x10.json
 sampled_500_groups_x_10.jsonl
 sweep_results/
-_*.sh
-_*.log
+# Root-level ad-hoc scratch scripts/logs only — anchored with a leading slash so
+# an in-tree build script named `_*.sh` (e.g. crates/.../_build_*.sh) is NOT
+# silently excluded from the repo.
+/_*.sh
+/_*.log
 logs/
 
 # Nsight Systems profiler output — large local-only artifacts (~600MB).
@@ -58,10 +61,6 @@ verify_fa.py
 launch_prelude.sh
 launch_vllm.sh
 launch_vllm_docker.sh
-# candle-fa3-0102 standalone-crate ad-hoc bench inputs
-crates/candle-fa3-0102/bench_vllm_fa3.py
-crates/candle-fa3-0102/bench_vllm_varlen_dataset.py
-crates/candle-fa3-0102/gen_random_inputs.py
 # candle-fa3-bench: legacy microbench for the fork FA3 path (superseded by
 # prelude-cuda tests + verify tooling); removed from the workspace to stop
 # --workspace builds from force-compiling the fork's CUTLASS kernels.

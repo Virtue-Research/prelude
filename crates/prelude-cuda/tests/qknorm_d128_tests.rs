@@ -7,18 +7,15 @@
 use candle_core::{DType, Device, Tensor};
 use prelude_cuda::qknorm_rope_qk_for_tests;
 
+mod common;
+use common::randn_bf16;
+
 const D: usize = 128;
 const HQ: usize = 32;
 const HKV: usize = 4;
 
 fn dev() -> Device {
     Device::new_cuda(0).expect("needs CUDA device 0")
-}
-
-fn randn_bf16(shape: &[usize], dev: &Device, off: f64) -> Tensor {
-    let t = Tensor::randn(0f32, 1f32, shape, &Device::Cpu).unwrap();
-    let t = (t + off).unwrap();
-    t.to_device(dev).unwrap().to_dtype(DType::BF16).unwrap()
 }
 
 /// Build the serving-shaped inputs: q/k are non-contiguous views into a fused

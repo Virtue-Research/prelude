@@ -431,7 +431,12 @@ fn profile_peak_activation(
         // a padded lm_head vocab), then swap the full-token rows for a realistic
         // profile_max_seqs-row allocation. Keep whatever non-logits residual the
         // snapshot captured (layer/attention/MoE working set).
-        let logit_rows = _logits.dims().first().copied().unwrap_or(profile_tokens).max(1);
+        let logit_rows = _logits
+            .dims()
+            .first()
+            .copied()
+            .unwrap_or(profile_tokens)
+            .max(1);
         let logits_bytes = _logits.elem_count() * _logits.dtype().size_in_bytes();
         let real_rows = profile_max_seqs.clamp(1, logit_rows);
         let realistic_logits_bytes = logits_bytes / logit_rows * real_rows;
@@ -469,8 +474,13 @@ fn profile_peak_activation(
         //     affects how closely the pool tracks vLLM, not safety.
         let dsz = dtype.size_in_bytes();
         let real_rows = profile_max_seqs.clamp(1, profile_tokens);
-        let realistic_logits = real_rows.saturating_mul(config.vocab_size).saturating_mul(dsz);
-        let hidden = config.num_attention_heads.saturating_mul(config.head_dim).max(1);
+        let realistic_logits = real_rows
+            .saturating_mul(config.vocab_size)
+            .saturating_mul(dsz);
+        let hidden = config
+            .num_attention_heads
+            .saturating_mul(config.head_dim)
+            .max(1);
         let working_set = 4usize
             .saturating_mul(profile_tokens)
             .saturating_mul(hidden)

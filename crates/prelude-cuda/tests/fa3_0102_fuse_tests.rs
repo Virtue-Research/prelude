@@ -14,6 +14,9 @@
 
 use candle_core::{DType, Device, Tensor};
 
+mod common;
+use common::{cosine_stats, randn_bf16};
+
 const D: usize = 128;
 const HQ: usize = 32;
 const HKV: usize = 4;
@@ -21,12 +24,6 @@ const PAGE: usize = 16;
 
 fn dev() -> Device {
     Device::new_cuda(0).expect("needs CUDA device 0")
-}
-
-fn randn_bf16(shape: &[usize], dev: &Device, off: f64) -> Tensor {
-    let t = Tensor::randn(0f32, 1f32, shape, &Device::Cpu).unwrap();
-    let t = (t + off).unwrap();
-    t.to_device(dev).unwrap().to_dtype(DType::BF16).unwrap()
 }
 
 fn rope_tables(max_pos: usize, dev: &Device) -> (Tensor, Tensor) {
@@ -109,32 +106,6 @@ fn cu(lens: &[usize], dev: &Device) -> Tensor {
     Tensor::from_vec(v, (lens.len() + 1,), dev).unwrap()
 }
 
-fn stats(a: &Tensor, b: &Tensor) -> (f32, f64) {
-    let x = a
-        .to_dtype(DType::F32)
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap();
-    let y = b
-        .to_dtype(DType::F32)
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap();
-    let mut max_abs = 0f32;
-    let (mut dot, mut n1, mut n2) = (0f64, 0f64, 0f64);
-    for (p, q) in x.iter().zip(y.iter()) {
-        max_abs = max_abs.max((p - q).abs());
-        dot += (*p as f64) * (*q as f64);
-        n1 += (*p as f64) * (*p as f64);
-        n2 += (*q as f64) * (*q as f64);
-    }
-    (max_abs, dot / (n1.sqrt() * n2.sqrt()).max(1e-30))
-}
-
 /// One scenario: build raw Q + pre-roped K/V cache, compare fused vs reference.
 fn run_case(name: &str, qlens: &[usize], klens: &[usize]) {
     let dev = dev();
@@ -203,8 +174,8 @@ fn run_case(name: &str, qlens: &[usize], klens: &[usize]) {
     )
     .unwrap();
 
-    let (ma, cs) = stats(&out_fused, &out_ref);
-    let (ma_raw, _) = stats(&out_fused, &out_raw);
+    let (ma, cs) = cosine_stats(&out_fused, &out_ref);
+    let (ma_raw, _) = cosine_stats(&out_fused, &out_raw);
     println!("{name}: fused-vs-ref max_abs={ma:.5} cos={cs:.6} | fused-vs-raw max_abs={ma_raw:.3}");
     assert!(
         ma < 3e-2 && cs > 0.9995,

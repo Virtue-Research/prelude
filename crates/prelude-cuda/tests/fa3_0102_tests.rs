@@ -10,6 +10,14 @@
 
 use candle_core::{DType, Device, Tensor};
 
+mod common;
+use common::randn_bf16;
+
+// Shape coverage: head_dim is fixed at 128 (the backend is hdim128-only by
+// construction — every other dim is `-DFLASHATTENTION_DISABLE_HDIM*`'d out of the
+// build). The GQA ratio here is the production 8 (32 Q / 4 KV); coverage of other
+// GQA ratios (e.g. MHA 1:1, MQA n:1) is a tracked follow-up — it needs these
+// head-count constants threaded through `sdpa_ref`/`build_paged` rather than baked.
 const HEAD_DIM: usize = 128;
 const H_Q: usize = 32;
 const H_KV: usize = 4; // Qwen3-MoE GQA ratio 8 (32 Q / 4 KV)
@@ -17,13 +25,6 @@ const PAGE: usize = 128;
 
 fn dev() -> Device {
     Device::new_cuda(0).expect("needs CUDA device 0")
-}
-
-fn randn_bf16(shape: &[usize], dev: &Device, seed_off: f64) -> Tensor {
-    // The candle fork removed CUDA rand_normal — generate on CPU, then upload.
-    let t = Tensor::randn(0f32, 1f32, shape, &Device::Cpu).unwrap();
-    let t = (t + seed_off).unwrap();
-    t.to_device(dev).unwrap().to_dtype(DType::BF16).unwrap()
 }
 
 /// f32 SDPA reference (computed on CPU — the candle fork's GPU matmul needs a
@@ -102,30 +103,7 @@ fn sdpa_ref(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool, scale: f32) -> Ten
 }
 
 fn cmp(name: &str, got: &Tensor, want: &Tensor, max_abs_tol: f32) {
-    let g = got
-        .to_dtype(DType::F32)
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap();
-    let w = want
-        .to_dtype(DType::F32)
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap();
-    assert_eq!(g.len(), w.len(), "{name}: length mismatch");
-    let mut max_abs = 0f32;
-    let (mut dot, mut n1, mut n2) = (0f64, 0f64, 0f64);
-    for (a, b) in g.iter().zip(w.iter()) {
-        max_abs = max_abs.max((a - b).abs());
-        dot += (*a as f64) * (*b as f64);
-        n1 += (*a as f64) * (*a as f64);
-        n2 += (*b as f64) * (*b as f64);
-    }
-    let cos = dot / (n1.sqrt() * n2.sqrt()).max(1e-30);
+    let (max_abs, cos) = common::cosine_stats(got, want);
     println!("{name}: max_abs={max_abs:.5} cos={cos:.6}");
     assert!(
         max_abs < max_abs_tol && cos > 0.999,
